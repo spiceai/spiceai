@@ -54,6 +54,7 @@ limitations under the License.
 //! The legacy one-shot [`CayenneStagedAppend::commit`] is reimplemented in terms
 //! of this lifecycle and remains observably identical to the previous behavior.
 
+use super::PartitionedWal;
 use super::Result;
 use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME};
 use super::table::CayenneTableProvider;
@@ -539,9 +540,18 @@ impl CayenneTableProvider {
         })?;
         tokio::fs::write(&wal_path, content.as_bytes()).await?;
 
-        // fsync the WAL file to ensure it is durable before we begin moving files.
+        // fsync the WAL file content.
         let file = tokio::fs::File::open(&wal_path).await?;
         file.sync_all().await?;
+
+        // fsync the staging directory so that the directory entry for the newly
+        // written WAL file (and any data files previously written to this staging
+        // dir by `write_to_snapshot`) are durably persisted. This completes the
+        // "prepare" phase durability: the staging WAL record that lists the files
+        // to be moved is only considered durably written after its own directory
+        // entry is safe. Matches the full tmp+rename+dir-fsync pattern used for
+        // `PartitionedWal` and the syncs we perform after move and after WAL removal.
+        Self::sync_snapshot_dir(&staging_dir).await?;
 
         tracing::debug!(
             "Wrote staging WAL for table {} with {} file(s) targeting snapshot {target_snapshot}",
@@ -649,14 +659,32 @@ impl CayenneTableProvider {
             let staging_dir =
                 Self::snapshot_dir_path(self.table_path(), self.table_id(), STAGING_DIR_NAME);
             let wal_path = staging_dir.join(STAGING_WAL_FILENAME);
-            match tokio::fs::remove_file(&wal_path).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            let removed = match tokio::fs::remove_file(&wal_path).await {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true, // already gone = success state
                 Err(e) => {
                     tracing::warn!(
                         "Failed to remove staging WAL for table {}: {e}",
                         self.table_name(),
                     );
+                    false
+                }
+            };
+
+            if removed {
+                // Durability: after removing the WAL marker (the "commit success" signal),
+                // fsync the staging directory so the unlink is persisted. A crash without
+                // this sync could make the removal non-durable, causing a false-positive
+                // "incomplete write" detection on the next open even though the data move
+                // succeeded and was synced. This completes the "WAL absent = durably
+                // committed" contract for local FS staged appends (symmetric to the
+                // sync after data file moves).
+                if let Err(e) = Self::sync_snapshot_dir(&staging_dir).await {
+                    tracing::warn!(
+                        "Failed to sync staging dir after WAL removal for table {}: {e} (data is safe; may see stale WAL on restart)",
+                        self.table_name(),
+                    );
+                    // Non-fatal: data files are already durable. A lingering WAL is conservative.
                 }
             }
         }
@@ -682,13 +710,32 @@ impl CayenneTableProvider {
         if let Some((wal, wal_location)) = wal {
             // Automated recovery attempt will be implemented in the future — for now we just error with details to help the operator resolve the issue.
 
+            // Best-effort enrichment: if this per-partition incomplete write was part
+            // of a cross-partition commit (i.e. a `PartitionedWal` record references
+            // this partition's table_id), include the commit_id in the error message.
+            // This helps operators correlate "incomplete write" errors across multiple
+            // partitions of the same logical table and points them at the
+            // `_partitioned_wal/` directory for manual resolution.
+            let mut extra = String::new();
+            if let Ok(all_pw) =
+                PartitionedWal::read_all_in(std::path::Path::new(self.table_path())).await
+            {
+                for (pw, _) in all_pw {
+                    if pw.partitions.iter().any(|e| e.table_id == self.table_id()) {
+                        extra = format!(" (part of cross-partition commit {})", pw.commit_id);
+                        break;
+                    }
+                }
+            }
+
             return Err(Error::IncompleteWrite {
                 table: self.table_name().to_string(),
                 message: format!(
-                    "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Some files may have been partially written and require manual resolution. The WAL file is located at '{wal_location}'.",
+                    "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Some files may have been partially written and require manual resolution. The WAL file is located at '{wal_location}'.{}",
                     wal.staged_files.len(),
                     wal.target_snapshot,
                     wal.created_at,
+                    extra,
                 ),
             });
         }

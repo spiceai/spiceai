@@ -261,5 +261,82 @@ fn bench_inline_mutation_paths(c: &mut Criterion) {
     pressure.finish();
 }
 
-criterion_group!(benches, bench_append_roundtrip, bench_inline_mutation_paths);
+/// Benchmarks the directory durability primitives added for ACID correctness
+/// on local FS (parent-directory `sync_all` after `create_dir_all` for
+/// snapshot directories, _partitioned_wal/, and deletions/ subdirs).
+///
+/// These one-time-per-snapshot or per-table costs are the direct result of
+/// the durability hardening. The benchmark quantifies the "tax" for Q21
+/// workloads that trigger frequent compactions or cross-partition operations.
+fn bench_directory_durability_primitives(c: &mut Criterion) {
+    let rt = Runtime::new().expect("runtime");
+
+    let mut group = c.benchmark_group("directory_durability_sync_all");
+    // These are one-time operations; a smaller sample size is sufficient
+    // to get stable numbers without making the bench too slow.
+    group.sample_size(30);
+
+    group.bench_function("create_dir_all_plus_parent_sync", |b| {
+        b.iter_batched(
+            || {
+                let temp = tempfile::tempdir().expect("tempdir for bench");
+                let parent = temp.path().to_path_buf();
+                let child = parent.join("new_snapshot_or_wal_or_deletions_dir");
+                (temp, parent, child)
+            },
+            |(_keep_alive, parent, child)| {
+                rt.block_on(async {
+                    // Replicate the exact hardened pattern used in
+                    // ensure_snapshot_dir_exists, ensure_partitioned_wal_dir_and_sync_parent,
+                    // and the deletions/ subdir creation in DeletionVectorWriter.
+                    if !child.exists() {
+                        tokio::fs::create_dir_all(&child)
+                            .await
+                            .expect("create_dir_all");
+                        let p = parent.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            std::fs::File::open(&p).and_then(|f| f.sync_all())
+                        })
+                        .await;
+                    }
+                    black_box(child);
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    // For comparison: the cost of create_dir_all *without* the parent sync.
+    // This shows the incremental cost of the durability guarantee.
+    group.bench_function("create_dir_all_without_sync", |b| {
+        b.iter_batched(
+            || {
+                let temp = tempfile::tempdir().expect("tempdir for bench");
+                let parent = temp.path().to_path_buf();
+                let child = parent.join("new_snapshot_without_sync");
+                (temp, parent, child)
+            },
+            |(_keep_alive, _parent, child)| {
+                rt.block_on(async {
+                    if !child.exists() {
+                        tokio::fs::create_dir_all(&child)
+                            .await
+                            .expect("create_dir_all");
+                    }
+                    black_box(child);
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_append_roundtrip,
+    bench_inline_mutation_paths,
+    bench_directory_durability_primitives
+);
 criterion_main!(benches);

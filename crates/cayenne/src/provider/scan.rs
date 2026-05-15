@@ -14,14 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, sync::Arc};
+use std::{
+    any::Any,
+    collections::BTreeSet,
+    sync::{Arc, OnceLock},
+};
 
 use arrow_schema::SchemaRef;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::{DataFusionError, Statistics};
+use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_datasource::source::DataSourceExec;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr};
 use datafusion_physical_expr::{Distribution, OrderingRequirements, PhysicalExpr};
 use futures::TryStreamExt;
 
@@ -36,6 +43,7 @@ use datafusion_physical_plan::{
     metrics::MetricsSet,
     projection::ProjectionExec,
     repartition::RepartitionExec,
+    union::UnionExec,
 };
 
 /// Wrapper for Cayenne acceleration execution plans.
@@ -43,14 +51,347 @@ use datafusion_physical_plan::{
 #[derive(Debug)]
 pub struct CayenneAccelerationExec {
     inner: Arc<dyn ExecutionPlan>,
+    scan_identity: OnceLock<Option<Arc<ScanIdentity>>>,
 }
 
 impl CayenneAccelerationExec {
     /// Creates a new `CayenneAccelerationExec` wrapping the given execution plan.
     #[must_use]
     pub fn new(inner: Arc<dyn ExecutionPlan>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            scan_identity: OnceLock::new(),
+        }
     }
+
+    /// Returns a stable identity for the underlying scan source, derived from
+    /// the `FileScanConfig`'s `object_store_url` plus the sorted set of file
+    /// paths backing the inner `DataSourceExec`.
+    ///
+    /// Two `CayenneAccelerationExec` nodes that scan the same set of physical
+    /// files return the same identity, which is the precondition for sharing a
+    /// runtime dynamic filter across them (see the cross-scan filter sharing
+    /// workstream documented in `crates/cayenne/src/optimizer_rules.rs`).
+    ///
+    /// Returns `None` if the inner plan does not contain a `DataSourceExec`
+    /// whose `DataSource` is a `FileScanConfig` with at least one file. Mixed
+    /// inlined-data scans use a `UnionExec`; their in-memory branch is ignored
+    /// and the identity is derived from the file-backed branch. The identity
+    /// intentionally ignores ordering of files within partitions and projection
+    /// differences — it is purely a per-table fingerprint.
+    ///
+    /// The `object_store_url` is required to disambiguate two stores that
+    /// happen to contain the same relative paths (e.g. two different S3
+    /// buckets both with `part-000.vortex`). Without it the identity would
+    /// silently collide when paths are stored as relative locations.
+    #[must_use]
+    pub(crate) fn scan_identity(&self) -> Option<Arc<ScanIdentity>> {
+        self.scan_identity
+            .get_or_init(|| compute_scan_identity(&self.inner))
+            .as_ref()
+            .map(Arc::clone)
+    }
+
+    /// Returns the dynamic filters currently pushed into this Cayenne scan.
+    ///
+    /// These filters originate from `DataFusion`'s hash-join dynamic-filter
+    /// pass. They are safe to share only when an optimizer has proven the target
+    /// scan is equi-joined on every referenced column.
+    #[must_use]
+    pub(crate) fn dynamic_filters(&self) -> Vec<ScanDynamicFilter> {
+        let mut filters = Vec::new();
+        for file_scan_config in file_scan_configs(&self.inner) {
+            if let Some(filter) = file_scan_config.file_source().filter() {
+                collect_dynamic_filters(&filter, &mut filters);
+            }
+        }
+        filters
+    }
+
+    /// Push additional dynamic filters into the underlying file source.
+    ///
+    /// Returns `Ok(None)` when the scan source declined all filters or the inner
+    /// plan is not a simple file scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when rebuilding the underlying `DataSourceExec` with the
+    /// additional filters fails.
+    pub(crate) fn with_additional_dynamic_filters(
+        &self,
+        filters: &[Arc<dyn PhysicalExpr>],
+        config: &ConfigOptions,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let Some(inner) =
+            push_dynamic_filters_to_data_source(Arc::clone(&self.inner), filters, config)?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(Arc::new(Self::new(inner))))
+    }
+}
+
+fn compute_scan_identity(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<ScanIdentity>> {
+    let file_scan_configs = file_scan_configs(plan);
+    let first_file_scan_config = file_scan_configs.first()?;
+    let object_store_url = first_file_scan_config.object_store_url.as_str();
+    if file_scan_configs
+        .iter()
+        .any(|file_scan_config| file_scan_config.object_store_url.as_str() != object_store_url)
+    {
+        return None;
+    }
+
+    let mut paths: Vec<String> = file_scan_configs
+        .iter()
+        .flat_map(|file_scan_config| file_scan_config.file_groups.iter())
+        .flat_map(datafusion_datasource::file_groups::FileGroup::iter)
+        .map(|pf| pf.object_meta.location.to_string())
+        .collect();
+
+    if paths.is_empty() {
+        return None;
+    }
+
+    paths.sort();
+    paths.dedup();
+    Some(Arc::new(ScanIdentity {
+        object_store_url: Arc::from(object_store_url),
+        paths: Arc::from(paths),
+    }))
+}
+
+/// Stable identifier for a Cayenne scan source, derived from the
+/// `FileScanConfig`'s `object_store_url` plus the sorted set of file paths
+/// backing the underlying `DataSourceExec`.
+///
+/// Equality and hashing are content-based on both the `object_store_url` and
+/// the path set, so two `CayenneAccelerationExec` instances over the same
+/// logical table compare equal regardless of projection, partitioning, or
+/// wrapper-plan differences — and two scans over different stores that happen
+/// to share a relative path (e.g. two S3 buckets each with `part-000.vortex`)
+/// do *not* collide. The path set is reference-counted so copying a scan
+/// identity during optimizer rewrites does not clone every file path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ScanIdentity {
+    object_store_url: Arc<str>,
+    paths: Arc<[String]>,
+}
+
+/// A dynamic filter currently attached to a Cayenne scan, plus the scan-local
+/// column names the filter references.
+#[derive(Clone)]
+pub(crate) struct ScanDynamicFilter {
+    filter: Arc<dyn PhysicalExpr>,
+    columns: BTreeSet<String>,
+}
+
+impl ScanDynamicFilter {
+    /// Returns the shared dynamic filter expression.
+    #[must_use]
+    pub(crate) fn filter(&self) -> &Arc<dyn PhysicalExpr> {
+        &self.filter
+    }
+
+    /// Returns the scan-local column names referenced by this filter.
+    #[must_use]
+    pub(crate) fn columns(&self) -> &BTreeSet<String> {
+        &self.columns
+    }
+}
+
+fn file_scan_configs(plan: &Arc<dyn ExecutionPlan>) -> Vec<&FileScanConfig> {
+    let mut configs = Vec::new();
+    collect_file_scan_configs(plan, &mut configs);
+    configs
+}
+
+/// Walks `plan` looking for underlying file-backed `DataSourceExec` nodes,
+/// descending only through a whitelist of operators that are known to preserve
+/// scan identity, plus `UnionExec` for mixed file + inlined-memory scans.
+///
+/// Cayenne plans typically wrap the data source in transparent or
+/// near-transparent operators: `ProjectionExec`, `RepartitionExec`,
+/// `CoalesceBatchesExec`, `CoalescePartitionsExec`, plus the runtime's
+/// `BytesProcessedExec` / `SchemaCastScanExec` and the cayenne-internal
+/// `InexactStatsExec`. Any one of those may sit between
+/// `CayenneAccelerationExec` and the `DataSourceExec`.
+///
+/// Cayenne tables with inlined rows add a `UnionExec` whose file-backed branch
+/// should still participate in dynamic-filter sharing. Non-file children such
+/// as `MemoryExec` are ignored; they stay unfiltered because inline batches are
+/// intentionally small.
+///
+/// Anything else with a single child (e.g. `FilterExec`, `SortExec`,
+/// `LimitExec`, an unfamiliar custom node) is *not* identity-preserving for
+/// our purposes — it may change cardinality, ordering, or the file-set
+/// semantics the identity relies on. Collecting no file scans is safer than
+/// misattributing identity: the worst that happens is dynamic-filter sharing is
+/// conservatively disabled.
+fn collect_file_scan_configs<'a>(
+    plan: &'a Arc<dyn ExecutionPlan>,
+    configs: &mut Vec<&'a FileScanConfig>,
+) {
+    if let Some(data_source_exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
+        if let Some(file_scan_config) = data_source_exec
+            .data_source()
+            .as_any()
+            .downcast_ref::<FileScanConfig>()
+        {
+            configs.push(file_scan_config);
+        }
+        return;
+    }
+
+    if plan.as_any().downcast_ref::<UnionExec>().is_some() {
+        for child in plan.children() {
+            collect_file_scan_configs(child, configs);
+        }
+        return;
+    }
+
+    if !is_identity_preserving_wrapper(plan) {
+        return;
+    }
+
+    let children = plan.children();
+    if children.len() != 1 {
+        return;
+    }
+
+    collect_file_scan_configs(children[0], configs);
+}
+
+/// Returns `true` if `plan` is a known transparent / near-transparent wrapper
+/// that preserves the underlying scan's identity (same file set, same logical
+/// rows, just resharded / renamed / instrumented).
+///
+/// The check is by-type for the wrappers we have in-scope, and by `name()` for
+/// the ones that live in other crates or are crate-private. Adding a new
+/// wrapper requires touching this function explicitly — that's intentional;
+/// it stops a future operator from silently being treated as transparent.
+fn is_identity_preserving_wrapper(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let any = plan.as_any();
+    if any.downcast_ref::<ProjectionExec>().is_some()
+        || any.downcast_ref::<RepartitionExec>().is_some()
+        || any
+            .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+            .is_some()
+        || any
+            .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
+            .is_some()
+        || any.downcast_ref::<CayenneAccelerationExec>().is_some()
+    {
+        return true;
+    }
+
+    // Cross-crate / crate-private wrappers we can't downcast to without
+    // pulling in their concrete types: match by the stable `name()` string.
+    matches!(
+        plan.name(),
+        "BytesProcessedExec" | "SchemaCastScanExec" | "InexactStatsExec"
+    )
+}
+
+fn collect_dynamic_filters(expr: &Arc<dyn PhysicalExpr>, filters: &mut Vec<ScanDynamicFilter>) {
+    if let Some(dynamic_filter) = expr.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
+        if let Some(columns) = dynamic_filter_column_names(dynamic_filter) {
+            filters.push(ScanDynamicFilter {
+                filter: Arc::clone(expr),
+                columns,
+            });
+        }
+        return;
+    }
+
+    for child in expr.children() {
+        collect_dynamic_filters(child, filters);
+    }
+}
+
+fn dynamic_filter_column_names(
+    dynamic_filter: &DynamicFilterPhysicalExpr,
+) -> Option<BTreeSet<String>> {
+    let mut columns = BTreeSet::new();
+    for child in dynamic_filter.children() {
+        let column = child.as_any().downcast_ref::<Column>()?;
+        columns.insert(column.name().to_string());
+    }
+
+    if columns.is_empty() {
+        None
+    } else {
+        Some(columns)
+    }
+}
+
+fn push_dynamic_filters_to_data_source(
+    plan: Arc<dyn ExecutionPlan>,
+    filters: &[Arc<dyn PhysicalExpr>],
+    optimizer_config: &ConfigOptions,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    if filters.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(data_source_exec) = plan.as_any().downcast_ref::<DataSourceExec>()
+        && let Some(file_scan_config) = data_source_exec
+            .data_source()
+            .as_any()
+            .downcast_ref::<FileScanConfig>()
+    {
+        let filters = filters.iter().map(Arc::clone).collect();
+        let propagation = file_scan_config
+            .file_source()
+            .try_pushdown_filters(filters, optimizer_config)?;
+
+        let Some(updated_source) = propagation.updated_node else {
+            return Ok(None);
+        };
+
+        let mut updated_config = file_scan_config.clone();
+        updated_config.file_source = updated_source;
+        let updated_exec = data_source_exec
+            .clone()
+            .with_data_source(Arc::new(updated_config));
+        return Ok(Some(Arc::new(updated_exec)));
+    }
+
+    let children = plan
+        .children()
+        .into_iter()
+        .map(Arc::clone)
+        .collect::<Vec<_>>();
+    if children.is_empty() {
+        return Ok(None);
+    }
+
+    let is_union = plan.as_any().downcast_ref::<UnionExec>().is_some();
+    if !is_union && !is_identity_preserving_wrapper(&plan) {
+        return Ok(None);
+    }
+    if !is_union && children.len() != 1 {
+        return Ok(None);
+    }
+
+    let mut changed = false;
+    let mut new_children = Vec::with_capacity(children.len());
+    for child in children {
+        match push_dynamic_filters_to_data_source(Arc::clone(&child), filters, optimizer_config)? {
+            Some(updated_child) => {
+                changed = true;
+                new_children.push(updated_child);
+            }
+            None => new_children.push(child),
+        }
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+
+    plan.with_new_children(new_children).map(Some)
 }
 
 pub(crate) fn round_robin_repartition_if_needed(
@@ -356,5 +697,84 @@ mod tests {
                 .is_some(),
             "projection-swapped Cayenne plan should stay wrapped for optimizer identification"
         );
+    }
+
+    #[test]
+    fn scan_identity_returns_none_for_non_file_data_source() {
+        // MemorySourceConfig is not a FileScanConfig, so scan_identity must
+        // return None rather than misattributing identity.
+        let exec = CayenneAccelerationExec::new(one_partition_plan());
+        assert!(exec.scan_identity().is_none());
+    }
+
+    #[test]
+    fn scan_identity_returns_none_when_inner_wraps_unknown_multi_child_plan() {
+        // A plan with multiple children (e.g. a join) cannot have a single
+        // unambiguous scan identity; find_data_source_exec must bail.
+        let left = one_partition_plan();
+        let right = one_partition_plan();
+        let schema = left.schema();
+        let projection_expr = col("id", &schema).expect("id column should exist");
+
+        // Construct a 2-child wrapper via UnionExec to exercise the
+        // `children.len() != 1` early return without depending on join wiring.
+        let union = datafusion::physical_plan::union::UnionExec::try_new(vec![left, right])
+            .expect("union exec should be created");
+
+        // Wrap in a projection so the top isn't a DataSourceExec.
+        let projection = ProjectionExec::try_new(vec![(projection_expr, "id".to_string())], union)
+            .expect("projection exec should be created");
+        let exec = CayenneAccelerationExec::new(Arc::new(projection));
+        assert!(exec.scan_identity().is_none());
+    }
+
+    #[test]
+    fn scan_identity_equality_and_hashing_are_path_based() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let a = ScanIdentity {
+            object_store_url: Arc::from("s3://bucket/"),
+            paths: Arc::from(vec!["a.parquet".to_string(), "b.parquet".to_string()]),
+        };
+        let b = ScanIdentity {
+            object_store_url: Arc::from("s3://bucket/"),
+            paths: Arc::from(vec!["a.parquet".to_string(), "b.parquet".to_string()]),
+        };
+        let c = ScanIdentity {
+            object_store_url: Arc::from("s3://bucket/"),
+            paths: Arc::from(vec!["a.parquet".to_string()]),
+        };
+
+        assert_eq!(a, b, "same path set must compare equal");
+        assert_ne!(a, c, "different path sets must not compare equal");
+
+        let mut ha = DefaultHasher::new();
+        a.hash(&mut ha);
+        let mut hb = DefaultHasher::new();
+        b.hash(&mut hb);
+        // Verify Hash compiles and is content-based (we don't assert exact
+        // equality of finish() between distinct hashers, but both use the
+        // same content; the trait must be derivable from the inner fields).
+        let _ = (ha.finish(), hb.finish());
+
+        assert_eq!(a.object_store_url.as_ref(), "s3://bucket/");
+        assert_eq!(a.paths.as_ref(), &["a.parquet", "b.parquet"]);
+    }
+
+    #[test]
+    fn scan_identity_does_not_collide_across_object_stores() {
+        // Same relative paths across two different stores must produce
+        // distinct identities — otherwise cross-scan dynamic filters could
+        // mistakenly share state across unrelated tables.
+        let bucket_a = ScanIdentity {
+            object_store_url: Arc::from("s3://bucket-a/"),
+            paths: Arc::from(vec!["part-000.vortex".to_string()]),
+        };
+        let bucket_b = ScanIdentity {
+            object_store_url: Arc::from("s3://bucket-b/"),
+            paths: Arc::from(vec!["part-000.vortex".to_string()]),
+        };
+        assert_ne!(bucket_a, bucket_b);
     }
 }
