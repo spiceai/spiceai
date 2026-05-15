@@ -39,7 +39,9 @@ service ClusterService {
 
     // Get DDL catch-up statements since a given version.
     // Called by executors after loading catalogs and replaying initial DDL
-    // to close the TOCTOU window between GetAppDefinition and AllocateInitialPartitions.
+    // Executors call this after replaying the DDL snapshot from GetAppDefinition
+    // to close the TOCTOU window: any DDL committed on the scheduler between the
+    // GetAppDefinition snapshot and now is returned so the executor can replay it.
     rpc GetDdlCatchup(GetDdlCatchupRequest) returns (GetDdlCatchupResponse);
 }
 

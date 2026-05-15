@@ -2004,7 +2004,8 @@ async fn replay_ddl_statements(rt: &Runtime, statements: &[String]) -> usize {
         };
         if let Some(e) = error {
             tracing::warn!(
-                "Failed to replay DDL statement ({}/{}) — skipping remaining: {e}\n  SQL: {sql}",
+                sql,
+                "Failed to replay DDL statement ({}/{}) — skipping remaining: {e}",
                 i + 1,
                 statements.len()
             );

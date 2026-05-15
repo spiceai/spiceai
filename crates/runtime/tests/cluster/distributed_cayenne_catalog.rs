@@ -2150,6 +2150,28 @@ async fn test_distributed_cayenne_late_join_ddl_replay() -> Result<(), anyhow::E
             )?;
             assert_eq!(count, 3);
 
+            // Verify directly against the late-joining executor's DataFusion context
+            // that DDL replay actually registered the schema and table. Querying
+            // through the scheduler above is insufficient because the scheduler may
+            // route all reads to executor0 (which had the table pre-join); this
+            // check is immune to that routing decision.
+            let late_executor = harness
+                .executors
+                .last()
+                .expect("late-joining executor must exist");
+            let catalog = late_executor
+                .datafusion()
+                .ctx
+                .catalog("ljcat")
+                .expect("catalog 'ljcat' must be registered on late executor after DDL replay");
+            let schema = catalog
+                .schema("ljs")
+                .expect("schema 'ljs' must exist on late executor after DDL replay");
+            assert!(
+                schema.table_names().contains(&"items".to_string()),
+                "table 'items' must be in schema 'ljs' on late executor after DDL replay"
+            );
+
             harness.shutdown().await;
             Ok(())
         })
