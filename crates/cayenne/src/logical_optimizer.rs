@@ -91,6 +91,23 @@ limitations under the License.
 //! across the outer plan and an `InSubquery`. The dim-table-filter shape
 //! (`Filter(n_name='CHINA') → TableScan(nation)`) and small dimension snowflakes
 //! are cheap to re-execute.
+//!
+//! Two cardinality gates further suppress propagations that wouldn't pay off
+//! at runtime, when the underlying [`TableSource`]s expose row counts via
+//! `TableProvider::statistics`:
+//!
+//! * [`MIN_DIM_ROWS_FOR_PROPAGATION`] — skip when the dim subtree's known
+//!   upper-bound row count is below the threshold. Very small dims (≪ 1k
+//!   rows) already participate in fast hash builds; the extra `InSubquery →
+//!   LeftSemi` shape we'd introduce doesn't recover its own decorrelation /
+//!   planning cost.
+//! * [`MIN_FACT_ROWS_FOR_PROPAGATION`] — skip when the receiving fact
+//!   subtree's known upper-bound row count is below the threshold. Below it
+//!   there isn't enough probe-side cardinality for the filter to save
+//!   meaningful work, and the plain hash join wins.
+//!
+//! Both gates only fire when stats are present (`Precision::Exact` or
+//! `Precision::Inexact`); missing stats fall back to the structural behavior.
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DataFusionError, NullEquality, Result, Spans, TableReference};
@@ -203,6 +220,7 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
                         && left_analysis.is_dim_like
                         && left_analysis.has_non_key_filter(&left.name)
                         && key_preserved_through_summaries(&join.left, left)
+                        && !skip_propagation_by_cardinality(&join.left, &join.right)
                         && !right_analysis.has_propagated_filter_target(&column_expr(right))
                     {
                         let subquery_plan = build_key_projection_subquery(
@@ -226,6 +244,7 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
                         && right_analysis.is_dim_like
                         && right_analysis.has_non_key_filter(&right.name)
                         && key_preserved_through_summaries(&join.right, right)
+                        && !skip_propagation_by_cardinality(&join.right, &join.left)
                         && !left_analysis.has_propagated_filter_target(&column_expr(left))
                     {
                         let subquery_plan = build_key_projection_subquery(
@@ -258,6 +277,7 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
                         && left_analysis.is_dim_like
                         && left_analysis.has_non_key_filter(&left_col.name)
                         && key_preserved_through_summaries(&join.left, left_col)
+                        && !skip_propagation_by_cardinality(&join.left, &join.right)
                         && !right_analysis.has_propagated_filter_target(right_expr)
                     {
                         let subquery_plan = build_key_projection_subquery(
@@ -284,6 +304,7 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
                         && right_analysis.is_dim_like
                         && right_analysis.has_non_key_filter(&right_col.name)
                         && key_preserved_through_summaries(&join.right, right_col)
+                        && !skip_propagation_by_cardinality(&join.right, &join.left)
                         && !left_analysis.has_propagated_filter_target(left_expr)
                     {
                         let subquery_plan = build_key_projection_subquery(
@@ -445,6 +466,17 @@ fn join_key_types_match(
 /// large dim joins whose re-execution under an `InSubquery` would be expensive.
 const MAX_DIM_LIKE_TABLE_SCANS: usize = 3;
 
+/// Skip propagation when the dim subtree's known upper-bound row count is
+/// below this threshold. Below it the dim is already small enough that the
+/// stock hash build is fast, and the `InSubquery → LeftSemi` decorrelation +
+/// planning cost outweighs the saved probe work.
+const MIN_DIM_ROWS_FOR_PROPAGATION: usize = 1_000;
+
+/// Skip propagation when the receiving fact subtree's known upper-bound row
+/// count is below this threshold. Below it there isn't enough probe
+/// cardinality for the filter to recoup the propagation overhead.
+const MIN_FACT_ROWS_FOR_PROPAGATION: usize = 100_000;
+
 /// Returns `true` if `plan` is a "dim-like" subtree — a small snowflake of
 /// dimensions composed of at most [`MAX_DIM_LIKE_TABLE_SCANS`] `TableScan`s
 /// connected through identity-preserving operators (`Projection`,
@@ -493,6 +525,66 @@ fn distinct_input(distinct: &datafusion::logical_expr::Distinct) -> &LogicalPlan
         Distinct::All(input) => input,
         Distinct::On(on) => &on.input,
     }
+}
+
+/// Sum of known upper-bound row counts of all `TableScan`s reachable from
+/// `plan`. Returns `None` if any reachable `TableScan` is missing stats — the
+/// caller falls back to the structural gates in that case.
+///
+/// The walk follows every `LogicalPlan` child (not just dim-like wrappers) so
+/// fact-side subtrees with joins, aggregates, etc. are summed too. The result
+/// is a loose *upper bound* — filter selectivity isn't accounted for — which
+/// is the right direction for the "skip if known small" gate (a true upper
+/// bound below the threshold guarantees the subtree is actually small).
+fn subtree_upper_bound_rows(plan: &LogicalPlan) -> Option<usize> {
+    use datafusion::common::stats::Precision;
+    use datafusion::datasource::DefaultTableSource;
+
+    let mut total: usize = 0;
+    let mut any_unknown = false;
+    let _ = plan.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            let rows = scan
+                .source
+                .as_any()
+                .downcast_ref::<DefaultTableSource>()
+                .and_then(|default| default.table_provider.statistics())
+                .and_then(|stats| match stats.num_rows {
+                    Precision::Exact(n) | Precision::Inexact(n) => Some(n),
+                    Precision::Absent => None,
+                });
+            match rows {
+                Some(n) => total = total.saturating_add(n),
+                None => {
+                    any_unknown = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    if any_unknown { None } else { Some(total) }
+}
+
+/// `true` when stats prove the dim side is below
+/// [`MIN_DIM_ROWS_FOR_PROPAGATION`] *or* the fact side is below
+/// [`MIN_FACT_ROWS_FOR_PROPAGATION`]. Missing stats on either side fall back
+/// to the structural gates: this function returns `false` (allow propagation),
+/// matching the rule's behavior before the cardinality gates were added.
+fn skip_propagation_by_cardinality(dim_side: &LogicalPlan, fact_side: &LogicalPlan) -> bool {
+    if matches!(
+        subtree_upper_bound_rows(dim_side),
+        Some(n) if n < MIN_DIM_ROWS_FOR_PROPAGATION
+    ) {
+        return true;
+    }
+    if matches!(
+        subtree_upper_bound_rows(fact_side),
+        Some(n) if n < MIN_FACT_ROWS_FOR_PROPAGATION
+    ) {
+        return true;
+    }
+    false
 }
 
 /// Returns `true` if `key` retains its scan-level domain through every
