@@ -66,7 +66,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let scale_factor = test_args.scale_factor.unwrap_or(1.0);
     let duration = Duration::from_secs(test_args.common.duration);
     let driver: Arc<dyn chbench_driver::ChBenchDriver> =
-        Arc::new(prepare_chbench_source(scale_factor, Some(duration)).await?);
+        Arc::new(prepare_chbench_source(scale_factor).await?);
 
     // 2. Start spiced.
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
@@ -111,11 +111,11 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let metrics_scraper = Some(MetricsScraper::spawn()?);
 
     // 3. Start the OLTP workload in the background.
-    let oltp_cancel = CancellationToken::new();
+    let oltp_stop = CancellationToken::new();
     let oltp_handle = {
-        let cancel = oltp_cancel.clone();
+        let stop = oltp_stop.clone();
         let driver = Arc::clone(&driver);
-        tokio::spawn(async move { driver.run(cancel).await })
+        tokio::spawn(async move { driver.run(stop).await })
     };
 
     // 3b. Start staleness probe alongside the OLTP workload.
@@ -124,7 +124,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let staleness_handle = staleness::spawn_staleness_probe(
         Arc::clone(&driver),
         staleness_spice_client,
-        oltp_cancel.clone(),
+        oltp_stop.clone(),
     );
 
     // 4. Run analytical queries through spiced concurrently with the OLTP load.
@@ -160,7 +160,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         super::process_spiced_metrics(metrics_scraper, test_args.common.metrics, &[]).await;
 
     // 6. Stop OLTP and collect results.
-    oltp_cancel.cancel();
+    oltp_stop.cancel();
     let oltp_result = oltp_handle.await;
     let staleness_result = staleness_handle.await;
 

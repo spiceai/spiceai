@@ -744,6 +744,7 @@ dependencies = [
  "arrow-cast",
  "arrow-json",
  "arrow-schema",
+ "criterion 0.7.0",
  "datafusion",
  "insta",
  "serde_json",
@@ -3436,6 +3437,7 @@ dependencies = [
  "test-log",
  "tokio",
  "tokio-rusqlite",
+ "tokio-stream",
  "tracing",
  "turso",
  "turso-shared",
@@ -15796,6 +15798,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "turso",
+ "turso-shared",
  "twox-hash",
  "url",
  "util",
@@ -17996,6 +17999,7 @@ dependencies = [
  "spice-cloud-client",
  "spicepod",
  "system-adapter-protocol",
+ "tempfile",
  "tokio",
  "tonic",
  "url",
@@ -18568,7 +18572,7 @@ dependencies = [
 [[package]]
 name = "system-adapter-protocol"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/spicebench.git?rev=6327983bc1a90123e0c754b79781b931c969831e#6327983bc1a90123e0c754b79781b931c969831e"
+source = "git+https://github.com/spiceai/spicebench.git?rev=0152edc7ba5a6c0fd471c0ef6ef074cce8b8f830#0152edc7ba5a6c0fd471c0ef6ef074cce8b8f830"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -18990,9 +18994,12 @@ dependencies = [
  "serde_json",
  "spiceai",
  "spicepod",
+ "system-adapter-protocol",
  "test-framework",
  "tokio",
  "tokio-util",
+ "url",
+ "uuid 1.21.0",
  "yaml",
 ]
 
