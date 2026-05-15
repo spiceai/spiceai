@@ -1136,19 +1136,16 @@ async fn test_multiple_concurrent_overwrites(backend: BackendType) -> TestResult
 }
 
 // ============================================================================
-// Concurrent catalog DB first-creation + immediate data writes + restart
+// Concurrent catalog DB first-creation + table lookup + restart
 // ============================================================================
 
-/// Test concurrent table creation (triggering catalog DB dir + file creation)
-/// followed immediately by data writes that exercise the staging WAL + compaction
-/// path, then "restart" by creating new providers from the same catalog.
-///
-/// This is a comprehensive regression for the catalog DB first-creation edge case
-/// under load (as referenced in the durability audit), combined with the now-hardened
-/// data durability contract (WAL, pre-recovery audit, compaction).
-test_with_backends_multithreaded!(test_concurrent_table_creation_writes_restart_impl);
+// Test concurrent table creation (triggering catalog DB dir + file creation)
+// followed immediately by catalog lookups, then "restart" by creating new
+// providers from the same catalog. This is a comprehensive regression for the
+// catalog DB first-creation edge case under load.
+test_with_backends_multithreaded!(test_concurrent_table_creation_lookup_restart_impl);
 
-async fn test_concurrent_table_creation_writes_restart_impl(
+async fn test_concurrent_table_creation_lookup_restart_impl(
     backend: BackendType,
 ) -> TestResult<()> {
     let temp_dir = TempDir::new()?;
@@ -1160,7 +1157,7 @@ async fn test_concurrent_table_creation_writes_restart_impl(
 
     // Two tasks will concurrently create their own CayenneCatalog (triggering
     // the catalog DB dir + file creation logic in init()) and then immediately
-    // create a table + do a write that goes through the hardened durability path.
+    // create and read back a table through the shared catalog.
     let barrier = Arc::new(Barrier::new(2));
 
     let task1 = {
@@ -1190,12 +1187,9 @@ async fn test_concurrent_table_creation_writes_restart_impl(
 
             let table_id = catalog.create_table(table_options).await?;
 
-            // Get the table and do a write (exercises staging WAL + compaction).
             let table = catalog.get_table("concurrent_t1").await?;
-            // For simplicity in this test, we just verify the table was created
-            // and the catalog is consistent after concurrent creation + write path.
-            // A full write would require a CayenneTableProvider, which is heavier.
-            Ok::<_, Box<dyn std::error::Error>>((table_id, "t1_ok"))
+            assert_eq!(table.table_name, "concurrent_t1");
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((table_id, "t1_ok"))
         })
     };
 
@@ -1227,7 +1221,8 @@ async fn test_concurrent_table_creation_writes_restart_impl(
             let table_id = catalog.create_table(table_options).await?;
 
             let table = catalog.get_table("concurrent_t2").await?;
-            Ok::<_, Box<dyn std::error::Error>>((table_id, "t2_ok"))
+            assert_eq!(table.table_name, "concurrent_t2");
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((table_id, "t2_ok"))
         })
     };
 
@@ -1250,11 +1245,11 @@ async fn test_concurrent_table_creation_writes_restart_impl(
 
     assert!(
         t1.is_ok(),
-        "table concurrent_t1 must survive restart after concurrent creation + write path"
+        "table concurrent_t1 must survive restart after concurrent creation + lookup path"
     );
     assert!(
         t2.is_ok(),
-        "table concurrent_t2 must survive restart after concurrent creation + write path"
+        "table concurrent_t2 must survive restart after concurrent creation + lookup path"
     );
 
     Ok(())
