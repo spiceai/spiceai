@@ -474,6 +474,8 @@ impl CayenneTableProvider {
 
         self.clear_staging_dir().await?;
 
+        self.staging_may_have_files().store(true, Ordering::Release);
+
         let (row_count, _writer_ops, _stats_acc) = self
             .write_to_snapshot(
                 prepared_insert.stream,
@@ -518,13 +520,13 @@ impl CayenneTableProvider {
         let staging_dir =
             Self::snapshot_dir_path(self.table_path(), self.table_id(), STAGING_DIR_NAME);
 
-        // Collect staged file names (exclude the WAL file itself).
+        // Collect staged data file names (exclude WAL bookkeeping files).
         let mut staged_files = Vec::new();
         let mut entries = tokio::fs::read_dir(&staging_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             if entry.file_type().await?.is_file() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name != STAGING_WAL_FILENAME {
+                if name != STAGING_WAL_FILENAME && name != STAGING_WAL_TMP_FILENAME {
                     staged_files.push(name);
                 }
             }
@@ -538,6 +540,7 @@ impl CayenneTableProvider {
         };
 
         let wal_path = staging_dir.join(STAGING_WAL_FILENAME);
+        let tmp_path = staging_dir.join(STAGING_WAL_TMP_FILENAME);
         // Compact serialization: this WAL is a machine-only marker written on
         // every staged append. Pretty-printing roughly doubles the byte size
         // and adds CPU time for whitespace formatting — both pure overhead on
@@ -558,20 +561,24 @@ impl CayenneTableProvider {
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&wal_path)
+            .open(&tmp_path)
             .await?;
         file.write_all(content.as_bytes()).await?;
         file.sync_all().await?;
+        drop(file);
+
+        if let Err(e) = tokio::fs::rename(&tmp_path, &wal_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(Error::IoError { source: e });
+        }
 
         // fsync the staging directory so that the directory entry for the newly
         // written WAL file (and any data files previously written to this staging
         // dir by `write_to_snapshot`) are durably persisted. This completes the
         // "prepare" phase durability: the staging WAL record that lists the files
         // to be moved is only considered durably written after its own directory
-        // entry is safe. Unlike `PartitionedWal`, this local WAL path writes the
-        // final file directly; the read path treats an unparseable WAL as absent,
-        // so a future tmp+rename hardening pass would need to preserve that
-        // fail-safe behavior.
+        // entry is safe. Because the final file is published by rename, the read
+        // path never observes a half-written WAL from this writer.
         Self::sync_snapshot_dir(&staging_dir).await?;
 
         tracing::debug!(
@@ -591,7 +598,7 @@ impl CayenneTableProvider {
             return Ok(());
         };
 
-        // List staged files (exclude the WAL file itself).
+        // List staged data files (exclude WAL bookkeeping objects).
         let objects: Vec<_> = config
             .store
             .list(Some(&staging_prefix))
@@ -611,7 +618,7 @@ impl CayenneTableProvider {
                     .as_ref()
                     .strip_prefix(staging_prefix.as_ref())
                     .unwrap_or(meta.location.as_ref());
-                if name == STAGING_WAL_FILENAME {
+                if name == STAGING_WAL_FILENAME || name == STAGING_WAL_TMP_FILENAME {
                     None
                 } else {
                     Some(name.to_string())
@@ -734,13 +741,23 @@ impl CayenneTableProvider {
     /// Returns [`Error::IncompleteWrite`] if a staging WAL file is found.
     pub(crate) async fn ensure_no_incomplete_write(&self) -> Result<()> {
         if !self.staging_wal_present().load(Ordering::Acquire) {
-            return Ok(());
+            if self.table_path().starts_with("s3://") {
+                return Ok(());
+            }
+            let staging_dir =
+                Self::snapshot_dir_path(self.table_path(), self.table_id(), STAGING_DIR_NAME);
+            let wal_path = staging_dir.join(STAGING_WAL_FILENAME);
+            match tokio::fs::try_exists(&wal_path).await {
+                Ok(true) => {}
+                Ok(false) => return Ok(()),
+                Err(e) => return Err(Error::IoError { source: e }),
+            }
         }
 
         let wal = if self.table_path().starts_with("s3://") {
-            self.read_staging_wal_s3().await
+            self.read_staging_wal_s3().await?
         } else {
-            self.read_staging_wal_local().await
+            self.read_staging_wal_local().await?
         };
 
         if let Some((wal, wal_location)) = wal {
@@ -972,63 +989,68 @@ impl CayenneTableProvider {
             }
         }
 
-        // WAL absent (or unparseable, treated as absent for liveness): correct
-        // the flag so future writes take the fast path (no S3 GET / FS read).
+        // WAL absent: correct the flag so future writes take the fast path (no
+        // S3 GET / FS read). Unparseable committed WALs are errors above; only
+        // uncommitted tmp WALs are ignored.
         self.staging_wal_present().store(false, Ordering::Release);
         Ok(())
     }
 
     /// Read the staging WAL from local filesystem, if present.
     /// Returns the WAL data and the absolute path to the WAL file.
-    async fn read_staging_wal_local(&self) -> Option<(StagingWal, String)> {
+    async fn read_staging_wal_local(&self) -> Result<Option<(StagingWal, String)>> {
         let staging_dir =
             Self::snapshot_dir_path(self.table_path(), self.table_id(), STAGING_DIR_NAME);
         let wal_path = staging_dir.join(STAGING_WAL_FILENAME);
         let location = wal_path.to_string_lossy().to_string();
         match tokio::fs::read_to_string(&wal_path).await {
             Ok(content) => match serde_json::from_str::<StagingWal>(&content) {
-                Ok(wal) => Some((wal, location)),
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to parse staging WAL for table {}: {e}",
-                        self.table_name(),
-                    );
-                    None
-                }
+                Ok(wal) => Ok(Some((wal, location))),
+                Err(e) => Err(Error::IncompleteWrite {
+                    table: self.table_name().to_string(),
+                    message: format!(
+                        "Found unreadable staging WAL at '{location}': {e}. Refusing writes to avoid ignoring a possibly committed staged append. Manual resolution is required."
+                    ),
+                }),
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to read staging WAL for table {}: {e}",
-                    self.table_name(),
-                );
-                None
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::IoError { source: e }),
         }
     }
 
     /// Read the staging WAL from S3, if present.
     /// Returns the WAL data and the S3 key of the WAL file.
-    async fn read_staging_wal_s3(&self) -> Option<(StagingWal, String)> {
-        let config = self.require_object_store().ok()?;
-        let staging_prefix = self.snapshot_object_store_prefix(STAGING_DIR_NAME).ok()??;
+    async fn read_staging_wal_s3(&self) -> Result<Option<(StagingWal, String)>> {
+        let config = self.require_object_store()?;
+        let Some(staging_prefix) = self.snapshot_object_store_prefix(STAGING_DIR_NAME)? else {
+            return Ok(None);
+        };
         let wal_key =
             ObjectStorePath::from(format!("{}{STAGING_WAL_FILENAME}", staging_prefix.as_ref()));
         let location = wal_key.to_string();
         match config.store.get(&wal_key).await {
             Ok(result) => {
-                let bytes = result.bytes().await.ok()?;
-                let wal = serde_json::from_slice::<StagingWal>(&bytes).ok()?;
-                Some((wal, location))
+                let bytes = result.bytes().await.map_err(|e| Error::ObjectStore {
+                    operation: "read staging WAL",
+                    table: self.table_name().to_string(),
+                    source: e,
+                })?;
+                let wal = serde_json::from_slice::<StagingWal>(&bytes).map_err(|e| {
+                    Error::IncompleteWrite {
+                        table: self.table_name().to_string(),
+                        message: format!(
+                            "Found unreadable staging WAL at '{location}': {e}. Refusing writes to avoid ignoring a possibly committed staged append. Manual resolution is required."
+                        ),
+                    }
+                })?;
+                Ok(Some((wal, location)))
             }
-            Err(object_store::Error::NotFound { .. }) => None,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to read staging WAL (S3) for table {}: {e}",
-                    self.table_name(),
-                );
-                None
-            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(Error::ObjectStore {
+                operation: "read staging WAL",
+                table: self.table_name().to_string(),
+                source: e,
+            }),
         }
     }
 }

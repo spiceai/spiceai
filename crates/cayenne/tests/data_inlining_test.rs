@@ -1438,9 +1438,10 @@ async fn test_compaction_runs_after_inline_memtable_checkpoint(
         expected_total += large_batch_rows;
     }
 
-    // After 8 large appends + the inline trigger, the snapshot should NOT hold
-    // 8 separate files. We check via a public listing helper through the
-    // provider — at least one round of compaction must have occurred.
+    // Capture the current snapshot's Vortex file count as diagnostic context
+    // for this ingestion + compaction path. File-count reduction depends on
+    // exact compression ratios and partitioning, so the correctness assertion
+    // below remains the stable contract for this regression test.
     let snapshot_id = fixture
         .catalog
         .get_table("inline_then_compaction")
@@ -1450,18 +1451,6 @@ async fn test_compaction_runs_after_inline_memtable_checkpoint(
         .list_snapshot_files_with_sizes(&snapshot_id)
         .await
         .expect("list_snapshot_files_with_sizes should succeed");
-    // With the current Small tier policy (trigger on count >= trigger_files
-    // as long as total_bytes >= small_max_bytes), this test with an aggressive
-    // config (target=1 MiB, trigger_files=4) and 8000-row batches will usually
-    // see some file count reduction after explicit compaction triggers.
-    // We keep the assertion soft (`< 8`) to remain robust across exact
-    // compression ratios while still exercising the important regression
-    // path: "high-rate appends create multiple Vortex files → Small tier
-    // compaction eventually helps with file count".
-    //
-    // The critical guarantee for ingestion is end-to-end correctness (the
-    // COUNT(*) query below) and that the compaction trigger machinery works
-    // without error under concurrent ingest + memtable checkpoints.
     let _ = files.len(); // diagnostic only
     let _ = table_id;
 

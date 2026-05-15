@@ -2928,26 +2928,11 @@ mod tests {
         assert_eq!(collect_numeric_from_max_df(&mem, "t").await, None);
     }
 
-    /// Regression test for ACID consistency edge case in append refresh dedup:
-    /// When the time_column is nullable and contains NULL values, the current
-    /// `except_existing_records_from` implementation (which only loads rows where
-    /// time > max_timestamp for the anti-join) will *not* include NULL-time rows
-    /// in the "existing" set. Consequently, an incoming row with NULL time that
-    /// exactly matches an already-accelerated NULL-time row will *not* be filtered
-    /// and will be appended again.
+    /// Regression test for append refresh dedup with nullable time columns.
     ///
-    /// This can cause duplicate rows (violating "exactly the data from source")
-    /// on repeated refresh or after partial failure recovery for datasets that
-    /// legitimately have NULLs in their time_column.
-    ///
-    /// The all-null max case is already tested above (correctly appends everything).
-    /// This test exercises the mixed case (max exists + NULL time rows in both
-    /// accelerator and update stream) and asserts the current behavior so that
-    /// when we enhance the logic to also collect `time IS NULL` rows for dedup
-    /// comparison, this test can be updated to expect proper deduplication.
-    ///
-    /// Part of recurring scheduled ACID correctness audit (play devil's advocate
-    /// on append mode assumptions for nullable columns).
+    /// Mixed batches with both non-NULL and NULL timestamps must include existing
+    /// NULL-time rows in the anti-join comparison, otherwise a duplicate NULL-time
+    /// source row can be appended on repeated refresh or partial-failure recovery.
     #[tokio::test]
     async fn test_except_existing_records_from_nullable_time_column_with_nulls() {
         // Schema with nullable timestamp (the append time_column) + id

@@ -141,7 +141,7 @@ pub(crate) struct CompactionCandidate<P> {
 /// 1. Bucket files into `Small` and `Mid` tiers (anything at/above
 ///    `mid_max_bytes` is settled).
 /// 2. For each tier in order Small → Mid:
-///    - if `count >= trigger_files` AND `total_bytes >= mid_max_bytes`,
+///    - if `count >= trigger_files` AND tier bytes reach that tier's threshold,
 ///      sort ascending by size, take the first `max_files_per_pick`, return
 ///      them as the candidate.
 /// 3. Otherwise return `None`.

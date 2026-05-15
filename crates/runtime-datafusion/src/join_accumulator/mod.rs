@@ -199,9 +199,8 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
             tracing::warn!(
                 total_memory_size,
                 max_inlist_memory_size = self.max_inlist_memory_size,
-                "ExactLeftAccumulator exceeded its local in-list memory limit and fell back to a range pre-filter. \
-                 For anti-join / LeftAnti / NOT IN / NOT EXISTS patterns this approximation can silently drop rows that should have survived the anti-condition (false negatives). \
-                 This is a known correctness trade-off under memory pressure. Consider increasing memory limits or reducing cardinality of the build side."
+                "ExactLeftAccumulator exceeded its local in-list memory limit and disabled dynamic filtering for this join. \
+                  Returning a no-op filter preserves query correctness under memory pressure. Consider increasing memory limits or reducing cardinality of the build side."
             );
             self.inlist_memory_reservation = None;
             self.range_bounds = self.range_bounds_from_collected_arrays(array.as_ref())?;
@@ -217,9 +216,8 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
                 current_shared_inlist_memory_bytes =
                     CURRENT_INLIST_MEMORY_BYTES.load(AtomicOrdering::Relaxed),
                 maximum_shared_inlist_memory_bytes = maximum_shared_inlist_memory_bytes(),
-                "ExactLeftAccumulator shared in-list memory budget is exhausted and fell back to a range pre-filter. \
-                 For anti-join / LeftAnti / NOT IN / NOT EXISTS patterns this approximation can silently drop rows that should have survived the anti-condition (false negatives). \
-                 This is a known correctness trade-off under memory pressure. Consider increasing memory limits or reducing cardinality of the build side."
+                "ExactLeftAccumulator shared in-list memory budget is exhausted and disabled dynamic filtering for this join. \
+                 Returning a no-op filter preserves query correctness under memory pressure. Consider increasing memory limits or reducing cardinality of the build side."
             );
             self.inlist_memory_reservation = None;
             self.range_bounds = self.range_bounds_from_collected_arrays(array.as_ref())?;
@@ -248,7 +246,7 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
             arrays,
             total_memory_size,
             range_bounds,
-            use_range_fallback: exact_values_exceeded_memory_limit,
+            exact_values_exceeded_memory_limit,
             _inlist_memory_reservation: inlist_memory_reservation,
         }))
     }
@@ -304,7 +302,7 @@ pub struct ExactColumnBounds {
     arrays: Vec<Arc<dyn Array>>,
     total_memory_size: usize,
     range_bounds: RangeBounds,
-    use_range_fallback: bool,
+    exact_values_exceeded_memory_limit: bool,
     _inlist_memory_reservation: Option<InListMemoryReservation>,
 }
 
@@ -312,38 +310,38 @@ impl ColumnBounds for ExactColumnBounds {
     /// Converts the collected arrays into an `InListExpr` for use in dynamic filtering.
     /// This builds an IN expression with all collected values.
     ///
-    /// Devil's advocate (ACID Consistency for anti-join / LeftAnti / Q21 patterns):
-    /// When `use_range_fallback` is true (memory limit hit), we produce a range
-    /// filter instead of an exact InList. For inner/semi joins this is a safe
-    /// over-filter (some rows may be unnecessarily excluded from the probe, but
-    /// the join result remains correct because the build side still filters).
+    /// If the exact in-list exceeds its memory budget, return a no-op filter.
+    /// A range approximation would be safe for some join shapes, but it is not
+    /// semantics-preserving for anti-join / `LeftAnti` / `NOT IN` / `NOT EXISTS`
+    /// patterns: probe rows outside the collected min/max range can be skipped
+    /// even though they should survive the anti-condition. Disabling pushdown in
+    /// that case preserves correctness and lets the join execute normally.
     ///
-    /// For LeftAnti (and similar "not exists" / "not in" patterns pushed to
-    /// Cayenne via ExactLeftAccumulator), the inclusive range pre-filter
-    /// (`col BETWEEN min AND max`) is an approximation. Probe rows outside the
-    /// min/max range that are not present in the exact collected set should
-    /// survive the anti-join, but the scanner can skip them, producing false
-    /// negatives (missing result rows). This is accepted as a performance
-    /// trade-off when memory is exhausted; the alternative would be to spill or
-    /// OOM.
-    ///
-    /// The CoalescePartitionsExec + iterative flatten wrapper detection added
+    /// The `CoalescePartitionsExec` + iterative flatten wrapper detection added
     /// in the optimizer ensures more plans (including those with partition
     /// coalescing between join and Cayenne scan) now correctly route through
-    /// ExactLeftAccumulator, increasing the importance of these edge cases
+    /// `ExactLeftAccumulator`, increasing the importance of these edge cases
     /// being well understood and tested.
     ///
     /// NULL handling: In the exact path, NULLs from the build side are collected
-    /// as ScalarValue::Null. An InList containing NULL never matches (SQL
+    /// as `ScalarValue::Null`. An `InList` containing NULL never matches (SQL
     /// three-valued logic), which is the correct "not in" behavior for anti-joins.
-    /// The range fallback may treat NULLs differently depending on RangeBounds
-    /// implementation.
     fn physical_expr(
         &self,
         left_expr: Arc<dyn PhysicalExpr>,
     ) -> DataFusionResult<Arc<dyn PhysicalExpr>> {
-        if self.use_range_fallback {
-            return Ok(self.range_bounds.physical_expr(left_expr));
+        if self.exact_values_exceeded_memory_limit {
+            tracing::warn!(
+                range_interval_count = self.range_bounds.intervals.len(),
+                "ExactLeftAccumulator exact values exceeded memory limit; returning no-op dynamic filter to preserve correctness."
+            );
+            if tracing::enabled!(tracing::Level::TRACE) {
+                let _approximate_filter = self.range_bounds.physical_expr(Arc::clone(&left_expr));
+                tracing::trace!(
+                    "ExactLeftAccumulator built approximate range filter for diagnostics but did not apply it."
+                );
+            }
+            return Ok(literal_true());
         }
 
         let unique_values = self
@@ -1333,7 +1331,7 @@ mod tests {
 
     #[test]
     fn test_exact_left_accumulator_exceeds_memory() {
-        // Test that when accumulated arrays exceed the in-list memory limit, we fallback to a range filter.
+        // Test that when accumulated arrays exceed the in-list memory limit, we disable pushdown.
         let batch = create_uint64_batch(vec![1, 3, 5]);
 
         let left_expr = col("a", &batch.schema()).expect("Should create column expr");
@@ -1352,27 +1350,14 @@ mod tests {
             .physical_expr(left_expr)
             .expect("Should create physical expr");
 
-        // Validate the expression is a range filter from 1 through 5, not a no-op filter.
-        assert!(physical_expr.as_any().downcast_ref::<Literal>().is_none());
-
-        let probe_schema = Schema::new(vec![Field::new("a", DataType::UInt64, false)]);
-        let probe_array: ArrayRef = Arc::new(UInt64Array::from(vec![0, 1, 3, 5, 6]));
-        let probe_batch = RecordBatch::try_new(Arc::new(probe_schema), vec![probe_array])
-            .expect("Should create probe record batch");
-        let actual_values = evaluate_boolean_expression(&physical_expr, &probe_batch);
-
-        assert_eq!(
-            vec![Some(false), Some(true), Some(true), Some(true), Some(false)],
-            actual_values
-        );
+        assert_literal_true(&physical_expr);
     }
 
     #[test]
     fn test_exact_left_accumulator_memory_fallback_with_nulls_and_mixed_values() {
         // Edge case: memory limit exceeded while accumulating a column that contains NULLs.
-        // The range fallback must still produce a valid (conservative) range filter.
-        // For anti-join / LeftAnti usage this is important: the range must not
-        // cause incorrect dropping of probe rows that should survive the anti-condition.
+        // The dynamic filter must become a no-op so anti-join / LeftAnti usage
+        // cannot drop probe rows that should survive the anti-condition.
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
         let values: Vec<Option<i32>> = vec![Some(5), None, Some(10), Some(15), None, Some(20)];
         let array: ArrayRef = Arc::new(Int32Array::from(values));
@@ -1397,26 +1382,7 @@ mod tests {
             .physical_expr(left_expr)
             .expect("Should create physical expr");
 
-        // Must not be a no-op literal (would be incorrect for anti-join semantics).
-        assert!(
-            physical_expr.as_any().downcast_ref::<Literal>().is_none(),
-            "Range fallback must produce a real range filter, not a literal no-op"
-        );
-
-        // The range should be derived from the non-null min/max present in the data.
-        // (Exact bounds depend on RangeBounds implementation; we only assert it is a
-        // non-trivial filter.)
-        let probe_schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
-        let probe_values: Vec<Option<i32>> = vec![Some(0), Some(12), None, Some(25), Some(30)];
-        let probe_array: ArrayRef = Arc::new(Int32Array::from(probe_values));
-        let probe_batch = RecordBatch::try_new(Arc::new(probe_schema), vec![probe_array])
-            .expect("Should create probe batch");
-
-        let filtered = evaluate_boolean_expression(&physical_expr, &probe_batch);
-        // We do not assert exact boolean results here (depends on the concrete
-        // range expression), but we do assert that the filter was evaluable
-        // without error and produced a boolean array of the expected length.
-        assert_eq!(filtered.len(), 5);
+        assert_literal_true(&physical_expr);
     }
 
     #[test]
@@ -1447,17 +1413,11 @@ mod tests {
             .physical_expr(left_expr)
             .expect("Should create physical expr");
 
-        let probe_batch = create_uint64_batch(vec![0, 1, 15, 30, 31]);
-        let actual_values = evaluate_boolean_expression(&physical_expr, &probe_batch);
-
-        assert_eq!(
-            vec![Some(false), Some(true), Some(true), Some(true), Some(false)],
-            actual_values
-        );
+        assert_literal_true(&physical_expr);
     }
 
     #[test]
-    fn test_exact_left_accumulator_range_fallback_updates_after_limit_exceeded() {
+    fn test_exact_left_accumulator_noop_after_limit_exceeded() {
         let first_batch = create_uint64_batch(vec![10, 20]);
         let second_batch = create_uint64_batch(vec![1, 30]);
 
@@ -1479,17 +1439,11 @@ mod tests {
             .physical_expr(left_expr)
             .expect("Should create physical expr");
 
-        let probe_batch = create_uint64_batch(vec![0, 1, 15, 30, 31]);
-        let actual_values = evaluate_boolean_expression(&physical_expr, &probe_batch);
-
-        assert_eq!(
-            vec![Some(false), Some(true), Some(true), Some(true), Some(false)],
-            actual_values
-        );
+        assert_literal_true(&physical_expr);
     }
 
     #[test]
-    fn test_exact_left_accumulator_range_fallback_keeps_disjoint_intervals() {
+    fn test_exact_left_accumulator_tracks_disjoint_intervals_but_returns_noop() {
         let first_batch = create_uint64_batch(vec![10, 20]);
         let second_batch = create_uint64_batch(vec![100, 110]);
         let max_memory_size = first_batch.column(0).get_array_memory_size();
@@ -1512,10 +1466,7 @@ mod tests {
             .physical_expr(left_expr)
             .expect("Should create physical expr");
 
-        let probe_batch = create_uint64_batch(vec![15, 50, 105]);
-        let actual_values = evaluate_boolean_expression(&physical_expr, &probe_batch);
-
-        assert_eq!(vec![Some(true), Some(false), Some(true)], actual_values);
+        assert_literal_true(&physical_expr);
     }
 
     #[test]
@@ -1642,7 +1593,7 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_left_accumulator_range_fallback_ignores_nulls() {
+    fn test_exact_left_accumulator_memory_noop_with_nulls() {
         let batch = create_nullable_uint64_batch(vec![Some(1), None, Some(3)]);
 
         let left_expr = col("a", &batch.schema()).expect("Should create column expr");
@@ -1659,17 +1610,11 @@ mod tests {
             .physical_expr(Arc::clone(&left_expr))
             .expect("Should create physical expr");
 
-        let probe_batch = create_uint64_batch(vec![0, 1, 2, 3, 4]);
-        let actual_values = evaluate_boolean_expression(&physical_expr, &probe_batch);
-
-        assert_eq!(
-            vec![Some(false), Some(true), Some(true), Some(true), Some(false)],
-            actual_values
-        );
+        assert_literal_true(&physical_expr);
     }
 
     #[test]
-    fn test_exact_left_accumulator_range_fallback_with_only_nulls_returns_noop() {
+    fn test_exact_left_accumulator_memory_noop_with_only_nulls() {
         let batch = create_nullable_uint64_batch(vec![None, None]);
 
         let left_expr = col("a", &batch.schema()).expect("Should create column expr");
@@ -1689,7 +1634,7 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_left_accumulator_range_fallback_with_unsupported_type_returns_noop() {
+    fn test_exact_left_accumulator_memory_noop_with_unsupported_type() {
         let schema = Schema::new(vec![Field::new("a", DataType::Boolean, false)]);
         let a: ArrayRef = Arc::new(BooleanArray::from(vec![true, false]));
         let batch =
@@ -1712,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_left_accumulator_range_fallback_with_nan_returns_noop() {
+    fn test_exact_left_accumulator_memory_noop_with_nan() {
         let schema = Schema::new(vec![Field::new("a", DataType::Float64, false)]);
         let a: ArrayRef = Arc::new(Float64Array::from(vec![1.0, f64::NAN, 3.0]));
         let batch =
@@ -1735,7 +1680,7 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_left_accumulator_range_fallback_with_strings() {
+    fn test_exact_left_accumulator_memory_noop_with_strings() {
         let schema = Schema::new(vec![Field::new("a", DataType::Utf8, false)]);
         let a: ArrayRef = Arc::new(StringArray::from(vec!["delta", "bravo", "charlie"]));
         let batch =
@@ -1754,18 +1699,7 @@ mod tests {
             .physical_expr(left_expr)
             .expect("Should create physical expr");
 
-        let probe_schema = Schema::new(vec![Field::new("a", DataType::Utf8, false)]);
-        let probe_array: ArrayRef = Arc::new(StringArray::from(vec![
-            "alpha", "bravo", "charlie", "delta", "zulu",
-        ]));
-        let probe_batch = RecordBatch::try_new(Arc::new(probe_schema), vec![probe_array])
-            .expect("Should create probe record batch");
-        let actual_values = evaluate_boolean_expression(&physical_expr, &probe_batch);
-
-        assert_eq!(
-            vec![Some(false), Some(true), Some(true), Some(true), Some(false)],
-            actual_values
-        );
+        assert_literal_true(&physical_expr);
     }
 
     #[test]

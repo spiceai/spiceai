@@ -208,6 +208,43 @@ fn write_deletion_file_still_fsyncs_parent_dir() {
     );
 }
 
+#[test]
+fn write_staging_wal_local_uses_single_open_write_fsync() {
+    let body = extract_fn_body(STAGING_WAL_SRC, "write_staging_wal_local")
+        .expect("write_staging_wal_local function not found in staging_wal.rs");
+
+    // After the durability hardening sweep, the local staging WAL write path
+    // was updated to a single open + write + fsync pattern (no redundant
+    // reopen of the file just to call sync_all a second time). This removes
+    // a per-write fsync + open cost on every staged append (ingestion).
+    //
+    // We assert the presence of a proper write path and that there is at most
+    // one file-level sync_all (directory syncs are allowed and distinct).
+    assert!(
+        body.contains("tokio::fs::File::create") || body.contains("OpenOptions"),
+        "write_staging_wal_local must open the WAL file for writing"
+    );
+
+    let file_sync_count = body
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            line.contains(".sync_all()")
+                && !line.contains("dir.sync_all()")
+                && !line.contains("staging_dir")
+                && !line.contains("parent")
+        })
+        .count();
+
+    assert!(
+        file_sync_count <= 1,
+        "write_staging_wal_local must perform at most one file-level sync_all \
+         after writing the WAL content (efficient single open+write+fsync). \
+         Found {file_sync_count} file syncs. A redundant reopen+fsync was \
+         previously present on the hot ingestion path and has been removed."
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Devil's Advocate / "Be really sure" analysis (for the recurring /loop task)
 // -----------------------------------------------------------------------------

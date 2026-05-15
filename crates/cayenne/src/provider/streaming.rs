@@ -26,8 +26,8 @@ use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::PlanProperties;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType, Partitioning};
-use futures::stream::unfold;
 use futures::StreamExt;
+use futures::stream::unfold;
 use parking_lot::Mutex;
 use std::any::Any;
 use std::sync::Arc;
@@ -131,9 +131,7 @@ impl ExecutionPlan for StreamingExec {
         })?;
 
         let inner_stream = guard.take().ok_or_else(|| {
-            datafusion_common::DataFusionError::Execution(
-                "Stream already consumed".to_string(),
-            )
+            datafusion_common::DataFusionError::Execution("Stream already consumed".to_string())
         })?;
 
         // Forward using `futures::stream::unfold`. The inner

@@ -589,17 +589,15 @@ mod tests {
         let parsed: PartitionedWal = serde_json::from_slice(&bytes).expect("parse final key");
         assert_eq!(parsed.commit_id, wal.commit_id);
 
-        // The tmp key for the same commit_id must not be visible as the final key
-        // (best-effort cleanup should have removed it, or at least the final key
-        // is the only one that matters for readers).
+        // The tmp key for the same commit_id must be cleaned up after the final
+        // key is published, so readers only ever see the committed WAL object.
         let tmp_key = base
             .child(PARTITIONED_WAL_DIR)
             .child(format!("{}.json.tmp", wal.commit_id));
-        // We only assert that the final key is the authoritative one; the tmp
-        // may or may not be cleaned up depending on the exact put/delete order,
-        // but the important invariant (reader sees complete document or nothing)
-        // is upheld by the final key.
-        let _ = store.get(&tmp_key).await;
+        assert!(matches!(
+            store.get(&tmp_key).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
         assert!(store.get(&final_key).await.is_ok());
     }
 }

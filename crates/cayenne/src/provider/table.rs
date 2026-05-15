@@ -1152,10 +1152,6 @@ impl CayenneTableProvider {
         &self.staging_may_have_files
     }
 
-    pub(crate) fn new_files_since_last_compaction(&self) -> &AtomicUsize {
-        &self.new_files_since_last_compaction
-    }
-
     #[must_use]
     pub(crate) fn target_file_size_bytes(&self) -> usize {
         self.context.target_file_size_bytes()
@@ -1585,7 +1581,23 @@ impl CayenneTableProvider {
         // removes a significant per-write cost for the common small-append
         // (inline) ingestion path, especially on S3.
         if !self.staging_may_have_files().load(Ordering::Acquire) {
-            return Ok(());
+            if self.table_metadata.path.starts_with("s3://") {
+                return Ok(());
+            }
+
+            let staging_dir = Self::snapshot_dir_path(
+                &self.table_metadata.path,
+                &self.table_metadata.table_id,
+                STAGING_DIR_NAME,
+            );
+            let mut entries = match tokio::fs::read_dir(&staging_dir).await {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            if entries.next_entry().await?.is_none() {
+                return Ok(());
+            }
         }
 
         if self.table_metadata.path.starts_with("s3://") {
@@ -4037,9 +4049,7 @@ impl CayenneTableProvider {
         // (S3 LIST or local readdir of potentially thousands of files) on
         // every post-write trigger.
         let cfg = self.context.compaction_picker_config();
-        if self.new_files_since_last_compaction.load(Ordering::Relaxed)
-            < cfg.trigger_files
-        {
+        if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files {
             return Ok(false);
         }
 
@@ -4561,7 +4571,8 @@ impl CayenneTableProvider {
         // Any snapshot rewrite (compaction, sort, etc.) means the "new files
         // since last compaction" counter should be reset. The next accumulation
         // phase starts from a clean slate.
-        self.new_files_since_last_compaction.store(0, Ordering::Relaxed);
+        self.new_files_since_last_compaction
+            .store(0, Ordering::Relaxed);
         tracing::debug!(
             "Updated current snapshot ID for table {} to {}",
             self.table_metadata.table_name,
