@@ -2963,9 +2963,10 @@ mod tests {
         ) as Arc<dyn TableProvider>;
 
         // Mirror the construction from the "column subset" test in this module for compatibility.
-        let federated = Arc::new(
+        let federated_table = Arc::new(
             MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("federated mem table"),
         ) as Arc<dyn TableProvider>;
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&federated_table)));
 
         let task = RefreshTaskBuilder::new(
             crate::status::RuntimeStatus::new(),
