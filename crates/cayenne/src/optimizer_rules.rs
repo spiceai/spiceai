@@ -299,7 +299,7 @@ fn filter_additions_for_join(
             if filter.columns().is_subset(&shared_columns) {
                 push_filter_addition(
                     &mut right_additions,
-                    right_scan.identity.clone(),
+                    Arc::clone(&right_scan.identity),
                     Arc::clone(filter.filter()),
                 );
             }
@@ -309,7 +309,7 @@ fn filter_additions_for_join(
             if filter.columns().is_subset(&shared_columns) {
                 push_filter_addition(
                     &mut left_additions,
-                    left_scan.identity.clone(),
+                    Arc::clone(&left_scan.identity),
                     Arc::clone(filter.filter()),
                 );
             }
