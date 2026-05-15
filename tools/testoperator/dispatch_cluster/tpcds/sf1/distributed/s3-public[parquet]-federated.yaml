@@ -1,11 +1,12 @@
 tests:
   bench:
-    # Disabled because the distributed ClickBench v1-queries/Ballista benchmark takes >8 hours.
+    # Disabled because the distributed TPC-DS v1-queries/Ballista benchmark takes >6 hours.
     enabled: false
     spicepod_path: federated/s3-public[parquet].yaml
-    query_set: clickbench
+    query_set: tpcds
     query_transport: v1-queries
     shuffle_location: s3://spiceai-testing-cluster-state/testoperator-cluster-bench-shuffle/{github_run_id}/{github_run_attempt}
     ephemeral_storage_limit: 1Gi
     runner_type: spiceai-dev-runners
     validate_results: false
+    ready_wait: 900

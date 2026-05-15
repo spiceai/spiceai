@@ -1,7 +1,11 @@
 tests:
   bench:
+    # Disabled because the distributed TPC-H v1-queries/Ballista benchmark is taking too long.
+    enabled: false
     spicepod_path: federated/s3-public[parquet].yaml
     query_set: tpch
     query_transport: v1-queries
+    shuffle_location: s3://spiceai-testing-cluster-state/testoperator-cluster-bench-shuffle/{github_run_id}/{github_run_attempt}
+    ephemeral_storage_limit: 1Gi
     runner_type: spiceai-dev-runners
     validate_results: false

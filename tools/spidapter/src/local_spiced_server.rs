@@ -29,8 +29,11 @@ fn to_stdio_args(args: &LocalSpicedArgs) -> StdioArgs {
         ready_wait: args.ready_wait,
         aws_region: args.aws_region.clone(),
         cayenne_data_dir: args.cayenne_data_dir.clone(),
+        cayenne_file_path: None,
         cayenne_metadata_dir: args.cayenne_metadata_dir.clone(),
         scheduler_state_location: args.scheduler_state_location.clone(),
+        shuffle_location: None,
+        query_temp_directory: None,
         query_memory_limit: args.query_memory_limit.clone(),
         // SCP-only fields — unused in local mode
         spice_cloud_api_url: String::new(),

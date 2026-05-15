@@ -1,5 +1,5 @@
 name: cluster benchmark e2e tests
-run-name: cluster-bench - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
+run-name: cluster-bench - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }} - ${{ github.event.inputs.dispatch_id || github.run_id }}
 
 # Cluster-mode counterpart to `testoperator_run_bench.yml`. Instead of spawning a
 # local `spiced` process, testoperator drives the benchmark against a SUT
@@ -10,6 +10,11 @@ run-name: cluster-bench - ${{ github.event.inputs.query_set }} - ${{ github.even
 on:
   workflow_dispatch:
     inputs:
+      dispatch_id:
+        description: 'Optional unique ID from a parent dispatcher, used only to identify this run.'
+        required: false
+        default: ''
+        type: string
       spicepod_path:
         description: 'The spicepod file to test with (relative to test/spicepods/{query_set}/sf{scale_factor}/)'
         required: true
@@ -58,10 +63,47 @@ on:
           Custom runtime container image tag from `ghcr.io/spiceai/spiceai-dev`
           (e.g. `trunk-20260514.1055`, produced by the `spiced_docker_dev`
           workflow). When set, overrides `channel` so the bench runs against a
-          specific spiced build instead of the published channel image — match
-          how `testoperator_run_bench.yml` benchmarks a specific spiced commit.
-          Until the cluster-bench dispatch wires this in automatically, build
-          the image manually first and pass the tag here.
+          specific spiced build instead of the published channel image. The
+          cluster dispatch workflow sets this automatically after building the
+          commit-pinned image; set it manually only when running this workflow
+          directly against a pre-built image.
+        required: false
+        default: ''
+        type: string
+      shuffle_location:
+        description: |
+          Ballista shuffle location passed to spidapter as SPIDAPTER_SHUFFLE_LOCATION.
+          Supports `{github_run_id}` and `{github_run_attempt}` placeholders.
+        required: false
+        default: ''
+        type: string
+      query_temp_directory:
+        description: 'runtime.query.temp_directory passed to spidapter (for spill/local work files)'
+        required: false
+        default: ''
+        type: string
+      app_storage_size_gb:
+        description: 'PVC size in GiB for the scheduler pod (/data)'
+        required: false
+        default: ''
+        type: string
+      executor_storage_size_gb:
+        description: 'PVC size in GiB for executor pods (/data)'
+        required: false
+        default: ''
+        type: string
+      ephemeral_storage_limit:
+        description: 'Pod ephemeral-storage limit passed to spidapter (e.g. 20Gi)'
+        required: false
+        default: ''
+        type: string
+      cayenne_file_path:
+        description: 'Cayenne file accelerator base path passed to spidapter (e.g. /data/cayenne)'
+        required: false
+        default: ''
+        type: string
+      cayenne_metadata_dir:
+        description: 'Cayenne metadata directory passed to spidapter (e.g. /data/cayenne/metadata)'
         required: false
         default: ''
         type: string
@@ -112,10 +154,9 @@ permissions:
   packages: read
   pull-requests: write
 
-# Centralized defaults so push-triggered runs (where github.event.inputs.* is
-# empty) and workflow_dispatch runs share the same fallback chain. Configured
-# for a Ballista distributed-query smoke test against the public-S3 TPC-H
-# spicepod by default.
+# Centralized defaults so workflow_dispatch runs have one fallback chain.
+# Defaults exercise the public-S3 TPC-H Cayenne distributed-acceleration
+# Flight SQL path.
 env:
   CB_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path || 'distributed/s3-public[parquet]-cayenne[file].yaml' }}
   CB_QUERY_SET: ${{ github.event.inputs.query_set || 'tpch' }}
@@ -124,6 +165,13 @@ env:
   CB_EXECUTOR_REPLICAS: ${{ github.event.inputs.executor_replicas || '3' }}
   CB_CHANNEL: ${{ github.event.inputs.channel || 'nightly' }}
   CB_CUSTOM_IMAGE_TAG: ${{ github.event.inputs.custom_image_tag || '' }}
+  CB_SHUFFLE_LOCATION: ${{ github.event.inputs.shuffle_location || '' }}
+  CB_QUERY_TEMP_DIRECTORY: ${{ github.event.inputs.query_temp_directory || '' }}
+  CB_APP_STORAGE_SIZE_GB: ${{ github.event.inputs.app_storage_size_gb || '' }}
+  CB_EXECUTOR_STORAGE_SIZE_GB: ${{ github.event.inputs.executor_storage_size_gb || '' }}
+  CB_EPHEMERAL_STORAGE_LIMIT: ${{ github.event.inputs.ephemeral_storage_limit || '' }}
+  CB_CAYENNE_FILE_PATH: ${{ github.event.inputs.cayenne_file_path || '' }}
+  CB_CAYENNE_METADATA_DIR: ${{ github.event.inputs.cayenne_metadata_dir || '' }}
   CB_SCALE_FACTOR: ${{ github.event.inputs.scale_factor || '1' }}
   CB_VALIDATE_RESULTS: ${{ github.event.inputs.validate_results || 'true' }}
   CB_UPDATE_SNAPSHOTS: ${{ github.event.inputs.update_snapshots || 'default' }}
@@ -231,11 +279,20 @@ jobs:
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+          AWS_REGION: us-east-1
+          AWS_DEFAULT_REGION: us-east-1
           SCHEDULER_STATE_LOCATION: 's3://spiceai-testing-cluster-state/testoperator-cluster-bench-${{ github.run_id }}/'
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           EXECUTOR_REPLICAS: ${{ env.CB_EXECUTOR_REPLICAS }}
           CHANNEL: ${{ env.CB_CHANNEL }}
           CUSTOM_IMAGE_TAG: ${{ env.CB_CUSTOM_IMAGE_TAG }}
+          SHUFFLE_LOCATION: ${{ env.CB_SHUFFLE_LOCATION }}
+          QUERY_TEMP_DIRECTORY: ${{ env.CB_QUERY_TEMP_DIRECTORY }}
+          APP_STORAGE_SIZE_GB: ${{ env.CB_APP_STORAGE_SIZE_GB }}
+          EXECUTOR_STORAGE_SIZE_GB: ${{ env.CB_EXECUTOR_STORAGE_SIZE_GB }}
+          EPHEMERAL_STORAGE_LIMIT: ${{ env.CB_EPHEMERAL_STORAGE_LIMIT }}
+          CAYENNE_FILE_PATH: ${{ env.CB_CAYENNE_FILE_PATH }}
+          CAYENNE_METADATA_DIR: ${{ env.CB_CAYENNE_METADATA_DIR }}
           QUERY_SET: ${{ env.CB_QUERY_SET }}
           QUERY_TRANSPORT: ${{ env.CB_QUERY_TRANSPORT }}
           SCALE_FACTOR: ${{ env.CB_SCALE_FACTOR }}
@@ -267,6 +324,32 @@ jobs:
           # env vars, which testoperator's child process inherits from this step's
           # env block.
           export SPIDAPTER_EXECUTOR_REPLICAS="${EXECUTOR_REPLICAS}"
+
+          resolve_spidapter_template() {
+            local value="$1"
+            value="${value//\{github_run_id\}/${GITHUB_RUN_ID}}"
+            value="${value//\{github_run_attempt\}/${GITHUB_RUN_ATTEMPT}}"
+            echo "${value}"
+          }
+
+          export_spidapter_env_if_set() {
+            local env_name="$1"
+            local raw_value="$2"
+            if [ -n "${raw_value}" ]; then
+              local resolved_value
+              resolved_value="$(resolve_spidapter_template "${raw_value}")"
+              export "${env_name}=${resolved_value}"
+              echo "${env_name}=${resolved_value}"
+            fi
+          }
+
+          export_spidapter_env_if_set SPIDAPTER_SHUFFLE_LOCATION "${SHUFFLE_LOCATION}"
+          export_spidapter_env_if_set SPIDAPTER_QUERY_TEMP_DIRECTORY "${QUERY_TEMP_DIRECTORY}"
+          export_spidapter_env_if_set SPIDAPTER_APP_STORAGE_SIZE_GB "${APP_STORAGE_SIZE_GB}"
+          export_spidapter_env_if_set SPIDAPTER_EXECUTOR_STORAGE_SIZE_GB "${EXECUTOR_STORAGE_SIZE_GB}"
+          export_spidapter_env_if_set SPIDAPTER_EPHEMERAL_STORAGE_LIMIT_GB "${EPHEMERAL_STORAGE_LIMIT}"
+          export_spidapter_env_if_set SPIDAPTER_CAYENNE_FILE_PATH "${CAYENNE_FILE_PATH}"
+          export_spidapter_env_if_set SPIDAPTER_CAYENNE_METADATA_DIR "${CAYENNE_METADATA_DIR}"
 
           # When a custom image tag is provided (e.g. a `trunk-<sha>` image
           # freshly published by `spiced_docker_dev`), pin spidapter to that
@@ -487,4 +570,3 @@ jobs:
             --base "${{ github.ref_name }}" \
             --head "${BRANCH_NAME}" \
             --label area/ci
-          gh pr merge --squash --auto "${BRANCH_NAME}" || true
