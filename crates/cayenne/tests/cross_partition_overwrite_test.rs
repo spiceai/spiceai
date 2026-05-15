@@ -28,22 +28,24 @@ You may obtain a copy of the License at
 //! All local-FS directory creation points that are part of the write +
 //! crash-recovery infrastructure now perform the required parent-directory
 //! sync after `create_dir_all` (snapshot directories via
-//! `ensure_snapshot_dir_exists`, the _partitioned_wal/ coordination
-//! directory via the helper in `PartitionedWal::write_to`, and
-//! `deletions/` subdirectories under snapshots via DeletionVectorWriter).
+//! `ensure_snapshot_dir_exists` (including initial table creation before
+//! metastore INSERT), the _partitioned_wal/ coordination directory via the
+//! helper in `PartitionedWal::write_to`, `deletions/` subdirectories under
+//! snapshots via DeletionVectorWriter, and partition value subdirectories
+//! via CayennePartitionCreator before `add_partition`).
 //! Combined with the per-partition staging WAL, deletion vector file
 //! sync_all, and directory syncs in the delete sinks, a successful
 //! cross-partition operation (append or overwrite, including any
-//! concurrent or pending deletions) leaves a fully durable set of
-//! coordination records and data files on local FS.
+//! concurrent or pending deletions or new partitions) leaves a fully
+//! durable set of coordination records and data files on local FS.
 //! The existing fault-injection and restart tests in this file, together
 //! with the per-partition durability tests (deletion vector restart,
-//! staged-append restart, acid_compliance, data_inlining), provide
-//! comprehensive regression coverage for this property, including the
-//! edge cases of the very first cross-partition write on a brand-new
-//! table (first creation of the _partitioned_wal/ directory) and the
-//! first deletion vector written to a snapshot (first creation of its
-//! deletions/ subdirectory).
+//! staged-append restart, acid_compliance, data_inlining, catalog
+//! concurrency with partitions), provide comprehensive regression coverage
+//! for this property, including the edge cases of the very first
+//! cross-partition write on a brand-new table (first creation of the
+//! _partitioned_wal/ directory), the first deletion vector written to a
+//! snapshot, and the first discovery of a new partition value.
 
 #![expect(
     clippy::expect_used,
