@@ -54,6 +54,7 @@ use std::path::{Path, PathBuf};
 
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectStorePath;
+use tokio::io::AsyncWriteExt;
 
 use super::Result;
 use crate::provider::Error;
@@ -200,8 +201,20 @@ impl PartitionedWal {
         })?;
 
         // Step 1: write to tmp file + fsync.
-        tokio::fs::write(&tmp_path, content.as_bytes()).await?;
-        let tmp_file = tokio::fs::File::open(&tmp_path).await?;
+        //
+        // Single open + write + fsync. The previous revision called
+        // `tokio::fs::write` (open + write + drop fd) and then re-opened the
+        // file to call `sync_all`, paying an extra `open(2)` per WAL write.
+        // Using `OpenOptions` + `AsyncWriteExt::write_all` keeps the fd open
+        // through the fsync, which is one fewer syscall per cross-partition
+        // commit on the local-FS hot path.
+        let mut tmp_file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .await?;
+        tmp_file.write_all(content.as_bytes()).await?;
         tmp_file.sync_all().await?;
         drop(tmp_file);
 

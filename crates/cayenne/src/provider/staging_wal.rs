@@ -64,6 +64,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectStorePath;
 use std::sync::atomic::Ordering;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::OwnedMutexGuard;
 
 /// Coordinates staged writes and the staging WAL lifecycle for a Cayenne table.
@@ -546,10 +547,20 @@ impl CayenneTableProvider {
             table: self.table_name().to_string(),
             message: format!("Failed to serialize staging WAL: {e}"),
         })?;
-        tokio::fs::write(&wal_path, content.as_bytes()).await?;
 
-        // fsync the WAL file content.
-        let file = tokio::fs::File::open(&wal_path).await?;
+        // Single open + write + fsync, keeping the fd through to `sync_all`.
+        // The previous revision called `tokio::fs::write` (which opens,
+        // writes, drops the fd) and then re-opened the file to call
+        // `sync_all` — paying an extra `open(2)` per WAL write on every
+        // staged append. Replacing the two opens with one is a small but
+        // real per-ingestion saving on the local-FS hot path.
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&wal_path)
+            .await?;
+        file.write_all(content.as_bytes()).await?;
         file.sync_all().await?;
 
         // fsync the staging directory so that the directory entry for the newly
