@@ -1363,6 +1363,58 @@ mod tests {
     }
 
     #[test]
+    fn test_exact_left_accumulator_memory_fallback_with_nulls_and_mixed_values() {
+        // Edge case: memory limit exceeded while accumulating a column that contains NULLs.
+        // The range fallback must still produce a valid (conservative) range filter.
+        // For anti-join / LeftAnti usage this is important: the range must not
+        // cause incorrect dropping of probe rows that should survive the anti-condition.
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let values: Vec<Option<i32>> = vec![Some(5), None, Some(10), Some(15), None, Some(20)];
+        let array: ArrayRef = Arc::new(Int32Array::from(values));
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![array])
+            .expect("Should create batch with NULLs");
+
+        let left_expr = col("a", &batch.schema()).expect("Should create column expr");
+
+        // Extremely small memory limit to force immediate fallback.
+        let mut accumulator =
+            ExactLeftAccumulator::new_with_memory_limit(Arc::clone(&left_expr), 1);
+
+        accumulator
+            .update_batch(&batch)
+            .expect("Should update batch with NULLs and values");
+
+        assert!(accumulator.exact_values_exceeded_memory_limit);
+        assert!(accumulator.arrays.is_empty());
+
+        let column_bounds = accumulator.evaluate().expect("Should evaluate bounds");
+        let physical_expr = column_bounds
+            .physical_expr(left_expr)
+            .expect("Should create physical expr");
+
+        // Must not be a no-op literal (would be incorrect for anti-join semantics).
+        assert!(
+            physical_expr.as_any().downcast_ref::<Literal>().is_none(),
+            "Range fallback must produce a real range filter, not a literal no-op"
+        );
+
+        // The range should be derived from the non-null min/max present in the data.
+        // (Exact bounds depend on RangeBounds implementation; we only assert it is a
+        // non-trivial filter.)
+        let probe_schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let probe_values: Vec<Option<i32>> = vec![Some(0), Some(12), None, Some(25), Some(30)];
+        let probe_array: ArrayRef = Arc::new(Int32Array::from(probe_values));
+        let probe_batch = RecordBatch::try_new(Arc::new(probe_schema), vec![probe_array])
+            .expect("Should create probe batch");
+
+        let filtered = evaluate_boolean_expression(&physical_expr, &probe_batch);
+        // We do not assert exact boolean results here (depends on the concrete
+        // range expression), but we do assert that the filter was evaluable
+        // without error and produced a boolean array of the expected length.
+        assert_eq!(filtered.len(), 5);
+    }
+
+    #[test]
     fn test_exact_left_accumulator_defers_range_bounds_until_memory_limit_exceeded() {
         let first_batch = create_uint64_batch(vec![10, 20]);
         let second_batch = create_uint64_batch(vec![1, 30]);
