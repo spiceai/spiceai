@@ -1458,7 +1458,7 @@ mod tests {
         // Cycle prevention: running the rule a second time must be a no-op
         // (the unified Display-keyed cycle guard tracks the InSubquery target
         // expression, not just column targets).
-        let (_, changed2) = apply_rule_to_all_joins(&r, transformed_plan.clone(), &cfg)?;
+        let (_, changed2) = apply_rule_to_all_joins(&r, transformed_plan, &cfg)?;
         assert!(
             !changed2,
             "second pass must not re-propagate (cycle guard) on expression target"
