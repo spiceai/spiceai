@@ -1415,7 +1415,13 @@ async fn test_compaction_runs_after_inline_memtable_checkpoint(
 
     // Step 1: 8 batches above INLINE_MAX_ROWS so each writes a Vortex file
     // directly (bypassing the inline memtable). Compaction should fire inline.
-    let large_batch_rows: i64 = 1500;
+    // Use larger batches here so the resulting Vortex files are still "small"
+    // relative to the 1 MiB target but have enough aggregate bytes that 8 of
+    // them reliably trigger the Small tier (with trigger_files=4). This makes
+    // the "ingestion created N direct Vortex files → Small tier compaction
+    // consolidated them" regression path deterministic and fast under the
+    // aggressive config used in this test.
+    let large_batch_rows: i64 = 8000;
     let mut expected_total: i64 = 0;
     for batch_idx in 0..8_i64 {
         let start = batch_idx * large_batch_rows;
