@@ -22,6 +22,7 @@ mod commands;
 mod health;
 mod metrics;
 mod spiced_metrics;
+mod system_adapter;
 
 use args::{
     Commands, DataConsistencyArgs, DatasetTestArgs, HtapArgs, LoadTestArgs, SchemaTestArgs,
