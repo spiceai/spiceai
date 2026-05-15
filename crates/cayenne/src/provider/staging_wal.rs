@@ -63,6 +63,7 @@ use crate::provider::Error;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectStorePath;
+use std::sync::atomic::Ordering;
 use tokio::sync::OwnedMutexGuard;
 
 /// Coordinates staged writes and the staging WAL lifecycle for a Cayenne table.
@@ -503,10 +504,12 @@ impl CayenneTableProvider {
         let current_snapshot = self.get_current_snapshot_id()?;
 
         if self.table_path().starts_with("s3://") {
-            self.write_staging_wal_s3(&current_snapshot).await
+            self.write_staging_wal_s3(&current_snapshot).await?;
         } else {
-            self.write_staging_wal_local(&current_snapshot).await
+            self.write_staging_wal_local(&current_snapshot).await?;
         }
+        self.staging_wal_present().store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Write the staging WAL on local filesystem.
@@ -648,12 +651,15 @@ impl CayenneTableProvider {
                 ));
                 // Best-effort delete — if the key doesn't exist, that's fine.
                 match config.store.delete(&wal_key).await {
-                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {
+                        self.staging_wal_present().store(false, Ordering::Release);
+                    }
                     Err(e) => {
                         tracing::warn!(
                             "Failed to remove staging WAL (S3) for table {}: {e}",
                             self.table_name(),
                         );
+                        // leave flag true so next ensure will retry the check
                     }
                 }
             }
@@ -674,6 +680,7 @@ impl CayenneTableProvider {
             };
 
             if removed {
+                self.staging_wal_present().store(false, Ordering::Release);
                 // Durability: after removing the WAL marker (the "commit success" signal),
                 // fsync the staging directory so the unlink is persisted. A crash without
                 // this sync could make the removal non-durable, causing a false-positive
@@ -703,6 +710,10 @@ impl CayenneTableProvider {
     ///
     /// Returns [`Error::IncompleteWrite`] if a staging WAL file is found.
     pub(crate) async fn ensure_no_incomplete_write(&self) -> Result<()> {
+        if !self.staging_wal_present().load(Ordering::Acquire) {
+            return Ok(());
+        }
+
         let wal = if self.table_path().starts_with("s3://") {
             self.read_staging_wal_s3().await
         } else {
@@ -907,6 +918,8 @@ impl CayenneTableProvider {
                 "Incomplete staged append detected — attempting automated recovery"
             );
 
+            // `current_snapshot` was validated above to equal `wal.target_snapshot`,
+            // so this helper's current-snapshot destination is the WAL target.
             match self.move_files_to_current_snapshot().await {
                 Ok(()) => {
                     self.remove_staging_wal().await.ok();
@@ -936,6 +949,9 @@ impl CayenneTableProvider {
             }
         }
 
+        // WAL absent (or unparseable, treated as absent for liveness): correct
+        // the flag so future writes take the fast path (no S3 GET / FS read).
+        self.staging_wal_present().store(false, Ordering::Release);
         Ok(())
     }
 

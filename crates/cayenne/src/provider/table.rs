@@ -90,7 +90,7 @@ use roaring::RoaringBitmap;
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::task;
 use vortex::dtype::arrow::FromArrowType;
@@ -741,6 +741,16 @@ pub struct CayenneTableProvider {
     /// append-heavy inline CDC writes don't query the metastore after every
     /// burst just to decide whether to checkpoint.
     inlined_row_count: Arc<AtomicI64>,
+    /// Tracks whether a staging WAL may be present (for fast-path short-circuit
+    /// of expensive S3 GET / local FS read in `ensure_no_incomplete_write`).
+    ///
+    /// Initialized to `true` so the check always runs at table open (to detect
+    /// incomplete writes from prior crashes). Set to `false` after a clean check
+    /// or successful recovery/remove. Set to `true` when `write_staging_wal`
+    /// succeeds; set to `false` when `remove_staging_wal` succeeds. If a
+    /// `PreparedStagedAppend` is dropped without cleanup the flag stays `true`,
+    /// forcing the next writer to re-check disk and recover or error.
+    staging_wal_present: Arc<AtomicBool>,
     /// Serializes concurrent compaction passes on this table so a write-driven
     /// inline trigger and the background scheduler can't both rewrite the
     /// current snapshot at the same time. Held across the *entire* trigger
@@ -1111,6 +1121,10 @@ impl CayenneTableProvider {
     #[must_use]
     pub(crate) fn write_lock_arc(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.write_lock)
+    }
+
+    pub(crate) fn staging_wal_present(&self) -> &AtomicBool {
+        &self.staging_wal_present
     }
 
     #[must_use]
@@ -1632,32 +1646,23 @@ impl CayenneTableProvider {
             moved_count += 1;
         }
 
-        // Make the renames durable before the caller proceeds to remove the
-        // WAL. The dir fsync flushes the inode/directory entry updates produced
-        // by each rename — without it, a power loss after WAL removal could
-        // leave the snapshot directory missing files that were "moved" in the
-        // page cache but never written through to disk.
-        if moved_count > 0
-            && let Err(e) = Self::sync_snapshot_dir(&target_dir).await
-        {
-            tracing::warn!(
-                "Failed to fsync target snapshot dir {} after move for table {}: {e}",
-                target_dir.display(),
-                self.table_metadata.table_name,
-            );
-        }
-
         tracing::debug!(
             "Moved {moved_count} file(s) from staging to snapshot {current_snapshot} for table {table_name}",
             table_name = self.table_metadata.table_name,
         );
 
-        // Durability: fsync the target snapshot directory so that the rename operations
-        // are persisted before the caller removes the staging WAL. This ensures that
-        // "WAL absent" truly means the data files are durable on disk (ACID Durability
-        // for the staged append path on local filesystems). Matches the sync performed
-        // in the sort-rewrite / compaction path before metadata commit.
-        Self::sync_snapshot_dir(&target_dir).await?;
+        // Durability: fsync the target snapshot directory so the rename
+        // operations are persisted before the caller removes the staging WAL.
+        // Without this, a power loss after WAL removal could leave the snapshot
+        // directory missing files that were "moved" in the page cache but
+        // never written through to disk. Skipped when `moved_count == 0` (no
+        // renames happened, so no dir entry change to flush) — this is the
+        // single source of truth for the post-move dir fsync; a previous
+        // revision accidentally issued two back-to-back fsyncs of the same
+        // directory, which doubled the per-commit fsync cost on local FS.
+        if moved_count > 0 {
+            Self::sync_snapshot_dir(&target_dir).await?;
+        }
 
         Ok(())
     }
@@ -2067,6 +2072,7 @@ impl CayenneTableProvider {
             object_store_config,
             protected_snapshots: Arc::new(RwLock::new(protected_snapshots)),
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
+            staging_wal_present: Arc::new(AtomicBool::new(true)),
             compaction_lock: Arc::new(tokio::sync::Mutex::new(())),
             background_compactor: Arc::new(std::sync::OnceLock::new()),
         };
@@ -2470,6 +2476,7 @@ impl CayenneTableProvider {
             current_snapshot_id: Arc::clone(&self.current_snapshot_id),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
+            staging_wal_present: Arc::clone(&self.staging_wal_present),
             // Shared so inline (write-driven) and background compaction
             // attempts on the same table coordinate, even across clones.
             compaction_lock: Arc::clone(&self.compaction_lock),
@@ -3977,13 +3984,10 @@ impl CayenneTableProvider {
 
         let cfg = self.context.compaction_picker_config();
         let Some(candidate) = pick_candidates(
-            &files
-                .iter()
-                .map(|(path, size)| FileEntry {
-                    path: path.clone(),
-                    size_bytes: *size,
-                })
-                .collect::<Vec<_>>(),
+            files.iter().map(|(path, size)| FileEntry {
+                path: path.as_str(),
+                size_bytes: *size,
+            }),
             &cfg,
         ) else {
             return Ok(false);
@@ -6777,7 +6781,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         // Background scheduler path: serialize with the per-table `write_lock`
         // so concurrent appends (which write to the current snapshot dir under
         // `write_lock`) cannot land between this pass reading the current
-        // snapshot and the `commit_overwrite` advancing the pointer.
+        // snapshot and the snapshot-rewrite commit advancing the pointer.
         //
         // Using `try_lock` keeps the background loop non-blocking from a
         // writer's perspective — if a writer is active we skip this tick and
