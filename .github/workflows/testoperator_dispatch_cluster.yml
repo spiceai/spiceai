@@ -37,7 +37,7 @@ on:
 permissions:
   contents: read
   packages: write    # workflow_call into spiced_docker_dev needs write
-  actions: write     # gh workflow run needs this
+  actions: write     # workflow_dispatch API needs this
 
 concurrency:
   # One cluster-bench dispatch at a time; the cluster benches themselves are
@@ -171,6 +171,99 @@ jobs:
             sudo install -m 0755 /tmp/yq /usr/local/bin/yq
           fi
 
+          api_url="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          api_headers=(
+            -H "Accept: application/vnd.github+json"
+            -H "Authorization: Bearer ${GH_TOKEN}"
+            -H "X-GitHub-Api-Version: 2022-11-28"
+          )
+
+          dispatch_workflow() {
+            local spicepod_path="$1"
+            local query_set="$2"
+            local scale_factor="$3"
+            local runner_type="$4"
+            local validate_results="$5"
+            local ready_wait="$6"
+            local query_transport="$7"
+            local executor_replicas="$8"
+            local channel="$9"
+            local payload
+
+            payload="$(python3 - \
+              "${GITHUB_REF_NAME}" \
+              "${spicepod_path}" \
+              "${query_set}" \
+              "${scale_factor}" \
+              "${runner_type}" \
+              "${validate_results}" \
+              "${ready_wait}" \
+              "${query_transport}" \
+              "${executor_replicas}" \
+              "${channel}" \
+              "${IMAGE_TAG}" <<'PY'
+          import json
+          import sys
+
+          keys = [
+              "spicepod_path",
+              "query_set",
+              "scale_factor",
+              "runner_type",
+              "validate_results",
+              "ready_wait",
+              "query_transport",
+              "executor_replicas",
+              "channel",
+              "custom_image_tag",
+          ]
+          print(json.dumps({"ref": sys.argv[1], "inputs": dict(zip(keys, sys.argv[2:]))}))
+          PY
+            )"
+
+            curl -fsS -X POST "${api_headers[@]}" \
+              "${api_url}/actions/workflows/testoperator_run_cluster_bench.yml/dispatches" \
+              -d "${payload}"
+          }
+
+          find_run_id() {
+            local created_at="$1"
+            local runs_json
+            runs_json="$(curl -fsSL -G "${api_headers[@]}" \
+              "${api_url}/actions/workflows/testoperator_run_cluster_bench.yml/runs" \
+              --data-urlencode "branch=${GITHUB_REF_NAME}" \
+              --data-urlencode "event=workflow_dispatch" \
+              --data-urlencode "created=>=${created_at}" \
+              --data-urlencode "per_page=10")"
+
+            python3 -c 'import json, sys; runs=json.load(sys.stdin).get("workflow_runs", []); print(runs[0]["id"] if runs else "")' <<< "${runs_json}"
+          }
+
+          watch_run() {
+            local run_id="$1"
+            local entry_path="$2"
+            local run_json status conclusion html_url
+
+            while true; do
+              run_json="$(curl -fsSL "${api_headers[@]}" "${api_url}/actions/runs/${run_id}")"
+              IFS=$'\t' read -r status conclusion html_url < <(
+                python3 -c 'import json, sys; r=json.load(sys.stdin); print("\t".join([r.get("status") or "", r.get("conclusion") or "", r.get("html_url") or ""]))' <<< "${run_json}"
+              )
+
+              echo "Run ${run_id} for ${entry_path}: status=${status} conclusion=${conclusion:-pending}"
+              echo "${html_url}"
+
+              if [ "${status}" = "completed" ]; then
+                if [ "${conclusion}" != "success" ]; then
+                  echo "Warning: cluster bench run ${run_id} for ${entry_path} completed with ${conclusion}"
+                fi
+                break
+              fi
+
+              sleep 60
+            done
+          }
+
           dispatched_runs=()
           for f in "${dispatch_files[@]}"; do
             entry_name="$(basename "$f" .yaml)"
@@ -179,76 +272,76 @@ jobs:
             entry_path="${entry_path%.yaml}"
             echo "::group::Dispatching ${entry_path}"
 
-              # Helper to default missing fields.
-              field() {
-                local key="$1" default="$2"
-                local v
-                v="$(yq -r "${key} // \"\"" "$f")"
-                if [ -z "$v" ] || [ "$v" = "null" ]; then
-                  v="$default"
-                fi
-                echo "$v"
-              }
-
-              spicepod_path="$(field '.tests.bench.spicepod_path' '')"
-              if [ -z "$spicepod_path" ]; then
-                echo "skipping ${entry_name}: missing .tests.bench.spicepod_path"
-                echo "::endgroup::"
-                continue
+            # Helper to default missing fields.
+            field() {
+              local key="$1" default="$2"
+              local v
+              v="$(yq -r "${key} // \"\"" "$f")"
+              if [ -z "$v" ] || [ "$v" = "null" ]; then
+                v="$default"
               fi
+              echo "$v"
+            }
 
-              query_set="$(field '.tests.bench.query_set' 'tpch')"
-              scale_factor="$(field '.tests.bench.scale_factor' '1')"
-              runner_type="$(field '.tests.bench.runner_type' 'spiceai-dev-runners')"
-              validate_results="$(field '.tests.bench.validate_results' 'false')"
-              ready_wait="$(field '.tests.bench.ready_wait' '600')"
-              # Cluster-bench-specific fields (optional in the yaml; sensible defaults).
-              query_transport="$(field '.tests.bench.query_transport' 'flightsql')"
-              executor_replicas="$(field '.tests.bench.executor_replicas' '3')"
-              channel="$(field '.tests.bench.channel' 'nightly')"
-
-              echo "  spicepod_path=${spicepod_path}"
-              echo "  query_set=${query_set}  scale_factor=${scale_factor}"
-              echo "  query_transport=${query_transport}  executor_replicas=${executor_replicas}"
-              echo "  custom_image_tag=${IMAGE_TAG}"
-
-              gh workflow run testoperator_run_cluster_bench.yml \
-                --ref "${GITHUB_REF_NAME}" \
-                -f spicepod_path="${spicepod_path}" \
-                -f query_set="${query_set}" \
-                -f scale_factor="${scale_factor}" \
-                -f runner_type="${runner_type}" \
-                -f validate_results="${validate_results}" \
-                -f ready_wait="${ready_wait}" \
-                -f query_transport="${query_transport}" \
-                -f executor_replicas="${executor_replicas}" \
-                -f channel="${channel}" \
-                -f custom_image_tag="${IMAGE_TAG}"
-
-              dispatched_runs+=("${entry_path}")
+            spicepod_path="$(field '.tests.bench.spicepod_path' '')"
+            if [ -z "$spicepod_path" ]; then
+              echo "skipping ${entry_name}: missing .tests.bench.spicepod_path"
               echo "::endgroup::"
+              continue
+            fi
 
-              # Sequential dispatch: wait for the just-launched run to finish
-              # before starting the next one. Cluster benches each provision a
-              # real Spice Cloud app, so max_concurrent=1 keeps cloud-side load
-              # bounded.
-              echo "Waiting briefly for the run to register…"
+            query_set="$(field '.tests.bench.query_set' 'tpch')"
+            scale_factor="$(field '.tests.bench.scale_factor' '1')"
+            runner_type="$(field '.tests.bench.runner_type' 'spiceai-dev-runners')"
+            validate_results="$(field '.tests.bench.validate_results' 'false')"
+            ready_wait="$(field '.tests.bench.ready_wait' '600')"
+            # Cluster-bench-specific fields (optional in the yaml; sensible defaults).
+            query_transport="$(field '.tests.bench.query_transport' 'flightsql')"
+            executor_replicas="$(field '.tests.bench.executor_replicas' '3')"
+            channel="$(field '.tests.bench.channel' 'nightly')"
+
+            echo "  spicepod_path=${spicepod_path}"
+            echo "  query_set=${query_set}  scale_factor=${scale_factor}"
+            echo "  query_transport=${query_transport}  executor_replicas=${executor_replicas}"
+            echo "  custom_image_tag=${IMAGE_TAG}"
+
+            triggered_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            dispatch_workflow \
+              "${spicepod_path}" \
+              "${query_set}" \
+              "${scale_factor}" \
+              "${runner_type}" \
+              "${validate_results}" \
+              "${ready_wait}" \
+              "${query_transport}" \
+              "${executor_replicas}" \
+              "${channel}"
+
+            dispatched_runs+=("${entry_path}")
+            echo "::endgroup::"
+
+            # Sequential dispatch: wait for the just-launched run to finish
+            # before starting the next one. Cluster benches each provision a
+            # real Spice Cloud app, so max_concurrent=1 keeps cloud-side load
+            # bounded.
+            echo "Waiting briefly for the run to register…"
+            run_id=""
+            for attempt in {1..20}; do
               sleep 15
-              run_id="$(gh run list \
-                --workflow testoperator_run_cluster_bench.yml \
-                --branch "${GITHUB_REF_NAME}" \
-                --event workflow_dispatch \
-                --limit 1 \
-                --json databaseId,createdAt \
-                --jq '.[0].databaseId')"
-
-              if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
-                echo "Warning: could not resolve run id for ${entry_path}; continuing"
-                continue
+              run_id="$(find_run_id "${triggered_at}")"
+              if [ -n "${run_id}" ]; then
+                break
               fi
+              echo "Waiting for workflow_dispatch run to appear (${attempt}/20)…"
+            done
 
-              echo "Watching run ${run_id} for ${entry_path}"
-              gh run watch "${run_id}" --interval 60 || true
+            if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+              echo "Warning: could not resolve run id for ${entry_path}; continuing"
+              continue
+            fi
+
+            echo "Watching run ${run_id} for ${entry_path}"
+            watch_run "${run_id}" "${entry_path}"
           done
 
           if [ "${#dispatched_runs[@]}" -eq 0 ]; then
