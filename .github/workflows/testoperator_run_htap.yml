@@ -1,5 +1,5 @@
-name: HTAP(CH-benCHmark) tests
-run-name: htap - ${{ github.event.inputs.spicepod_path }} - SF${{ github.event.inputs.scale_factor }} - ${{ github.event.inputs.duration }}s
+name: htap benchmark tests
+run-name: CH-BenCHmark - ${{ github.event.inputs.spicepod_path }} - SF${{ github.event.inputs.scale_factor }} - ${{ github.event.inputs.duration }}s
 
 on:
   workflow_dispatch:
@@ -37,7 +37,7 @@ on:
           - 'spiceai-dev-large-runners'
 jobs:
   run-htap:
-    name: Run HTAP(CH-benCHmark)
+    name: Run CH-BenCHmark
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
     steps:
