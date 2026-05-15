@@ -575,7 +575,8 @@ fn truncate_list_view_array(
     let sizes = list_array.value_sizes();
     // Fast path for ListView: sizes are stored explicitly, cheap raw scan.
     // Safe on 64-bit (project minimum) with validated Arrow sizes. We keep the
-    // fallible path only for the actual truncation work.
+    // fallible path only for the actual truncation work (consistency with
+    // List/LargeList optimizations).
     let needs_trunc = sizes.iter().any(|&size| (size as usize) > max_len);
     if !needs_trunc {
         return Ok(list_array.clone());
