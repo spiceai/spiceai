@@ -519,17 +519,12 @@ fn contains_decimal_to_floating_cast(expr: &dyn PhysicalExpr, schema: &Schema) -
         }
     }
 
-    if expr
+    if let Some(dynamic_filter) = expr
         .as_any()
         .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
-        .is_some()
+        && let Ok(current) = dynamic_filter.current()
+        && contains_decimal_to_floating_cast(current.as_ref(), schema)
     {
-        // Conservatively skip Vortex predicate pushdown for any filter containing a
-        // DynamicFilterPhysicalExpr. The runtime predicate (from `current()`) is populated
-        // during execution by the join build side and may contain decimal-to-float casts
-        // due to type coercion on join keys, even if the planning-time snapshot does not.
-        // Treating DynamicFilter nodes as "contains bad cast" ensures we never push an
-        // unsafe filter to Vortex, preserving data correctness over pushdown coverage.
         return true;
     }
 
@@ -669,7 +664,9 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion_common::ScalarValue;
     use datafusion_expr::Operator;
-    use datafusion_physical_expr::expressions::{BinaryExpr, CastExpr, Column, Literal};
+    use datafusion_physical_expr::expressions::{
+        BinaryExpr, CastExpr, Column, DynamicFilterPhysicalExpr, Literal,
+    };
     use datafusion_physical_expr::expressions::{col, lit};
 
     #[test]
@@ -701,5 +698,33 @@ mod tests {
         let predicate = BinaryExpr::new(amount, Operator::Lt, literal);
 
         assert!(!contains_decimal_to_floating_cast(&predicate, &schema));
+    }
+
+    #[test]
+    fn allows_dynamic_filter_without_decimal_to_floating_current_predicate() {
+        let schema = Schema::new(vec![Field::new("amount", DataType::Int64, true)]);
+        let amount = col("amount", &schema).expect("amount column should exist");
+        let dynamic_filter = DynamicFilterPhysicalExpr::new(vec![amount], lit(true));
+
+        assert!(!contains_decimal_to_floating_cast(&dynamic_filter, &schema));
+    }
+
+    #[test]
+    fn detects_dynamic_filter_decimal_to_floating_current_predicate() {
+        let schema = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(15, 2),
+            true,
+        )]);
+        let amount = Arc::new(Column::new("amount", 0)) as Arc<dyn PhysicalExpr>;
+        let cast = Arc::new(CastExpr::new(amount, DataType::Float64, None));
+        let literal = Arc::new(Literal::new(ScalarValue::Float64(Some(1.0))));
+        let predicate = Arc::new(BinaryExpr::new(cast, Operator::Lt, literal));
+        let dynamic_filter = DynamicFilterPhysicalExpr::new(
+            vec![col("amount", &schema).expect("amount column should exist")],
+            predicate,
+        );
+
+        assert!(contains_decimal_to_floating_cast(&dynamic_filter, &schema));
     }
 }

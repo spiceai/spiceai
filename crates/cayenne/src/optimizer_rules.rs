@@ -90,7 +90,7 @@ limitations under the License.
 //! `test_framework::queries::get_chbench_test_queries`.
 
 use arrow::compute::SortOptions;
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{JoinType, NullEquality};
 use datafusion::config::ConfigOptions;
@@ -259,6 +259,7 @@ struct CayenneScanSummary {
 #[derive(Clone)]
 struct FilterAddition {
     identity: Arc<ScanIdentity>,
+    schema_fields: Vec<(String, DataType)>,
     filter: Arc<dyn PhysicalExpr>,
 }
 
@@ -329,6 +330,7 @@ fn filter_additions_for_join(
                 push_filter_addition(
                     &mut right_additions,
                     Arc::clone(&right_scan.identity),
+                    right_scan.schema_fields.clone(),
                     Arc::clone(filter.filter()),
                 );
             }
@@ -339,6 +341,7 @@ fn filter_additions_for_join(
                 push_filter_addition(
                     &mut left_additions,
                     Arc::clone(&left_scan.identity),
+                    left_scan.schema_fields.clone(),
                     Arc::clone(filter.filter()),
                 );
             }
@@ -426,10 +429,9 @@ fn spillable_rewrite_build_input_exact_rows(hash_join: &HashJoinExec) -> Option<
     // `HashJoinExec` materializes the LEFT input as the (non-spillable) build
     // hash table regardless of join type — including `*Anti` and `*Semi`.
     let build_input = match hash_join.join_type() {
-        JoinType::LeftAnti
-        | JoinType::RightAnti
-        | JoinType::LeftSemi
-        | JoinType::RightSemi => hash_join.left(),
+        JoinType::LeftAnti | JoinType::RightAnti | JoinType::LeftSemi | JoinType::RightSemi => {
+            hash_join.left()
+        }
         _ => return None,
     };
 
@@ -503,12 +505,7 @@ fn collect_cayenne_scans_inner(plan: &Arc<dyn ExecutionPlan>, scans: &mut Vec<Ca
     if let Some(cayenne) = plan.as_any().downcast_ref::<CayenneAccelerationExec>()
         && let Some(identity) = cayenne.scan_identity()
     {
-        let schema_fields = cayenne
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| (field.name().clone(), field.data_type().clone()))
-            .collect::<Vec<_>>();
+        let schema_fields = plan_schema_fields(cayenne.schema());
         let columns = schema_fields.iter().map(|(name, _)| name.clone()).collect();
         scans.push(CayenneScanSummary {
             identity,
@@ -570,16 +567,30 @@ fn same_source_pairs_for_column(
 fn push_filter_addition(
     additions: &mut Vec<FilterAddition>,
     identity: Arc<ScanIdentity>,
+    schema_fields: Vec<(String, DataType)>,
     filter: Arc<dyn PhysicalExpr>,
 ) {
-    if additions
-        .iter()
-        .any(|addition| addition.identity == identity && Arc::ptr_eq(&addition.filter, &filter))
-    {
+    if additions.iter().any(|addition| {
+        addition.identity == identity
+            && addition.schema_fields == schema_fields
+            && Arc::ptr_eq(&addition.filter, &filter)
+    }) {
         return;
     }
 
-    additions.push(FilterAddition { identity, filter });
+    additions.push(FilterAddition {
+        identity,
+        schema_fields,
+        filter,
+    });
+}
+
+fn plan_schema_fields(schema: SchemaRef) -> Vec<(String, DataType)> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| (field.name().clone(), field.data_type().clone()))
+        .collect()
 }
 
 fn apply_filter_additions(
@@ -595,10 +606,12 @@ fn apply_filter_additions(
         let Some(identity) = cayenne.scan_identity() else {
             return Ok((plan, false));
         };
+        let schema_fields = plan_schema_fields(cayenne.schema());
         let existing = cayenne.dynamic_filters();
         let filters = additions
             .iter()
             .filter(|addition| addition.identity == identity)
+            .filter(|addition| addition.schema_fields == schema_fields)
             .filter(|addition| {
                 !existing
                     .iter()
@@ -789,7 +802,8 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
 mod tests {
     use super::{
         ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS, CayenneAntiJoinSortMergeRewriter,
-        CayenneDynamicFilterSharing, CayenneJoinRewriter,
+        CayenneDynamicFilterSharing, CayenneJoinRewriter, FilterAddition, apply_filter_additions,
+        plan_schema_fields,
     };
     use crate::provider::CayenneAccelerationExec;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1383,6 +1397,41 @@ mod tests {
     }
 
     #[test]
+    fn does_not_apply_filter_addition_to_same_identity_different_projection_order() {
+        // `apply_filter_additions` must not push a filter into a scan whose
+        // schema fields don't match the source scan exactly (different column
+        // ordering / types means the filter's column-by-position indices
+        // would refer to wrong columns).
+        let source_schema = order_line_schema();
+        let target_schema = reordered_order_line_schema();
+        let source_filter = dynamic_filter_for("order_id", &source_schema);
+        let source = CayenneAccelerationExec::new(file_exec(
+            &source_schema,
+            "order_line.vortex",
+            Some(Arc::clone(&source_filter)),
+        ));
+        let addition = FilterAddition {
+            identity: source
+                .scan_identity()
+                .expect("source scan should have file identity"),
+            schema_fields: plan_schema_fields(source.schema()),
+            filter: Arc::clone(&source_filter),
+        };
+        let target = cayenne_file_exec(&target_schema, "order_line.vortex", None);
+
+        let (optimized, changed) =
+            apply_filter_additions(Arc::clone(&target), &[addition], &ConfigOptions::default())
+                .expect("filter addition should be evaluated");
+
+        assert!(!changed);
+        let target = optimized
+            .as_any()
+            .downcast_ref::<CayenneAccelerationExec>()
+            .expect("target should remain Cayenne");
+        assert!(target.dynamic_filters().is_empty());
+    }
+
+    #[test]
     fn does_not_share_dynamic_filter_for_anti_join() {
         // `*Anti` joins must not receive a shared dynamic filter: their
         // output requires the *absence* of a match, so filtering the probe
@@ -1452,7 +1501,11 @@ mod tests {
             .expect("right side should remain Cayenne");
         let filters = right.dynamic_filters();
 
-        assert_eq!(1, filters.len(), "semi join should propagate same-source filter");
+        assert_eq!(
+            1,
+            filters.len(),
+            "semi join should propagate same-source filter"
+        );
         assert!(Arc::ptr_eq(filters[0].filter(), &source_filter));
     }
 

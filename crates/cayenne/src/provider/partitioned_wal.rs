@@ -194,6 +194,41 @@ impl PartitionedWal {
                     "Removed partitioned WAL at {} (commit {commit_id})",
                     path.display(),
                 );
+
+                // Best-effort directory sync so that the absence of the
+                // cross-partition coordination marker is durable. This aligns
+                // the removal of the top-level `PartitionedWal` with the
+                // per-partition staging WAL removal (which now also syncs its
+                // directory). A crash without this sync could leave the marker
+                // visible, causing a conservative "incomplete cross-partition
+                // commit" detection on the next open (safe, but noisy).
+                // The actual data durability is already guaranteed by the
+                // per-partition move + WAL removal steps that ran under the
+                // held barrier before this call.
+                let wal_dir = table_root.join(PARTITIONED_WAL_DIR);
+                let wal_dir_display = wal_dir.display().to_string();
+                match tokio::task::spawn_blocking(move || {
+                    std::fs::File::open(&wal_dir).and_then(|f| f.sync_all())
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            "Failed to sync {} after removing PartitionedWal {} (data is safe; may see stale marker on restart): {e}",
+                            wal_dir_display,
+                            commit_id,
+                        );
+                    }
+                    Err(join_err) => {
+                        tracing::warn!(
+                            "Join error while syncing {} after removing PartitionedWal {} (data is safe): {join_err}",
+                            wal_dir_display,
+                            commit_id,
+                        );
+                    }
+                }
+
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

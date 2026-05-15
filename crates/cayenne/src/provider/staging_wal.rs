@@ -539,9 +539,18 @@ impl CayenneTableProvider {
         })?;
         tokio::fs::write(&wal_path, content.as_bytes()).await?;
 
-        // fsync the WAL file to ensure it is durable before we begin moving files.
+        // fsync the WAL file content.
         let file = tokio::fs::File::open(&wal_path).await?;
         file.sync_all().await?;
+
+        // fsync the staging directory so that the directory entry for the newly
+        // written WAL file (and any data files previously written to this staging
+        // dir by `write_to_snapshot`) are durably persisted. This completes the
+        // "prepare" phase durability: the staging WAL record that lists the files
+        // to be moved is only considered durably written after its own directory
+        // entry is safe. Matches the full tmp+rename+dir-fsync pattern used for
+        // `PartitionedWal` and the syncs we perform after move and after WAL removal.
+        Self::sync_snapshot_dir(&staging_dir).await?;
 
         tracing::debug!(
             "Wrote staging WAL for table {} with {} file(s) targeting snapshot {target_snapshot}",

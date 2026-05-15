@@ -175,6 +175,7 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
                     // Propagate the LEFT-side filtered key domain → the RIGHT side.
                     if left_analysis.is_dim_like
                         && left_analysis.has_non_key_filter(&left.name)
+                        && key_preserved_through_summaries(&join.left, left)
                         && !right_analysis.has_propagated_filter_target(&column_expr(right))
                     {
                         let subquery_plan = build_key_projection_subquery(
@@ -196,6 +197,7 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
                     // Propagate the RIGHT-side filtered key domain → the LEFT side.
                     if right_analysis.is_dim_like
                         && right_analysis.has_non_key_filter(&right.name)
+                        && key_preserved_through_summaries(&join.right, right)
                         && !left_analysis.has_propagated_filter_target(&column_expr(left))
                     {
                         let subquery_plan = build_key_projection_subquery(
@@ -226,6 +228,7 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
                     // subquery, which would no longer be a cheap re-execution.
                     if left_analysis.is_dim_like
                         && left_analysis.has_non_key_filter(&left_col.name)
+                        && key_preserved_through_summaries(&join.left, left_col)
                         && !right_analysis.has_propagated_filter_target(right_expr)
                     {
                         let subquery_plan = build_key_projection_subquery(
@@ -250,6 +253,7 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
                     // Symmetric: only RIGHT-dim → LEFT-expr direction.
                     if right_analysis.is_dim_like
                         && right_analysis.has_non_key_filter(&right_col.name)
+                        && key_preserved_through_summaries(&join.right, right_col)
                         && !left_analysis.has_propagated_filter_target(left_expr)
                     {
                         let subquery_plan = build_key_projection_subquery(
@@ -414,13 +418,19 @@ const MAX_DIM_LIKE_TABLE_SCANS: usize = 3;
 /// Returns `true` if `plan` is a "dim-like" subtree — a small snowflake of
 /// dimensions composed of at most [`MAX_DIM_LIKE_TABLE_SCANS`] `TableScan`s
 /// connected through identity-preserving operators (`Projection`,
-/// `SubqueryAlias`, `Filter`, `Limit`) and inner equi-joins with default SQL
-/// NULL equality.
+/// `SubqueryAlias`, `Filter`, `Limit`), inner equi-joins with default SQL
+/// NULL equality, `Aggregate`, or `Distinct`.
 ///
 /// The conservatism here keeps the duplicated subquery cheap: `DataFusion` will
 /// execute it independently of the outer join, so we only fire on subtrees
-/// where re-running the scan(s) + filter(s) is cheap. Aggregates, distincts,
-/// unions, windows, and any non-inner / null-equal join terminate the walk.
+/// where re-running the scan(s) + filter(s) is cheap. Unions, windows, sorts,
+/// and any non-inner / null-equal join terminate the walk.
+///
+/// `Aggregate` and `Distinct` are *structurally* allowed here, but the rule's
+/// caller must additionally verify the join key is preserved through any
+/// aggregations via [`key_preserved_through_summaries`] — an aggregate that
+/// does not group by the key does not preserve its domain and cannot be the
+/// source of a propagated subquery on that key.
 fn is_dim_like_subtree(plan: &LogicalPlan) -> bool {
     count_dim_like_table_scans(plan).is_some_and(|n| n <= MAX_DIM_LIKE_TABLE_SCANS)
 }
@@ -432,6 +442,8 @@ fn count_dim_like_table_scans(plan: &LogicalPlan) -> Option<usize> {
         LogicalPlan::SubqueryAlias(a) => count_dim_like_table_scans(&a.input),
         LogicalPlan::Filter(f) => count_dim_like_table_scans(&f.input),
         LogicalPlan::Limit(l) => count_dim_like_table_scans(&l.input),
+        LogicalPlan::Aggregate(a) => count_dim_like_table_scans(&a.input),
+        LogicalPlan::Distinct(d) => count_dim_like_table_scans(distinct_input(d)),
         LogicalPlan::Join(j)
             if j.join_type == JoinType::Inner
                 && j.null_equality == NullEquality::NullEqualsNothing =>
@@ -442,6 +454,66 @@ fn count_dim_like_table_scans(plan: &LogicalPlan) -> Option<usize> {
         }
         _ => None,
     }
+}
+
+/// Returns the single input plan of a `Distinct` regardless of variant.
+fn distinct_input(distinct: &datafusion::logical_expr::Distinct) -> &LogicalPlan {
+    use datafusion::logical_expr::Distinct;
+    match distinct {
+        Distinct::All(input) => input,
+        Distinct::On(on) => &on.input,
+    }
+}
+
+/// Returns `true` if `key` retains its scan-level domain through every
+/// `Aggregate` / `Distinct` reachable in `plan`.
+///
+/// * `Aggregate` preserves a column's domain only when it appears in
+///   `group_expr` as a plain `Expr::Column` reference.
+/// * `Distinct::All` preserves every projected column (deduplication keeps
+///   value identity).
+/// * `Distinct::On(distinct_on)` preserves only the columns named in its `on`
+///   list; for safety we conservatively require the key to appear there.
+///
+/// The walk follows only identity-preserving operators plus inner equi-joins —
+/// the same shape `is_dim_like_subtree` accepts. Anything outside that vocab
+/// (`Sort`, `Window`, etc.) is conservatively rejected by returning `false`.
+fn key_preserved_through_summaries(plan: &LogicalPlan, key: &Column) -> bool {
+    fn walk(plan: &LogicalPlan, key: &Column) -> bool {
+        match plan {
+            LogicalPlan::TableScan(_) => true,
+            LogicalPlan::Projection(p) => walk(&p.input, key),
+            LogicalPlan::SubqueryAlias(a) => walk(&a.input, key),
+            LogicalPlan::Filter(f) => walk(&f.input, key),
+            LogicalPlan::Limit(l) => walk(&l.input, key),
+            LogicalPlan::Aggregate(a) => {
+                let key_in_group = a
+                    .group_expr
+                    .iter()
+                    .any(|expr| matches!(expr, Expr::Column(column) if column.name == key.name));
+                key_in_group && walk(&a.input, key)
+            }
+            LogicalPlan::Distinct(distinct) => {
+                use datafusion::logical_expr::Distinct;
+                let key_kept = match distinct {
+                    Distinct::All(_) => true,
+                    Distinct::On(on) => on.on_expr.iter().any(
+                        |expr| matches!(expr, Expr::Column(column) if column.name == key.name),
+                    ),
+                };
+                key_kept && walk(distinct_input(distinct), key)
+            }
+            LogicalPlan::Join(j)
+                if j.join_type == JoinType::Inner
+                    && j.null_equality == NullEquality::NullEqualsNothing =>
+            {
+                walk(&j.left, key) || walk(&j.right, key)
+            }
+            _ => false,
+        }
+    }
+
+    walk(plan, key)
 }
 
 fn collect_filter_column_names(expr: &Expr, columns: &mut BTreeSet<String>) {
@@ -919,6 +991,92 @@ mod tests {
         assert!(
             find_propagated_side(&transformed_plan).is_some(),
             "rule fired but produced no propagated-filter marker; plan was:\n{transformed_plan}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn key_preserved_through_summaries_accepts_distinct_all() -> Result<()> {
+        // `Distinct::All` deduplicates whole rows but preserves every column's
+        // values (it can only remove duplicate rows), so any join key survives.
+        use datafusion::logical_expr::Distinct;
+        use datafusion_expr::builder::table_scan;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let scan = table_scan(Some("t"), &schema, None)?.build()?;
+        let distinct = LogicalPlan::Distinct(Distinct::All(Arc::new(scan)));
+
+        let key_a = Column::new(Some("t"), "a");
+        let key_b = Column::new(Some("t"), "b");
+
+        assert!(key_preserved_through_summaries(&distinct, &key_a));
+        assert!(key_preserved_through_summaries(&distinct, &key_b));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_dim_propagates_when_key_is_in_group_by() -> Result<()> {
+        // Pre-aggregated dim: `SELECT n_nationkey, count(*) FROM nation
+        // WHERE n_name = 'CHINA' GROUP BY n_nationkey` joined against
+        // supplier. The aggregate's GROUP BY includes `n_nationkey`, so the
+        // key's domain is preserved through the aggregation and the rule
+        // should still propagate to supplier.
+        let ctx = make_ctx()?;
+        let plan = ctx
+            .sql(
+                "SELECT s_suppkey FROM supplier, \
+                 (SELECT n_nationkey FROM nation WHERE n_name = 'CHINA' \
+                  GROUP BY n_nationkey) AS n_agg \
+                 WHERE s_nationkey = n_nationkey",
+            )
+            .await?
+            .into_optimized_plan()?;
+
+        let r = rule();
+        let cfg = datafusion::optimizer::OptimizerContext::new();
+        let (transformed_plan, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
+        assert!(
+            changed,
+            "rule should fire when dim has Aggregate(GROUP BY key); plan was:\n{plan}"
+        );
+        assert!(
+            find_propagated_side(&transformed_plan).is_some(),
+            "rule fired but produced no propagated-filter marker; plan was:\n{transformed_plan}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn key_preserved_through_summaries_rejects_aggregate_without_key_in_group() -> Result<()> {
+        // Sanity-check the helper: an aggregate that does NOT group by `a`
+        // must report the key as not preserved.
+        use datafusion::logical_expr::Aggregate;
+        use datafusion_expr::builder::table_scan;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let scan = table_scan(Some("t"), &schema, None)?.build()?;
+        let agg = LogicalPlan::Aggregate(Aggregate::try_new(
+            Arc::new(scan),
+            vec![Expr::Column(Column::new(Some("t"), "b"))],
+            vec![],
+        )?);
+
+        let key_a = Column::new(Some("t"), "a");
+        let key_b = Column::new(Some("t"), "b");
+
+        assert!(
+            !key_preserved_through_summaries(&agg, &key_a),
+            "`a` aggregated away, must not be preserved"
+        );
+        assert!(
+            key_preserved_through_summaries(&agg, &key_b),
+            "`b` is in GROUP BY, must be preserved"
         );
         Ok(())
     }
