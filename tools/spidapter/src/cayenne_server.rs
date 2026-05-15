@@ -171,6 +171,7 @@ impl Handler for CayenneFlightsqlHandler {
             db_kwargs,
             catalog_namespace,
             read_driver: None,
+            endpoints: std::collections::HashMap::new(),
         };
 
         self.runs.insert(run_id, state);
