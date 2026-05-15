@@ -34,11 +34,12 @@ limitations under the License.
 //!
 //! ## What the rule does
 //!
-//! For every `LogicalPlan::Join` with `JoinType::Inner`, default SQL NULL
-//! equality (`NULL != NULL`), and one or more column-only equi-key pairs
-//! `(left.a, right.b)` whose data types match, the rule inspects each side for a
-//! non-trivial `Filter` that references at least one column other than each
-//! candidate join key. If one is found, it wraps the *opposite* side with
+//! For every `LogicalPlan::Join` with `JoinType::Inner`, `JoinType::LeftSemi`,
+//! or `JoinType::RightSemi`, default SQL NULL equality (`NULL != NULL`), and one
+//! or more equi-key pairs whose data types match, the rule inspects each side
+//! for a non-trivial `Filter` that references at least one column other than
+//! each candidate join key. If one side is dim-like and has a projectable column
+//! key, it wraps the *opposite* side with
 //!
 //! ```text
 //! Filter(other_side.key IN (SELECT this_side.key FROM this_side_subtree))
@@ -53,6 +54,15 @@ limitations under the License.
 //! IN (SELECT n_nationkey FROM nation WHERE n_name = 'CHINA')` is visible
 //! while the join graph is being costed.
 //!
+//! Semi-join coverage is what makes chained propagation work: after
+//! `decorrelate_predicate_subquery` rewrites a propagated `InSubquery` into a
+//! `LeftSemi` join, the next optimizer pass can keep propagating across
+//! adjacent inner joins (e.g. `region → nation → supplier → fact`) instead of
+//! halting at the semi-join boundary. Propagation correctness on
+//! `LeftSemi`/`RightSemi` follows from the join's existing key-domain
+//! semantics: wrapping either input with `IN (SELECT key FROM other_side)`
+//! produces a subset of rows that the semi-join would already retain.
+//!
 //! ## Termination
 //!
 //! Each introduced subquery is wrapped in a `SubqueryAlias` whose name
@@ -64,14 +74,14 @@ limitations under the License.
 //!
 //! ## Conservatism
 //!
-//! The rule only fires when the side providing the filter terminates in a
-//! single `TableScan` (possibly behind `SubqueryAlias`, `Projection`,
-//! `Filter`, `Limit`). Joining a non-trivial subtree would risk
-//! duplicate-executing a large plan inside the subquery, since `DataFusion`
-//! does not currently de-duplicate plan-level common subexpressions across
-//! the outer plan and an `InSubquery`. The dim-table-filter shape
-//! (`Filter(n_name='CHINA') → TableScan(nation)`) is the q21 case and is
-//! cheap to re-execute.
+//! The rule only fires when the side providing the filter is dim-like: a small
+//! subtree with at most [`MAX_DIM_LIKE_TABLE_SCANS`] table scans behind
+//! identity-preserving operators and inner joins. Joining a non-trivial subtree
+//! would risk duplicate-executing a large plan inside the subquery, since
+//! `DataFusion` does not currently de-duplicate plan-level common subexpressions
+//! across the outer plan and an `InSubquery`. The dim-table-filter shape
+//! (`Filter(n_name='CHINA') → TableScan(nation)`) and small dimension snowflakes
+//! are cheap to re-execute.
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DataFusionError, NullEquality, Result, Spans, TableReference};
@@ -92,8 +102,9 @@ use std::{collections::BTreeSet, sync::Arc};
 /// a marker in explain output so the rewrite is recognizable when reading plans.
 pub const PROPAGATED_FILTER_ALIAS_PREFIX: &str = "__cayenne_xclos__";
 
-/// Logical optimizer rule that, for each Inner Join with default SQL NULL
-/// equality and a simple equi-key `(left.a = right.b)`, introduces
+/// Logical optimizer rule that, for each `Inner`, `LeftSemi`, or `RightSemi`
+/// join with default SQL NULL equality and a simple equi-key
+/// `(left.a = right.b)`, introduces
 /// `Filter(other_side.key IN (SELECT this_side.key FROM this_side_subtree))`
 /// on the side opposite a non-key filter.
 ///
@@ -136,15 +147,18 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
             LogicalPlan::Join(j) => j,
             other => return Ok(Transformed::no(other)),
         };
-        if join.join_type != JoinType::Inner {
+        if !matches!(
+            join.join_type,
+            JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi,
+        ) {
             return Ok(Transformed::no(LogicalPlan::Join(join)));
         }
         if join.null_equality != NullEquality::NullEqualsNothing {
             return Ok(Transformed::no(LogicalPlan::Join(join)));
         }
 
-        let equijoin_columns = matching_equijoin_columns(&join);
-        if equijoin_columns.is_empty() {
+        let equijoin_keys = matching_equijoin_keys(&join);
+        if equijoin_keys.is_empty() {
             return Ok(Transformed::no(LogicalPlan::Join(join)));
         }
 
@@ -155,39 +169,104 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
         let mut new_right: Arc<LogicalPlan> = Arc::clone(&join.right);
         let mut changed = false;
 
-        for (left_col, right_col) in &equijoin_columns {
-            // Propagate the LEFT-side filtered key domain → the RIGHT side.
-            if left_analysis.is_dim_like
-                && left_analysis.has_non_key_filter(left_col)
-                && !right_analysis.has_propagated_filter_on_key(right_col)
-            {
-                let subquery_plan = build_key_projection_subquery(
-                    Arc::clone(&join.left),
-                    left_col,
-                    config.alias_generator(),
-                )?;
-                let wrapped =
-                    wrap_with_in_subquery_filter(Arc::clone(&new_right), right_col, subquery_plan)?;
-                new_right = Arc::new(wrapped);
-                right_analysis.add_propagated_filter_key(right_col);
-                changed = true;
-            }
+        for key in &equijoin_keys {
+            match key {
+                EquiKey::BothColumns { left, right } => {
+                    // Propagate the LEFT-side filtered key domain → the RIGHT side.
+                    if left_analysis.is_dim_like
+                        && left_analysis.has_non_key_filter(&left.name)
+                        && !right_analysis.has_propagated_filter_target(&column_expr(right))
+                    {
+                        let subquery_plan = build_key_projection_subquery(
+                            Arc::clone(&join.left),
+                            left,
+                            config.alias_generator(),
+                        )?;
+                        let target = column_expr(right);
+                        let wrapped = wrap_with_in_subquery_filter_expr(
+                            Arc::clone(&new_right),
+                            &target,
+                            subquery_plan,
+                        )?;
+                        new_right = Arc::new(wrapped);
+                        right_analysis.add_propagated_filter_target(&target);
+                        changed = true;
+                    }
 
-            // Propagate the RIGHT-side filtered key domain → the LEFT side.
-            if right_analysis.is_dim_like
-                && right_analysis.has_non_key_filter(right_col)
-                && !left_analysis.has_propagated_filter_on_key(left_col)
-            {
-                let subquery_plan = build_key_projection_subquery(
-                    Arc::clone(&join.right),
+                    // Propagate the RIGHT-side filtered key domain → the LEFT side.
+                    if right_analysis.is_dim_like
+                        && right_analysis.has_non_key_filter(&right.name)
+                        && !left_analysis.has_propagated_filter_target(&column_expr(left))
+                    {
+                        let subquery_plan = build_key_projection_subquery(
+                            Arc::clone(&join.right),
+                            right,
+                            config.alias_generator(),
+                        )?;
+                        let target = column_expr(left);
+                        let wrapped = wrap_with_in_subquery_filter_expr(
+                            Arc::clone(&new_left),
+                            &target,
+                            subquery_plan,
+                        )?;
+                        new_left = Arc::new(wrapped);
+                        left_analysis.add_propagated_filter_target(&target);
+                        changed = true;
+                    }
+                }
+                EquiKey::LeftColumnRightExpr {
+                    left_col,
+                    right_expr,
+                } => {
+                    // Only LEFT-dim → RIGHT-expr direction can fire: the right
+                    // side has an expression key, so the fact-side filter
+                    // target must be that expression. Propagation in the other
+                    // direction would require projecting an expression
+                    // (potentially referencing fact-side rows) inside the dim
+                    // subquery, which would no longer be a cheap re-execution.
+                    if left_analysis.is_dim_like
+                        && left_analysis.has_non_key_filter(&left_col.name)
+                        && !right_analysis.has_propagated_filter_target(right_expr)
+                    {
+                        let subquery_plan = build_key_projection_subquery(
+                            Arc::clone(&join.left),
+                            left_col,
+                            config.alias_generator(),
+                        )?;
+                        let wrapped = wrap_with_in_subquery_filter_expr(
+                            Arc::clone(&new_right),
+                            right_expr,
+                            subquery_plan,
+                        )?;
+                        new_right = Arc::new(wrapped);
+                        right_analysis.add_propagated_filter_target(right_expr);
+                        changed = true;
+                    }
+                }
+                EquiKey::LeftExprRightColumn {
+                    left_expr,
                     right_col,
-                    config.alias_generator(),
-                )?;
-                let wrapped =
-                    wrap_with_in_subquery_filter(Arc::clone(&new_left), left_col, subquery_plan)?;
-                new_left = Arc::new(wrapped);
-                left_analysis.add_propagated_filter_key(left_col);
-                changed = true;
+                } => {
+                    // Symmetric: only RIGHT-dim → LEFT-expr direction.
+                    if right_analysis.is_dim_like
+                        && right_analysis.has_non_key_filter(&right_col.name)
+                        && !left_analysis.has_propagated_filter_target(left_expr)
+                    {
+                        let subquery_plan = build_key_projection_subquery(
+                            Arc::clone(&join.right),
+                            right_col,
+                            config.alias_generator(),
+                        )?;
+                        let wrapped = wrap_with_in_subquery_filter_expr(
+                            Arc::clone(&new_left),
+                            left_expr,
+                            subquery_plan,
+                        )?;
+                        new_left = Arc::new(wrapped);
+                        left_analysis.add_propagated_filter_target(left_expr);
+                        changed = true;
+                    }
+                }
             }
         }
 
@@ -213,23 +292,30 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
 struct SideAnalysis {
     is_dim_like: bool,
     filter_columns: BTreeSet<String>,
-    propagated_filter_keys: BTreeSet<String>,
+    /// Targets of already-propagated `InSubquery` filters on this side, keyed
+    /// by the `Display` form of the target expression. Used for cycle
+    /// prevention — the same target should not be wrapped twice. Tracks both
+    /// pure-column and expression targets uniformly, so the chbench
+    /// `ascii(substr(c_state,1,1)) - 65` shape is also cycle-guarded.
+    propagated_filter_targets: BTreeSet<String>,
 }
 
 impl SideAnalysis {
-    fn has_non_key_filter(&self, key_col: &Column) -> bool {
-        self.filter_columns
-            .iter()
-            .any(|column| column != &key_col.name)
+    fn has_non_key_filter(&self, key_name: &str) -> bool {
+        self.filter_columns.iter().any(|column| column != key_name)
     }
 
-    fn has_propagated_filter_on_key(&self, key_col: &Column) -> bool {
-        self.propagated_filter_keys.contains(&key_col.name)
+    fn has_propagated_filter_target(&self, target: &Expr) -> bool {
+        self.propagated_filter_targets.contains(&target.to_string())
     }
 
-    fn add_propagated_filter_key(&mut self, key_col: &Column) {
-        self.propagated_filter_keys.insert(key_col.name.clone());
+    fn add_propagated_filter_target(&mut self, target: &Expr) {
+        self.propagated_filter_targets.insert(target.to_string());
     }
+}
+
+fn column_expr(column: &Column) -> Expr {
+    Expr::Column(column.clone())
 }
 
 fn analyze_logical_side(plan: &LogicalPlan) -> SideAnalysis {
@@ -241,7 +327,10 @@ fn analyze_logical_side(plan: &LogicalPlan) -> SideAnalysis {
     let _ = plan.apply(|node| {
         if let LogicalPlan::Filter(filter) = node {
             collect_filter_column_names(&filter.predicate, &mut analysis.filter_columns);
-            collect_propagated_filter_keys(&filter.predicate, &mut analysis.propagated_filter_keys);
+            collect_propagated_filter_targets(
+                &filter.predicate,
+                &mut analysis.propagated_filter_targets,
+            );
         }
 
         Ok(TreeNodeRecursion::Continue)
@@ -250,9 +339,27 @@ fn analyze_logical_side(plan: &LogicalPlan) -> SideAnalysis {
     analysis
 }
 
-/// Return the column-only equi-key pairs from `join.on` whose data types match.
-/// Expression keys and type-mismatched pairs are skipped conservatively.
-fn matching_equijoin_columns(join: &Join) -> Vec<(Column, Column)> {
+/// An equi-join key from `Join::on`, classified by which sides are pure
+/// columns. Propagation requires the *dim* side to be a `Column` so the IN
+/// subquery has a cheap, projectable key; the *fact* side may be an arbitrary
+/// expression (e.g. the chbench `ascii(substr(c_state,1,1)) - 65` pattern).
+enum EquiKey {
+    /// Both join keys are columns. The rule may fire in either direction
+    /// depending on which side is dim-like.
+    BothColumns { left: Column, right: Column },
+    /// Left key is a column, right key is an expression. Only the
+    /// `LEFT → RIGHT` propagation direction is supported.
+    LeftColumnRightExpr { left_col: Column, right_expr: Expr },
+    /// Right key is a column, left key is an expression. Only the
+    /// `RIGHT → LEFT` propagation direction is supported.
+    LeftExprRightColumn { left_expr: Expr, right_col: Column },
+}
+
+/// Return the equi-join keys from `join.on` whose data types match. Drops
+/// pairs where both sides are expressions (no dim-like column to project) and
+/// pairs whose types differ (the `IN` subquery would need an implicit cast we
+/// don't insert here).
+fn matching_equijoin_keys(join: &Join) -> Vec<EquiKey> {
     join.on
         .iter()
         .filter_map(|(left, right)| {
@@ -261,7 +368,20 @@ fn matching_equijoin_columns(join: &Join) -> Vec<(Column, Column)> {
             }
 
             match (left, right) {
-                (Expr::Column(l), Expr::Column(r)) => Some((l.clone(), r.clone())),
+                (Expr::Column(l), Expr::Column(r)) => Some(EquiKey::BothColumns {
+                    left: l.clone(),
+                    right: r.clone(),
+                }),
+                (Expr::Column(l), other) => Some(EquiKey::LeftColumnRightExpr {
+                    left_col: l.clone(),
+                    right_expr: other.clone(),
+                }),
+                (other, Expr::Column(r)) => Some(EquiKey::LeftExprRightColumn {
+                    left_expr: other.clone(),
+                    right_col: r.clone(),
+                }),
+                // Both sides are non-trivial expressions — no cheap projection
+                // target on either side, skip.
                 _ => None,
             }
         })
@@ -284,25 +404,43 @@ fn join_key_types_match(
     left_type == right_type
 }
 
-/// Walks `plan` through transparent operators
-/// (`Projection`, `SubqueryAlias`, `Filter`, `Limit`) and returns `true` if
-/// it bottoms out in a single `TableScan` with no `Join`, `Aggregate`,
-/// `Distinct`, `Union`, or `Window` in between.
+/// Maximum number of `TableScan` leaves allowed inside a dim-like subtree.
+///
+/// Chosen to cover the canonical chbench / TPC-H dimension snowflake
+/// (`region ⋈ nation ⋈ supplier`, three leaves) without admitting arbitrarily
+/// large dim joins whose re-execution under an `InSubquery` would be expensive.
+const MAX_DIM_LIKE_TABLE_SCANS: usize = 3;
+
+/// Returns `true` if `plan` is a "dim-like" subtree — a small snowflake of
+/// dimensions composed of at most [`MAX_DIM_LIKE_TABLE_SCANS`] `TableScan`s
+/// connected through identity-preserving operators (`Projection`,
+/// `SubqueryAlias`, `Filter`, `Limit`) and inner equi-joins with default SQL
+/// NULL equality.
 ///
 /// The conservatism here keeps the duplicated subquery cheap: `DataFusion` will
 /// execute it independently of the outer join, so we only fire on subtrees
-/// where re-running the scan + filter is cheap.
+/// where re-running the scan(s) + filter(s) is cheap. Aggregates, distincts,
+/// unions, windows, and any non-inner / null-equal join terminate the walk.
 fn is_dim_like_subtree(plan: &LogicalPlan) -> bool {
-    let mut cursor = plan;
-    loop {
-        match cursor {
-            LogicalPlan::TableScan(_) => return true,
-            LogicalPlan::Projection(p) => cursor = p.input.as_ref(),
-            LogicalPlan::SubqueryAlias(a) => cursor = a.input.as_ref(),
-            LogicalPlan::Filter(f) => cursor = f.input.as_ref(),
-            LogicalPlan::Limit(l) => cursor = l.input.as_ref(),
-            _ => return false,
+    count_dim_like_table_scans(plan).is_some_and(|n| n <= MAX_DIM_LIKE_TABLE_SCANS)
+}
+
+fn count_dim_like_table_scans(plan: &LogicalPlan) -> Option<usize> {
+    match plan {
+        LogicalPlan::TableScan(_) => Some(1),
+        LogicalPlan::Projection(p) => count_dim_like_table_scans(&p.input),
+        LogicalPlan::SubqueryAlias(a) => count_dim_like_table_scans(&a.input),
+        LogicalPlan::Filter(f) => count_dim_like_table_scans(&f.input),
+        LogicalPlan::Limit(l) => count_dim_like_table_scans(&l.input),
+        LogicalPlan::Join(j)
+            if j.join_type == JoinType::Inner
+                && j.null_equality == NullEquality::NullEqualsNothing =>
+        {
+            let l = count_dim_like_table_scans(&j.left)?;
+            let r = count_dim_like_table_scans(&j.right)?;
+            Some(l + r)
         }
+        _ => None,
     }
 }
 
@@ -316,21 +454,20 @@ fn collect_filter_column_names(expr: &Expr, columns: &mut BTreeSet<String>) {
     });
 }
 
-fn collect_propagated_filter_keys(expr: &Expr, keys: &mut BTreeSet<String>) {
+fn collect_propagated_filter_targets(expr: &Expr, targets: &mut BTreeSet<String>) {
     let _ = expr.apply(|e| {
         if let Expr::InSubquery(InSubquery {
             expr: target_expr,
             subquery,
             ..
         }) = e
-            && let Expr::Column(column) = target_expr.as_ref()
             && let LogicalPlan::SubqueryAlias(alias) = subquery.subquery.as_ref()
             && alias
                 .alias
                 .table()
                 .starts_with(PROPAGATED_FILTER_ALIAS_PREFIX)
         {
-            keys.insert(column.name.clone());
+            targets.insert(target_expr.to_string());
             return Ok(TreeNodeRecursion::Jump);
         }
 
@@ -406,16 +543,19 @@ fn build_key_projection_subquery(
     Ok(LogicalPlan::SubqueryAlias(aliased))
 }
 
-/// Wrap `input` with `Filter(other_col IN (subquery))` using the
-/// `subquery_plan` (which must already be a `SubqueryAlias` named with
-/// [`PROPAGATED_FILTER_ALIAS_PREFIX`]) as the right-hand side.
-fn wrap_with_in_subquery_filter(
+/// Wrap `input` with `Filter(target IN (subquery))` using the `subquery_plan`
+/// (which must already be a `SubqueryAlias` named with
+/// [`PROPAGATED_FILTER_ALIAS_PREFIX`]) as the right-hand side. `target` may be
+/// a column or any expression whose columns all resolve in `input`'s schema —
+/// the chbench `ascii(substr(c_state,1,1)) - 65` shape is supported through
+/// this entry point.
+fn wrap_with_in_subquery_filter_expr(
     input: Arc<LogicalPlan>,
-    other_col: &Column,
+    target: &Expr,
     subquery_plan: LogicalPlan,
 ) -> Result<LogicalPlan> {
     let predicate = Expr::InSubquery(InSubquery::new(
-        Box::new(Expr::Column(other_col.clone())),
+        Box::new(target.clone()),
         Subquery {
             subquery: Arc::new(subquery_plan),
             outer_ref_columns: vec![],
@@ -441,24 +581,48 @@ mod tests {
 
     fn make_ctx() -> Result<SessionContext> {
         let ctx = SessionContext::new();
-        // dim-like nation table
+        // dim-like nation table — gains an `n_regionkey` so the multi-hop
+        // `region ⋈ nation` propagation tests can join through it.
         let nation_schema = Arc::new(Schema::new(vec![
             Field::new("n_nationkey", DataType::Int64, false),
             Field::new("n_name", DataType::Utf8, true),
+            Field::new("n_regionkey", DataType::Int64, false),
+        ]));
+        // dim-like region table for multi-hop tests.
+        let region_schema = Arc::new(Schema::new(vec![
+            Field::new("r_regionkey", DataType::Int64, false),
+            Field::new("r_name", DataType::Utf8, true),
         ]));
         // fact-like supplier table
         let supplier_schema = Arc::new(Schema::new(vec![
             Field::new("s_suppkey", DataType::Int64, false),
             Field::new("s_nationkey", DataType::Int64, false),
         ]));
+        // fact-like customer table for expression-equi-key tests
+        // (chbench `ascii(substr(c_state, 1, 1)) - 65` nation mapping).
+        let customer_schema = Arc::new(Schema::new(vec![
+            Field::new("c_id", DataType::Int64, false),
+            Field::new("c_state", DataType::Utf8, true),
+        ]));
         ctx.register_table(
             "nation",
             Arc::new(MemTable::try_new(Arc::clone(&nation_schema), vec![vec![]])?),
         )?;
         ctx.register_table(
+            "region",
+            Arc::new(MemTable::try_new(Arc::clone(&region_schema), vec![vec![]])?),
+        )?;
+        ctx.register_table(
             "supplier",
             Arc::new(MemTable::try_new(
                 Arc::clone(&supplier_schema),
+                vec![vec![]],
+            )?),
+        )?;
+        ctx.register_table(
+            "customer",
+            Arc::new(MemTable::try_new(
+                Arc::clone(&customer_schema),
                 vec![vec![]],
             )?),
         )?;
@@ -617,6 +781,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn left_semi_join_with_dim_filter_propagates_via_subquery() -> Result<()> {
+        // The `IN (subquery)` shape that `decorrelate_predicate_subquery`
+        // rewrites into a `LeftSemi` join. The propagation rule must still
+        // fire on the resulting semi-join so the dim filter reaches the fact
+        // side across chained joins.
+        let ctx = make_ctx()?;
+        let plan = ctx
+            .sql(
+                "SELECT s_suppkey FROM supplier \
+                 WHERE s_nationkey IN \
+                   (SELECT n_nationkey FROM nation WHERE n_name = 'CHINA')",
+            )
+            .await?
+            .into_optimized_plan()?;
+
+        // Sanity-check that decorrelation produced a semi-join shape; if it
+        // didn't, this test is testing the wrong thing.
+        let mut semi_seen = false;
+        let _ = plan.apply(|node| {
+            if let LogicalPlan::Join(j) = node
+                && matches!(j.join_type, JoinType::LeftSemi | JoinType::RightSemi)
+            {
+                semi_seen = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        assert!(
+            semi_seen,
+            "expected decorrelation to produce a semi-join; plan was:\n{plan}"
+        );
+
+        let r = rule();
+        let cfg = datafusion::optimizer::OptimizerContext::new();
+        let (transformed_plan, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
+        assert!(
+            changed,
+            "rule should fire on semi-join with dim-side non-key filter; plan was:\n{plan}"
+        );
+        assert!(
+            find_propagated_side(&transformed_plan).is_some(),
+            "rule fired but produced no propagated-filter marker; plan was:\n{transformed_plan}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn inner_join_without_filter_is_noop() -> Result<()> {
         let ctx = make_ctx()?;
         let plan = ctx
@@ -633,6 +844,81 @@ mod tests {
         assert!(
             !changed,
             "rule must not fire when neither side has a non-key filter; plan was:\n{plan}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inner_join_with_expression_fact_key_propagates_dim_filter() -> Result<()> {
+        // The canonical chbench Q5/Q7/Q10 shape: a non-trivial expression on
+        // the fact side and a pure column on the dim side, with the dim side
+        // carrying the selective non-key filter.
+        //
+        // The rule must fire on `(Column, Expr)` (or `(Expr, Column)`) equi-key
+        // pairs even though neither side is a pure column-column join.
+        let ctx = make_ctx()?;
+        let plan = ctx
+            .sql(
+                "SELECT c_id FROM customer, nation \
+                 WHERE ascii(substr(c_state, 1, 1)) - 65 = n_nationkey \
+                   AND n_name = 'CHINA'",
+            )
+            .await?
+            .into_optimized_plan()?;
+
+        let r = rule();
+        let cfg = datafusion::optimizer::OptimizerContext::new();
+        let (transformed_plan, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
+        assert!(
+            changed,
+            "rule should fire on expression-vs-column equi-key; plan was:\n{plan}"
+        );
+        assert!(
+            find_propagated_side(&transformed_plan).is_some(),
+            "rule fired but produced no propagated-filter marker; plan was:\n{transformed_plan}"
+        );
+
+        // Cycle prevention: running the rule a second time must be a no-op
+        // (the unified Display-keyed cycle guard tracks the InSubquery target
+        // expression, not just column targets).
+        let (_, changed2) = apply_rule_to_all_joins(&r, transformed_plan.clone(), &cfg)?;
+        assert!(
+            !changed2,
+            "second pass must not re-propagate (cycle guard) on expression target"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multi_hop_dim_subtree_propagates_through_region_nation() -> Result<()> {
+        // The canonical Q5 shape: `region ⋈ nation ⋈ supplier` with a
+        // selective filter on `region.r_name`. With the multi-hop dim
+        // detector the `region ⋈ nation` subtree counts as dim-like, so the
+        // rule can propagate the filtered `n_nationkey` domain to `supplier`
+        // in a single pass instead of waiting for the optimizer's fixed
+        // point.
+        let ctx = make_ctx()?;
+        let plan = ctx
+            .sql(
+                "SELECT s_suppkey FROM supplier, nation, region \
+                 WHERE s_nationkey = n_nationkey \
+                   AND n_regionkey = r_regionkey \
+                   AND r_name = 'ASIA'",
+            )
+            .await?
+            .into_optimized_plan()?;
+
+        let r = rule();
+        let cfg = datafusion::optimizer::OptimizerContext::new();
+        let (transformed_plan, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
+        assert!(
+            changed,
+            "rule should propagate r_name filter through the multi-hop dim subtree; \
+             plan was:\n{plan}"
+        );
+        assert!(
+            find_propagated_side(&transformed_plan).is_some(),
+            "rule fired but produced no propagated-filter marker; plan was:\n{transformed_plan}"
         );
         Ok(())
     }

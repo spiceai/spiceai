@@ -147,17 +147,22 @@ impl std::fmt::Debug for CayenneDynamicFilterSharing {
     }
 }
 
-/// Rewrites same-source Cayenne anti joins from hash join to sort-merge join.
+/// Rewrites same-source Cayenne anti and semi joins from hash join to
+/// sort-merge join when the build side is large enough to risk OOM.
 ///
 /// `DataFusion`'s `HashJoinExec` always materializes its left input as the
-/// non-spillable build side. For q21's correlated `NOT EXISTS` self-join, that
-/// preserved side can be a large multi-way `order_line` result. Sort-merge join
-/// keeps anti-join semantics without allocating a full hash table for that side.
+/// non-spillable build side regardless of join type. For q21's correlated
+/// `NOT EXISTS` self-join (a `LeftAnti`) that build side can be a large
+/// multi-way `order_line` result; the same shape arises in `EXISTS` /
+/// `IN (subquery)` constructs that decorrelate into `LeftSemi`. Sort-merge
+/// preserves the join semantics for each of these types while keeping the
+/// build side spillable.
 #[derive(Default)]
 pub struct CayenneAntiJoinSortMergeRewriter;
 
-/// Only rewrite anti joins whose preserved side is large enough that the
-/// spillable sort-merge shape is worth its two explicit sort buffers.
+/// Only rewrite same-source anti or semi joins whose LEFT (build) input has
+/// `Precision::Exact` row count exceeding this threshold. Below it the
+/// in-memory hash table is faster than two explicit sort buffers.
 const ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS: usize = 10_000_000;
 
 impl CayenneAntiJoinSortMergeRewriter {
@@ -260,7 +265,15 @@ struct FilterAddition {
 fn filter_additions_for_join(
     hash_join: &HashJoinExec,
 ) -> (Vec<FilterAddition>, Vec<FilterAddition>) {
-    if *hash_join.join_type() != JoinType::Inner {
+    // `Inner`, `LeftSemi`, and `RightSemi` all preserve the equi-key domain:
+    // a dynamic filter built from one side is also a valid filter for an
+    // equi-joined same-source scan on the other side. `LeftAnti`/`RightAnti`
+    // do not — their output requires the absence of a match, so propagating
+    // the filter would drop rows that should be retained.
+    if !matches!(
+        *hash_join.join_type(),
+        JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi,
+    ) {
         return (Vec::new(), Vec::new());
     }
 
@@ -338,9 +351,13 @@ fn filter_additions_for_join(
 fn try_rewrite_same_source_anti_join(
     hash_join: &HashJoinExec,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
+    // Same-source `LeftAnti`/`RightAnti`/`LeftSemi`/`RightSemi` joins all
+    // share the relevant property: `HashJoinExec` builds the LEFT input into
+    // a non-spillable hash table, so a large build side risks OOM. Sort-merge
+    // is spillable and preserves the join semantics for each of these types.
     if !matches!(
         hash_join.join_type(),
-        JoinType::LeftAnti | JoinType::RightAnti
+        JoinType::LeftAnti | JoinType::RightAnti | JoinType::LeftSemi | JoinType::RightSemi,
     ) {
         return Ok(None);
     }
@@ -353,7 +370,7 @@ fn try_rewrite_same_source_anti_join(
         return Ok(None);
     }
 
-    let Some(build_row_count) = anti_join_build_input_exact_rows(hash_join) else {
+    let Some(build_row_count) = spillable_rewrite_build_input_exact_rows(hash_join) else {
         return Ok(None);
     };
     if build_row_count <= ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS {
@@ -399,15 +416,20 @@ fn try_rewrite_same_source_anti_join(
         join_type = ?hash_join.join_type(),
         build_row_count,
         threshold = ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS,
-        "Replacing same-source Cayenne anti HashJoinExec with SortMergeJoinExec"
+        "Replacing same-source Cayenne anti/semi HashJoinExec with SortMergeJoinExec"
     );
 
     Ok(Some(Arc::new(join)))
 }
 
-fn anti_join_build_input_exact_rows(hash_join: &HashJoinExec) -> Option<usize> {
+fn spillable_rewrite_build_input_exact_rows(hash_join: &HashJoinExec) -> Option<usize> {
+    // `HashJoinExec` materializes the LEFT input as the (non-spillable) build
+    // hash table regardless of join type — including `*Anti` and `*Semi`.
     let build_input = match hash_join.join_type() {
-        JoinType::LeftAnti | JoinType::RightAnti => hash_join.left(),
+        JoinType::LeftAnti
+        | JoinType::RightAnti
+        | JoinType::LeftSemi
+        | JoinType::RightSemi => hash_join.left(),
         _ => return None,
     };
 
@@ -1361,7 +1383,10 @@ mod tests {
     }
 
     #[test]
-    fn does_not_share_dynamic_filter_for_non_inner_join() {
+    fn does_not_share_dynamic_filter_for_anti_join() {
+        // `*Anti` joins must not receive a shared dynamic filter: their
+        // output requires the *absence* of a match, so filtering the probe
+        // side would drop rows that the anti-join should preserve.
         let schema = order_line_schema();
         let source_filter = dynamic_filter_for("order_id", &schema);
         let left = cayenne_file_exec(
@@ -1391,6 +1416,71 @@ mod tests {
             .expect("right side should remain Cayenne");
 
         assert!(right.dynamic_filters().is_empty());
+    }
+
+    #[test]
+    fn shares_dynamic_filter_for_left_semi_join() {
+        // `LeftSemi` preserves the equi-key domain: a dynamic filter built
+        // from the left side is also valid on a same-source equi-joined
+        // right scan, since the semi join's output is a subset of the left.
+        let schema = order_line_schema();
+        let source_filter = dynamic_filter_for("order_id", &schema);
+        let left = cayenne_file_exec(
+            &schema,
+            "order_line.vortex",
+            Some(Arc::clone(&source_filter)),
+        );
+        let right = cayenne_file_exec(&schema, "order_line.vortex", None);
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::LeftSemi,
+            NullEquality::NullEqualsNothing,
+        ));
+
+        let optimized = optimize_filter_sharing(join);
+        let join = optimized
+            .as_any()
+            .downcast_ref::<HashJoinExec>()
+            .expect("optimized plan should remain a hash join");
+        let right = join
+            .right()
+            .as_any()
+            .downcast_ref::<CayenneAccelerationExec>()
+            .expect("right side should remain Cayenne");
+        let filters = right.dynamic_filters();
+
+        assert_eq!(1, filters.len(), "semi join should propagate same-source filter");
+        assert!(Arc::ptr_eq(filters[0].filter(), &source_filter));
+    }
+
+    #[test]
+    fn rewrites_same_source_left_semi_hash_join_to_sort_merge() {
+        // Same memory concern as `LeftAnti`: `HashJoinExec` materializes the
+        // LEFT input as a non-spillable hash table, and a large same-source
+        // semi-join build side risks OOM.
+        let schema = order_line_schema();
+        let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let right = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::LeftSemi,
+            NullEquality::NullEqualsNothing,
+        ));
+
+        let optimized = optimize_anti_join_sort_merge(join);
+        assert!(
+            optimized
+                .as_any()
+                .downcast_ref::<SortMergeJoinExec>()
+                .is_some(),
+            "same-source Cayenne LeftSemi join should use sort-merge join"
+        );
     }
 
     #[test]

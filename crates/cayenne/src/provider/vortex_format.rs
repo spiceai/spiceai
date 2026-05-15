@@ -512,12 +512,17 @@ fn contains_decimal_to_floating_cast(expr: &dyn PhysicalExpr, schema: &Schema) -
         }
     }
 
-    if let Some(dynamic_filter) = expr
+    if expr
         .as_any()
         .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
-        && let Ok(current) = dynamic_filter.current()
-        && contains_decimal_to_floating_cast(current.as_ref(), schema)
+        .is_some()
     {
+        // Conservatively skip Vortex predicate pushdown for any filter containing a
+        // DynamicFilterPhysicalExpr. The runtime predicate (from `current()`) is populated
+        // during execution by the join build side and may contain decimal-to-float casts
+        // due to type coercion on join keys, even if the planning-time snapshot does not.
+        // Treating DynamicFilter nodes as "contains bad cast" ensures we never push an
+        // unsafe filter to Vortex, preserving data correctness over pushdown coverage.
         return true;
     }
 
@@ -534,13 +539,11 @@ fn contains_decimal_to_floating_cast(expr: &dyn PhysicalExpr, schema: &Schema) -
 #[derive(Debug)]
 struct InexactStatsExec {
     inner: Arc<dyn ExecutionPlan>,
-    properties: PlanProperties,
 }
 
 impl InexactStatsExec {
     fn new(inner: Arc<dyn ExecutionPlan>) -> Self {
-        let properties = inner.properties().clone();
-        Self { inner, properties }
+        Self { inner }
     }
 }
 
@@ -566,7 +569,7 @@ impl ExecutionPlan for InexactStatsExec {
     }
 
     fn properties(&self) -> &PlanProperties {
-        &self.properties
+        self.inner.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
