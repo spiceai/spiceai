@@ -1085,7 +1085,7 @@ mod tests {
 
     /// Regression test for the post-decorrelation re-propagation bug
     /// (`cayenne::logical_optimizer`): after the rule wraps a Filter with
-    /// `InSubquery` and DataFusion decorrelates it to `LeftSemi`, the
+    /// `InSubquery` and `DataFusion` decorrelates it to `LeftSemi`, the
     /// optimizer iterates the rule pipeline to fixed point. Without the
     /// cycle-detection fix in `analyze_logical_side`, the rule would re-fire
     /// each pass and stack one redundant `LeftSemi` per iteration up to
