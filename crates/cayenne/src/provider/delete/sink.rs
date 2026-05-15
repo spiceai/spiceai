@@ -46,12 +46,12 @@ limitations under the License.
 //! 6. Update in-memory caches for immediate query consistency
 
 use super::super::Error;
-use super::super::constants::LISTING_TABLE_LOCK_POISONED;
 use super::super::deletion_strategy::PkDeletionStrategyWithCache;
 use super::super::utils::convert_to_u64_box;
 use super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use crate::catalog::MetadataCatalog;
 use crate::metadata::TableMetadata;
+use arc_swap::ArcSwap;
 use arrow::array::ArrayRef;
 use arrow_row::RowConverter;
 use arrow_schema::SchemaRef;
@@ -70,7 +70,7 @@ use datafusion_expr::Expr;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use futures::StreamExt;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
 // Position-based deletion methods implemented in sink/position_based.rs
@@ -89,7 +89,7 @@ pub(crate) mod file_based;
 pub struct CayenneDeletionSink {
     table_metadata: TableMetadata,
     catalog: Arc<dyn MetadataCatalog>,
-    listing_table: Arc<RwLock<Arc<ListingTable>>>,
+    listing_table: Arc<ArcSwap<ListingTable>>,
     schema: SchemaRef,
     filters: Vec<Expr>,
     /// Deletion strategy for this table, with embedded caches.
@@ -115,7 +115,7 @@ impl CayenneDeletionSink {
     pub fn new(
         table_metadata: TableMetadata,
         catalog: Arc<dyn MetadataCatalog>,
-        listing_table: Arc<RwLock<Arc<ListingTable>>>,
+        listing_table: Arc<ArcSwap<ListingTable>>,
         schema: SchemaRef,
         filters: &[Expr],
         pk_deletion_strategy: PkDeletionStrategyWithCache,
@@ -753,13 +753,11 @@ impl DeletionSink for CayenneDeletionSink {
             Arc::clone(&self.runtime_env),
         );
 
-        let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| Error::LockPoisoned {
-                table: self.table_metadata.table_name.clone(),
-                lock: LISTING_TABLE_LOCK_POISONED,
-            })?;
-            Arc::clone(&guard)
-        };
+        // Wait-free ArcSwap snapshot. Concurrent listing-table refreshes are
+        // serialized against this code path by `self.write_lock`, which the
+        // caller holds (or, for sub-sinks, is held by the orchestrating
+        // operation), so we never observe a torn swap here.
+        let listing_table = self.listing_table.load_full();
 
         // Collect all tables to scan: main listing table + protected snapshots
         let mut all_tables = vec![Arc::clone(&listing_table)];
