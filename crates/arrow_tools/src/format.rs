@@ -563,16 +563,10 @@ fn truncate_list_view_array(
     }
     let child_array = list_array.values();
     let sizes = list_array.value_sizes();
-    // Fast path for ListView: sizes are stored explicitly, cheap any() scan.
-    // When no element exceeds the limit we return the original (preserving
-    // whatever non-contiguous view layout the caller had).
-    let needs_trunc = sizes.iter().try_fold(false, |needs_trunc, &size| {
-        if needs_trunc {
-            return Ok::<_, ArrowError>(true);
-        }
-
-        value_to_usize(size, "ListViewArray size").map(|size| size > max_len)
-    })?;
+    // Fast path for ListView: sizes are stored explicitly, cheap raw scan.
+    // Safe on 64-bit (project minimum) with validated Arrow sizes. We keep the
+    // fallible path only for the actual truncation work.
+    let needs_trunc = sizes.iter().any(|&size| (size as usize) > max_len);
     if !needs_trunc {
         return Ok(list_array.clone());
     }
