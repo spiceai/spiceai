@@ -73,6 +73,7 @@ partition-table-provider = ["dep:runtime-table-partition"]
 criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 datafusion-federation.workspace = true
 datafusion-functions = { workspace = true }
+duckdb = { workspace = true, features = ["bundled"] }
 insta = { workspace = true, features = ["json"] }
 paste.workspace = true
 rstest = "0.26.1"
@@ -101,6 +102,22 @@ name = "mutation_writer"
 [[bench]]
 harness = false
 name = "listing_fence_overhead"
+
+[[bench]]
+harness = false
+name = "vs_duckdb_ingest"
+
+[[bench]]
+harness = false
+name = "vs_duckdb_scan"
+
+[[bench]]
+harness = false
+name = "vs_duckdb_pk_lookup"
+
+[[bench]]
+harness = false
+name = "vs_duckdb_delete"
 
 [[bench]]
 harness = false

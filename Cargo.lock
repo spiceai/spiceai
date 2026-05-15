@@ -3415,6 +3415,7 @@ dependencies = [
  "datafusion-physical-expr",
  "datafusion-physical-plan",
  "datafusion-table-providers",
+ "duckdb",
  "flatbuffers",
  "futures",
  "hash-index",
