@@ -24,7 +24,11 @@ limitations under the License.
 
 use std::hint::black_box;
 
-use cayenne::provider::compaction::{CompactionPickerConfig, FileEntry, pick_candidates};
+#[allow(dead_code)]
+#[path = "../src/provider/compaction.rs"]
+mod compaction;
+
+use compaction::{CompactionPickerConfig, FileEntry, pick_candidates};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 fn synthetic_files(count: usize) -> Vec<FileEntry<String>> {

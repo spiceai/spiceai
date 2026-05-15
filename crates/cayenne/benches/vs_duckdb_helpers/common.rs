@@ -231,12 +231,10 @@ pub async fn cayenne_insert_from_parquet(
     use datafusion::prelude::{ParquetReadOptions, SessionContext};
     use datafusion_expr::dml::InsertOp;
 
+    let parquet_path = parquet_path.to_string_lossy().into_owned();
     let ctx = SessionContext::new();
     let df = ctx
-        .read_parquet(
-            parquet_path.to_string_lossy().as_ref(),
-            ParquetReadOptions::default(),
-        )
+        .read_parquet::<&str>(parquet_path.as_str(), ParquetReadOptions::default())
         .await
         .expect("cayenne read_parquet");
     let input_exec = df

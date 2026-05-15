@@ -4878,9 +4878,22 @@ impl CayenneTableProvider {
         // Persist table stats from the checkpoint write (best-effort; logs on error).
         self.persist_table_stats(&stats).await;
 
-        self.clear_inlined_metadata_after_checkpoint().await?;
-
-        self.refresh_listing_table().await?;
+        // Hold the listing fence across BOTH the catalog clear and the
+        // listing-table swap. Without bracketing, a scan that starts between
+        // the clear and the refresh observes the metastore as already empty
+        // of inlined rows AND the listing table as still pointing at the old
+        // snapshot (missing the freshly-checkpointed Vortex file) — so the
+        // just-checkpointed rows disappear from the visible state briefly.
+        // The fence write blocks new readers for the duration of these two
+        // catalog ops (microseconds in the typical case), so concurrent
+        // scans always observe either the pre-checkpoint state (old listing
+        // + inlined data) or the post-checkpoint state (new listing + no
+        // inlined data).
+        {
+            let _fence = self.listing_fence.write().await;
+            self.clear_inlined_metadata_after_checkpoint().await?;
+            self.refresh_listing_table_under_held_fence()?;
+        }
 
         Ok(u64::try_from(total_rows).unwrap_or(u64::MAX))
     }

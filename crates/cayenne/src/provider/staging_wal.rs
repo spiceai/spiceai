@@ -788,6 +788,8 @@ impl CayenneTableProvider {
         };
 
         if let Some((wal, wal_location)) = wal {
+            let table_name = self.table_name().to_string();
+
             // Best-effort automated recovery:
             // Re-drive the move of any remaining files listed in the WAL from
             // staging into the target snapshot, then remove the WAL.
@@ -799,7 +801,7 @@ impl CayenneTableProvider {
             // no longer exists (very old WAL after many compactions) or the
             // move fails irrecoverably, we still return IncompleteWrite.
             tracing::warn!(
-                table = %self.table_name(),
+                table = table_name.as_str(),
                 wal_location = %wal_location,
                 target_snapshot = %wal.target_snapshot,
                 staged_files = wal.staged_files.len(),
@@ -811,19 +813,19 @@ impl CayenneTableProvider {
                     // Move succeeded (or was a no-op). Remove the WAL.
                     self.remove_staging_wal().await.ok();
                     tracing::info!(
-                        table = %self.table_name(),
+                        table = table_name.as_str(),
                         "Automated recovery from incomplete write succeeded; table is now writable"
                     );
                     return Ok(());
                 }
                 Err(e) => {
                     tracing::error!(
-                        table = %self.table_name(),
+                        table = table_name.as_str(),
                         error = %e,
                         "Automated recovery from incomplete write failed — manual intervention required"
                     );
                     return Err(Error::IncompleteWrite {
-                        table: self.table_name().to_string(),
+                        table: table_name,
                         message: format!(
                             "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Automated recovery was attempted but failed ({}). Manual resolution is required. The WAL file is located at '{wal_location}'.",
                             wal.staged_files.len(),

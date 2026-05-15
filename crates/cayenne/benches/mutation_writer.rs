@@ -367,8 +367,6 @@ fn bench_compaction_overhead(c: &mut Criterion) {
 /// the memtable), then measure the time for a single explicit compaction
 /// trigger.
 fn bench_compaction_throughput(c: &mut Criterion) {
-    use cayenne::provider::compaction::CompactionRunner;
-
     let rt = Runtime::new().expect("runtime");
     let mut group = c.benchmark_group("mutation_writer_compaction_throughput");
     group.sample_size(10);
@@ -412,7 +410,7 @@ fn bench_compaction_throughput(c: &mut Criterion) {
                         rt.block_on(async move {
                             let ran = bench_table
                                 .table
-                                .run_compaction_trigger()
+                                .maybe_compact_small_files()
                                 .await
                                 .expect("compaction should succeed");
                             black_box((bench_table, ran));
