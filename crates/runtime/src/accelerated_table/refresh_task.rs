@@ -1591,35 +1591,34 @@ impl RefreshTask {
         // task. We only pay the (hopefully small) cost of loading the NULL-time
         // subset; the > max tail optimization is preserved for the non-null
         // recent data. If the time_column is non-nullable, we skip this path.
-        if let Some(tc) = &refresh.time_column {
-            if self
+        if let Some(tc) = &refresh.time_column
+            && self
                 .accelerator
                 .schema()
                 .column_with_name(tc)
-                .map_or(false, |(_, f)| f.is_nullable())
-            {
-                let null_time_rows = accelerator_df(
-                    &Arc::clone(&self.accelerator),
-                    &Self::create_refresh_df_context(
-                        Arc::clone(&federated_provider),
-                        &self.dataset_name,
-                        &self.accelerator,
-                        self.disable_federation,
-                        self.io_runtime.clone(),
-                    )
-                    .await,
+                .is_some_and(|(_, f)| f.is_nullable())
+        {
+            let null_time_rows = accelerator_df(
+                &Arc::clone(&self.accelerator),
+                &Self::create_refresh_df_context(
+                    Arc::clone(&federated_provider),
+                    &self.dataset_name,
+                    &self.accelerator,
+                    self.disable_federation,
+                    self.io_runtime.clone(),
                 )
-                .map_err(find_datafusion_root)
-                .context(super::UnableToScanTableProviderSnafu)?
-                .filter(col(tc).is_null())
-                .map_err(find_datafusion_root)
-                .context(super::UnableToScanTableProviderSnafu)?
-                .collect()
-                .await
-                .map_err(find_datafusion_root)
-                .context(super::UnableToScanTableProviderSnafu)?;
-                existing_records.extend(null_time_rows);
-            }
+                .await,
+            )
+            .map_err(find_datafusion_root)
+            .context(super::UnableToScanTableProviderSnafu)?
+            .filter(col(tc).is_null())
+            .map_err(find_datafusion_root)
+            .context(super::UnableToScanTableProviderSnafu)?
+            .collect()
+            .await
+            .map_err(find_datafusion_root)
+            .context(super::UnableToScanTableProviderSnafu)?;
+            existing_records.extend(null_time_rows);
         }
 
         // Use the update stream's schema for dedup comparison, not the full federated
@@ -3037,7 +3036,11 @@ mod tests {
         // whether large numbers of NULL-time rows could cause memory pressure — in
         // practice the "timeless" set is expected to be small relative to the recent tail;
         // if not, a follow-up can add a bounded collection or fall back to on-conflict upsert.
-        assert_eq!(collected.data.len(), 1, "one output batch after NULL-time dedup fix");
+        assert_eq!(
+            collected.data.len(),
+            1,
+            "one output batch after NULL-time dedup fix"
+        );
         assert_eq!(
             collected.data[0].num_rows(),
             1,
@@ -3049,6 +3052,10 @@ mod tests {
             .as_any()
             .downcast_ref::<Int32Array>()
             .expect("id column should be Int32 in NULL-time dedup test");
-        assert_eq!(id_col.value(0), 2, "remaining row after fix should be the new id=2 (NULL dup was filtered)");
+        assert_eq!(
+            id_col.value(0),
+            2,
+            "remaining row after fix should be the new id=2 (NULL dup was filtered)"
+        );
     }
 }

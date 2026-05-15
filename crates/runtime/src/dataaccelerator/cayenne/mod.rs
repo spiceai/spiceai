@@ -733,9 +733,7 @@ impl CayenneAccelerator {
         let provider = Arc::new(cayenne_table);
         let spawned = provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
         if spawned {
-            tracing::debug!(
-                "Background compaction task spawned for Cayenne table {table_name}",
-            );
+            tracing::debug!("Background compaction task spawned for Cayenne table {table_name}",);
         }
         Ok(provider)
     }
@@ -860,7 +858,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Maximum number of consecutive compaction passes per trigger. Bounds write amplification when promotion keeps producing new candidates. Default: 3.")
             .default("3"),
         ParameterSpec::component("compaction_max_files_per_pick")
-            .description("Maximum number of files combined in one compaction pass. Keeps individual passes bounded in IO and memory. Default: 32.")
+            .description("Maximum number of eligible file paths retained in one compaction candidate for trigger selection and observability. The current compactor rewrites the whole current snapshot once triggered, so this does not bound rewrite IO or memory. Default: 32.")
             .default("32"),
         ParameterSpec::component("compaction_background_interval_ms")
             .description("Background compaction interval in milliseconds. The accelerator runs a per-table background task at this interval. Set to 0 to disable the background task — inline compaction on writes still runs. Default: 30000.")
@@ -1643,7 +1641,7 @@ impl std::fmt::Debug for CayennePartitionCreator {
             .field("primary_key", &self.primary_key)
             .field("on_conflict", &self.on_conflict.is_some())
             .field("context", &"<CayenneContext>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1907,8 +1905,7 @@ impl PartitionCreator for CayennePartitionCreator {
                 .context(creator::InferringPartitionsSnafu)?;
 
             let partition_provider = Arc::new(cayenne_table);
-            partition_provider
-                .spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
+            partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
             result.push(Partition {
                 partition_values,
                 table_provider: partition_provider,

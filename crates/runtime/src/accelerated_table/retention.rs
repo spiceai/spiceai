@@ -97,7 +97,7 @@ impl super::AcceleratedTable {
                         if accelerator
                             .schema()
                             .column_with_name(time_column)
-                            .map_or(false, |(_, f)| f.is_nullable())
+                            .is_some_and(|(_, f)| f.is_nullable())
                         {
                             tracing::warn!(
                                 "[retention] time_column '{time_column}' for dataset {dataset_name} is nullable. \
