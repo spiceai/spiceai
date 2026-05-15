@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,19 +24,19 @@ limitations under the License.
 //! "actual truncation" (exercises the slice+concat / collect paths).
 
 use arrow::array::{
-    FixedSizeListArray, Int32Array, ListArray, ListViewArray, StringArray, StringViewArray,
-    StringViewBuilder,
+    FixedSizeListArray, Int32Array, ListArray, ListViewArray, StringArray, StringViewBuilder,
 };
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_tools::record_batch::{truncate_numeric_column_length, truncate_string_columns};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use std::sync::Arc;
 
 /// Creates a batch where *no* string needs truncation at the given limit.
 /// This exercises the new UTF8 fast-path (cheap any() + early Arc::clone).
-fn make_all_short_string_batch(n: usize, max_chars: usize) -> RecordBatch {
+fn make_all_short_string_batch(n: usize, _max_chars: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, true)]));
     // All strings are ASCII and well under the limit
     let short = "short".repeat(3); // ~15 chars
@@ -111,8 +111,14 @@ fn make_all_short_list_batch(n: usize, max_elems: usize) -> RecordBatch {
     )]));
     let per_list = max_elems.min(5);
     let total_values = n * per_list;
-    let values = Int32Array::from((0..total_values).collect::<Vec<_>>());
-    let offsets: Vec<i32> = (0..=n).map(|i| (i * per_list as i32)).collect();
+    let values = Int32Array::from(
+        (0..total_values)
+            .map(|v| i32::try_from(v).expect("value fits in i32"))
+            .collect::<Vec<i32>>(),
+    );
+    let offsets: Vec<i32> = (0..=n)
+        .map(|i| i32::try_from(i * per_list).expect("offset fits in i32"))
+        .collect();
     let list = ListArray::new(
         Arc::new(Field::new("item", DataType::Int32, true)),
         OffsetBuffer::<i32>::new(offsets.into()),
@@ -131,8 +137,14 @@ fn make_long_list_batch(n: usize, truncate_to: usize) -> RecordBatch {
     )]));
     let per_list = truncate_to + 15; // will need truncation
     let total_values = n * per_list;
-    let values = Int32Array::from((0..total_values).collect::<Vec<_>>());
-    let offsets: Vec<i32> = (0..=n).map(|i| (i * per_list as i32)).collect();
+    let values = Int32Array::from(
+        (0..total_values)
+            .map(|v| i32::try_from(v).expect("value fits in i32"))
+            .collect::<Vec<i32>>(),
+    );
+    let offsets: Vec<i32> = (0..=n)
+        .map(|i| i32::try_from(i * per_list).expect("offset fits in i32"))
+        .collect();
     let list = ListArray::new(
         Arc::new(Field::new("item", DataType::Int32, true)),
         OffsetBuffer::<i32>::new(offsets.into()),
@@ -153,9 +165,16 @@ fn make_all_short_list_view_batch(n: usize, max_elems: usize) -> RecordBatch {
     )]));
     let per_list = max_elems.min(5);
     let total_values = n * per_list;
-    let values = Int32Array::from((0..total_values).collect::<Vec<_>>());
-    let offsets: Vec<i32> = (0..n).map(|i| (i * per_list as i32)).collect();
-    let sizes: Vec<i32> = (0..n).map(|_| per_list as i32).collect();
+    let values = Int32Array::from(
+        (0..total_values)
+            .map(|v| i32::try_from(v).expect("value fits in i32"))
+            .collect::<Vec<i32>>(),
+    );
+    let offsets: Vec<i32> = (0..n)
+        .map(|i| i32::try_from(i * per_list).expect("offset fits in i32"))
+        .collect();
+    let per_list_i32 = i32::try_from(per_list).expect("per_list fits in i32");
+    let sizes: Vec<i32> = (0..n).map(|_| per_list_i32).collect();
     let list_view = ListViewArray::try_new(
         Arc::new(Field::new("item", DataType::Int32, true)),
         ScalarBuffer::<i32>::from(offsets),
@@ -175,9 +194,16 @@ fn make_long_list_view_batch(n: usize, truncate_to: usize) -> RecordBatch {
     )]));
     let per_list = truncate_to + 15;
     let total_values = n * per_list;
-    let values = Int32Array::from((0..total_values).collect::<Vec<_>>());
-    let offsets: Vec<i32> = (0..n).map(|i| (i * per_list as i32)).collect();
-    let sizes: Vec<i32> = (0..n).map(|_| per_list as i32).collect();
+    let values = Int32Array::from(
+        (0..total_values)
+            .map(|v| i32::try_from(v).expect("value fits in i32"))
+            .collect::<Vec<i32>>(),
+    );
+    let offsets: Vec<i32> = (0..n)
+        .map(|i| i32::try_from(i * per_list).expect("offset fits in i32"))
+        .collect();
+    let per_list_i32 = i32::try_from(per_list).expect("per_list fits in i32");
+    let sizes: Vec<i32> = (0..n).map(|_| per_list_i32).collect();
     let list_view = ListViewArray::try_new(
         Arc::new(Field::new("item", DataType::Int32, true)),
         ScalarBuffer::<i32>::from(offsets),
@@ -192,7 +218,7 @@ fn make_long_list_view_batch(n: usize, truncate_to: usize) -> RecordBatch {
 /// FixedSizeList<i32> versions (exercises the FixedSizeList fast-path, which is
 /// the cheapest of all — just a uniform size comparison — plus the stride-based
 /// slicing + concat work path).
-fn make_all_short_fixed_size_list_batch(n: usize, max_elems: usize) -> RecordBatch {
+fn make_all_short_fixed_size_list_batch(n: usize, _max_elems: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "nums",
         DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 5),
@@ -200,7 +226,11 @@ fn make_all_short_fixed_size_list_batch(n: usize, max_elems: usize) -> RecordBat
     )]));
     let per_list = 5usize;
     let total_values = n * per_list;
-    let values = Int32Array::from((0..total_values).collect::<Vec<_>>());
+    let values = Int32Array::from(
+        (0..total_values)
+            .map(|v| i32::try_from(v).expect("value fits in i32"))
+            .collect::<Vec<i32>>(),
+    );
     let list = FixedSizeListArray::new(
         Arc::new(Field::new("item", DataType::Int32, true)),
         5,
@@ -220,7 +250,11 @@ fn make_long_fixed_size_list_batch(n: usize, _truncate_to: usize) -> RecordBatch
     )]));
     let per_list = 20usize;
     let total_values = n * per_list;
-    let values = Int32Array::from((0..total_values).collect::<Vec<_>>());
+    let values = Int32Array::from(
+        (0..total_values)
+            .map(|v| i32::try_from(v).expect("value fits in i32"))
+            .collect::<Vec<i32>>(),
+    );
     let list = FixedSizeListArray::new(
         Arc::new(Field::new("item", DataType::Int32, true)),
         20,

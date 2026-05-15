@@ -75,7 +75,7 @@ pub(crate) fn format_column_data(
                 .as_any()
                 .downcast_ref::<arrow::array::StringArray>()
                 .ok_or(ArrowError::CastError(
-                    "Failed to downcast to ListArray".into(),
+                    "Failed to downcast to StringArray".into(),
                 ))?;
 
             // Fast path: zero-copy when no string requires character truncation.
@@ -1775,7 +1775,7 @@ Cras venenatis euismod malesuada.",
         let out_fast = truncate_list_view_array(&input, 100).expect("fast path");
         assert_eq!(out_fast.len(), 3);
         assert!(out_fast.is_null(1));
-        assert_eq!(out_fast.value_sizes().as_ref(), &[3, 0, 1]); // unchanged layout
+        assert_eq!(out_fast.value_sizes(), &[3, 0, 1]); // unchanged layout
 
         // max_len=0 path
         let out_zero = truncate_list_view_array(&input, 0).expect("zero len view");
