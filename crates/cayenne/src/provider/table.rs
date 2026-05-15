@@ -751,6 +751,19 @@ pub struct CayenneTableProvider {
     /// `PreparedStagedAppend` is dropped without cleanup the flag stays `true`,
     /// forcing the next writer to re-check disk and recover or error.
     staging_wal_present: Arc<AtomicBool>,
+    /// Tracks whether the `_staging/` directory may contain files from a
+    /// previous or in-progress write. Used to fast-path `clear_staging_dir`
+    /// (which does an expensive recursive delete or S3 List+DeletePrefix on
+    /// every append). Initialized true so the first use after open/restart
+    /// always cleans any orphan files left by a crash between a clear and the
+    /// subsequent WAL write (the pre-WAL orphan case).
+    ///
+    /// Set true immediately before any code path that will write Vortex files
+    /// into the staging directory. Set false after a successful clear or after
+    /// a successful staged-append finalize (move + WAL removal) that empties
+    /// staging. The write_lock serializes writers, so the flag is a reliable
+    /// "we left it clean" signal between appends in the same process.
+    staging_may_have_files: Arc<AtomicBool>,
     /// Serializes concurrent compaction passes on this table so a write-driven
     /// inline trigger and the background scheduler can't both rewrite the
     /// current snapshot at the same time. Held across the *entire* trigger
@@ -1125,6 +1138,10 @@ impl CayenneTableProvider {
 
     pub(crate) fn staging_wal_present(&self) -> &AtomicBool {
         &self.staging_wal_present
+    }
+
+    pub(crate) fn staging_may_have_files(&self) -> &AtomicBool {
+        &self.staging_may_have_files
     }
 
     #[must_use]
@@ -1550,6 +1567,15 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if the directory cannot be cleaned or created.
     pub(crate) async fn clear_staging_dir(&self) -> Result<()> {
+        // Fast path: if a previous append completed cleanly (or this is the
+        // first write after open and no orphan files were present), staging is
+        // known empty. Skipping the recursive delete / S3 List+DeletePrefix
+        // removes a significant per-write cost for the common small-append
+        // (inline) ingestion path, especially on S3.
+        if !self.staging_may_have_files().load(Ordering::Acquire) {
+            return Ok(());
+        }
+
         if self.table_metadata.path.starts_with("s3://") {
             // S3: delete all objects under the staging prefix
             if let Some(prefix) = self.snapshot_object_store_prefix(STAGING_DIR_NAME)? {
@@ -1569,6 +1595,9 @@ impl CayenneTableProvider {
             }
             tokio::fs::create_dir_all(&staging_dir).await?;
         }
+
+        // Staging is now known to be empty.
+        self.staging_may_have_files().store(false, Ordering::Release);
         Ok(())
     }
 
@@ -2073,6 +2102,7 @@ impl CayenneTableProvider {
             protected_snapshots: Arc::new(RwLock::new(protected_snapshots)),
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
             staging_wal_present: Arc::new(AtomicBool::new(true)),
+            staging_may_have_files: Arc::new(AtomicBool::new(true)),
             compaction_lock: Arc::new(tokio::sync::Mutex::new(())),
             background_compactor: Arc::new(std::sync::OnceLock::new()),
         };
@@ -2477,6 +2507,7 @@ impl CayenneTableProvider {
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
             staging_wal_present: Arc::clone(&self.staging_wal_present),
+            staging_may_have_files: Arc::clone(&self.staging_may_have_files),
             // Shared so inline (write-driven) and background compaction
             // attempts on the same table coordinate, even across clones.
             compaction_lock: Arc::clone(&self.compaction_lock),

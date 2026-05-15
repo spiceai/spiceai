@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
@@ -360,6 +361,14 @@ impl<'a> AppendMutationWriter<'a> {
         stream: SendableRecordBatchStream,
         target_size_bytes: usize,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
+        // We are about to (or have started to) write Vortex files into the
+        // staging directory. Mark it "dirty" so the next clear_staging_dir
+        // (on this or a future writer, or on recovery after a crash) will
+        // actually perform the cleanup instead of taking the fast path.
+        self.table
+            .staging_may_have_files()
+            .store(true, Ordering::Release);
+
         let result = match self
             .table
             .write_to_snapshot(

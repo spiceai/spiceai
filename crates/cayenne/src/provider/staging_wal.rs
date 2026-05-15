@@ -653,6 +653,7 @@ impl CayenneTableProvider {
                 match config.store.delete(&wal_key).await {
                     Ok(()) | Err(object_store::Error::NotFound { .. }) => {
                         self.staging_wal_present().store(false, Ordering::Release);
+                        self.staging_may_have_files().store(false, Ordering::Release);
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -681,6 +682,7 @@ impl CayenneTableProvider {
 
             if removed {
                 self.staging_wal_present().store(false, Ordering::Release);
+                self.staging_may_have_files().store(false, Ordering::Release);
                 // Durability: after removing the WAL marker (the "commit success" signal),
                 // fsync the staging directory so the unlink is persisted. A crash without
                 // this sync could make the removal non-durable, causing a false-positive
