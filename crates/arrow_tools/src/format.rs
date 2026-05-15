@@ -1658,8 +1658,8 @@ Cras venenatis euismod malesuada.",
     /// (including metadata/nullable) are preserved exactly.
     #[test]
     fn test_truncate_list_to_zero_elements() {
-        use arrow::array::{Int32Array, ListArray as ListArrayAlias, ListViewArray as ListViewArrayAlias};
-        use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+        use arrow::array::{Int32Array, ListArray as ListArrayAlias};
+        use arrow::buffer::{NullBuffer, OffsetBuffer};
 
         let element_field = Arc::new(
             Field::new("value", DataType::Int32, false)
@@ -1667,9 +1667,10 @@ Cras venenatis euismod malesuada.",
         );
 
         // List<i32> with mixed lengths + one parent NULL
+        // lists: [0,1,2], [], [3,4,5], [6]  (values 0..6)
         let list = ListArrayAlias::new(
             Arc::clone(&element_field),
-            OffsetBuffer::<i32>::new(vec![0_i32, 3, 3, 6, 8].into()),
+            OffsetBuffer::<i32>::new(vec![0_i32, 3, 3, 6, 7].into()),
             Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7])),
             Some(NullBuffer::from(vec![true, false, true, true])),
         );
@@ -1767,15 +1768,13 @@ Cras venenatis euismod malesuada.",
             None,
         );
 
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(short), Arc::new(long)],
-        )
-        .expect("batch");
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(short), Arc::new(long)])
+                .expect("batch");
 
         // max_elements=3 : short_lists hits fast path (no change), long_lists truncated
-        let processed = truncate_numeric_column_length(&batch, 3)
-            .expect("truncate_numeric_column_length");
+        let processed =
+            truncate_numeric_column_length(&batch, 3).expect("truncate_numeric_column_length");
 
         assert_eq!(processed.num_columns(), 2);
         // First column should be the exact same Arc (fast path clone in practice
