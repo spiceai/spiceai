@@ -24,7 +24,8 @@ limitations under the License.
 //! "actual truncation" (exercises the slice+concat / collect paths).
 
 use arrow::array::{
-    FixedSizeListArray, Int32Array, ListArray, ListViewArray, StringArray, StringViewBuilder,
+    FixedSizeListArray, Int32Array, LargeListViewArray, ListArray, ListViewArray, StringArray,
+    StringViewBuilder,
 };
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -264,6 +265,61 @@ fn make_long_fixed_size_list_batch(n: usize, _truncate_to: usize) -> RecordBatch
     RecordBatch::try_new(schema, vec![Arc::new(list)]).expect("valid batch")
 }
 
+/// LargeListView<i32> versions (completes benchmark coverage for all five list
+/// variants that received full support during the type audit; i64 offsets/sizes
+/// + more complex offset rebuild in the work path).
+fn make_all_short_large_list_view_batch(n: usize, max_elems: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "nums",
+        DataType::LargeListView(Arc::new(Field::new("item", DataType::Int32, true))),
+        true,
+    )]));
+    let per_list = max_elems.min(5);
+    let total_values = n * per_list;
+    let values = Int32Array::from(
+        (0..total_values)
+            .map(|v| i32::try_from(v).expect("value fits in i32"))
+            .collect::<Vec<i32>>(),
+    );
+    let offsets: Vec<i64> = (0..n).map(|i| (i * per_list as i64)).collect();
+    let sizes: Vec<i64> = (0..n).map(|_| per_list as i64).collect();
+    let list_view = LargeListViewArray::try_new(
+        Arc::new(Field::new("item", DataType::Int32, true)),
+        ScalarBuffer::<i64>::from(offsets),
+        ScalarBuffer::<i64>::from(sizes),
+        Arc::new(values),
+        None,
+    )
+    .expect("LargeListViewArray construction for benchmark");
+    RecordBatch::try_new(schema, vec![Arc::new(list_view)]).expect("valid batch")
+}
+
+fn make_long_large_list_view_batch(n: usize, truncate_to: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "nums",
+        DataType::LargeListView(Arc::new(Field::new("item", DataType::Int32, true))),
+        true,
+    )]));
+    let per_list = truncate_to + 15;
+    let total_values = n * per_list;
+    let values = Int32Array::from(
+        (0..total_values)
+            .map(|v| i32::try_from(v).expect("value fits in i32"))
+            .collect::<Vec<i32>>(),
+    );
+    let offsets: Vec<i64> = (0..n).map(|i| (i * per_list as i64)).collect();
+    let sizes: Vec<i64> = (0..n).map(|_| per_list as i64).collect();
+    let list_view = LargeListViewArray::try_new(
+        Arc::new(Field::new("item", DataType::Int32, true)),
+        ScalarBuffer::<i64>::from(offsets),
+        ScalarBuffer::<i64>::from(sizes),
+        Arc::new(values),
+        None,
+    )
+    .expect("LargeListViewArray construction for benchmark");
+    RecordBatch::try_new(schema, vec![Arc::new(list_view)]).expect("valid batch")
+}
+
 pub fn bench_truncate(c: &mut Criterion) {
     let mut group = c.benchmark_group("arrow_tools_truncate");
 
@@ -344,6 +400,23 @@ pub fn bench_truncate(c: &mut Criterion) {
     group.bench_function("fixed_size_list_with_truncation_800_rows", |b| {
         b.iter(|| {
             truncate_numeric_column_length(black_box(&long_fsl), 5).unwrap();
+        })
+    });
+
+    // LargeListView fast path (completes the five-variant benchmark coverage;
+    // i64 sizes scan + zero-copy clone)
+    let short_large_list_views = make_all_short_large_list_view_batch(800, 5);
+    group.bench_function("large_listview_fast_path_800_rows_all_short", |b| {
+        b.iter(|| {
+            truncate_numeric_column_length(black_box(&short_large_list_views), 5).unwrap();
+        })
+    });
+
+    // LargeListView actual truncation work (i64 offset/size rebuild path)
+    let long_large_list_views = make_long_large_list_view_batch(800, 5);
+    group.bench_function("large_listview_with_truncation_800_rows", |b| {
+        b.iter(|| {
+            truncate_numeric_column_length(black_box(&long_large_list_views), 5).unwrap();
         })
     });
 
