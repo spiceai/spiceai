@@ -131,16 +131,20 @@ impl PartitionedWal {
         table_root: &Path,
         wal_dir: &Path,
     ) -> Result<()> {
-        if !wal_dir.exists() {
-            let parent = table_root.to_path_buf(); // the table root
-            let table = table_root.display().to_string();
-            tokio::fs::create_dir_all(wal_dir).await?;
+        match tokio::fs::create_dir(wal_dir).await {
+            Ok(()) => {
+                let parent = table_root.to_path_buf(); // the table root
+                let table = table_root.display().to_string();
 
-            // Sync the table root so the _partitioned_wal/ subdir entry is durable.
-            tokio::task::spawn_blocking(move || std::fs::File::open(&parent)?.sync_all())
-                .await
-                .map_err(|source| Error::TaskPanicked { table, source })??;
+                // Sync the table root so the _partitioned_wal/ subdir entry is durable.
+                tokio::task::spawn_blocking(move || std::fs::File::open(&parent)?.sync_all())
+                    .await
+                    .map_err(|source| Error::TaskPanicked { table, source })??;
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(source) => return Err(Error::IoError { source }),
         }
+
         Ok(())
     }
 

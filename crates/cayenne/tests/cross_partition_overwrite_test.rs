@@ -28,16 +28,22 @@ You may obtain a copy of the License at
 //! All local-FS directory creation points that are part of the write +
 //! crash-recovery infrastructure now perform the required parent-directory
 //! sync after `create_dir_all` (snapshot directories via
-//! `ensure_snapshot_dir_exists`, and the _partitioned_wal/ coordination
-//! directory via the helper in `PartitionedWal::write_to`). Combined with
-//! the per-partition staging WAL and deletion vector durability fixes,
-//! a successful cross-partition operation (append or overwrite) leaves
-//! a fully durable set of coordination records and data files on local FS.
+//! `ensure_snapshot_dir_exists`, the _partitioned_wal/ coordination
+//! directory via the helper in `PartitionedWal::write_to`, and
+//! `deletions/` subdirectories under snapshots via DeletionVectorWriter).
+//! Combined with the per-partition staging WAL, deletion vector file
+//! sync_all, and directory syncs in the delete sinks, a successful
+//! cross-partition operation (append or overwrite, including any
+//! concurrent or pending deletions) leaves a fully durable set of
+//! coordination records and data files on local FS.
 //! The existing fault-injection and restart tests in this file, together
-//! with the per-partition durability tests, provide comprehensive regression
-//! coverage for this property, including the edge case of the very first
-//! cross-partition write on a brand-new table (first creation of the
-//! _partitioned_wal/ directory).
+//! with the per-partition durability tests (deletion vector restart,
+//! staged-append restart, acid_compliance, data_inlining), provide
+//! comprehensive regression coverage for this property, including the
+//! edge cases of the very first cross-partition write on a brand-new
+//! table (first creation of the _partitioned_wal/ directory) and the
+//! first deletion vector written to a snapshot (first creation of its
+//! deletions/ subdirectory).
 
 #![expect(
     clippy::expect_used,

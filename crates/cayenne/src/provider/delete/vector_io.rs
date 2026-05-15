@@ -198,11 +198,9 @@ impl<'a> DeletionVectorWriter<'a> {
                 tokio::fs::create_dir_all(&deletion_dir).await?;
 
                 let table = self.table.path.clone();
-                tokio::task::spawn_blocking(move || {
-                    std::fs::File::open(&snapshot_dir)?.sync_all()
-                })
-                .await
-                .map_err(|source| Error::TaskPanicked { table, source })??;
+                tokio::task::spawn_blocking(move || std::fs::File::open(&snapshot_dir)?.sync_all())
+                    .await
+                    .map_err(|source| Error::TaskPanicked { table, source })??;
             } else {
                 tokio::fs::create_dir_all(&deletion_dir).await?;
             }
