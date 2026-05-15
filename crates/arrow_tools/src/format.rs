@@ -58,9 +58,7 @@ pub(crate) fn format_column_data(
             // Fast path: zero-copy when no string requires character truncation.
             // Cheap byte-length filter first (char count only on candidates).
             if !string_array.iter().any(|opt| {
-                opt.map_or(false, |s| {
-                    s.len() > max_characters && s.chars().count() > max_characters
-                })
+                opt.is_some_and(|s| s.len() > max_characters && s.chars().count() > max_characters)
             }) {
                 return Ok(Arc::clone(&column));
             }
@@ -83,9 +81,7 @@ pub(crate) fn format_column_data(
             // Fast path: zero-copy when no string requires character truncation.
             // Cheap byte-length filter first (char count only on candidates).
             if !string_array.iter().any(|opt| {
-                opt.map_or(false, |s| {
-                    s.len() > max_characters && s.chars().count() > max_characters
-                })
+                opt.is_some_and(|s| s.len() > max_characters && s.chars().count() > max_characters)
             }) {
                 return Ok(Arc::clone(&column));
             }

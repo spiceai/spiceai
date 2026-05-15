@@ -23,7 +23,7 @@ limitations under the License.
 //! exercises the zero-copy clone() paths added in the audit) from
 //! "actual truncation" (exercises the slice+concat / collect paths).
 
-use arrow::array::{Int32Array, ListArray, StringArray};
+use arrow::array::{Int32Array, ListArray, StringArray, StringViewArray, StringViewBuilder};
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -58,6 +58,43 @@ fn make_many_long_string_batch(n: usize, max_chars: usize) -> RecordBatch {
         })
         .collect();
     let arr = StringArray::from(strings);
+    RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("valid batch")
+}
+
+/// StringViewArray versions of the above (exercises the specific fast-path
+/// arm for DataType::Utf8View that was added during the audit).
+fn make_all_short_string_view_batch(n: usize, _max_chars: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "text",
+        DataType::Utf8View,
+        true,
+    )]));
+    let short = "short".repeat(3);
+    let mut builder = StringViewBuilder::new();
+    for _ in 0..n {
+        builder.append_value(&short);
+    }
+    let arr = builder.finish();
+    RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("valid batch")
+}
+
+fn make_many_long_string_view_batch(n: usize, max_chars: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "text",
+        DataType::Utf8View,
+        true,
+    )]));
+    let long = "x".repeat(max_chars + 20);
+    let short = "s";
+    let mut builder = StringViewBuilder::new();
+    for i in 0..n {
+        if i % 3 == 0 {
+            builder.append_value(&long);
+        } else {
+            builder.append_value(short);
+        }
+    }
+    let arr = builder.finish();
     RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("valid batch")
 }
 
@@ -105,7 +142,7 @@ fn make_long_list_batch(n: usize, truncate_to: usize) -> RecordBatch {
 pub fn bench_truncate(c: &mut Criterion) {
     let mut group = c.benchmark_group("arrow_tools_truncate");
 
-    // String fast path (the new UTF8 early-exit + Arc::clone)
+    // String (Utf8) fast path
     let short_strings = make_all_short_string_batch(2000, 50);
     group.bench_function("string_fast_path_2000_rows_all_short", |b| {
         b.iter(|| {
@@ -113,11 +150,27 @@ pub fn bench_truncate(c: &mut Criterion) {
         })
     });
 
-    // String actual work
+    // String (Utf8) actual work
     let long_strings = make_many_long_string_batch(2000, 50);
     group.bench_function("string_with_truncation_2000_rows_mixed", |b| {
         b.iter(|| {
             truncate_string_columns(black_box(&long_strings), 50).unwrap();
+        })
+    });
+
+    // StringView fast path (exercises the specific Utf8View arm + is_some_and decision)
+    let short_views = make_all_short_string_view_batch(2000, 50);
+    group.bench_function("stringview_fast_path_2000_rows_all_short", |b| {
+        b.iter(|| {
+            truncate_string_columns(black_box(&short_views), 50).unwrap();
+        })
+    });
+
+    // StringView actual truncation
+    let long_views = make_many_long_string_view_batch(2000, 50);
+    group.bench_function("stringview_with_truncation_2000_rows_mixed", |b| {
+        b.iter(|| {
+            truncate_string_columns(black_box(&long_views), 50).unwrap();
         })
     });
 
