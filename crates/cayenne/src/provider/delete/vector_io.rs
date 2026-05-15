@@ -200,17 +200,20 @@ impl<'a> DeletionVectorWriter<'a> {
             //
             // The sync is one-time per snapshot (first deletion vector
             // written to it). Subsequent deletions reuse the directory.
-            match tokio::fs::create_dir(&deletion_dir).await {
-                Ok(()) => {
-                    let table = self.table.path.clone();
-                    tokio::task::spawn_blocking(move || {
-                        std::fs::File::open(&snapshot_dir)?.sync_all()
-                    })
+            let sync_snapshot_parent = match tokio::fs::create_dir(&deletion_dir).await {
+                Ok(()) => true,
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    tokio::fs::create_dir_all(&deletion_dir).await?;
+                    true
+                }
+                Err(source) => return Err(Error::IoError { source }),
+            };
+            if sync_snapshot_parent {
+                let table = self.table.path.clone();
+                tokio::task::spawn_blocking(move || std::fs::File::open(&snapshot_dir)?.sync_all())
                     .await
                     .map_err(|source| Error::TaskPanicked { table, source })??;
-                }
-                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(source) => return Err(Error::IoError { source }),
             }
 
             let file_path = Self::deletion_file_path(&deletion_dir);
