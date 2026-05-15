@@ -39,6 +39,9 @@ With no message, opens an interactive REPL. With a positional message,
 streams a single response and exits (non-interactive mode). The model must be
 registered in `spicepod.yaml` under `models:` and reported by `spice models`.
 
+The `-p` and `-chat` forms are root-level shortcuts for one-shot prompts. Quote
+multi-word prompts so the shell passes them as one argument.
+
 EXAMPLES
     spice -chat "Summarize loaded datasets"       # One-shot prompt with the only configured model
     spice -p --model llm "Summarize TPC-H Q1"     # One-shot prompt with a specific model

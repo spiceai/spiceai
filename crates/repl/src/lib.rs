@@ -713,10 +713,9 @@ pub async fn run_query(
             )?;
             Ok(())
         }
-        Err(FlightError::Tonic(status)) => Err(Box::<dyn Error>::from(format!(
-            "Flight SQL query failed: {}",
-            status.message()
-        ))),
+        Err(FlightError::Tonic(status)) => {
+            Err(Box::<dyn Error>::from(format_flight_sql_status(&status)))
+        }
         Err(error) => Err(Box::<dyn Error>::from(format!(
             "Unexpected Flight error: {error}. Check connection or query syntax."
         ))),
@@ -737,6 +736,14 @@ fn build_user_agent(user_agent_override: Option<&str>) -> String {
         Some(override_value) => format!("{override_value} {user_agent}"),
         None => user_agent,
     }
+}
+
+fn format_flight_sql_status(status: &Status) -> String {
+    format!(
+        "Flight SQL query failed ({:?}): {}",
+        status.code(),
+        status.message()
+    )
 }
 
 async fn connect_flight_client(
@@ -1158,6 +1165,14 @@ mod tests {
 
         RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(name_array)])
             .expect("Failed to create RecordBatch")
+    }
+
+    #[test]
+    fn flight_sql_status_error_includes_grpc_code() {
+        let message = format_flight_sql_status(&Status::permission_denied("missing token"));
+
+        assert!(message.contains("PermissionDenied"));
+        assert!(message.contains("missing token"));
     }
 
     #[test]

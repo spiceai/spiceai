@@ -110,6 +110,7 @@ impl CloudClient {
     /// Exchange a device auth code for an access token.
     ///
     /// Returns `Ok(None)` while the user has not yet completed the browser flow.
+    /// Returns an error if the user denies the browser authorization request.
     pub async fn exchange_code(&self, auth_code: &str) -> Result<Option<AuthExchangeResponse>> {
         let url = format!("{}/auth/token/exchange", self.oauth_base_url());
         let request = AuthExchangeRequest { code: auth_code };
@@ -135,11 +136,7 @@ impl CloudClient {
         }
 
         let body: AuthExchangeResponse = response.json().await.context(HttpRequestSnafu)?;
-        // Pending: the server returned 200 but the code is not yet authorized.
-        if !body.access_denied && body.access_token.as_deref().is_none_or(str::is_empty) {
-            return Ok(None);
-        }
-        Ok(Some(body))
+        auth_exchange_result(body)
     }
 
     /// Returns the base URL for OAuth endpoints by stripping the API host segment.
@@ -627,6 +624,21 @@ impl CloudClient {
     }
 }
 
+fn auth_exchange_result(body: AuthExchangeResponse) -> Result<Option<AuthExchangeResponse>> {
+    if body.access_denied {
+        return Err(error::Error::Api {
+            status: reqwest::StatusCode::FORBIDDEN.as_u16(),
+            message: "Device authorization was denied".to_string(),
+        });
+    }
+
+    if body.access_token.as_deref().is_none_or(str::is_empty) {
+        return Ok(None);
+    }
+
+    Ok(Some(body))
+}
+
 fn body_or<'a>(fallback: &'a str, body: &'a str) -> &'a str {
     if body.trim().is_empty() {
         fallback
@@ -656,8 +668,9 @@ fn oauth_host(host: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::CloudClient;
+    use super::{CloudClient, auth_exchange_result};
     use crate::types::{AuthContext, AuthContextApp, AuthContextOrg, AuthContextRaw};
+    use crate::{error, types::AuthExchangeResponse};
 
     #[test]
     fn oauth_base_url_rewrites_api_hosts() {
@@ -687,6 +700,42 @@ mod tests {
             client.get_auth_url("ABCD1234"),
             "https://spice.ai/auth/token?code=ABCD1234"
         );
+    }
+
+    #[test]
+    fn auth_exchange_denial_is_error() {
+        let result = auth_exchange_result(AuthExchangeResponse {
+            access_token: None,
+            access_denied: true,
+        });
+
+        let Err(error::Error::Api { status, message }) = result else {
+            panic!("denied auth exchange should return an API error");
+        };
+        assert_eq!(status, reqwest::StatusCode::FORBIDDEN.as_u16());
+        assert!(message.contains("denied"));
+    }
+
+    #[test]
+    fn auth_exchange_without_token_is_pending() {
+        let result = auth_exchange_result(AuthExchangeResponse {
+            access_token: None,
+            access_denied: false,
+        })
+        .expect("pending auth exchange should not fail");
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn auth_exchange_with_token_is_success() {
+        let result = auth_exchange_result(AuthExchangeResponse {
+            access_token: Some("token".to_string()),
+            access_denied: false,
+        })
+        .expect("completed auth exchange should not fail");
+
+        assert!(result.is_some());
     }
 
     #[test]

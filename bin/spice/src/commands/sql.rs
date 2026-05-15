@@ -27,6 +27,9 @@ use spice_cloud_client::endpoints::flight_endpoint as spice_cloud_flight_endpoin
     about = "Run SQL queries against the Spice.ai runtime",
     long_about = r#"Run SQL queries against the Spice.ai runtime
 
+The `-sql` form is a root-level shortcut for a one-shot query. Quote multi-word
+queries so the shell passes them as one argument.
+
 Examples:
   $ spice -sql "show tables"
   # Runs a single SQL query and exits.

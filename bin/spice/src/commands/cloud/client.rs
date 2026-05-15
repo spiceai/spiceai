@@ -43,6 +43,23 @@ pub struct CloudClient {
     inner: InnerCloudClient,
 }
 
+#[derive(Default)]
+pub struct UpdateAppParams<'a> {
+    pub description: Option<&'a str>,
+    pub visibility: Option<&'a str>,
+    pub replicas: Option<i32>,
+    pub image_tag: Option<&'a str>,
+    pub region: Option<&'a str>,
+    pub cpu: Option<i32>,
+    pub memory: Option<NumBytes>,
+    pub storage_size_gb: Option<f64>,
+    pub executor_replicas: Option<i32>,
+    pub executor_cpu: Option<i32>,
+    pub executor_memory: Option<NumBytes>,
+    pub spicepod: Option<String>,
+    pub channel: Option<UpdateChannel>,
+}
+
 impl CloudClient {
     /// Create a new authenticated cloud client.
     pub fn new() -> Result<Self> {
@@ -207,40 +224,28 @@ impl CloudClient {
         self.inner.create_app(&request).await.map_err(into_cli)
     }
 
-    #[expect(clippy::too_many_arguments)]
-    pub async fn update_app(
-        &self,
-        org_app: &str,
-        description: Option<&str>,
-        visibility: Option<&str>,
-        replicas: Option<i32>,
-        image_tag: Option<&str>,
-        region: Option<&str>,
-        cpu: Option<i32>,
-        memory: Option<NumBytes>,
-        storage_size_gb: Option<f64>,
-        executor_replicas: Option<i32>,
-        executor_cpu: Option<i32>,
-        executor_memory: Option<NumBytes>,
-        spicepod: Option<String>,
-        channel: Option<UpdateChannel>,
-    ) -> Result<App> {
+    pub async fn update_app(&self, org_app: &str, params: UpdateAppParams<'_>) -> Result<App> {
         let app = self.get_app(org_app).await?;
-        let resources = build_resources(cpu, memory);
+        let resources = build_resources(params.cpu, params.memory);
         // The update endpoint accepts storage size at the app level; create app nests it under executor.
-        let executor = build_executor(executor_replicas, executor_cpu, executor_memory, None);
+        let executor = build_executor(
+            params.executor_replicas,
+            params.executor_cpu,
+            params.executor_memory,
+            None,
+        );
 
         let request = UpdateAppRequest {
-            description: description.map(String::from),
-            visibility: visibility.map(String::from),
-            replicas,
-            image_tag: image_tag.map(String::from),
-            update_channel: channel.map(|channel| channel.to_string()),
-            region: region.map(String::from),
+            description: params.description.map(String::from),
+            visibility: params.visibility.map(String::from),
+            replicas: params.replicas,
+            image_tag: params.image_tag.map(String::from),
+            update_channel: params.channel.map(|channel| channel.to_string()),
+            region: params.region.map(String::from),
             resources,
             executor,
-            storage_size_gb,
-            spicepod,
+            storage_size_gb: params.storage_size_gb,
+            spicepod: params.spicepod,
         };
         self.inner
             .update_app(app.id, &request)

@@ -1371,19 +1371,11 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
                 match client
                     .update_app(
                         &org_app,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        spicepod_content,
-                        args.channel,
+                        client::UpdateAppParams {
+                            spicepod: spicepod_content,
+                            channel: args.channel,
+                            ..client::UpdateAppParams::default()
+                        },
                     )
                     .await
                 {
@@ -1471,19 +1463,21 @@ async fn execute_update(cmd: &UpdateCommands) -> Result<()> {
             let app = client
                 .update_app(
                     &app_name,
-                    args.description.as_deref(),
-                    args.visibility.as_deref(),
-                    args.replicas,
-                    args.image.as_deref(),
-                    args.region.as_deref(),
-                    args.cpu,
-                    args.memory,
-                    args.storage_size_gb,
-                    args.executor_replicas,
-                    args.executor_cpu,
-                    args.executor_memory,
-                    spicepod_content,
-                    args.channel,
+                    client::UpdateAppParams {
+                        description: args.description.as_deref(),
+                        visibility: args.visibility.as_deref(),
+                        replicas: args.replicas,
+                        image_tag: args.image.as_deref(),
+                        region: args.region.as_deref(),
+                        cpu: args.cpu,
+                        memory: args.memory,
+                        storage_size_gb: args.storage_size_gb,
+                        executor_replicas: args.executor_replicas,
+                        executor_cpu: args.executor_cpu,
+                        executor_memory: args.executor_memory,
+                        spicepod: spicepod_content,
+                        channel: args.channel,
+                    },
                 )
                 .await?;
 

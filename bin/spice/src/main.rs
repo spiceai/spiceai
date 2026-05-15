@@ -26,11 +26,11 @@ use spice::commands::{
 };
 use spice::output::OutputFormat;
 use spice::{Result, RuntimeContext};
+use spice_cloud_client::endpoints::is_valid_region as is_valid_cloud_region;
 use std::ffi::{OsStr, OsString};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_CLOUD_REGION: &str = "us-east-1";
-const CLOUD_REGION_VALUES: &[&str] = &["us-east-1", "us-west-2"];
 const MACHINE_ERROR_SERIALIZATION_FAILED: &str = r#"{"status":"error","error":{"code":"error_serialization_failed","message":"Failed to serialize CLI error"}}"#;
 const GLOBAL_VALUE_FLAGS: &[&str] = &[
     "--api-key",
@@ -56,9 +56,12 @@ Quick start:
   spice init my_app          # Scaffold a new Spicepod in ./my_app/
   cd my_app
   spice run                  # Install (if needed) and start the runtime
-  spice -sql \"show tables\"   # Run a single SQL query and exit
-  spice -chat \"Summarize loaded datasets\" # Prompt the configured LLM and exit
+    spice -sql \"show tables\"   # Run a single SQL query and exit
+    spice -chat \"Summarize loaded datasets\" # Prompt the configured LLM and exit
   spice sql                  # Open an interactive SQL REPL
+
+Direct shortcuts (`-sql`, `-p`, `-chat`) are root-level forms. Quote multi-word
+queries and prompts so the shell passes them as one argument.
 
 Common workflows:
   Manage data:    spice dataset add ...  |  spice catalog add ...  |  spice refresh ...
@@ -76,7 +79,7 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
-    /// Machine-readable mode for LLMs and automation: prefer JSON output and structured JSON errors.
+    /// Machine-readable mode for LLMs and automation: prefer JSON output where supported and always emit structured JSON errors.
     #[arg(long, alias = "programmatic")]
     machine: bool,
 
@@ -89,7 +92,7 @@ struct Cli {
     cloud: bool,
 
     /// Spice.ai Cloud runtime endpoint region used with --cloud.
-    #[arg(long, global = true, value_parser = ["us-east-1", "us-west-2"], default_value = DEFAULT_CLOUD_REGION, requires = "cloud")]
+    #[arg(long, global = true, value_parser = parse_cloud_region, default_value = DEFAULT_CLOUD_REGION, requires = "cloud")]
     cloud_region: String,
 
     /// HTTP endpoint of the Spice runtime to talk to.
@@ -322,7 +325,7 @@ fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Ve
             normalized.push(arg);
             if args
                 .peek()
-                .is_some_and(|value| is_cloud_region_os(value.as_os_str()))
+                .is_some_and(|value| should_treat_as_cloud_region(value.as_os_str()))
             {
                 normalized.push(OsString::from("--cloud-region"));
                 if let Some(region) = args.next() {
@@ -375,7 +378,7 @@ fn normalize_cloud_region_flags(args: impl IntoIterator<Item = OsString>) -> Vec
             normalized.push(arg);
             if args
                 .peek()
-                .is_some_and(|value| is_cloud_region_os(value.as_os_str()))
+                .is_some_and(|value| should_treat_as_cloud_region(value.as_os_str()))
             {
                 normalized.push(OsString::from("--cloud-region"));
                 if let Some(region) = args.next() {
@@ -391,19 +394,31 @@ fn normalize_cloud_region_flags(args: impl IntoIterator<Item = OsString>) -> Vec
     normalized
 }
 
-fn is_cloud_region(value: &str) -> bool {
-    CLOUD_REGION_VALUES.contains(&value)
+fn parse_cloud_region(value: &str) -> std::result::Result<String, String> {
+    if is_valid_cloud_region(value) {
+        return Ok(value.to_string());
+    }
+
+    Err(format!(
+        "invalid cloud region '{value}': expected lowercase letters, digits, and hyphens, starting and ending with a letter or digit"
+    ))
 }
 
-fn is_cloud_region_os(value: &OsStr) -> bool {
-    value.to_str().is_some_and(is_cloud_region)
+fn should_treat_as_cloud_region(value: &OsStr) -> bool {
+    value
+        .to_str()
+        .is_some_and(|value| !value.starts_with('-') && !is_top_level_command(value))
 }
 
 fn cloud_region_from_equals(value: &OsStr) -> Option<&str> {
     let value = value.to_str()?;
-    value
-        .strip_prefix("--cloud=")
-        .filter(|region| is_cloud_region(region))
+    value.strip_prefix("--cloud=")
+}
+
+fn is_top_level_command(value: &str) -> bool {
+    Cli::command().get_subcommands().any(|command| {
+        command.get_name() == value || command.get_all_aliases().any(|alias| alias == value)
+    })
 }
 
 fn raw_args_enable_machine_mode() -> bool {
@@ -856,6 +871,11 @@ mod tests {
         Cli::try_parse_from(args).expect("failed to parse CLI args")
     }
 
+    fn try_parse_normalized(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
+        let args = normalize_direct_command_args(args.iter().map(OsString::from));
+        Cli::try_parse_from(args)
+    }
+
     fn is_json(args: &[&str]) -> bool {
         is_json_output(&parse(args).command)
     }
@@ -995,6 +1015,17 @@ mod tests {
     }
 
     #[test]
+    fn cloud_flag_accepts_legacy_unlisted_region_value() {
+        let cli = parse_normalized(&["spice", "--cloud", "eu-central-1", "status"]);
+        assert!(cli.cloud);
+        assert_eq!(cli.cloud_region, "eu-central-1");
+
+        let Commands::Status(_) = cli.command else {
+            panic!("expected status command");
+        };
+    }
+
+    #[test]
     fn cloud_flag_accepts_equals_region_value() {
         let cli = parse_normalized(&["spice", "--cloud=us-west-2", "status"]);
         assert!(cli.cloud);
@@ -1003,6 +1034,37 @@ mod tests {
         let Commands::Status(_) = cli.command else {
             panic!("expected status command");
         };
+    }
+
+    #[test]
+    fn cloud_flag_accepts_equals_unlisted_region_value() {
+        let cli = parse_normalized(&["spice", "--cloud=eu-central-1", "status"]);
+        assert!(cli.cloud);
+        assert_eq!(cli.cloud_region, "eu-central-1");
+
+        let Commands::Status(_) = cli.command else {
+            panic!("expected status command");
+        };
+    }
+
+    #[test]
+    fn cloud_flag_does_not_consume_top_level_command_as_region() {
+        let cli = parse_normalized(&["spice", "--cloud", "models"]);
+        assert!(cli.cloud);
+        assert_eq!(cli.cloud_region, DEFAULT_CLOUD_REGION);
+
+        let Commands::Models(_) = cli.command else {
+            panic!("expected models command");
+        };
+    }
+
+    #[test]
+    fn cloud_region_rejects_invalid_values_after_normalization() {
+        let Err(error) = try_parse_normalized(&["spice", "--cloud=bad_region", "status"]) else {
+            panic!("invalid cloud region should fail parsing");
+        };
+
+        assert!(error.to_string().contains("invalid cloud region"));
     }
 
     #[test]
