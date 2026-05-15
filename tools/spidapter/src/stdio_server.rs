@@ -1544,6 +1544,101 @@ fn parse_and_rename_spicepod(yaml_str: &str, run_id: &Uuid) -> anyhow::Result<Sp
     Ok(spicepod)
 }
 
+fn trimmed_arg(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+}
+
+fn apply_runtime_overrides(spicepod: &mut SpicepodDefinition, args: &StdioArgs) {
+    if let Some(shuffle_location) = trimmed_arg(&args.shuffle_location) {
+        spicepod
+            .runtime
+            .params
+            .insert("shuffle_location".to_string(), shuffle_location);
+    }
+
+    let query_memory_limit = trimmed_arg(&args.query_memory_limit);
+    let query_temp_directory = trimmed_arg(&args.query_temp_directory);
+    if query_memory_limit.is_none() && query_temp_directory.is_none() {
+        return;
+    }
+
+    let query = spicepod.runtime.query.get_or_insert_with(Query::default);
+    if let Some(memory_limit) = query_memory_limit {
+        query.memory_limit = Some(memory_limit);
+    }
+    if let Some(temp_directory) = query_temp_directory {
+        query.temp_directory = Some(temp_directory);
+    }
+}
+
+fn apply_cayenne_acceleration_overrides(
+    spicepod: &mut SpicepodDefinition,
+    args: &StdioArgs,
+) -> usize {
+    let cayenne_file_path = trimmed_arg(&args.cayenne_file_path).or_else(|| {
+        // Keep the older SPIDAPTER_CAYENNE_DATA_DIR knob useful for file-mode
+        // accelerations when the newer, accelerator-specific env var is not set.
+        trimmed_arg(&args.cayenne_data_dir)
+    });
+    let cayenne_metadata_dir = trimmed_arg(&args.cayenne_metadata_dir);
+
+    if cayenne_file_path.is_none() && cayenne_metadata_dir.is_none() {
+        return 0;
+    }
+
+    let mut updated = 0;
+    for dataset_ref in &mut spicepod.datasets {
+        let ComponentOrReference::Component(dataset) = dataset_ref else {
+            continue;
+        };
+
+        let Some(acceleration) = dataset.acceleration.as_mut() else {
+            continue;
+        };
+
+        let is_cayenne = acceleration
+            .engine
+            .as_deref()
+            .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"));
+        let is_file_mode = matches!(
+            acceleration.mode,
+            Mode::File | Mode::FileCreate | Mode::FileUpdate
+        );
+        if !is_cayenne || !is_file_mode {
+            continue;
+        }
+
+        let params = acceleration.params.get_or_insert_with(Params::default);
+        if let Some(path) = &cayenne_file_path {
+            params.data.insert(
+                "cayenne_file_path".to_string(),
+                ParamValue::String(path.clone()),
+            );
+        }
+        if let Some(path) = &cayenne_metadata_dir {
+            params.data.insert(
+                "cayenne_metadata_dir".to_string(),
+                ParamValue::String(path.clone()),
+            );
+        }
+        updated += 1;
+    }
+
+    updated
+}
+
+fn apply_spicepod_overrides(spicepod: &mut SpicepodDefinition, args: &StdioArgs) {
+    apply_runtime_overrides(spicepod, args);
+    let updated = apply_cayenne_acceleration_overrides(spicepod, args);
+    if updated > 0 {
+        eprintln!("[stdio] Applied Cayenne acceleration storage overrides to {updated} dataset(s)");
+    }
+}
+
 fn generate_hive_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
@@ -1746,6 +1841,8 @@ async fn generate_initial_spicepod(
         }
     }
 
+    apply_spicepod_overrides(&mut spicepod, args);
+
     Ok(spicepod)
 }
 
@@ -1779,8 +1876,11 @@ mod tests {
             app_storage_size_gb: None,
             executor_storage_size_gb: None,
             scheduler_state_location: Some("s3://bucket/state".to_string()),
+            shuffle_location: None,
+            query_temp_directory: None,
             aws_region: None,
             cayenne_data_dir: None,
+            cayenne_file_path: None,
             cayenne_metadata_dir: None,
             ephemeral_storage_limit_gb: None,
             organization_tag: None,
@@ -1934,6 +2034,71 @@ mod tests {
         assert!(
             yaml.contains("s3_auth: public"),
             "public auth from file is missing: {yaml}"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_initial_spicepod_applies_storage_overrides() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("input.yaml");
+        tokio::fs::write(
+            &path,
+            "version: v1\nkind: Spicepod\nname: user-supplied\ndatasets:\n  - from: s3://public-bucket/customer.parquet\n    name: customer\n    params:\n      file_format: parquet\n      s3_auth: public\n    acceleration:\n      enabled: true\n      engine: cayenne\n      mode: file\n",
+        )
+        .await
+        .expect("write yaml");
+
+        let setup_config = SetupConfig {
+            region: None,
+            endpoint: None,
+            sink_type: None,
+            spicepod_path: Some(path.to_string_lossy().into_owned()),
+        };
+        let datasets: HashMap<String, DatasetConfig> = HashMap::new();
+        let mut args = test_stdio_args();
+        args.shuffle_location = Some("s3://bucket/shuffle".to_string());
+        args.query_temp_directory = Some("/data/spice/tmp".to_string());
+        args.cayenne_file_path = Some("/data/cayenne".to_string());
+        args.cayenne_metadata_dir = Some("/data/cayenne/metadata".to_string());
+
+        let spicepod =
+            generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None, &args)
+                .await
+                .expect("spicepod loads from disk");
+
+        assert_eq!(
+            spicepod.runtime.params.get("shuffle_location"),
+            Some(&"s3://bucket/shuffle".to_string())
+        );
+        assert_eq!(
+            spicepod
+                .runtime
+                .query
+                .as_ref()
+                .and_then(|query| query.temp_directory.as_deref()),
+            Some("/data/spice/tmp")
+        );
+
+        let ComponentOrReference::Component(dataset) = &spicepod.datasets[0] else {
+            panic!("expected concrete dataset");
+        };
+        let params = &dataset
+            .acceleration
+            .as_ref()
+            .expect("acceleration")
+            .params
+            .as_ref()
+            .expect("params")
+            .data;
+        assert_eq!(
+            params.get("cayenne_file_path").map(ParamValue::as_string),
+            Some("/data/cayenne".to_string())
+        );
+        assert_eq!(
+            params
+                .get("cayenne_metadata_dir")
+                .map(ParamValue::as_string),
+            Some("/data/cayenne/metadata".to_string())
         );
     }
 

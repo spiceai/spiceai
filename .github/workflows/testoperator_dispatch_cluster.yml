@@ -26,6 +26,11 @@ on:
         required: false
         type: boolean
         default: false
+      custom_image_tag:
+        description: 'Use an already-published ghcr.io/spiceai/spiceai-dev image tag and skip the image build'
+        required: false
+        type: string
+        default: ''
       dispatch_dir:
         description: >-
           Cluster dispatch matrix root to recursively fan out from
@@ -68,21 +73,21 @@ jobs:
         id: resolve
         env:
           FORCE_REBUILD: ${{ github.event.inputs.force_rebuild || 'false' }}
+          CUSTOM_IMAGE_TAG: ${{ github.event.inputs.custom_image_tag || '' }}
         run: |
           set -euo pipefail
           spiced_ref="${{ github.event.inputs.spiced_ref || 'trunk' }}"
-          spiced_sha="$(git rev-parse --short=12 HEAD)"
-          image_tag="trunk-${spiced_sha}"
-
-          echo "spiced_ref=${spiced_ref}" >> "$GITHUB_OUTPUT"
-          echo "spiced_sha=${spiced_sha}" >> "$GITHUB_OUTPUT"
-          echo "image_tag=${image_tag}" >> "$GITHUB_OUTPUT"
-
-          # Check whether the image already exists in GHCR. If so, skip the
-          # build job to avoid re-publishing identical bits. `force_rebuild`
-          # short-circuits the cache hit.
+          spiced_sha="$(git rev-parse HEAD)"
+          spiced_sha_short="$(git rev-parse --short=12 HEAD)"
+          image_tag="trunk-${spiced_sha_short}"
           need_build="true"
-          if [ "${FORCE_REBUILD}" = "true" ]; then
+
+          if [ -n "${CUSTOM_IMAGE_TAG}" ]; then
+            echo "custom_image_tag=${CUSTOM_IMAGE_TAG} → skipping image build"
+            image_tag="${CUSTOM_IMAGE_TAG}"
+            spiced_sha="custom:${CUSTOM_IMAGE_TAG}"
+            need_build="false"
+          elif [ "${FORCE_REBUILD}" = "true" ]; then
             echo "force_rebuild=true → will rebuild"
           elif docker buildx imagetools inspect \
               "ghcr.io/spiceai/spiceai-dev:${image_tag}" >/dev/null 2>&1; then
@@ -91,6 +96,10 @@ jobs:
           else
             echo "Image not found; will build"
           fi
+
+          echo "spiced_ref=${spiced_ref}" >> "$GITHUB_OUTPUT"
+          echo "spiced_sha=${spiced_sha}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${image_tag}" >> "$GITHUB_OUTPUT"
           echo "need_build=${need_build}" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
@@ -106,6 +115,7 @@ jobs:
     with:
       tag: ${{ needs.resolve-image.outputs.image_tag }}
       variant: models
+      ref: ${{ needs.resolve-image.outputs.spiced_sha }}
     secrets: inherit
 
   # ---------------------------------------------------------------------------
@@ -188,6 +198,14 @@ jobs:
             local query_transport="$7"
             local executor_replicas="$8"
             local channel="$9"
+            local shuffle_location="${10}"
+            local query_temp_directory="${11}"
+            local app_storage_size_gb="${12}"
+            local executor_storage_size_gb="${13}"
+            local ephemeral_storage_limit="${14}"
+            local cayenne_file_path="${15}"
+            local cayenne_metadata_dir="${16}"
+            local dispatch_id="${17}"
             local payload
 
             payload="$(python3 - \
@@ -201,7 +219,15 @@ jobs:
               "${query_transport}" \
               "${executor_replicas}" \
               "${channel}" \
-              "${IMAGE_TAG}" <<'PY'
+              "${IMAGE_TAG}" \
+              "${shuffle_location}" \
+              "${query_temp_directory}" \
+              "${app_storage_size_gb}" \
+              "${executor_storage_size_gb}" \
+              "${ephemeral_storage_limit}" \
+              "${cayenne_file_path}" \
+              "${cayenne_metadata_dir}" \
+              "${dispatch_id}" <<'PY'
           import json
           import sys
 
@@ -216,6 +242,14 @@ jobs:
               "executor_replicas",
               "channel",
               "custom_image_tag",
+              "shuffle_location",
+              "query_temp_directory",
+              "app_storage_size_gb",
+              "executor_storage_size_gb",
+              "ephemeral_storage_limit",
+              "cayenne_file_path",
+              "cayenne_metadata_dir",
+              "dispatch_id",
           ]
           print(json.dumps({"ref": sys.argv[1], "inputs": dict(zip(keys, sys.argv[2:]))}))
           PY
@@ -228,15 +262,16 @@ jobs:
 
           find_run_id() {
             local created_at="$1"
+            local dispatch_id="$2"
             local runs_json
             runs_json="$(curl -fsSL -G "${api_headers[@]}" \
               "${api_url}/actions/workflows/testoperator_run_cluster_bench.yml/runs" \
               --data-urlencode "branch=${GITHUB_REF_NAME}" \
               --data-urlencode "event=workflow_dispatch" \
               --data-urlencode "created=>=${created_at}" \
-              --data-urlencode "per_page=10")"
+              --data-urlencode "per_page=50")"
 
-            python3 -c 'import json, sys; runs=json.load(sys.stdin).get("workflow_runs", []); print(runs[0]["id"] if runs else "")' <<< "${runs_json}"
+            DISPATCH_ID="${dispatch_id}" python3 -c 'import json, os, sys; dispatch_id=os.environ["DISPATCH_ID"]; runs=json.load(sys.stdin).get("workflow_runs", []); print(next((str(run["id"]) for run in runs if dispatch_id in (run.get("display_title") or "")), ""))' <<< "${runs_json}"
           }
 
           watch_run() {
@@ -255,9 +290,10 @@ jobs:
 
               if [ "${status}" = "completed" ]; then
                 if [ "${conclusion}" != "success" ]; then
-                  echo "Warning: cluster bench run ${run_id} for ${entry_path} completed with ${conclusion}"
+                  echo "Error: cluster bench run ${run_id} for ${entry_path} completed with ${conclusion}"
+                  return 1
                 fi
-                break
+                return 0
               fi
 
               sleep 60
@@ -265,6 +301,7 @@ jobs:
           }
 
           dispatched_runs=()
+          failed_runs=()
           for f in "${dispatch_files[@]}"; do
             entry_name="$(basename "$f" .yaml)"
             entry_path="${f#tools/testoperator/dispatch_cluster/}"
@@ -276,12 +313,25 @@ jobs:
             field() {
               local key="$1" default="$2"
               local v
-              v="$(yq -r "${key} // \"\"" "$f")"
-              if [ -z "$v" ] || [ "$v" = "null" ]; then
+              # Preserve explicit false/0 values. yq's `//` treats false as
+              # empty, which would incorrectly default `enabled: false` to true.
+              if [ "$(yq -r "${key} | tag" "$f")" = "!!null" ]; then
                 v="$default"
+              else
+                v="$(yq -r "${key}" "$f")"
               fi
               echo "$v"
             }
+
+            enabled="$(field '.tests.bench.enabled' 'true')"
+            enabled_lower="$(printf '%s' "$enabled" | tr '[:upper:]' '[:lower:]')"
+            case "$enabled_lower" in
+              false|0|no)
+                echo "skipping ${entry_name}: .tests.bench.enabled=${enabled}"
+                echo "::endgroup::"
+                continue
+                ;;
+            esac
 
             spicepod_path="$(field '.tests.bench.spicepod_path' '')"
             if [ -z "$spicepod_path" ]; then
@@ -299,11 +349,23 @@ jobs:
             query_transport="$(field '.tests.bench.query_transport' 'flightsql')"
             executor_replicas="$(field '.tests.bench.executor_replicas' '3')"
             channel="$(field '.tests.bench.channel' 'nightly')"
+            shuffle_location="$(field '.tests.bench.shuffle_location' '')"
+            query_temp_directory="$(field '.tests.bench.query_temp_directory' '')"
+            app_storage_size_gb="$(field '.tests.bench.app_storage_size_gb' '')"
+            executor_storage_size_gb="$(field '.tests.bench.executor_storage_size_gb' '')"
+            ephemeral_storage_limit="$(field '.tests.bench.ephemeral_storage_limit' '')"
+            cayenne_file_path="$(field '.tests.bench.cayenne_file_path' '')"
+            cayenne_metadata_dir="$(field '.tests.bench.cayenne_metadata_dir' '')"
 
             echo "  spicepod_path=${spicepod_path}"
             echo "  query_set=${query_set}  scale_factor=${scale_factor}"
             echo "  query_transport=${query_transport}  executor_replicas=${executor_replicas}"
+            echo "  storage: app=${app_storage_size_gb:-<none>} executor=${executor_storage_size_gb:-<none>} ephemeral=${ephemeral_storage_limit:-<none>}"
+            echo "  shuffle_location=${shuffle_location:-<default>}"
+            echo "  cayenne_file_path=${cayenne_file_path:-<default>} cayenne_metadata_dir=${cayenne_metadata_dir:-<default>}"
+            dispatch_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${#dispatched_runs[@]}"
             echo "  custom_image_tag=${IMAGE_TAG}"
+            echo "  dispatch_id=${dispatch_id}"
 
             triggered_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             dispatch_workflow \
@@ -315,7 +377,15 @@ jobs:
               "${ready_wait}" \
               "${query_transport}" \
               "${executor_replicas}" \
-              "${channel}"
+              "${channel}" \
+              "${shuffle_location}" \
+              "${query_temp_directory}" \
+              "${app_storage_size_gb}" \
+              "${executor_storage_size_gb}" \
+              "${ephemeral_storage_limit}" \
+              "${cayenne_file_path}" \
+              "${cayenne_metadata_dir}" \
+              "${dispatch_id}"
 
             dispatched_runs+=("${entry_path}")
             echo "::endgroup::"
@@ -324,28 +394,36 @@ jobs:
             # before starting the next one. Cluster benches each provision a
             # real Spice Cloud app, so max_concurrent=1 keeps cloud-side load
             # bounded.
-            echo "Waiting briefly for the run to register…"
+            echo "Waiting for the dispatched run to register…"
             run_id=""
-            for attempt in {1..20}; do
+            for attempt in {1..40}; do
               sleep 15
-              run_id="$(find_run_id "${triggered_at}")"
+              run_id="$(find_run_id "${triggered_at}" "${dispatch_id}")"
               if [ -n "${run_id}" ]; then
                 break
               fi
-              echo "Waiting for workflow_dispatch run to appear (${attempt}/20)…"
+              echo "Waiting for workflow_dispatch run with dispatch_id=${dispatch_id} to appear (${attempt}/40)…"
             done
 
             if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
-              echo "Warning: could not resolve run id for ${entry_path}; continuing"
-              continue
+              echo "Error: could not resolve run id for ${entry_path} (dispatch_id=${dispatch_id})"
+              exit 1
             fi
 
             echo "Watching run ${run_id} for ${entry_path}"
-            watch_run "${run_id}" "${entry_path}"
+            if ! watch_run "${run_id}" "${entry_path}"; then
+              failed_runs+=("${entry_path} (${run_id})")
+            fi
           done
 
           if [ "${#dispatched_runs[@]}" -eq 0 ]; then
             echo "No spicepods dispatched from ${DISPATCH_DIR}"
+            exit 1
+          fi
+
+          if [ "${#failed_runs[@]}" -gt 0 ]; then
+            echo "One or more cluster-bench child runs failed:"
+            printf '  %s\n' "${failed_runs[@]}"
             exit 1
           fi
 

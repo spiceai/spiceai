@@ -24,6 +24,11 @@ on:
           - 'amd64'
           - 'arm64'
         default: 'all'
+      ref:
+        description: 'Git ref/SHA to check out for the image build. Defaults to the workflow commit.'
+        required: false
+        type: string
+        default: ''
   # Mirror the dispatch inputs so other workflows (e.g. the cluster-bench
   # dispatch) can call this as a reusable workflow to build a commit-pinned
   # spiced image and feed the resulting tag into downstream jobs.
@@ -40,13 +45,18 @@ on:
         required: false
         type: string
         default: 'models'
+      ref:
+        description: 'Git ref/SHA to check out for the image build. Defaults to the caller workflow commit.'
+        required: false
+        type: string
+        default: ''
     outputs:
       image:
         description: 'Fully-qualified image reference, including tag'
-        value: ghcr.io/spiceai/spiceai-dev:${{ inputs.tag }}
+        value: ${{ jobs.setup.outputs.image }}
       tag:
         description: 'The published image tag (echo of the input)'
-        value: ${{ inputs.tag }}
+        value: ${{ jobs.setup.outputs.tag }}
 
 jobs:
   setup:
@@ -56,8 +66,18 @@ jobs:
       dev_label: ${{ steps.set_version.outputs.dev_label }}
       run_amd64: ${{ steps.set_targets.outputs.run_amd64 }}
       run_arm64: ${{ steps.set_targets.outputs.run_arm64 }}
+      image: ${{ steps.set_image_metadata.outputs.image }}
+      tag: ${{ steps.set_image_metadata.outputs.tag }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Set image metadata
+        id: set_image_metadata
+        run: |
+          echo "image=ghcr.io/spiceai/spiceai-dev:${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
 
       - name: Set version
         id: set_version
@@ -106,6 +126,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Add dev postfix to version in Cargo.toml
         env:
@@ -193,6 +215,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Add dev postfix to version in Cargo.toml
         env:

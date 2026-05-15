@@ -3,6 +3,13 @@ tests:
     spicepod_path: distributed/s3-public[parquet]-cayenne[file].yaml
     query_set: clickbench
     query_transport: flightsql
+    shuffle_location: s3://spiceai-testing-cluster-state/testoperator-cluster-bench-shuffle/{github_run_id}/{github_run_attempt}
+    query_temp_directory: /data
+    app_storage_size_gb: 50
+    executor_storage_size_gb: 100
+    ephemeral_storage_limit: 1Gi
+    cayenne_file_path: /data/cayenne
+    cayenne_metadata_dir: /data/cayenne/metadata
     runner_type: spiceai-dev-runners
     validate_results: false
     ready_wait: 1200

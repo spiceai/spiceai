@@ -125,6 +125,14 @@ pub struct StdioArgs {
     #[arg(long, env = "SCHEDULER_STATE_LOCATION")]
     pub scheduler_state_location: Option<String>,
 
+    /// Ballista shuffle location to inject into `runtime.params.shuffle_location` (e.g. `memory`, `/data/shuffle`, `s3://bucket/shuffle`).
+    #[arg(long, env = "SPIDAPTER_SHUFFLE_LOCATION")]
+    pub shuffle_location: Option<String>,
+
+    /// Query temporary directory to inject into `runtime.query.temp_directory` (e.g. `/data/spice/tmp`).
+    #[arg(long, env = "SPIDAPTER_QUERY_TEMP_DIRECTORY")]
+    pub query_temp_directory: Option<String>,
+
     /// AWS region for S3 data sources and scheduler state (e.g. `us-east-1`).
     /// Falls back to `AWS_DEFAULT_REGION` environment variable if not set.
     #[arg(long, env = "AWS_REGION")]
@@ -134,7 +142,11 @@ pub struct StdioArgs {
     #[arg(long, env = "SPIDAPTER_CAYENNE_DATA_DIR")]
     pub cayenne_data_dir: Option<String>,
 
-    /// Cayenne Catalog metadata directory
+    /// Cayenne file accelerator data path to inject as `cayenne_file_path` (e.g. `/data/cayenne`).
+    #[arg(long, env = "SPIDAPTER_CAYENNE_FILE_PATH")]
+    pub cayenne_file_path: Option<String>,
+
+    /// Cayenne Catalog/accelerator metadata directory
     #[arg(long, env = "SPIDAPTER_CAYENNE_METADATA_DIR")]
     pub cayenne_metadata_dir: Option<String>,
 
