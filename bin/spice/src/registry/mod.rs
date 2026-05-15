@@ -113,7 +113,7 @@ pub async fn get_pod(
 }
 
 /// Check if a pod path refers to a local file system path.
-fn is_local_path(pod_path: &str) -> bool {
+pub(crate) fn is_local_path(pod_path: &str) -> bool {
     pod_path.starts_with('/')
         || pod_path.starts_with("../")
         || pod_path.starts_with("file://")

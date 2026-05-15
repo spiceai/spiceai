@@ -775,7 +775,9 @@ async fn connect_flight_client(
         None
     };
 
-    if let (Some(tls_config), Some(identity)) = (client_tls_config.take(), client_identity) {
+    if let Some(identity) = client_identity {
+        let tls_config =
+            client_tls_config.unwrap_or_else(|| ClientTlsConfig::new().with_native_roots());
         client_tls_config = Some(tls_config.identity(identity));
     }
 

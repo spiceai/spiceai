@@ -718,6 +718,16 @@ fn build_component_value(
         set_path(&mut value, &path, field_value)?;
     }
 
+    if mode == MutationMode::Add && component_name(&value).is_none() {
+        return InvalidArgumentSnafu {
+            message: format!(
+                "{} add requires a component name, --file/--stdin input with name, or --set name=...",
+                section.label()
+            ),
+        }
+        .fail();
+    }
+
     if mode == MutationMode::Add
         && section.requires_from_for_add()
         && value.get("from").and_then(Value::as_str).is_none()
@@ -1450,6 +1460,57 @@ mod tests {
         .expect_err("duplicate reference should fail");
 
         assert!(error.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn add_view_rejects_anonymous_inline_component() {
+        let mut spicepod = base_spicepod();
+        let args = ComponentAddArgs::default();
+
+        let error = mutate_component(
+            &mut spicepod,
+            ComponentSection::View,
+            args.name.as_deref(),
+            &args.options,
+            MutationMode::Add,
+        )
+        .expect_err("anonymous view should fail");
+
+        assert!(error.to_string().contains("requires a component name"));
+        assert!(spicepod.get("views").is_none());
+    }
+
+    #[test]
+    fn add_worker_accepts_name_from_set_flag() {
+        let mut spicepod = base_spicepod();
+        let args = ComponentAddArgs {
+            name: None,
+            options: CommonComponentOptions {
+                set: vec!["name=refresh_worker".to_string()],
+                cron: Some("*/5 * * * *".to_string()),
+                sql: Some("select 1".to_string()),
+                ..CommonComponentOptions::default()
+            },
+        };
+
+        mutate_component(
+            &mut spicepod,
+            ComponentSection::Worker,
+            args.name.as_deref(),
+            &args.options,
+            MutationMode::Add,
+        )
+        .expect("worker with name from set should be added");
+
+        let worker = spicepod
+            .get("workers")
+            .and_then(Value::as_sequence)
+            .and_then(|workers| workers.first())
+            .expect("worker should exist");
+        assert_eq!(
+            worker.get("name").and_then(Value::as_str),
+            Some("refresh_worker")
+        );
     }
 
     #[test]

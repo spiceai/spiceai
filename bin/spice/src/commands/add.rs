@@ -107,7 +107,7 @@ pub async fn execute_add_or_connect(
         println!("\x1b[32m{} initialized!\x1b[0m", spicepod_path.display());
     }
 
-    let dependency_path = get_relative_dependency_path(ctx.app_dir(), &download_path)?;
+    let dependency_path = dependency_reference(pod_path, ctx.app_dir(), &download_path)?;
     if manifest::ensure_string_sequence_item(&mut spicepod, "dependencies", &dependency_path)? {
         manifest::write_spicepod_value(&spicepod_path, &spicepod)?;
     }
@@ -134,4 +134,48 @@ fn get_relative_dependency_path(base: &Path, path: &Path) -> Result<String> {
         ),
     })?;
     Ok(manifest::path_to_spicepod_ref(relative_path))
+}
+
+fn dependency_reference(pod_path: &str, base: &Path, download_path: &Path) -> Result<String> {
+    if registry::is_local_path(pod_path) {
+        return get_relative_dependency_path(base, download_path);
+    }
+
+    Ok(pod_path.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dependency_reference_preserves_remote_version_pin() {
+        let reference = dependency_reference(
+            "spiceai/quickstart@v1.0",
+            Path::new("/app"),
+            Path::new("/app/spicepods/spiceai/quickstart"),
+        )
+        .expect("remote dependency reference should be built");
+
+        assert_eq!(reference, "spiceai/quickstart@v1.0");
+    }
+
+    #[test]
+    fn dependency_reference_uses_relative_path_for_local_sources() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let local_source = temp_dir.path().join("localpod");
+        std::fs::create_dir_all(&local_source).expect("local source should be created");
+        let download_path = temp_dir.path().join("spicepods/localpod");
+
+        let reference = dependency_reference(
+            local_source
+                .to_str()
+                .expect("local source path should be utf-8"),
+            temp_dir.path(),
+            &download_path,
+        )
+        .expect("local dependency reference should be built");
+
+        assert_eq!(reference, "spicepods/localpod");
+    }
 }

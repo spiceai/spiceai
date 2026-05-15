@@ -1367,9 +1367,8 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
 
             let org_app = app.full_name();
 
-            // Spicepod and channel are set via update (not supported on create)
-            if spicepod_content.is_some() || args.channel.is_some() {
-                client
+            let app = if spicepod_content.is_some() || args.channel.is_some() {
+                match client
                     .update_app(
                         &org_app,
                         None,
@@ -1386,8 +1385,20 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
                         spicepod_content,
                         args.channel,
                     )
-                    .await?;
-            }
+                    .await
+                {
+                    Ok(updated_app) => updated_app,
+                    Err(error) => {
+                        return Err(crate::error::Error::InvalidResponse {
+                            message: format!(
+                                "Created app {org_app}, but failed to update spicepod/channel: {error}. The app still exists; run `spice cloud update app --app {org_app}` to apply those settings or delete the app manually."
+                            ),
+                        });
+                    }
+                }
+            } else {
+                app
+            };
 
             if args.output == OutputFormat::Json {
                 return write_json(&app);

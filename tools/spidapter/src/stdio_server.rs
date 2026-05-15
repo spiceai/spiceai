@@ -1817,7 +1817,8 @@ mod tests {
 
     #[test]
     fn backend_mode_parser_rejects_unknown_values() {
-        BackendMode::from_str("unexpected", true).expect("'BackendMode' should be constructed");
+        BackendMode::from_str("unexpected", true)
+            .expect_err("unknown backend mode should be rejected");
     }
 
     #[tokio::test]

@@ -407,28 +407,16 @@ fn cloud_region_from_equals(value: &OsStr) -> Option<&str> {
 }
 
 fn raw_args_enable_machine_mode() -> bool {
-    let mut args = std::env::args().skip(1).peekable();
+    args_enable_machine_mode(std::env::args_os().skip(1))
+}
 
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--machine" | "--programmatic" => return true,
-            "--" => return false,
-            "--cloud" => {
-                if args.peek().is_some_and(|value| is_cloud_region(value)) {
-                    let _ = args.next();
-                }
-            }
-            value if value.strip_prefix("--cloud=").is_some_and(is_cloud_region) => {}
-            value if GLOBAL_VALUE_FLAGS.contains(&value) => {
-                let _ = args.next();
-            }
-            value
-                if GLOBAL_VALUE_FLAGS
-                    .iter()
-                    .any(|flag| value.starts_with(&format!("{flag}="))) => {}
-            value if value.starts_with("--") => {}
-            value if value.starts_with('-') => {}
-            _ => return false,
+fn args_enable_machine_mode(args: impl IntoIterator<Item = OsString>) -> bool {
+    for arg in args {
+        if arg == OsStr::new("--") {
+            return false;
+        }
+        if arg == OsStr::new("--machine") || arg == OsStr::new("--programmatic") {
+            return true;
         }
     }
 
@@ -919,6 +907,44 @@ mod tests {
         };
 
         assert_eq!(machine_error_code(&error), "invalid_argument");
+    }
+
+    #[test]
+    fn machine_mode_error_detection_is_lexical() {
+        assert!(args_enable_machine_mode(
+            ["--machine", "unknown-command"]
+                .into_iter()
+                .map(OsString::from)
+        ));
+        assert!(args_enable_machine_mode(
+            ["unknown-command", "--programmatic"]
+                .into_iter()
+                .map(OsString::from)
+        ));
+        assert!(!args_enable_machine_mode(
+            ["--", "--machine"].into_iter().map(OsString::from)
+        ));
+    }
+
+    #[test]
+    fn global_value_flags_match_cli_definition() {
+        let actual = Cli::command()
+            .get_arguments()
+            .filter(|arg| arg.is_global_set())
+            .filter(|arg| {
+                matches!(
+                    arg.get_action(),
+                    clap::ArgAction::Set | clap::ArgAction::Append
+                )
+            })
+            .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
+            .collect::<Vec<_>>();
+        let expected = GLOBAL_VALUE_FLAGS
+            .iter()
+            .map(|flag| (*flag).to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

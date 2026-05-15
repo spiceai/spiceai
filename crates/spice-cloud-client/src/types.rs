@@ -161,8 +161,8 @@ pub struct AppResources {
 pub struct AppResourceLimits {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<String>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub memory: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
     #[serde(rename = "ephemeral-storage", skip_serializing_if = "Option::is_none")]
     pub ephemeral_storage: Option<String>,
 }
