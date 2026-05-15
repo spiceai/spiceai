@@ -30,12 +30,17 @@ use cayenne::metadata::CreateTableOptions;
 
 use cayenne::CayenneTableProvider;
 
+use datafusion::datasource::TableProvider;
+
+use datafusion::execution::config::SessionConfig;
+
 use datafusion::prelude::*;
 
 use std::sync::Arc;
 
 // Generate test variants for each backend
 test_with_backends!(test_cayenne_partition_pruning_impl);
+test_with_backends!(test_cayenne_scan_uses_target_partitions_impl);
 
 /// Sanitize file paths in explain plans for deterministic snapshots.
 /// Replaces temp directory paths with a placeholder.
@@ -360,6 +365,73 @@ async fn test_cayenne_partition_pruning_impl(
         .expect("count column should be Int64Array");
     assert_eq!(count_array.value(0), 6, "Full scan should return 6 rows");
     println!("✓ Full table scan returned correct count");
+
+    Ok(())
+}
+
+async fn test_cayenne_scan_uses_target_partitions_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let catalog = &fixture.catalog;
+    let data_path = &fixture.data_path;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("bucket", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let table_options = CreateTableOptions {
+        table_name: "target_partitioned_table".to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec![],
+        on_conflict: None,
+        base_path: data_path.to_string_lossy().to_string(),
+        partition_column: Some("bucket".to_string()),
+        vortex_config: cayenne::metadata::VortexConfig::default(),
+    };
+
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::<cayenne::CayenneCatalog>::clone(catalog),
+            table_options,
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    let registered_table = Arc::clone(&table) as Arc<dyn TableProvider>;
+    ctx.register_table("target_partitioned_table", registered_table)?;
+
+    ctx.sql(
+        "INSERT INTO target_partitioned_table VALUES \
+         (1, 'a', 100), \
+         (2, 'a', 200), \
+         (3, 'b', 300), \
+         (4, 'b', 400), \
+         (5, 'c', 500), \
+         (6, 'c', 600), \
+         (7, 'd', 700), \
+         (8, 'd', 800)",
+    )
+    .await?
+    .collect()
+    .await?;
+
+    let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
+    assert_eq!(
+        scan_plan
+            .properties()
+            .output_partitioning()
+            .partition_count(),
+        4,
+        "Full Cayenne scan should honor SessionConfig target_partitions"
+    );
+
+    let df = ctx.sql("SELECT * FROM target_partitioned_table").await?;
+    let results = df.collect().await?;
+    let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(total_rows, 8, "Expected all rows from full scan");
 
     Ok(())
 }

@@ -262,17 +262,37 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                 std::task::Poll::Ready(Some(Ok(batch))) => {
                     let batch_size = batch.num_rows();
 
+                    if batch_size == 0 {
+                        return std::task::Poll::Ready(Some(Ok(batch)));
+                    }
+
                     // Fast path: empty deleted keys index
                     if self.deleted_row_keys.is_empty() {
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
+                    if self.pk_column_indices.is_empty() {
+                        return std::task::Poll::Ready(Some(Err(
+                            datafusion_common::DataFusionError::Internal(
+                                "KeyBasedDeletionFilterExec requires at least one primary key column index".to_string(),
+                            ),
+                        )));
+                    }
+
                     // Extract PK columns from the batch
-                    let pk_columns: Vec<ArrayRef> = self
-                        .pk_column_indices
-                        .iter()
-                        .map(|&idx| Arc::clone(batch.column(idx)))
-                        .collect();
+                    let mut pk_columns: Vec<ArrayRef> =
+                        Vec::with_capacity(self.pk_column_indices.len());
+                    for &idx in &self.pk_column_indices {
+                        let Some(column) = batch.columns().get(idx) else {
+                            return std::task::Poll::Ready(Some(Err(
+                                datafusion_common::DataFusionError::Internal(format!(
+                                    "KeyBasedDeletionFilterExec primary key column index {idx} is out of bounds for a batch with {} columns",
+                                    batch.num_columns()
+                                )),
+                            )));
+                        };
+                        pk_columns.push(Arc::clone(column));
+                    }
 
                     // Convert PK columns to row bytes (single batched conversion).
                     let rows = match self.row_converter.convert_columns(&pk_columns) {
@@ -491,13 +511,25 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                 std::task::Poll::Ready(Some(Ok(batch))) => {
                     let batch_size = batch.num_rows();
 
+                    if batch_size == 0 {
+                        return std::task::Poll::Ready(Some(Ok(batch)));
+                    }
+
                     // Fast path: empty deletion index
                     if self.deleted_pk_values.is_empty() {
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
                     // Get the PK column and downcast to Int64Array
-                    let pk_column = batch.column(self.pk_column_index);
+                    let Some(pk_column) = batch.columns().get(self.pk_column_index) else {
+                        return std::task::Poll::Ready(Some(Err(
+                            datafusion_common::DataFusionError::Internal(format!(
+                                "Int64PkDeletionFilterExec primary key column index {} is out of bounds for a batch with {} columns",
+                                self.pk_column_index,
+                                batch.num_columns()
+                            )),
+                        )));
+                    };
                     let pk_array =
                         pk_column
                             .as_any()
@@ -576,5 +608,54 @@ impl futures::Stream for Int64PkDeletionFilterStream {
 impl datafusion_execution::RecordBatchStream for Int64PkDeletionFilterStream {
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::clone(&self.schema)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::{array::RecordBatch, datatypes::DataType};
+    use arrow_row::SortField;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::StreamExt;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn key_based_deletion_filter_passes_empty_batches_without_pk_columns()
+    -> datafusion_common::Result<()> {
+        let schema = Arc::new(arrow_schema::Schema::empty());
+        let empty_batch = RecordBatch::new_empty(Arc::clone(&schema));
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter([Ok(empty_batch)]),
+        ));
+        let deleted_row_keys = Arc::new(KeyDeletionIndex::from_map(HashMap::from([(
+            Box::<[u8]>::from([42_u8].as_slice()),
+            1_i64,
+        )])));
+        let row_converter = Arc::new(RowConverter::new(vec![
+            SortField::new(DataType::Int64),
+            SortField::new(DataType::Int64),
+            SortField::new(DataType::Int64),
+        ])?);
+
+        let mut stream = KeyBasedDeletionFilterStream {
+            input,
+            deleted_row_keys,
+            insert_records: Arc::new(KeyDeletionIndex::empty()),
+            pk_column_indices: Vec::new(),
+            row_converter,
+            schema,
+        };
+
+        let Some(batch) = stream.next().await.transpose()? else {
+            return Err(datafusion_common::DataFusionError::Internal(
+                "Expected an empty batch from KeyBasedDeletionFilterStream".to_string(),
+            ));
+        };
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), 0);
+
+        Ok(())
     }
 }

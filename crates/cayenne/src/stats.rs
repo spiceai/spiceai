@@ -298,10 +298,6 @@ pub(crate) fn build_file_statistics(
 /// min/max/null-count has been incorporated it stays incorporated, and the
 /// merged `num_rows` reflects the full table when `existing_num_rows` is
 /// passed in correctly by the caller.
-#[expect(
-    dead_code,
-    reason = "Wired into `persist_table_stats` in a follow-up that switches table-level stats from last-write-wins to cross-write merge; kept here as the scaffold."
-)]
 pub(crate) fn merge_serialized_stats(
     existing_blob: &[u8],
     new_column_stats: &[StatsSet],
@@ -393,6 +389,53 @@ mod tests {
         assert_eq!(
             col.max_value,
             DfPrecision::Exact(ScalarValue::Utf8(Some("cherry".into())))
+        );
+    }
+
+    #[test]
+    fn serialized_statistics_merge_preserves_cross_write_min_max() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let first_stats = ColumnStatistics {
+            null_count: DfPrecision::Exact(1),
+            min_value: DfPrecision::Exact(ScalarValue::Int64(Some(10))),
+            max_value: DfPrecision::Exact(ScalarValue::Int64(Some(20))),
+            sum_value: DfPrecision::Absent,
+            distinct_count: DfPrecision::Absent,
+            byte_size: DfPrecision::Absent,
+        };
+        let second_stats = ColumnStatistics {
+            null_count: DfPrecision::Exact(2),
+            min_value: DfPrecision::Exact(ScalarValue::Int64(Some(1))),
+            max_value: DfPrecision::Exact(ScalarValue::Int64(Some(30))),
+            sum_value: DfPrecision::Absent,
+            distinct_count: DfPrecision::Absent,
+            byte_size: DfPrecision::Absent,
+        };
+        let first_set = column_stats_to_stats_set(&first_stats);
+        let second_set = column_stats_to_stats_set(&second_stats);
+        let first_file_stats = build_file_statistics(vec![first_set], &schema);
+        let first_blob = serialize_file_statistics(&first_file_stats).expect("serialize ok");
+        let dtypes = vec![DType::from_arrow((
+            schema.field(0).data_type(),
+            Nullability::Nullable,
+        ))];
+
+        let merged_blob = merge_serialized_stats(&first_blob, &[second_set], &dtypes, &schema)
+            .expect("statistics should merge");
+        let merged_stats =
+            deserialize_file_statistics(&merged_blob, &schema).expect("deserialize ok");
+        let df = file_statistics_to_df(&merged_stats, 6);
+        let col = &df.column_statistics[0];
+
+        assert_eq!(df.num_rows, DfPrecision::Exact(6));
+        assert_eq!(col.null_count, DfPrecision::Exact(3));
+        assert_eq!(
+            col.min_value,
+            DfPrecision::Exact(ScalarValue::Int64(Some(1)))
+        );
+        assert_eq!(
+            col.max_value,
+            DfPrecision::Exact(ScalarValue::Int64(Some(30)))
         );
     }
 }

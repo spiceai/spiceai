@@ -18,14 +18,15 @@ limitations under the License.
 
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use super::metadata::{
-    CreateTableOptions, DeleteFile, InlinedData, InlinedDelete, PartitionMetadata, TableMetadata,
-    TableStatistics,
+    CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
+    PartitionMetadata, TableMetadata, TableStatistics,
 };
 use super::metastore::sqlite::SqliteMetastore;
 #[cfg(feature = "turso")]
 use super::metastore::turso::TursoMetastore;
 use super::metastore::{
-    ExecuteParams, MetastoreBackend, MetastoreRow, MetastoreValue, QueryParams, QueryRowParams,
+    ExecuteParams, MetastoreBackend, MetastoreRow, MetastoreTransaction, MetastoreValue,
+    QueryParams, QueryRowParams,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -198,6 +199,90 @@ impl CayenneCatalog {
     /// maintenance pragma statements fail to execute.
     pub async fn shutdown(&self) -> CatalogResult<()> {
         self.metastore.shutdown().await
+    }
+
+    /// Open a transaction on the underlying metastore.
+    ///
+    /// Each backend sends the appropriate BEGIN statement (e.g. `BEGIN IMMEDIATE`
+    /// for `SQLite`, `BEGIN CONCURRENT` for Turso). The returned handle owns
+    /// exclusive access to the connection until `commit` or `rollback` is
+    /// called, or the handle is dropped (which auto-rolls-back).
+    ///
+    /// Used by the cross-partition coordinator (issue #10125) to batch every
+    /// partition's [`Self::commit_compaction_in_txn`] call inside a single
+    /// transaction. Single-partition callers should prefer the higher-level
+    /// [`MetadataCatalog::commit_compaction`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot begin a transaction (e.g.
+    /// connection failure, busy timeout).
+    pub async fn begin_transaction(&self) -> CatalogResult<Box<dyn MetastoreTransaction>> {
+        self.metastore.begin_transaction().await
+    }
+
+    /// Apply a compaction commit's catalog mutations inside the caller's
+    /// `MetastoreTransaction`, without opening a new transaction.
+    ///
+    /// This is the building block for cross-partition atomic commits
+    /// (issue #10125): the coordinator opens one transaction via
+    /// [`Self::begin_transaction`], calls this method for every participating
+    /// partition, then commits the transaction once. Either every partition's
+    /// snapshot pointer advances or none do.
+    ///
+    /// The mutations and their order match
+    /// [`MetadataCatalog::commit_compaction`]:
+    ///
+    /// 1. `DELETE FROM cayenne_delete_file       WHERE table_id = ?`
+    /// 2. `DELETE FROM cayenne_insert_record     WHERE table_id = ?`
+    /// 3. `DELETE FROM cayenne_snapshot_sequence WHERE table_id = ?`
+    /// 4. `UPDATE cayenne_table SET current_snapshot_id = ? WHERE table_id = ?`
+    ///
+    /// Caller owns transaction lifecycle: `commit` and retry-on-conflict are
+    /// the coordinator's responsibility. This method does not retry — a
+    /// `SQLITE_BUSY` / write-conflict on the borrowed transaction is surfaced
+    /// to the caller so it can roll back and retry the entire cross-partition
+    /// batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::InvalidOperationNoSource`] if either UUID is
+    /// malformed (validated to prevent SQL injection — both values are
+    /// interpolated into the batch SQL).
+    /// Returns [`CatalogError::FailedToSetCurrentSnapshot`] if the
+    /// `execute_batch` call against the borrowed transaction fails.
+    pub async fn commit_compaction_in_txn(
+        &self,
+        txn: &mut dyn MetastoreTransaction,
+        table_id: &str,
+        new_snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        // Validate that IDs are well-formed UUIDs to prevent SQL injection.
+        // Both values are generated internally via uuid::Uuid::now_v7(), but
+        // we enforce the invariant here since they are interpolated into
+        // batch SQL.
+        for (name, value) in [("table_id", table_id), ("new_snapshot_id", new_snapshot_id)] {
+            if uuid::Uuid::parse_str(value).is_err() {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!("{name} is not a valid UUID: {value}"),
+                });
+            }
+        }
+
+        let table_id_literal = sql_text_literal(table_id);
+        let new_snapshot_id_literal = sql_text_literal(new_snapshot_id);
+        let batch_sql = format!(
+            "DELETE FROM cayenne_delete_file WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_insert_record WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_snapshot_sequence WHERE table_id = {table_id_literal}; \
+             UPDATE cayenne_table SET current_snapshot_id = {new_snapshot_id_literal} WHERE table_id = {table_id_literal};"
+        );
+
+        txn.execute_batch(&batch_sql)
+            .await
+            .map_err(|e| CatalogError::FailedToSetCurrentSnapshot {
+                source: Box::new(e),
+            })
     }
 
     async fn validate_existing_table_configuration(
@@ -1023,20 +1108,9 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()> {
-        // Validate that IDs are well-formed UUIDs to prevent SQL injection.
-        // Both values are generated internally via uuid::Uuid::now_v7(), but we enforce
-        // the invariant here since they are interpolated into batch SQL.
-        for (name, value) in [("table_id", table_id), ("new_snapshot_id", new_snapshot_id)] {
-            if uuid::Uuid::parse_str(value).is_err() {
-                return Err(CatalogError::InvalidOperationNoSource {
-                    message: format!("{name} is not a valid UUID: {value}"),
-                });
-            }
-        }
-
         // Execute all operations atomically using a proper transaction.
         //
-        // Order matters for crash safety:
+        // Order matters for crash safety (enforced by `commit_compaction_in_txn`):
         // 1. Clear delete files first - they reference the old snapshot's data
         // 2. Clear insert records - they correspond to the cleared delete files
         // 3. Clear snapshot sequences - protected snapshots are no longer needed
@@ -1046,15 +1120,7 @@ impl MetadataCatalog for CayenneCatalog {
         // If interrupted between these, the old snapshot remains active with
         // no delete files, which is safe (just loses the pending deletions,
         // but data is not corrupted).
-        let table_id_literal = sql_text_literal(table_id);
-        let new_snapshot_id_literal = sql_text_literal(new_snapshot_id);
-        let batch_sql = format!(
-            "DELETE FROM cayenne_delete_file WHERE table_id = {table_id_literal}; \
-             DELETE FROM cayenne_insert_record WHERE table_id = {table_id_literal}; \
-             DELETE FROM cayenne_snapshot_sequence WHERE table_id = {table_id_literal}; \
-             UPDATE cayenne_table SET current_snapshot_id = {new_snapshot_id_literal} WHERE table_id = {table_id_literal};"
-        );
-
+        //
         // The transaction may fail with SQLITE_BUSY/SQLITE_LOCKED conflicts at
         // commit time (especially with Turso's BEGIN CONCURRENT). Retry a few
         // times with backoff.
@@ -1066,13 +1132,16 @@ impl MetadataCatalog for CayenneCatalog {
         }
 
         for attempt in 1..=max_attempts {
-            let tx = self.metastore.begin_transaction().await.map_err(|e| {
+            let mut tx = self.begin_transaction().await.map_err(|e| {
                 CatalogError::FailedToSetCurrentSnapshot {
                     source: Box::new(e),
                 }
             })?;
 
-            match tx.execute_batch(&batch_sql).await {
+            match self
+                .commit_compaction_in_txn(&mut *tx, table_id, new_snapshot_id)
+                .await
+            {
                 Ok(()) => match tx.commit().await {
                     Ok(()) => return Ok(()),
                     Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
@@ -1093,9 +1162,7 @@ impl MetadataCatalog for CayenneCatalog {
                 },
                 Err(e) => {
                     // Transaction auto-rolls-back on drop.
-                    return Err(CatalogError::FailedToSetCurrentSnapshot {
-                        source: Box::new(e),
-                    });
+                    return Err(e);
                 }
             }
         }
@@ -1407,6 +1474,31 @@ impl MetadataCatalog for CayenneCatalog {
                     params: vec![MetastoreValue::Text(table_id.to_string())],
                 },
                 |row| row.get_i64(0),
+            )
+            .await
+    }
+
+    async fn get_inlined_data_stats(&self, table_id: &str) -> CatalogResult<InlinedDataStats> {
+        self.metastore
+            .query_row_helper(
+                QueryRowParams {
+                    sql: r"
+                    SELECT
+                        COALESCE(SUM(record_count), 0),
+                        COUNT(*),
+                        COALESCE(SUM(LENGTH(data_ipc)), 0)
+                    FROM cayenne_inlined_data
+                    WHERE table_id = ?1
+                    ",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                |row| {
+                    Ok(InlinedDataStats {
+                        record_count: row.get_i64(0)?,
+                        entry_count: row.get_i64(1)?,
+                        ipc_bytes: row.get_i64(2)?,
+                    })
+                },
             )
             .await
     }
@@ -1790,7 +1882,16 @@ impl MetadataCatalog for CayenneCatalog {
     }
 }
 
-fn is_retryable_write_conflict(error: &CatalogError) -> bool {
+/// Returns `true` if the given catalog error looks like a transient write
+/// conflict (`SQLITE_BUSY`, `SQLITE_LOCKED`, or the equivalent Turso
+/// `BEGIN CONCURRENT` write-conflict at commit time).
+///
+/// Used by `commit_compaction` / `commit_compaction_in_txn` to drive their
+/// internal retry loops, and by the cross-partition coordinator
+/// (`CayennePartitionedInsertStrategy`, issue #10125) to retry batched
+/// transactions on transient failures.
+#[must_use]
+pub fn is_retryable_write_conflict(error: &CatalogError) -> bool {
     match error {
         CatalogError::Database { message } => is_retryable_write_conflict_message(message),
         _ => false,
@@ -1878,7 +1979,7 @@ async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResul
 ///
 /// Returns `true` if the configuration matches (no recreation needed).
 /// Only compares data-affecting fields; runtime tuning parameters like cache sizes
-/// and upload concurrency are excluded since they don't affect data correctness.
+/// and write/upload concurrency are excluded since they don't affect data correctness.
 fn configuration_matches(stored: &TableMetadata, options: &CreateTableOptions) -> bool {
     // Compare primary keys
     if stored.primary_key != options.primary_key {
@@ -3124,6 +3225,7 @@ mod tests {
             footer_cache_mb: 512,
             segment_cache_mb: 1024,
             upload_concurrency: 8,
+            write_concurrency: Some(16),
             target_vortex_file_size_mb: 512,
             ..Default::default()
         };
@@ -3261,6 +3363,258 @@ mod tests {
         // Invalid new_snapshot_id should fail.
         let result = catalog.commit_compaction(&valid_uuid, "not-a-uuid").await;
         assert!(result.is_err(), "Should reject non-UUID new_snapshot_id");
+
+        // Cleanup.
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Helper used by the `commit_compaction_in_txn` tests: create a table and
+    /// attach a delete file to it so the `in_txn` variant has metadata to clear
+    /// and a snapshot pointer to advance.
+    async fn setup_table_with_delete_file(
+        catalog: &CayenneCatalog,
+        table_name: &str,
+        base_path: &str,
+    ) -> String {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema,
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: base_path.to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("Failed to create table");
+
+        let delete_file = DeleteFile {
+            delete_file_id: String::new(),
+            table_id: table_id.clone(),
+            source_data_file_path: None,
+            path: format!("/tmp/delete_{table_name}.parquet"),
+            path_is_relative: false,
+            format: "parquet".to_string(),
+            delete_count: 5,
+            file_size_bytes: 256,
+            deletion_type: DeletionType::default(),
+            sequence_number: 1,
+        };
+        catalog
+            .add_delete_file(delete_file)
+            .await
+            .expect("Failed to add delete file");
+
+        table_id
+    }
+
+    /// Issue #10125 — `commit_compaction_in_txn` applied to a single partition
+    /// inside an explicit transaction is observably equivalent to the legacy
+    /// `commit_compaction`: snapshot pointer advances, delete files cleared.
+    #[tokio::test]
+    async fn test_commit_compaction_in_txn_single_partition_parity() {
+        let test_db = format!("sqlite://./.test_in_txn_parity_{}.db", uuid::Uuid::now_v7());
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let table_id =
+            setup_table_with_delete_file(&catalog, "in_txn_parity", "/tmp/in_txn_parity").await;
+
+        // Sanity: delete file exists before the in_txn call.
+        let before = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("Failed to get delete files");
+        assert_eq!(before.len(), 1, "Expected 1 delete file before commit");
+
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+
+        // Caller-owned transaction: open, apply in_txn variant, commit.
+        let mut tx = catalog
+            .begin_transaction()
+            .await
+            .expect("Failed to begin transaction");
+        catalog
+            .commit_compaction_in_txn(&mut *tx, &table_id, &new_snapshot_id)
+            .await
+            .expect("commit_compaction_in_txn failed");
+        tx.commit()
+            .await
+            .expect("Failed to commit caller transaction");
+
+        // Delete files cleared.
+        let after = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("Failed to get delete files after commit");
+        assert!(
+            after.is_empty(),
+            "Delete files should be cleared after commit_compaction_in_txn"
+        );
+
+        // Snapshot pointer advanced.
+        let table = catalog
+            .get_table("in_txn_parity")
+            .await
+            .expect("Failed to get table after commit");
+        assert_eq!(table.current_snapshot_id, new_snapshot_id);
+
+        // Cleanup.
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Issue #10125 — two `commit_compaction_in_txn` calls inside one
+    /// transaction commit atomically: after `tx.commit()`, both partitions'
+    /// pointers have advanced together.
+    #[tokio::test]
+    async fn test_commit_compaction_in_txn_cross_partition_atomicity() {
+        let test_db = format!(
+            "sqlite://./.test_in_txn_cross_atomic_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        // Two "partitions": independent tables, treated as a single atomic
+        // commit unit by the (future) cross-partition coordinator.
+        let table_a = setup_table_with_delete_file(&catalog, "partition_a", "/tmp/p_a").await;
+        let table_b = setup_table_with_delete_file(&catalog, "partition_b", "/tmp/p_b").await;
+
+        let snap_a = uuid::Uuid::now_v7().to_string();
+        let snap_b = uuid::Uuid::now_v7().to_string();
+
+        let mut tx = catalog
+            .begin_transaction()
+            .await
+            .expect("Failed to begin transaction");
+        catalog
+            .commit_compaction_in_txn(&mut *tx, &table_a, &snap_a)
+            .await
+            .expect("partition A in_txn failed");
+        catalog
+            .commit_compaction_in_txn(&mut *tx, &table_b, &snap_b)
+            .await
+            .expect("partition B in_txn failed");
+        tx.commit().await.expect("Failed to commit transaction");
+
+        // Both partitions advanced after the single tx.commit().
+        let a = catalog.get_table("partition_a").await.expect("get a");
+        let b = catalog.get_table("partition_b").await.expect("get b");
+        assert_eq!(a.current_snapshot_id, snap_a);
+        assert_eq!(b.current_snapshot_id, snap_b);
+
+        // Cleanup.
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Issue #10125 — dropping the transaction without committing rolls back
+    /// every `commit_compaction_in_txn` call applied inside it. The catalog
+    /// is left exactly as it was before the transaction opened.
+    #[tokio::test]
+    async fn test_commit_compaction_in_txn_rolls_back_on_drop() {
+        let test_db = format!(
+            "sqlite://./.test_in_txn_rollback_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let table_id =
+            setup_table_with_delete_file(&catalog, "in_txn_rollback", "/tmp/in_txn_rb").await;
+
+        // Capture pre-commit state.
+        let before = catalog.get_table("in_txn_rollback").await.expect("get");
+        let original_snapshot_id = before.current_snapshot_id.clone();
+
+        let attempted_snapshot_id = uuid::Uuid::now_v7().to_string();
+
+        {
+            let mut tx = catalog
+                .begin_transaction()
+                .await
+                .expect("Failed to begin transaction");
+            catalog
+                .commit_compaction_in_txn(&mut *tx, &table_id, &attempted_snapshot_id)
+                .await
+                .expect("in_txn variant succeeded inside tx");
+            // Drop tx without committing — auto-rollback.
+        }
+
+        // The pointer must NOT have advanced.
+        let after = catalog.get_table("in_txn_rollback").await.expect("get");
+        assert_eq!(
+            after.current_snapshot_id, original_snapshot_id,
+            "Dropping the transaction must roll back commit_compaction_in_txn"
+        );
+
+        // The delete file must STILL exist.
+        let delete_files = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("get delete files");
+        assert_eq!(
+            delete_files.len(),
+            1,
+            "Delete files must still exist after a rolled-back commit_compaction_in_txn"
+        );
+
+        // Cleanup.
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Issue #10125 — `commit_compaction_in_txn` rejects non-UUID identifiers
+    /// before touching the borrowed transaction. The error path leaves the
+    /// catalog and the transaction untouched.
+    #[tokio::test]
+    async fn test_commit_compaction_in_txn_rejects_invalid_uuid() {
+        let test_db = format!(
+            "sqlite://./.test_in_txn_invalid_uuid_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let valid_uuid = uuid::Uuid::now_v7().to_string();
+
+        let mut tx = catalog
+            .begin_transaction()
+            .await
+            .expect("Failed to begin transaction");
+
+        // Invalid table_id should fail.
+        let result = catalog
+            .commit_compaction_in_txn(&mut *tx, "'; DROP TABLE cayenne_table;--", &valid_uuid)
+            .await;
+        assert!(result.is_err(), "Should reject non-UUID table_id");
+
+        // Invalid new_snapshot_id should fail.
+        let result = catalog
+            .commit_compaction_in_txn(&mut *tx, &valid_uuid, "not-a-uuid")
+            .await;
+        assert!(result.is_err(), "Should reject non-UUID new_snapshot_id");
+
+        // The borrowed transaction is still usable for a subsequent valid call
+        // (we never rolled back; the error path is purely validation, no SQL
+        // was sent).
+        drop(tx);
 
         // Cleanup.
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);

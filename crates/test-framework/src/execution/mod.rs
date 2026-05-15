@@ -362,14 +362,20 @@ impl QueryExecutor for DistributedExecutor {
             }
 
             let status_json: serde_json::Value = status_response.json().await?;
-            let state = status_json
-                .get("state")
+            // The /v1/queries status response uses JSON field `status` (not
+            // `state`) with values serialized as SCREAMING_SNAKE_CASE
+            // (see `runtime/src/jobs/state.rs::JobStatus`). Matching either
+            // the wrong key or the wrong casing makes every poll fall through
+            // to "keep waiting" and the query never exits the loop until the
+            // hard timeout.
+            let status = status_json
+                .get("status")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
+                .unwrap_or("UNKNOWN");
 
-            match state {
-                "succeeded" => break,
-                "failed" => {
+            match status {
+                "SUCCEEDED" => break,
+                "FAILED" => {
                     let error_msg = status_json
                         .get("error")
                         .and_then(|e| e.get("message"))
@@ -377,44 +383,46 @@ impl QueryExecutor for DistributedExecutor {
                         .unwrap_or("Unknown error");
                     anyhow::bail!("Query distributed execution failed: {error_msg}");
                 }
-                "cancelled" => anyhow::bail!("Query was cancelled"),
-                "closed" => anyhow::bail!("Query results expired before retrieval"),
-                "pending" | "running" => {
+                "CANCELLED" => anyhow::bail!("Query was cancelled"),
+                "CLOSED" => anyhow::bail!("Query results expired before retrieval"),
+                "PENDING" | "RUNNING" => {
                     // Continue polling with exponential backoff
                     tokio::time::sleep(poll_interval).await;
                     poll_interval = std::cmp::min(poll_interval * 2, MAX_POLL_INTERVAL);
                 }
                 _ => {
-                    // Unknown state, continue polling
+                    // Unknown status, continue polling
                     tokio::time::sleep(poll_interval).await;
                     poll_interval = std::cmp::min(poll_interval * 2, MAX_POLL_INTERVAL);
                 }
             }
         }
 
-        // Step 3: Fetch results (first chunk to get row count)
-        let results_url = format!("{queries_url}/{query_id}/results");
-        let results_response = self.client.get(&results_url).send().await?;
+        // Step 3: Fetch total row count from the full query response.
+        // `/results` returns a ChunkResponse with per-chunk counts; the manifest
+        // (with `total_row_count`) lives on the query-level response at
+        // `GET /v1/queries/{id}`. See `runtime/src/http/v1/queries.rs::QueryResponse`.
+        let query_url = format!("{queries_url}/{query_id}");
+        let query_response = self.client.get(&query_url).send().await?;
 
-        let results_status = results_response.status();
-        if !results_status.is_success() {
-            let error_text = results_response.text().await.unwrap_or_default();
-            anyhow::bail!("Query results fetch failed: {results_status} - {error_text}");
+        let query_status = query_response.status();
+        if !query_status.is_success() {
+            let error_text = query_response.text().await.unwrap_or_default();
+            anyhow::bail!("Query info fetch failed: {query_status} - {error_text}");
         }
 
-        let results_json: serde_json::Value = results_response.json().await?;
+        let query_json: serde_json::Value = query_response.json().await?;
 
-        // Get total row count from manifest
-        let manifest = results_json
+        let manifest = query_json
             .get("manifest")
-            .ok_or_else(|| anyhow::anyhow!("Query results response missing 'manifest' field"))?;
+            .ok_or_else(|| anyhow::anyhow!("Query response missing 'manifest' field"))?;
 
-        let total_row_count_value = manifest.get("total_row_count").ok_or_else(|| {
-            anyhow::anyhow!("Query results manifest missing 'total_row_count' field")
-        })?;
+        let total_row_count_value = manifest
+            .get("total_row_count")
+            .ok_or_else(|| anyhow::anyhow!("Query manifest missing 'total_row_count' field"))?;
 
         let total_row_count_u64 = total_row_count_value.as_u64().ok_or_else(|| {
-            anyhow::anyhow!("Query results manifest 'total_row_count' field is not a valid u64")
+            anyhow::anyhow!("Query manifest 'total_row_count' field is not a valid u64")
         })?;
 
         #[expect(clippy::cast_possible_truncation)]

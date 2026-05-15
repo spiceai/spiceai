@@ -16,6 +16,7 @@ limitations under the License.
 
 //! Physical optimizer rules for Cayenne execution plans.
 
+use datafusion::common::NullEquality;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
@@ -176,6 +177,10 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
                 return Ok(Transformed::no(node));
             }
 
+            if hash_join.null_equality() != NullEquality::NullEqualsNothing {
+                return Ok(Transformed::no(node));
+            }
+
             tracing::debug!(
                 "Replacing HashJoinExec with ExactLeftAccumulator for Cayenne acceleration"
             );
@@ -185,5 +190,225 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
             Ok(Transformed::yes(Arc::new(new_join)))
         })
         .data()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CayenneJoinRewriter;
+    use crate::provider::CayenneAccelerationExec;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::{JoinType, NullEquality};
+    use datafusion::config::ConfigOptions;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_optimizer::PhysicalOptimizerRule;
+    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+    use datafusion::physical_plan::projection::ProjectionExec;
+    use datafusion::physical_plan::{ExecutionPlan, displayable};
+    use datafusion_physical_expr::expressions::col;
+    use runtime_datafusion::join_accumulator::ExactLeftAccumulator;
+    use std::sync::Arc;
+
+    fn memory_exec(column_name: &str) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            column_name,
+            DataType::Int32,
+            false,
+        )]));
+        MemorySourceConfig::try_new_exec(&[vec![]], schema, None)
+            .expect("memory exec should be valid")
+    }
+
+    fn hash_join(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        left_column: &str,
+        right_column: &str,
+    ) -> HashJoinExec {
+        hash_join_with_null_equality(
+            left,
+            right,
+            left_column,
+            right_column,
+            NullEquality::NullEqualsNothing,
+        )
+    }
+
+    fn hash_join_with_null_equality(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        left_column: &str,
+        right_column: &str,
+        null_equality: NullEquality,
+    ) -> HashJoinExec {
+        let left_key = col(left_column, &left.schema()).expect("left join key should exist");
+        let right_key = col(right_column, &right.schema()).expect("right join key should exist");
+
+        HashJoinExec::try_new(
+            left,
+            right,
+            vec![(left_key, right_key)],
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::Partitioned,
+            null_equality,
+        )
+        .expect("hash join should be valid")
+    }
+
+    fn join_with_right(right: Arc<dyn ExecutionPlan>) -> HashJoinExec {
+        hash_join(memory_exec("left_id"), right, "left_id", "right_id")
+    }
+
+    fn optimize(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        CayenneJoinRewriter::new()
+            .optimize(plan, &ConfigOptions::default())
+            .expect("optimizer should succeed")
+    }
+
+    fn plan_snapshot(plan: &Arc<dyn ExecutionPlan>) -> String {
+        displayable(plan.as_ref()).indent(true).to_string()
+    }
+
+    #[test]
+    fn rewrites_hash_join_with_cayenne_probe_side() {
+        let right = Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
+        let join = Arc::new(join_with_right(right));
+
+        let optimized = optimize(join);
+
+        assert!(
+            optimized
+                .as_any()
+                .downcast_ref::<HashJoinExec<ExactLeftAccumulator>>()
+                .is_some(),
+            "Cayenne-backed joins should use ExactLeftAccumulator"
+        );
+    }
+
+    #[test]
+    fn leaves_hash_join_without_cayenne_probe_side_unchanged() {
+        let right = memory_exec("right_id");
+        let join = Arc::new(join_with_right(right));
+
+        let optimized = optimize(join);
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "Non-Cayenne joins should keep the default accumulator"
+        );
+    }
+
+    #[test]
+    fn leaves_null_equal_hash_join_unchanged() {
+        let left = memory_exec("left_id");
+        let right = Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
+        let join = Arc::new(hash_join_with_null_equality(
+            left,
+            right,
+            "left_id",
+            "right_id",
+            NullEquality::NullEqualsNull,
+        ));
+
+        let optimized = optimize(join);
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "Null-equal joins should keep the default accumulator to preserve probe NULL matches"
+        );
+    }
+
+    #[test]
+    fn rewrites_hash_join_through_transparent_projection() {
+        let right_input = Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
+        let right_schema = right_input.schema();
+        let right = Arc::new(
+            ProjectionExec::try_new(
+                vec![(
+                    col("right_id", &right_schema).expect("projection column should exist"),
+                    "right_id".to_string(),
+                )],
+                right_input,
+            )
+            .expect("projection should be valid"),
+        );
+        let join = Arc::new(join_with_right(right));
+
+        let optimized = optimize(join);
+
+        assert!(
+            optimized
+                .as_any()
+                .downcast_ref::<HashJoinExec<ExactLeftAccumulator>>()
+                .is_some(),
+            "Transparent wrappers over Cayenne scans should still use ExactLeftAccumulator"
+        );
+    }
+
+    #[test]
+    fn rewrites_nested_cayenne_probe_join_chain() {
+        let nested_left = Arc::new(CayenneAccelerationExec::new(memory_exec("nested_left_id")));
+        let nested_right = Arc::new(CayenneAccelerationExec::new(memory_exec("nested_right_id")));
+        let nested_join = Arc::new(hash_join(
+            nested_left,
+            nested_right,
+            "nested_left_id",
+            "nested_right_id",
+        ));
+        let top_join = Arc::new(hash_join(
+            memory_exec("top_id"),
+            nested_join,
+            "top_id",
+            "nested_left_id",
+        ));
+
+        let optimized = optimize(top_join);
+        let snapshot = plan_snapshot(&optimized);
+
+        assert_eq!(
+            2,
+            snapshot.matches("accumulator=ExactLeftAccumulator").count(),
+            "The top join and nested Cayenne probe join should both use ExactLeftAccumulator"
+        );
+    }
+
+    #[test]
+    fn snapshots_cayenne_probe_join_explain_plan() {
+        let right = Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
+        let join = Arc::new(join_with_right(right));
+
+        let optimized = optimize(join);
+
+        insta::assert_snapshot!(
+            "cayenne_probe_join_uses_exact_accumulator_explain",
+            plan_snapshot(&optimized)
+        );
+    }
+
+    #[test]
+    fn snapshots_nested_cayenne_probe_join_explain_plan() {
+        let nested_left = Arc::new(CayenneAccelerationExec::new(memory_exec("nested_left_id")));
+        let nested_right = Arc::new(CayenneAccelerationExec::new(memory_exec("nested_right_id")));
+        let nested_join = Arc::new(hash_join(
+            nested_left,
+            nested_right,
+            "nested_left_id",
+            "nested_right_id",
+        ));
+        let top_join = Arc::new(hash_join(
+            memory_exec("top_id"),
+            nested_join,
+            "top_id",
+            "nested_left_id",
+        ));
+
+        let optimized = optimize(top_join);
+
+        insta::assert_snapshot!(
+            "nested_cayenne_probe_join_uses_exact_accumulator_explain",
+            plan_snapshot(&optimized)
+        );
     }
 }

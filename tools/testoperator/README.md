@@ -336,3 +336,55 @@ testoperator run query --query-set tpch --query-overrides duckdb
 ```
 
 Testoperator will run without explain plan or result snapshotting. Result validation is supported with `--validate`. Telemetry and metrics emission is not supported.
+
+### Driving a distributed cluster via a system adapter
+
+Testoperator can acquire its SUT through an out-of-process JSON-RPC adapter (the same protocol [spicebench](https://github.com/spiceai/spicebench) uses). This is how cluster benchmarks — distributed accelerations and Ballista-style distributed query — are wired up: the adapter provisions the cluster (k8s, Spice Cloud, local docker-compose, …) and returns the Flight SQL URL (and optionally an HTTP base URL) for testoperator to drive queries against.
+
+When `--system-adapter-stdio-cmd` or `--system-adapter-http-url` is set, testoperator skips the local-spawn path entirely: it calls `setup()` on the adapter, runs the benchmark against the returned URLs, and calls `teardown()` at the end (even on failure). The adapter receives the resolved spicepod path and any `--system-adapter-param` key/values in the setup metadata so it can deploy that spicepod to the cluster.
+
+System-adapter mode is supported today by `run bench` and `run throughput`.
+
+#### System Adapter Options
+
+- `--system-adapter-stdio-cmd <CMD>`: Command to spawn as a stdio JSON-RPC adapter (mutually exclusive with `--system-adapter-http-url`).
+- `--system-adapter-stdio-args <STR>`: Space-delimited argument string for the stdio command.
+- `--system-adapter-http-url <URL>`: URL of an already-running HTTP JSON-RPC adapter.
+- `--system-adapter-param KEY=VALUE`: Adapter-specific parameter; passed in the `setup()` metadata map. Repeatable.
+- `--system-adapter-env KEY=VALUE`: Environment variable for the stdio adapter subprocess. Repeatable; stdio-only.
+- `--system-adapter-name <NAME>`: Logical name surfaced as a metric attribute and forwarded to the adapter. Defaults to `system_adapter`.
+
+#### Query Transport Selection
+
+Cluster SUTs typically expose two query interfaces from the scheduler:
+
+- Flight SQL gRPC — exercises the distributed-acceleration code path. This is the default; nothing extra to set.
+- HTTP `POST /v1/queries` — exercises the Ballista (distributed-query) submit-and-poll path. Select this with the existing `--distributed` flag.
+
+The HTTP base URL used by `--distributed` comes from the adapter's `setup` response: testoperator looks for an entry under `endpoints["spice.http.v1.queries"]`, and falls back to deriving the base URL from the Flight URL if the adapter doesn't provide one.
+
+#### Example: distributed accelerations against a local cluster
+
+```sh
+testoperator run bench \
+    -p ./test/spicepods/tpch/sf1/accelerated/distributed/cayenne.yaml \
+    --system-adapter-stdio-cmd ./target/debug/spidapter \
+    --system-adapter-stdio-args "local-spiced" \
+    --system-adapter-param executor_replicas=3 \
+    --query-set tpch \
+    --validate
+```
+
+#### Example: Ballista distributed query against the same cluster
+
+```sh
+testoperator run bench \
+    -p ./test/spicepods/tpch/sf1/distributed/ballista.yaml \
+    --system-adapter-stdio-cmd ./target/debug/spidapter \
+    --system-adapter-stdio-args "local-spiced" \
+    --system-adapter-param executor_replicas=3 \
+    --query-set tpch \
+    --distributed
+```
+
+Local-spawn-only side metrics (process memory, on-disk acceleration size) are skipped when running through a system adapter — the adapter's `metrics()` RPC is the canonical source of SUT-side resource usage for cluster benches.

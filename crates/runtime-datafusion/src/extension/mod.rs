@@ -25,6 +25,7 @@ use datafusion::{
 use std::sync::Arc;
 
 pub mod bytes_processed;
+pub mod data_source_tree_display;
 
 /// [`ExtensionPlanQueryPlanner`] implements [`QueryPlanner`] with a set of [`ExtensionPlanner`].
 ///

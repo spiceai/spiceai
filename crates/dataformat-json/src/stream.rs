@@ -879,7 +879,7 @@ pub enum ReadResult {
 /// # Example
 ///
 /// ```rust,no_run
-/// use dataformat_json::stream::{ArrayToNdjsonPush, ReadResult};
+/// use dataformat_json::{ArrayToNdjsonPush, ReadResult};
 ///
 /// let mut adapter = ArrayToNdjsonPush::new();
 ///
@@ -888,7 +888,7 @@ pub enum ReadResult {
 /// adapter.push_bytes(b"\"John\"}]").unwrap();
 ///
 /// // Read processed NDJSON
-/// match adapter.try_read().unwrap() {
+/// match adapter.try_read() {
 ///     ReadResult::Ready(data) => {
 ///         let output = std::str::from_utf8(&data).unwrap();
 ///         assert!(output.contains("{\"name\":\"John\"}"));
@@ -936,9 +936,6 @@ impl ArrayToNdjsonPush {
 
     /// Try to read processed NDJSON data
     ///
-    /// # Errors
-    ///
-    /// Returns an error if there are issues with the internal state or JSON parsing.
     pub fn try_read(&mut self) -> ReadResult {
         if self.pending.is_empty() {
             if matches!(self.state, ParsingState::Complete) {
