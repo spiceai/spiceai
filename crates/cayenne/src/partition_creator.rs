@@ -214,6 +214,28 @@ impl PartitionCreator for CayennePartitionCreator {
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
 
+        // Durability: fsync the parent table directory after creating a new
+        // partition subdir. Without this, a crash after mkdir but before the
+        // directory entry is on disk can make the partition path unreachable
+        // even though catalog metadata was written and data files may have
+        // been created inside it. This is the last create_dir_all + catalog
+        // metadata record site in the Cayenne write surface; it completes the
+        // uniform durability contract (matching snapshot dirs, staging/,
+        // deletions/, _partitioned_wal/, catalog DB dir, etc.).
+        //
+        // Only relevant for local FS; on object stores (S3) directories are
+        // virtual and the "create" is a no-op.
+        if self.object_store_config.is_none() {
+            let parent = self.base_path.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(dir) = std::fs::File::open(&parent) {
+                    let _ = dir.sync_all();
+                }
+            })
+            .await
+            .ok();
+        }
+
         let partition_column_names = self.partition_column_labels();
         let partition_key = partition_value_strings.join("/");
 
