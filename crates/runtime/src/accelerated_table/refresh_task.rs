@@ -1570,6 +1570,23 @@ impl RefreshTask {
         // (via make_comparator + Ordering::Equal). Exact duplicate NULL-time
         // rows are now correctly filtered.
         //
+        // Devil's advocate / remaining edge case (being really sure):
+        // This loads the *entire historical set* of NULL-time rows on every
+        // append refresh when the column is nullable. For datasets with a very
+        // large number of distinct historical rows that happen to have NULL
+        // time (rare but possible with dirty sources or optional event times),
+        // this can consume significant memory during the dedup phase, potentially
+        // causing OOM in the refresh task. In such cases the >max optimization
+        // is defeated for the NULL subset.
+        //
+        // Mitigation in practice: most append workloads either have non-nullable
+        // time columns, or the number of NULL-time rows is small/bounded. For
+        // high-cardinality NULL time + append, users should prefer defining a
+        // primary key + on_conflict upsert semantics on the accelerator (which
+        // the engine will enforce at write time) or avoid append mode.
+        // We explicitly document the limitation here as part of rigorous
+        // correctness review for the recurring ACID task.
+        //
         // This is the "comprehensive edge case" coverage for the recurring ACID
         // task. We only pay the (hopefully small) cost of loading the NULL-time
         // subset; the > max tail optimization is preserved for the non-null
