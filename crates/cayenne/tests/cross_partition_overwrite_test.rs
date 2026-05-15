@@ -45,13 +45,15 @@ You may obtain a copy of the License at
 //! with the per-partition durability tests (deletion vector restart,
 //! staged-append restart, acid_compliance, data_inlining, catalog
 //! concurrency with partitions, and shared_metastore_concurrency_test
-//! which exercises fresh catalog DB directory creation), provide
-//! comprehensive regression coverage for this property, including the
-//! edge cases of the very first cross-partition write on a brand-new
-//! table (first creation of the _partitioned_wal/ directory), the first
-//! deletion vector written to a snapshot, the first discovery of a new
-//! partition value, and first-time catalog initialization on a brand-new
-//! data directory.
+//! which exercises fresh catalog DB directory creation in both
+//! CayenneCatalog::init and the SQLite/Turso metastore backends),
+//! provide comprehensive regression coverage for this property,
+//! including the edge cases of the very first cross-partition write on a
+//! brand-new table (first creation of the _partitioned_wal/ directory),
+//! the first deletion vector written to a snapshot, the first discovery
+//! of a new partition value, and first-time catalog initialization on a
+//! brand-new data directory (including defense-in-depth in the
+//! connection setup paths).
 
 #![expect(
     clippy::expect_used,
