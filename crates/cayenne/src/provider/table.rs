@@ -2095,6 +2095,17 @@ impl CayenneTableProvider {
             )
             .await?;
 
+        // Sync the new snapshot directory for durability before recording the
+        // sequence number in the catalog. This is required for the same reason
+        // as in the sort-rewrite and normal append paths: the Vortex files must
+        // be durably present before the catalog metadata that makes them
+        // visible (via sequence number / protected snapshot) is committed.
+        let is_s3 = self.table_metadata.path.starts_with("s3://");
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            Self::sync_snapshot_dir(&snapshot_dir).await?;
+        }
+
         tracing::debug!(
             "Insert to new snapshot {} completed, wrote {} rows to Vortex in {} chunk(s)",
             new_snapshot_id,
