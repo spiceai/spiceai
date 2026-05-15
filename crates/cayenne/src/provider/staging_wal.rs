@@ -649,14 +649,32 @@ impl CayenneTableProvider {
             let staging_dir =
                 Self::snapshot_dir_path(self.table_path(), self.table_id(), STAGING_DIR_NAME);
             let wal_path = staging_dir.join(STAGING_WAL_FILENAME);
-            match tokio::fs::remove_file(&wal_path).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            let removed = match tokio::fs::remove_file(&wal_path).await {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true, // already gone = success state
                 Err(e) => {
                     tracing::warn!(
                         "Failed to remove staging WAL for table {}: {e}",
                         self.table_name(),
                     );
+                    false
+                }
+            };
+
+            if removed {
+                // Durability: after removing the WAL marker (the "commit success" signal),
+                // fsync the staging directory so the unlink is persisted. A crash without
+                // this sync could make the removal non-durable, causing a false-positive
+                // "incomplete write" detection on the next open even though the data move
+                // succeeded and was synced. This completes the "WAL absent = durably
+                // committed" contract for local FS staged appends (symmetric to the
+                // sync after data file moves).
+                if let Err(e) = Self::sync_snapshot_dir(&staging_dir).await {
+                    tracing::warn!(
+                        "Failed to sync staging dir after WAL removal for table {}: {e} (data is safe; may see stale WAL on restart)",
+                        self.table_name(),
+                    );
+                    // Non-fatal: data files are already durable. A lingering WAL is conservative.
                 }
             }
         }

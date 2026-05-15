@@ -1580,6 +1580,13 @@ impl CayenneTableProvider {
             table_name = self.table_metadata.table_name,
         );
 
+        // Durability: fsync the target snapshot directory so that the rename operations
+        // are persisted before the caller removes the staging WAL. This ensures that
+        // "WAL absent" truly means the data files are durable on disk (ACID Durability
+        // for the staged append path on local filesystems). Matches the sync performed
+        // in the sort-rewrite / compaction path before metadata commit.
+        Self::sync_snapshot_dir(&target_dir).await?;
+
         Ok(())
     }
 
