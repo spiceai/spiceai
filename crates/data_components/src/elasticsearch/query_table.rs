@@ -975,8 +975,8 @@ mod tests {
     // ── UInt64 (ES `unsigned_long`) ────────────────────────────────────────────
 
     /// schema.rs maps ES `unsigned_long` to Arrow `UInt64`. Without a dedicated
-    /// decoder arm, the schema would say UInt64 while the decoder fell into
-    /// the JSON-string fallback, blowing up at RecordBatch construction with a
+    /// decoder arm, the schema would say `UInt64` while the decoder fell into
+    /// the JSON-string fallback, blowing up at `RecordBatch` construction with a
     /// schema/data type mismatch.
     #[test]
     fn test_unsigned_long_decodes_to_uint64() {
