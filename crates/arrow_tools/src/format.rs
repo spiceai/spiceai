@@ -55,6 +55,16 @@ pub(crate) fn format_column_data(
                     "Failed to downcast to StringViewArray".into(),
                 ))?;
 
+            // Fast path: zero-copy when no string requires character truncation.
+            // Cheap byte-length filter first (char count only on candidates).
+            if !string_array.iter().any(|opt| {
+                opt.map_or(false, |s| {
+                    s.len() > max_characters && s.chars().count() > max_characters
+                })
+            }) {
+                return Ok(Arc::clone(&column));
+            }
+
             let truncated = string_array
                 .iter()
                 .map(|x| truncate_str(x, max_characters))
@@ -69,6 +79,16 @@ pub(crate) fn format_column_data(
                 .ok_or(ArrowError::CastError(
                     "Failed to downcast to ListArray".into(),
                 ))?;
+
+            // Fast path: zero-copy when no string requires character truncation.
+            // Cheap byte-length filter first (char count only on candidates).
+            if !string_array.iter().any(|opt| {
+                opt.map_or(false, |s| {
+                    s.len() > max_characters && s.chars().count() > max_characters
+                })
+            }) {
+                return Ok(Arc::clone(&column));
+            }
 
             let truncated = string_array
                 .iter()
@@ -151,6 +171,12 @@ pub(crate) fn format_column_data(
                 FormatOperation::TruncateUtf8Length(max_characters),
             )?;
 
+            // Zero-copy fast path for the outer list when the inner values were
+            // not modified (common when text in lists is short).
+            if Arc::ptr_eq(&truncated_values, list_array.values()) {
+                return Ok(Arc::clone(&column));
+            }
+
             let list = ListArray::new(
                 Arc::clone(&field),
                 list_array.offsets().clone(),
@@ -173,6 +199,12 @@ pub(crate) fn format_column_data(
                 &field,
                 FormatOperation::TruncateUtf8Length(max_characters),
             )?;
+
+            // Zero-copy fast path for the outer list when the inner values were
+            // not modified (common when text in lists is short).
+            if Arc::ptr_eq(&truncated_values, list_array.values()) {
+                return Ok(Arc::clone(&column));
+            }
 
             let list = LargeListArray::new(
                 Arc::clone(&field),
@@ -200,6 +232,12 @@ pub(crate) fn format_column_data(
                 FormatOperation::TruncateUtf8Length(max_characters),
             )?;
 
+            // Zero-copy fast path for the outer list when the inner values were
+            // not modified (common when text in lists is short).
+            if Arc::ptr_eq(&truncated_values, list_array.values()) {
+                return Ok(Arc::clone(&column));
+            }
+
             let list = FixedSizeListArray::new(
                 Arc::clone(&field),
                 size,
@@ -222,6 +260,12 @@ pub(crate) fn format_column_data(
                 &field,
                 FormatOperation::TruncateUtf8Length(max_characters),
             )?;
+
+            // Zero-copy fast path for the outer list when the inner values were
+            // not modified (common when text in lists is short).
+            if Arc::ptr_eq(&truncated_values, list_array.values()) {
+                return Ok(Arc::clone(&column));
+            }
 
             ListViewArray::try_new(
                 Arc::clone(&field),
@@ -249,6 +293,12 @@ pub(crate) fn format_column_data(
                 FormatOperation::TruncateUtf8Length(max_characters),
             )?;
 
+            // Zero-copy fast path for the outer list when the inner values were
+            // not modified (common when text in lists is short).
+            if Arc::ptr_eq(&truncated_values, list_array.values()) {
+                return Ok(Arc::clone(&column));
+            }
+
             LargeListViewArray::try_new(
                 Arc::clone(&field),
                 list_array.offsets().clone(),
@@ -264,7 +314,7 @@ pub(crate) fn format_column_data(
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| ArrowError::CastError("Failed to downcast to StructArray".into()))?;
 
-            let columns = fields
+            let columns: Vec<_> = fields
                 .iter()
                 .enumerate()
                 .map(|(i, field)| {
@@ -276,6 +326,15 @@ pub(crate) fn format_column_data(
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+
+            // Zero-copy fast path for the whole struct when no field was modified.
+            let all_unchanged = columns
+                .iter()
+                .enumerate()
+                .all(|(i, c)| Arc::ptr_eq(c, struct_array.column(i)));
+            if all_unchanged {
+                return Ok(Arc::clone(&column));
+            }
 
             let truncated_struct =
                 StructArray::from(fields.iter().cloned().zip(columns).collect::<Vec<_>>());
