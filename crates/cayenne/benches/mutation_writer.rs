@@ -261,5 +261,176 @@ fn bench_inline_mutation_paths(c: &mut Criterion) {
     pressure.finish();
 }
 
-criterion_group!(benches, bench_append_roundtrip, bench_inline_mutation_paths);
+async fn setup_table_with_options_and_config(
+    table_name: &str,
+    primary_key: Vec<String>,
+    on_conflict: Option<OnConflict>,
+    vortex_config: cayenne::metadata::VortexConfig,
+) -> BenchTable {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let data_path = temp_dir.path().join("data");
+    tokio::fs::create_dir_all(&data_path)
+        .await
+        .expect("data dir");
+    let db_path = temp_dir.path().join("bench.db");
+    let catalog = Arc::new(
+        CayenneCatalog::new(format!("sqlite://{}", db_path.to_string_lossy())).expect("catalog"),
+    );
+    catalog.init().await.expect("catalog init");
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&schema),
+                primary_key,
+                on_conflict,
+                base_path: data_path.to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config,
+            },
+            ctx.runtime_env(),
+        )
+        .await
+        .expect("table"),
+    );
+
+    BenchTable {
+        _temp_dir: temp_dir,
+        table,
+        schema,
+    }
+}
+
+/// Per-append overhead from the inline tiered-compaction trigger.
+///
+/// `no_compaction` raises `compaction_trigger_files` so high that the picker
+/// is guaranteed to skip on every write. `with_compaction` uses defaults. The
+/// gap between the two groups is the picker + listing cost we add on the hot
+/// write path when there's nothing to do.
+fn bench_compaction_overhead(c: &mut Criterion) {
+    let rt = Runtime::new().expect("runtime");
+
+    let mut group = c.benchmark_group("mutation_writer_inline_compaction_overhead");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(1));
+
+    for (case, config) in [
+        ("no_compaction", {
+            let mut cfg = cayenne::metadata::VortexConfig::default();
+            cfg.compaction_trigger_files = usize::MAX;
+            cfg.compaction_background_interval_ms = 0;
+            cfg
+        }),
+        ("with_compaction", {
+            let mut cfg = cayenne::metadata::VortexConfig::default();
+            // Tiny target so tiny files count as small — but trigger stays at 8
+            // (default), so the picker only fires after enough writes. We
+            // measure single-row appends so it will skip every time.
+            cfg.target_vortex_file_size_mb = 1;
+            cfg.compaction_background_interval_ms = 0;
+            cfg
+        }),
+    ] {
+        group.bench_function(case, |b| {
+            b.iter_batched(
+                || {
+                    rt.block_on(setup_table_with_options_and_config(
+                        "bench_compaction_overhead",
+                        vec![],
+                        None,
+                        config.clone(),
+                    ))
+                },
+                |bench_table| {
+                    rt.block_on(async move {
+                        let batch = make_batch(Arc::clone(&bench_table.schema), 0, 1);
+                        let written = append_batch(&bench_table.table, batch).await;
+                        black_box((bench_table, written));
+                    });
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+/// Direct compaction throughput. Pre-stage N small Vortex files in the
+/// current snapshot by appending rows above `INLINE_MAX_ROWS` (so they bypass
+/// the memtable), then measure the time for a single explicit compaction
+/// trigger.
+fn bench_compaction_throughput(c: &mut Criterion) {
+    use cayenne::provider::compaction::CompactionRunner;
+
+    let rt = Runtime::new().expect("runtime");
+    let mut group = c.benchmark_group("mutation_writer_compaction_throughput");
+    group.sample_size(10);
+
+    let rows_per_file: i64 = 1500; // > INLINE_MAX_ROWS so each lands as a file
+
+    for &file_count in &[8_usize, 16, 32] {
+        group.throughput(Throughput::Elements(file_count as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(file_count),
+            &file_count,
+            |b, &file_count| {
+                b.iter_batched(
+                    || {
+                        rt.block_on(async {
+                            let mut cfg = cayenne::metadata::VortexConfig::default();
+                            cfg.target_vortex_file_size_mb = 1;
+                            // Disable inline trigger during setup so the file
+                            // count we stage is the exact starting state.
+                            cfg.compaction_trigger_files = usize::MAX;
+                            cfg.compaction_background_interval_ms = 0;
+                            let bench_table = setup_table_with_options_and_config(
+                                "bench_compaction_throughput",
+                                vec![],
+                                None,
+                                cfg,
+                            )
+                            .await;
+                            for idx in 0..file_count as i64 {
+                                let batch = make_batch(
+                                    Arc::clone(&bench_table.schema),
+                                    idx * rows_per_file,
+                                    rows_per_file as usize,
+                                );
+                                let _ = append_batch(&bench_table.table, batch).await;
+                            }
+                            bench_table
+                        })
+                    },
+                    |bench_table| {
+                        rt.block_on(async move {
+                            let ran = bench_table
+                                .table
+                                .run_compaction_trigger()
+                                .await
+                                .expect("compaction should succeed");
+                            black_box((bench_table, ran));
+                        });
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_append_roundtrip,
+    bench_inline_mutation_paths,
+    bench_compaction_overhead,
+    bench_compaction_throughput,
+);
 criterion_main!(benches);

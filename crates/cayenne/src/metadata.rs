@@ -265,6 +265,36 @@ pub struct VortexConfig {
     /// When unset, writes use the current `DataFusion` session target partition count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_concurrency: Option<usize>,
+    /// Minimum number of "small" Vortex files that must accumulate in the current
+    /// snapshot before tiered compaction is eligible to run. Files are classified
+    /// as "small" when their size is below `target_vortex_file_size_mb / 4`. The
+    /// compactor also requires that the picked files' total size meets the
+    /// per-tier target before rewriting (see [`crate::provider::compaction`]).
+    ///
+    /// Defaults to 8.
+    #[serde(default = "default_compaction_trigger_files")]
+    pub compaction_trigger_files: usize,
+    /// Maximum number of consecutive compaction passes that a single trigger can
+    /// run. Each pass picks the smallest eligible tier and rewrites a single
+    /// snapshot. Capping this avoids unbounded write amplification when the
+    /// picker would keep finding work after each promotion.
+    ///
+    /// Defaults to 3.
+    #[serde(default = "default_compaction_max_levels")]
+    pub compaction_max_levels: usize,
+    /// Maximum number of files the picker will combine in a single compaction
+    /// pass. Keeps individual passes bounded in IO and memory.
+    ///
+    /// Defaults to 32.
+    #[serde(default = "default_compaction_max_files_per_pick")]
+    pub compaction_max_files_per_pick: usize,
+    /// Background compaction interval in milliseconds. The accelerator spawns a
+    /// per-table background task that calls the compactor every interval. Set to
+    /// 0 to disable the background task — inline compaction on writes still runs.
+    ///
+    /// Defaults to 30_000 ms.
+    #[serde(default = "default_compaction_background_interval_ms")]
+    pub compaction_background_interval_ms: u64,
 }
 
 fn default_concurrency() -> usize {
@@ -273,6 +303,22 @@ fn default_concurrency() -> usize {
 
 fn default_upload_concurrency() -> usize {
     default_concurrency()
+}
+
+fn default_compaction_trigger_files() -> usize {
+    8
+}
+
+fn default_compaction_max_levels() -> usize {
+    3
+}
+
+fn default_compaction_max_files_per_pick() -> usize {
+    32
+}
+
+fn default_compaction_background_interval_ms() -> u64 {
+    30_000
 }
 
 impl Default for VortexConfig {
@@ -288,6 +334,10 @@ impl Default for VortexConfig {
             compression_strategy: CompressionStrategy::default(),
             upload_concurrency: default_upload_concurrency(),
             write_concurrency: None,
+            compaction_trigger_files: default_compaction_trigger_files(),
+            compaction_max_levels: default_compaction_max_levels(),
+            compaction_max_files_per_pick: default_compaction_max_files_per_pick(),
+            compaction_background_interval_ms: default_compaction_background_interval_ms(),
         }
     }
 }

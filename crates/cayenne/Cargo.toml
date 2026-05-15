@@ -118,3 +118,7 @@ name = "vs_duckdb_pk_lookup"
 [[bench]]
 harness = false
 name = "vs_duckdb_delete"
+
+[[bench]]
+harness = false
+name = "compaction_picker"

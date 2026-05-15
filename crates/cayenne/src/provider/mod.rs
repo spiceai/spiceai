@@ -41,6 +41,7 @@ limitations under the License.
 //! - [`constants`]: Shared constants
 //! - [`context`]: Shared context for Cayenne operations
 //! - [`staging_wal`]: Staging WAL for crash-safe staged appends
+pub(crate) mod compaction;
 pub(crate) mod constants;
 pub(crate) mod context;
 pub(crate) mod delete;

@@ -295,6 +295,14 @@ impl ColumnStatsAccumulator {
     }
 }
 
+// Inlining caps are intentionally conservative: inlined data is reread on every
+// scan, lives as BLOBs in the metastore, and gets no zone-map pruning. Raising
+// these limits trades a slightly cheaper write path for read amplification on
+// every subsequent query — the wrong tradeoff for large-dataset workloads,
+// which are the dominant use case for Cayenne. The right lever for large
+// datasets is `target_vortex_file_size_mb` plus the tiered small-files
+// compaction in `provider::compaction`, not bigger memtables.
+
 /// Maximum number of rows to inline in the metastore instead of writing a Vortex file.
 pub(crate) const INLINE_MAX_ROWS: usize = 1024;
 
@@ -512,6 +520,21 @@ pub struct CayenneTableProvider {
     /// append-heavy inline CDC writes don't query the metastore after every
     /// burst just to decide whether to checkpoint.
     inlined_row_count: Arc<AtomicI64>,
+    /// Serializes concurrent compaction passes on this table so a write-driven
+    /// inline trigger and the background scheduler can't both rewrite the
+    /// current snapshot at the same time. Held across the *entire* trigger
+    /// sequence — up to `compaction_max_levels` consecutive snapshot rewrites
+    /// per call to [`Self::maybe_compact_small_files`] — so that competing
+    /// triggers no-op via `try_lock` rather than chaining onto a backlog. The
+    /// per-table write lock continues to serialize ordinary inserts
+    /// independently.
+    compaction_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-table background compaction task, populated by
+    /// [`Self::spawn_background_compaction`]. Held by `Arc<OnceLock<…>>` so it
+    /// survives [`Self::clone_for_write`] and shares its drop signal across
+    /// all clones — when the last `Arc<CayenneTableProvider>` is dropped the
+    /// compactor's `JoinHandle::abort` runs and the background task exits.
+    background_compactor: Arc<std::sync::OnceLock<super::compaction::BackgroundCompactor>>,
 }
 
 /// Builder for constructing a `CayenneTableProvider` with optional configuration.
@@ -1757,6 +1780,8 @@ impl CayenneTableProvider {
             object_store_config,
             protected_snapshots: Arc::new(RwLock::new(protected_snapshots)),
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
+            compaction_lock: Arc::new(tokio::sync::Mutex::new(())),
+            background_compactor: Arc::new(std::sync::OnceLock::new()),
         };
 
         // Fail construction if a staging WAL exists — the table may contain
@@ -2147,6 +2172,10 @@ impl CayenneTableProvider {
             current_snapshot_id: Arc::clone(&self.current_snapshot_id),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
+            // Shared so inline (write-driven) and background compaction
+            // attempts on the same table coordinate, even across clones.
+            compaction_lock: Arc::clone(&self.compaction_lock),
+            background_compactor: Arc::clone(&self.background_compactor),
         }
     }
 
@@ -3588,6 +3617,353 @@ impl CayenneTableProvider {
         );
 
         Ok(())
+    }
+
+    /// Inline tiered-merge-tree trigger.
+    ///
+    /// Lists Vortex files in the current snapshot directory along with their
+    /// sizes, runs the picker, and — if a candidate exists — rewrites the
+    /// entire current snapshot into a fresh one. Re-evaluates after each pass,
+    /// up to `compaction_max_levels` consecutive rewrites, so a tier can
+    /// promote (small → mid → settled) within one trigger.
+    ///
+    /// Best-effort by design: errors are returned to the caller for logging,
+    /// but never bubble up to fail the originating write or query. The
+    /// per-table `compaction_lock` is acquired with `try_lock` — if another
+    /// pass is already in flight (inline or background), we skip this trigger
+    /// rather than queueing more work.
+    ///
+    /// **Callers are responsible for write-lock coordination.** Inline callers
+    /// (in `mutation_writer`) hold `write_lock` already, so they call this
+    /// directly. The background scheduler's [`super::compaction::CompactionRunner`]
+    /// adapter `try_lock`s `write_lock` before delegating here. Tests use the
+    /// `#[doc(hidden)] pub` exposure for direct access — no concurrent writers
+    /// in single-table test setups.
+    ///
+    /// Returns `Ok(true)` if at least one snapshot rewrite occurred.
+    #[doc(hidden)]
+    pub async fn maybe_compact_small_files(&self) -> Result<bool> {
+        let Ok(_guard) = self.compaction_lock.try_lock() else {
+            tracing::trace!(
+                table = self.table_metadata.table_name.as_str(),
+                "Skipping compaction trigger: another pass already running",
+            );
+            return Ok(false);
+        };
+
+        let max_passes = self.context.compaction_max_levels();
+        let mut total_passes = 0_usize;
+
+        for _ in 0..max_passes {
+            if !self.run_one_compaction_pass().await? {
+                break;
+            }
+            total_passes += 1;
+        }
+
+        Ok(total_passes > 0)
+    }
+
+    /// Single compaction pass — list, pick, rewrite.
+    ///
+    /// Returns `Ok(true)` if the pass produced a new snapshot.
+    async fn run_one_compaction_pass(&self) -> Result<bool> {
+        use super::compaction::{FileEntry, pick_candidates};
+
+        let snapshot_id = self.get_current_snapshot_id()?;
+        let files = self
+            .list_snapshot_files_with_sizes(&snapshot_id)
+            .await?;
+
+        if files.len() < 2 {
+            return Ok(false);
+        }
+
+        let cfg = self.context.compaction_picker_config();
+        let Some(candidate) = pick_candidates(
+            &files
+                .iter()
+                .map(|(path, size)| FileEntry {
+                    path: path.clone(),
+                    size_bytes: *size,
+                })
+                .collect::<Vec<_>>(),
+            &cfg,
+        ) else {
+            return Ok(false);
+        };
+
+        tracing::info!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            tier = candidate.tier.as_str(),
+            picked_files = candidate.paths.len(),
+            picked_bytes = candidate.total_bytes,
+            total_files = files.len(),
+            "Running tiered compaction pass"
+        );
+
+        self.rewrite_current_snapshot_for_compaction().await?;
+        Ok(true)
+    }
+
+    /// List Vortex files in the current snapshot directory with their sizes.
+    ///
+    /// Local filesystem: uses [`tokio::fs::read_dir`].
+    /// S3 (and S3 Express One Zone): uses the configured `ObjectStore::list`.
+    ///
+    /// Only entries whose name ends in `.vortex` are returned, which matches
+    /// the file naming used by [`Self::write_to_snapshot`]. Hidden files
+    /// (those starting with `.`) and the staging WAL are filtered out.
+    ///
+    /// Exposed as `#[doc(hidden)] pub` so the crate's integration tests can
+    /// assert on file counts after compaction without forcing this internal
+    /// diagnostic helper into the documented public surface area.
+    #[doc(hidden)]
+    pub async fn list_snapshot_files_with_sizes(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Vec<(String, u64)>> {
+        if self.table_metadata.path.starts_with("s3://") {
+            self.list_snapshot_files_with_sizes_s3(snapshot_id).await
+        } else {
+            self.list_snapshot_files_with_sizes_local(snapshot_id).await
+        }
+    }
+
+    async fn list_snapshot_files_with_sizes_local(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Vec<(String, u64)>> {
+        let snapshot_dir = self.snapshot_dir_path_for(snapshot_id);
+        let mut entries = match tokio::fs::read_dir(&snapshot_dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut files = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+
+            if !Self::is_compactable_data_file(name_str) {
+                continue;
+            }
+
+            let metadata = entry.metadata().await?;
+            files.push((name_str.to_string(), metadata.len()));
+        }
+
+        Ok(files)
+    }
+
+    async fn list_snapshot_files_with_sizes_s3(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Vec<(String, u64)>> {
+        let Some(prefix) = self.snapshot_object_store_prefix(snapshot_id)? else {
+            return Ok(Vec::new());
+        };
+
+        let config = self.require_object_store()?;
+        // Stream-iterate so a large snapshot directory doesn't materialize the
+        // full `ObjectMeta` list in memory on the write path — only the small
+        // `(name, size)` pairs the picker needs are retained.
+        let mut stream = config.store.list(Some(&prefix));
+        let mut files = Vec::new();
+        while let Some(meta) = stream
+            .try_next()
+            .await
+            .map_err(|e| Error::ObjectStore {
+                operation: "list snapshot objects for compaction",
+                table: self.table_metadata.table_name.clone(),
+                source: e,
+            })?
+        {
+            let path_str = meta.location.as_ref();
+            let name = path_str
+                .rsplit_once('/')
+                .map_or(path_str, |(_, name)| name);
+
+            if !Self::is_compactable_data_file(name) {
+                continue;
+            }
+            // `object_store::ObjectMeta::size` is `usize`; widen via checked
+            // conversion so a future 128-bit target would not silently
+            // misclassify file sizes for the picker.
+            let size_bytes = u64::try_from(meta.size).unwrap_or(u64::MAX);
+            files.push((name.to_string(), size_bytes));
+        }
+
+        Ok(files)
+    }
+
+    /// Returns true if the file name looks like a compactable Vortex data file
+    /// (and not a hidden file or staging-WAL artifact).
+    fn is_compactable_data_file(name: &str) -> bool {
+        if name.starts_with('.') {
+            return false;
+        }
+        if name == STAGING_WAL_FILENAME {
+            return false;
+        }
+        name.ends_with(".vortex")
+    }
+
+    /// Rewrite the current snapshot into a fresh one, consolidating its files.
+    ///
+    /// This mirrors the structure of [`Self::sort_and_rewrite_data`] but does
+    /// not apply a sort transform. The picker has already decided that the
+    /// current snapshot has enough small files to justify a rewrite, so the
+    /// goal here is purely to consolidate.
+    ///
+    /// On success the catalog is atomically pointed at the new snapshot, the
+    /// in-memory listing table is swapped, deletion caches are cleared, and
+    /// old snapshot dirs are reaped in the background.
+    async fn rewrite_current_snapshot_for_compaction(&self) -> Result<()> {
+        let listing_table = self.listing_table.load_full();
+        let ctx = self.create_session_context();
+        let df = ctx.read_table(listing_table)?;
+        let stream = df.execute_stream().await?;
+
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let is_s3 = self.table_metadata.path.starts_with("s3://");
+
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
+        }
+
+        let target_size_bytes = self.context.target_file_size_bytes();
+        let target_partitions = ctx.state().config().target_partitions();
+        let write_result = self
+            .write_to_snapshot(
+                stream,
+                target_size_bytes,
+                &new_snapshot_id,
+                target_partitions,
+            )
+            .await;
+
+        let (total_rows, _writer_ops, stats_acc) = match write_result {
+            Ok(result) => result,
+            Err(e) => {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(e);
+            }
+        };
+
+        if total_rows == 0 {
+            // No live rows in the source — clean up the empty new snapshot
+            // dir and skip the catalog commit. Subsequent triggers will keep
+            // returning the same empty state and pick None, so this is rare.
+            self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                .await;
+            return Ok(());
+        }
+
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            if let Err(e) = Self::sync_snapshot_dir(&snapshot_dir).await {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(Error::Catalog { source: e });
+            }
+        }
+
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            &new_snapshot_id,
+        );
+        let new_listing_table = Self::create_listing_table(
+            &snapshot_dir_url,
+            Arc::clone(&self.table_metadata.schema),
+            self.context.file_format(),
+            &self.pk_deletion_strategy,
+        )?;
+
+        if let Err(e) = self.commit_overwrite(&new_snapshot_id).await {
+            self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                .await;
+            return Err(Error::Catalog { source: e });
+        }
+
+        {
+            let _fence = self.listing_fence.write().await;
+            self.listing_table.store(new_listing_table);
+        }
+
+        self.update_current_snapshot_id(&new_snapshot_id)?;
+
+        if let Err(e) = self.clear_all_deletion_caches() {
+            tracing::warn!(
+                "Failed to clear deletion caches after compaction for table {}: {e}",
+                self.table_metadata.table_name
+            );
+        }
+
+        // Persist accumulated stats from the rewrite — keeps DataFusion's
+        // synchronous statistics path consistent with the new snapshot.
+        self.persist_table_stats(&stats_acc).await;
+
+        self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
+
+        tracing::info!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            rows = total_rows,
+            new_snapshot_id = new_snapshot_id.as_str(),
+            "Compaction snapshot committed"
+        );
+
+        Ok(())
+    }
+
+    async fn cleanup_failed_compaction_snapshot(&self, new_snapshot_id: &str, is_s3: bool) {
+        if is_s3 {
+            match self.snapshot_object_store_prefix(new_snapshot_id) {
+                Ok(Some(prefix)) => {
+                    if let Err(e) = self.delete_prefix_with_object_store(&prefix).await {
+                        tracing::warn!(
+                            "Failed to clean up failed compaction snapshot prefix {} for table {}: {e}",
+                            new_snapshot_id,
+                            self.table_metadata.table_name
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to resolve compaction-cleanup prefix for snapshot {} on table {}: {e}",
+                        new_snapshot_id,
+                        self.table_metadata.table_name
+                    );
+                }
+            }
+        } else {
+            let snapshot_dir = self.snapshot_dir_path_for(new_snapshot_id);
+            if let Err(e) = tokio::fs::remove_dir_all(&snapshot_dir).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "Failed to clean up failed compaction snapshot dir {} for table {}: {e}",
+                        snapshot_dir.display(),
+                        self.table_metadata.table_name
+                    );
+                }
+            }
+        }
     }
 
     /// Create a `SessionContext` for data operations using the shared `RuntimeEnv`.
@@ -6085,6 +6461,73 @@ fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
         format!("{:.2} KiB/s", bytes_per_sec / KIB)
     } else {
         format!("{bytes_per_sec:.0} B/s")
+    }
+}
+
+#[async_trait::async_trait]
+impl super::compaction::CompactionRunner for CayenneTableProvider {
+    async fn run_compaction_trigger(&self) -> std::result::Result<bool, String> {
+        // Background scheduler path: serialize with the per-table `write_lock`
+        // so concurrent appends (which write to the current snapshot dir under
+        // `write_lock`) cannot land between this pass reading the current
+        // snapshot and the `commit_overwrite` advancing the pointer.
+        //
+        // Using `try_lock` keeps the background loop non-blocking from a
+        // writer's perspective — if a writer is active we skip this tick and
+        // re-evaluate on the next interval. The inline trigger paths in
+        // `mutation_writer.rs` call `maybe_compact_small_files` directly while
+        // the caller already holds `write_lock`, so they bypass this guard
+        // (tokio mutexes are not re-entrant, so we must not re-acquire there).
+        let Ok(_write_guard) = self.write_lock.try_lock() else {
+            tracing::trace!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Skipping background compaction: write_lock held by another writer",
+            );
+            return Ok(false);
+        };
+        self.maybe_compact_small_files()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    fn compaction_target_name(&self) -> &str {
+        &self.table_metadata.table_name
+    }
+}
+
+impl CayenneTableProvider {
+    /// Spawn the background compaction task for this provider, if not already
+    /// spawned and if the configured interval is non-zero.
+    ///
+    /// Must be called after the provider has been wrapped in an `Arc` — the
+    /// scheduler holds a `Weak<Self>` so it does not extend the provider's
+    /// lifetime. The returned compactor is owned by the provider itself
+    /// (stored in `background_compactor`); when the last `Arc` to the provider
+    /// is dropped, the compactor drops and the task aborts.
+    ///
+    /// Returns `true` if a task was spawned by this call, `false` otherwise
+    /// (interval = 0, or a previous call already spawned one).
+    pub fn spawn_background_compaction(
+        self: &Arc<Self>,
+        semaphore: Arc<tokio::sync::Semaphore>,
+    ) -> bool {
+        if self.background_compactor.get().is_some() {
+            return false;
+        }
+        let Some(interval) = self.context.compaction_background_interval() else {
+            return false;
+        };
+        let Some(compactor) = super::compaction::BackgroundCompactor::spawn(
+            Arc::downgrade(self) as std::sync::Weak<dyn super::compaction::CompactionRunner>,
+            interval,
+            semaphore,
+        ) else {
+            return false;
+        };
+        // OnceLock::set fails only if already initialized — race here is fine,
+        // the lost compactor drops and aborts its own task.
+        self.background_compactor.set(compactor).is_ok()
     }
 }
 

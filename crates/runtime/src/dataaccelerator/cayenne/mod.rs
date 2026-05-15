@@ -141,6 +141,11 @@ pub(crate) fn transform_schema_for_vortex(
 
 pub struct CayenneAccelerator {
     catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
+    /// Shared semaphore that bounds the number of concurrent per-table
+    /// background compactions across all Cayenne tables registered with this
+    /// accelerator. Sized at `available_parallelism()` so a fleet of tables
+    /// can't oversubscribe the writer pool.
+    compaction_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl Default for CayenneAccelerator {
@@ -194,8 +199,13 @@ fn is_local_path(path: &str) -> bool {
 impl CayenneAccelerator {
     #[must_use]
     pub fn new() -> Self {
+        let permits = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .max(1);
         Self {
             catalog: Arc::new(OnceCell::new()),
+            compaction_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
         }
     }
 
@@ -468,15 +478,52 @@ impl CayenneAccelerator {
                 }
             }
 
+            config.compaction_trigger_files = parse_usize(
+                acceleration,
+                "cayenne_compaction_trigger_files",
+                config.compaction_trigger_files,
+            );
+            config.compaction_max_levels = parse_usize(
+                acceleration,
+                "cayenne_compaction_max_levels",
+                config.compaction_max_levels,
+            );
+            config.compaction_max_files_per_pick = parse_usize(
+                acceleration,
+                "cayenne_compaction_max_files_per_pick",
+                config.compaction_max_files_per_pick,
+            );
+
+            if let Some(interval_str) = acceleration
+                .params
+                .get("cayenne_compaction_background_interval_ms")
+            {
+                match interval_str.parse::<u64>() {
+                    Ok(parsed) => {
+                        config.compaction_background_interval_ms = parsed;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "Invalid 'cayenne_compaction_background_interval_ms' value: '{interval_str}'. Expected a non-negative integer (milliseconds, 0 disables). Keeping default of {}.",
+                            config.compaction_background_interval_ms
+                        );
+                    }
+                }
+            }
+
             tracing::debug!(
-                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}",
+                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, compaction_trigger_files={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}",
                 config.footer_cache_mb,
                 config.segment_cache_mb,
                 config.target_vortex_file_size_mb,
                 config.upload_concurrency,
                 config.write_concurrency,
                 config.sort_columns,
-                config.compression_strategy
+                config.compression_strategy,
+                config.compaction_trigger_files,
+                config.compaction_max_levels,
+                config.compaction_max_files_per_pick,
+                config.compaction_background_interval_ms,
             );
         }
 
@@ -683,7 +730,14 @@ impl CayenneAccelerator {
             .context(AccelerationCreationFailedSnafu)?;
 
         tracing::debug!("create_cayenne_table_provider: table {table_name} created successfully");
-        Ok(Arc::new(cayenne_table))
+        let provider = Arc::new(cayenne_table);
+        let spawned = provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
+        if spawned {
+            tracing::debug!(
+                "Background compaction task spawned for Cayenne table {table_name}",
+            );
+        }
+        Ok(provider)
     }
 }
 
@@ -762,8 +816,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    12,
-    { S3_PARAMS_LEN + 12 },
+    16,
+    { S3_PARAMS_LEN + 16 },
 >(
     S3_PARAMETERS,
     [
@@ -799,6 +853,18 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Maximum number of concurrent file uploads when writing multiple Vortex files. Defaults to available CPU parallelism."),
         ParameterSpec::component("write_concurrency")
             .description("Optional writer partition override for unsorted Cayenne ingests. Defaults to runtime.query.target_partitions."),
+        ParameterSpec::component("compaction_trigger_files")
+            .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 8.")
+            .default("8"),
+        ParameterSpec::component("compaction_max_levels")
+            .description("Maximum number of consecutive compaction passes per trigger. Bounds write amplification when promotion keeps producing new candidates. Default: 3.")
+            .default("3"),
+        ParameterSpec::component("compaction_max_files_per_pick")
+            .description("Maximum number of files combined in one compaction pass. Keeps individual passes bounded in IO and memory. Default: 32.")
+            .default("32"),
+        ParameterSpec::component("compaction_background_interval_ms")
+            .description("Background compaction interval in milliseconds. The accelerator runs a per-table background task at this interval. Set to 0 to disable the background task — inline compaction on writes still runs. Default: 30000.")
+            .default("30000"),
     ],
 );
 
@@ -1347,6 +1413,7 @@ impl DataAccelerator for CayenneAccelerator {
                 primary_keys.clone(),
                 on_conflict,
                 runtime_env,
+                Arc::clone(&self.compaction_semaphore),
             ));
 
             // Wrap the base table provider with partitioning logic, installing
@@ -1549,6 +1616,11 @@ pub(crate) struct CayennePartitionCreator {
     on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
     /// Shared Cayenne context with cache, created once and shared across all partitions.
     context: Arc<cayenne::CayenneContext>,
+    /// Shared compaction semaphore inherited from the parent
+    /// [`CayenneAccelerator`]. Per-partition providers spawn their own
+    /// background compaction tasks through this semaphore so the whole accelerator
+    /// shares one concurrency budget.
+    compaction_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for CayennePartitionCreator {
@@ -1592,6 +1664,7 @@ impl CayennePartitionCreator {
         primary_key: Vec<String>,
         on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
         runtime_env: Arc<RuntimeEnv>,
+        compaction_semaphore: Arc<tokio::sync::Semaphore>,
     ) -> Self {
         // Create shared Cayenne context with cache once, to be shared across all partitions.
         // This ensures all partitions share the same footer/segment caches instead of
@@ -1613,6 +1686,7 @@ impl CayennePartitionCreator {
             primary_key,
             on_conflict,
             context,
+            compaction_semaphore,
         }
     }
 
@@ -1761,9 +1835,11 @@ impl PartitionCreator for CayennePartitionCreator {
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
 
+        let partition_provider = Arc::new(cayenne_table);
+        partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
         Ok(Partition {
             partition_values,
-            table_provider: Arc::new(cayenne_table),
+            table_provider: partition_provider,
         })
     }
 
@@ -1830,9 +1906,12 @@ impl PartitionCreator for CayennePartitionCreator {
                 .boxed()
                 .context(creator::InferringPartitionsSnafu)?;
 
+            let partition_provider = Arc::new(cayenne_table);
+            partition_provider
+                .spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
             result.push(Partition {
                 partition_values,
-                table_provider: Arc::new(cayenne_table),
+                table_provider: partition_provider,
             });
         }
 

@@ -211,6 +211,13 @@ impl<'a> AppendMutationWriter<'a> {
                     }
                     self.table.persist_table_stats(&stats_acc).await;
 
+                    if let Err(e) = self.table.maybe_compact_small_files().await {
+                        tracing::warn!(
+                            "Post-write compaction trigger failed for {}: {e}",
+                            self.table.table_name(),
+                        );
+                    }
+
                     return Ok(rows);
                 }
             }
@@ -266,6 +273,17 @@ impl<'a> AppendMutationWriter<'a> {
 
         self.table.persist_table_stats(&write_stats_acc).await;
 
+        // Inline tiered compaction trigger for the non-inline write path. The
+        // call is best-effort: the write has already succeeded, so any
+        // compaction failure here is logged but never bubbled back to the
+        // writer. Skipped automatically when the picker finds no candidate.
+        if let Err(e) = self.table.maybe_compact_small_files().await {
+            tracing::warn!(
+                "Post-write compaction trigger failed for {}: {e}",
+                self.table.table_name(),
+            );
+        }
+
         Ok(total_rows)
     }
 
@@ -313,6 +331,17 @@ impl<'a> AppendMutationWriter<'a> {
             {
                 tracing::warn!(
                     "Auto-checkpoint of inline memtable failed for {}: {e}",
+                    self.table.table_name(),
+                );
+            }
+
+            // Inline tiered compaction trigger. Best-effort: when the inline
+            // memtable just flushed (above), a new Vortex file landed in the
+            // current snapshot, so check whether we should consolidate small
+            // files now while we're already touching the table.
+            if let Err(e) = self.table.maybe_compact_small_files().await {
+                tracing::warn!(
+                    "Inline compaction trigger failed for {}: {e}",
                     self.table.table_name(),
                 );
             }
