@@ -719,16 +719,35 @@ impl CayenneTableProvider {
         if self.table_path().starts_with("s3://") {
             let config = self.require_object_store()?;
             if let Some(staging_prefix) = self.snapshot_object_store_prefix(STAGING_DIR_NAME)? {
-                let wal_key = ObjectStorePath::from(format!(
+                let final_key = ObjectStorePath::from(format!(
                     "{}{STAGING_WAL_FILENAME}",
                     staging_prefix.as_ref()
                 ));
-                // Best-effort delete — if the key doesn't exist, that's fine.
-                match config.store.delete(&wal_key).await {
+                let tmp_key = ObjectStorePath::from(format!(
+                    "{}{STAGING_WAL_TMP_FILENAME}",
+                    staging_prefix.as_ref()
+                ));
+
+                // Best-effort delete of the final WAL key — if it doesn't exist, that's fine.
+                match config.store.delete(&final_key).await {
                     Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                     Err(e) => {
                         tracing::warn!(
                             "Failed to remove staging WAL (S3) for table {}: {e}",
+                            self.table_name(),
+                        );
+                    }
+                }
+
+                // Also best-effort delete any stray tmp WAL object (e.g., left behind
+                // after a crash during write_staging_wal_s3 or after automated recovery).
+                // This keeps the staging prefix clean and prevents future recovery
+                // logic or listing from seeing confusing tmp objects.
+                match config.store.delete(&tmp_key).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to remove staging WAL tmp object (S3) for table {}: {e}",
                             self.table_name(),
                         );
                     }
