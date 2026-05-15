@@ -1862,4 +1862,54 @@ Cras venenatis euismod malesuada.",
             assert!(long_out.value(i).len() <= 3);
         }
     }
+
+    /// `max_len = 0` must work correctly for ListView (non-contiguous layout).
+    /// This exercises the ListView truncation path with the most aggressive
+    /// truncation limit, ensuring parent nulls and element Field are preserved
+    /// even when every list is reduced to zero elements.
+    #[test]
+    fn test_truncate_list_view_to_zero_elements() {
+        use arrow::array::{Int32Array, ListViewArray as ListViewArrayAlias};
+        use arrow::buffer::{NullBuffer, ScalarBuffer};
+
+        let element_field = Arc::new(
+            Field::new("value", DataType::Int32, false)
+                .with_metadata([("audit".to_string(), "zero_len_view".to_string())].into()),
+        );
+
+        // ListView with mixed lengths + one parent NULL
+        let values = Int32Array::from(vec![1, 2, 3, 4, 5, 6]);
+        let offsets = ScalarBuffer::<i32>::from(vec![0_i32, 3, 3, 6]);
+        let sizes = ScalarBuffer::<i32>::from(vec![3_i32, 0, 3]);
+        let nulls = NullBuffer::from(vec![true, false, true]);
+        let input = ListViewArrayAlias::try_new(
+            Arc::clone(&element_field),
+            offsets,
+            sizes,
+            Arc::new(values),
+            Some(nulls),
+        )
+        .expect("ListView construction");
+
+        let out = truncate_list_view_array(&input, 0).expect("truncate ListView to 0");
+
+        assert_eq!(out.len(), 3);
+        assert!(out.is_null(1));
+        assert!(!out.is_null(0));
+        assert!(!out.is_null(2));
+        assert_eq!(out.value(0).len(), 0);
+        assert_eq!(out.value(2).len(), 0);
+
+        // Element field preserved
+        if let DataType::ListView(f) = out.data_type() {
+            assert_eq!(f.name(), "value");
+            assert!(!f.is_nullable());
+            assert_eq!(
+                f.metadata().get("audit"),
+                Some(&"zero_len_view".to_string())
+            );
+        } else {
+            panic!("expected ListView");
+        }
+    }
 }
