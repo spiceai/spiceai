@@ -44,9 +44,8 @@ async fn load_cayenne(rows: usize) -> CayenneFixture {
     fixture
 }
 
-fn load_duckdb(rows: usize, parquet_path: &std::path::Path) -> DuckDbFixture {
+fn load_duckdb(parquet_path: &std::path::Path) -> DuckDbFixture {
     let fixture = setup_duckdb("scan_bench");
-    let _ = rows;
     duckdb_insert_parquet(&fixture.conn, "scan_bench", parquet_path);
     fixture
 }
@@ -67,7 +66,7 @@ fn bench_scan(c: &mut Criterion) {
 
         // Load once, query many times — match the steady-state read pattern.
         let cayenne_fixture = Arc::new(rt.block_on(load_cayenne(rows)));
-        let duckdb_fixture = Arc::new(load_duckdb(rows, &parquet_path));
+        let duckdb_fixture = Arc::new(load_duckdb(&parquet_path));
 
         // --- count_star ---
         let cf = Arc::clone(&cayenne_fixture);

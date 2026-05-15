@@ -114,14 +114,15 @@ pairs:
     must_beat: true
     runner_type: spiceai-dev-large-runners
 
-  - id: throughput-tpch-sf10-file
+  - id: throughput-tpch-sf10-s3
     workload: throughput
     query_set: tpch
     scale_factor: 10
-    cayenne: tpch/sf10/accelerated/file[parquet]-cayenne[file].yaml
-    duckdb: tpch/sf10/accelerated/file[parquet]-duckdb[file].yaml
+    cayenne: tpch/sf10/accelerated/s3[parquet]-cayenne[file].yaml
+    duckdb: tpch/sf10/accelerated/s3[parquet]-duckdb[file].yaml
     must_beat: true
     runner_type: spiceai-dev-large-runners
+    notes: SF10 file-mode pair is omitted because no DuckDB file-mode SF10 pod exists today.
 
   # ===========================================================================
   # Load tests (long-running, read-only, observe drift over time)

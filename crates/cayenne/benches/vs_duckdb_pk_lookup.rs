@@ -46,9 +46,8 @@ async fn load_cayenne(rows: usize) -> CayenneFixture {
     fixture
 }
 
-fn load_duckdb(rows: usize, parquet_path: &std::path::Path) -> DuckDbFixture {
+fn load_duckdb(parquet_path: &std::path::Path) -> DuckDbFixture {
     let fixture = setup_duckdb_pk("pk_bench");
-    let _ = rows;
     duckdb_insert_parquet(&fixture.conn, "pk_bench", parquet_path);
     fixture
 }
@@ -66,7 +65,7 @@ fn bench_pk_lookup(c: &mut Criterion) {
         write_parquet(&batch, &parquet_path);
 
         let cayenne_fixture = Arc::new(rt.block_on(load_cayenne(rows)));
-        let duckdb_fixture = Arc::new(load_duckdb(rows, &parquet_path));
+        let duckdb_fixture = Arc::new(load_duckdb(&parquet_path));
 
         // Pick a stable key in the middle so neither engine's caching is
         // accidentally over-counted at edges.

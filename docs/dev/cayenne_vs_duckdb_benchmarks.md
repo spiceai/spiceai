@@ -108,5 +108,6 @@ layer-2 micro-bench that targets that path.
    entry to `pairs.yaml`, and document any unavoidable asymmetry.
 3. **Micro-bench**: add `crates/cayenne/benches/vs_duckdb_<dimension>.rs`,
    register it in `crates/cayenne/Cargo.toml`'s `[[bench]]` section, and
-   reuse `vs_duckdb_common.rs` helpers where possible.
+   reuse the helpers in `crates/cayenne/benches/vs_duckdb_helpers/common.rs`
+   where possible.
 4. Update this page with the new entry.

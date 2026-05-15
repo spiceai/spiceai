@@ -13,9 +13,10 @@
 //! pieces that are identical across benches — schema, fixture generation,
 //! parquet materialization, and the canonical Cayenne / DuckDB setup paths.
 //!
-//! Included via `#[path = "vs_duckdb_common.rs"] mod common;` from each
-//! bench file — keeps Cayenne's bench layout (one file per bench, no
-//! shared crate) intact while avoiding code duplication.
+//! Included via `#[path = "vs_duckdb_helpers/common.rs"] mod common;`
+//! from each bench file. Placing the helper inside a subdirectory keeps
+//! Cargo's bench auto-discovery from picking it up as a standalone target,
+//! so no `autobenches = false` is required on the cayenne crate.
 
 #![allow(dead_code)]
 #![allow(clippy::expect_used)]
@@ -200,6 +201,48 @@ pub async fn cayenne_insert(table: &Arc<CayenneTableProvider>, batch: RecordBatc
     let schema = Arc::clone(batch.schema_ref());
     let input_exec =
         MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).expect("memory exec");
+    let insert_plan = table
+        .insert_into(&ctx.state(), input_exec, InsertOp::Append)
+        .await
+        .expect("cayenne insert plan");
+    let results = datafusion_physical_plan::collect(insert_plan, ctx.task_ctx())
+        .await
+        .expect("cayenne insert collect");
+    results
+        .first()
+        .and_then(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+        })
+        .map_or(0, |rows| rows.value(0))
+}
+
+/// Insert from a parquet file through Cayenne via DataFusion's parquet
+/// reader. Mirrors spiced's `file:` connector → accelerator ingestion path
+/// and gives parity with `duckdb_insert_parquet` (both engines now consume
+/// the same on-disk parquet, including the decode work).
+pub async fn cayenne_insert_from_parquet(
+    table: &Arc<CayenneTableProvider>,
+    parquet_path: &Path,
+) -> u64 {
+    use datafusion::datasource::TableProvider;
+    use datafusion::prelude::{ParquetReadOptions, SessionContext};
+    use datafusion_expr::dml::InsertOp;
+
+    let ctx = SessionContext::new();
+    let df = ctx
+        .read_parquet(
+            parquet_path.to_string_lossy().as_ref(),
+            ParquetReadOptions::default(),
+        )
+        .await
+        .expect("cayenne read_parquet");
+    let input_exec = df
+        .create_physical_plan()
+        .await
+        .expect("cayenne physical plan");
     let insert_plan = table
         .insert_into(&ctx.state(), input_exec, InsertOp::Append)
         .await

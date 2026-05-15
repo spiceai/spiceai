@@ -8,9 +8,12 @@
 
 //! Ingest throughput: Cayenne vs DuckDB.
 //!
-//! For each row count, two benches run on the same generated Arrow batch:
-//! * `cayenne` — insert via `CayenneTableProvider::insert_into`
-//! * `duckdb`  — insert via `INSERT INTO ... SELECT * FROM read_parquet(...)`,
+//! Both engines load from the same pre-materialized parquet file
+//! (written once outside the timed region) so the measurement is
+//! apples-to-apples — both pay parquet decode cost on top of the
+//! engine's write path:
+//! * `cayenne` — `ctx.read_parquet(...)` → `CayenneTableProvider::insert_into`
+//! * `duckdb`  — `INSERT INTO ... SELECT * FROM read_parquet(...)`,
 //!               DuckDB's recommended bulk-ingestion path
 //!
 //! Both engines materialize to local disk (Cayenne to a temp directory,
@@ -18,11 +21,6 @@
 //! file-mode — see `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/README.md`
 //! for why that's the only fair pairing (Cayenne does not support
 //! in-memory mode).
-//!
-//! The DuckDB path includes the parquet read cost. Cayenne reads the
-//! same parquet via DataFusion's ListingTable in a real spiced
-//! ingestion, so the comparison is end-to-end ingestion, not raw
-//! writer throughput.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::cast_possible_wrap)]
@@ -37,8 +35,8 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, 
 use tokio::runtime::Runtime;
 
 use common::{
-    cayenne_insert, duckdb_insert_parquet, make_batch, schema, setup_cayenne, setup_duckdb,
-    write_parquet,
+    cayenne_insert_from_parquet, duckdb_insert_parquet, make_batch, schema, setup_cayenne,
+    setup_duckdb, write_parquet,
 };
 
 const ROW_COUNTS: &[usize] = &[1_024, 16_384, 131_072];
@@ -57,13 +55,14 @@ fn bench_bulk_ingest(c: &mut Criterion) {
         let batch = make_batch(schema(), 0, rows);
         write_parquet(&batch, &parquet_path);
 
+        let path = parquet_path.clone();
         group.bench_with_input(BenchmarkId::new("cayenne", rows), &rows, |b, &_rows| {
             b.iter_batched(
                 || rt.block_on(setup_cayenne("ingest_bench")),
                 |fixture| {
                     rt.block_on(async {
-                        let batch = make_batch(schema(), 0, rows);
-                        let written = cayenne_insert(&fixture.table, batch).await;
+                        let written =
+                            cayenne_insert_from_parquet(&fixture.table, &path).await;
                         black_box((fixture, written));
                     });
                 },
@@ -71,11 +70,12 @@ fn bench_bulk_ingest(c: &mut Criterion) {
             );
         });
 
+        let path = parquet_path.clone();
         group.bench_with_input(BenchmarkId::new("duckdb", rows), &rows, |b, &_rows| {
             b.iter_batched(
                 || setup_duckdb("ingest_bench"),
                 |fixture| {
-                    duckdb_insert_parquet(&fixture.conn, "ingest_bench", &parquet_path);
+                    duckdb_insert_parquet(&fixture.conn, "ingest_bench", &path);
                     black_box(fixture);
                 },
                 BatchSize::PerIteration,
@@ -113,18 +113,15 @@ fn bench_incremental_append(c: &mut Criterion) {
     }
     let parquet_paths = Arc::new(parquet_paths);
 
+    let cayenne_paths = Arc::clone(&parquet_paths);
     group.bench_function("cayenne", |b| {
+        let paths = Arc::clone(&cayenne_paths);
         b.iter_batched(
             || rt.block_on(setup_cayenne("incr_bench")),
             |fixture| {
                 rt.block_on(async {
-                    for i in 0..batches_count {
-                        let batch = make_batch(
-                            schema(),
-                            (i * per_batch_rows) as i64,
-                            per_batch_rows,
-                        );
-                        let _ = cayenne_insert(&fixture.table, batch).await;
+                    for path in paths.iter() {
+                        let _ = cayenne_insert_from_parquet(&fixture.table, path).await;
                     }
                     black_box(fixture);
                 });

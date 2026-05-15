@@ -12,13 +12,15 @@ pod, on which workload, at which scale."
 ## Running a single pair locally
 
 ```sh
-# Bench (single query stream, all 22 TPC-H queries):
+# Bench (single query stream, all 22 TPC-H queries).
+# Spicepod paths are quoted because they contain `[` and `]`, which
+# zsh and some other shells interpret as glob characters.
 testoperator run bench \
-  -p test/spicepods/tpch/sf1/accelerated/file[parquet]-cayenne[file].yaml \
+  -p 'test/spicepods/tpch/sf1/accelerated/file[parquet]-cayenne[file].yaml' \
   -s spiced -d ./.data --query-set tpch --validate
 
 testoperator run bench \
-  -p test/spicepods/tpch/sf1/accelerated/file[parquet]-duckdb[file].yaml \
+  -p 'test/spicepods/tpch/sf1/accelerated/file[parquet]-duckdb[file].yaml' \
   -s spiced -d ./.data --query-set tpch --validate
 ```
 

@@ -79,9 +79,8 @@ async fn load_cayenne(rows: usize) -> CayenneFixture {
     fixture
 }
 
-fn load_duckdb(rows: usize, parquet_path: &std::path::Path) -> DuckDbFixture {
+fn load_duckdb(parquet_path: &std::path::Path) -> DuckDbFixture {
     let fixture = setup_duckdb_pk("del_bench");
-    let _ = rows;
     duckdb_insert_parquet(&fixture.conn, "del_bench", parquet_path);
     fixture
 }
@@ -120,7 +119,7 @@ fn bench_delete(c: &mut Criterion) {
         let path = parquet_path.clone();
         group.bench_with_input(BenchmarkId::new("duckdb/delete", rows), &rows, |b, &_| {
             b.iter_batched(
-                || load_duckdb(rows, &path),
+                || load_duckdb(&path),
                 |fixture| {
                     duckdb_delete_range(&fixture, "del_bench", lo, hi);
                     black_box(fixture);
@@ -137,7 +136,7 @@ fn bench_delete(c: &mut Criterion) {
             fixture
         }));
         let duckdb_fixture = Arc::new({
-            let fixture = load_duckdb(rows, &parquet_path);
+            let fixture = load_duckdb(&parquet_path);
             duckdb_delete_range(&fixture, "del_bench", lo, hi);
             fixture
         });
