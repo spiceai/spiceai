@@ -502,6 +502,83 @@ fn sql_response_normalization_is_noop_when_round_scores_disabled() {
 }
 
 #[test]
+fn sql_response_normalization_skips_trunc_3_columns_with_all_zero_third_decimals() {
+    // Regression: a `trunc(_score, 3)` snapshot whose values all happen to end
+    // in `0` (e.g. `0.540, 0.530, 0.520, 0.510`) is numerically indistinguishable
+    // from a 2dp response. The explicit precision in the column name must keep
+    // us from rounding it.
+    let input = json!([
+        {"id": 1, "trunc(vector_search()._score,Int64(3))": 0.540},
+        {"id": 2, "trunc(vector_search()._score,Int64(3))": 0.530},
+        {"id": 3, "trunc(vector_search()._score,Int64(3))": 0.520},
+        {"id": 4, "trunc(vector_search()._score,Int64(3))": 0.510}
+    ]);
+    let normalized = normalize_sql_response_for_snapshot(input.clone(), true);
+    assert_eq!(normalized, input);
+}
+
+#[test]
+fn sql_response_normalization_picks_primary_score_key_deterministically() {
+    // When a row carries multiple score-like columns (constructed manually here
+    // for the test), the function should always pick `_score` first regardless
+    // of JSON insertion order.
+    let input_a = json!([
+        {"id": 1, "_score": 0.34, "_fused_score": 0.34},
+        {"id": 2, "_score": 0.30, "_fused_score": 0.30},
+        {"id": 3, "_score": 0.29, "_fused_score": 0.29},
+        {"id": 4, "_score": 0.29, "_fused_score": 0.29}
+    ]);
+    let input_b = json!([
+        {"id": 1, "_fused_score": 0.34, "_score": 0.34},
+        {"id": 2, "_fused_score": 0.30, "_score": 0.30},
+        {"id": 3, "_fused_score": 0.29, "_score": 0.29},
+        {"id": 4, "_fused_score": 0.29, "_score": 0.29}
+    ]);
+    let a = normalize_sql_response_for_snapshot(input_a, true);
+    let b = normalize_sql_response_for_snapshot(input_b, true);
+
+    // Both should normalize identically; the field order inside each row will
+    // follow the original insertion order of that input, but the SET of fields
+    // and their values must match.
+    let extract_values = |v: &Value| -> Vec<(i64, f64, f64)> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let id = row.get("id").and_then(|x| x.as_i64()).unwrap();
+                let s = row.get("_score").and_then(|x| x.as_f64()).unwrap();
+                let f = row.get("_fused_score").and_then(|x| x.as_f64()).unwrap();
+                (id, s, f)
+            })
+            .collect()
+    };
+    assert_eq!(extract_values(&a), extract_values(&b));
+}
+
+#[test]
+fn parse_trunc_precision_handles_int64_form() {
+    assert_eq!(parse_trunc_precision("trunc(x,Int64(2))"), Some(2));
+    assert_eq!(parse_trunc_precision("trunc(x,Int64(3))"), Some(3));
+    assert_eq!(
+        parse_trunc_precision("trunc(vector_search(qs, Utf8(\"a\"), col)._score,Int64(2))"),
+        Some(2)
+    );
+}
+
+#[test]
+fn parse_trunc_precision_handles_bare_integer_form() {
+    assert_eq!(parse_trunc_precision("trunc(x,2)"), Some(2));
+    assert_eq!(parse_trunc_precision("trunc(x, 3)"), Some(3));
+}
+
+#[test]
+fn parse_trunc_precision_returns_none_for_non_trunc_columns() {
+    assert_eq!(parse_trunc_precision("_score"), None);
+    assert_eq!(parse_trunc_precision("_fused_score"), None);
+    assert_eq!(parse_trunc_precision("id"), None);
+}
+
+#[test]
 fn sql_response_normalization_preserves_already_tight_2dp_clusters() {
     // Range = 0.01 (here, 0.54 - 0.53 in f64 ≈ 0.010000000000000009). Scores
     // are already so tight that 1-decimal rounding would collapse the cluster
@@ -633,10 +710,10 @@ fn normalize_search_response(json: Value, round_scores: bool) -> String {
 /// in the snapshot.
 ///
 /// Returns the input unchanged when normalization does not apply — namely
-/// when `round_scores` is `false`, the response has no score column, scores
-/// are at higher precision than 2 decimals (e.g. from `trunc(_score, 3)`), or
-/// scores are either all-tied (range ≤ 0.01) or well-separated (range
-/// > 0.06).
+/// when `round_scores` is `false`, the response has no score column, the
+/// score column comes from `trunc(_, N)` with `N != 2`, scores are at higher
+/// precision than 2 decimals (e.g. from `trunc(_score, 3)`), or scores are
+/// either all-tied (range ≤ 0.01) or well-separated (range > 0.06).
 fn normalize_sql_response_for_snapshot(value: Value, round_scores: bool) -> Value {
     if !round_scores {
         return value;
@@ -649,7 +726,7 @@ fn normalize_sql_response_for_snapshot(value: Value, round_scores: bool) -> Valu
         return Value::Array(rows);
     }
 
-    let score_keys: Vec<String> = rows
+    let mut score_keys: Vec<String> = rows
         .first()
         .and_then(|row| row.as_object())
         .map(|obj| {
@@ -663,9 +740,26 @@ fn normalize_sql_response_for_snapshot(value: Value, round_scores: bool) -> Valu
         })
         .unwrap_or_default();
 
+    // Pick the primary score key deterministically: prefer `_score`, then
+    // `_fused_score`, then `trunc(...)` columns lexicographically. JSON object
+    // iteration otherwise depends on the SQL response shape, which would make
+    // normalization non-deterministic if a row carried multiple score-like
+    // columns.
+    score_keys.sort_by(|a, b| score_key_priority(a).cmp(&score_key_priority(b)));
+
     let Some(primary_score_key) = score_keys.first().cloned() else {
         return Value::Array(rows);
     };
+
+    // When the column name encodes the `trunc` precision explicitly (e.g.
+    // `trunc(..., Int64(3))`), use that to gate normalization — it's more
+    // reliable than inspecting the score values, which can't distinguish
+    // `0.54` from `0.540`.
+    if let Some(precision) = parse_trunc_precision(&primary_score_key)
+        && precision != 2
+    {
+        return Value::Array(rows);
+    }
 
     let scores: Vec<f64> = rows
         .iter()
@@ -679,6 +773,14 @@ fn normalize_sql_response_for_snapshot(value: Value, round_scores: bool) -> Valu
     // (e.g. from `trunc(_score, 3)`) carry enough resolution to remain stable
     // across CI runs and rounding them to 1 decimal would lose meaningful
     // information.
+    //
+    // NOTE: this check uses `s * 100` ≈ integer, which means it can't tell
+    // `0.54` from `0.540` for aliased columns where the column name doesn't
+    // expose the trunc precision (e.g. `... as _score`). The explicit
+    // precision check above catches the unaliased case; aliased 3dp columns
+    // whose values all happen to end in 0 would be misclassified, but in
+    // practice DataFusion's f64 → JSON serialization preserves enough
+    // floating-point noise that all-zeros 3rd-decimal values are unusual.
     let is_2dp_precision = scores.iter().all(|&s| {
         let scaled = s * 100.0;
         (scaled - scaled.round()).abs() < 1e-6
@@ -734,6 +836,29 @@ fn normalize_sql_response_for_snapshot(value: Value, round_scores: bool) -> Valu
     });
 
     Value::Array(rows)
+}
+
+fn score_key_priority(key: &str) -> (u8, &str) {
+    let bucket = match key {
+        "_score" => 0,
+        "_fused_score" => 1,
+        _ => 2,
+    };
+    (bucket, key)
+}
+
+/// Parse the precision argument out of a DataFusion `trunc(<expr>, Int64(N))`
+/// or `trunc(<expr>, N)` column name. Returns `None` for any other column
+/// shape (including aliased columns like `_score`).
+fn parse_trunc_precision(col_name: &str) -> Option<usize> {
+    let inner = col_name.strip_prefix("trunc(")?.strip_suffix(')')?;
+    let comma = inner.rfind(',')?;
+    let arg = inner[comma + 1..].trim();
+    let n_str = arg
+        .strip_prefix("Int64(")
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(arg);
+    n_str.trim().parse().ok()
 }
 
 fn quote_sql_identifier(identifier: &str) -> String {
