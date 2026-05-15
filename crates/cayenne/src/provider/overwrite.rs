@@ -98,10 +98,19 @@ impl PreparedOverwrite {
     /// Apply the catalog mutation for this overwrite inside the caller's
     /// transaction.
     ///
-    /// Executes the same SQL batch as
-    /// [`crate::MetadataCatalog::commit_compaction`] (delete files cleared,
-    /// insert records cleared, snapshot sequences cleared, snapshot pointer
-    /// updated) but against `txn` instead of opening a new transaction.
+    /// Executes the SQL batch from
+    /// [`crate::CayenneCatalog::commit_overwrite_in_txn`] — the per-snapshot
+    /// delete/insert/sequence tables are cleared, the inlined memtable and
+    /// table statistics are dropped (everything keyed on the old snapshot),
+    /// and the snapshot pointer is advanced — all against the caller's `txn`
+    /// instead of opening a new transaction.
+    ///
+    /// The atomic inlined-data clear is what differentiates this from
+    /// `commit_compaction_in_txn`: scans UNION the listing table with
+    /// inlined data, so if the pointer flip committed but a subsequent
+    /// (non-transactional) clear failed mid-flight, stale inlined rows
+    /// would re-appear in scans of the new snapshot. Bundling them into
+    /// the same transaction closes that consistency window.
     ///
     /// The caller owns the transaction lifecycle: this method does not
     /// commit, roll back, or retry. Cross-partition coordinators batch every
@@ -109,7 +118,7 @@ impl PreparedOverwrite {
     /// so the pointer flips happen atomically.
     ///
     /// Single-partition callers can use [`Self::apply_owned_txn`] instead,
-    /// which goes through the trait-based [`crate::MetadataCatalog::commit_compaction`]
+    /// which goes through the trait-based [`crate::MetadataCatalog::commit_overwrite`]
     /// (own transaction, retry-on-conflict, no concrete-catalog dependency).
     ///
     /// # Errors
@@ -123,7 +132,7 @@ impl PreparedOverwrite {
         txn: &mut dyn MetastoreTransaction,
     ) -> CatalogResult<()> {
         catalog
-            .commit_compaction_in_txn(txn, self.table_id(), &self.new_snapshot_id)
+            .commit_overwrite_in_txn(txn, self.table_id(), &self.new_snapshot_id)
             .await
     }
 
@@ -132,17 +141,18 @@ impl PreparedOverwrite {
     ///
     /// Convenience for callers that don't need to batch with other partitions
     /// (e.g. [`super::sink::CayenneDataSink::write_all`] in overwrite mode).
-    /// Delegates to [`crate::MetadataCatalog::commit_compaction`] which opens
-    /// its own transaction with retry-on-conflict. The retry semantics match
-    /// the pre-issue-#10125 behavior exactly.
+    /// Delegates to [`crate::MetadataCatalog::commit_overwrite`] which opens
+    /// its own transaction with retry-on-conflict and atomically clears the
+    /// inlined data, inlined deletes, and table statistics along with the
+    /// snapshot pointer flip.
     ///
     /// # Errors
     ///
-    /// Returns any error surfaced by the catalog's `commit_compaction`.
+    /// Returns any error surfaced by the catalog's `commit_overwrite`.
     pub async fn apply_owned_txn(&self) -> CatalogResult<()> {
         self.table
             .catalog()
-            .commit_compaction(self.table_id(), &self.new_snapshot_id)
+            .commit_overwrite(self.table_id(), &self.new_snapshot_id)
             .await
     }
 
