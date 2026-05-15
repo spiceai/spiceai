@@ -462,8 +462,6 @@ fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArr
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
     // Fast path: zero-copy clone when no list element exceeds max_len.
-    // Avoids building per-row slices + concat (major allocation + copy overhead
-    // in the common display path where lists are short).
     let needs_trunc = (0..list_array.len()).try_fold(false, |needs_trunc, i| {
         if needs_trunc {
             return Ok::<_, ArrowError>(true);

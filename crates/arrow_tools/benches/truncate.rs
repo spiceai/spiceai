@@ -24,7 +24,8 @@ limitations under the License.
 //! "actual truncation" (exercises the slice+concat / collect paths).
 
 use arrow::array::{
-    Int32Array, ListArray, ListViewArray, StringArray, StringViewArray, StringViewBuilder,
+    FixedSizeListArray, Int32Array, ListArray, ListViewArray, StringArray, StringViewArray,
+    StringViewBuilder,
 };
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -188,6 +189,47 @@ fn make_long_list_view_batch(n: usize, truncate_to: usize) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(list_view)]).expect("valid batch")
 }
 
+/// FixedSizeList<i32> versions (exercises the FixedSizeList fast-path, which is
+/// the cheapest of all — just a uniform size comparison — plus the stride-based
+/// slicing + concat work path).
+fn make_all_short_fixed_size_list_batch(n: usize, max_elems: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "nums",
+        DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 5),
+        true,
+    )]));
+    let per_list = 5usize;
+    let total_values = n * per_list;
+    let values = Int32Array::from((0..total_values).collect::<Vec<_>>());
+    let list = FixedSizeListArray::new(
+        Arc::new(Field::new("item", DataType::Int32, true)),
+        5,
+        Arc::new(values),
+        None,
+    );
+    RecordBatch::try_new(schema, vec![Arc::new(list)]).expect("valid batch")
+}
+
+fn make_long_fixed_size_list_batch(n: usize, _truncate_to: usize) -> RecordBatch {
+    // For FixedSizeList the "long" case is when the fixed size > truncate_to.
+    // We create lists of size 20 and truncate to 5.
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "nums",
+        DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 20),
+        true,
+    )]));
+    let per_list = 20usize;
+    let total_values = n * per_list;
+    let values = Int32Array::from((0..total_values).collect::<Vec<_>>());
+    let list = FixedSizeListArray::new(
+        Arc::new(Field::new("item", DataType::Int32, true)),
+        20,
+        Arc::new(values),
+        None,
+    );
+    RecordBatch::try_new(schema, vec![Arc::new(list)]).expect("valid batch")
+}
+
 pub fn bench_truncate(c: &mut Criterion) {
     let mut group = c.benchmark_group("arrow_tools_truncate");
 
@@ -252,6 +294,22 @@ pub fn bench_truncate(c: &mut Criterion) {
     group.bench_function("listview_with_truncation_800_rows", |b| {
         b.iter(|| {
             truncate_numeric_column_length(black_box(&long_list_views), 5).unwrap();
+        })
+    });
+
+    // FixedSizeList fast path (cheapest decision: uniform size comparison)
+    let short_fsl = make_all_short_fixed_size_list_batch(800, 5);
+    group.bench_function("fixed_size_list_fast_path_800_rows_all_short", |b| {
+        b.iter(|| {
+            truncate_numeric_column_length(black_box(&short_fsl), 5).unwrap();
+        })
+    });
+
+    // FixedSizeList actual truncation work (stride-based slicing + concat)
+    let long_fsl = make_long_fixed_size_list_batch(800, 5);
+    group.bench_function("fixed_size_list_with_truncation_800_rows", |b| {
+        b.iter(|| {
+            truncate_numeric_column_length(black_box(&long_fsl), 5).unwrap();
         })
     });
 
