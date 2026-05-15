@@ -120,6 +120,13 @@ impl PartitionedWal {
     /// cross-partition coordination infrastructure (the write side of
     /// `PartitionedWal` now has the same treatment as the removal side
     /// and as all snapshot directory creation paths).
+    ///
+    /// Note for S3 tables: the _partitioned_wal/ directory and the
+    /// PartitionedWal JSON file are still local files on the writer's
+    /// machine (coordination is local to the writer process). The per-
+    /// partition "staging WAL" on S3 is an object in the staging prefix,
+    /// and its removal is a best-effort object delete. The local FS
+    /// durability fixes apply to the coordination records on the writer.
     async fn ensure_partitioned_wal_dir_and_sync_parent(
         table_root: &Path,
         wal_dir: &Path,
