@@ -87,6 +87,12 @@ impl TursoMetastore {
                     // the sync already performed in CayenneCatalog::init).
                     // Ensures the db_dir entry is durable before opening the
                     // Turso connection and initializing the schema.
+                    //
+                    // We keep this best-effort (with warning on failure) for
+                    // the same reasons as in CayenneCatalog::init: one-time
+                    // initialization, followed by DB file + schema creation,
+                    // and the parent is often a stable operator-managed
+                    // volume root.
                     let db_dir_for_sync = db_dir.to_path_buf();
                     if let Err(e) = tokio::task::spawn_blocking(move || {
                         std::fs::File::open(&db_dir_for_sync).and_then(|f| f.sync_all())

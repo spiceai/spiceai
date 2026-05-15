@@ -1493,7 +1493,8 @@ impl CayenneTableProvider {
                     let f = std::fs::File::open(&parent)?;
                     f.sync_all()
                 })
-                .await??;
+                .await
+                .map_err(std::io::Error::other)??;
             }
         }
         Ok(())

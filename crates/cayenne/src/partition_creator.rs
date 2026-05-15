@@ -210,7 +210,8 @@ impl PartitionCreator for CayennePartitionCreator {
         }
 
         tracing::debug!("creating Cayenne partition at {partition_path}");
-        std::fs::create_dir_all(&partition_dir)
+        tokio::fs::create_dir_all(&partition_dir)
+            .await
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
 
@@ -221,7 +222,21 @@ impl PartitionCreator for CayennePartitionCreator {
         // deletions/ subdirs, and initial table creation.
         if self.object_store_config.is_none() {
             if let Some(parent) = partition_dir.parent() {
-                let _ = std::fs::File::open(parent).and_then(|f| f.sync_all());
+                let parent = parent.to_path_buf();
+                let parent_display = parent.display().to_string();
+                match tokio::task::spawn_blocking(move || {
+                    std::fs::File::open(&parent).and_then(|f| f.sync_all())
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing::warn!(
+                        "Failed to sync Cayenne partition parent directory {parent_display}: {error}"
+                    ),
+                    Err(error) => tracing::warn!(
+                        "Failed to join Cayenne partition parent directory sync task for {parent_display}: {error}"
+                    ),
+                }
             }
         }
 
