@@ -54,6 +54,7 @@ limitations under the License.
 //! The legacy one-shot [`CayenneStagedAppend::commit`] is reimplemented in terms
 //! of this lifecycle and remains observably identical to the previous behavior.
 
+use super::PartitionedWal;
 use super::Result;
 use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME};
 use super::table::CayenneTableProvider;
@@ -709,13 +710,32 @@ impl CayenneTableProvider {
         if let Some((wal, wal_location)) = wal {
             // Automated recovery attempt will be implemented in the future — for now we just error with details to help the operator resolve the issue.
 
+            // Best-effort enrichment: if this per-partition incomplete write was part
+            // of a cross-partition commit (i.e. a `PartitionedWal` record references
+            // this partition's table_id), include the commit_id in the error message.
+            // This helps operators correlate "incomplete write" errors across multiple
+            // partitions of the same logical table and points them at the
+            // `_partitioned_wal/` directory for manual resolution.
+            let mut extra = String::new();
+            if let Ok(all_pw) =
+                PartitionedWal::read_all_in(std::path::Path::new(self.table_path())).await
+            {
+                for (pw, _) in all_pw {
+                    if pw.partitions.iter().any(|e| e.table_id == self.table_id()) {
+                        extra = format!(" (part of cross-partition commit {})", pw.commit_id);
+                        break;
+                    }
+                }
+            }
+
             return Err(Error::IncompleteWrite {
                 table: self.table_name().to_string(),
                 message: format!(
-                    "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Some files may have been partially written and require manual resolution. The WAL file is located at '{wal_location}'.",
+                    "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Some files may have been partially written and require manual resolution. The WAL file is located at '{wal_location}'.{}",
                     wal.staged_files.len(),
                     wal.target_snapshot,
                     wal.created_at,
+                    extra,
                 ),
             });
         }

@@ -474,6 +474,17 @@ async fn write_deletion_file(
         writer.write(&batch)?;
         writer.finish()?;
 
+        // Ensure the deletion vector file content is durable before we record
+        // a pointer to it in the catalog. A crash without this sync could leave
+        // a zero-length or partial .arrow file while the catalog transaction
+        // that references it has committed (or is about to). On recovery,
+        // readers would then hit a missing/corrupt deletion vector for a
+        // "committed" delete — either erroring or (worse) returning deleted rows.
+        // This is the exact durability requirement we enforce for data files
+        // and WAL markers in the append path.
+        let f = std::fs::OpenOptions::new().write(true).open(&output_path)?;
+        f.sync_all()?;
+
         let metadata = std::fs::metadata(&output_path)?;
 
         Ok(metadata.len())
