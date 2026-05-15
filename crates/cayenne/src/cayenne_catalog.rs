@@ -382,10 +382,23 @@ impl MetadataCatalog for CayenneCatalog {
 
             // Best-effort sync of the parent directory so the db_dir entry
             // itself is durable on local FS before we proceed to create the
-            // catalog DB file and initialize its schema. This follows the
-            // uniform durability contract applied to all other directory
-            // creations (snapshot dirs, _partitioned_wal/, deletions/,
-            // partition subdirs, initial table creation).
+            // catalog DB file and initialize its schema.
+            //
+            // We keep this best-effort (with warning on failure) rather than
+            // fatal because:
+            // - Catalog DB directory creation is a one-time initialization
+            //   event (not a hot write path).
+            // - It is immediately followed by DB file creation and schema
+            //   initialization, which provide strong content durability.
+            // - The parent directory is frequently a stable, operator-
+            //   managed volume root (e.g., K8s PersistentVolume) where
+            //   directory entry durability is already handled at a higher
+            //   level.
+            //
+            // This is still the right thing to do for consistency with the
+            // uniform durability contract used for all per-table mutable
+            // data paths, and it gives operators a clear warning if
+            // something unusual happens on a fresh deployment.
             if let Some(parent) = db_dir.parent() {
                 let parent = parent.to_path_buf();
                 if let Err(e) = tokio::task::spawn_blocking(move || {
