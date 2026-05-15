@@ -503,7 +503,7 @@ fn sql_response_normalization_is_noop_when_round_scores_disabled() {
 
 #[test]
 fn sql_response_normalization_preserves_already_tight_2dp_clusters() {
-    // Range = 0.01 (here, 0.8 - 0.79 in f64 = 0.010000000000000009). Scores
+    // Range = 0.01 (here, 0.54 - 0.53 in f64 ≈ 0.010000000000000009). Scores
     // are already so tight that 1-decimal rounding would collapse the cluster
     // unnecessarily — leave them alone so well-tested snapshots stay stable.
     let input = json!([
