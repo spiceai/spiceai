@@ -33,6 +33,9 @@ You may obtain a copy of the License at
 //! helper in `PartitionedWal::write_to`, `deletions/` subdirectories under
 //! snapshots via DeletionVectorWriter, and partition value subdirectories
 //! via CayennePartitionCreator before `add_partition`).
+//! The catalog DB directory creation in `CayenneCatalog::init` also
+//! receives a best-effort parent sync for completeness of the system
+//! initialization path.
 //! Combined with the per-partition staging WAL, deletion vector file
 //! sync_all, and directory syncs in the delete sinks, a successful
 //! cross-partition operation (append or overwrite, including any
