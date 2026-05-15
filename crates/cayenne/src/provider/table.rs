@@ -1475,10 +1475,16 @@ impl CayenneTableProvider {
                 .store
                 .copy(&meta.location, &target_path)
                 .await
-                .map_err(|e| Error::ObjectStore {
-                    operation: "copy staging file to snapshot",
-                    table: self.table_metadata.table_name.clone(),
-                    source: e,
+                .map_err(|e| {
+                    // On S3, a copy failure for a file listed in a leftover staging WAL
+                    // is often caused by a partial/incomplete multipart upload (crash
+                    // during a large Vortex file upload). The recovery will fail for
+                    // this WAL (safe), but we emit a clear error to aid diagnosis.
+                    Error::ObjectStore {
+                        operation: "copy staging file to snapshot (may be partial multipart upload from interrupted write)",
+                        table: self.table_metadata.table_name.clone(),
+                        source: e,
+                    }
                 })?;
             copied_locations.push(meta.location.clone());
         }
