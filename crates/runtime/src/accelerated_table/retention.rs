@@ -85,6 +85,28 @@ impl super::AcceleratedTable {
                             continue;
                         };
 
+                        // ACID / correctness warning for nullable time columns.
+                        // `timestamp < cutoff` (and any <, >, = comparison) evaluates to NULL (false)
+                        // when the timestamp is NULL. Therefore, rows with NULL in the retention
+                        // time_column are *never* deleted by a time-based policy. This can lead to
+                        // unbounded table growth if the source produces NULL-timestamp data that
+                        // the user expects to be eventually cleaned up.
+                        // We surface this explicitly so operators are not surprised by "leaky"
+                        // retention. For full control, users can use an Expression filter with
+                        // explicit NULL handling (e.g. `time < cutoff OR time IS NULL`).
+                        if accelerator
+                            .schema()
+                            .column_with_name(time_column)
+                            .map_or(false, |(_, f)| f.is_nullable())
+                        {
+                            tracing::warn!(
+                                "[retention] time_column '{time_column}' for dataset {dataset_name} is nullable. \
+                                 Rows with NULL in this column will never satisfy `time < cutoff` and will not be deleted by retention. \
+                                 This can cause the accelerated table to grow without bound if the source emits NULL timestamps. \
+                                 Consider making the time column non-nullable or using a custom Expression retention filter."
+                            );
+                        }
+
                         let start = SystemTime::now() - *period;
                         let timestamp = refresh::get_timestamp(start);
                         let expr = converter.convert(timestamp, Operator::Lt);
