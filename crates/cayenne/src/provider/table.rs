@@ -90,7 +90,7 @@ use roaring::RoaringBitmap;
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::task;
 use vortex::dtype::arrow::FromArrowType;
@@ -741,6 +741,14 @@ pub struct CayenneTableProvider {
     /// append-heavy inline CDC writes don't query the metastore after every
     /// burst just to decide whether to checkpoint.
     inlined_row_count: Arc<AtomicI64>,
+    /// Approximate count of new Vortex files created in the *current* snapshot
+    /// since the last successful compaction pass (or since table open).
+    /// Used as a cheap early-out in `run_one_compaction_pass` so that during
+    /// the common "accumulation phase" of many small appends we avoid the
+    /// expensive full snapshot listing + picker decision on every write.
+    /// Reset to 0 after a compaction rewrite. Conservative: can only cause
+    /// extra listings, never missed compactions.
+    new_files_since_last_compaction: Arc<AtomicUsize>,
     /// Tracks whether a staging WAL may be present (for fast-path short-circuit
     /// of expensive S3 GET / local FS read in `ensure_no_incomplete_write`).
     ///
@@ -761,7 +769,7 @@ pub struct CayenneTableProvider {
     /// Set true immediately before any code path that will write Vortex files
     /// into the staging directory. Set false after a successful clear or after
     /// a successful staged-append finalize (move + WAL removal) that empties
-    /// staging. The write_lock serializes writers, so the flag is a reliable
+    /// staging. The `write_lock` serializes writers, so the flag is a reliable
     /// "we left it clean" signal between appends in the same process.
     staging_may_have_files: Arc<AtomicBool>,
     /// Serializes concurrent compaction passes on this table so a write-driven
@@ -1142,6 +1150,10 @@ impl CayenneTableProvider {
 
     pub(crate) fn staging_may_have_files(&self) -> &AtomicBool {
         &self.staging_may_have_files
+    }
+
+    pub(crate) fn new_files_since_last_compaction(&self) -> &AtomicUsize {
+        &self.new_files_since_last_compaction
     }
 
     #[must_use]
@@ -1597,7 +1609,8 @@ impl CayenneTableProvider {
         }
 
         // Staging is now known to be empty.
-        self.staging_may_have_files().store(false, Ordering::Release);
+        self.staging_may_have_files()
+            .store(false, Ordering::Release);
         Ok(())
     }
 
@@ -2103,6 +2116,7 @@ impl CayenneTableProvider {
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
             staging_wal_present: Arc::new(AtomicBool::new(true)),
             staging_may_have_files: Arc::new(AtomicBool::new(true)),
+            new_files_since_last_compaction: Arc::new(AtomicUsize::new(0)),
             compaction_lock: Arc::new(tokio::sync::Mutex::new(())),
             background_compactor: Arc::new(std::sync::OnceLock::new()),
         };
@@ -2427,6 +2441,15 @@ impl CayenneTableProvider {
             );
         }
 
+        // Track new files created in the *current* (non-staging) snapshot for
+        // the cheap early-out in the compaction trigger. Only count files
+        // landed in the live snapshot; staging writes are tracked separately
+        // via the staging_may_have_files flag.
+        if snapshot_id != STAGING_DIR_NAME && writer_ops > 0 {
+            self.new_files_since_last_compaction
+                .fetch_add(writer_ops, Ordering::Relaxed);
+        }
+
         Ok((total_rows, writer_ops, stats_accumulator))
     }
 
@@ -2508,6 +2531,7 @@ impl CayenneTableProvider {
             inlined_row_count: Arc::clone(&self.inlined_row_count),
             staging_wal_present: Arc::clone(&self.staging_wal_present),
             staging_may_have_files: Arc::clone(&self.staging_may_have_files),
+            new_files_since_last_compaction: Arc::clone(&self.new_files_since_last_compaction),
             // Shared so inline (write-driven) and background compaction
             // attempts on the same table coordinate, even across clones.
             compaction_lock: Arc::clone(&self.compaction_lock),
@@ -4006,14 +4030,25 @@ impl CayenneTableProvider {
     async fn run_one_compaction_pass(&self) -> Result<bool> {
         use super::compaction::{FileEntry, pick_candidates};
 
+        // Cheap early-out using in-memory counter. During the common
+        // "accumulation phase" of many small appends we have not yet created
+        // enough new files in the current snapshot to possibly cross the
+        // trigger threshold. This avoids the expensive full snapshot listing
+        // (S3 LIST or local readdir of potentially thousands of files) on
+        // every post-write trigger.
+        let cfg = self.context.compaction_picker_config();
+        if self.new_files_since_last_compaction.load(Ordering::Relaxed)
+            < cfg.trigger_files
+        {
+            return Ok(false);
+        }
+
         let snapshot_id = self.get_current_snapshot_id()?;
         let files = self.list_snapshot_files_with_sizes(&snapshot_id).await?;
 
         if files.len() < 2 {
             return Ok(false);
         }
-
-        let cfg = self.context.compaction_picker_config();
         let Some(candidate) = pick_candidates(
             files.iter().map(|(path, size)| FileEntry {
                 path: path.as_str(),
@@ -4127,11 +4162,7 @@ impl CayenneTableProvider {
             if !Self::is_compactable_data_file(name) {
                 continue;
             }
-            // `object_store::ObjectMeta::size` is `usize`; widen via checked
-            // conversion so a future 128-bit target would not silently
-            // misclassify file sizes for the picker.
-            let size_bytes = u64::try_from(meta.size).unwrap_or(u64::MAX);
-            files.push((name.to_string(), size_bytes));
+            files.push((name.to_string(), meta.size));
         }
 
         Ok(files)
@@ -4283,14 +4314,14 @@ impl CayenneTableProvider {
             }
         } else {
             let snapshot_dir = self.snapshot_dir_path_for(new_snapshot_id);
-            if let Err(e) = tokio::fs::remove_dir_all(&snapshot_dir).await {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        "Failed to clean up failed compaction snapshot dir {} for table {}: {e}",
-                        snapshot_dir.display(),
-                        self.table_metadata.table_name
-                    );
-                }
+            if let Err(e) = tokio::fs::remove_dir_all(&snapshot_dir).await
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    "Failed to clean up failed compaction snapshot dir {} for table {}: {e}",
+                    snapshot_dir.display(),
+                    self.table_metadata.table_name
+                );
             }
         }
     }
@@ -4526,6 +4557,11 @@ impl CayenneTableProvider {
                 lock: LISTING_TABLE_LOCK_POISONED,
             })?;
         *guard = new_snapshot_id.to_string();
+
+        // Any snapshot rewrite (compaction, sort, etc.) means the "new files
+        // since last compaction" counter should be reset. The next accumulation
+        // phase starts from a clean slate.
+        self.new_files_since_last_compaction.store(0, Ordering::Relaxed);
         tracing::debug!(
             "Updated current snapshot ID for table {} to {}",
             self.table_metadata.table_name,
