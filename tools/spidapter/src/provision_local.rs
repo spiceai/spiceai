@@ -717,14 +717,14 @@ async fn wait_for_runtime_ready(
             request = request.header("X-API-Key", key);
         }
 
-        if let Ok(response) = request.send().await {
-            if response.status().is_success() {
-                eprintln!(
-                    "[stdio] runtime ready after {}ms",
-                    started.elapsed().as_millis()
-                );
-                return Ok(());
-            }
+        if let Ok(response) = request.send().await
+            && response.status().is_success()
+        {
+            eprintln!(
+                "[stdio] runtime ready after {}ms",
+                started.elapsed().as_millis()
+            );
+            return Ok(());
         }
 
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -902,7 +902,7 @@ async fn cleanup_local_artifacts(working_dir: &Path) -> anyhow::Result<()> {
             .flatten()
         {
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "log") {
+            if path.extension().is_some_and(|e| e == "log") {
                 let dest = std::env::temp_dir().join(entry.file_name());
                 let _ = std::fs::copy(&path, &dest);
                 eprintln!("[stdio] local backend: log preserved at {}", dest.display());

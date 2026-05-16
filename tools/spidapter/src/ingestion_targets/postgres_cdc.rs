@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use arrow::datatypes::DataType;
 use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode};
@@ -35,7 +36,7 @@ fn pub_name_for_table(table_name: &str) -> String {
     format!("spicebench_pub_{table_name}")
 }
 
-/// PostgreSQL connection details for the WAL CDC write path.
+/// `PostgreSQL` connection details for the WAL CDC write path.
 #[derive(Debug, Clone)]
 pub(crate) struct PgConfig {
     pub(crate) host: String,
@@ -109,7 +110,8 @@ pub(crate) fn generate_postgres_wal_spicepod(
     run_id: &Uuid,
     pg: &PgConfig,
     datasets: &HashMap<String, DatasetConfig>,
-) -> anyhow::Result<SpicepodDefinition> {
+    acceleration_engine: &str,
+) -> SpicepodDefinition {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
 
@@ -155,7 +157,7 @@ pub(crate) fn generate_postgres_wal_spicepod(
         dataset.params = Some(Params::from_string_map(param_map));
         dataset.acceleration = Some(Acceleration {
             enabled: true,
-            engine: Some("duckdb".to_string()),
+            engine: Some(acceleration_engine.to_string()),
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Changes),
             primary_key,
@@ -168,14 +170,15 @@ pub(crate) fn generate_postgres_wal_spicepod(
             .push(ComponentOrReference::Component(dataset));
     }
 
-    Ok(spicepod)
+    spicepod
 }
 
 pub(crate) fn pg_type_for_arrow(data_type: &DataType) -> anyhow::Result<String> {
     Ok(match data_type {
         DataType::Boolean => "BOOLEAN".to_string(),
-        DataType::Int8 | DataType::UInt8 => "SMALLINT".to_string(),
-        DataType::Int16 | DataType::UInt16 => "SMALLINT".to_string(),
+        DataType::Int8 | DataType::UInt8 | DataType::Int16 | DataType::UInt16 => {
+            "SMALLINT".to_string()
+        }
         DataType::Int32 | DataType::UInt32 => "INTEGER".to_string(),
         DataType::Int64 | DataType::UInt64 => "BIGINT".to_string(),
         DataType::Float16 | DataType::Float32 => "REAL".to_string(),
@@ -238,7 +241,7 @@ pub(crate) fn pg_error_message(e: &tokio_postgres::Error) -> String {
     if let Some(db_err) = e.as_db_error() {
         let mut msg = db_err.message().to_string();
         if let Some(detail) = db_err.detail() {
-            msg.push_str(&format!(": {detail}"));
+            let _ = write!(msg, ": {detail}");
         }
         msg
     } else {

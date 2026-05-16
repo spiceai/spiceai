@@ -33,7 +33,7 @@ use tokio::process::Child;
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::args::StdioArgs;
+use crate::args::{PgAccelerationEngine, StdioArgs};
 use crate::commands;
 
 #[path = "ingestion_targets/mod.rs"]
@@ -71,8 +71,8 @@ enum RunState {
         sql_url: String,
         /// Cloud client used during provisioning (reused for teardown).
         cloud: CloudClient,
-        /// If the run used PostgreSQL WAL CDC, connection details needed for teardown.
-        pg_config: Option<PgConfig>,
+        /// If the run used `PostgreSQL` WAL CDC, connection details needed for teardown.
+        pg_config: Box<Option<PgConfig>>,
     },
     Local(Box<LocalRunState>),
 }
@@ -343,7 +343,7 @@ impl Handler for SpidapterHandler {
                 let pg = setup_config
                     .pg_config
                     .as_ref()
-                    .expect("pg_config set when target is PostgresCdc");
+                    .ok_or_else(|| "pg_config missing for PostgresCdc target".to_string())?;
                 let flight_kwargs = HashMap::from([
                     (
                         "uri".to_string(),
@@ -438,7 +438,7 @@ impl Handler for SpidapterHandler {
         let run_datasets = self.run_datasets.remove(&run_id).unwrap_or_default();
 
         let pg_config = match &state {
-            RunState::Scp { pg_config, .. } => pg_config.clone(),
+            RunState::Scp { pg_config, .. } => *pg_config.clone(),
             RunState::Local(local) => local.pg_config.clone(),
         };
 
@@ -777,8 +777,12 @@ async fn generate_initial_spicepod(
                 let pg = setup_config
                     .pg_config
                     .as_ref()
-                    .expect("pg_config set when target is PostgresCdc");
-                generate_postgres_wal_spicepod(run_id, pg, datasets)?
+                    .ok_or_else(|| anyhow::anyhow!("pg_config missing for PostgresCdc target"))?;
+                let engine = match args.pg_acceleration {
+                    PgAccelerationEngine::Cayenne => "cayenne",
+                    PgAccelerationEngine::Duckdb => "duckdb",
+                };
+                generate_postgres_wal_spicepod(run_id, pg, datasets, engine)
             }
             IngestionTarget::Cayenne => match setup_config.sink_type {
                 Some(EtlSinkType::Adbc) => {
@@ -877,6 +881,7 @@ mod tests {
             pg_password: String::new(),
             pg_database: None,
             pg_schema: "public".to_string(),
+            pg_acceleration: PgAccelerationEngine::Cayenne,
             spiced_binary: "spiced".to_string(),
         }
     }

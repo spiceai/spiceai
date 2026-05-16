@@ -59,6 +59,7 @@ fn to_stdio_args(args: &LocalSpicedArgs) -> StdioArgs {
         pg_password: String::new(),
         pg_database: None,
         pg_schema: "public".to_string(),
+        pg_acceleration: crate::args::PgAccelerationEngine::Cayenne,
         spiced_binary: "spiced".to_string(),
     }
 }
