@@ -362,8 +362,63 @@ impl ExecutionPlan for StreamingDataUpdateExecutionPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::collect;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::sql::TableReference;
+
+    fn one_column_batch(schema: &SchemaRef, values: Vec<i32>) -> RecordBatch {
+        RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(Int32Array::from(values))])
+            .expect("batch should be valid")
+    }
+
+    fn one_batch_stream(batch: RecordBatch) -> SendableRecordBatchStream {
+        Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter(vec![Ok::<_, DataFusionError>(batch)]),
+        ))
+    }
+
+    async fn collect_i32_values(plan: Arc<StreamingDataUpdateExecutionPlan>) -> Vec<i32> {
+        let exec: Arc<dyn ExecutionPlan> = plan;
+        let batches = collect(exec, Arc::new(TaskContext::default()))
+            .await
+            .expect("collect should succeed");
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let values = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("Int32 column");
+                (0..values.len())
+                    .map(|idx| values.value(idx))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn streaming_execution_plan_can_be_refilled_after_consumption() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let plan = Arc::new(StreamingDataUpdateExecutionPlan::new_empty(Arc::clone(
+            &schema,
+        )));
+
+        plan.set_stream(one_batch_stream(one_column_batch(&schema, vec![1, 2])))
+            .expect("first stream should be accepted");
+        assert_eq!(collect_i32_values(Arc::clone(&plan)).await, vec![1, 2]);
+        plan.clear_stream()
+            .expect("consumed stream slot should clear");
+
+        plan.set_stream(one_batch_stream(one_column_batch(&schema, vec![3, 4, 5])))
+            .expect("second stream should be accepted");
+        assert_eq!(collect_i32_values(Arc::clone(&plan)).await, vec![3, 4, 5]);
+        plan.clear_stream()
+            .expect("second consumed stream slot should clear");
+    }
 
     #[tokio::test]
     async fn data_update_broadcaster_delivers_published_updates() {
