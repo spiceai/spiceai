@@ -184,6 +184,16 @@ fn parse_optional_usize<'a>(
     })
 }
 
+fn parse_usize_aliases(acceleration: &Acceleration, keys: &[&str], default: usize) -> usize {
+    parse_optional_usize(acceleration, keys).map_or(default, |(_, value)| value)
+}
+
+fn parse_usize_aliases_as_i64(acceleration: &Acceleration, keys: &[&str], default: i64) -> i64 {
+    let default_usize = usize::try_from(default).unwrap_or(usize::MAX);
+    let parsed = parse_usize_aliases(acceleration, keys, default_usize);
+    i64::try_from(parsed).unwrap_or(i64::MAX)
+}
+
 /// Returns true if the path is a local filesystem path (not a remote object store).
 ///
 /// Local paths include:
@@ -494,6 +504,46 @@ impl CayenneAccelerator {
                 config.compaction_max_files_per_pick,
             );
 
+            config.inline_max_rows = parse_usize_aliases(
+                acceleration,
+                &["cayenne_inline_max_rows", "inline_max_rows"],
+                config.inline_max_rows,
+            );
+            config.inline_max_bytes = parse_usize_aliases(
+                acceleration,
+                &["cayenne_inline_max_bytes", "inline_max_bytes"],
+                config.inline_max_bytes,
+            );
+            config.inline_max_buffer_bytes = parse_usize_aliases(
+                acceleration,
+                &["cayenne_inline_max_buffer_bytes", "inline_max_buffer_bytes"],
+                config.inline_max_buffer_bytes,
+            );
+            config.inline_memtable_max_rows = parse_usize_aliases_as_i64(
+                acceleration,
+                &[
+                    "cayenne_inline_memtable_max_rows",
+                    "inline_memtable_max_rows",
+                ],
+                config.inline_memtable_max_rows,
+            );
+            config.inline_memtable_max_segments = parse_usize_aliases_as_i64(
+                acceleration,
+                &[
+                    "cayenne_inline_memtable_max_segments",
+                    "inline_memtable_max_segments",
+                ],
+                config.inline_memtable_max_segments,
+            );
+            config.inline_memtable_max_bytes = parse_usize_aliases_as_i64(
+                acceleration,
+                &[
+                    "cayenne_inline_memtable_max_bytes",
+                    "inline_memtable_max_bytes",
+                ],
+                config.inline_memtable_max_bytes,
+            );
+
             if let Some(interval_str) = acceleration
                 .params
                 .get("cayenne_compaction_background_interval_ms")
@@ -512,7 +562,7 @@ impl CayenneAccelerator {
             }
 
             tracing::debug!(
-                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, compaction_trigger_files={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}",
+                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, compaction_trigger_files={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_memtable_max_rows={}, inline_memtable_max_segments={}, inline_memtable_max_bytes={}",
                 config.footer_cache_mb,
                 config.segment_cache_mb,
                 config.target_vortex_file_size_mb,
@@ -524,6 +574,12 @@ impl CayenneAccelerator {
                 config.compaction_max_levels,
                 config.compaction_max_files_per_pick,
                 config.compaction_background_interval_ms,
+                config.inline_max_rows,
+                config.inline_max_bytes,
+                config.inline_max_buffer_bytes,
+                config.inline_memtable_max_rows,
+                config.inline_memtable_max_segments,
+                config.inline_memtable_max_bytes,
             );
         }
 
@@ -814,8 +870,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    16,
-    { S3_PARAMS_LEN + 16 },
+    22,
+    { S3_PARAMS_LEN + 22 },
 >(
     S3_PARAMETERS,
     [
@@ -863,6 +919,24 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("compaction_background_interval_ms")
             .description("Background compaction interval in milliseconds. The accelerator runs a per-table background task at this interval. Set to 0 to disable the background task — inline compaction on writes still runs. Default: 30000.")
             .default("30000"),
+        ParameterSpec::component("inline_max_rows")
+            .description("Maximum rows in a single write that can be inlined into the Cayenne metastore instead of writing a Vortex file. Set to 0 to disable write-entry inlining. Default: 1024.")
+            .default("1024"),
+        ParameterSpec::component("inline_max_bytes")
+            .description("Maximum serialized Arrow IPC bytes in a single inlined Cayenne metastore entry. Set to 0 to disable write-entry inlining. Default: 1048576.")
+            .default("1048576"),
+        ParameterSpec::component("inline_max_buffer_bytes")
+            .description("Maximum Arrow in-memory bytes buffered while deciding whether to inline a write. Set to 0 to force the Vortex write path after the first buffered batch. Default: 4194304.")
+            .default("4194304"),
+        ParameterSpec::component("inline_memtable_max_rows")
+            .description("Maximum inline memtable rows before checkpointing inline data to Vortex. Default: 10000.")
+            .default("10000"),
+        ParameterSpec::component("inline_memtable_max_segments")
+            .description("Maximum inline memtable entries before checkpointing inline data to Vortex. Default: 64.")
+            .default("64"),
+        ParameterSpec::component("inline_memtable_max_bytes")
+            .description("Maximum inline memtable IPC bytes before checkpointing inline data to Vortex. Default: 8388608.")
+            .default("8388608"),
     ],
 );
 
@@ -2356,6 +2430,53 @@ mod tests {
 
         assert_eq!(hot.write_concurrency, Some(16));
         assert_eq!(quiet.write_concurrency, Some(2));
+    }
+
+    #[test]
+    fn test_inline_thresholds_are_resolved_from_acceleration_params() {
+        let app = Arc::new(AppBuilder::new("test").build());
+
+        let mut dataset = DatasetBuilder::try_new("cdc_hot".to_string(), "cdc_hot")
+            .expect("dataset builder")
+            .with_app(app)
+            .build()
+            .expect("dataset");
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            params: [
+                ("cayenne_inline_max_rows".to_string(), "0".to_string()),
+                ("cayenne_inline_max_bytes".to_string(), "262144".to_string()),
+                (
+                    "cayenne_inline_max_buffer_bytes".to_string(),
+                    "524288".to_string(),
+                ),
+                (
+                    "cayenne_inline_memtable_max_rows".to_string(),
+                    "2048".to_string(),
+                ),
+                (
+                    "cayenne_inline_memtable_max_segments".to_string(),
+                    "16".to_string(),
+                ),
+                (
+                    "cayenne_inline_memtable_max_bytes".to_string(),
+                    "2097152".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset);
+
+        assert_eq!(config.inline_max_rows, 0);
+        assert_eq!(config.inline_max_bytes, 262_144);
+        assert_eq!(config.inline_max_buffer_bytes, 524_288);
+        assert_eq!(config.inline_memtable_max_rows, 2_048);
+        assert_eq!(config.inline_memtable_max_segments, 16);
+        assert_eq!(config.inline_memtable_max_bytes, 2_097_152);
     }
 
     #[test]

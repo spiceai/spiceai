@@ -20,6 +20,19 @@ use arrow_schema::SchemaRef;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use serde::{Deserialize, Serialize};
 
+/// Default maximum number of rows to inline in the metastore instead of writing a Vortex file.
+pub const DEFAULT_INLINE_MAX_ROWS: usize = 1024;
+/// Default maximum serialized IPC size in bytes for a single inlined entry.
+pub const DEFAULT_INLINE_MAX_BYTES: usize = 1_048_576;
+/// Default maximum in-memory byte budget while buffering an inline fast-path stream.
+pub const DEFAULT_INLINE_MAX_BUFFER_BYTES: usize = 4 * 1_048_576;
+/// Default maximum rows to keep in the inline level-0 memtable before flushing to Vortex.
+pub const DEFAULT_INLINE_MEMTABLE_MAX_ROWS: i64 = 10_000;
+/// Default maximum inline level-0 entries before flushing to Vortex.
+pub const DEFAULT_INLINE_MEMTABLE_MAX_SEGMENTS: i64 = 64;
+/// Default maximum serialized IPC bytes to keep inline before flushing to Vortex.
+pub const DEFAULT_INLINE_MEMTABLE_MAX_BYTES: i64 = 8 * 1_048_576;
+
 /// Metadata about a table in the catalog.
 #[derive(Debug, Clone)]
 pub struct TableMetadata {
@@ -298,6 +311,27 @@ pub struct VortexConfig {
     /// Defaults to `30_000` ms.
     #[serde(default = "default_compaction_background_interval_ms")]
     pub compaction_background_interval_ms: u64,
+    /// Maximum rows in a single write that can be inlined directly into the metastore.
+    /// Set to 0 to disable write-entry inlining.
+    #[serde(default = "default_inline_max_rows")]
+    pub inline_max_rows: usize,
+    /// Maximum serialized Arrow IPC bytes in a single inlined metastore entry.
+    /// Set to 0 to disable write-entry inlining.
+    #[serde(default = "default_inline_max_bytes")]
+    pub inline_max_bytes: usize,
+    /// Maximum Arrow in-memory bytes to buffer while deciding whether to inline a write.
+    /// Set to 0 to force the normal Vortex write path after the first buffered batch.
+    #[serde(default = "default_inline_max_buffer_bytes")]
+    pub inline_max_buffer_bytes: usize,
+    /// Maximum inline memtable rows before checkpointing inline data to Vortex.
+    #[serde(default = "default_inline_memtable_max_rows")]
+    pub inline_memtable_max_rows: i64,
+    /// Maximum inline memtable entries before checkpointing inline data to Vortex.
+    #[serde(default = "default_inline_memtable_max_segments")]
+    pub inline_memtable_max_segments: i64,
+    /// Maximum inline memtable IPC bytes before checkpointing inline data to Vortex.
+    #[serde(default = "default_inline_memtable_max_bytes")]
+    pub inline_memtable_max_bytes: i64,
 }
 
 fn default_concurrency() -> usize {
@@ -324,6 +358,30 @@ fn default_compaction_background_interval_ms() -> u64 {
     30_000
 }
 
+fn default_inline_max_rows() -> usize {
+    DEFAULT_INLINE_MAX_ROWS
+}
+
+fn default_inline_max_bytes() -> usize {
+    DEFAULT_INLINE_MAX_BYTES
+}
+
+fn default_inline_max_buffer_bytes() -> usize {
+    DEFAULT_INLINE_MAX_BUFFER_BYTES
+}
+
+fn default_inline_memtable_max_rows() -> i64 {
+    DEFAULT_INLINE_MEMTABLE_MAX_ROWS
+}
+
+fn default_inline_memtable_max_segments() -> i64 {
+    DEFAULT_INLINE_MEMTABLE_MAX_SEGMENTS
+}
+
+fn default_inline_memtable_max_bytes() -> i64 {
+    DEFAULT_INLINE_MEMTABLE_MAX_BYTES
+}
+
 impl Default for VortexConfig {
     fn default() -> Self {
         Self {
@@ -341,6 +399,12 @@ impl Default for VortexConfig {
             compaction_max_levels: default_compaction_max_levels(),
             compaction_max_files_per_pick: default_compaction_max_files_per_pick(),
             compaction_background_interval_ms: default_compaction_background_interval_ms(),
+            inline_max_rows: default_inline_max_rows(),
+            inline_max_bytes: default_inline_max_bytes(),
+            inline_max_buffer_bytes: default_inline_max_buffer_bytes(),
+            inline_memtable_max_rows: default_inline_memtable_max_rows(),
+            inline_memtable_max_segments: default_inline_memtable_max_segments(),
+            inline_memtable_max_bytes: default_inline_memtable_max_bytes(),
         }
     }
 }

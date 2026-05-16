@@ -61,6 +61,18 @@ pub struct CayenneCatalogProviderConfig {
     pub upload_concurrency: Option<usize>,
     /// Number of writer partitions to use when ingesting unsorted data.
     pub write_concurrency: Option<usize>,
+    /// Maximum rows in a single write that can be inlined into the metastore.
+    pub inline_max_rows: Option<usize>,
+    /// Maximum serialized IPC bytes in a single inlined metastore entry.
+    pub inline_max_bytes: Option<usize>,
+    /// Maximum Arrow in-memory bytes buffered while deciding whether to inline.
+    pub inline_max_buffer_bytes: Option<usize>,
+    /// Maximum inline memtable rows before checkpointing to Vortex.
+    pub inline_memtable_max_rows: Option<i64>,
+    /// Maximum inline memtable entries before checkpointing to Vortex.
+    pub inline_memtable_max_segments: Option<i64>,
+    /// Maximum inline memtable IPC bytes before checkpointing to Vortex.
+    pub inline_memtable_max_bytes: Option<i64>,
 }
 
 /// Errors that can occur when interacting with a Cayenne catalog.
@@ -265,6 +277,24 @@ impl CayenneCatalogProvider {
         }
         if let Some(v) = provider_config.write_concurrency {
             config.write_concurrency = Some(v.max(1));
+        }
+        if let Some(v) = provider_config.inline_max_rows {
+            config.inline_max_rows = v;
+        }
+        if let Some(v) = provider_config.inline_max_bytes {
+            config.inline_max_bytes = v;
+        }
+        if let Some(v) = provider_config.inline_max_buffer_bytes {
+            config.inline_max_buffer_bytes = v;
+        }
+        if let Some(v) = provider_config.inline_memtable_max_rows {
+            config.inline_memtable_max_rows = v.max(0);
+        }
+        if let Some(v) = provider_config.inline_memtable_max_segments {
+            config.inline_memtable_max_segments = v.max(0);
+        }
+        if let Some(v) = provider_config.inline_memtable_max_bytes {
+            config.inline_memtable_max_bytes = v.max(0);
         }
         config
     }

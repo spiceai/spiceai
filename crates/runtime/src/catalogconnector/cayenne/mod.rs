@@ -58,6 +58,24 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .description("Maximum number of concurrent file uploads when writing multiple Vortex files. Defaults to available CPU parallelism."),
     ParameterSpec::component("write_concurrency")
         .description("Optional writer partition override for unsorted Cayenne ingests. Defaults to runtime.query.target_partitions."),
+    ParameterSpec::component("inline_max_rows")
+        .description("Maximum rows in a single write that can be inlined into the Cayenne metastore instead of writing a Vortex file. Set to 0 to disable write-entry inlining. Default: 1024.")
+        .default("1024"),
+    ParameterSpec::component("inline_max_bytes")
+        .description("Maximum serialized Arrow IPC bytes in a single inlined Cayenne metastore entry. Set to 0 to disable write-entry inlining. Default: 1048576.")
+        .default("1048576"),
+    ParameterSpec::component("inline_max_buffer_bytes")
+        .description("Maximum Arrow in-memory bytes buffered while deciding whether to inline a write. Set to 0 to force the Vortex write path after the first buffered batch. Default: 4194304.")
+        .default("4194304"),
+    ParameterSpec::component("inline_memtable_max_rows")
+        .description("Maximum inline memtable rows before checkpointing inline data to Vortex. Default: 10000.")
+        .default("10000"),
+    ParameterSpec::component("inline_memtable_max_segments")
+        .description("Maximum inline memtable entries before checkpointing inline data to Vortex. Default: 64.")
+        .default("64"),
+    ParameterSpec::component("inline_memtable_max_bytes")
+        .description("Maximum inline memtable IPC bytes before checkpointing inline data to Vortex. Default: 8388608.")
+        .default("8388608"),
 ];
 
 /// A catalog connector for Cayenne lakehouse catalogs.
@@ -137,6 +155,45 @@ impl CayenneCatalogConnector {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .map(|v| v.max(1));
+        let inline_max_rows = self
+            .params
+            .get("inline_max_rows")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        let inline_max_bytes = self
+            .params
+            .get("inline_max_bytes")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        let inline_max_buffer_bytes = self
+            .params
+            .get("inline_max_buffer_bytes")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        let inline_memtable_max_rows = self
+            .params
+            .get("inline_memtable_max_rows")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(|v| v.max(0));
+        let inline_memtable_max_segments = self
+            .params
+            .get("inline_memtable_max_segments")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(|v| v.max(0));
+        let inline_memtable_max_bytes = self
+            .params
+            .get("inline_memtable_max_bytes")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(|v| v.max(0));
 
         CayenneCatalogProviderConfig {
             data_dir,
@@ -148,6 +205,12 @@ impl CayenneCatalogConnector {
             compression_strategy,
             upload_concurrency,
             write_concurrency,
+            inline_max_rows,
+            inline_max_bytes,
+            inline_max_buffer_bytes,
+            inline_memtable_max_rows,
+            inline_memtable_max_segments,
+            inline_memtable_max_bytes,
         }
     }
 }
@@ -217,6 +280,7 @@ mod tests {
 
         assert!(display_names.contains(&"cayenne_upload_concurrency".to_string()));
         assert!(display_names.contains(&"cayenne_write_concurrency".to_string()));
+        assert!(display_names.contains(&"cayenne_inline_max_rows".to_string()));
         assert!(
             display_names
                 .iter()
@@ -242,6 +306,14 @@ mod tests {
                     "cayenne_write_concurrency".to_string(),
                     SecretString::new("8".to_string().into()),
                 ),
+                (
+                    "cayenne_inline_max_rows".to_string(),
+                    SecretString::new("0".to_string().into()),
+                ),
+                (
+                    "cayenne_inline_memtable_max_bytes".to_string(),
+                    SecretString::new("2097152".to_string().into()),
+                ),
             ],
             PREFIX,
             Arc::new(RwLock::new(Secrets::new())),
@@ -256,5 +328,7 @@ mod tests {
         assert_eq!(config.data_dir.as_deref(), Some("/tmp/cayenne-data"));
         assert_eq!(config.upload_concurrency, Some(1));
         assert_eq!(config.write_concurrency, Some(8));
+        assert_eq!(config.inline_max_rows, Some(0));
+        assert_eq!(config.inline_memtable_max_bytes, Some(2_097_152));
     }
 }

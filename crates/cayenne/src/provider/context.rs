@@ -129,6 +129,42 @@ impl CayenneContext {
         self.config.write_concurrency.map(|v| v.max(1))
     }
 
+    /// Maximum rows in one write that may be inlined into the metastore.
+    #[must_use]
+    pub(crate) fn inline_max_rows(&self) -> usize {
+        self.config.inline_max_rows
+    }
+
+    /// Maximum serialized IPC bytes in one inlined metastore entry.
+    #[must_use]
+    pub(crate) fn inline_max_bytes(&self) -> usize {
+        self.config.inline_max_bytes
+    }
+
+    /// Maximum in-memory Arrow bytes buffered while deciding whether to inline.
+    #[must_use]
+    pub(crate) fn inline_max_buffer_bytes(&self) -> usize {
+        self.config.inline_max_buffer_bytes
+    }
+
+    /// Maximum inline memtable rows before checkpointing to Vortex.
+    #[must_use]
+    pub(crate) fn inline_memtable_max_rows(&self) -> i64 {
+        self.config.inline_memtable_max_rows.max(0)
+    }
+
+    /// Maximum inline memtable entries before checkpointing to Vortex.
+    #[must_use]
+    pub(crate) fn inline_memtable_max_segments(&self) -> i64 {
+        self.config.inline_memtable_max_segments.max(0)
+    }
+
+    /// Maximum inline memtable IPC bytes before checkpointing to Vortex.
+    #[must_use]
+    pub(crate) fn inline_memtable_max_bytes(&self) -> i64 {
+        self.config.inline_memtable_max_bytes.max(0)
+    }
+
     /// Build the compaction picker config from the underlying `VortexConfig`.
     #[must_use]
     pub(crate) fn compaction_picker_config(&self) -> super::compaction::CompactionPickerConfig {

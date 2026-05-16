@@ -31,8 +31,8 @@ use super::constants::STAGING_DIR_NAME;
 use super::context::CayenneContext;
 use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 use super::table::{
-    CayenneCdcWrite, CayenneTableProvider, ColumnStatsAccumulator, INLINE_MAX_BUFFER_BYTES,
-    INLINE_MAX_ROWS, OnConflictDeletions, PreparedInsertStream,
+    CayenneCdcWrite, CayenneTableProvider, ColumnStatsAccumulator, OnConflictDeletions,
+    PreparedInsertStream,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +61,8 @@ impl InlineMutationPolicy {
 pub(crate) struct InlineBatchBuffer {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
+    max_rows: usize,
+    max_buffer_bytes: usize,
     total_rows: usize,
     total_bytes: usize,
     exceeded: bool,
@@ -68,10 +70,12 @@ pub(crate) struct InlineBatchBuffer {
 
 impl InlineBatchBuffer {
     #[must_use]
-    pub(crate) fn new(schema: SchemaRef) -> Self {
+    pub(crate) fn new(schema: SchemaRef, max_rows: usize, max_buffer_bytes: usize) -> Self {
         Self {
             schema,
             batches: Vec::new(),
+            max_rows,
+            max_buffer_bytes,
             total_rows: 0,
             total_bytes: 0,
             exceeded: false,
@@ -84,8 +88,7 @@ impl InlineBatchBuffer {
             .total_bytes
             .saturating_add(batch.get_array_memory_size());
         self.batches.push(batch);
-        self.exceeded =
-            self.total_rows > INLINE_MAX_ROWS || self.total_bytes > INLINE_MAX_BUFFER_BYTES;
+        self.exceeded = self.total_rows > self.max_rows || self.total_bytes > self.max_buffer_bytes;
     }
 
     #[must_use]
@@ -367,7 +370,11 @@ impl<'a> AppendMutationWriter<'a> {
         deleted_inlined_row_keys: &[Box<[u8]>],
     ) -> Result<InlineMutationOutcome> {
         let schema = prepared_stream.schema();
-        let mut buffer = InlineBatchBuffer::new(Arc::clone(&schema));
+        let mut buffer = InlineBatchBuffer::new(
+            Arc::clone(&schema),
+            self.context.inline_max_rows(),
+            self.context.inline_max_buffer_bytes(),
+        );
 
         while let Some(batch) = StreamExt::next(&mut prepared_stream).await {
             buffer.push(batch?);
@@ -547,6 +554,7 @@ fn should_refresh_listing_table_after_post_write(
 
 #[cfg(test)]
 mod tests {
+    use super::super::table::{INLINE_MAX_BUFFER_BYTES, INLINE_MAX_ROWS};
     use super::*;
     use arrow::array::{BinaryArray, Int64Array};
     use arrow_schema::{DataType, Field, Schema};
@@ -575,7 +583,7 @@ mod tests {
         )
         .expect("batch should be valid");
 
-        let mut buffer = InlineBatchBuffer::new(schema);
+        let mut buffer = InlineBatchBuffer::new(schema, INLINE_MAX_ROWS, INLINE_MAX_BUFFER_BYTES);
         buffer.push(batch);
 
         assert_eq!(buffer.total_rows(), INLINE_MAX_ROWS);
@@ -593,7 +601,7 @@ mod tests {
         )
         .expect("batch should be valid");
 
-        let mut buffer = InlineBatchBuffer::new(schema);
+        let mut buffer = InlineBatchBuffer::new(schema, INLINE_MAX_ROWS, INLINE_MAX_BUFFER_BYTES);
         buffer.push(batch);
 
         assert_eq!(buffer.total_rows(), INLINE_MAX_ROWS + 1);
@@ -614,7 +622,7 @@ mod tests {
         )
         .expect("batch should be valid");
 
-        let mut buffer = InlineBatchBuffer::new(schema);
+        let mut buffer = InlineBatchBuffer::new(schema, INLINE_MAX_ROWS, INLINE_MAX_BUFFER_BYTES);
         buffer.push(batch);
 
         assert!(!buffer.should_continue_buffering());

@@ -678,30 +678,34 @@ impl ColumnStatsAccumulator {
 // compaction in `provider::compaction`, not bigger memtables.
 
 /// Maximum number of rows to inline in the metastore instead of writing a Vortex file.
-pub(crate) const INLINE_MAX_ROWS: usize = 1024;
-
-/// Maximum serialized IPC size (bytes) to inline in the metastore.
-const INLINE_MAX_BYTES: usize = 1_048_576; // 1 MB
+#[cfg(test)]
+pub(crate) const INLINE_MAX_ROWS: usize = crate::metadata::DEFAULT_INLINE_MAX_ROWS;
 
 /// Maximum rows to keep in the inline level-0 memtable before flushing to Vortex.
-pub(crate) const INLINE_MEMTABLE_MAX_ROWS: i64 = 10_000;
+#[cfg(test)]
+pub(crate) const INLINE_MEMTABLE_MAX_ROWS: i64 = crate::metadata::DEFAULT_INLINE_MEMTABLE_MAX_ROWS;
 
 /// Maximum inline level-0 entries before flushing to Vortex.
-pub(crate) const INLINE_MEMTABLE_MAX_SEGMENTS: i64 = 64;
+#[cfg(test)]
+pub(crate) const INLINE_MEMTABLE_MAX_SEGMENTS: i64 =
+    crate::metadata::DEFAULT_INLINE_MEMTABLE_MAX_SEGMENTS;
 
 /// Maximum serialized IPC bytes to keep inline before flushing to Vortex.
-pub(crate) const INLINE_MEMTABLE_MAX_BYTES: i64 = 8 * 1_048_576;
+#[cfg(test)]
+pub(crate) const INLINE_MEMTABLE_MAX_BYTES: i64 =
+    crate::metadata::DEFAULT_INLINE_MEMTABLE_MAX_BYTES;
 
 /// Maximum in-memory byte budget while buffering the inline fast-path stream.
 ///
-/// `INLINE_MAX_ROWS` alone does not bound memory usage — a pathological batch
+/// `DEFAULT_INLINE_MAX_ROWS` alone does not bound memory usage — a pathological batch
 /// with few rows but very large string / binary values can still consume a lot
 /// of RAM. Once the cumulative array memory size of buffered batches exceeds
 /// this budget the fast-path bails out and falls through to the normal Vortex
 /// write path, where the stream is consumed incrementally. Held slightly above
-/// `INLINE_MAX_BYTES` (the serialized IPC cap) to account for in-memory Arrow
-/// overhead vs. the compact IPC representation.
-pub(crate) const INLINE_MAX_BUFFER_BYTES: usize = 4 * 1_048_576; // 4 MB
+/// the default serialized IPC cap to account for in-memory Arrow overhead vs.
+/// the compact IPC representation.
+#[cfg(test)]
+pub(crate) const INLINE_MAX_BUFFER_BYTES: usize = crate::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InlineMemtablePressure {
@@ -722,14 +726,30 @@ impl InlineMemtablePressure {
 }
 
 #[must_use]
+#[cfg(test)]
 pub(crate) fn inline_memtable_pressure(stats: InlinedDataStats) -> Option<InlineMemtablePressure> {
-    if stats.record_count >= INLINE_MEMTABLE_MAX_ROWS {
+    inline_memtable_pressure_with_thresholds(
+        stats,
+        INLINE_MEMTABLE_MAX_ROWS,
+        INLINE_MEMTABLE_MAX_SEGMENTS,
+        INLINE_MEMTABLE_MAX_BYTES,
+    )
+}
+
+#[must_use]
+fn inline_memtable_pressure_with_thresholds(
+    stats: InlinedDataStats,
+    max_rows: i64,
+    max_segments: i64,
+    max_bytes: i64,
+) -> Option<InlineMemtablePressure> {
+    if stats.record_count >= max_rows {
         return Some(InlineMemtablePressure::Rows);
     }
-    if stats.entry_count > INLINE_MEMTABLE_MAX_SEGMENTS {
+    if stats.entry_count > max_segments {
         return Some(InlineMemtablePressure::Segments);
     }
-    if stats.ipc_bytes >= INLINE_MEMTABLE_MAX_BYTES {
+    if stats.ipc_bytes >= max_bytes {
         return Some(InlineMemtablePressure::IpcBytes);
     }
     None
@@ -5243,12 +5263,14 @@ impl CayenneTableProvider {
         if total_rows == 0 {
             return Ok(true); // nothing to write
         }
-        if total_rows > INLINE_MAX_ROWS {
+        let inline_max_rows = self.context.inline_max_rows();
+        let inline_max_bytes = self.context.inline_max_bytes();
+        if inline_max_rows == 0 || inline_max_bytes == 0 || total_rows > inline_max_rows {
             return Ok(false);
         }
         let ipc_bytes =
             serialize_batches_to_ipc(batches).map_err(|e| Error::Arrow { source: e })?;
-        if ipc_bytes.len() > INLINE_MAX_BYTES {
+        if ipc_bytes.len() > inline_max_bytes {
             return Ok(false);
         }
 
@@ -5591,29 +5613,30 @@ impl CayenneTableProvider {
         // `clear_staging_dir`, `ensure_no_incomplete_write`, and the
         // compaction trigger.
         //
-        // Why the threshold is `INLINE_MEMTABLE_MAX_BYTES / INLINE_MAX_BYTES`:
+        // Why the threshold is `inline_memtable_max_bytes / inline_max_bytes`:
         // every `commit_inlined_data_mutation` call from the inline-write
-        // path adds at most 1 inline entry, with at most `INLINE_MAX_BYTES`
-        // (1 MiB) of IPC payload and at most `INLINE_MAX_ROWS` (1024) rows.
+        // path adds at most 1 inline entry, with at most `inline_max_bytes`
+        // of IPC payload and at most `inline_max_rows` rows.
         // Cached `inlined_row_count` ≥ number of commits (each commit
         // contributes ≥ 1 row). So:
         //   - commits ≤ cached_rows
-        //   - entries  ≤ commits          ≤ cached_rows < INLINE_MEMTABLE_MAX_SEGMENTS
-        //   - bytes    ≤ commits·1MiB     ≤ cached_rows·1MiB < INLINE_MEMTABLE_MAX_BYTES
-        // when `cached_rows < INLINE_MEMTABLE_MAX_BYTES / INLINE_MAX_BYTES`
-        // (currently 8). The row threshold is the loosest of the three (10K
-        // vs 8 vs 64 in commit units), so the bytes bound dominates the
-        // safe-skip region.
+        //   - entries  ≤ commits          ≤ cached_rows < inline_memtable_max_segments
+        //   - bytes    ≤ commits·max_ipc  ≤ cached_rows·max_ipc < inline_memtable_max_bytes
+        // when `cached_rows < inline_memtable_max_bytes / inline_max_bytes`.
+        // The bytes bound usually dominates the safe-skip region.
         //
         // For workloads with many small rows per commit (typical CDC: a
         // single row per envelope) this skips the catalog for the entire
-        // first 8 commits. For larger commits (each near `INLINE_MAX_BYTES`)
-        // the safe-skip ends sooner — correctly — because we are closer to
+        // first few commits. For larger commits (each near `inline_max_bytes`)
+        // the safe-skip ends sooner — correctly — because they are closer to
         // the bytes threshold. After the fast path stops, we fall through
         // to the catalog for accurate stats including bytes.
         let cached_rows = self.inlined_row_count.load(Ordering::Relaxed);
-        let inline_max_bytes_i64 = i64::try_from(INLINE_MAX_BYTES).unwrap_or(i64::MAX);
-        let safe_skip_threshold: i64 = (INLINE_MEMTABLE_MAX_BYTES / inline_max_bytes_i64).max(1);
+        let inline_max_bytes_i64 = i64::try_from(self.context.inline_max_bytes())
+            .unwrap_or(i64::MAX)
+            .max(1);
+        let safe_skip_threshold: i64 =
+            (self.context.inline_memtable_max_bytes() / inline_max_bytes_i64).max(1);
         if cached_rows < safe_skip_threshold {
             return Ok(());
         }
@@ -5625,7 +5648,12 @@ impl CayenneTableProvider {
         self.inlined_row_count
             .store(stats.record_count, Ordering::Relaxed);
 
-        let Some(pressure) = inline_memtable_pressure(stats) else {
+        let Some(pressure) = inline_memtable_pressure_with_thresholds(
+            stats,
+            self.context.inline_memtable_max_rows(),
+            self.context.inline_memtable_max_segments(),
+            self.context.inline_memtable_max_bytes(),
+        ) else {
             return Ok(());
         };
 
