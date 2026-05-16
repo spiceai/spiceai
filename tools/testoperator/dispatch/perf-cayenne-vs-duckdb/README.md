@@ -9,6 +9,27 @@ It is **not** a new set of spicepods — every yaml referenced from
 source of truth for "which Cayenne pod should I compare against which DuckDB
 pod, on which workload, at which scale."
 
+## Metastore variants (SQLite vs Turso)
+
+Cayenne supports two metastore backends: **SQLite** (default) and **Turso**
+(libSQL). Each Cayenne entry in `pairs.yaml` exists in two forms:
+
+- The default entry (e.g. `bench-tpch-sf1-file`) points at a pod with no
+  `cayenne_metastore` param, which falls back to SQLite.
+- The `*-turso` entry (e.g. `bench-tpch-sf1-file-turso`) points at a sibling
+  pod with `cayenne_metastore: turso` set under `acceleration.params`. The
+  sibling is otherwise byte-identical to the SQLite pod.
+
+The DuckDB side is shared by both — the only thing changing across a SQLite/
+Turso pair is the metastore. So the SQLite-vs-Turso comparison (running the
+two `cayenne` pods side-by-side and ignoring the DuckDB column) isolates the
+metastore's contribution to Cayenne's overall numbers.
+
+This pairing is most informative on **write-heavy and mixed workloads**
+(`append-*`, `mixed-*`) where the metastore commit path is on the critical
+path of every burst. On pure-read benchmarks the two metastores should be
+indistinguishable.
+
 ## Running a single pair locally
 
 ```sh
@@ -66,6 +87,11 @@ reads and writes contend for the same accelerator.
    `must_beat: false`.
 4. Append the entry to `pairs.yaml`. Keep entries grouped by workload, then
    `query_set`, then `scale_factor`.
+5. **Add the matching `*-turso` entry directly after the SQLite default**.
+   The Turso variant points at a sibling pod that differs only by an added
+   `cayenne_metastore: turso` under `acceleration.params`. If the Turso pod
+   doesn't exist yet, create it next to the SQLite pod with the `[file]turso`
+   naming convention (e.g. `file[parquet]-cayenne[file]turso.yaml`).
 
 ## Fair-comparison rules
 
