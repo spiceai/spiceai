@@ -1025,7 +1025,15 @@ impl TableProvider for EmbeddingTable {
         state: &dyn Session,
         args: datafusion::catalog::ScanArgs<'a>,
     ) -> DataFusionResult<datafusion::catalog::ScanResult> {
-        self.base_table.scan_with_args(state, args).await
+        let plan = self
+            .scan(
+                state,
+                args.projection().map(|p| p.to_vec()).as_ref(),
+                args.filters().unwrap_or(&[]),
+                args.limit(),
+            )
+            .await?;
+        Ok(plan.into())
     }
 
     async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {

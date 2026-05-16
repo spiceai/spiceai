@@ -2299,7 +2299,6 @@ mod tests {
         write_log: Arc<TokioMutex<Vec<String>>>,
     }
 
-    #[deny(clippy::missing_trait_methods)]
     #[async_trait]
     impl TableProvider for WriteOrderRecordingProvider {
         fn as_any(&self) -> &dyn std::any::Any {
@@ -2337,7 +2336,6 @@ mod tests {
         failures_remaining: Arc<AtomicUsize>,
     }
 
-    #[deny(clippy::missing_trait_methods)]
     #[async_trait]
     impl TableProvider for FailFirstWriteProvider {
         fn as_any(&self) -> &dyn std::any::Any {
@@ -2653,7 +2651,6 @@ mod tests {
         writes_started: Arc<AtomicUsize>,
     }
 
-    #[deny(clippy::missing_trait_methods)]
     #[async_trait]
     impl TableProvider for SlowProvider {
         fn as_any(&self) -> &dyn std::any::Any {

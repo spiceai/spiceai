@@ -326,7 +326,15 @@ impl TableProvider for LocationPruningListingTable {
         state: &dyn datafusion::catalog::Session,
         args: datafusion::catalog::ScanArgs<'a>,
     ) -> datafusion::error::Result<datafusion::catalog::ScanResult> {
-        self.inner.scan_with_args(state, args).await
+        let plan = self
+            .scan(
+                state,
+                args.projection().map(|p| p.to_vec()).as_ref(),
+                args.filters().unwrap_or(&[]),
+                args.limit(),
+            )
+            .await?;
+        Ok(plan.into())
     }
 
     fn statistics(&self) -> Option<datafusion::common::Statistics> {

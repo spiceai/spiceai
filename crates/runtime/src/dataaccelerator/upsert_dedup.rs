@@ -203,11 +203,15 @@ impl TableProvider for UpsertDedupTableProvider {
         state: &dyn Session,
         args: datafusion::catalog::ScanArgs<'a>,
     ) -> datafusion::error::Result<datafusion::catalog::ScanResult> {
-        self.inner.scan_with_args(state, args).await
-    }
-
-    fn statistics(&self) -> Option<datafusion::common::Statistics> {
-        self.inner.statistics()
+        let plan = self
+            .scan(
+                state,
+                args.projection().map(|p| p.to_vec()).as_ref(),
+                args.filters().unwrap_or(&[]),
+                args.limit(),
+            )
+            .await?;
+        Ok(plan.into())
     }
 
     async fn truncate(
