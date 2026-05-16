@@ -671,12 +671,9 @@ impl CayenneDeletionSink {
             ));
 
             // Pre-build updated cache bitmap (u32 representable positions only).
-            // Use `Arc::try_unwrap` to mutate in place when this writer holds
-            // the only ref (no readers active on this entry); otherwise fall
-            // back to a one-time clone of THIS file's bitmap. Either way, we
-            // never touch any other file's bitmap data.
-            let mut updated_bitmap =
-                Arc::try_unwrap(existing_bitmap_arc).unwrap_or_else(|shared| (*shared).clone());
+            // Clone only THIS file's bitmap; unchanged file bitmaps remain
+            // shared through their existing `Arc`s in the outer map snapshot.
+            let mut updated_bitmap = (*existing_bitmap_arc).clone();
             updated_bitmap.extend(
                 unique_new_row_ids
                     .iter()

@@ -331,8 +331,10 @@ impl ColumnBounds for ExactColumnBounds {
     /// being well understood and tested.
     ///
     /// NULL handling: In the exact path, NULLs from the build side are collected
-    /// as `ScalarValue::Null`. An `InList` containing NULL never matches (SQL
-    /// three-valued logic), which is the correct "not in" behavior for anti-joins.
+    /// as `ScalarValue::Null`. The generated expression is a non-negated `IN`
+    /// predicate, so probe rows only match concrete collected values. If either
+    /// side is NULL, SQL three-valued logic yields NULL rather than true, and the
+    /// dynamic filter does not keep that row on the basis of the NULL alone.
     fn physical_expr(
         &self,
         left_expr: Arc<dyn PhysicalExpr>,

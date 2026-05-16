@@ -1454,8 +1454,10 @@ async fn test_compaction_runs_after_inline_memtable_checkpoint(
         .list_snapshot_files_with_sizes(&snapshot_id)
         .await
         .expect("list_snapshot_files_with_sizes should succeed");
-    let _ = files.len(); // diagnostic only — see comment above
-    let _ = table_id;
+    eprintln!(
+        "inline_then_compaction table_id={table_id} snapshot_id={snapshot_id} visible_vortex_files={}",
+        files.len()
+    );
 
     // Row count must match end-to-end after compaction.
     let df = ctx

@@ -63,6 +63,7 @@ struct ApplyContext<'a> {
     initial_load_completed: &'a Arc<AtomicBool>,
     write_ctx: &'a SessionContext,
     write_session_state: &'a SessionState,
+    commit_timeout: Duration,
     pending_commit: &'a mut Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -352,13 +353,13 @@ impl RefreshTask {
             }
         });
 
-        // The tail of the ordered source-side commit chain. Commits are
-        // network round-trips to the source (PG `Standby Status Update`, Kafka
-        // offset commit, DynamoDB shard checkpoint) that don't need to gate the
-        // next apply once the accelerator write has succeeded. Each new commit
-        // task awaits the previous tail internally before committing its own
-        // envelopes, preserving monotonic LSN/offset advancement while the
-        // apply loop continues draining catch-up backlogs.
+        // The previous burst's source-side commit task. Commits are network
+        // round-trips to the source (PG `Standby Status Update`, Kafka offset
+        // commit, DynamoDB shard checkpoint) that don't need to gate the next
+        // apply once the accelerator write has succeeded. Before publishing a
+        // new commit task we drain the previous one with `commit_timeout`, so
+        // commit(N) overlaps apply(N+1) without accumulating an unbounded chain
+        // of tasks if the source-side commit path stalls.
         let mut pending_commit: Option<tokio::task::JoinHandle<()>> = None;
         let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
         let write_ctx = SessionContext::new();
@@ -408,6 +409,7 @@ impl RefreshTask {
                 initial_load_completed: &initial_load_completed,
                 write_ctx: &write_ctx,
                 write_session_state: &write_session_state,
+                commit_timeout: cdc_cfg.commit_timeout,
                 pending_commit: &mut pending_commit,
             };
             if !self.apply_burst(&mut apply_context, burst).await {
@@ -616,9 +618,24 @@ impl RefreshTask {
                     );
                 }
 
-                let previous_commit = context.pending_commit.take();
+                if let Some(previous_commit) = context.pending_commit.take()
+                    && let Some(error_message) = join_pending_commit(
+                        previous_commit,
+                        context.dataset_name,
+                        self.runtime_status.is_shutdown(),
+                        context.commit_timeout,
+                    )
+                    .await
+                {
+                    self.set_refresh_status(
+                        context.refresh_sql,
+                        status::ComponentStatus::error_with_message(error_message),
+                    )
+                    .await;
+                    return false;
+                }
+
                 *context.pending_commit = Some(spawn_ordered_commit_task(
-                    previous_commit,
                     committers,
                     Arc::clone(&self.runtime_status),
                     context.dataset_name.clone(),
@@ -1091,34 +1108,16 @@ async fn join_pending_commit(
 }
 
 fn spawn_ordered_commit_task(
-    previous: Option<tokio::task::JoinHandle<()>>,
     committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
     runtime_status: Arc<status::RuntimeStatus>,
     commit_dataset: TableReference,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Safe catch-up mode: this task is spawned only after the accelerator
-        // write returns successfully. It can wait on the prior commit without
-        // holding up the apply loop, but it never acknowledges source progress
-        // ahead of a durable/visible accelerator write.
-        if let Some(previous) = previous {
-            match previous.await {
-                Ok(()) => {}
-                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-                Err(e) if e.is_cancelled() && runtime_status.is_shutdown() => {
-                    tracing::debug!(
-                        "Previous CDC commit task for {commit_dataset} was cancelled during shutdown"
-                    );
-                    return;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Previous CDC commit task for {commit_dataset} ended unexpectedly: {e}"
-                    );
-                }
-            }
-        }
-
+        // write returns successfully. `apply_envelope_run` has already drained
+        // the previous commit task with timeout/backpressure before spawning
+        // this one, so source progress is acknowledged in order without ever
+        // running ahead of a durable/visible accelerator write.
         for committer in committers {
             if let Err(e) = committer.commit().await
                 && !runtime_status.is_shutdown()
@@ -2536,6 +2535,7 @@ mod tests {
             initial_load_completed: &initial_load_completed,
             write_ctx: &write_ctx,
             write_session_state: &write_session_state,
+            commit_timeout: Duration::from_secs(5),
             pending_commit: &mut pending_commit,
         };
 

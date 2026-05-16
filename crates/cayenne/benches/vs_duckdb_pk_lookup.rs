@@ -72,7 +72,8 @@ fn bench_pk_lookup(c: &mut Criterion) {
         // accidentally over-counted at edges.
         let target_id = (rows / 2) as i64;
         let target_lo = target_id - (BATCH_KEYS as i64) / 2;
-        let target_hi = target_id + (BATCH_KEYS as i64) / 2;
+        let target_hi_exclusive = target_lo + BATCH_KEYS as i64;
+        let target_hi_inclusive = target_hi_exclusive - 1;
 
         // --- single PK lookup ---
         let cayenne_sql = format!("SELECT value FROM t WHERE id = {target_id}");
@@ -113,7 +114,9 @@ fn bench_pk_lookup(c: &mut Criterion) {
         );
 
         // --- IN-list lookup ---
-        let ids: Vec<String> = (target_lo..target_hi).map(|i| i.to_string()).collect();
+        let ids: Vec<String> = (target_lo..target_hi_exclusive)
+            .map(|i| i.to_string())
+            .collect();
         let in_list = ids.join(",");
         let cayenne_sql = format!("SELECT SUM(value) FROM t WHERE id IN ({in_list})");
         let duckdb_sql = format!("SELECT SUM(value) FROM pk_bench WHERE id IN ({in_list})");
@@ -153,10 +156,12 @@ fn bench_pk_lookup(c: &mut Criterion) {
         );
 
         // --- PK range scan ---
-        let cayenne_sql =
-            format!("SELECT SUM(value) FROM t WHERE id BETWEEN {target_lo} AND {target_hi}");
-        let duckdb_sql =
-            format!("SELECT SUM(value) FROM pk_bench WHERE id BETWEEN {target_lo} AND {target_hi}");
+        let cayenne_sql = format!(
+            "SELECT SUM(value) FROM t WHERE id BETWEEN {target_lo} AND {target_hi_inclusive}"
+        );
+        let duckdb_sql = format!(
+            "SELECT SUM(value) FROM pk_bench WHERE id BETWEEN {target_lo} AND {target_hi_inclusive}"
+        );
         rt.block_on(capture_comparison_plans(
             &format!("pk_lookup/{rows}/pk_range"),
             &cayenne_fixture.table,
