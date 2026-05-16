@@ -2321,3 +2321,70 @@ async fn cayenne_catalog_ddl_string_partition_dml() -> Result<(), String> {
         })
         .await
 }
+
+// =============================================================================
+// Test: Cayenne catalog rejected in non-distributed (standalone) mode
+// =============================================================================
+
+#[tokio::test]
+async fn cayenne_catalog_rejected_without_distributed_mode() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            let catalog = make_cayenne_catalog(
+                "standalone_cat",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let app = AppBuilder::new("cayenne_standalone_reject")
+                .with_catalog(catalog.clone())
+                .build();
+
+            configure_test_datafusion();
+            // Build runtime WITHOUT cluster config (standalone / non-distributed mode).
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_runtime_config(Config::default().with_caching_disabled())
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err("Timeout waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            // The catalog should have failed to register with a configuration error.
+            let statuses = rt.status().get_catalog_statuses();
+            let status = statuses
+                .get("standalone_cat")
+                .ok_or("expected catalog 'standalone_cat' in status map")?;
+
+            assert!(status.is_error(), "expected Error status, got: {status}");
+            let err_msg = status
+                .error_message()
+                .ok_or("expected error message in catalog status")?;
+            assert!(
+                err_msg.contains("distributed"),
+                "expected error about distributed mode, got: {err_msg}"
+            );
+
+            // The catalog should NOT be registered in DataFusion.
+            assert!(
+                rt.datafusion().ctx.catalog("standalone_cat").is_none(),
+                "cayenne catalog should not be registered in standalone mode"
+            );
+
+            Ok(())
+        })
+        .await
+}
