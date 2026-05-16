@@ -106,6 +106,48 @@ impl PartitionedWal {
         }
     }
 
+    /// Ensure the `_partitioned_wal/` subdirectory exists.
+    /// If we just created it, sync its parent (the table root) so the
+    /// subdirectory entry itself is durable on local FS.
+    ///
+    /// This is required for the same reason as the parent-directory sync
+    /// in `ensure_snapshot_dir_exists`: on POSIX, creating a subdirectory
+    /// updates the parent's directory metadata. Without the parent sync,
+    /// a crash can make the `_partitioned_wal/` directory "disappear" even
+    /// though we are about to write a coordination record inside it.
+    ///
+    /// This is the last piece of the local-FS durability puzzle for the
+    /// cross-partition coordination infrastructure (the write side of
+    /// `PartitionedWal` now has the same treatment as the removal side
+    /// and as all snapshot directory creation paths).
+    ///
+    /// Note for S3 tables: the `_partitioned_wal/` directory and the
+    /// `PartitionedWal` JSON file are still local files on the writer's
+    /// machine (coordination is local to the writer process). The per-
+    /// partition "staging WAL" on S3 is an object in the staging prefix,
+    /// and its removal is a best-effort object delete. The local FS
+    /// durability fixes apply to the coordination records on the writer.
+    async fn ensure_partitioned_wal_dir_and_sync_parent(
+        table_root: &Path,
+        wal_dir: &Path,
+    ) -> Result<()> {
+        match tokio::fs::create_dir(wal_dir).await {
+            Ok(()) => {
+                let parent = table_root.to_path_buf(); // the table root
+                let table = table_root.display().to_string();
+
+                // Sync the table root so the _partitioned_wal/ subdir entry is durable.
+                tokio::task::spawn_blocking(move || std::fs::File::open(&parent)?.sync_all())
+                    .await
+                    .map_err(|source| Error::TaskPanicked { table, source })??;
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(source) => return Err(Error::IoError { source }),
+        }
+
+        Ok(())
+    }
+
     /// Return the on-disk path for this WAL under the given table root.
     #[must_use]
     pub fn path_under(&self, table_root: &Path) -> PathBuf {
@@ -133,7 +175,12 @@ impl PartitionedWal {
     /// be written, serialization fails, or the atomic rename / fsync fails.
     pub async fn write_to(&self, table_root: &Path) -> Result<PathBuf> {
         let wal_dir = table_root.join(PARTITIONED_WAL_DIR);
-        tokio::fs::create_dir_all(&wal_dir).await?;
+
+        // Ensure the _partitioned_wal/ subdirectory exists and, if we just
+        // created it, sync its parent (the table root) so the subdirectory
+        // entry itself is durable. This is the same durability requirement we
+        // now enforce for new snapshot directories in ensure_snapshot_dir_exists.
+        Self::ensure_partitioned_wal_dir_and_sync_parent(table_root, &wal_dir).await?;
 
         let wal_path = wal_dir.join(format!("{}.json", self.commit_id));
         let tmp_path = wal_dir.join(format!("{}.json.tmp", self.commit_id));
@@ -194,6 +241,41 @@ impl PartitionedWal {
                     "Removed partitioned WAL at {} (commit {commit_id})",
                     path.display(),
                 );
+
+                // Best-effort directory sync so that the absence of the
+                // cross-partition coordination marker is durable. This aligns
+                // the removal of the top-level `PartitionedWal` with the
+                // per-partition staging WAL removal (which now also syncs its
+                // directory). A crash without this sync could leave the marker
+                // visible, causing a conservative "incomplete cross-partition
+                // commit" detection on the next open (safe, but noisy).
+                // The actual data durability is already guaranteed by the
+                // per-partition move + WAL removal steps that ran under the
+                // held barrier before this call.
+                let wal_dir = table_root.join(PARTITIONED_WAL_DIR);
+                let wal_dir_display = wal_dir.display().to_string();
+                match tokio::task::spawn_blocking(move || {
+                    std::fs::File::open(&wal_dir).and_then(|f| f.sync_all())
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            "Failed to sync {} after removing PartitionedWal {} (data is safe; may see stale marker on restart): {e}",
+                            wal_dir_display,
+                            commit_id,
+                        );
+                    }
+                    Err(join_err) => {
+                        tracing::warn!(
+                            "Join error while syncing {} after removing PartitionedWal {} (data is safe): {join_err}",
+                            wal_dir_display,
+                            commit_id,
+                        );
+                    }
+                }
+
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
