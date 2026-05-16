@@ -10,6 +10,7 @@ The comparison has two layers:
 | Layer                          | What it measures                                                               | Where it lives                                                                                                    | How to run                                                                                     |
 | ------------------------------ | ------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | End-to-end spicepod benchmarks | Real spiced ingesting from real sources, queries via Flight                    | `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/pairs.yaml` references existing yamls under `test/spicepods/` | `testoperator run bench` / `throughput` / `load` / `append` on each side of a pair             |
+| Mixed append+query benchmarks  | Analytical query workers running while append/upsert/retention loads mutate data | `pairs.yaml` entries with `workload: mixed` and append dispatch yamls under `tools/testoperator/dispatch/tpch/`   | `testoperator run append --concurrency <N> --load-interval <S> --load-steps <N>`               |
 | In-process micro-benchmarks    | Direct `CayenneTableProvider` vs `duckdb::Connection` on identical Arrow input | `crates/cayenne/benches/vs_duckdb_*.rs`                                                                           | `cargo bench -p cayenne --features duckdb-bench --bench vs_duckdb_ingest` (or the other three) |
 
 ## Layer 1 — Spicepod matrix
@@ -37,6 +38,39 @@ cargo run -p testoperator -- run bench \
 Then diff the query durations. A first-class `testoperator compare`
 subcommand that ingests `pairs.yaml` and produces a side-by-side report is
 planned — see the manifest's README for the input format.
+
+### Mixed append+query runs
+
+The matrix includes `workload: mixed` entries for real-world interference
+tests: one or more analytical query workers loop over the query set while
+the append worker periodically generates new load files. This is the
+Cayenne-vs-DuckDB analogue of the CH-benCH idea: reads and writes compete
+for the same accelerator instead of being measured in isolation.
+
+Run both sides of the SF1 mixed pair locally with the same duration,
+append cadence, load count, and query-worker count:
+
+```sh
+# Cayenne side
+cargo run -p testoperator -- run append \
+  -p test/spicepods/tpch/sf1/accelerated/append/file\[parquet\]-cayenne\[file\]-append.yaml \
+  -s spiced -d ./.data --query-set tpch --validate \
+  --duration 720 --concurrency 4 --load-interval 30 --load-steps 20
+
+# DuckDB side
+cargo run -p testoperator -- run append \
+  -p test/spicepods/tpch/sf1/accelerated/append/file\[parquet\]-duckdb\[file\]-append.yaml \
+  -s spiced -d ./.data --query-set tpch --query-overrides duckdb --validate \
+  --duration 720 --concurrency 4 --load-interval 30 --load-steps 20
+```
+
+The pass/fail bar is correctness first: all analytical queries must
+succeed, appended row counts must match expectations, and memory/health
+metrics must remain stable. The performance comparison then looks at
+query latency under write pressure, append completion, and resource usage.
+For a source-level OLTP plus analytical-query benchmark, use
+`testoperator run htap --query-set chbench`; that command follows the
+CH-benCH shape directly and complements these accelerator-pair runs.
 
 ### Fair-comparison rules
 
@@ -91,8 +125,8 @@ measure:
 
 - Flight serialization or DataFusion plan construction overhead — those
   are covered by the layer-1 spicepod benchmarks.
-- Concurrency or throughput under load — covered by `testoperator run
-  throughput` against the same pods.
+- Real read/write interference — covered by the mixed append+query runs,
+  where analytical query workers execute while append loads are generated.
 - Resource consumption (peak RSS, disk usage) — covered by spiced's OTLP
   metrics during layer-1 runs.
 
@@ -105,7 +139,9 @@ layer-2 micro-bench that targets that path.
 1. If the new dimension is a workload, decide whether it's better served
    by a spicepod pair (more realistic) or a micro-bench (more isolated).
 2. **Spicepod pair**: add the yamls under `test/spicepods/`, append an
-   entry to `pairs.yaml`, and document any unavoidable asymmetry.
+  entry to `pairs.yaml`, and document any unavoidable asymmetry. For a
+  real-world mixed workload, use `workload: mixed` and include the append
+  cadence plus query concurrency in the entry.
 3. **Micro-bench**: add `crates/cayenne/benches/vs_duckdb_<dimension>.rs`,
    register it in `crates/cayenne/Cargo.toml`'s `[[bench]]` section, and
    reuse the helpers in `crates/cayenne/benches/vs_duckdb_helpers/common.rs`

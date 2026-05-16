@@ -225,6 +225,8 @@ pub struct AppendArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub load_interval: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load_steps: Option<u64>,
@@ -451,6 +453,13 @@ tests:
     concurrency: 128
     duration: 1800
     random_param_set_count: 1000
+    append:
+        spicepod_path: file[parquet]-cayenne[file]-append.yaml
+        query_set: tpch
+        duration: 720
+        concurrency: 4
+        load_interval: 30
+        load_steps: 20
 ";
 
         let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
@@ -478,6 +487,18 @@ tests:
         assert_eq!(test_file.tests.load[0].concurrency, Some(128));
         assert_eq!(test_file.tests.load[0].duration, Some(1800));
         assert_eq!(test_file.tests.load[0].random_param_set_count, Some(1000));
+
+        // Verify append section (single item becomes vec with one element)
+        assert_eq!(test_file.tests.append.len(), 1);
+        assert_eq!(
+            test_file.tests.append[0].spicepod_path.to_string_lossy(),
+            "file[parquet]-cayenne[file]-append.yaml"
+        );
+        assert_eq!(test_file.tests.append[0].query_set, QuerySet::Tpch);
+        assert_eq!(test_file.tests.append[0].duration, Some(720));
+        assert_eq!(test_file.tests.append[0].concurrency, Some(4));
+        assert_eq!(test_file.tests.append[0].load_interval, Some(30));
+        assert_eq!(test_file.tests.append[0].load_steps, Some(20));
 
         // Verify empty sections default to empty vectors
         assert_eq!(test_file.tests.throughput.len(), 0);

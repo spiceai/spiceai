@@ -9,7 +9,7 @@
 # Schema:
 #   pairs:
 #     - id:              unique identifier for the pair
-#       workload:        bench | throughput | load | ingest | mutation | point-lookup | append
+#       workload:        bench | throughput | load | ingest | mutation | point-lookup | append | mixed
 #       query_set:       tpch | tpcds | clickbench | chbench (omit for non-query workloads)
 #       scale_factor:    1 | 5 | 10 | 100 | 1000
 #       cayenne:         spicepod path relative to test/spicepods/
@@ -18,6 +18,9 @@
 #                        (used by `testoperator compare` to set non-zero exit code on regression)
 #       runner_type:     spiceai-dev-runners | spiceai-dev-large-runners
 #       duration_secs:   load/throughput test duration (omit for bench)
+#       query_concurrency: analytical query workers for mixed append+query runs
+#       load_interval_secs: seconds between append loads for mixed/append runs
+#       load_steps:      number of append loads for mixed/append runs
 #       notes:           free-text explanation of trade-offs or known asymmetries
 #
 # Adding a new pair:
@@ -123,6 +126,23 @@ pairs:
     must_beat: true
     runner_type: spiceai-dev-large-runners
     notes: SF10 file-mode pair is omitted because no DuckDB file-mode SF10 pod exists today.
+
+  # ===========================================================================
+  # Mixed workloads (append while querying, CH-benCH-style interference)
+  # ===========================================================================
+  - id: mixed-append-query-tpch-sf1-file
+    workload: mixed
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/append/file[parquet]-cayenne[file]-append.yaml
+    duckdb: tpch/sf1/accelerated/append/file[parquet]-duckdb[file]-append.yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+    duration_secs: 720
+    query_concurrency: 4
+    load_interval_secs: 30
+    load_steps: 20
+    notes: Runs analytical TPC-H query workers while append loads mutate the source, measuring query latency and correctness under ingest pressure.
 
   # ===========================================================================
   # Load tests (long-running, read-only, observe drift over time)

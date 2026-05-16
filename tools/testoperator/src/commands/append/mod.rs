@@ -59,7 +59,7 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
         NotStarted::new()
             .with_query_set(query_set.clone(), query_overrides)
             .await?
-            .with_parallel_count(1)
+            .with_parallel_count(args.test_args.common.concurrency)
             .with_end_duration(Duration::from_secs(args.test_args.common.duration))
             .with_tempdir_path(start_request.get_tempdir_path())
             .with_load_interval(Duration::from_secs(args.load_interval))

@@ -2,7 +2,7 @@
 
 This directory pairs every Cayenne spicepod with its DuckDB counterpart so the
 two accelerators can be compared head-to-head across query, throughput, load,
-ingest, and write-heavy workloads.
+ingest, write-heavy workloads, and mixed append+query workloads.
 
 It is **not** a new set of spicepods — every yaml referenced from
 `pairs.yaml` already lives under `test/spicepods/`. The manifest is the single
@@ -27,6 +27,31 @@ testoperator run bench \
 Run both and diff the resulting query durations. A first-class
 `testoperator compare` subcommand that does this in one shot is planned —
 this manifest is its input format.
+
+## Running the mixed append+query pair locally
+
+The `mixed-*` entries model real-world interference: analytical query workers
+loop through the query set while append loads are generated in the background.
+Run both sides with the same duration, append cadence, load count, and query
+concurrency.
+
+```sh
+# Cayenne side
+testoperator run append \
+  -p 'test/spicepods/tpch/sf1/accelerated/append/file[parquet]-cayenne[file]-append.yaml' \
+  -s spiced -d ./.data --query-set tpch --validate \
+  --duration 720 --concurrency 4 --load-interval 30 --load-steps 20
+
+# DuckDB side
+testoperator run append \
+  -p 'test/spicepods/tpch/sf1/accelerated/append/file[parquet]-duckdb[file]-append.yaml' \
+  -s spiced -d ./.data --query-set tpch --query-overrides duckdb --validate \
+  --duration 720 --concurrency 4 --load-interval 30 --load-steps 20
+```
+
+This is the Cayenne-vs-DuckDB analogue of a CH-benCH-style benchmark: query
+latency, append progress, correctness, memory, and health are measured while
+reads and writes contend for the same accelerator.
 
 ## Adding a new pair
 
