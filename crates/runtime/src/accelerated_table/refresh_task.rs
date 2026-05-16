@@ -343,6 +343,7 @@ impl RefreshTaskBuilder {
             last_updated_at: self.last_updated_at,
             is_s3_express_acceleration: self.is_s3_express_acceleration,
             snapshot_refresh_state: self.snapshot_refresh_state,
+            cdc_insert_plan_cache: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -370,6 +371,8 @@ pub struct RefreshTask {
     /// Per-dataset state required for `RefreshMode::Snapshot`. `None` for all
     /// other refresh modes.
     snapshot_refresh_state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
+    /// Cached generic CDC append plan. Cayenne's native CDC path bypasses this.
+    cdc_insert_plan_cache: Arc<Mutex<Option<changes::CdcInsertPlanCache>>>,
 }
 
 impl std::fmt::Debug for RefreshTask {

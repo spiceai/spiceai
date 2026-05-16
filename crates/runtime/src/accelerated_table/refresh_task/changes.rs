@@ -22,7 +22,7 @@ use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{
     Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
 };
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow_tools::record_batch::try_cast_to;
 use cache::Caching;
 #[cfg(not(windows))]
@@ -61,6 +61,40 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Notify, RwLock};
 
 type PendingApplyFinalize = tokio::task::JoinHandle<crate::accelerated_table::Result<()>>;
+
+pub(super) struct CdcInsertPlanCache {
+    target_schema: SchemaRef,
+    streaming_plan: Arc<StreamingDataUpdateExecutionPlan>,
+    insert_plan: Arc<dyn ExecutionPlan>,
+}
+
+impl CdcInsertPlanCache {
+    async fn try_new(
+        accelerator: &Arc<dyn TableProvider>,
+        session_state: &SessionState,
+        target_schema: SchemaRef,
+    ) -> Result<Self, DataFusionError> {
+        let streaming_plan = Arc::new(StreamingDataUpdateExecutionPlan::new_empty(Arc::clone(
+            &target_schema,
+        )));
+        let streaming_exec: Arc<dyn ExecutionPlan> = streaming_plan.clone();
+        let cast_plan: Arc<dyn ExecutionPlan> =
+            Arc::new(SchemaCastScanExec::new(streaming_exec, Arc::clone(&target_schema)));
+        let insert_plan = accelerator
+            .insert_into(session_state, cast_plan, InsertOp::Append)
+            .await?;
+
+        Ok(Self {
+            target_schema,
+            streaming_plan,
+            insert_plan,
+        })
+    }
+
+    fn matches_schema(&self, schema: &SchemaRef) -> bool {
+        self.target_schema.as_ref() == schema.as_ref()
+    }
+}
 
 struct ApplyContext<'a> {
     refresh_sql: Option<&'a str>,
@@ -912,23 +946,51 @@ impl RefreshTask {
 
         let _lock_guard = self.accelerator_write_mutex.lock().await;
 
-        // Wrap with SchemaCastScanExec to ensure data types match the accelerator schema
-        // (e.g., timestamp precision conversion from Millisecond to Microsecond for Cayenne)
-        let streaming_plan: Arc<dyn ExecutionPlan> =
-            Arc::new(StreamingDataUpdateExecutionPlan::new(record_batch_stream));
-        let cast_plan: Arc<dyn ExecutionPlan> =
-            Arc::new(SchemaCastScanExec::new(streaming_plan, target_schema));
+        let (streaming_plan, insert_plan) = {
+            let mut cache_guard = self.cdc_insert_plan_cache.lock().await;
+            let rebuild_cache = cache_guard
+                .as_ref()
+                .is_none_or(|cache| !cache.matches_schema(&target_schema));
+            if rebuild_cache {
+                *cache_guard = Some(
+                    CdcInsertPlanCache::try_new(
+                        &self.accelerator,
+                        session_state,
+                        Arc::clone(&target_schema),
+                    )
+                    .await
+                    .map_err(find_datafusion_root)
+                    .context(crate::accelerated_table::FailedToWriteDataSnafu)?,
+                );
+            }
 
-        let insert_plan = self
-            .accelerator
-            .insert_into(session_state, cast_plan, InsertOp::Append)
+            let cache = cache_guard.as_ref().ok_or_else(|| {
+                crate::accelerated_table::Error::FailedToWriteData {
+                    source: DataFusionError::Execution(
+                        "CDC insert plan cache was not initialized".to_string(),
+                    ),
+                }
+            })?;
+            cache
+                .streaming_plan
+                .set_stream(record_batch_stream)
+                .map_err(find_datafusion_root)
+                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+            (
+                Arc::clone(&cache.streaming_plan),
+                Arc::clone(&cache.insert_plan),
+            )
+        };
+
+        let collect_result = collect(insert_plan, ctx.task_ctx())
             .await
             .map_err(find_datafusion_root)
-            .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
-        collect(insert_plan, ctx.task_ctx())
-            .await
+            .context(crate::accelerated_table::FailedToWriteDataSnafu);
+        streaming_plan
+            .clear_stream()
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+        collect_result?;
         perform_change_write_maintenance(&self.accelerator).await?;
 
         self.update_last_updated_at();
@@ -2077,6 +2139,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_write_change_reuses_cached_insert_plan_for_upserts() {
+        let insert_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingInsertProvider {
+            inner: make_mem_table() as Arc<dyn TableProvider>,
+            insert_calls: Arc::clone(&insert_calls),
+        });
+        let task = make_refresh_task(provider as Arc<dyn TableProvider>);
+        let ctx = SessionContext::new();
+        let session_state = ctx.state();
+
+        let first_batch =
+            create_test_change_batch(vec!["c"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
+        let second_batch =
+            create_test_change_batch(vec!["c"], &[vec!["id"]], vec![2], vec![Some("Bob")]);
+
+        assert_eq!(
+            task.write_change_with_context(first_batch, &ctx, &session_state)
+                .await
+                .expect("first write_change should succeed")
+                .result,
+            WriteChangeResult::DataWritten
+        );
+        assert_eq!(
+            task.write_change_with_context(second_batch, &ctx, &session_state)
+                .await
+                .expect("second write_change should succeed")
+                .result,
+            WriteChangeResult::DataWritten
+        );
+
+        assert_eq!(
+            insert_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "CDC upserts should reuse the cached insert_into plan"
+        );
+    }
+
+    #[tokio::test]
     async fn test_write_change_delete_returns_data_written() {
         let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         let change_batch =
@@ -2534,6 +2634,48 @@ mod tests {
     }
 
     // -- Correctness: commit-after-write ordering -----------------------------
+
+    /// Wraps a `TableProvider` and counts each `insert_into` call.
+    #[derive(Debug)]
+    struct CountingInsertProvider {
+        inner: Arc<dyn TableProvider>,
+        insert_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TableProvider for CountingInsertProvider {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+
+        async fn insert_into(
+            &self,
+            state: &dyn Session,
+            input: Arc<dyn ExecutionPlan>,
+            insert_op: InsertOp,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.insert_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner.insert_into(state, input, insert_op).await
+        }
+    }
 
     /// Wraps a `TableProvider` and records each `insert_into` call.
     /// Together with `CommitLog`, this lets us assert that for every

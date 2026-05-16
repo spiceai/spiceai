@@ -237,8 +237,20 @@ impl StreamingDataUpdateExecutionPlan {
     #[must_use]
     pub fn new(record_batch_stream: SendableRecordBatchStream) -> Self {
         let schema = record_batch_stream.schema();
+        Self::new_with_stream(schema, Some(record_batch_stream))
+    }
+
+    #[must_use]
+    pub fn new_empty(schema: SchemaRef) -> Self {
+        Self::new_with_stream(schema, None)
+    }
+
+    fn new_with_stream(
+        schema: SchemaRef,
+        record_batch_stream: Option<SendableRecordBatchStream>,
+    ) -> Self {
         Self {
-            record_batch_stream: Arc::new(Mutex::new(Some(record_batch_stream))),
+            record_batch_stream: Arc::new(Mutex::new(record_batch_stream)),
             schema: Arc::clone(&schema),
             properties: PlanProperties::new(
                 EquivalenceProperties::new(schema),
@@ -247,6 +259,44 @@ impl StreamingDataUpdateExecutionPlan {
                 Boundedness::Bounded,
             ),
         }
+    }
+
+    pub fn set_stream(
+        &self,
+        record_batch_stream: SendableRecordBatchStream,
+    ) -> DataFusionResult<()> {
+        let stream_schema = record_batch_stream.schema();
+        if stream_schema.as_ref() != self.schema.as_ref() {
+            return Err(DataFusionError::Execution(format!(
+                "StreamingDataUpdateExecutionPlan stream schema mismatch: expected {:?}, got {:?}",
+                self.schema, stream_schema
+            )));
+        }
+
+        let mut stream = self.record_batch_stream.try_lock().map_err(|e| {
+            DataFusionError::Execution(format!(
+                "StreamingDataUpdateExecutionPlan is already executing: {e}"
+            ))
+        })?;
+
+        if stream.is_some() {
+            return Err(DataFusionError::Execution(
+                "StreamingDataUpdateExecutionPlan stream has not been consumed".to_string(),
+            ));
+        }
+
+        *stream = Some(record_batch_stream);
+        Ok(())
+    }
+
+    pub fn clear_stream(&self) -> DataFusionResult<()> {
+        let mut stream = self.record_batch_stream.try_lock().map_err(|e| {
+            DataFusionError::Execution(format!(
+                "StreamingDataUpdateExecutionPlan is already executing: {e}"
+            ))
+        })?;
+        stream.take();
+        Ok(())
     }
 }
 
