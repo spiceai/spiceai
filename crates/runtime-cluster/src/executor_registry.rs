@@ -138,7 +138,7 @@ impl DdlLog {
 
     /// Returns all statements appended after `since_version`.
     fn statements_since(&self, since_version: u64) -> &[String] {
-        let idx = since_version as usize;
+        let idx = usize::try_from(since_version).unwrap_or(usize::MAX);
         if idx >= self.statements.len() {
             &[]
         } else {

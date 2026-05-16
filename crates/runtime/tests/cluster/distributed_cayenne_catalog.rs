@@ -2100,7 +2100,7 @@ async fn test_distributed_cayenne_late_join_ddl_replay() -> Result<(), anyhow::E
                         id BIGINT NOT NULL,
                         name VARCHAR NOT NULL,
                         PRIMARY KEY (id)
-                    )",
+                    ) PARTITION BY id",
                 )
                 .await?;
 
