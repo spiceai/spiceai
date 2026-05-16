@@ -597,6 +597,7 @@ datasets:
         cayenne_cayenne_target_file_size_mb: '128'
         cayenne_sort_columns: id,timestamp
         cayenne_compression_strategy: zstd
+        cayenne_pk_conflict_detection: none
 
   # ---------------------------------------------------------------------------
   # S3 connector (full params)

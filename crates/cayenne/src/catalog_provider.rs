@@ -37,7 +37,7 @@ use parking_lot::RwLock;
 use snafu::prelude::*;
 
 use crate::catalog::CatalogError;
-use crate::metadata::{CompressionStrategy, VortexConfig};
+use crate::metadata::{CompressionStrategy, PkConflictDetection, VortexConfig};
 use crate::{CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog};
 
 /// Configuration for constructing a [`CayenneCatalogProvider`].
@@ -73,6 +73,8 @@ pub struct CayenneCatalogProviderConfig {
     pub inline_memtable_max_segments: Option<i64>,
     /// Maximum inline memtable IPC bytes before checkpointing to Vortex.
     pub inline_memtable_max_bytes: Option<i64>,
+    /// Primary-key conflict detection behavior for inserts.
+    pub pk_conflict_detection: Option<PkConflictDetection>,
 }
 
 /// Errors that can occur when interacting with a Cayenne catalog.
@@ -295,6 +297,9 @@ impl CayenneCatalogProvider {
         }
         if let Some(v) = provider_config.inline_memtable_max_bytes {
             config.inline_memtable_max_bytes = v.max(0);
+        }
+        if let Some(v) = provider_config.pk_conflict_detection {
+            config.pk_conflict_detection = v;
         }
         config
     }

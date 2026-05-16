@@ -32,7 +32,8 @@ use super::mutation_writer::AppendMutationWriter;
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use crate::metadata::{
-    CreateTableOptions, InlinedData, InlinedDataStats, TableMetadata, TableStatistics,
+    CreateTableOptions, InlinedData, InlinedDataStats, PkConflictDetection, TableMetadata,
+    TableStatistics,
 };
 use crate::provider::scan::{CayenneAccelerationExec, round_robin_repartition_if_needed};
 use crate::provider::sink::CayenneDataSink;
@@ -3249,6 +3250,8 @@ impl CayenneTableProvider {
     /// 3. Returns a prepared stream with conflicts resolved and deletion specs
     ///
     /// If no primary key is configured, returns the stream unchanged with empty deletion specs.
+    /// If `pk_conflict_detection` is `none`, returns the stream unchanged and trusts the source
+    /// to enforce PK uniqueness; no existing data is scanned.
     pub(crate) async fn prepare_stream_for_insert(
         &self,
         stream: SendableRecordBatchStream,
@@ -3259,6 +3262,17 @@ impl CayenneTableProvider {
                 on_conflict_deletions: OnConflictDeletions::default(),
             });
         };
+
+        if self.context.pk_conflict_detection() == PkConflictDetection::None {
+            tracing::trace!(
+                table = %self.table_metadata.table_name,
+                "Skipping Cayenne primary-key conflict detection for append"
+            );
+            return Ok(PreparedInsertStream {
+                stream,
+                on_conflict_deletions: OnConflictDeletions::default(),
+            });
+        }
 
         let converter = self.build_pk_converter(&pk_indices)?;
         let mut existing_keys = self.load_existing_keyset(&pk_indices, &converter).await?;

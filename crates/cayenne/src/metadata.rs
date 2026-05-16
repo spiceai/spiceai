@@ -248,6 +248,38 @@ pub enum CompressionStrategy {
     Zstd,
 }
 
+/// Primary-key conflict detection behavior for Cayenne inserts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PkConflictDetection {
+    /// Build a PK keyset and apply configured `on_conflict` behavior.
+    #[default]
+    Auto,
+    /// Append without scanning existing PKs. The source must enforce PK uniqueness.
+    None,
+}
+
+impl PkConflictDetection {
+    /// Parse a spicepod parameter value.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    /// Return the spicepod/config string for this mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::None => "none",
+        }
+    }
+}
+
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VortexConfig {
@@ -332,6 +364,10 @@ pub struct VortexConfig {
     /// Maximum inline memtable IPC bytes before checkpointing inline data to Vortex.
     #[serde(default = "default_inline_memtable_max_bytes")]
     pub inline_memtable_max_bytes: i64,
+    /// Whether inserts should scan existing data for primary-key conflicts.
+    /// Set to `none` only when the source enforces PK uniqueness.
+    #[serde(default)]
+    pub pk_conflict_detection: PkConflictDetection,
 }
 
 fn default_concurrency() -> usize {
@@ -405,13 +441,14 @@ impl Default for VortexConfig {
             inline_memtable_max_rows: default_inline_memtable_max_rows(),
             inline_memtable_max_segments: default_inline_memtable_max_segments(),
             inline_memtable_max_bytes: default_inline_memtable_max_bytes(),
+            pk_conflict_detection: PkConflictDetection::default(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::VortexConfig;
+    use super::{PkConflictDetection, VortexConfig};
 
     #[test]
     fn test_concurrency_defaults_use_available_parallelism_where_global() {
@@ -421,6 +458,27 @@ mod tests {
 
         assert_eq!(config.upload_concurrency, available_parallelism);
         assert_eq!(config.write_concurrency, None);
+        assert_eq!(config.pk_conflict_detection, PkConflictDetection::Auto);
+    }
+
+    #[test]
+    fn test_vortex_config_deserializes_pk_conflict_detection_default() {
+        let config: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
+
+        assert_eq!(config.pk_conflict_detection, PkConflictDetection::Auto);
+    }
+
+    #[test]
+    fn test_pk_conflict_detection_parse() {
+        assert_eq!(
+            PkConflictDetection::parse("auto"),
+            Some(PkConflictDetection::Auto)
+        );
+        assert_eq!(
+            PkConflictDetection::parse("none"),
+            Some(PkConflictDetection::None)
+        );
+        assert_eq!(PkConflictDetection::parse("invalid"), None);
     }
 }
 

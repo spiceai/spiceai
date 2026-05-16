@@ -19,7 +19,7 @@ limitations under the License.
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use super::metadata::{
     CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    PartitionMetadata, TableMetadata, TableStatistics,
+    PartitionMetadata, PkConflictDetection, TableMetadata, TableStatistics,
 };
 use super::metastore::sqlite::SqliteMetastore;
 #[cfg(feature = "turso")]
@@ -29,6 +29,7 @@ use super::metastore::{
     QueryParams, QueryRowParams,
 };
 use async_trait::async_trait;
+use datafusion_table_providers::util::on_conflict::OnConflict;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -504,6 +505,8 @@ impl MetadataCatalog for CayenneCatalog {
     async fn create_table(&self, options: CreateTableOptions) -> CatalogResult<String> {
         let table_name = options.table_name.clone();
         let base_path = options.base_path.clone();
+
+        validate_create_table_options(&options)?;
 
         // Check if table already exists first (read-only check)
         let existing_table_id: Option<String> = self
@@ -2232,6 +2235,23 @@ fn configuration_matches(stored: &TableMetadata, options: &CreateTableOptions) -
     }
 
     true
+}
+
+fn validate_create_table_options(options: &CreateTableOptions) -> CatalogResult<()> {
+    if matches!(
+        options.vortex_config.pk_conflict_detection,
+        PkConflictDetection::None
+    ) && matches!(options.on_conflict, Some(OnConflict::Upsert(_)))
+    {
+        return Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "cayenne_pk_conflict_detection=none cannot be combined with on_conflict=upsert on table {}: upsert requires conflict detection. Either remove on_conflict or set pk_conflict_detection=auto.",
+                options.table_name
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 /// Logs a warning describing exactly which configuration fields differ between the

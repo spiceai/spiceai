@@ -447,6 +447,19 @@ impl CayenneAccelerator {
                 }
             }
 
+            if let Some((key, value)) = ["cayenne_pk_conflict_detection", "pk_conflict_detection"]
+                .iter()
+                .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
+            {
+                if let Some(mode) = cayenne::metadata::PkConflictDetection::parse(value) {
+                    config.pk_conflict_detection = mode;
+                } else {
+                    tracing::warn!(
+                        "Dataset '{table_name}' contains an invalid `{key}` value: '{value}'. Expected one of: auto, none. Defaulting to auto."
+                    );
+                }
+            }
+
             // Parse sort columns
             if let Some(sort_cols_str) = acceleration
                 .params
@@ -562,7 +575,7 @@ impl CayenneAccelerator {
             }
 
             tracing::debug!(
-                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, compaction_trigger_files={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_memtable_max_rows={}, inline_memtable_max_segments={}, inline_memtable_max_bytes={}",
+                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, pk_conflict_detection={}, compaction_trigger_files={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_memtable_max_rows={}, inline_memtable_max_segments={}, inline_memtable_max_bytes={}",
                 config.footer_cache_mb,
                 config.segment_cache_mb,
                 config.target_vortex_file_size_mb,
@@ -570,6 +583,7 @@ impl CayenneAccelerator {
                 config.write_concurrency,
                 config.sort_columns,
                 config.compression_strategy,
+                config.pk_conflict_detection.as_str(),
                 config.compaction_trigger_files,
                 config.compaction_max_levels,
                 config.compaction_max_files_per_pick,
@@ -870,8 +884,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    22,
-    { S3_PARAMS_LEN + 22 },
+    23,
+    { S3_PARAMS_LEN + 23 },
 >(
     S3_PARAMETERS,
     [
@@ -903,6 +917,10 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Compression strategy to use for Vortex files. Options: 'btrblocks' (default), 'zstd'")
             .one_of(&["btrblocks", "zstd"])
             .default("btrblocks"),
+        ParameterSpec::component("pk_conflict_detection")
+            .description("Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts and applies on_conflict behavior. 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness, such as append-only CDC from a primary-key constrained source.")
+            .one_of(&["auto", "none"])
+            .default("auto"),
         ParameterSpec::component("upload_concurrency")
             .description("Maximum number of concurrent file uploads when writing multiple Vortex files. Defaults to available CPU parallelism."),
         ParameterSpec::component("write_concurrency")
@@ -2463,6 +2481,10 @@ mod tests {
                     "cayenne_inline_memtable_max_bytes".to_string(),
                     "2097152".to_string(),
                 ),
+                (
+                    "cayenne_pk_conflict_detection".to_string(),
+                    "none".to_string(),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -2477,6 +2499,10 @@ mod tests {
         assert_eq!(config.inline_memtable_max_rows, 2_048);
         assert_eq!(config.inline_memtable_max_segments, 16);
         assert_eq!(config.inline_memtable_max_bytes, 2_097_152);
+        assert_eq!(
+            config.pk_conflict_detection,
+            cayenne::metadata::PkConflictDetection::None
+        );
     }
 
     #[test]

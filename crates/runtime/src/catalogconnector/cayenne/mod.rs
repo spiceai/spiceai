@@ -54,6 +54,10 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("compression_strategy")
         .description("Compression: 'btrblocks' (default) or 'zstd'.")
         .default("btrblocks"),
+    ParameterSpec::component("pk_conflict_detection")
+        .description("Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts; 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness.")
+        .one_of(&["auto", "none"])
+        .default("auto"),
     ParameterSpec::component("upload_concurrency")
         .description("Maximum number of concurrent file uploads when writing multiple Vortex files. Defaults to available CPU parallelism."),
     ParameterSpec::component("write_concurrency")
@@ -141,6 +145,12 @@ impl CayenneCatalogConnector {
                 "btrblocks" => Some(cayenne::metadata::CompressionStrategy::Btrblocks),
                 _ => None,
             });
+        let pk_conflict_detection = self
+            .params
+            .get("pk_conflict_detection")
+            .expose()
+            .ok()
+            .and_then(cayenne::metadata::PkConflictDetection::parse);
         let upload_concurrency = self
             .params
             .get("upload_concurrency")
@@ -203,6 +213,7 @@ impl CayenneCatalogConnector {
             segment_cache_mb,
             target_file_size_mb,
             compression_strategy,
+            pk_conflict_detection,
             upload_concurrency,
             write_concurrency,
             inline_max_rows,
@@ -281,6 +292,7 @@ mod tests {
         assert!(display_names.contains(&"cayenne_upload_concurrency".to_string()));
         assert!(display_names.contains(&"cayenne_write_concurrency".to_string()));
         assert!(display_names.contains(&"cayenne_inline_max_rows".to_string()));
+        assert!(display_names.contains(&"cayenne_pk_conflict_detection".to_string()));
         assert!(
             display_names
                 .iter()
@@ -314,6 +326,10 @@ mod tests {
                     "cayenne_inline_memtable_max_bytes".to_string(),
                     SecretString::new("2097152".to_string().into()),
                 ),
+                (
+                    "cayenne_pk_conflict_detection".to_string(),
+                    SecretString::new("none".to_string().into()),
+                ),
             ],
             PREFIX,
             Arc::new(RwLock::new(Secrets::new())),
@@ -330,5 +346,9 @@ mod tests {
         assert_eq!(config.write_concurrency, Some(8));
         assert_eq!(config.inline_max_rows, Some(0));
         assert_eq!(config.inline_memtable_max_bytes, Some(2_097_152));
+        assert_eq!(
+            config.pk_conflict_detection,
+            Some(cayenne::metadata::PkConflictDetection::None)
+        );
     }
 }

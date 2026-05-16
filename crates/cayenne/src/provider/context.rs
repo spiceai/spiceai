@@ -24,7 +24,7 @@ use vortex::VortexSessionDefault;
 use vortex_datafusion::{VortexFormat, VortexTableOptions};
 use vortex_session::VortexSession;
 
-use crate::metadata::VortexConfig;
+use crate::metadata::{PkConflictDetection, VortexConfig};
 
 /// Shared context for Cayenne table operations.
 ///
@@ -163,6 +163,12 @@ impl CayenneContext {
     #[must_use]
     pub(crate) fn inline_memtable_max_bytes(&self) -> i64 {
         self.config.inline_memtable_max_bytes.max(0)
+    }
+
+    /// Primary-key conflict detection behavior for inserts.
+    #[must_use]
+    pub(crate) fn pk_conflict_detection(&self) -> PkConflictDetection {
+        self.config.pk_conflict_detection
     }
 
     /// Build the compaction picker config from the underlying `VortexConfig`.
