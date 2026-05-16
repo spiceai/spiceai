@@ -228,6 +228,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::Operator;
+    use datafusion::logical_expr::utils::split_binary;
     use std::sync::Arc;
 
     fn make_single_row_batch(pk: i64, sk: &str) -> RecordBatch {
@@ -511,28 +512,12 @@ mod tests {
         assert!(pairs.contains(&(2, "b".to_string())));
     }
 
-    /// Recursively collects all leaf conditions from an OR tree
     fn collect_or_conditions(expr: &Expr) -> Vec<&Expr> {
-        match expr {
-            Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
-                let mut conditions = collect_or_conditions(&binary.left);
-                conditions.extend(collect_or_conditions(&binary.right));
-                conditions
-            }
-            _ => vec![expr],
-        }
+        split_binary(expr, Operator::Or)
     }
 
-    /// Recursively collects all leaf conditions from an AND tree
     fn collect_and_conditions(expr: &Expr) -> Vec<&Expr> {
-        match expr {
-            Expr::BinaryExpr(binary) if binary.op == Operator::And => {
-                let mut conditions = collect_and_conditions(&binary.left);
-                conditions.extend(collect_and_conditions(&binary.right));
-                conditions
-            }
-            _ => vec![expr],
-        }
+        split_binary(expr, Operator::And)
     }
 
     /// Checks if expression is `column_name = <something>`
