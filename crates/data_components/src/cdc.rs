@@ -80,6 +80,9 @@ pub enum StreamError {
     #[cfg(feature = "dynamodb")]
     /// Error from `DynamoDB`, such as failure during streaming or subscription.
     DynamoDB(crate::dynamodb::stream::StreamError),
+    #[cfg(feature = "mongodb")]
+    /// Error from `MongoDB`, such as failure during change stream processing.
+    MongoDB(crate::mongodb::stream::StreamError),
 }
 
 impl std::error::Error for StreamError {}
@@ -95,6 +98,8 @@ impl std::fmt::Display for StreamError {
             StreamError::External(e) => write!(f, "External error: {e}"),
             #[cfg(feature = "dynamodb")]
             StreamError::DynamoDB(e) => write!(f, "DynamoDB error: {e}"),
+            #[cfg(feature = "mongodb")]
+            StreamError::MongoDB(e) => write!(f, "MongoDB error: {e}"),
         }
     }
 }

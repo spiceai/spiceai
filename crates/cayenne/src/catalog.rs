@@ -21,8 +21,8 @@ limitations under the License.
 //! (`SQLite`, `PostgreSQL`, etc.).
 
 use super::metadata::{
-    CreateTableOptions, DeleteFile, InlinedData, InlinedDelete, PartitionMetadata, TableMetadata,
-    TableStatistics,
+    CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
+    PartitionMetadata, TableMetadata, TableStatistics,
 };
 use async_trait::async_trait;
 use snafu::Snafu;
@@ -380,11 +380,28 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get the total number of inlined rows for a table.
     async fn get_inlined_data_count(&self, table_id: &str) -> CatalogResult<i64>;
 
+    /// Get aggregate inline data size information for a table.
+    async fn get_inlined_data_stats(&self, table_id: &str) -> CatalogResult<InlinedDataStats>;
+
     /// Remove all inlined data for a table (called after checkpoint flushes to Vortex).
     async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()>;
 
     /// Add a small batch of delete identifiers inlined in the metastore.
     async fn add_inlined_delete(&self, delete: InlinedDelete) -> CatalogResult<String>;
+
+    /// Atomically rewrite existing inline data rows, remove emptied inline data rows,
+    /// and append new inline data rows.
+    ///
+    /// Inline mutations rewrite row-store metadata entries in place instead of adding
+    /// delete-marker side records. Newly appended inline data rows receive a fresh
+    /// sequence number when present; rewritten rows retain their original sequence.
+    async fn commit_inlined_mutation(
+        &self,
+        table_id: &str,
+        updated_data: Vec<InlinedData>,
+        deleted_inlined_ids: Vec<String>,
+        data: Vec<InlinedData>,
+    ) -> CatalogResult<()>;
 
     /// Get all inlined delete entries for a table.
     async fn get_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>>;

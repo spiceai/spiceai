@@ -109,6 +109,10 @@ impl TableProvider for UpsertDedupTableProvider {
         self.inner.table_type()
     }
 
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        self.inner.statistics()
+    }
+
     fn constraints(&self) -> Option<&Constraints> {
         if self.constraints.is_empty() {
             None
