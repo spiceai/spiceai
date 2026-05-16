@@ -2320,6 +2320,45 @@ mod tests {
     }
 
     #[test]
+    fn test_write_concurrency_is_resolved_per_dataset() {
+        let app = Arc::new(AppBuilder::new("test").build());
+
+        let mut hot_dataset = DatasetBuilder::try_new("hot".to_string(), "hot")
+            .expect("hot dataset builder")
+            .with_app(Arc::clone(&app))
+            .build()
+            .expect("hot dataset");
+        hot_dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            params: [("cayenne_write_concurrency".to_string(), "16".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+
+        let mut quiet_dataset = DatasetBuilder::try_new("quiet".to_string(), "quiet")
+            .expect("quiet dataset builder")
+            .with_app(app)
+            .build()
+            .expect("quiet dataset");
+        quiet_dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            params: [("cayenne_write_concurrency".to_string(), "2".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+
+        let hot = CayenneAccelerator::get_vortex_config("hot", &hot_dataset);
+        let quiet = CayenneAccelerator::get_vortex_config("quiet", &quiet_dataset);
+
+        assert_eq!(hot.write_concurrency, Some(16));
+        assert_eq!(quiet.write_concurrency, Some(2));
+    }
+
+    #[test]
     fn test_resolve_metadata_dir_trims_trailing_slash() {
         let acceleration = Acceleration {
             params: [(

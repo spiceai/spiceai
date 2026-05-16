@@ -212,12 +212,7 @@ impl<'a> AppendMutationWriter<'a> {
                     }
                     self.table.persist_table_stats(&stats_acc).await;
 
-                    if let Err(e) = self.table.maybe_compact_small_files().await {
-                        tracing::warn!(
-                            "Post-write compaction trigger failed for {}: {e}",
-                            self.table.table_name(),
-                        );
-                    }
+                    self.table.schedule_post_write_compaction();
 
                     return Ok(rows);
                 }
@@ -274,16 +269,7 @@ impl<'a> AppendMutationWriter<'a> {
 
         self.table.persist_table_stats(&write_stats_acc).await;
 
-        // Inline tiered compaction trigger for the non-inline write path. The
-        // call is best-effort: the write has already succeeded, so any
-        // compaction failure here is logged but never bubbled back to the
-        // writer. Skipped automatically when the picker finds no candidate.
-        if let Err(e) = self.table.maybe_compact_small_files().await {
-            tracing::warn!(
-                "Post-write compaction trigger failed for {}: {e}",
-                self.table.table_name(),
-            );
-        }
+        self.table.schedule_post_write_compaction();
 
         Ok(total_rows)
     }
@@ -336,16 +322,7 @@ impl<'a> AppendMutationWriter<'a> {
                 );
             }
 
-            // Inline tiered compaction trigger. Best-effort: when the inline
-            // memtable just flushed (above), a new Vortex file landed in the
-            // current snapshot, so check whether we should consolidate small
-            // files now while we're already touching the table.
-            if let Err(e) = self.table.maybe_compact_small_files().await {
-                tracing::warn!(
-                    "Inline compaction trigger failed for {}: {e}",
-                    self.table.table_name(),
-                );
-            }
+            self.table.schedule_post_write_compaction();
 
             return Ok(InlineMutationOutcome::Inlined(
                 u64::try_from(buffer.total_rows()).unwrap_or(u64::MAX),

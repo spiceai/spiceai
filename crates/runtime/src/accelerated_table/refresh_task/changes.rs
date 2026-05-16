@@ -61,6 +61,8 @@ struct ApplyContext<'a> {
     caching: Option<&'a Weak<Caching>>,
     ready_sender: Option<&'a Arc<Notify>>,
     initial_load_completed: &'a Arc<AtomicBool>,
+    write_ctx: &'a SessionContext,
+    write_session_state: &'a SessionState,
     pending_commit: &'a mut Option<tokio::task::JoinHandle<()>>,
     commit_timeout: Duration,
 }
@@ -361,6 +363,8 @@ impl RefreshTask {
         // the actual idle window in the original serial loop.
         let mut pending_commit: Option<tokio::task::JoinHandle<()>> = None;
         let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
 
         while let Some(first) = match carried_item.take() {
             Some(item) => Some(item),
@@ -404,6 +408,8 @@ impl RefreshTask {
                 caching: caching.as_ref(),
                 ready_sender: ready_sender.as_ref(),
                 initial_load_completed: &initial_load_completed,
+                write_ctx: &write_ctx,
+                write_session_state: &write_session_state,
                 pending_commit: &mut pending_commit,
                 commit_timeout: cdc_cfg.commit_timeout,
             };
@@ -580,7 +586,14 @@ impl RefreshTask {
             }
         };
 
-        match self.write_change(coalesced_batch).await {
+        match self
+            .write_change_with_context(
+                coalesced_batch,
+                context.write_ctx,
+                context.write_session_state,
+            )
+            .await
+        {
             Ok(write_result) => {
                 if any_ready {
                     context
@@ -664,11 +677,21 @@ impl RefreshTask {
         &self,
         change_batch: ChangeBatch,
     ) -> crate::accelerated_table::Result<WriteChangeResult> {
+        let ctx = SessionContext::new();
+        let session_state = ctx.state();
+        self.write_change_with_context(change_batch, &ctx, &session_state)
+            .await
+    }
+
+    async fn write_change_with_context(
+        &self,
+        change_batch: ChangeBatch,
+        ctx: &SessionContext,
+        session_state: &SessionState,
+    ) -> crate::accelerated_table::Result<WriteChangeResult> {
         let dataset_name = self.dataset_name.clone();
 
         let sub_batches = group_into_sub_batches(&change_batch);
-        let ctx = SessionContext::new();
-        let session_state = ctx.state();
 
         tracing::trace!(
             "Processing append/change stream batch: dataset={}, rows={}, sub-batches={}",

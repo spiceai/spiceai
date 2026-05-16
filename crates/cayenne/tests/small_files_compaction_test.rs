@@ -176,14 +176,16 @@ async fn compaction_reduces_file_count_after_n_small_appends(
     .await;
 
     // 20 small batches above INLINE_MAX_ROWS (1024) so each lands as a Vortex
-    // file. Without compaction we'd expect ~20 files. With inline compaction
-    // firing after each write past the trigger threshold, file count drops
-    // monotonically as small files get merged into larger ones.
+    // file. The production write path schedules compaction off the append hot
+    // path; this test drives the trigger explicitly after each write so the
+    // file-count assertion remains deterministic with the background scheduler
+    // disabled.
     let batch_rows: i64 = 1500;
     for batch_idx in 0..20_i64 {
         let start = batch_idx * batch_rows;
         let batch = make_batch(&schema, start, batch_rows);
         common::insert_batch(&table, batch).await?;
+        let _ = run_compaction(&table).await;
     }
 
     // Read the current snapshot id off the provider — compactions advance it.

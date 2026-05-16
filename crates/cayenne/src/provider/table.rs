@@ -781,6 +781,10 @@ pub struct CayenneTableProvider {
     /// per-table write lock continues to serialize ordinary inserts
     /// independently.
     compaction_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Coalesces write-driven compaction notifications so a high-ingest table
+    /// does not spawn one background compaction task per append while a prior
+    /// notification is still pending.
+    post_write_compaction_scheduled: Arc<AtomicBool>,
     /// Per-table background compaction task, populated by
     /// [`Self::spawn_background_compaction`]. Held by `Arc<OnceLock<…>>` so it
     /// survives [`Self::clone_for_write`] and shares its drop signal across
@@ -2130,6 +2134,7 @@ impl CayenneTableProvider {
             staging_may_have_files: Arc::new(AtomicBool::new(true)),
             new_files_since_last_compaction: Arc::new(AtomicUsize::new(0)),
             compaction_lock: Arc::new(tokio::sync::Mutex::new(())),
+            post_write_compaction_scheduled: Arc::new(AtomicBool::new(false)),
             background_compactor: Arc::new(std::sync::OnceLock::new()),
         };
 
@@ -2547,6 +2552,7 @@ impl CayenneTableProvider {
             // Shared so inline (write-driven) and background compaction
             // attempts on the same table coordinate, even across clones.
             compaction_lock: Arc::clone(&self.compaction_lock),
+            post_write_compaction_scheduled: Arc::clone(&self.post_write_compaction_scheduled),
             background_compactor: Arc::clone(&self.background_compactor),
         }
     }
@@ -4034,6 +4040,45 @@ impl CayenneTableProvider {
         }
 
         Ok(total_passes > 0)
+    }
+
+    pub(crate) fn schedule_post_write_compaction(&self) {
+        let cfg = self.context.compaction_picker_config();
+        if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files {
+            return;
+        }
+
+        if self
+            .post_write_compaction_scheduled
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+
+        let table = self.clone_for_write();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let result = super::compaction::CompactionRunner::run_compaction_trigger(&table).await;
+            table
+                .post_write_compaction_scheduled
+                .store(false, Ordering::Release);
+
+            match result {
+                Ok(true) => {
+                    tracing::debug!(
+                        table = table.table_metadata.table_name.as_str(),
+                        "Post-write compaction pass completed"
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        table = table.table_metadata.table_name.as_str(),
+                        "Post-write compaction trigger failed: {e}"
+                    );
+                }
+            }
+        });
     }
 
     /// Single compaction pass — list, pick, rewrite.
