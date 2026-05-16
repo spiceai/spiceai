@@ -165,7 +165,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let staleness_result = staleness_handle.await;
 
     // Skip row count consistency validation — OLTP mutations cause row counts to vary between iterations.
-    let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Benchmark)?;
+    let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Htap)?;
     let test_succeeded = test.succeeded();
     let mut spiced_instance = test.end()?;
     let (max_memory, median_memory) = observe_memory(memory_token, memory_readings).await?;
