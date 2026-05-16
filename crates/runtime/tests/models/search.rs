@@ -291,7 +291,7 @@ fn assert_search_response_snapshot(test_name: &str, resp: Value, round_scores: b
         // across a two-decimal rounding boundary. Use structural validation instead of
         // exact snapshot comparison for these tests.
         name if use_structural_search_response_validation(name) => {
-            assert_search_response_structure(name, resp);
+            assert_search_response_structure(name, &resp);
         }
         _ => {
             insta::assert_snapshot!(
@@ -312,7 +312,7 @@ fn use_structural_search_response_validation(test_name: &str) -> bool {
 
 /// Validate the structure and invariants of a search response without asserting exact item content.
 /// Used for S3 Vectors HTTP search tests where the result set is non-deterministic.
-fn assert_search_response_structure(test_name: &str, resp: Value) {
+fn assert_search_response_structure(test_name: &str, resp: &Value) {
     let results = resp
         .get("results")
         .and_then(|r| r.as_array())
@@ -355,10 +355,7 @@ fn assert_search_response_structure(test_name: &str, resp: Value) {
         );
 
         // Verify scores are in descending order and within [0, 1]
-        let score: f64 = result
-            .get("_score")
-            .and_then(|s| s.as_f64())
-            .unwrap_or(-1.0);
+        let score: f64 = result.get("_score").and_then(Value::as_f64).unwrap_or(-1.0);
         assert!(
             !score.is_nan(),
             "{test_name}: result[{i}] score should not be NaN"
@@ -396,7 +393,7 @@ fn assert_search_response_structure(test_name: &str, resp: Value) {
 fn structural_search_response_accepts_additional_columns_in_data() {
     assert_search_response_structure(
         "s3vectors_chunking_additional_columns",
-        json!({
+        &json!({
             "duration_ms": 1,
             "results": [
                 {"_score": 0.4, "data": {"question": "q1"}, "dataset": "qs", "matches": {"answer": ["a1"]}, "primary_key": {"id": 1}},
@@ -412,7 +409,7 @@ fn structural_search_response_accepts_additional_columns_in_data() {
 fn structural_search_response_accepts_additional_columns_in_primary_key() {
     assert_search_response_structure(
         "s3vectors_composite_additional_columns",
-        json!({
+        &json!({
             "duration_ms": 1,
             "results": [
                 {"_score": 0.4, "dataset": "qs", "matches": {"answer": ["a1"]}, "primary_key": {"id": 1, "question": "q1"}},
@@ -554,7 +551,7 @@ fn sql_response_normalization_picks_primary_score_key_deterministically() {
             .map(|row| {
                 let id = row
                     .get("id")
-                    .and_then(|x| x.as_i64())
+                    .and_then(Value::as_i64)
                     .expect("normalized row should contain integer id");
                 let s = row
                     .get("_score")
@@ -723,7 +720,7 @@ fn normalize_search_response(json: Value, round_scores: bool) -> String {
 /// decimal place for ordering and re-sorts rows by rounded score (descending)
 /// then by `id` (ascending). This absorbs the ±0.01 jitter that crosses
 /// `trunc` boundaries across CI runs with non-deterministic embeddings
-/// (model2vec / s3vectors / OpenAI).
+/// (`model2vec` / `s3vectors` / `OpenAI`).
 ///
 /// Returns the input unchanged when normalization does not apply — namely when
 /// `round_scores` is `false`, the response has no score column, the score
@@ -778,7 +775,7 @@ fn normalize_sql_response_for_snapshot(value: Value, round_scores: bool) -> Valu
 
     let scores: Vec<f64> = rows
         .iter()
-        .filter_map(|row| row.get(&primary_score_key).and_then(|v| v.as_f64()))
+        .filter_map(|row| row.get(&primary_score_key).and_then(Value::as_f64))
         .collect();
     if scores.is_empty() {
         return Value::Array(rows);
@@ -814,7 +811,7 @@ fn normalize_sql_response_for_snapshot(value: Value, round_scores: bool) -> Valu
                 continue;
             };
             for k in &score_keys {
-                if let Some(f) = obj.get(k).and_then(|v| v.as_f64()) {
+                if let Some(f) = obj.get(k).and_then(Value::as_f64) {
                     let rounded = (f * 10.0).round() / 10.0;
                     if let Some(num) = serde_json::Number::from_f64(rounded) {
                         obj.insert(k.clone(), Value::Number(num));
@@ -826,16 +823,16 @@ fn normalize_sql_response_for_snapshot(value: Value, round_scores: bool) -> Valu
         rows.sort_by(|a, b| {
             let sa = a
                 .get(&primary_score_key)
-                .and_then(|v| v.as_f64())
+                .and_then(Value::as_f64)
                 .unwrap_or(0.0);
             let sb = b
                 .get(&primary_score_key)
-                .and_then(|v| v.as_f64())
+                .and_then(Value::as_f64)
                 .unwrap_or(0.0);
             match sb.partial_cmp(&sa).unwrap_or(Ordering::Equal) {
                 Ordering::Equal => {
-                    let id_a = a.get("id").and_then(|v| v.as_i64()).unwrap_or(i64::MAX);
-                    let id_b = b.get("id").and_then(|v| v.as_i64()).unwrap_or(i64::MAX);
+                    let id_a = a.get("id").and_then(Value::as_i64).unwrap_or(i64::MAX);
+                    let id_b = b.get("id").and_then(Value::as_i64).unwrap_or(i64::MAX);
                     id_a.cmp(&id_b)
                 }
                 order => order,
@@ -848,7 +845,7 @@ fn normalize_sql_response_for_snapshot(value: Value, round_scores: bool) -> Valu
             continue;
         };
         for k in &score_keys {
-            if obj.get(k).and_then(|v| v.as_f64()).is_some() {
+            if obj.get(k).and_then(Value::as_f64).is_some() {
                 obj.insert(k.clone(), Value::String("[score]".to_string()));
             }
         }
@@ -866,7 +863,7 @@ fn score_key_priority(key: &str) -> (u8, &str) {
     (bucket, key)
 }
 
-/// Parse the precision argument out of a DataFusion `trunc(<expr>, Int64(N))`
+/// Parse the precision argument out of a `DataFusion` `trunc(<expr>, Int64(N))`
 /// or `trunc(<expr>, N)` column name. Returns `None` for any other column
 /// shape (including aliased columns like `_score`).
 fn parse_trunc_precision(col_name: &str) -> Option<usize> {
