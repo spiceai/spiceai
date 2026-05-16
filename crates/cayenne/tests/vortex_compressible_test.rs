@@ -14,8 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![allow(clippy::expect_used)]
-#![allow(clippy::clone_on_ref_ptr)]
+#![expect(
+    clippy::expect_used,
+    reason = "test code uses .expect() for i32 conversion"
+)]
 
 //! Test for Cayenne support of highly compressed Vortex data.
 //!
@@ -25,7 +27,7 @@ limitations under the License.
 //! single low-cardinality grouping key.
 //!
 //! Writes such data through the full Cayenne write + read path and runs a
-//! `GROUP BY` aggregation — which triggers DataFusion file re-partitioning —
+//! `GROUP BY` aggregation — which triggers `DataFusion` file re-partitioning —
 //! to verify correctness.
 
 mod common;
@@ -47,7 +49,7 @@ test_with_backends!(test_vortex_highly_compressible_data_impl);
 /// Validates support for highly compressed Vortex data where the file size is
 /// smaller than the row count (sub-1-byte-per-row). Writes a schema with a
 /// single non-null grouping column and all-NULL nullable columns into Cayenne,
-/// then runs a `GROUP BY` query that forces DataFusion to re-partition the
+/// then runs a `GROUP BY` query that forces `DataFusion` to re-partition the
 /// Vortex file.
 async fn test_vortex_highly_compressible_data_impl(
     fixture: common::TestFixture,
@@ -88,7 +90,9 @@ async fn test_vortex_highly_compressible_data_impl(
     // - all other columns are NULL → extreme compression
     let num_rows: usize = 200_000;
 
-    let org_ids: Int32Array = (0..num_rows).map(|i| (i % 3 + 1) as i32).collect();
+    let org_ids: Int32Array = (0..num_rows)
+        .map(|i| i32::try_from(i % 3 + 1).expect("value fits in i32"))
+        .collect();
 
     // Build NULL arrays for each nullable column type.
     let null_view: Arc<dyn arrow::array::Array> = {
