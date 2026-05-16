@@ -591,10 +591,25 @@ impl<'a> AppendMutationWriter<'a> {
         let staged_append = CayenneStagedAppend::from_staged_append_in(
             self.table.clone_for_write_operations(),
             write_guard,
-            staging_snapshot_id,
+            staging_snapshot_id.clone(),
             rows,
         );
-        let prepared_append = staged_append.prepare().await?;
+        let prepared_append = match staged_append.prepare().await {
+            Ok(prepared_append) => prepared_append,
+            Err(e) => {
+                if let Err(cleanup_err) = self
+                    .table
+                    .clear_staging_snapshot_dir(&staging_snapshot_id)
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to clean staging dir after WAL prepare error for table {}: {cleanup_err}",
+                        self.table.table_name(),
+                    );
+                }
+                return Err(e);
+            }
+        };
 
         Ok((rows, writer_ops, stats_acc, prepared_append))
     }

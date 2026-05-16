@@ -1141,16 +1141,57 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Read the staging WAL from local filesystem, if present.
-    /// Returns the WAL data and the absolute path to the WAL file.
-    async fn read_staging_wal_local(&self) -> Result<Option<(StagingWal, String)>> {
-        let staging_dir =
+    async fn read_staging_wals(&self) -> Result<Vec<LocatedStagingWal>> {
+        if self.table_path().starts_with("s3://") {
+            self.read_staging_wals_s3().await
+        } else {
+            self.read_staging_wals_local().await
+        }
+    }
+
+    async fn read_staging_wals_local(&self) -> Result<Vec<LocatedStagingWal>> {
+        let mut wals = Vec::new();
+        if let Some(wal) = self.read_staging_wal_local_at(STAGING_DIR_NAME).await? {
+            wals.push(wal);
+        }
+
+        let staging_root =
             Self::snapshot_dir_path(self.table_path(), self.table_id(), STAGING_DIR_NAME);
+        let mut entries = match tokio::fs::read_dir(&staging_root).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(wals),
+            Err(e) => return Err(Error::IoError { source: e }),
+        };
+
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let child = entry.file_name().to_string_lossy().to_string();
+            let staging_snapshot_id = format!("{STAGING_DIR_NAME}/{child}");
+            if let Some(wal) = self.read_staging_wal_local_at(&staging_snapshot_id).await? {
+                wals.push(wal);
+            }
+        }
+
+        Ok(wals)
+    }
+
+    async fn read_staging_wal_local_at(
+        &self,
+        staging_snapshot_id: &str,
+    ) -> Result<Option<LocatedStagingWal>> {
+        let staging_dir =
+            Self::snapshot_dir_path(self.table_path(), self.table_id(), staging_snapshot_id);
         let wal_path = staging_dir.join(STAGING_WAL_FILENAME);
         let location = wal_path.to_string_lossy().to_string();
         match tokio::fs::read_to_string(&wal_path).await {
             Ok(content) => match serde_json::from_str::<StagingWal>(&content) {
-                Ok(wal) => Ok(Some((wal, location))),
+                Ok(wal) => Ok(Some(LocatedStagingWal {
+                    staging_snapshot_id: staging_snapshot_id.to_string(),
+                    wal,
+                    location,
+                })),
                 Err(e) => Err(Error::IncompleteWrite {
                     table: self.table_name().to_string(),
                     message: format!(
@@ -1163,39 +1204,67 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Read the staging WAL from S3, if present.
-    /// Returns the WAL data and the S3 key of the WAL file.
-    async fn read_staging_wal_s3(&self) -> Result<Option<(StagingWal, String)>> {
+    async fn read_staging_wals_s3(&self) -> Result<Vec<LocatedStagingWal>> {
         let config = self.require_object_store()?;
         let Some(staging_prefix) = self.snapshot_object_store_prefix(STAGING_DIR_NAME)? else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
-        let wal_key =
-            ObjectStorePath::from(format!("{}{STAGING_WAL_FILENAME}", staging_prefix.as_ref()));
-        let location = wal_key.to_string();
-        match config.store.get(&wal_key).await {
-            Ok(result) => {
-                let bytes = result.bytes().await.map_err(|e| Error::ObjectStore {
-                    operation: "read staging WAL",
-                    table: self.table_name().to_string(),
-                    source: e,
-                })?;
-                let wal = serde_json::from_slice::<StagingWal>(&bytes).map_err(|e| {
-                    Error::IncompleteWrite {
+        let objects: Vec<_> = config
+            .store
+            .list(Some(&staging_prefix))
+            .try_collect()
+            .await
+            .map_err(|e| Error::ObjectStore {
+                operation: "list staging WALs",
+                table: self.table_name().to_string(),
+                source: e,
+            })?;
+
+        let mut wals = Vec::new();
+        for meta in objects {
+            let Some(relative) = meta.location.as_ref().strip_prefix(staging_prefix.as_ref())
+            else {
+                continue;
+            };
+            let staging_snapshot_id = if relative == STAGING_WAL_FILENAME {
+                STAGING_DIR_NAME.to_string()
+            } else if let Some(child) = relative.strip_suffix(&format!("/{STAGING_WAL_FILENAME}")) {
+                format!("{STAGING_DIR_NAME}/{child}")
+            } else {
+                continue;
+            };
+
+            let location = meta.location.to_string();
+            let result =
+                config
+                    .store
+                    .get(&meta.location)
+                    .await
+                    .map_err(|e| Error::ObjectStore {
+                        operation: "read staging WAL",
                         table: self.table_name().to_string(),
-                        message: format!(
-                            "Found unreadable staging WAL at '{location}': {e}. Refusing writes to avoid ignoring a possibly committed staged append. Manual resolution is required."
-                        ),
-                    }
-                })?;
-                Ok(Some((wal, location)))
-            }
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(Error::ObjectStore {
+                        source: e,
+                    })?;
+            let bytes = result.bytes().await.map_err(|e| Error::ObjectStore {
                 operation: "read staging WAL",
                 table: self.table_name().to_string(),
                 source: e,
-            }),
+            })?;
+            let wal = serde_json::from_slice::<StagingWal>(&bytes).map_err(|e| {
+                Error::IncompleteWrite {
+                    table: self.table_name().to_string(),
+                    message: format!(
+                        "Found unreadable staging WAL at '{location}': {e}. Refusing writes to avoid ignoring a possibly committed staged append. Manual resolution is required."
+                    ),
+                }
+            })?;
+            wals.push(LocatedStagingWal {
+                staging_snapshot_id,
+                wal,
+                location,
+            });
         }
+
+        Ok(wals)
     }
 }

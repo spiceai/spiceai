@@ -26,6 +26,7 @@ mod common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -75,6 +76,56 @@ async fn test_staged_append_basic_impl(
     );
 
     assert_staging_empty(&staging_dir(&table));
+
+    Ok(())
+}
+
+test_with_backends!(test_cdc_stage_a_does_not_wait_for_prior_finalize_impl);
+
+async fn test_cdc_stage_a_does_not_wait_for_prior_finalize_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vortex_config = cayenne::metadata::VortexConfig {
+        inline_max_rows: 0,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    let (table, ctx) =
+        setup_table_with_vortex_config(&fixture, "cdc_stage_a_overlap", vortex_config).await;
+    let task_ctx = ctx.task_ctx();
+
+    let first = table
+        .write_cdc_append_stream(batch_stream(make_batch(&[1, 2], &["A", "B"])), &task_ctx)
+        .await?;
+    assert!(
+        first.has_pending_finalize(),
+        "first CDC write should return after Stage A with Stage B pending"
+    );
+
+    let second = tokio::time::timeout(
+        Duration::from_secs(2),
+        table.write_cdc_append_stream(batch_stream(make_batch(&[3, 4], &["C", "D"])), &task_ctx),
+    )
+    .await
+    .expect("second Stage A should not wait for first Stage B")?;
+    assert!(
+        second.has_pending_finalize(),
+        "second CDC write should also stage before finalizing"
+    );
+
+    first.finish().await?;
+    second.finish().await?;
+
+    let rows = query_all(&ctx, "cdc_stage_a_overlap").await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "A".to_string()),
+            (2, "B".to_string()),
+            (3, "C".to_string()),
+            (4, "D".to_string()),
+        ]
+    );
 
     Ok(())
 }
@@ -1256,12 +1307,16 @@ async fn begin_staged_append_with_batch(
     table: &CayenneTableProvider,
     batch: RecordBatch,
 ) -> Result<CayenneStagedAppend, Box<dyn std::error::Error>> {
+    let stream = batch_stream(batch);
+    Ok(table.begin_staged_append(stream, 1).await?)
+}
+
+fn batch_stream(batch: RecordBatch) -> SendableRecordBatchStream {
     let schema = batch.schema();
-    let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+    Box::pin(RecordBatchStreamAdapter::new(
         schema,
         futures::stream::iter(vec![Ok::<_, DataFusionError>(batch)]),
-    ));
-    Ok(table.begin_staged_append(stream, 1).await?)
+    ))
 }
 
 /// Drive `CayenneTableProvider::begin_staged_append` with a fixed-shape batch
@@ -1274,10 +1329,6 @@ async fn begin_staged_append_with_rows(
     let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
     let names: Vec<&str> = rows.iter().map(|(_, name)| *name).collect();
     let batch = make_batch(&ids, &names);
-    let schema = batch.schema();
-    let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-        schema,
-        futures::stream::iter(vec![Ok::<_, DataFusionError>(batch)]),
-    ));
+    let stream = batch_stream(batch);
     Ok(table.begin_staged_append(stream, 1).await?)
 }
