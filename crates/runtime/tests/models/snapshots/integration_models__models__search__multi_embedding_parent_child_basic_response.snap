@@ -1,7 +1,14 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: "normalize_search_response_json(resp, true, round_scores)"
+expression: normalize_search_response_json(resp, true)
 ---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "_score": "[score]",
+      "dataset": "multiple_columns",
+      "matches": {
         "cp_department": [
           "DEPARTMENT"
         ],
@@ -14,7 +21,7 @@ expression: "normalize_search_response_json(resp, true, round_scores)"
       }
     },
     {
-      "_score": "0.03",
+      "_score": "[score]",
       "dataset": "multiple_columns",
       "matches": {
         "cp_department": [

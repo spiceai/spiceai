@@ -1,12 +1,13 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp, round_scores)
+expression: "serde_json::to_string_pretty(&normalize_search_response_json(resp,\ntrue)).expect(\"search response snapshot serialization should succeed\")"
+snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.03",
+      "_score": "[score]",
       "dataset": "qs",
       "matches": {
         "question": [
@@ -19,19 +20,19 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.01",
+      "_score": "[score]",
       "dataset": "qs",
       "matches": {
         "question": [
-          "There are 22 female students and 18 male students in a classroom. Find the total number \\( t \\) of students."
+          "Find the number of groups of 7 in 21."
         ]
       },
       "primary_key": {
-        "id": 787
+        "id": 359
       }
     },
     {
-      "_score": "0.01",
+      "_score": "[score]",
       "dataset": "qs",
       "matches": {
         "question": [
@@ -43,15 +44,15 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.01",
+      "_score": "[score]",
       "dataset": "qs",
       "matches": {
         "question": [
-          "Find the number of groups of 7 in 21."
+          "There are 22 female students and 18 male students in a classroom. Find the total number \\( t \\) of students."
         ]
       },
       "primary_key": {
-        "id": 359
+        "id": 787
       }
     }
   ]

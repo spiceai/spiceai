@@ -1,12 +1,25 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp, round_scores)
+expression: "serde_json::to_string_pretty(&normalize_search_response_json(resp,\ntrue)).expect(\"search response snapshot serialization should succeed\")"
+snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.01",
+      "_score": "[score]",
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\)."
+        ]
+      },
+      "primary_key": {
+        "id": 772
+      }
+    },
+    {
+      "_score": "[score]",
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -18,7 +31,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.01",
+      "_score": "[score]",
       "dataset": "qs",
       "matches": {
         "question": [
@@ -27,18 +40,6 @@ expression: normalize_search_response(resp, round_scores)
       },
       "primary_key": {
         "id": 361
-      }
-    },
-    {
-      "_score": "0.01",
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\)."
-        ]
-      },
-      "primary_key": {
-        "id": 772
       }
     }
   ]

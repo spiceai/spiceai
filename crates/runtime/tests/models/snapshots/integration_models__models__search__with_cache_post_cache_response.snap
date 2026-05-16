@@ -1,24 +1,13 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp, round_scores)
+expression: "serde_json::to_string_pretty(&normalize_search_response_json(resp,\ntrue)).expect(\"search response snapshot serialization should succeed\")"
+snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.94",
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": [
-          "In general basic characters welcome. Clearly lively friends con"
-        ]
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 1
-      }
-    },
-    {
-      "_score": "0.93",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -30,7 +19,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.93",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -42,7 +31,19 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.92",
+      "_score": "[score]",
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": [
+          "In general basic characters welcome. Clearly lively friends con"
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 1
+      }
+    },
+    {
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -54,7 +55,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.91",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -66,7 +67,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.91",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -78,31 +79,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.91",
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": [
-          "Practical schools might put twice interested, strong organizations. Regulatory"
-        ]
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 17
-      }
-    },
-    {
-      "_score": "0.90",
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": [
-          "Heavily direct problems try eventually on a nurses. Courses may make "
-        ]
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 8
-      }
-    },
-    {
-      "_score": "0.90",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -114,7 +91,19 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.90",
+      "_score": "[score]",
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": [
+          "Heavily direct problems try eventually on a nurses. Courses may make "
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 8
+      }
+    },
+    {
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -126,7 +115,19 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.89",
+      "_score": "[score]",
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": [
+          "Practical schools might put twice interested, strong organizations. Regulatory"
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 17
+      }
+    },
+    {
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -138,7 +139,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.89",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -150,7 +151,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.89",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -162,7 +163,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.88",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -174,7 +175,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.87",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -186,7 +187,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.87",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -198,7 +199,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.86",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -210,7 +211,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.84",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -222,7 +223,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.82",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [

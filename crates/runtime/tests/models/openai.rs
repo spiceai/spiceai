@@ -231,7 +231,6 @@ mod search {
                 ),
             ],
             false,
-            false,
         )
         .await
     }
@@ -316,7 +315,6 @@ mod search {
                     })),
                 ),
             ],
-            false,
             false,
         )
         .await

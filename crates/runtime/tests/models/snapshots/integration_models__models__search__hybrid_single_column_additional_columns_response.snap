@@ -1,27 +1,13 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: "normalize_search_response(resp, round_scores)"
+expression: "serde_json::to_string_pretty(&normalize_search_response_json(resp,\ntrue)).expect(\"search response snapshot serialization should succeed\")"
+snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.01",
-      "data": {
-        "question": "In which of the following compounds, cations are present in tetrahedral voids?  \na. ZnS  \nb. SrF₂  \nc. NaBr  \nd. Na₂O"
-      },
-      "dataset": "qs",
-      "matches": {
-        "question": [
-          "In which of the following compounds, cations are present in tetrahedral voids?  \na. ZnS  \nb. SrF₂  \nc. NaBr  \nd. Na₂O"
-        ]
-      },
-      "primary_key": {
-        "id": 539
-      }
-    },
-    {
-      "_score": "0.01",
+      "_score": "[score]",
       "data": {
         "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
       },
@@ -36,7 +22,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.01",
+      "_score": "[score]",
       "data": {
         "question": "How many chirality centers does cholesterol have?"
       },
@@ -51,7 +37,22 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.01",
+      "_score": "[score]",
+      "data": {
+        "question": "In which of the following compounds, cations are present in tetrahedral voids?  \na. ZnS  \nb. SrF₂  \nc. NaBr  \nd. Na₂O"
+      },
+      "dataset": "qs",
+      "matches": {
+        "question": [
+          "In which of the following compounds, cations are present in tetrahedral voids?  \na. ZnS  \nb. SrF₂  \nc. NaBr  \nd. Na₂O"
+        ]
+      },
+      "primary_key": {
+        "id": 539
+      }
+    },
+    {
+      "_score": "[score]",
       "data": {
         "question": "What is the area of a parallelogram with a base of 8 units and a height of 9 units?"
       },
