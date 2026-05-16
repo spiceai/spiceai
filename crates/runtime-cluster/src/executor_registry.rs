@@ -350,6 +350,7 @@ impl ExecutorRegistry {
     /// one `FlightSQL` table provider per selected executor. The caller decides whether the
     /// table should actually be partitioned (e.g. `AcceleratedPartitionProvider` checks
     /// `AcceleratedTable` downcast in the runtime crate).
+    #[must_use]
     pub fn resolve_accelerated_partitions(
         &self,
         table: &TableReference,
