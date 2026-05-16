@@ -436,7 +436,7 @@ fn spawn_sighup_reload_task(control: std::sync::Arc<runtime::tls::TlsControl>) {
                     return;
                 }
             };
-            tracing::info!("TLS reload: SIGHUP handler installed");
+            tracing::debug!("TLS reload: SIGHUP handler installed");
             while sighup.recv().await.is_some() {
                 tracing::info!("TLS reload: SIGHUP received, reloading TLS material");
                 if let Err(err) = control.reload_all() {
