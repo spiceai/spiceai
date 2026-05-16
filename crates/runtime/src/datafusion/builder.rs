@@ -1244,11 +1244,11 @@ mod tests {
         );
         assert!(
             cayenne_filter_sharing_position < cayenne_anti_sort_merge_position,
-            "CayenneDynamicFilterSharing must run before CayenneAntiJoinSortMergeRewriter so anti joins can still receive shared scan filters"
+            "CayenneDynamicFilterSharing must run before CayenneAntiJoinSortMergeRewriter so same-source joins can receive shared scan filters before any sort-merge rewrite"
         );
         assert!(
             cayenne_anti_sort_merge_position < cayenne_rewriter_position,
-            "CayenneAntiJoinSortMergeRewriter must run before CayenneJoinRewriter so anti joins are not recreated with the hash-join accumulator"
+            "CayenneAntiJoinSortMergeRewriter must run before CayenneJoinRewriter so large same-source joins are not recreated with the hash-join accumulator"
         );
     }
 

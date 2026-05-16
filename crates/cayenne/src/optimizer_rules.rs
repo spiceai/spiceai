@@ -166,9 +166,9 @@ impl std::fmt::Debug for CayenneDynamicFilterSharing {
 #[derive(Default)]
 pub struct CayenneAntiJoinSortMergeRewriter;
 
-/// Only rewrite same-source anti or semi joins whose LEFT (build) input has
-/// `Precision::Exact` row count exceeding this threshold. Below it the
-/// in-memory hash table is faster than two explicit sort buffers.
+/// Only rewrite same-source joins whose LEFT (build) input has
+/// `Precision::Exact` row count exceeding this threshold. Below it, the
+/// in-memory hash table is usually faster than two explicit sort buffers.
 const ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS: usize = 10_000_000;
 
 impl CayenneAntiJoinSortMergeRewriter {
