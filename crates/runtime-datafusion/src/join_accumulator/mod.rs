@@ -183,14 +183,17 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
             batch.num_rows()
         );
 
+        if self.exact_values_exceeded_memory_limit {
+            if tracing::enabled!(tracing::Level::TRACE) {
+                let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
+                self.range_bounds.update(array.as_ref())?;
+            }
+            return Ok(());
+        }
+
         // eagerly evaluate the expression and store the resulting array
         // this avoids storing the entire record batch in memory, only storing the evaluated column
         let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
-
-        if self.exact_values_exceeded_memory_limit {
-            self.range_bounds.update(array.as_ref())?;
-            return Ok(());
-        }
 
         let array_memory_size = array.get_array_memory_size();
         let total_memory_size = self.total_memory_size.saturating_add(array_memory_size);
@@ -203,7 +206,9 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
                   Returning a no-op filter preserves query correctness under memory pressure. Consider increasing memory limits or reducing cardinality of the build side."
             );
             self.inlist_memory_reservation = None;
-            self.range_bounds = self.range_bounds_from_collected_arrays(array.as_ref())?;
+            if tracing::enabled!(tracing::Level::TRACE) {
+                self.range_bounds = self.range_bounds_from_collected_arrays(array.as_ref())?;
+            }
             self.arrays.clear();
             self.total_memory_size = total_memory_size;
             self.exact_values_exceeded_memory_limit = true;
@@ -220,7 +225,9 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
                  Returning a no-op filter preserves query correctness under memory pressure. Consider increasing memory limits or reducing cardinality of the build side."
             );
             self.inlist_memory_reservation = None;
-            self.range_bounds = self.range_bounds_from_collected_arrays(array.as_ref())?;
+            if tracing::enabled!(tracing::Level::TRACE) {
+                self.range_bounds = self.range_bounds_from_collected_arrays(array.as_ref())?;
+            }
             self.arrays.clear();
             self.total_memory_size = total_memory_size;
             self.exact_values_exceeded_memory_limit = true;
@@ -1443,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_left_accumulator_tracks_disjoint_intervals_but_returns_noop() {
+    fn test_exact_left_accumulator_skips_range_bounds_after_limit_exceeded() {
         let first_batch = create_uint64_batch(vec![10, 20]);
         let second_batch = create_uint64_batch(vec![100, 110]);
         let max_memory_size = first_batch.column(0).get_array_memory_size();
@@ -1459,7 +1466,8 @@ mod tests {
             .update_batch(&second_batch)
             .expect("Should update second batch");
 
-        assert_eq!(2, accumulator.range_bounds.intervals.len());
+        assert!(accumulator.exact_values_exceeded_memory_limit);
+        assert!(accumulator.range_bounds.intervals.is_empty());
 
         let column_bounds = accumulator.evaluate().expect("Should evaluate bounds");
         let physical_expr = column_bounds

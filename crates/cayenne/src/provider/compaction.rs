@@ -56,8 +56,8 @@ pub(crate) struct CompactionTiers {
 impl CompactionTiers {
     #[must_use]
     pub(crate) fn from_target_file_size_bytes(target_file_size_bytes: u64) -> Self {
-        // target / 4 is the small/mid boundary. Use saturating division so a
-        // misconfigured target of 0 still produces deterministic tiers.
+        // target / 4 is the small/mid boundary. A misconfigured target of 0
+        // still produces deterministic tiers.
         let small_max_bytes = target_file_size_bytes / 4;
         Self {
             small_max_bytes,
@@ -400,8 +400,9 @@ mod tests {
     #[test]
     fn picker_caps_at_max_files_per_pick() {
         // Target = 64 MiB → mid_max = 64 MiB, small_max = 16 MiB.
-        // 10 small files of 10 MiB each. Sum of any 4 = 40 MiB (< 64 MiB,
-        // would skip), so we widen the cap enough that the picker has work.
+        // 10 small files of 10 MiB each. The whole Small tier totals 100 MiB,
+        // which is above the 16 MiB Small-tier threshold, so the picker has
+        // work and then caps the retained candidate paths at max_files_per_pick.
         let cfg = CompactionPickerConfig::new(2, 8, 64 * 1024 * 1024);
         let files = entries(&[10 * 1024 * 1024; 10]);
         let candidate = pick_candidates(files.iter().cloned(), &cfg).expect("expected a candidate");

@@ -264,8 +264,8 @@ impl PartitionedWal {
     /// # Errors
     ///
     /// Returns an error if the WAL cannot be serialized, uploaded to the
-    /// temporary key, copied to the final key, or deleted from the temporary
-    /// key during cleanup.
+    /// temporary key, or copied to the final key. Temporary-key cleanup after
+    /// publishing the final key is best-effort.
     pub async fn write_to_object_store(
         &self,
         store: &dyn ObjectStore,
