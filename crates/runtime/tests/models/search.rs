@@ -472,6 +472,74 @@ fn sql_response_normalization_preserves_aliased_trunc_3_order() {
 }
 
 #[test]
+fn sql_response_normalization_respects_id_desc_tie_breaker() {
+    let input = json!([
+        {"id": 2, "_score": 0.34},
+        {"id": 4, "_score": 0.31},
+        {"id": 1, "_score": 0.30},
+        {"id": 3, "_score": 0.29}
+    ]);
+    let normalized = normalize_sql_response_for_snapshot_with_sql(
+        input,
+        true,
+        Some(
+            "SELECT id, trunc(_score, 2) AS _score FROM vector_search(qs, 'second') ORDER BY _score DESC, id DESC",
+        ),
+    );
+    assert_eq!(
+        normalized,
+        json!([
+            {"id": 4, "_score": "[score]"},
+            {"id": 3, "_score": "[score]"},
+            {"id": 2, "_score": "[score]"},
+            {"id": 1, "_score": "[score]"}
+        ])
+    );
+}
+
+#[test]
+fn sql_response_normalization_does_not_reorder_non_score_primary_ordering() {
+    let input = json!([
+        {"id": 2, "package_weight_kg": 4, "_score": 0.34},
+        {"id": 4, "package_weight_kg": 3, "_score": 0.31},
+        {"id": 1, "package_weight_kg": 2, "_score": 0.30},
+        {"id": 3, "package_weight_kg": 1, "_score": 0.29}
+    ]);
+    let normalized = normalize_sql_response_for_snapshot_with_sql(
+        input,
+        true,
+        Some(
+            "SELECT id, package_weight_kg, trunc(_score, 2) AS _score FROM vector_search(qs, 'second') ORDER BY package_weight_kg DESC, _score DESC",
+        ),
+    );
+    assert_eq!(
+        normalized,
+        json!([
+            {"id": 2, "package_weight_kg": 4, "_score": "[score]"},
+            {"id": 4, "package_weight_kg": 3, "_score": "[score]"},
+            {"id": 1, "package_weight_kg": 2, "_score": "[score]"},
+            {"id": 3, "package_weight_kg": 1, "_score": "[score]"}
+        ])
+    );
+}
+
+#[test]
+fn sql_response_normalization_redacts_round_score_columns() {
+    let input = json!([
+        {"id": 1, "round(vector_search().score,Int64(1))": 0.5},
+        {"id": 2, "round(vector_search().score,Int64(1))": 0.4}
+    ]);
+    let normalized = normalize_sql_response_for_snapshot(input, true);
+    assert_eq!(
+        normalized,
+        json!([
+            {"id": 1, "round(vector_search().score,Int64(1))": "[score]"},
+            {"id": 2, "round(vector_search().score,Int64(1))": "[score]"}
+        ])
+    );
+}
+
+#[test]
 fn sql_response_normalization_picks_primary_score_key_deterministically() {
     // When a row carries multiple score-like columns (constructed manually here
     // for the test), the function should always pick `_score` first regardless
@@ -734,7 +802,10 @@ fn normalize_sql_response_for_snapshot_with_sql(
         return Value::Array(rows);
     }
 
-    if round_scores && should_stabilize_sql_score_order(&primary_score_key, &scores, sql) {
+    if let Some(tie_breaker) = sql_score_tie_breaker(sql)
+        && round_scores
+        && should_stabilize_sql_score_order(&primary_score_key, &scores, sql)
+    {
         rows.sort_by(|a, b| {
             let score_a = a
                 .get(&primary_score_key)
@@ -748,7 +819,10 @@ fn normalize_sql_response_for_snapshot_with_sql(
                 Ordering::Equal => {
                     let id_a = a.get("id").and_then(Value::as_i64).unwrap_or(i64::MAX);
                     let id_b = b.get("id").and_then(Value::as_i64).unwrap_or(i64::MAX);
-                    id_a.cmp(&id_b)
+                    match tie_breaker {
+                        SqlTieBreaker::Asc => id_a.cmp(&id_b),
+                        SqlTieBreaker::Desc => id_b.cmp(&id_a),
+                    }
                 }
                 order => order,
             }
@@ -810,9 +884,62 @@ fn ensure_sql_response_scores_descending(
 }
 
 fn sql_orders_by_score_desc(sql: &str) -> bool {
+    sql_order_by_terms(sql)
+        .first()
+        .is_some_and(|term| order_term_is_score_desc(term))
+}
+
+#[derive(Clone, Copy)]
+enum SqlTieBreaker {
+    Asc,
+    Desc,
+}
+
+fn sql_score_tie_breaker(sql: Option<&str>) -> Option<SqlTieBreaker> {
+    let Some(sql) = sql else {
+        return Some(SqlTieBreaker::Asc);
+    };
+
+    let terms = sql_order_by_terms(sql);
+    let Some(first_term) = terms.first() else {
+        return Some(SqlTieBreaker::Asc);
+    };
+    if !order_term_is_score_desc(first_term) {
+        return None;
+    }
+
+    match terms.get(1).map(String::as_str) {
+        Some(term) if order_term_is_id(term) && term.contains("desc") => Some(SqlTieBreaker::Desc),
+        Some(term) if order_term_is_id(term) => Some(SqlTieBreaker::Asc),
+        Some(_) => None,
+        None => Some(SqlTieBreaker::Asc),
+    }
+}
+
+fn sql_order_by_terms(sql: &str) -> Vec<String> {
     let normalized = sql.to_ascii_lowercase();
-    normalized.contains("order by")
-        && (normalized.contains("_score desc") || normalized.contains("_fused_score desc"))
+    let Some((_, order_by)) = normalized.split_once("order by") else {
+        return Vec::new();
+    };
+    let order_by = order_by
+        .split_once(" limit ")
+        .map_or(order_by, |(order_by, _)| order_by);
+    order_by
+        .trim_end_matches(';')
+        .split(',')
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn order_term_is_score_desc(term: &str) -> bool {
+    (term.contains("_score") || term.contains("_fused_score")) && term.contains("desc")
+}
+
+fn order_term_is_id(term: &str) -> bool {
+    let term = term.trim_start_matches('(').trim();
+    term == "id" || term.starts_with("id ") || term == "\"id\"" || term.starts_with("\"id\" ")
 }
 
 fn sql_score_keys(rows: &[Value]) -> Option<(String, Vec<String>)> {
@@ -823,7 +950,10 @@ fn sql_score_keys(rows: &[Value]) -> Option<(String, Vec<String>)> {
             obj.keys()
                 .filter(|k| {
                     let s = k.as_str();
-                    s == "_score" || s == "_fused_score" || s.starts_with("trunc(")
+                    s == "_score"
+                        || s == "_fused_score"
+                        || ((s.starts_with("trunc(") || s.starts_with("round("))
+                            && s.contains("score"))
                 })
                 .cloned()
                 .collect()
