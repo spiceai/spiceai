@@ -269,14 +269,6 @@ impl CloudClient {
             .map_err(into_cli)
     }
 
-    pub async fn rollback(&self, org_app: &str, target_deployment_id: i64) -> Result<Deployment> {
-        let app = self.get_app(org_app).await?;
-        self.inner
-            .rollback(app.id, target_deployment_id)
-            .await
-            .map_err(into_cli)
-    }
-
     // ========================================================================
     // Regions & Images
     // ========================================================================
