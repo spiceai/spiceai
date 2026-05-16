@@ -352,14 +352,13 @@ impl RefreshTask {
             }
         });
 
-        // The previous burst's commit task. Commits are network round-trips
-        // to the source (PG `Standby Status Update`, Kafka offset commit,
-        // DynamoDB shard checkpoint) that don't need to gate the next apply.
-        // We keep at most one commit task in flight: by waiting on the
-        // previous commit before *spawning* the next one, we preserve
-        // strict commit ordering across bursts (LSN/offsets advance
-        // monotonically), while letting commit(N) overlap with apply(N+1) —
-        // the actual idle window in the original serial loop.
+        // The tail of the ordered source-side commit chain. Commits are
+        // network round-trips to the source (PG `Standby Status Update`, Kafka
+        // offset commit, DynamoDB shard checkpoint) that don't need to gate the
+        // next apply once the accelerator write has succeeded. Each new commit
+        // task awaits the previous tail internally before committing its own
+        // envelopes, preserving monotonic LSN/offset advancement while the
+        // apply loop continues draining catch-up backlogs.
         let mut pending_commit: Option<tokio::task::JoinHandle<()>> = None;
         let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
         let write_ctx = SessionContext::new();
@@ -410,7 +409,6 @@ impl RefreshTask {
                 write_ctx: &write_ctx,
                 write_session_state: &write_session_state,
                 pending_commit: &mut pending_commit,
-                commit_timeout: cdc_cfg.commit_timeout,
             };
             if !self.apply_burst(&mut apply_context, burst).await {
                 rx.close();
@@ -481,8 +479,9 @@ impl RefreshTask {
     /// underlying `RecordBatch`es into a single `ChangeBatch` and call
     /// `write_change` once — turning N small writes into one larger write
     /// and amortizing the per-envelope `SessionContext` + `insert_into`
-    /// planning cost. After a successful write we hand the run's committers
-    /// to a background commit task so that commit(N) overlaps with apply(N+1).
+    /// planning cost. After a successful write we append the run's committers
+    /// to the ordered background commit chain so source acknowledgements stay
+    /// monotonic without blocking catch-up apply work.
     async fn apply_burst(
         &self,
         context: &mut ApplyContext<'_>,
@@ -530,8 +529,7 @@ impl RefreshTask {
     }
 
     /// Apply a contiguous run of successful envelopes as a single coalesced
-    /// write, then schedule their commits in a background task that overlaps
-    /// with the next burst's apply.
+    /// write, then append their commits to the ordered background commit chain.
     async fn apply_envelope_run(
         &self,
         context: &mut ApplyContext<'_>,
@@ -1099,6 +1097,10 @@ fn spawn_ordered_commit_task(
     commit_dataset: TableReference,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Safe catch-up mode: this task is spawned only after the accelerator
+        // write returns successfully. It can wait on the prior commit without
+        // holding up the apply loop, but it never acknowledges source progress
+        // ahead of a durable/visible accelerator write.
         if let Some(previous) = previous {
             match previous.await {
                 Ok(()) => {}
