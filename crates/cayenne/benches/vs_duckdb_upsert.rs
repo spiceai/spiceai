@@ -51,7 +51,11 @@ const CONFLICT_PERCENTS: &[usize] = &[0, 50, 100];
 /// existing `0..TABLE_ROWS` keyspace. New rows start at `TABLE_ROWS` and grow
 /// upward, guaranteeing they don't collide either with existing rows or with
 /// each other.
-fn make_upsert_batch(conflict_pct: usize, table_rows: usize, incoming_rows: usize) -> arrow::array::RecordBatch {
+fn make_upsert_batch(
+    conflict_pct: usize,
+    table_rows: usize,
+    incoming_rows: usize,
+) -> arrow::array::RecordBatch {
     use arrow::array::{Int64Array, RecordBatch, StringArray};
     use std::sync::Arc;
 
@@ -105,10 +109,7 @@ fn bench_upsert(c: &mut Criterion) {
     // Cayenne re-uses the same Arrow batch through `cayenne_insert`. Both
     // engines see identical initial state.
     let base_parquet_path = parquet_dir.path().join("base.parquet");
-    write_parquet(
-        &make_batch(schema(), 0, TABLE_ROWS),
-        &base_parquet_path,
-    );
+    write_parquet(&make_batch(schema(), 0, TABLE_ROWS), &base_parquet_path);
 
     for &conflict_pct in CONFLICT_PERCENTS {
         let upsert_batch = Arc::new(make_upsert_batch(conflict_pct, TABLE_ROWS, INCOMING_ROWS));

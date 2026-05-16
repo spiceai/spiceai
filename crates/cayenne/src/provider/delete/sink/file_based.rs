@@ -46,8 +46,9 @@ use datafusion_catalog::TableProvider;
 use datafusion_common::ScalarValue;
 use datafusion_expr::Expr;
 use object_store::{ObjectMeta, ObjectStore};
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
 /// Result from file-based deletion, including metadata for post-delete cleanup.
@@ -448,15 +449,7 @@ impl FileBasedDeletionSink {
             }
 
             // 2. Remove from in-memory map
-            if let Ok(mut guard) = self.protected_snapshots.write() {
-                guard.remove(snapshot_id);
-            } else {
-                tracing::warn!(
-                    "Protected snapshots lock poisoned while cleaning up snapshot {snapshot_id} in table {}",
-                    self.table_name
-                );
-                continue;
-            }
+            self.protected_snapshots.write().remove(snapshot_id);
 
             // 3. Delete the empty snapshot directory
             let snapshot_dir = std::path::PathBuf::from(&self.table_path)

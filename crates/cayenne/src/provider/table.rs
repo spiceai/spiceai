@@ -20,8 +20,7 @@ limitations under the License.
 //! `DataFusion`'s `TableProvider` trait for Cayenne tables.
 
 use super::constants::{
-    DEFAULT_DATA_FILE_ID, LISTING_TABLE_LOCK_POISONED, PROTECTED_SNAPSHOTS_LOCK_POISONED,
-    STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
+    DEFAULT_DATA_FILE_ID, STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
 };
 use super::delete::{
     CayenneDeletionSink, DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter,
@@ -86,12 +85,13 @@ use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path as ObjectStorePath;
+use parking_lot::{Mutex as ParkingMutex, RwLock};
 use roaring::RoaringBitmap;
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
 use tokio::task;
 use vortex::dtype::arrow::FromArrowType;
 use vortex_datafusion::VortexFormat;
@@ -582,6 +582,23 @@ pub(crate) fn inline_memtable_pressure(stats: InlinedDataStats) -> Option<Inline
     None
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ScanListingTableKey {
+    snapshot_id: String,
+    target_partitions: usize,
+    collect_statistics: bool,
+}
+
+impl ScanListingTableKey {
+    fn new(snapshot_id: &str, session_config: &SessionConfig) -> Self {
+        Self {
+            snapshot_id: snapshot_id.to_string(),
+            target_partitions: session_config.target_partitions(),
+            collect_statistics: session_config.collect_statistics(),
+        }
+    }
+}
+
 /// Serialize one or more `RecordBatch`es to Arrow IPC stream bytes.
 fn serialize_batches_to_ipc(
     batches: &[RecordBatch],
@@ -687,6 +704,11 @@ pub struct CayenneTableProvider {
     /// do *not* take the fence — they read a snapshot of the listing table
     /// atomically via [`Self::listing_table`] and never observe partial state.
     listing_fence: Arc<tokio::sync::RwLock<()>>,
+    /// Cached scan listing tables keyed by live snapshot and the session knobs
+    /// that `ListingOptions::with_session_config_options` copies into each
+    /// table. Reusing the table keeps file-statistics caches warm across scans
+    /// while preserving per-session target partition and statistics settings.
+    scan_listing_tables: Arc<ParkingMutex<HashMap<ScanListingTableKey, Arc<ListingTable>>>>,
     /// Table-level Vortex statistics loaded from the metastore and maintained
     /// after writes. This gives `DataFusion` synchronous access to Cayenne stats
     /// without querying the async catalog from `TableProvider::statistics`.
@@ -721,6 +743,10 @@ pub struct CayenneTableProvider {
     /// Optional object store configuration for remote storage (e.g., S3 Express One Zone).
     /// When set, this object store is registered with `SessionContext` for data file operations.
     object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+    /// RuntimeEnv identities where `object_store_config` has already been
+    /// verified/registered. This avoids probing the registry on every scan in
+    /// the common case while still handling distinct query runtimes correctly.
+    object_store_registered_runtime_envs: Arc<ParkingMutex<HashSet<usize>>>,
     /// Current snapshot ID, updated after compaction operations.
     ///
     /// This is separate from `table_metadata.current_snapshot_id` because compaction
@@ -1234,10 +1260,7 @@ impl CayenneTableProvider {
     pub(crate) async fn trigger_old_snapshot_cleanup(&self, current_snapshot: &str) {
         // Collect protected snapshot IDs to preserve during cleanup
         let protected_snapshot_ids: HashSet<String> = {
-            let Ok(guard) = self.protected_snapshots.read() else {
-                tracing::warn!("Failed to read protected snapshots for cleanup");
-                return;
-            };
+            let guard = self.protected_snapshots.read();
             guard.keys().cloned().collect()
         };
 
@@ -1316,6 +1339,30 @@ impl CayenneTableProvider {
             runtime_env.register_object_store(&config.url, Arc::clone(&config.store));
             tracing::debug!("Registered object store for {}", config.url.as_str());
         }
+    }
+
+    fn runtime_env_cache_key(runtime_env: &Arc<RuntimeEnv>) -> usize {
+        Arc::as_ptr(runtime_env) as usize
+    }
+
+    fn register_object_store_for_runtime(
+        &self,
+        runtime_env: &Arc<RuntimeEnv>,
+        config: &crate::metadata::ObjectStoreConfig,
+    ) {
+        let runtime_env_key = Self::runtime_env_cache_key(runtime_env);
+        if self
+            .object_store_registered_runtime_envs
+            .lock()
+            .contains(&runtime_env_key)
+        {
+            return;
+        }
+
+        Self::register_object_store_if_needed(runtime_env, config);
+        self.object_store_registered_runtime_envs
+            .lock()
+            .insert(runtime_env_key);
     }
 
     pub(super) fn require_object_store(&self) -> Result<&crate::metadata::ObjectStoreConfig> {
@@ -2113,12 +2160,19 @@ impl CayenneTableProvider {
             Self::register_object_store_if_needed(context.runtime_env(), config);
         }
 
+        let mut object_store_registered_runtime_envs = HashSet::new();
+        if object_store_config.is_some() {
+            object_store_registered_runtime_envs
+                .insert(Self::runtime_env_cache_key(context.runtime_env()));
+        }
+
         let provider = Self {
             current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
             table_metadata,
             catalog,
             listing_table: Arc::new(ArcSwap::new(listing_table)),
             listing_fence: Arc::new(tokio::sync::RwLock::new(())),
+            scan_listing_tables: Arc::new(ParkingMutex::new(HashMap::new())),
             table_statistics: Arc::new(RwLock::new(table_statistics)),
             retention_filters,
             time_retention_filter_builder,
@@ -2128,6 +2182,9 @@ impl CayenneTableProvider {
             pk_column_indices,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             object_store_config,
+            object_store_registered_runtime_envs: Arc::new(ParkingMutex::new(
+                object_store_registered_runtime_envs,
+            )),
             protected_snapshots: Arc::new(RwLock::new(protected_snapshots)),
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
             staging_wal_present: Arc::new(AtomicBool::new(true)),
@@ -2261,13 +2318,7 @@ impl CayenneTableProvider {
         // We do NOT clear old protected snapshots because they may contain data that's still valid.
         // Each protected snapshot applies its own partial deletion filter based on when it was created.
         {
-            let mut guard = self
-                .protected_snapshots
-                .write()
-                .map_err(|_| Error::LockPoisoned {
-                    table: self.table_metadata.table_name.clone(),
-                    lock: PROTECTED_SNAPSHOTS_LOCK_POISONED,
-                })?;
+            let mut guard = self.protected_snapshots.write();
             guard.insert(new_snapshot_id.clone(), max_delete_seq);
         }
 
@@ -2534,6 +2585,7 @@ impl CayenneTableProvider {
             catalog: Arc::clone(&self.catalog),
             listing_table: Arc::clone(&self.listing_table),
             listing_fence: Arc::clone(&self.listing_fence),
+            scan_listing_tables: Arc::clone(&self.scan_listing_tables),
             table_statistics: Arc::clone(&self.table_statistics),
             context: Arc::clone(&self.context),
             retention_filters: self.retention_filters.clone(),
@@ -2543,6 +2595,9 @@ impl CayenneTableProvider {
             pk_column_indices: self.pk_column_indices.clone(),
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             object_store_config: self.object_store_config.clone(),
+            object_store_registered_runtime_envs: Arc::clone(
+                &self.object_store_registered_runtime_envs,
+            ),
             current_snapshot_id: Arc::clone(&self.current_snapshot_id),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
@@ -2600,7 +2655,7 @@ impl CayenneTableProvider {
 
     fn cached_table_statistics_for_optimizer(&self) -> Option<Statistics> {
         let stats = {
-            let guard = self.table_statistics.read().ok()?;
+            let guard = self.table_statistics.read();
             guard.clone()?
         };
 
@@ -2635,13 +2690,7 @@ impl CayenneTableProvider {
     }
 
     fn set_cached_table_statistics(&self, stats: Option<Statistics>) {
-        let Ok(mut guard) = self.table_statistics.write() else {
-            tracing::warn!(
-                "Failed to update cached table stats for {} because the lock is poisoned",
-                self.table_metadata.table_name
-            );
-            return;
-        };
+        let mut guard = self.table_statistics.write();
         *guard = stats;
     }
 
@@ -2704,13 +2753,7 @@ impl CayenneTableProvider {
 
         // Clone protected snapshots to avoid holding locks across await points
         let protected_snapshots = {
-            let guard = self
-                .protected_snapshots
-                .read()
-                .map_err(|_| Error::LockPoisoned {
-                    table: self.table_metadata.table_name.clone(),
-                    lock: PROTECTED_SNAPSHOTS_LOCK_POISONED,
-                })?;
+            let guard = self.protected_snapshots.read();
             guard.clone()
         };
 
@@ -4558,13 +4601,7 @@ impl CayenneTableProvider {
 
         // Clear protected snapshots - after compaction all data is in the main snapshot
         {
-            let mut guard = self
-                .protected_snapshots
-                .write()
-                .map_err(|_| Error::LockPoisoned {
-                    table: self.table_metadata.table_name.clone(),
-                    lock: LISTING_TABLE_LOCK_POISONED,
-                })?;
+            let mut guard = self.protected_snapshots.write();
             guard.clear();
         }
 
@@ -4583,15 +4620,9 @@ impl CayenneTableProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error if the lock is poisoned.
+    /// This method keeps a `Result` return type for caller compatibility.
     pub(super) fn get_current_snapshot_id(&self) -> Result<String> {
-        let guard = self
-            .current_snapshot_id
-            .read()
-            .map_err(|_| Error::LockPoisoned {
-                table: self.table_metadata.table_name.clone(),
-                lock: LISTING_TABLE_LOCK_POISONED,
-            })?;
+        let guard = self.current_snapshot_id.read();
         Ok(guard.clone())
     }
 
@@ -4602,15 +4633,12 @@ impl CayenneTableProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error if the lock is poisoned.
+    /// This method keeps a `Result` return type for caller compatibility.
     pub(crate) fn update_current_snapshot_id(&self, new_snapshot_id: &str) -> Result<()> {
-        let mut guard = self
-            .current_snapshot_id
-            .write()
-            .map_err(|_| Error::LockPoisoned {
-                table: self.table_metadata.table_name.clone(),
-                lock: LISTING_TABLE_LOCK_POISONED,
-            })?;
+        let mut guard = self.current_snapshot_id.write();
+        if guard.as_str() != new_snapshot_id {
+            self.scan_listing_tables.lock().clear();
+        }
         *guard = new_snapshot_id.to_string();
 
         // Any snapshot rewrite (compaction, sort, etc.) means the "new files
@@ -4686,13 +4714,7 @@ impl CayenneTableProvider {
         })?;
 
         {
-            let mut guard = self
-                .protected_snapshots
-                .write()
-                .map_err(|_| Error::LockPoisoned {
-                    table: self.table_metadata.table_name.clone(),
-                    lock: PROTECTED_SNAPSHOTS_LOCK_POISONED,
-                })?;
+            let mut guard = self.protected_snapshots.write();
             *guard = fresh_protected_snapshots;
         }
 
@@ -5956,17 +5978,19 @@ impl CayenneTableProvider {
         deletion_snapshot: &PkDeletionSnapshot,
     ) -> datafusion_common::Result<Vec<Arc<dyn ExecutionPlan>>> {
         let protected_snapshots = {
-            let guard = self.protected_snapshots.read().map_err(|_| {
-                datafusion_common::DataFusionError::Execution(
-                    "Protected snapshots lock poisoned".to_string(),
-                )
-            })?;
+            let guard = self.protected_snapshots.read();
             guard.clone()
         };
 
         if protected_snapshots.is_empty() {
             return Ok(Vec::new());
         }
+
+        tracing::trace!(
+            table = %self.table_metadata.table_name,
+            protected_snapshot_count = protected_snapshots.len(),
+            "Scanning protected snapshots for Cayenne table"
+        );
 
         let mut plans = Vec::with_capacity(protected_snapshots.len());
 
@@ -5978,18 +6002,13 @@ impl CayenneTableProvider {
                 &snapshot_id,
             );
 
-            let listing_table = Self::create_listing_table_with_config(
-                &snapshot_url,
-                Arc::clone(&self.table_metadata.schema),
-                self.context.file_format(),
-                &self.pk_deletion_strategy,
-                state.config(),
-            )
-            .map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to create listing table for protected snapshot {snapshot_id}: {e}"
-                ))
-            })?;
+            let listing_table = self
+                .scan_listing_table_for_config(&snapshot_url, &snapshot_id, state.config())
+                .map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to create listing table for protected snapshot {snapshot_id}: {e}"
+                    ))
+                })?;
 
             let plan = listing_table
                 .scan(state, projection, filters, limit)
@@ -6007,6 +6026,45 @@ impl CayenneTableProvider {
         }
 
         Ok(plans)
+    }
+
+    fn scan_listing_table_for_config(
+        &self,
+        snapshot_dir_url: &str,
+        snapshot_id: &str,
+        session_config: &SessionConfig,
+    ) -> Result<Arc<ListingTable>> {
+        let key = ScanListingTableKey::new(snapshot_id, session_config);
+        if let Some(listing_table) = self.scan_listing_tables.lock().get(&key).cloned() {
+            tracing::trace!(
+                table = %self.table_metadata.table_name,
+                snapshot_id,
+                target_partitions = key.target_partitions,
+                collect_statistics = key.collect_statistics,
+                "Reusing cached Cayenne ListingTable for scan"
+            );
+            return Ok(listing_table);
+        }
+
+        let listing_table = Self::create_listing_table_with_config(
+            snapshot_dir_url,
+            Arc::clone(&self.table_metadata.schema),
+            self.context.file_format(),
+            &self.pk_deletion_strategy,
+            session_config,
+        )?;
+
+        let mut cache = self.scan_listing_tables.lock();
+        let listing_table = Arc::clone(cache.entry(key.clone()).or_insert(listing_table));
+        tracing::trace!(
+            table = %self.table_metadata.table_name,
+            snapshot_id,
+            target_partitions = key.target_partitions,
+            collect_statistics = key.collect_statistics,
+            cache_entries = cache.len(),
+            "Cached Cayenne ListingTable for scan"
+        );
+        Ok(listing_table)
     }
 
     /// Apply partial deletion filter - only deletions with seq > threshold are applied.
@@ -6245,7 +6303,7 @@ impl TableProvider for CayenneTableProvider {
         // Register object store with the session's runtime env if configured for S3 Express One Zone.
         // This ensures the session can access S3 when the underlying ListingTable reads data.
         if let Some(ref config) = self.object_store_config {
-            Self::register_object_store_if_needed(state.runtime_env(), config);
+            self.register_object_store_for_runtime(state.runtime_env(), config);
         }
 
         // Capture one immutable deletion snapshot for this scan and use it for
@@ -6358,16 +6416,15 @@ impl TableProvider for CayenneTableProvider {
         // (target_partitions, etc.). The fence still matters because
         // append-mode coordinators move files into the CURRENT snapshot dir.
         let _fence = self.listing_fence.read().await;
+        let current_snapshot_id = self.get_current_snapshot_id()?;
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
-            &self.get_current_snapshot_id()?,
+            &current_snapshot_id,
         );
-        let listing_table = Self::create_listing_table_with_config(
+        let listing_table = self.scan_listing_table_for_config(
             &snapshot_dir_url,
-            Arc::clone(&self.table_metadata.schema),
-            self.context.file_format(),
-            &self.pk_deletion_strategy,
+            &current_snapshot_id,
             state.config(),
         )?;
         let main_plan = listing_table
@@ -6392,13 +6449,19 @@ impl TableProvider for CayenneTableProvider {
             )
             .await?;
 
-        // Read any inlined data and create a MemoryExec plan for it.
-        let inlined_batches = self.read_inlined_batches().await.map_err(|e| {
-            datafusion_common::DataFusionError::Execution(format!(
-                "Failed to read inlined data for table {}: {e}",
-                self.table_metadata.table_name
-            ))
-        })?;
+        // Read any inlined data and create a MemoryExec plan for it. The cached
+        // row count is maintained on writes/checkpoints, so the common fully
+        // materialized path avoids a metastore read on every scan.
+        let inlined_batches = if self.cached_inlined_row_count() > 0 {
+            self.read_inlined_batches().await.map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to read inlined data for table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?
+        } else {
+            Vec::new()
+        };
         let inlined_plan: Option<Arc<dyn ExecutionPlan>> = if inlined_batches.is_empty() {
             None
         } else {
@@ -6565,7 +6628,7 @@ impl TableProvider for CayenneTableProvider {
         // Register object store with the session's runtime env if configured for S3 Express One Zone.
         // This ensures the session can access S3 when the underlying ListingTable writes data.
         if let Some(ref config) = self.object_store_config {
-            Self::register_object_store_if_needed(state.runtime_env(), config);
+            self.register_object_store_for_runtime(state.runtime_env(), config);
         } else if is_s3 {
             tracing::warn!(
                 "S3 table {} has no object_store_config! Writes will fail.",
@@ -6841,11 +6904,7 @@ impl CayenneTableProvider {
         &self,
     ) -> datafusion_common::Result<Vec<(String, Arc<ListingTable>)>> {
         let protected_snapshots = {
-            let guard = self.protected_snapshots.read().map_err(|_| {
-                datafusion_common::DataFusionError::Execution(
-                    "Protected snapshots lock poisoned".to_string(),
-                )
-            })?;
+            let guard = self.protected_snapshots.read();
             guard.clone()
         };
 

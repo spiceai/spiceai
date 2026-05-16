@@ -246,9 +246,8 @@ async fn setup_cayenne_with(
         .await
         .expect("data dir");
     let db_path = temp_dir.path().join("catalog.db");
-    let catalog = Arc::new(
-        CayenneCatalog::new(metastore.connection_string(&db_path)).expect("catalog"),
-    );
+    let catalog =
+        Arc::new(CayenneCatalog::new(metastore.connection_string(&db_path)).expect("catalog"));
     catalog.init().await.expect("catalog init");
 
     let table = Arc::new(

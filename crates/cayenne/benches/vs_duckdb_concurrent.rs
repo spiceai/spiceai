@@ -162,17 +162,14 @@ fn bench_concurrent(c: &mut Criterion) {
         let bg = CayenneBgWriter::spawn(&rt, &fixture);
 
         let table = Arc::clone(&fixture.table);
-        group.bench_function(
-            BenchmarkId::new(lane_label, "scan_under_write"),
-            |b| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        let batches = cayenne_query(&table, CAYENNE_SCAN_SQL).await;
-                        black_box(batches);
-                    });
+        group.bench_function(BenchmarkId::new(lane_label, "scan_under_write"), |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let batches = cayenne_query(&table, CAYENNE_SCAN_SQL).await;
+                    black_box(batches);
                 });
-            },
-        );
+            });
+        });
 
         // Explicit drop order: stop the background writer before the
         // fixture, so the writer doesn't try to insert into a torn-down
@@ -183,15 +180,12 @@ fn bench_concurrent(c: &mut Criterion) {
 
     let duckdb_fixture = load_duckdb(&parquet_path);
     let bg = DuckDbBgWriter::spawn(&duckdb_fixture);
-    group.bench_function(
-        BenchmarkId::new("duckdb", "scan_under_write"),
-        |b| {
-            b.iter(|| {
-                let v = duckdb_query_scalar(&duckdb_fixture.conn, DUCKDB_SCAN_SQL);
-                black_box(v);
-            });
-        },
-    );
+    group.bench_function(BenchmarkId::new("duckdb", "scan_under_write"), |b| {
+        b.iter(|| {
+            let v = duckdb_query_scalar(&duckdb_fixture.conn, DUCKDB_SCAN_SQL);
+            black_box(v);
+        });
+    });
     drop(bg);
     drop(duckdb_fixture);
 

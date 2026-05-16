@@ -105,12 +105,9 @@ fn bench_join(c: &mut Criterion) {
                 |b, &_rows| {
                     b.iter(|| {
                         rt.block_on(async {
-                            let batches = cayenne_query_join(
-                                &cf.fact.table,
-                                &cf.dim.table,
-                                cayenne_join_agg,
-                            )
-                            .await;
+                            let batches =
+                                cayenne_query_join(&cf.fact.table, &cf.dim.table, cayenne_join_agg)
+                                    .await;
                             black_box(batches);
                         });
                     });

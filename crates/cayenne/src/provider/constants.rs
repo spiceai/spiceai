@@ -16,20 +16,6 @@ limitations under the License.
 
 //! Constants used throughout the Cayenne provider module.
 
-/// Error message for poisoned `RwLock` on the listing table.
-///
-/// Lock poisoning occurs when a thread panics while holding the lock, leaving it in an
-/// inconsistent state. This is a critical error that typically requires restarting the runtime.
-pub const LISTING_TABLE_LOCK_POISONED: &str = "Lock poisoned on listing table: a thread panicked while holding this lock. \
-    This indicates an internal error that requires restarting the runtime.";
-
-/// Error message for poisoned `RwLock` on protected snapshots.
-///
-/// Lock poisoning occurs when a thread panics while holding the lock, leaving it in an
-/// inconsistent state. This is a critical error that typically requires restarting the runtime.
-pub const PROTECTED_SNAPSHOTS_LOCK_POISONED: &str = "Lock poisoned on protected snapshots: a thread panicked while holding this lock. \
-    This indicates an internal error that requires restarting the runtime.";
-
 /// Default data file ID used for non-partitioned tables.
 ///
 /// In Cayenne, this represents the single data file in a non-partitioned table.

@@ -78,17 +78,13 @@ fn bench_groupby(c: &mut Criterion) {
             let duckdb_fixture = Arc::new(load_duckdb(&parquet_path));
 
             let cayenne_sql = "SELECT name, COUNT(*), SUM(value) FROM t GROUP BY name";
-            let duckdb_sql =
-                "SELECT name, COUNT(*), SUM(value) FROM groupby_bench GROUP BY name";
+            let duckdb_sql = "SELECT name, COUNT(*), SUM(value) FROM groupby_bench GROUP BY name";
 
             // Plan capture uses the SQLite lane — Turso would emit the same
             // DataFusion plan because the metastore only affects metadata I/O,
             // not query planning.
-            let plan_fixture = Arc::new(rt.block_on(load_cayenne(
-                Metastore::Sqlite,
-                rows,
-                effective_groups,
-            )));
+            let plan_fixture =
+                Arc::new(rt.block_on(load_cayenne(Metastore::Sqlite, rows, effective_groups)));
             rt.block_on(capture_comparison_plans(
                 &format!("groupby/{rows}/groups_{effective_groups}/group_by_name"),
                 &plan_fixture.table,
@@ -99,11 +95,8 @@ fn bench_groupby(c: &mut Criterion) {
 
             for &lane in CAYENNE_LANES {
                 let lane_label = lane.lane();
-                let cayenne_fixture = Arc::new(rt.block_on(load_cayenne(
-                    lane,
-                    rows,
-                    effective_groups,
-                )));
+                let cayenne_fixture =
+                    Arc::new(rt.block_on(load_cayenne(lane, rows, effective_groups)));
                 let cf = Arc::clone(&cayenne_fixture);
                 group.bench_with_input(
                     BenchmarkId::new(
