@@ -144,7 +144,7 @@ pub(crate) fn generate_postgres_wal_spicepod(
         dataset.params = Some(Params::from_string_map(param_map));
         dataset.acceleration = Some(Acceleration {
             enabled: true,
-            engine: Some("cayenne".to_string()),
+            engine: Some("duckdb".to_string()),
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Changes),
             primary_key,
