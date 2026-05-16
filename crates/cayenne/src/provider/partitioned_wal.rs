@@ -438,7 +438,9 @@ mod tests {
             vec![
                 PartitionedWalEntry {
                     table_id: "01HY0000000000000000000001".to_string(),
-                    staging_wal_path: Some("/data/p1/_staging/_wal.json".to_string()),
+                    staging_wal_path: Some(
+                        "/data/p1/_staging/01HZ0000000000000000000000/_wal.json".to_string(),
+                    ),
                 },
                 PartitionedWalEntry {
                     table_id: "01HY0000000000000000000002".to_string(),

@@ -773,7 +773,6 @@ async fn test_repeated_wal_writes_are_atomic_impl(
         .collect()
         .await?;
 
-    let staging = staging_dir(&table);
     assert!(
         staging_wal_paths(&table).is_empty(),
         "WAL must not persist after a successful commit"
