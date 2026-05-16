@@ -35,10 +35,24 @@ use crate::metadata::{
 use crate::provider::scan::{CayenneAccelerationExec, round_robin_repartition_if_needed};
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, Result};
-use arrow::array::Array;
+use arrow::array::{
+    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+    FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
+    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
+use arrow::compute::kernels::aggregate;
+use arrow::datatypes::{
+    Date32Type, Date64Type, Decimal128Type, Int8Type, Int16Type, Int32Type, Int64Type,
+    Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
+    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+    TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+};
 use arrow::record_batch::RecordBatch;
 use arrow_row::{OwnedRow, RowConverter, SortField};
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use data_components::delete::{DeletionExec, DeletionSink};
 use datafusion::datasource::file_format::FileFormat;
@@ -52,7 +66,7 @@ use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::tree_node::TreeNode;
-use datafusion_common::{ColumnStatistics, Constraints, DFSchema, Statistics};
+use datafusion_common::{ColumnStatistics, Constraints, DFSchema, ScalarValue, Statistics};
 use datafusion_execution::cache::TableScopedPath;
 use datafusion_execution::config::SessionConfig;
 use datafusion_expr::dml::InsertOp;
@@ -206,6 +220,22 @@ impl ColumnStatsAccumulator {
             };
         }
 
+        let (batch_min, batch_max) =
+            Self::fast_column_min_max(col).unwrap_or_else(|| Self::scalar_column_min_max(col));
+
+        datafusion_common::ColumnStatistics {
+            null_count,
+            min_value: batch_min.map_or(Precision::Absent, Precision::Exact),
+            max_value: batch_max.map_or(Precision::Absent, Precision::Exact),
+            sum_value: Precision::Absent,
+            distinct_count: Precision::Absent,
+            byte_size: Precision::Absent,
+        }
+    }
+
+    fn scalar_column_min_max(
+        col: &dyn arrow::array::Array,
+    ) -> (Option<ScalarValue>, Option<ScalarValue>) {
         // O(n) linear scan to find min/max using `ScalarValue` comparison.
         // NaN values are skipped entirely so stats remain deterministic.
         let mut batch_min: Option<datafusion_common::ScalarValue> = None;
@@ -246,14 +276,205 @@ impl ColumnStatsAccumulator {
             });
         }
 
-        datafusion_common::ColumnStatistics {
-            null_count,
-            min_value: batch_min.map_or(Precision::Absent, Precision::Exact),
-            max_value: batch_max.map_or(Precision::Absent, Precision::Exact),
-            sum_value: Precision::Absent,
-            distinct_count: Precision::Absent,
-            byte_size: Precision::Absent,
+        (batch_min, batch_max)
+    }
+
+    fn fast_column_min_max(
+        col: &dyn arrow::array::Array,
+    ) -> Option<(Option<ScalarValue>, Option<ScalarValue>)> {
+        macro_rules! primitive_min_max {
+            ($array_ty:ty, $arrow_ty:ty, |$value:ident| $scalar:expr) => {{
+                let array = col.as_any().downcast_ref::<$array_ty>()?;
+                let min_value = aggregate::min::<$arrow_ty>(array).map(|$value| $scalar);
+                let max_value = aggregate::max::<$arrow_ty>(array).map(|$value| $scalar);
+                Some((min_value, max_value))
+            }};
         }
+
+        macro_rules! byte_min_max {
+            ($array_ty:ty, $min_fn:ident, $max_fn:ident, |$value:ident| $scalar:expr) => {{
+                let array = col.as_any().downcast_ref::<$array_ty>()?;
+                let min_value = aggregate::$min_fn(array).map(|$value| $scalar);
+                let max_value = aggregate::$max_fn(array).map(|$value| $scalar);
+                Some((min_value, max_value))
+            }};
+        }
+
+        match col.data_type() {
+            DataType::Boolean => {
+                let array = col.as_any().downcast_ref::<BooleanArray>()?;
+                Some((
+                    aggregate::min_boolean(array).map(|value| ScalarValue::Boolean(Some(value))),
+                    aggregate::max_boolean(array).map(|value| ScalarValue::Boolean(Some(value))),
+                ))
+            }
+            DataType::Int8 => primitive_min_max!(Int8Array, Int8Type, |value| {
+                ScalarValue::Int8(Some(value))
+            }),
+            DataType::Int16 => primitive_min_max!(Int16Array, Int16Type, |value| {
+                ScalarValue::Int16(Some(value))
+            }),
+            DataType::Int32 => primitive_min_max!(Int32Array, Int32Type, |value| {
+                ScalarValue::Int32(Some(value))
+            }),
+            DataType::Int64 => primitive_min_max!(Int64Array, Int64Type, |value| {
+                ScalarValue::Int64(Some(value))
+            }),
+            DataType::UInt8 => primitive_min_max!(UInt8Array, UInt8Type, |value| {
+                ScalarValue::UInt8(Some(value))
+            }),
+            DataType::UInt16 => primitive_min_max!(UInt16Array, UInt16Type, |value| {
+                ScalarValue::UInt16(Some(value))
+            }),
+            DataType::UInt32 => primitive_min_max!(UInt32Array, UInt32Type, |value| {
+                ScalarValue::UInt32(Some(value))
+            }),
+            DataType::UInt64 => primitive_min_max!(UInt64Array, UInt64Type, |value| {
+                ScalarValue::UInt64(Some(value))
+            }),
+            DataType::Float32 => {
+                let array = col.as_any().downcast_ref::<Float32Array>()?;
+                let (min_value, max_value) = Self::float32_min_max(array);
+                Some((
+                    min_value.map(|value| ScalarValue::Float32(Some(value))),
+                    max_value.map(|value| ScalarValue::Float32(Some(value))),
+                ))
+            }
+            DataType::Float64 => {
+                let array = col.as_any().downcast_ref::<Float64Array>()?;
+                let (min_value, max_value) = Self::float64_min_max(array);
+                Some((
+                    min_value.map(|value| ScalarValue::Float64(Some(value))),
+                    max_value.map(|value| ScalarValue::Float64(Some(value))),
+                ))
+            }
+            DataType::Decimal128(precision, scale) => {
+                primitive_min_max!(Decimal128Array, Decimal128Type, |value| {
+                    ScalarValue::Decimal128(Some(value), *precision, *scale)
+                })
+            }
+            DataType::Utf8 => byte_min_max!(StringArray, min_string, max_string, |value| {
+                ScalarValue::Utf8(Some(value.to_string()))
+            }),
+            DataType::LargeUtf8 => {
+                byte_min_max!(LargeStringArray, min_string, max_string, |value| {
+                    ScalarValue::LargeUtf8(Some(value.to_string()))
+                })
+            }
+            DataType::Utf8View => {
+                byte_min_max!(StringViewArray, min_string_view, max_string_view, |value| {
+                    ScalarValue::Utf8View(Some(value.to_string()))
+                })
+            }
+            DataType::Binary => byte_min_max!(BinaryArray, min_binary, max_binary, |value| {
+                ScalarValue::Binary(Some(value.to_vec()))
+            }),
+            DataType::LargeBinary => {
+                byte_min_max!(LargeBinaryArray, min_binary, max_binary, |value| {
+                    ScalarValue::LargeBinary(Some(value.to_vec()))
+                })
+            }
+            DataType::BinaryView => {
+                byte_min_max!(BinaryViewArray, min_binary_view, max_binary_view, |value| {
+                    ScalarValue::BinaryView(Some(value.to_vec()))
+                })
+            }
+            DataType::FixedSizeBinary(size) => byte_min_max!(
+                FixedSizeBinaryArray,
+                min_fixed_size_binary,
+                max_fixed_size_binary,
+                |value| { ScalarValue::FixedSizeBinary(*size, Some(value.to_vec())) }
+            ),
+            DataType::Date32 => primitive_min_max!(Date32Array, Date32Type, |value| {
+                ScalarValue::Date32(Some(value))
+            }),
+            DataType::Date64 => primitive_min_max!(Date64Array, Date64Type, |value| {
+                ScalarValue::Date64(Some(value))
+            }),
+            DataType::Time32(TimeUnit::Second) => {
+                primitive_min_max!(Time32SecondArray, Time32SecondType, |value| {
+                    ScalarValue::Time32Second(Some(value))
+                })
+            }
+            DataType::Time32(TimeUnit::Millisecond) => {
+                primitive_min_max!(Time32MillisecondArray, Time32MillisecondType, |value| {
+                    ScalarValue::Time32Millisecond(Some(value))
+                })
+            }
+            DataType::Time64(TimeUnit::Microsecond) => {
+                primitive_min_max!(Time64MicrosecondArray, Time64MicrosecondType, |value| {
+                    ScalarValue::Time64Microsecond(Some(value))
+                })
+            }
+            DataType::Time64(TimeUnit::Nanosecond) => {
+                primitive_min_max!(Time64NanosecondArray, Time64NanosecondType, |value| {
+                    ScalarValue::Time64Nanosecond(Some(value))
+                })
+            }
+            DataType::Timestamp(TimeUnit::Second, tz) => {
+                primitive_min_max!(TimestampSecondArray, TimestampSecondType, |value| {
+                    ScalarValue::TimestampSecond(Some(value), tz.clone())
+                })
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, tz) => primitive_min_max!(
+                TimestampMillisecondArray,
+                TimestampMillisecondType,
+                |value| { ScalarValue::TimestampMillisecond(Some(value), tz.clone()) }
+            ),
+            DataType::Timestamp(TimeUnit::Microsecond, tz) => primitive_min_max!(
+                TimestampMicrosecondArray,
+                TimestampMicrosecondType,
+                |value| { ScalarValue::TimestampMicrosecond(Some(value), tz.clone()) }
+            ),
+            DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+                primitive_min_max!(TimestampNanosecondArray, TimestampNanosecondType, |value| {
+                    ScalarValue::TimestampNanosecond(Some(value), tz.clone())
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn float32_min_max(array: &Float32Array) -> (Option<f32>, Option<f32>) {
+        let mut min_value: Option<f32> = None;
+        let mut max_value: Option<f32> = None;
+
+        for value in array.iter().flatten() {
+            if value.is_nan() {
+                continue;
+            }
+            min_value = Some(match min_value {
+                Some(current) if current <= value => current,
+                _ => value,
+            });
+            max_value = Some(match max_value {
+                Some(current) if current >= value => current,
+                _ => value,
+            });
+        }
+
+        (min_value, max_value)
+    }
+
+    fn float64_min_max(array: &Float64Array) -> (Option<f64>, Option<f64>) {
+        let mut min_value: Option<f64> = None;
+        let mut max_value: Option<f64> = None;
+
+        for value in array.iter().flatten() {
+            if value.is_nan() {
+                continue;
+            }
+            min_value = Some(match min_value {
+                Some(current) if current <= value => current,
+                _ => value,
+            });
+            max_value = Some(match max_value {
+                Some(current) if current >= value => current,
+                _ => value,
+            });
+        }
+
+        (min_value, max_value)
     }
 
     /// Get the total accumulated row count.
@@ -437,11 +658,27 @@ pub struct CayenneTableProvider {
     /// Underlying Vortex `ListingTable` that scans all virtual files in the table directory.
     /// Note: Each `DataFile` in the catalog represents a subdirectory (virtual file),
     /// but this `ListingTable` currently scans all of them together.
-    /// Wrapped in `RwLock` to allow updating the listing table on overwrite operations.
-    /// Uses `std::sync::RwLock` instead of `tokio::sync::RwLock` because we need
-    /// synchronous access in `TableProvider` trait methods (`supports_filters_pushdown`
-    /// and `statistics`), and the lock is held for very short durations (just Arc clones).
-    listing_table: Arc<RwLock<Arc<ListingTable>>>,
+    ///
+    /// Held in an [`ArcSwap`] so synchronous `TableProvider` trait methods
+    /// (`supports_filters_pushdown` and `statistics`) get a wait-free snapshot
+    /// of the current `ListingTable`, and writers can atomically install a new
+    /// one without blocking readers' Arc-loads. Read/write *coordination* with
+    /// the append-side write barrier (issue #10125) lives in
+    /// [`Self::listing_fence`], not in the `ArcSwap` itself.
+    listing_table: Arc<ArcSwap<ListingTable>>,
+    /// Read/write fence that synchronizes [`Self::scan`] with the append-side
+    /// write barrier described in issue #10125 §6.4.
+    ///
+    /// Scans take `listing_fence.read().await` and hold it across the inner
+    /// `DataFusion` listing call so that concurrent file-move + listing-table
+    /// swap by a writer cannot interleave with the listing operation. The
+    /// writer barrier takes `listing_fence.write().await` for the duration of
+    /// its move + cache-invalidate + Arc swap.
+    ///
+    /// Sync `TableProvider` methods (`statistics`, `supports_filters_pushdown`)
+    /// do *not* take the fence — they read a snapshot of the listing table
+    /// atomically via [`Self::listing_table`] and never observe partial state.
+    listing_fence: Arc<tokio::sync::RwLock<()>>,
     /// Table-level Vortex statistics loaded from the metastore and maintained
     /// after writes. This gives `DataFusion` synchronous access to Cayenne stats
     /// without querying the async catalog from `TableProvider::statistics`.
@@ -892,7 +1129,13 @@ impl CayenneTableProvider {
     /// Update the listing table to point to a new snapshot directory.
     ///
     /// This ensures subsequent queries in the same context will read from the new data.
-    pub(crate) fn update_listing_table_for_snapshot(&self, new_snapshot_id: &str) -> Result<()> {
+    /// Holds [`Self::listing_fence`] for write across the Arc swap so any in-flight
+    /// [`Self::scan`] using `listing_fence.read()` either resolves entirely
+    /// before this swap or entirely after it.
+    pub(crate) async fn update_listing_table_for_snapshot(
+        &self,
+        new_snapshot_id: &str,
+    ) -> Result<()> {
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
@@ -906,14 +1149,8 @@ impl CayenneTableProvider {
             &self.pk_deletion_strategy,
         )?;
 
-        let mut listing_table_guard =
-            self.listing_table
-                .write()
-                .map_err(|_| Error::LockPoisoned {
-                    table: self.table_metadata.table_name.clone(),
-                    lock: LISTING_TABLE_LOCK_POISONED,
-                })?;
-        *listing_table_guard = new_listing_table;
+        let _fence = self.listing_fence.write().await;
+        self.listing_table.store(new_listing_table);
         Ok(())
     }
 
@@ -1184,9 +1421,11 @@ impl CayenneTableProvider {
 
     // Create listing options for Vortex format.
     ///
-    /// Only wraps the `VortexFormat` with `DeletionFilteringVortexFormat` for
-    /// `PositionBased` strategy. PK-based strategies (`Int64Pk`, `RowConverterBased`)
-    /// filter at the `ExecutionPlan` level, not during file reading.
+    /// Always wraps the `VortexFormat` so Cayenne-specific Vortex predicate
+    /// pushdown guards apply to every scan. `PositionBased` additionally
+    /// attaches deletion vectors during file reading; PK-based strategies
+    /// (`Int64Pk`, `RowConverterBased`) still filter at the `ExecutionPlan`
+    /// level.
     fn create_listing_options(
         vortex_format: &Arc<VortexFormat>,
         strategy: &PkDeletionStrategyWithCache,
@@ -1200,9 +1439,9 @@ impl CayenneTableProvider {
                 Arc::clone(cached_deleted_row_ids),
             )),
             PkDeletionStrategyWithCache::Int64Pk { .. }
-            | PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                Arc::clone(vortex_format) as Arc<dyn FileFormat>
-            }
+            | PkDeletionStrategyWithCache::RowConverterBased { .. } => Arc::new(
+                DeletionFilteringVortexFormat::without_deletion_vectors(Arc::clone(vortex_format)),
+            ),
         };
         ListingOptions::new(file_format).with_session_config_options(session_config)
     }
@@ -1238,7 +1477,25 @@ impl CayenneTableProvider {
         snapshot_dir: &std::path::Path,
     ) -> std::io::Result<()> {
         if !snapshot_dir.exists() {
+            // Capture the parent before creation so we can sync it afterwards.
+            let parent = snapshot_dir.parent().map(std::path::Path::to_path_buf);
             tokio::fs::create_dir_all(snapshot_dir).await?;
+
+            // Make the *creation of the new snapshot directory itself* durable.
+            // On POSIX, creating a subdirectory updates the parent's directory
+            // metadata. Without syncing the parent, a crash can make the new
+            // snapshot directory "disappear" from the filesystem even though
+            // we later write files into it and commit the catalog to point at it.
+            // This is the same durability requirement we enforce for file
+            // creation, renames, and WAL marker removal elsewhere in the code.
+            if let Some(parent) = parent {
+                tokio::task::spawn_blocking(move || {
+                    let f = std::fs::File::open(&parent)?;
+                    f.sync_all()
+                })
+                .await
+                .map_err(std::io::Error::other)??;
+            }
         }
         Ok(())
     }
@@ -1340,6 +1597,13 @@ impl CayenneTableProvider {
             "Moved {moved_count} file(s) from staging to snapshot {current_snapshot} for table {table_name}",
             table_name = self.table_metadata.table_name,
         );
+
+        // Durability: fsync the target snapshot directory so that the rename operations
+        // are persisted before the caller removes the staging WAL. This ensures that
+        // "WAL absent" truly means the data files are durable on disk (ACID Durability
+        // for the staged append path on local filesystems). Matches the sync performed
+        // in the sort-rewrite / compaction path before metadata commit.
+        Self::sync_snapshot_dir(&target_dir).await?;
 
         Ok(())
     }
@@ -1728,7 +1992,8 @@ impl CayenneTableProvider {
             current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
             table_metadata,
             catalog,
-            listing_table: Arc::new(RwLock::new(listing_table)),
+            listing_table: Arc::new(ArcSwap::new(listing_table)),
+            listing_fence: Arc::new(tokio::sync::RwLock::new(())),
             table_statistics: Arc::new(RwLock::new(table_statistics)),
             retention_filters,
             time_retention_filter_builder,
@@ -1829,6 +2094,17 @@ impl CayenneTableProvider {
                 target_partitions,
             )
             .await?;
+
+        // Sync the new snapshot directory for durability before recording the
+        // sequence number in the catalog. This is required for the same reason
+        // as in the sort-rewrite and normal append paths: the Vortex files must
+        // be durably present before the catalog metadata that makes them
+        // visible (via sequence number / protected snapshot) is committed.
+        let is_s3 = self.table_metadata.path.starts_with("s3://");
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            Self::sync_snapshot_dir(&snapshot_dir).await?;
+        }
 
         tracing::debug!(
             "Insert to new snapshot {} completed, wrote {} rows to Vortex in {} chunk(s)",
@@ -2117,6 +2393,7 @@ impl CayenneTableProvider {
             table_metadata: self.table_metadata.clone(),
             catalog: Arc::clone(&self.catalog),
             listing_table: Arc::clone(&self.listing_table),
+            listing_fence: Arc::clone(&self.listing_fence),
             table_statistics: Arc::clone(&self.table_statistics),
             context: Arc::clone(&self.context),
             retention_filters: self.retention_filters.clone(),
@@ -2274,14 +2551,8 @@ impl CayenneTableProvider {
         pk_indices: &[usize],
         converter: &RowConverter,
     ) -> Result<HashMap<OwnedRow, RowLocation>> {
-        // Clone listing table to avoid holding locks across await points
-        let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| Error::LockPoisoned {
-                table: self.table_metadata.table_name.clone(),
-                lock: LISTING_TABLE_LOCK_POISONED,
-            })?;
-            Arc::clone(&guard)
-        };
+        // Snapshot the current listing table via ArcSwap (wait-free).
+        let listing_table = self.listing_table.load_full();
 
         // Clone protected snapshots to avoid holding locks across await points
         let protected_snapshots = {
@@ -3402,14 +3673,8 @@ impl CayenneTableProvider {
             self.context.sort_columns()
         );
 
-        // Read all data from the current listing table
-        let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| Error::LockPoisoned {
-                table: self.table_metadata.table_name.clone(),
-                lock: LISTING_TABLE_LOCK_POISONED,
-            })?;
-            Arc::clone(&*guard)
-        };
+        // Snapshot the current listing table via ArcSwap (wait-free).
+        let listing_table = self.listing_table.load_full();
 
         // Create a session context and scan the listing table to get all data
         let ctx = self.create_session_context();
@@ -3554,15 +3819,11 @@ impl CayenneTableProvider {
         }
 
         // Now that catalog is committed, update the in-memory listing table.
+        // Hold listing_fence for write across the Arc swap so any concurrent
+        // scan() picks up either the old or the new listing atomically.
         {
-            let mut listing_table_guard =
-                self.listing_table
-                    .write()
-                    .map_err(|_| Error::LockPoisoned {
-                        table: self.table_metadata.table_name.clone(),
-                        lock: LISTING_TABLE_LOCK_POISONED,
-                    })?;
-            *listing_table_guard = new_listing_table;
+            let _fence = self.listing_fence.write().await;
+            self.listing_table.store(new_listing_table);
         }
 
         // Update in-memory state to match the new catalog
@@ -3909,7 +4170,7 @@ impl CayenneTableProvider {
         self.update_current_snapshot_id(&fresh_metadata.current_snapshot_id)?;
 
         // Rebuild the listing table from the fresh snapshot ID on disk.
-        self.refresh_listing_table()?;
+        self.refresh_listing_table().await?;
 
         tracing::debug!(
             "Refreshed in-memory state for table {} from catalog",
@@ -3975,7 +4236,27 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the listing table cannot be refreshed.
-    pub(crate) fn refresh_listing_table(&self) -> Result<()> {
+    pub(crate) async fn refresh_listing_table(&self) -> Result<()> {
+        // Acquire the listing fence for the duration of the swap. Single-partition
+        // path; the cross-partition append coordinator (issue #10125 step 6)
+        // uses `refresh_listing_table_under_held_fence` instead so it can hold
+        // every participating partition's fence across one barrier window.
+        let _fence = self.listing_fence.write().await;
+        self.refresh_listing_table_under_held_fence()
+    }
+
+    /// Refresh the listing table, ASSUMING the caller already holds
+    /// [`Self::listing_fence`] for write.
+    ///
+    /// Cross-partition coordinators (#10125 step 6) lock every participating
+    /// partition's fence in sorted order and call this method on each so the
+    /// listing-table swap happens under one combined barrier. Single-partition
+    /// callers should use [`Self::refresh_listing_table`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the listing table cannot be reconstructed.
+    pub(crate) fn refresh_listing_table_under_held_fence(&self) -> Result<()> {
         // Construct URL to current snapshot using the live snapshot ID
         // (which may differ from table_metadata after compaction)
         let current_snapshot = self.get_current_snapshot_id()?;
@@ -3996,22 +4277,45 @@ impl CayenneTableProvider {
             &self.pk_deletion_strategy,
         )?;
 
-        // Update the listing table with write lock
-        let mut guard = self
-            .listing_table
-            .write()
-            .map_err(|_| Error::LockPoisoned {
-                table: self.table_metadata.table_name.clone(),
-                lock: LISTING_TABLE_LOCK_POISONED,
-            })?;
-        *guard = new_listing_table;
+        self.listing_table.store(new_listing_table);
 
         tracing::debug!(
-            "Refreshed listing table for {} to pick up new files and update statistics",
+            "Refreshed listing table for {} (under held fence) to pick up new files",
             self.table_metadata.table_name
         );
 
         Ok(())
+    }
+
+    /// Acquire `listing_fence` for write and return an owned guard.
+    ///
+    /// Used by the cross-partition append coordinator (#10125 step 6) so it
+    /// can hold fences across every participating partition for the duration
+    /// of one barrier window.
+    pub async fn lock_listing_fence_write_owned(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.listing_fence).write_owned().await
+    }
+
+    /// Return the absolute path to the table's data root. Used by the
+    /// cross-partition coordinator to derive the top-level partitioned-WAL
+    /// directory (`<table_root>/_partitioned_wal/`).
+    #[must_use]
+    pub fn table_path_str(&self) -> &str {
+        &self.table_metadata.path
+    }
+
+    /// Return this partition's staging WAL path for top-level recovery
+    /// records. Local-filesystem only — S3-backed tables return the same
+    /// shape but recovery is not yet wired for object stores (#10125 step 6
+    /// scope).
+    #[must_use]
+    pub fn staging_wal_path_for_recovery(&self) -> std::path::PathBuf {
+        let staging_dir = Self::snapshot_dir_path(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            STAGING_DIR_NAME,
+        );
+        staging_dir.join(STAGING_WAL_FILENAME)
     }
 
     /// Invalidate the `list_files_cache` entry for the given snapshot directory URL.
@@ -4430,7 +4734,7 @@ impl CayenneTableProvider {
 
         self.clear_inlined_metadata_after_checkpoint().await?;
 
-        self.refresh_listing_table()?;
+        self.refresh_listing_table().await?;
 
         Ok(u64::try_from(total_rows).unwrap_or(u64::MAX))
     }
@@ -5444,6 +5748,17 @@ impl TableProvider for CayenneTableProvider {
 
         let target_partitions = state.config().target_partitions();
 
+        // Hold listing_fence.read() across the inner ListingTable::scan() call
+        // so concurrent writer barriers (#10125 §6.4) cannot interleave file
+        // moves with this scan's listing operation. Multiple concurrent scans
+        // share the read fence and do not block each other; only a writer-side
+        // barrier holding the write fence blocks scans, and vice versa.
+        //
+        // PR #10811 builds a fresh ListingTable per scan from the live
+        // current_snapshot_id so it can apply per-scan DataFusion config
+        // (target_partitions, etc.). The fence still matters because
+        // append-mode coordinators move files into the CURRENT snapshot dir.
+        let _fence = self.listing_fence.read().await;
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
@@ -5459,6 +5774,12 @@ impl TableProvider for CayenneTableProvider {
         let main_plan = listing_table
             .scan(state, effective_projection.as_ref(), scan_filters, limit)
             .await?;
+        // Note: we deliberately keep `_fence` alive until after the main plan
+        // has been built (i.e. until end of this function). DataFusion's
+        // ListingTable::scan resolves the file listing eagerly, so the fence
+        // really only needs to outlive `listing_table.scan(...).await`; we
+        // hold it slightly longer for clarity and to avoid micro-optimizing a
+        // microsecond-scale wait.
 
         // Check for protected snapshots that need to be scanned with partial deletion filter.
         let protected_snapshot_plans = self
@@ -5589,31 +5910,32 @@ impl TableProvider for CayenneTableProvider {
         &self,
         filters: &[&Expr],
     ) -> datafusion_common::Result<Vec<TableProviderFilterPushDown>> {
-        // Synchronous method - clone Arc quickly and release lock immediately
-        let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| {
-                datafusion_common::DataFusionError::Execution(
-                    LISTING_TABLE_LOCK_POISONED.to_string(),
-                )
-            })?;
-            Arc::clone(&guard)
-        };
+        // Synchronous TableProvider trait method: a wait-free ArcSwap snapshot
+        // is sufficient. No need to hold the listing fence — this delegates to
+        // ListingTable::supports_filters_pushdown which doesn't touch the
+        // filesystem.
+        let listing_table = self.listing_table.load_full();
         listing_table.supports_filters_pushdown(filters)
     }
 
     fn statistics(&self) -> Option<datafusion_common::Statistics> {
+        // Prefer the metastore-persisted table statistics (loaded from Vortex
+        // file footers) when present — they cover columns the ListingTable
+        // does not expose synchronously without rescanning footers.
         if let Some(stats) = self.cached_table_statistics_for_optimizer() {
             return Some(stats);
         }
 
+        // Inlined rows live only in the metastore; the ListingTable would
+        // under-count, so return None and let DataFusion treat the table as
+        // statistics-less rather than misleading the optimizer.
         if self.inlined_row_count.load(Ordering::Relaxed) > 0 {
             return None;
         }
 
-        let listing_table = {
-            let guard = self.listing_table.read().ok()?;
-            Arc::clone(&guard)
-        };
+        // Fall back to the underlying ListingTable stats. Synchronous method:
+        // wait-free ArcSwap snapshot is sufficient.
+        let listing_table = self.listing_table.load_full();
         listing_table.statistics()
     }
 
@@ -5880,15 +6202,9 @@ impl CayenneTableProvider {
         self.checkpoint_inlined_data_if_present_for_delete().await?;
 
         let ctx = self.create_session_context();
-        let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| {
-                datafusion_common::DataFusionError::Internal(format!(
-                    "Failed to read listing table lock for '{}'",
-                    self.table_metadata.table_name
-                ))
-            })?;
-            Arc::clone(&guard)
-        };
+        // Wait-free ArcSwap snapshot. Refreshes are serialized against this
+        // path by `self.write_lock`, held above.
+        let listing_table = self.listing_table.load_full();
 
         // PositionBased tables have no protected snapshots, so we only scan the main listing table.
         let all_tables = vec![listing_table];
@@ -6125,6 +6441,70 @@ mod tests {
         assert_eq!(
             stats.column_statistics[0].null_count,
             column_stats.null_count
+        );
+    }
+
+    #[test]
+    fn compute_column_stats_uses_typed_min_max_for_int64() {
+        let array = Int64Array::from(vec![Some(10), None, Some(-4), Some(7)]);
+
+        let stats = ColumnStatsAccumulator::compute_column_stats(&array);
+
+        assert_eq!(
+            stats.null_count,
+            datafusion_common::stats::Precision::Exact(1)
+        );
+        assert_eq!(
+            stats.min_value,
+            datafusion_common::stats::Precision::Exact(ScalarValue::Int64(Some(-4)))
+        );
+        assert_eq!(
+            stats.max_value,
+            datafusion_common::stats::Precision::Exact(ScalarValue::Int64(Some(10)))
+        );
+    }
+
+    #[test]
+    fn compute_column_stats_skips_float_nan_values() {
+        let array = Float64Array::from(vec![Some(f64::NAN), Some(5.0), None, Some(-2.0)]);
+
+        let stats = ColumnStatsAccumulator::compute_column_stats(&array);
+
+        assert_eq!(
+            stats.null_count,
+            datafusion_common::stats::Precision::Exact(1)
+        );
+        assert_eq!(
+            stats.min_value,
+            datafusion_common::stats::Precision::Exact(ScalarValue::Float64(Some(-2.0)))
+        );
+        assert_eq!(
+            stats.max_value,
+            datafusion_common::stats::Precision::Exact(ScalarValue::Float64(Some(5.0)))
+        );
+    }
+
+    #[test]
+    fn compute_column_stats_uses_typed_min_max_for_utf8_view() {
+        let array = StringViewArray::from(vec![Some("beta"), Some("alpha"), None]);
+
+        let stats = ColumnStatsAccumulator::compute_column_stats(&array);
+
+        assert_eq!(
+            stats.null_count,
+            datafusion_common::stats::Precision::Exact(1)
+        );
+        assert_eq!(
+            stats.min_value,
+            datafusion_common::stats::Precision::Exact(ScalarValue::Utf8View(Some(
+                "alpha".to_string()
+            )))
+        );
+        assert_eq!(
+            stats.max_value,
+            datafusion_common::stats::Precision::Exact(ScalarValue::Utf8View(Some(
+                "beta".to_string()
+            )))
         );
     }
 
@@ -6924,6 +7304,126 @@ mod tests {
                 &format!("row_{ts}"),
                 "name should match its timestamp"
             );
+        }
+    }
+
+    // ========================================================================
+    // Issue #10125 §6.4 — listing_fence regression guards
+    // ========================================================================
+    //
+    // These tests pin the fence semantics that scan() relies on. They access
+    // the private `listing_fence` field directly, so they must live in this
+    // module rather than in an integration test crate.
+    //
+    // Property under test: `scan()` holds `listing_fence.read()` across the
+    // inner DataFusion listing call, and `refresh_listing_table` /
+    // `update_listing_table_for_snapshot` hold `listing_fence.write()` across
+    // the ArcSwap store. Any reader/writer overlap is therefore serialized by
+    // the fence.
+
+    /// A held `listing_fence` read guard blocks an attempted write fence
+    /// acquisition until the read guard is dropped.
+    ///
+    /// This is the load-bearing guarantee for the append-side coordinator
+    /// (future work): with the read guard held by an in-flight scan, a
+    /// writer's `apply_under_barrier` (which is the future code path that
+    /// will replace `refresh_listing_table` for cross-partition commits) is
+    /// fenced out.
+    #[tokio::test]
+    async fn read_fence_blocks_write_fence_acquisition() {
+        let temp_dir = tempfile::TempDir::new().expect("create tempdir");
+        let db_path = temp_dir.path().join("test.db");
+        let data_path = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_path).expect("create data dir");
+
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("create catalog"));
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let options = CreateTableOptions {
+            table_name: "fence_test".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_path.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        };
+        let runtime_env = SessionContext::new().runtime_env();
+        let catalog_dyn: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let table = CayenneTableProvider::create_table(catalog_dyn, options, runtime_env)
+            .await
+            .expect("create table");
+
+        // Take the read fence — this models an in-flight scan().
+        let fence_arc = Arc::clone(&table.listing_fence);
+        let read_guard = fence_arc.read().await;
+
+        // Spawn a refresh: it must block on the write fence until we drop the
+        // read guard. (Cloning via clone_for_write shares the same fence.)
+        let table_for_writer = table.clone_for_write();
+        let writer = tokio::spawn(async move { table_for_writer.refresh_listing_table().await });
+
+        // Within a generous slice, the writer is still pending.
+        match tokio::time::timeout(std::time::Duration::from_millis(50), writer).await {
+            Err(_) => {
+                // Timeout — expected. Drop the read guard and verify the
+                // writer can now make progress.
+                drop(read_guard);
+                let table_for_writer = table.clone_for_write();
+                let writer =
+                    tokio::spawn(async move { table_for_writer.refresh_listing_table().await });
+                tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+                    .await
+                    .expect("refresh completes once the read fence is released")
+                    .expect("spawned task did not panic")
+                    .expect("refresh_listing_table returned Ok");
+            }
+            Ok(completed) => {
+                panic!("refresh_listing_table completed despite held read fence: {completed:?}");
+            }
+        }
+    }
+
+    /// A held `listing_fence` write guard blocks reader-side fence
+    /// acquisitions. Pairs with the previous test: under contention the fence
+    /// is bidirectional, so concurrent scans and the writer barrier always
+    /// observe consistent state.
+    #[tokio::test]
+    async fn write_fence_blocks_read_fence_acquisition() {
+        // Pure fence-primitive test — no need to construct a full
+        // CayenneTableProvider, since the field is just
+        // `Arc<tokio::sync::RwLock<()>>`.
+        let fence: Arc<tokio::sync::RwLock<()>> = Arc::new(tokio::sync::RwLock::new(()));
+
+        let write_guard = fence.write().await;
+
+        let fence_for_reader = Arc::clone(&fence);
+        let reader = tokio::spawn(async move {
+            let _read = fence_for_reader.read().await;
+        });
+
+        match tokio::time::timeout(std::time::Duration::from_millis(50), reader).await {
+            Err(_) => {
+                // Expected: reader blocked. Release the writer and ensure the
+                // reader can now proceed.
+                drop(write_guard);
+                let fence_for_reader = Arc::clone(&fence);
+                let reader = tokio::spawn(async move {
+                    let _read = fence_for_reader.read().await;
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+                    .await
+                    .expect("read fence acquires once writer is released")
+                    .expect("spawned task did not panic");
+            }
+            Ok(completed) => panic!("read fence acquired despite held write fence: {completed:?}"),
         }
     }
 }

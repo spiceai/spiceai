@@ -30,7 +30,13 @@ use crate::{config::ClusterRole, metrics::telemetry::track_bytes_processed, stat
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
 #[cfg(not(windows))]
-use cayenne::optimizer_rules::CayenneJoinRewriter;
+use cayenne::logical_optimizer::CayennePropagateFilterAcrossEquiJoinKeys;
+#[cfg(not(windows))]
+use cayenne::optimizer_rules::{
+    CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneJoinRewriter,
+};
+#[cfg(not(windows))]
+use datafusion::optimizer::{Optimizer, OptimizerRule};
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
@@ -383,7 +389,11 @@ impl DataFusionBuilder {
             // and accumulator budget are only configured for supported targets.
             // Windows keeps DataFusion's standard hash-join dynamic filters.
             clamp_maximum_shared_inlist_memory_bytes(exact_join_filter_memory_limit);
-            state = state.with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
+            state = with_cayenne_logical_optimizer(state);
+            state = state
+                .with_physical_optimizer_rule(Arc::new(CayenneDynamicFilterSharing::new()))
+                .with_physical_optimizer_rule(Arc::new(CayenneAntiJoinSortMergeRewriter::new()))
+                .with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
         }
         #[cfg(windows)]
         {
@@ -599,6 +609,43 @@ impl DataFusionBuilder {
     }
 }
 
+#[cfg(not(windows))]
+fn with_cayenne_logical_optimizer(mut state: SessionStateBuilder) -> SessionStateBuilder {
+    let trailing_rules = state.optimizer_rules().take().unwrap_or_default();
+    let mut optimizer_rules = state
+        .optimizer()
+        .take()
+        .map_or_else(|| Optimizer::new().rules, |optimizer| optimizer.rules);
+
+    insert_cayenne_logical_optimizer_rule(&mut optimizer_rules);
+    optimizer_rules.extend(trailing_rules);
+    state.with_optimizer_rules(optimizer_rules)
+}
+
+#[cfg(not(windows))]
+fn insert_cayenne_logical_optimizer_rule(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
+    if rules
+        .iter()
+        .any(|rule| rule.name() == "cayenne_propagate_filter_across_equi_join_keys")
+    {
+        return;
+    }
+
+    let insert_at = rules
+        .iter()
+        .position(|rule| rule.name() == "decorrelate_predicate_subquery")
+        .unwrap_or_else(|| {
+            rules
+                .iter()
+                .position(|rule| rule.name() == "push_down_filter")
+                .unwrap_or(rules.len())
+        });
+    rules.insert(
+        insert_at,
+        Arc::new(CayennePropagateFilterAcrossEquiJoinKeys::new()),
+    );
+}
+
 pub struct AnalyzerRulesBuilder {
     include_federation: bool,
     extra_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
@@ -777,6 +824,8 @@ mod tests {
     };
     #[cfg(not(windows))]
     use cayenne::provider::CayenneAccelerationExec;
+    #[cfg(not(windows))]
+    use datafusion::catalog::MemTable;
     use datafusion::optimizer::Analyzer;
     #[cfg(not(windows))]
     use datafusion::{
@@ -914,8 +963,208 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_registers_cayenne_logical_rule_before_subquery_decorrelation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .build();
+
+        let state = df.ctx.state();
+        let rule_names: Vec<&str> = state.optimizers().iter().map(|r| r.name()).collect();
+        let cayenne_position = rule_names
+            .iter()
+            .position(|name| *name == "cayenne_propagate_filter_across_equi_join_keys")
+            .expect("Cayenne logical filter propagation rule should be registered");
+        let decorrelate_position = rule_names
+            .iter()
+            .position(|name| *name == "decorrelate_predicate_subquery")
+            .expect("DataFusion decorrelate_predicate_subquery rule should be registered");
+        let push_down_position = rule_names
+            .iter()
+            .position(|name| *name == "push_down_filter")
+            .expect("DataFusion push_down_filter rule should be registered");
+
+        assert!(
+            cayenne_position < decorrelate_position,
+            "Cayenne logical filter propagation must run before decorrelate_predicate_subquery so generated InSubquery predicates cannot reach physical planning"
+        );
+        assert!(
+            decorrelate_position < push_down_position,
+            "DataFusion decorrelate_predicate_subquery must run before push_down_filter"
+        );
+        assert_eq!(
+            rule_names
+                .iter()
+                .filter(|name| **name == "cayenne_propagate_filter_across_equi_join_keys")
+                .count(),
+            1,
+            "Cayenne logical filter propagation rule should be registered exactly once"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_decorrelates_cayenne_propagated_subquery() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .build();
+
+        rt.block_on(async {
+            let nation_schema = Arc::new(Schema::new(vec![
+                Field::new("n_nationkey", DataType::Int64, false),
+                Field::new("n_name", DataType::Utf8, true),
+            ]));
+            let supplier_schema = Arc::new(Schema::new(vec![
+                Field::new("s_suppkey", DataType::Int64, false),
+                Field::new("s_nationkey", DataType::Int64, false),
+            ]));
+
+            df.ctx
+                .register_table(
+                    "nation",
+                    Arc::new(
+                        MemTable::try_new(Arc::clone(&nation_schema), vec![vec![]])
+                            .expect("nation mem table should be valid"),
+                    ),
+                )
+                .expect("nation table should register");
+            df.ctx
+                .register_table(
+                    "supplier",
+                    Arc::new(
+                        MemTable::try_new(Arc::clone(&supplier_schema), vec![vec![]])
+                            .expect("supplier mem table should be valid"),
+                    ),
+                )
+                .expect("supplier table should register");
+
+            let dataframe = df
+                .ctx
+                .sql(
+                    "SELECT s_suppkey FROM supplier, nation \
+                     WHERE s_nationkey = n_nationkey AND n_name = 'CHINA'",
+                )
+                .await
+                .expect("q21-shaped query should create a dataframe");
+            let optimized_plan = dataframe
+                .clone()
+                .into_optimized_plan()
+                .expect("q21-shaped query should optimize");
+            let optimized_plan = optimized_plan.to_string();
+
+            assert!(
+                !optimized_plan.contains("InSubquery"),
+                "Cayenne propagated subqueries must be decorrelated before physical planning: {optimized_plan}"
+            );
+
+            dataframe
+                .create_physical_plan()
+                .await
+                .expect("q21-shaped query should create a physical plan");
+        });
+    }
+
+    /// Regression test for the post-decorrelation re-propagation bug
+    /// (`cayenne::logical_optimizer`): after the rule wraps a Filter with
+    /// `InSubquery` and `DataFusion` decorrelates it to `LeftSemi`, the
+    /// optimizer iterates the rule pipeline to fixed point. Without the
+    /// cycle-detection fix in `analyze_logical_side`, the rule would re-fire
+    /// each pass and stack one redundant `LeftSemi` per iteration up to
+    /// `max_passes`. This integration test runs the full optimizer pipeline
+    /// and asserts the final plan has at most one `LeftSemi` for the q21
+    /// shape — proving the cycle guard holds across decorrelation.
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_does_not_stack_redundant_left_semi_after_decorrelation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .build();
+
+        rt.block_on(async {
+            let nation_schema = Arc::new(Schema::new(vec![
+                Field::new("n_nationkey", DataType::Int64, false),
+                Field::new("n_name", DataType::Utf8, true),
+            ]));
+            let supplier_schema = Arc::new(Schema::new(vec![
+                Field::new("s_suppkey", DataType::Int64, false),
+                Field::new("s_nationkey", DataType::Int64, false),
+            ]));
+
+            df.ctx
+                .register_table(
+                    "nation",
+                    Arc::new(
+                        MemTable::try_new(Arc::clone(&nation_schema), vec![vec![]])
+                            .expect("nation mem table should be valid"),
+                    ),
+                )
+                .expect("nation table should register");
+            df.ctx
+                .register_table(
+                    "supplier",
+                    Arc::new(
+                        MemTable::try_new(Arc::clone(&supplier_schema), vec![vec![]])
+                            .expect("supplier mem table should be valid"),
+                    ),
+                )
+                .expect("supplier table should register");
+
+            let dataframe = df
+                .ctx
+                .sql(
+                    "SELECT s_suppkey FROM supplier, nation \
+                     WHERE s_nationkey = n_nationkey AND n_name = 'CHINA'",
+                )
+                .await
+                .expect("q21-shaped query should create a dataframe");
+            let optimized_plan = dataframe
+                .into_optimized_plan()
+                .expect("q21-shaped query should optimize");
+            let plan_text = optimized_plan.to_string();
+
+            // The optimizer iterates rules to fixed point. Before the cycle
+            // guard, every iteration would add another `LeftSemi Join` on the
+            // fact side. With the guard in place we expect exactly one (the
+            // single decorrelated propagation).
+            let left_semi_count = plan_text.matches("LeftSemi Join").count();
+            assert!(
+                left_semi_count <= 1,
+                "post-decorrelation re-propagation is stacking redundant LeftSemi joins \
+                 (count={left_semi_count}); plan was:\n{plan_text}"
+            );
+        });
+    }
+
     /// Cayenne rewrites `HashJoinExec` to use a custom accumulator type, so it
-    /// must run after DataFusion's built-in physical optimizer rules that
+    /// must run after `DataFusion`'s built-in physical optimizer rules that
     /// downcast to the default `HashJoinExec` type.
     #[test]
     #[cfg(not(windows))]
@@ -947,10 +1196,34 @@ mod tests {
             .iter()
             .position(|name| *name == "CayenneJoinRewriter")
             .expect("Cayenne join rewriter should be registered");
+        let cayenne_filter_sharing_position = rule_names
+            .iter()
+            .position(|name| *name == "CayenneDynamicFilterSharing")
+            .expect("Cayenne dynamic filter sharing rule should be registered");
+        let cayenne_anti_sort_merge_position = rule_names
+            .iter()
+            .position(|name| *name == "CayenneAntiJoinSortMergeRewriter")
+            .expect("Cayenne anti join sort-merge rewriter should be registered");
 
         assert!(
             sanity_check_position < cayenne_rewriter_position,
             "CayenneJoinRewriter must run after DataFusion's built-in physical optimizer rules"
+        );
+        assert!(
+            sanity_check_position < cayenne_filter_sharing_position,
+            "CayenneDynamicFilterSharing must run after DataFusion's built-in physical optimizer rules"
+        );
+        assert!(
+            cayenne_filter_sharing_position < cayenne_rewriter_position,
+            "CayenneDynamicFilterSharing must run before CayenneJoinRewriter so it can inspect DataFusion's default HashJoinExec nodes"
+        );
+        assert!(
+            cayenne_filter_sharing_position < cayenne_anti_sort_merge_position,
+            "CayenneDynamicFilterSharing must run before CayenneAntiJoinSortMergeRewriter so anti joins can still receive shared scan filters"
+        );
+        assert!(
+            cayenne_anti_sort_merge_position < cayenne_rewriter_position,
+            "CayenneAntiJoinSortMergeRewriter must run before CayenneJoinRewriter so anti joins are not recreated with the hash-join accumulator"
         );
     }
 

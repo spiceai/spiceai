@@ -117,6 +117,41 @@ impl ExecutorConnection {
 
 pub type TablePartitions = HashMap<TableReference, Vec<Expr>>;
 
+/// Append-only log of DDL SQL statements applied to the cluster.
+///
+/// Used to replay DDL on executors that join after the statements were originally executed.
+/// Each statement is stored in executor-compatible form (e.g. `IF NOT EXISTS`/`IF EXISTS`).
+///
+/// The version is the count of statements in the log. `statements_since(version)` returns
+/// all statements appended after that version.
+#[derive(Debug, Default)]
+struct DdlLog {
+    statements: Vec<String>,
+}
+
+impl DdlLog {
+    /// Appends a DDL SQL statement. Returns the new version (count of statements).
+    fn append(&mut self, sql: String) -> u64 {
+        self.statements.push(sql);
+        self.statements.len() as u64
+    }
+
+    /// Returns all statements appended after `since_version`.
+    fn statements_since(&self, since_version: u64) -> &[String] {
+        let idx = usize::try_from(since_version).unwrap_or(usize::MAX);
+        if idx >= self.statements.len() {
+            &[]
+        } else {
+            &self.statements[idx..]
+        }
+    }
+
+    /// Returns all statements and the current version.
+    fn snapshot(&self) -> (&[String], u64) {
+        (&self.statements, self.statements.len() as u64)
+    }
+}
+
 /// Registry for tracking executor control stream connections.
 ///
 /// Schedulers use this registry to:
@@ -140,6 +175,9 @@ pub struct ExecutorRegistry {
     accelerations_partition_store: Arc<PartitionStore>,
 
     federated_partition_store: Arc<PartitionStore>,
+
+    /// Append-only log of DDL SQL statements applied to the cluster.
+    ddl_log: Arc<RwLock<DdlLog>>,
 }
 
 impl ExecutorRegistry {
@@ -155,6 +193,7 @@ impl ExecutorRegistry {
             partitions: Arc::new(RwLock::new(HashMap::new())),
             accelerations_partition_store,
             federated_partition_store,
+            ddl_log: Arc::new(RwLock::new(DdlLog::default())),
         }
     }
 
@@ -166,6 +205,31 @@ impl ExecutorRegistry {
     #[must_use]
     pub fn federated_partition_store(&self) -> Arc<PartitionStore> {
         Arc::clone(&self.federated_partition_store)
+    }
+
+    /// Appends a DDL SQL statement to the cluster DDL log.
+    ///
+    /// Must be called **before** forwarding to executors so that a concurrent
+    /// `GetAppDefinition` will include the statement in its snapshot.
+    pub async fn append_ddl(&self, sql: String) {
+        let version = self.ddl_log.write().await.append(sql);
+        tracing::debug!(ddl_version = version, "Appended DDL to cluster log");
+    }
+
+    /// Returns a snapshot of all DDL statements and the current version.
+    pub async fn ddl_snapshot(&self) -> (Vec<String>, u64) {
+        let log = self.ddl_log.read().await;
+        let (stmts, version) = log.snapshot();
+        (stmts.to_vec(), version)
+    }
+
+    /// Returns DDL statements appended after `since_version`.
+    pub async fn ddl_statements_since(&self, since_version: u64) -> Vec<String> {
+        self.ddl_log
+            .read()
+            .await
+            .statements_since(since_version)
+            .to_vec()
     }
 
     /// Registers an executor connection.
@@ -640,5 +704,55 @@ mod tests {
         // Original executor should still be registered
         let executors = registry.connected_executors().await;
         assert_eq!(executors, vec!["executor-1"]);
+    }
+
+    #[tokio::test]
+    async fn test_ddl_log_empty() {
+        let registry = make_registry().await;
+        let (stmts, version) = registry.ddl_snapshot().await;
+        assert!(stmts.is_empty());
+        assert_eq!(version, 0);
+        assert!(registry.ddl_statements_since(0).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ddl_log_append_and_snapshot() {
+        let registry = make_registry().await;
+
+        registry
+            .append_ddl("CREATE SCHEMA IF NOT EXISTS \"cat\".\"s1\"".to_string())
+            .await;
+        registry
+            .append_ddl(
+                "CREATE TABLE IF NOT EXISTS \"cat\".\"s1\".\"t1\" (id BIGINT NOT NULL)".to_string(),
+            )
+            .await;
+
+        let (stmts, version) = registry.ddl_snapshot().await;
+        assert_eq!(version, 2);
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("CREATE SCHEMA"));
+        assert!(stmts[1].contains("CREATE TABLE"));
+    }
+
+    #[tokio::test]
+    async fn test_ddl_log_statements_since() {
+        let registry = make_registry().await;
+        registry.append_ddl("stmt0".to_string()).await;
+        registry.append_ddl("stmt1".to_string()).await;
+        registry.append_ddl("stmt2".to_string()).await;
+
+        assert_eq!(
+            registry.ddl_statements_since(0).await,
+            vec!["stmt0", "stmt1", "stmt2"]
+        );
+        assert_eq!(
+            registry.ddl_statements_since(1).await,
+            vec!["stmt1", "stmt2"]
+        );
+        assert_eq!(registry.ddl_statements_since(2).await, vec!["stmt2"]);
+        assert!(registry.ddl_statements_since(3).await.is_empty());
+        // Beyond end returns empty
+        assert!(registry.ddl_statements_since(100).await.is_empty());
     }
 }

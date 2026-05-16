@@ -53,10 +53,11 @@ use parking_lot::RwLock;
 use runtime_proto::{
     AllocateInitialPartitionsRequest, AllocateInitialPartitionsResponse, BytesArray,
     CancelTasksCommand, ExecutorControlMessage, ExpandSecretRequest, ExpandSecretResponse,
-    GetAppDefinitionRequest, GetAppDefinitionResponse, GetMetricsRequest, GetMetricsResponse,
-    GetSchedulersRequest, GetSchedulersResponse, GetTaskHistoryRequest, GetTaskHistoryResponse,
-    PollNowCommand, SchedulerControlMessage, SchedulerInstance, TaskCancelInfo,
-    cluster_service_server::ClusterService, executor_control_message::Message as ExecutorMessage,
+    GetAppDefinitionRequest, GetAppDefinitionResponse, GetDdlCatchupRequest, GetDdlCatchupResponse,
+    GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest, GetSchedulersResponse,
+    GetTaskHistoryRequest, GetTaskHistoryResponse, PollNowCommand, SchedulerControlMessage,
+    SchedulerInstance, TaskCancelInfo, cluster_service_server::ClusterService,
+    executor_control_message::Message as ExecutorMessage,
     scheduler_control_message::Message as SchedulerMessage,
 };
 use runtime_secrets::Secrets;
@@ -306,15 +307,23 @@ impl ClusterService for ClusterServiceImpl {
             request.executor_id
         );
 
-        let app_guard = self.app.read().await;
-        let Some(ref app) = *app_guard else {
-            return Err(Status::internal("App context not available"));
+        let app_json = {
+            let app_guard = self.app.read().await;
+            let Some(ref app) = *app_guard else {
+                return Err(Status::internal("App context not available"));
+            };
+            serde_json::to_string(app.as_ref())
+                .map_err(|e| Status::internal(format!("Failed to serialize app: {e}")))?
         };
 
-        let app_json = serde_json::to_string(app.as_ref())
-            .map_err(|e| Status::internal(format!("Failed to serialize app: {e}")))?;
+        // Snapshot the DDL log so the executor can replay DDL-created tables/schemas.
+        let (ddl_statements, ddl_version) = self.executor_registry.ddl_snapshot().await;
 
-        Ok(Response::new(GetAppDefinitionResponse { app_json }))
+        Ok(Response::new(GetAppDefinitionResponse {
+            app_json,
+            ddl_statements,
+            ddl_version,
+        }))
     }
 
     async fn expand_secret(
@@ -729,6 +738,25 @@ impl ClusterService for ClusterServiceImpl {
         Ok(Response::new(AllocateInitialPartitionsResponse {
             table_partitions,
         }))
+    }
+
+    async fn get_ddl_catchup(
+        &self,
+        request: Request<GetDdlCatchupRequest>,
+    ) -> Result<Response<GetDdlCatchupResponse>, Status> {
+        let request = request.into_inner();
+        tracing::debug!(
+            "ClusterService::get_ddl_catchup for executor {}, since_version={}",
+            request.executor_id,
+            request.since_version
+        );
+
+        let ddl_statements = self
+            .executor_registry
+            .ddl_statements_since(request.since_version)
+            .await;
+
+        Ok(Response::new(GetDdlCatchupResponse { ddl_statements }))
     }
 }
 
