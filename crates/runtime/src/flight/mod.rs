@@ -625,11 +625,11 @@ pub(crate) fn is_address_in_use_error(err: &tonic::transport::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::cast_view_columns;
-    use arrow::array::RecordBatch;
+    use arrow::array::{Array, RecordBatch};
     use arrow::{
         array::{
-            BinaryArray, BinaryViewArray, Int32Array, LargeBinaryArray, LargeStringArray,
-            StringArray, StringViewArray,
+            BinaryViewArray, Int32Array, LargeBinaryArray, LargeStringArray, StringArray,
+            StringViewArray,
         },
         datatypes::{DataType, Field, Schema},
     };
