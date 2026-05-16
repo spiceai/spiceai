@@ -255,7 +255,8 @@ pub enum PkConflictDetection {
     /// Build a PK keyset and apply configured `on_conflict` behavior.
     #[default]
     Auto,
-    /// Append without scanning existing PKs. The source must enforce PK uniqueness.
+    /// Append without scanning existing PKs. The source must enforce PK uniqueness,
+    /// and the ingestion path must not replay rows across bootstrap/WAL boundaries.
     None,
 }
 
@@ -373,8 +374,8 @@ pub struct VortexConfig {
         alias = "inline_memtable_max_bytes"
     )]
     pub inline_flush_max_bytes: i64,
-    /// Whether inserts should scan existing data for primary-key conflicts.
-    /// Set to `none` only when the source enforces PK uniqueness.
+    /// Whether inserts should scan existing data for primary-key conflicts. Set to `none` only
+    /// when the source enforces PK uniqueness and ingestion cannot replay existing rows.
     #[serde(default)]
     pub pk_conflict_detection: PkConflictDetection,
 }

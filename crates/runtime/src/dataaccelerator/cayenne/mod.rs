@@ -924,7 +924,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["btrblocks", "zstd"])
             .default("btrblocks"),
         ParameterSpec::component("pk_conflict_detection")
-            .description("Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts and applies on_conflict behavior. 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness, such as append-only CDC from a primary-key constrained source.")
+            .description("Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts and applies on_conflict behavior. 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness and the ingestion path cannot replay existing rows, such as steady-state append-only CDC after bootstrap.")
             .one_of(&["auto", "none"])
             .default("auto"),
         ParameterSpec::component("upload_concurrency")

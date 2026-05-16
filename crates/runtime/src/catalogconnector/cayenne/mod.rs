@@ -55,7 +55,7 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .description("Compression: 'btrblocks' (default) or 'zstd'.")
         .default("btrblocks"),
     ParameterSpec::component("pk_conflict_detection")
-        .description("Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts; 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness.")
+        .description("Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts; 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness and ingestion cannot replay existing rows.")
         .one_of(&["auto", "none"])
         .default("auto"),
     ParameterSpec::component("upload_concurrency")
