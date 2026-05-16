@@ -60,9 +60,8 @@ const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "pg_catalog", "pg_toast"
 #[derive(Debug, Clone, serde::Serialize)]
 struct ForeignKeyConstraint {
     columns: Vec<String>,
-    referenced_schema: String,
-    referenced_table: String,
-    referenced_columns: Vec<String>,
+    foreign_table: String,
+    foreign_columns: Vec<String>,
 }
 
 /// FK constraints grouped by source table name within a schema.
@@ -148,8 +147,9 @@ impl PostgresCatalogProvider {
             .context(ConnectionFailedSnafu)?;
 
         // Use referential_constraints to link FK -> referenced PK/unique constraint,
-        // then join key_column_usage on both sides matched by ordinal_position.
-        // This avoids the cross-product issue with constraint_column_usage on composite FKs.
+        // then join key_column_usage on both sides matched by position_in_unique_constraint.
+        // This correctly handles composite FKs where column order differs from the referenced
+        // unique constraint's column order.
         let rows = conn
             .conn
             .query(
@@ -167,7 +167,7 @@ impl PostgresCatalogProvider {
                  JOIN information_schema.key_column_usage kcu2 \
                      ON kcu2.constraint_name = rc.unique_constraint_name \
                      AND kcu2.constraint_schema = rc.unique_constraint_schema \
-                     AND kcu2.ordinal_position = kcu1.ordinal_position \
+                     AND kcu2.ordinal_position = kcu1.position_in_unique_constraint \
                  WHERE rc.constraint_schema = $1 \
                  ORDER BY kcu1.table_name, rc.constraint_name, kcu1.ordinal_position",
                 &[&schema_name],
@@ -189,18 +189,18 @@ impl PostgresCatalogProvider {
 
             let table_constraints = constraints_by_table.entry(table_name).or_default();
 
+            let foreign_table = format!("{referenced_schema}.{referenced_table}");
             let fk =
                 table_constraints
                     .entry(constraint_name)
                     .or_insert_with(|| ForeignKeyConstraint {
                         columns: Vec::new(),
-                        referenced_schema,
-                        referenced_table,
-                        referenced_columns: Vec::new(),
+                        foreign_table,
+                        foreign_columns: Vec::new(),
                     });
 
             fk.columns.push(column_name);
-            fk.referenced_columns.push(referenced_column);
+            fk.foreign_columns.push(referenced_column);
         }
 
         // Flatten: HashMap<table, HashMap<constraint, FK>> -> HashMap<table, Vec<FK>>
@@ -639,9 +639,8 @@ mod tests {
             "orders".to_string(),
             vec![ForeignKeyConstraint {
                 columns: vec!["customer_id".to_string()],
-                referenced_schema: "public".to_string(),
-                referenced_table: "customers".to_string(),
-                referenced_columns: vec!["id".to_string()],
+                foreign_table: "public.customers".to_string(),
+                foreign_columns: vec!["id".to_string()],
             }],
         );
 
@@ -664,9 +663,8 @@ mod tests {
             serde_json::from_str(fk_json).expect("FK metadata should be valid JSON");
         assert_eq!(fks.len(), 1);
         assert_eq!(fks[0]["columns"], serde_json::json!(["customer_id"]));
-        assert_eq!(fks[0]["referenced_schema"], "public");
-        assert_eq!(fks[0]["referenced_table"], "customers");
-        assert_eq!(fks[0]["referenced_columns"], serde_json::json!(["id"]));
+        assert_eq!(fks[0]["foreign_table"], "public.customers");
+        assert_eq!(fks[0]["foreign_columns"], serde_json::json!(["id"]));
 
         // lineitem should have no FK metadata
         let lineitem_provider = tables.get("lineitem").expect("lineitem table should exist");
@@ -690,9 +688,8 @@ mod tests {
             "order_lines".to_string(),
             vec![ForeignKeyConstraint {
                 columns: vec!["order_id".to_string(), "line_id".to_string()],
-                referenced_schema: "public".to_string(),
-                referenced_table: "orders".to_string(),
-                referenced_columns: vec!["id".to_string(), "line_num".to_string()],
+                foreign_table: "public.orders".to_string(),
+                foreign_columns: vec!["id".to_string(), "line_num".to_string()],
             }],
         );
 
@@ -720,8 +717,9 @@ mod tests {
             fks[0]["columns"],
             serde_json::json!(["order_id", "line_id"])
         );
+        assert_eq!(fks[0]["foreign_table"], "public.orders");
         assert_eq!(
-            fks[0]["referenced_columns"],
+            fks[0]["foreign_columns"],
             serde_json::json!(["id", "line_num"])
         );
     }

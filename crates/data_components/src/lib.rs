@@ -37,9 +37,8 @@ use datafusion::{
 /// [
 ///   {
 ///     "columns": ["customer_id"],
-///     "referenced_schema": "public",
-///     "referenced_table": "customers",
-///     "referenced_columns": ["id"]
+///     "foreign_table": "public.customers",
+///     "foreign_columns": ["id"]
 ///   }
 /// ]
 /// ```
@@ -136,6 +135,8 @@ pub struct MetadataEnrichedTableProvider {
 
 impl MetadataEnrichedTableProvider {
     /// Wrap `inner`, merging `extra_metadata` into its schema-level metadata.
+    ///
+    /// Keys in `extra_metadata` will overwrite any pre-existing schema metadata with the same key.
     #[must_use]
     pub fn new(inner: Arc<dyn TableProvider>, extra_metadata: HashMap<String, String>) -> Self {
         let base = inner.schema();
