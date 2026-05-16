@@ -165,6 +165,7 @@ pub struct ExecutorRegistry {
 
     /// Map of `executor_id` -> `FlightSqlClient`
     /// An executor may be in `connections` and not in `flight_sql_clients` (e.g. during initial connection).
+    /// An executor with a `FlightSqlClient` is considered "ready" — the scheduler can route queries to it.
     flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
 
     /// Map of `executor_id` -> table partitions for that executor
@@ -305,9 +306,20 @@ impl ExecutorRegistry {
         self.partitions.read().await.clone()
     }
 
-    /// Returns the number of executors that currently have a `FlightSqlClient`.
+    /// Returns the number of executors that currently have a `FlightSqlClient` — i.e. the
+    /// scheduler can route queries to them. This is the "ready executor count" used by
+    /// `/v1/ready` query-param gating.
     pub async fn flight_sql_clients_count(&self) -> usize {
         self.flight_sql_clients.read().await.len()
+    }
+
+    /// Returns the number of executors currently registered via control stream.
+    ///
+    /// An executor is "registered" once its control stream is open but may not yet be "ready"
+    /// (queryable via `FlightSQL`) — the window between `register()` and the executor's first
+    /// `AllocateInitialPartitions` RPC. Used as the denominator for `/v1/ready` percentage gating.
+    pub async fn connected_executor_count(&self) -> usize {
+        self.connections.read().await.len()
     }
 
     /// Returns the list of currently connected executor IDs.
@@ -689,6 +701,58 @@ mod tests {
 
         assert_eq!(executors.len(), 2);
         assert_eq!(executors, vec!["executor-1", "executor-3"]);
+    }
+
+    fn dummy_flight_sql_client() -> FlightSqlClient {
+        use arrow_flight::flight_service_client::FlightServiceClient;
+        use arrow_flight::sql::client::FlightSqlServiceClient;
+        use flight_client::cookie::CookieService;
+        use tonic::transport::Endpoint;
+
+        // FlightSqlClient wraps a tonic channel; these tests only exercise the registry's
+        // bookkeeping, not actual flight calls. Build one with `connect_lazy` to a
+        // non-routable address so no connection is ever attempted.
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let cookie_channel = CookieService::new(channel, Arc::new(CookieStore::new()));
+        FlightSqlServiceClient::new_from_inner(FlightServiceClient::new(cookie_channel))
+    }
+
+    #[tokio::test]
+    async fn test_ready_and_connected_count_tracking() {
+        let registry = make_registry().await;
+
+        assert_eq!(registry.connected_executor_count().await, 0);
+        assert_eq!(registry.flight_sql_clients_count().await, 0);
+
+        // Control stream opens for three executors → connected, but not yet ready.
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        let (tx3, _rx3) = mpsc::channel(1);
+        registry.register("e1".to_string(), tx1).await;
+        registry.register("e2".to_string(), tx2).await;
+        registry.register("e3".to_string(), tx3).await;
+        assert_eq!(registry.connected_executor_count().await, 3);
+        assert_eq!(registry.flight_sql_clients_count().await, 0);
+
+        // Two of them complete the handshake (AllocateInitialPartitions) → ready.
+        registry
+            .insert_flight_sql_client("e1".to_string(), dummy_flight_sql_client())
+            .await;
+        registry
+            .insert_flight_sql_client("e2".to_string(), dummy_flight_sql_client())
+            .await;
+        assert_eq!(registry.connected_executor_count().await, 3);
+        assert_eq!(registry.flight_sql_clients_count().await, 2);
+
+        // Unregister one ready executor — both counts drop.
+        registry.unregister("e2").await;
+        assert_eq!(registry.connected_executor_count().await, 2);
+        assert_eq!(registry.flight_sql_clients_count().await, 1);
+
+        // Unregister the not-yet-ready executor — connected drops, ready unchanged.
+        registry.unregister("e3").await;
+        assert_eq!(registry.connected_executor_count().await, 1);
+        assert_eq!(registry.flight_sql_clients_count().await, 1);
     }
 
     #[tokio::test]
