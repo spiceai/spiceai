@@ -20,8 +20,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use spice::commands::acceleration::{AccelerationArgs, SnapshotArgs, SnapshotsArgs};
 use spice::commands::{
     acceleration, add, catalogs, chat, cloud, cluster, completions, connect, dataset, datasets,
-    init, install, login, models, nsql, pods, query, refresh, run, search, sql, status, trace,
-    upgrade, validate, version, workers,
+    feedback, init, install, login, models, nsql, pods, query, refresh, run, search, sql, status,
+    trace, upgrade, validate, version, workers,
 };
 use spice::{Result, RuntimeContext};
 use tracing_subscriber::EnvFilter;
@@ -138,6 +138,9 @@ enum Commands {
 
     /// Validate a spicepod.yaml without starting the runtime
     Validate(validate::ValidateArgs),
+
+    /// Open the Spice.ai community Slack to share feedback
+    Feedback(feedback::FeedbackArgs),
 }
 
 fn main() {
@@ -379,6 +382,9 @@ fn run_cli(cli: Cli) -> Result<()> {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(validate::execute(&args))?;
+        }
+        Commands::Feedback(args) => {
+            feedback::execute(&args)?;
         }
     }
 
