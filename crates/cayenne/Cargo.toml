@@ -1,6 +1,6 @@
 [package]
 authors = ["Spice.ai OSS Authors"]
-description = "Cayenne: A DuckLake-inspired lakehouse format using SQLite for metadata and Vortex files for data storage"
+description = "Cayenne: A lakehouse format using SQLite or Turso for metadata and Vortex files for data storage"
 edition = "2024"
 license = "Apache-2.0"
 name = "cayenne"

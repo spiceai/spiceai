@@ -1,10 +1,6 @@
 /*
 Copyright 2025-2026 The Spice.ai OSS Authors
-                deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::empty()));
-            }
 Licensed under the Apache License, Version 2.0 (the "License");
-                deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::empty()));
-            }
 You may obtain a copy of the License at
 
      https://www.apache.org/licenses/LICENSE-2.0
@@ -96,7 +92,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task;
 use vortex::dtype::arrow::FromArrowType;
 use vortex_datafusion::VortexFormat;
@@ -144,6 +140,7 @@ pub struct CayenneCdcWrite {
     rows: u64,
     prepared_append: Option<PreparedStagedAppend>,
     stats: Option<Arc<ColumnStatsAccumulator>>,
+    validated_file_keys: HashSet<OwnedRow>,
 }
 
 impl CayenneCdcWrite {
@@ -153,6 +150,7 @@ impl CayenneCdcWrite {
             rows,
             prepared_append: None,
             stats: None,
+            validated_file_keys: HashSet::new(),
         }
     }
 
@@ -161,12 +159,14 @@ impl CayenneCdcWrite {
         rows: u64,
         prepared_append: PreparedStagedAppend,
         stats: Arc<ColumnStatsAccumulator>,
+        validated_file_keys: HashSet<OwnedRow>,
     ) -> Self {
         Self {
             table,
             rows,
             prepared_append: Some(prepared_append),
             stats: Some(stats),
+            validated_file_keys,
         }
     }
 
@@ -191,6 +191,7 @@ impl CayenneCdcWrite {
         if let Some(prepared_append) = self.prepared_append {
             prepared_append.apply_under_barrier().await?;
             let rows = prepared_append.finish().await?;
+            self.table.record_file_pk_keys(&self.validated_file_keys);
             self.table
                 .schedule_post_write_maintenance(self.stats, false);
             Ok(rows)
@@ -936,6 +937,13 @@ pub struct CayenneTableProvider {
     /// Maps `snapshot_id` -> `minimum_sequence` (all deletes with seq <= `min_seq` don't apply).
     /// At scan time, data from these snapshots is scanned without deletion filtering.
     protected_snapshots: Arc<RwLock<HashMap<String, i64>>>,
+    /// Cached visible primary-key set for auto conflict detection.
+    ///
+    /// The first auto-mode insert still scans existing data to build the set;
+    /// later serialized writes reuse it and publish successful write deltas.
+    /// Delete paths invalidate this cache because arbitrary predicates can
+    /// remove keys without telling us which keys were affected.
+    pk_keyset_cache: Arc<ParkingMutex<Option<HashMap<OwnedRow, RowLocation>>>>,
     /// Cached inlined row count. Maintained while the process is running so
     /// append-heavy inline CDC writes don't query the metastore after every
     /// burst just to decide whether to checkpoint.
@@ -1168,6 +1176,24 @@ struct InlineAwareDeletionSink {
     filters: Vec<Expr>,
 }
 
+struct PkKeysetInvalidatingDeletionSink {
+    table: CayenneTableProvider,
+    inner: Arc<dyn DeletionSink>,
+}
+
+#[async_trait]
+impl DeletionSink for PkKeysetInvalidatingDeletionSink {
+    async fn delete_from(
+        &self,
+    ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let deleted = self.inner.delete_from().await?;
+        if deleted > 0 {
+            self.table.clear_cached_pk_keyset();
+        }
+        Ok(deleted)
+    }
+}
+
 #[async_trait]
 impl DeletionSink for InlineAwareDeletionSink {
     async fn delete_from(
@@ -1181,11 +1207,17 @@ impl DeletionSink for InlineAwareDeletionSink {
             .await?;
         let file_deleted = self.file_sink.delete_from().await?;
 
-        inlined_deleted.checked_add(file_deleted).ok_or_else(|| {
+        let deleted = inlined_deleted.checked_add(file_deleted).ok_or_else(|| {
             Box::new(datafusion_common::DataFusionError::Execution(
                 "Deleted row count overflowed u64".to_string(),
             )) as Box<dyn std::error::Error + Send + Sync>
-        })
+        })?;
+
+        if deleted > 0 {
+            self.table.clear_cached_pk_keyset();
+        }
+
+        Ok(deleted)
     }
 }
 
@@ -1206,6 +1238,7 @@ struct BatchValidationResult {
 pub(crate) struct PreparedInsertStream {
     pub(crate) stream: SendableRecordBatchStream,
     pub(crate) on_conflict_deletions: OnConflictDeletions,
+    pub(crate) validated_keys: HashSet<OwnedRow>,
 }
 
 #[derive(Default)]
@@ -1225,6 +1258,8 @@ impl OnConflictDeletions {
     #[must_use]
     pub(crate) fn has_file_deletions(&self) -> bool {
         !self.delete_specs.is_empty()
+            || !self.deleted_pk_i64.is_empty()
+            || !self.deleted_row_keys.is_empty()
     }
 
     #[must_use]
@@ -1302,6 +1337,7 @@ fn pk_deletion_snapshot_for_strategy(strategy: &PkDeletionStrategyWithCache) -> 
 struct OnConflictValidationResult {
     filtered_batches: Vec<RecordBatch>,
     on_conflict_deletions: OnConflictDeletions,
+    kept_keys: HashSet<OwnedRow>,
 }
 
 struct OnConflictContext<'a> {
@@ -1309,7 +1345,7 @@ struct OnConflictContext<'a> {
     converter: &'a RowConverter,
     on_conflict: &'a OnConflict,
     upsert_options: &'a UpsertOptions,
-    existing_keys: &'a mut HashMap<OwnedRow, RowLocation>,
+    existing_keys: &'a HashMap<OwnedRow, RowLocation>,
     incoming_keys: &'a HashSet<OwnedRow>,
 }
 
@@ -1908,6 +1944,15 @@ impl CayenneTableProvider {
         }
     }
 
+    fn record_current_snapshot_files_added(&self, file_count: usize) {
+        if file_count == 0 {
+            return;
+        }
+
+        self.new_files_since_last_compaction
+            .fetch_add(file_count, Ordering::Relaxed);
+    }
+
     /// Move staging files to the current snapshot on local filesystem.
     ///
     /// After all renames complete, the target snapshot directory is fsync'd so
@@ -1976,6 +2021,7 @@ impl CayenneTableProvider {
         // directory, which doubled the per-commit fsync cost on local FS.
         if moved_count > 0 {
             Self::sync_snapshot_dir(&target_dir).await?;
+            self.record_current_snapshot_files_added(moved_count);
         }
 
         Ok(())
@@ -2078,6 +2124,8 @@ impl CayenneTableProvider {
             copied_locations.len(),
             self.table_metadata.table_name,
         );
+
+        self.record_current_snapshot_files_added(copied_locations.len());
 
         Ok(())
     }
@@ -2395,6 +2443,7 @@ impl CayenneTableProvider {
                 object_store_registered_runtime_envs,
             )),
             protected_snapshots: Arc::new(RwLock::new(protected_snapshots)),
+            pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
             staging_wal_present: Arc::new(AtomicBool::new(true)),
             staging_may_have_files: Arc::new(AtomicBool::new(true)),
@@ -2723,8 +2772,7 @@ impl CayenneTableProvider {
         // landed in the live snapshot; staging writes are tracked separately
         // via the staging_may_have_files flag.
         if snapshot_id != STAGING_DIR_NAME && writer_ops > 0 {
-            self.new_files_since_last_compaction
-                .fetch_add(writer_ops, Ordering::Relaxed);
+            self.record_current_snapshot_files_added(writer_ops);
         }
 
         Ok((total_rows, writer_ops, stats_accumulator))
@@ -2809,6 +2857,7 @@ impl CayenneTableProvider {
             ),
             current_snapshot_id: Arc::clone(&self.current_snapshot_id),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
+            pk_keyset_cache: Arc::clone(&self.pk_keyset_cache),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
             staging_wal_present: Arc::clone(&self.staging_wal_present),
             staging_may_have_files: Arc::clone(&self.staging_may_have_files),
@@ -2906,6 +2955,46 @@ impl CayenneTableProvider {
 
     pub(crate) fn clear_cached_table_statistics(&self) {
         self.set_cached_table_statistics(None);
+    }
+
+    fn take_cached_pk_keyset(&self) -> Option<HashMap<OwnedRow, RowLocation>> {
+        self.pk_keyset_cache.lock().take()
+    }
+
+    fn store_cached_pk_keyset(&self, keyset: HashMap<OwnedRow, RowLocation>) {
+        *self.pk_keyset_cache.lock() = Some(keyset);
+    }
+
+    pub(crate) fn clear_cached_pk_keyset(&self) {
+        *self.pk_keyset_cache.lock() = None;
+    }
+
+    fn record_pk_keys_as(&self, keys: &HashSet<OwnedRow>, source: RowSource) {
+        if keys.is_empty() {
+            return;
+        }
+
+        let mut guard = self.pk_keyset_cache.lock();
+        let Some(keyset) = guard.as_mut() else {
+            return;
+        };
+
+        let location = RowLocation {
+            source,
+            data_file_id: DEFAULT_DATA_FILE_ID,
+            row_id: -1,
+        };
+        for key in keys {
+            keyset.insert(key.clone(), location);
+        }
+    }
+
+    pub(crate) fn record_inlined_pk_keys(&self, keys: &HashSet<OwnedRow>) {
+        self.record_pk_keys_as(keys, RowSource::Inlined);
+    }
+
+    pub(crate) fn record_file_pk_keys(&self, keys: &HashSet<OwnedRow>) {
+        self.record_pk_keys_as(keys, RowSource::File);
     }
 
     /// Returns the column indices for the configured primary key, if any.
@@ -3259,6 +3348,7 @@ impl CayenneTableProvider {
             return Ok(PreparedInsertStream {
                 stream,
                 on_conflict_deletions: OnConflictDeletions::default(),
+                validated_keys: HashSet::new(),
             });
         };
 
@@ -3270,20 +3360,33 @@ impl CayenneTableProvider {
             return Ok(PreparedInsertStream {
                 stream,
                 on_conflict_deletions: OnConflictDeletions::default(),
+                validated_keys: HashSet::new(),
             });
         }
 
         let converter = self.build_pk_converter(&pk_indices)?;
-        let mut existing_keys = self.load_existing_keyset(&pk_indices, &converter).await?;
-        tracing::debug!(
-            "prepare_stream_for_insert: loaded {} existing keys for table {}",
-            existing_keys.len(),
-            self.table_metadata.table_name
-        );
+        let existing_keys = if let Some(existing_keys) = self.take_cached_pk_keyset() {
+            tracing::trace!(
+                "prepare_stream_for_insert: reused {} cached existing keys for table {}",
+                existing_keys.len(),
+                self.table_metadata.table_name
+            );
+            existing_keys
+        } else {
+            let existing_keys = self.load_existing_keyset(&pk_indices, &converter).await?;
+            tracing::debug!(
+                "prepare_stream_for_insert: loaded {} existing keys for table {}",
+                existing_keys.len(),
+                self.table_metadata.table_name
+            );
+            existing_keys
+        };
 
         let validation_result = self
-            .validate_on_conflict(stream, &pk_indices, &converter, &mut existing_keys)
-            .await?;
+            .validate_on_conflict(stream, &pk_indices, &converter, &existing_keys)
+            .await;
+        self.store_cached_pk_keyset(existing_keys);
+        let validation_result = validation_result?;
 
         // Build a new stream from the validated batches.
         let schema = validation_result.filtered_batches.first().map_or_else(
@@ -3298,6 +3401,7 @@ impl CayenneTableProvider {
         Ok(PreparedInsertStream {
             stream: Box::pin(validated_stream) as SendableRecordBatchStream,
             on_conflict_deletions: validation_result.on_conflict_deletions,
+            validated_keys: validation_result.kept_keys,
         })
     }
 
@@ -3310,9 +3414,10 @@ impl CayenneTableProvider {
         mut stream: SendableRecordBatchStream,
         pk_indices: &[usize],
         converter: &RowConverter,
-        existing_keys: &mut HashMap<OwnedRow, RowLocation>,
+        existing_keys: &HashMap<OwnedRow, RowLocation>,
     ) -> Result<OnConflictValidationResult> {
         let mut incoming_keys: HashSet<OwnedRow> = HashSet::with_capacity(1024);
+        let mut all_kept_keys: HashSet<OwnedRow> = HashSet::with_capacity(1024);
         let mut filtered_batches = Vec::new();
         let mut delete_specs: HashMap<i64, Vec<i64>> = HashMap::new();
         let mut all_deleted_pk_i64: Vec<i64> = Vec::new();
@@ -3365,7 +3470,8 @@ impl CayenneTableProvider {
             all_deleted_inlined_pk_i64.extend(deleted_inlined_pk_i64);
             all_deleted_inlined_row_keys.extend(deleted_inlined_row_keys);
 
-            incoming_keys.extend(kept_keys);
+            incoming_keys.extend(kept_keys.iter().cloned());
+            all_kept_keys.extend(kept_keys);
 
             if let Some(batch) = filtered_batch {
                 filtered_batches.push(batch);
@@ -3381,6 +3487,7 @@ impl CayenneTableProvider {
                 deleted_inlined_pk_i64: all_deleted_inlined_pk_i64,
                 deleted_inlined_row_keys: all_deleted_inlined_row_keys,
             },
+            kept_keys: all_kept_keys,
         })
     }
 
@@ -3463,21 +3570,12 @@ impl CayenneTableProvider {
                             }
                         }
 
-                        if !is_inlined_conflict {
+                        if !is_inlined_conflict && existing.row_id >= 0 {
                             delete_specs
                                 .entry(existing.data_file_id)
                                 .or_default()
                                 .push(existing.row_id);
                         }
-
-                        ctx.existing_keys.insert(
-                            key.clone(),
-                            RowLocation {
-                                source: RowSource::Inlined,
-                                data_file_id: DEFAULT_DATA_FILE_ID,
-                                row_id: -1,
-                            },
-                        );
                         keep_mask.push(true);
                     }
                 }
@@ -4782,6 +4880,7 @@ impl CayenneTableProvider {
 
         // Refresh deletion cache after applying retention filters
         if deleted_count > 0 {
+            self.clear_cached_pk_keyset();
             self.refresh_deletion_cache().await?;
         }
 
@@ -4808,6 +4907,7 @@ impl CayenneTableProvider {
 
         self.pk_deletion_strategy
             .refresh_from(&fresh_strategy, &self.table_metadata.table_name)?;
+        self.clear_cached_pk_keyset();
 
         tracing::debug!(
             "Refreshed deletion cache for table {} (strategy: {:?})",
@@ -4872,6 +4972,8 @@ impl CayenneTableProvider {
             let mut guard = self.protected_snapshots.write();
             guard.clear();
         }
+
+        self.clear_cached_pk_keyset();
 
         tracing::debug!(
             "Cleared all deletion and insert records caches for table {}",
@@ -4960,6 +5062,7 @@ impl CayenneTableProvider {
 
         self.pk_deletion_strategy
             .refresh_from(&fresh_strategy, &self.table_metadata.table_name)?;
+        self.clear_cached_pk_keyset();
 
         // Reload protected snapshots from the catalog.
         let fresh_protected_snapshots = Self::load_protected_snapshots(
@@ -6388,6 +6491,26 @@ impl CayenneTableProvider {
         );
     }
 
+    fn record_listing_fence_wait_duration(&self, duration: Duration) {
+        telemetry::track_cayenne_listing_fence_wait_duration(
+            duration,
+            &[telemetry::KeyValue::new(
+                "dataset",
+                self.table_metadata.table_name.clone(),
+            )],
+        );
+    }
+
+    fn record_listing_scan_duration(&self, duration: Duration) {
+        telemetry::track_cayenne_listing_scan_duration(
+            duration,
+            &[telemetry::KeyValue::new(
+                "dataset",
+                self.table_metadata.table_name.clone(),
+            )],
+        );
+    }
+
     /// Apply partial deletion filter - only deletions with seq > threshold are applied.
     ///
     /// This is used for protected snapshots which should skip deletions that existed
@@ -6736,7 +6859,9 @@ impl TableProvider for CayenneTableProvider {
         // current_snapshot_id so it can apply per-scan DataFusion config
         // (target_partitions, etc.). The fence still matters because
         // append-mode coordinators move files into the CURRENT snapshot dir.
+        let listing_fence_wait_start = Instant::now();
         let _fence = self.listing_fence.read().await;
+        self.record_listing_fence_wait_duration(listing_fence_wait_start.elapsed());
         let current_snapshot_id = self.get_current_snapshot_id();
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
@@ -6748,9 +6873,12 @@ impl TableProvider for CayenneTableProvider {
             &current_snapshot_id,
             state.config(),
         )?;
-        let main_plan = listing_table
+        let listing_scan_start = Instant::now();
+        let main_plan_result = listing_table
             .scan(state, effective_projection.as_ref(), scan_filters, limit)
-            .await?;
+            .await;
+        self.record_listing_scan_duration(listing_scan_start.elapsed());
+        let main_plan = main_plan_result?;
         // Note: we deliberately keep `_fence` alive until after the main plan
         // has been built (i.e. until end of this function). DataFusion's
         // ListingTable::scan resolves the file listing eagerly, so the fence
@@ -7105,19 +7233,23 @@ impl CayenneTableProvider {
             Some(self.build_protected_snapshot_listing_tables()?)
         };
 
+        let sink: Arc<dyn DeletionSink> = Arc::new(FileBasedDeletionSink::new(
+            Arc::clone(&self.listing_table),
+            protected_snapshot_tables,
+            filter.clone(),
+            self.table_metadata.table_name.clone(),
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.protected_snapshots),
+            self.table_metadata.table_id.clone(),
+            self.table_metadata.path.clone(),
+            Arc::clone(self.context.runtime_env()),
+            Arc::clone(&self.write_lock),
+        ));
         Ok(Arc::new(DeletionExec::new(Arc::new(
-            FileBasedDeletionSink::new(
-                Arc::clone(&self.listing_table),
-                protected_snapshot_tables,
-                filter.clone(),
-                self.table_metadata.table_name.clone(),
-                Arc::clone(&self.catalog),
-                Arc::clone(&self.protected_snapshots),
-                self.table_metadata.table_id.clone(),
-                self.table_metadata.path.clone(),
-                Arc::clone(self.context.runtime_env()),
-                Arc::clone(&self.write_lock),
-            ),
+            PkKeysetInvalidatingDeletionSink {
+                table: self.clone_for_write(),
+                inner: sink,
+            },
         ))))
     }
 
@@ -7126,8 +7258,13 @@ impl CayenneTableProvider {
         &self,
         filters: &[Expr],
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let sink: Arc<dyn DeletionSink> =
+            Arc::new(self.build_deletion_vector_sink(filters, Some(Arc::clone(&self.write_lock)))?);
         Ok(Arc::new(DeletionExec::new(Arc::new(
-            self.build_deletion_vector_sink(filters, Some(Arc::clone(&self.write_lock)))?,
+            PkKeysetInvalidatingDeletionSink {
+                table: self.clone_for_write(),
+                inner: sink,
+            },
         ))))
     }
 
@@ -7203,9 +7340,14 @@ impl CayenneTableProvider {
             None, // write lock already held above
         );
 
-        sink.delete_by_key_hash_probe(&ctx, &all_tables, matched_keys, key_columns)
+        let deleted = sink
+            .delete_by_key_hash_probe(&ctx, &all_tables, matched_keys, key_columns)
             .await
-            .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))
+            .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
+        if deleted > 0 {
+            self.clear_cached_pk_keyset();
+        }
+        Ok(deleted)
     }
 
     /// Returns `true` if this table uses the `PositionBased` deletion strategy.

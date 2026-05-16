@@ -14,6 +14,54 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Append-side mutation writer for [`CayenneTableProvider`].
+//!
+//! `AppendMutationWriter` owns the logic that turns a `SendableRecordBatchStream`
+//! into either an inline-memtable update (small writes, no blocking config) or a
+//! staged Vortex write. Two entry points:
+//!
+//! - [`AppendMutationWriter::write`] — the synchronous append path used by
+//!   `DataFusion`'s `INSERT INTO` and by CDC fallback. Runs prepare →
+//!   try-inline-or-stage → optional on-conflict deletion vectors → optional
+//!   retention/sort → schedule post-write maintenance (debounced refresh +
+//!   stats + compaction).
+//! - [`AppendMutationWriter::write_cdc_pipelined`] — the CDC fast path. Stage A
+//!   writes Vortex files into the staging dir and returns a [`super::table::CayenneCdcWrite`]
+//!   that owns the staging-WAL receipt and the still-held per-table write
+//!   guard. The runtime spawns Stage B on a background task so the next CDC
+//!   burst can begin while burst N's catalog/listing finalization is in flight.
+//!
+//! ## Pipelined vs. synchronous routing
+//!
+//! `write_cdc_pipelined` short-circuits to the synchronous `write_prepared_stream`
+//! path when any of these hold:
+//!
+//! - the table has pending PK deletions
+//! - the burst produced file-level on-conflict deletions
+//! - the table has any on-conflict deletions
+//! - the table has `sort_columns` configured
+//! - the table is partitioned
+//! - the table has retention filters
+//!
+//! Those paths can't be safely deferred to Stage B because they require holding
+//! state (deletion vectors, sort order, retention pruning) until the visibility
+//! flip is durable.
+//!
+//! ## Inline-memtable admission
+//!
+//! `try_inline_or_restream` buffers up to
+//! [`crate::metadata::VortexConfig::inline_max_buffer_bytes`] of Arrow data and
+//! checks the per-write admission gate (`inline_max_rows`, `inline_max_bytes`).
+//! If it fits, the batch is serialized to Arrow IPC and inserted into the
+//! metastore's `cayenne_inlined_data` table. Otherwise the buffered batches are
+//! restreamed into the regular staged-write path.
+//!
+//! The cumulative memtable flush thresholds (`inline_flush_max_*` on
+//! `VortexConfig`) are evaluated by
+//! [`super::table::CayenneTableProvider::checkpoint_inlined_data_if_memtable_pressure_exceeded`]
+//! after every inline insert, and trigger a checkpoint to a Vortex file when
+//! exceeded.
+
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -160,6 +208,7 @@ impl<'a> AppendMutationWriter<'a> {
         let PreparedInsertStream {
             stream: mut prepared_stream,
             on_conflict_deletions,
+            validated_keys,
         } = self.table.prepare_stream_for_insert(data).await?;
 
         let has_file_on_conflict_deletions = on_conflict_deletions.has_file_deletions();
@@ -179,6 +228,7 @@ impl<'a> AppendMutationWriter<'a> {
                     on_conflict_deletions,
                     pending_pk_deletions,
                     has_file_on_conflict_deletions,
+                    validated_keys,
                 )
                 .await?;
             return Ok(CayenneCdcWrite::completed(
@@ -193,10 +243,13 @@ impl<'a> AppendMutationWriter<'a> {
             .try_inline_or_restream(prepared_stream, &[], &[])
             .await?
         {
-            InlineMutationOutcome::Inlined(rows) => Ok(CayenneCdcWrite::completed(
-                self.table.clone_for_write_operations(),
-                rows,
-            )),
+            InlineMutationOutcome::Inlined(rows) => {
+                self.table.record_inlined_pk_keys(&validated_keys);
+                Ok(CayenneCdcWrite::completed(
+                    self.table.clone_for_write_operations(),
+                    rows,
+                ))
+            }
             InlineMutationOutcome::Fallback(re_stream) => {
                 prepared_stream = re_stream;
                 let target_size_bytes = self.context.target_file_size_bytes();
@@ -215,6 +268,7 @@ impl<'a> AppendMutationWriter<'a> {
                     rows,
                     prepared_append,
                     stats_acc,
+                    validated_keys,
                 ))
             }
         }
@@ -236,6 +290,7 @@ impl<'a> AppendMutationWriter<'a> {
         let PreparedInsertStream {
             stream: prepared_stream,
             on_conflict_deletions,
+            validated_keys,
         } = self.table.prepare_stream_for_insert(data).await?;
 
         let has_file_on_conflict_deletions = on_conflict_deletions.has_file_deletions();
@@ -245,6 +300,7 @@ impl<'a> AppendMutationWriter<'a> {
             on_conflict_deletions,
             pending_pk_deletions,
             has_file_on_conflict_deletions,
+            validated_keys,
         )
         .await
     }
@@ -255,6 +311,7 @@ impl<'a> AppendMutationWriter<'a> {
         on_conflict_deletions: OnConflictDeletions,
         pending_pk_deletions: bool,
         has_file_on_conflict_deletions: bool,
+        validated_keys: std::collections::HashSet<arrow_row::OwnedRow>,
     ) -> Result<u64> {
         let has_on_conflict_deletions = !on_conflict_deletions.is_empty();
 
@@ -287,7 +344,10 @@ impl<'a> AppendMutationWriter<'a> {
                 )
                 .await?
             {
-                InlineMutationOutcome::Inlined(rows) => return Ok(rows),
+                InlineMutationOutcome::Inlined(rows) => {
+                    self.table.record_inlined_pk_keys(&validated_keys);
+                    return Ok(rows);
+                }
                 InlineMutationOutcome::Fallback(re_stream) => {
                     prepared_stream = re_stream;
                     let target_size_bytes = self.context.target_file_size_bytes();
@@ -308,6 +368,12 @@ impl<'a> AppendMutationWriter<'a> {
                             sorted,
                         ),
                     );
+
+                    if retention_deleted_rows > 0 {
+                        self.table.clear_cached_pk_keyset();
+                    } else {
+                        self.table.record_file_pk_keys(&validated_keys);
+                    }
 
                     return Ok(rows);
                 }
@@ -359,6 +425,12 @@ impl<'a> AppendMutationWriter<'a> {
             needs_new_snapshot
                 || should_refresh_listing_table_after_post_write(retention_deleted_rows, sorted),
         );
+
+        if retention_deleted_rows > 0 {
+            self.table.clear_cached_pk_keyset();
+        } else {
+            self.table.record_file_pk_keys(&validated_keys);
+        }
 
         Ok(total_rows)
     }
