@@ -278,7 +278,15 @@ impl SpicedInstance {
     ) -> Result<SpiceClient> {
         let mut spice_client = ClientBuilder::new();
 
-        if let Some(key) = api_key {
+        // Caller-supplied key wins; otherwise fall back to whatever was stashed
+        // on the External variant (e.g. by the system-adapter setup response).
+        let effective_key = api_key.or_else(|| match self {
+            Self::External {
+                api_key: Some(key), ..
+            } => Some(key.clone()),
+            _ => None,
+        });
+        if let Some(key) = effective_key {
             spice_client = spice_client.api_key(key.as_str());
         }
 
