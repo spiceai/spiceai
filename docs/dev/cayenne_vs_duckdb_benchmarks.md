@@ -7,11 +7,11 @@ retention, throughput — and to catch regressions early.
 
 The comparison has two layers:
 
-| Layer                          | What it measures                                                               | Where it lives                                                                                                    | How to run                                                                                     |
-| ------------------------------ | ------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| End-to-end spicepod benchmarks | Real spiced ingesting from real sources, queries via Flight                    | `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/pairs.yaml` references existing yamls under `test/spicepods/` | `testoperator run bench` / `throughput` / `load` / `append` on each side of a pair             |
+| Layer                          | What it measures                                                                 | Where it lives                                                                                                    | How to run                                                                                     |
+| ------------------------------ | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| End-to-end spicepod benchmarks | Real spiced ingesting from real sources, queries via Flight                      | `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/pairs.yaml` references existing yamls under `test/spicepods/` | `testoperator run bench` / `throughput` / `load` / `append` on each side of a pair             |
 | Mixed append+query benchmarks  | Analytical query workers running while append/upsert/retention loads mutate data | `pairs.yaml` entries with `workload: mixed` and append dispatch yamls under `tools/testoperator/dispatch/tpch/`   | `testoperator run append --concurrency <N> --load-interval <S> --load-steps <N>`               |
-| In-process micro-benchmarks    | Direct `CayenneTableProvider` vs `duckdb::Connection` on identical Arrow input | `crates/cayenne/benches/vs_duckdb_*.rs`                                                                           | `cargo bench -p cayenne --features duckdb-bench --bench vs_duckdb_ingest` (or the other three) |
+| In-process micro-benchmarks    | Direct `CayenneTableProvider` vs `duckdb::Connection` on identical Arrow input   | `crates/cayenne/benches/vs_duckdb_*.rs`                                                                           | `cargo bench -p cayenne --features duckdb-bench --bench vs_duckdb_ingest` (or the other three) |
 
 ## Layer 1 — Spicepod matrix
 
