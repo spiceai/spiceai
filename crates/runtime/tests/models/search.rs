@@ -281,6 +281,7 @@ async fn assert_search_result_primary_key_matches(
 fn assert_search_response_snapshot(test_name: &str, resp: Value, round_scores: bool) {
     match test_name {
         "multi_embedding_parent_child_basic" | "multi_embedding_parent_child_additional" => {
+            assert_search_response_scores_descending(test_name, &resp);
             insta::assert_json_snapshot!(
                 format!("{test_name}_response"),
                 normalize_search_response_json(resp, true, round_scores)
@@ -294,11 +295,37 @@ fn assert_search_response_snapshot(test_name: &str, resp: Value, round_scores: b
             assert_search_response_structure(name, &resp);
         }
         _ => {
+            assert_search_response_scores_descending(test_name, &resp);
             insta::assert_snapshot!(
                 format!("{test_name}_response"),
                 normalize_search_response(resp, round_scores)
             );
         }
+    }
+}
+
+fn assert_search_response_scores_descending(test_name: &str, resp: &Value) {
+    let results = resp
+        .get("results")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("{test_name}: response should have a 'results' array"));
+
+    let mut previous_score = f64::MAX;
+    for (index, result) in results.iter().enumerate() {
+        let score = result
+            .get("_score")
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| panic!("{test_name}: result[{index}] missing numeric '_score'"));
+
+        assert!(
+            !score.is_nan(),
+            "{test_name}: result[{index}] score should not be NaN"
+        );
+        assert!(
+            score <= previous_score,
+            "{test_name}: result[{index}] score {score} > previous {previous_score} (not descending)"
+        );
+        previous_score = score;
     }
 }
 
@@ -481,44 +508,63 @@ fn sql_response_normalization_redacts_well_separated_2dp_scores_without_reorderi
 }
 
 #[test]
-fn sql_response_normalization_preserves_higher_than_2dp_precision() {
-    // 3-decimal-precision scores (from `trunc(_score, 3)`) have enough
-    // resolution to remain stable across CI runs; the function must not
-    // touch them even when scores are clustered.
+fn sql_response_normalization_redacts_higher_than_2dp_precision_without_reordering() {
     let input = json!([
         {"id": 468, "_score": 0.540},
         {"id": 189, "_score": 0.539},
         {"id": 1277, "_score": 0.539},
         {"id": 948, "_score": 0.528}
     ]);
-    let normalized = normalize_sql_response_for_snapshot(input.clone(), true);
-    assert_eq!(normalized, input);
+    let normalized = normalize_sql_response_for_snapshot(input, true);
+    assert_eq!(
+        normalized,
+        json!([
+            {"id": 468, "_score": "[score]"},
+            {"id": 189, "_score": "[score]"},
+            {"id": 1277, "_score": "[score]"},
+            {"id": 948, "_score": "[score]"}
+        ])
+    );
 }
 
 #[test]
-fn sql_response_normalization_is_noop_when_round_scores_disabled() {
+fn sql_response_normalization_redacts_scores_when_round_scores_disabled() {
     let input = json!([
         {"id": 1, "_score": 0.34},
         {"id": 2, "_score": 0.30}
     ]);
-    let normalized = normalize_sql_response_for_snapshot(input.clone(), false);
-    assert_eq!(normalized, input);
+    let normalized = normalize_sql_response_for_snapshot(input, false);
+    assert_eq!(
+        normalized,
+        json!([
+            {"id": 1, "_score": "[score]"},
+            {"id": 2, "_score": "[score]"}
+        ])
+    );
 }
 
 #[test]
-fn sql_response_normalization_skips_trunc_3_columns_with_all_zero_third_decimals() {
+fn sql_response_normalization_redacts_trunc_3_columns_without_reordering() {
     // Regression: a `trunc(_score, 3)` snapshot whose values all happen to end
     // in `0` (e.g. `0.540, 0.530, 0.520, 0.510`) is numerically indistinguishable
-    // from a 2dp response. The explicit precision in the column name must keep
-    // us from rounding it.
+    // from a 2dp response. The explicit precision in the column name must keep us
+    // from reordering it, but the score values are still redacted for snapshots.
     let input = json!([
         {"id": 1, "trunc(vector_search()._score,Int64(3))": 0.540},
         {"id": 2, "trunc(vector_search()._score,Int64(3))": 0.530},
         {"id": 3, "trunc(vector_search()._score,Int64(3))": 0.520},
         {"id": 4, "trunc(vector_search()._score,Int64(3))": 0.510}
     ]);
-    let normalized = normalize_sql_response_for_snapshot(input.clone(), true);
-    assert_eq!(normalized, input);
+    let normalized = normalize_sql_response_for_snapshot(input, true);
+    assert_eq!(
+        normalized,
+        json!([
+            {"id": 1, "trunc(vector_search()._score,Int64(3))": "[score]"},
+            {"id": 2, "trunc(vector_search()._score,Int64(3))": "[score]"},
+            {"id": 3, "trunc(vector_search()._score,Int64(3))": "[score]"},
+            {"id": 4, "trunc(vector_search()._score,Int64(3))": "[score]"}
+        ])
+    );
 }
 
 #[test]
@@ -714,23 +760,14 @@ fn normalize_search_response(json: Value, round_scores: bool) -> String {
 /// Normalize a SQL search response for snapshot comparison when scores are
 /// non-deterministic.
 ///
-/// When `round_scores` is `true` and the response contains 2-decimal precision
-/// score columns (produced by `trunc(_score, 2)`), redacts score values before
-/// snapshotting. If those scores are also clustered, rounds each score to 1
-/// decimal place for ordering and re-sorts rows by rounded score (descending)
-/// then by `id` (ascending). This absorbs the ±0.01 jitter that crosses
-/// `trunc` boundaries across CI runs with non-deterministic embeddings
-/// (`model2vec` / `s3vectors` / `OpenAI`).
+/// Redacts score-like columns before snapshotting. When `round_scores` is `true`
+/// and the response contains clustered 2-decimal precision scores, re-sorts rows
+/// by 1-decimal rounded score (descending) then by `id` (ascending). This absorbs
+/// the ±0.01 jitter that crosses `trunc` boundaries across CI runs with
+/// non-deterministic embeddings (`model2vec` / `s3vectors` / `OpenAI`).
 ///
-/// Returns the input unchanged when normalization does not apply — namely when
-/// `round_scores` is `false`, the response has no score column, the score
-/// column comes from `trunc(_, N)` with `N != 2`, or scores are at higher
-/// precision than 2 decimals (e.g. from `trunc(_score, 3)`).
+/// Returns the input unchanged when the response has no score-like column.
 fn normalize_sql_response_for_snapshot(value: Value, round_scores: bool) -> Value {
-    if !round_scores {
-        return value;
-    }
-
     let Value::Array(mut rows) = value else {
         return value;
     };
@@ -763,16 +800,6 @@ fn normalize_sql_response_for_snapshot(value: Value, round_scores: bool) -> Valu
         return Value::Array(rows);
     };
 
-    // When the column name encodes the `trunc` precision explicitly (e.g.
-    // `trunc(..., Int64(3))`), use that to gate normalization — it's more
-    // reliable than inspecting the score values, which can't distinguish
-    // `0.54` from `0.540`.
-    if let Some(precision) = parse_trunc_precision(&primary_score_key)
-        && precision != 2
-    {
-        return Value::Array(rows);
-    }
-
     let scores: Vec<f64> = rows
         .iter()
         .filter_map(|row| row.get(&primary_score_key).and_then(Value::as_f64))
@@ -781,55 +808,19 @@ fn normalize_sql_response_for_snapshot(value: Value, round_scores: bool) -> Valu
         return Value::Array(rows);
     }
 
-    // Only normalize 2-decimal precision scores. Higher-precision scores
-    // (e.g. from `trunc(_score, 3)`) carry enough resolution to remain stable
-    // across CI runs and rounding them to 1 decimal would lose meaningful
-    // information.
-    //
-    // NOTE: this check uses `s * 100` ≈ integer, which means it can't tell
-    // `0.54` from `0.540` for aliased columns where the column name doesn't
-    // expose the trunc precision (e.g. `... as _score`). The explicit
-    // precision check above catches the unaliased case; aliased 3dp columns
-    // whose values all happen to end in 0 would be misclassified, but in
-    // practice DataFusion's f64 → JSON serialization preserves enough
-    // floating-point noise that all-zeros 3rd-decimal values are unusual.
-    let is_2dp_precision = scores.iter().all(|&s| {
-        let scaled = s * 100.0;
-        (scaled - scaled.round()).abs() < 1e-6
-    });
-    if !is_2dp_precision {
-        return Value::Array(rows);
-    }
-
-    let max = scores.iter().copied().fold(f64::MIN, f64::max);
-    let min = scores.iter().copied().fold(f64::MAX, f64::min);
-    let range = max - min;
-
-    if (0.011..=0.06).contains(&range) {
-        for row in &mut rows {
-            let Some(obj) = row.as_object_mut() else {
-                continue;
-            };
-            for k in &score_keys {
-                if let Some(f) = obj.get(k).and_then(Value::as_f64) {
-                    let rounded = (f * 10.0).round() / 10.0;
-                    if let Some(num) = serde_json::Number::from_f64(rounded) {
-                        obj.insert(k.clone(), Value::Number(num));
-                    }
-                }
-            }
-        }
-
+    if round_scores && should_stabilize_sql_score_order(&primary_score_key, &scores) {
         rows.sort_by(|a, b| {
-            let sa = a
+            let score_a = a
                 .get(&primary_score_key)
                 .and_then(Value::as_f64)
+                .map(round_to_one_decimal)
                 .unwrap_or(0.0);
-            let sb = b
+            let score_b = b
                 .get(&primary_score_key)
                 .and_then(Value::as_f64)
+                .map(round_to_one_decimal)
                 .unwrap_or(0.0);
-            match sb.partial_cmp(&sa).unwrap_or(Ordering::Equal) {
+            match score_b.partial_cmp(&score_a).unwrap_or(Ordering::Equal) {
                 Ordering::Equal => {
                     let id_a = a.get("id").and_then(Value::as_i64).unwrap_or(i64::MAX);
                     let id_b = b.get("id").and_then(Value::as_i64).unwrap_or(i64::MAX);
@@ -852,6 +843,32 @@ fn normalize_sql_response_for_snapshot(value: Value, round_scores: bool) -> Valu
     }
 
     Value::Array(rows)
+}
+
+fn should_stabilize_sql_score_order(primary_score_key: &str, scores: &[f64]) -> bool {
+    if let Some(precision) = parse_trunc_precision(primary_score_key)
+        && precision != 2
+    {
+        return false;
+    }
+
+    let is_2dp_precision = scores.iter().all(|&score| {
+        let scaled = score * 100.0;
+        (scaled - scaled.round()).abs() < 1e-6
+    });
+    if !is_2dp_precision {
+        return false;
+    }
+
+    let max = scores.iter().copied().fold(f64::MIN, f64::max);
+    let min = scores.iter().copied().fold(f64::MAX, f64::min);
+    let range = max - min;
+
+    (0.011..=0.06).contains(&range)
+}
+
+fn round_to_one_decimal(score: f64) -> f64 {
+    (score * 10.0).round() / 10.0
 }
 
 fn score_key_priority(key: &str) -> (u8, &str) {
