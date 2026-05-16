@@ -16,15 +16,11 @@ limitations under the License.
 
 //! Regression bench: per-append cost when `sort_columns` is configured.
 //!
-//! Demonstrates that a single append on a table with `cayenne_sort_columns`
-//! set scales **linearly with the preloaded table size**, because
-//! `AppendMutationWriter::sort_if_configured` (`provider/mutation_writer.rs:638`)
-//! calls `CayenneTableProvider::sort_and_rewrite_data`
-//! (`provider/table.rs:4272`) on every successful write. That helper reads
-//! every row in the current snapshot, runs them through DataFusion's
-//! `SortExec`, and rewrites them into a new snapshot via
-//! `commit_compaction` — i.e. `O(N log N)` per burst, where `N` is the full
-//! table row count, *not* the burst row count.
+//! Guards the sort-on-compact write path: a single append on a table with
+//! `cayenne_sort_columns` set should stay proportional to the incoming append
+//! size, not to the preloaded table size. Sort work is intentionally deferred
+//! to compaction; the append path should not call
+//! `CayenneTableProvider::sort_and_rewrite_data` after every write.
 //!
 //! For comparison the bench also measures the same append on an otherwise
 //! identical table without `sort_columns`. That lane stays roughly constant
@@ -33,14 +29,10 @@ limitations under the License.
 //!
 //! ## Why this matters
 //!
-//! Sustained CDC ingestion on a sort-column table currently hits this cost
-//! on every coalesced burst. On a 50 M-row table at SF100, a single burst
-//! drives hundreds of MB of read + write before the LSN can be acked. The
-//! benchmark is intentionally a regression test: it asserts (via Criterion's
-//! report) that the sorted-append cost grows with preload size while the
-//! unsorted lane does not. A future fix that moves the sort to compaction
-//! (level-0 unsorted writes → background level-N sorted compaction) should
-//! make the sorted curve match the unsorted one.
+//! Sustained CDC ingestion on a sort-column table should not rewrite the full
+//! table on every coalesced burst. The benchmark is intentionally a regression
+//! test: sorted and unsorted append lanes should both stay roughly constant in
+//! the preload size.
 //!
 //! ## How to read the report
 //!
@@ -48,8 +40,9 @@ limitations under the License.
 //! Look for:
 //! - `unsorted/<preload>` time roughly constant across preload sizes — the
 //!   `O(K)` baseline.
-//! - `sorted/<preload>` time growing roughly linearly with preload size —
-//!   the `O(N log N)` regression.
+//! - `sorted/<preload>` time roughly constant across preload sizes — if it
+//!   grows with preload size, the write path has regressed back into doing
+//!   full-table sort rewrites.
 //!
 //! The append payload size is held constant at [`APPEND_ROWS`] across all
 //! cases so the only varying input is the preloaded table size.

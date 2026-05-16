@@ -90,7 +90,7 @@ pub(crate) enum InlineMutationPolicy {
 
 impl InlineMutationPolicy {
     #[must_use]
-    pub(crate) fn from_blocking_conditions(blocking_conditions: [bool; 5]) -> Self {
+    pub(crate) fn from_blocking_conditions(blocking_conditions: [bool; 4]) -> Self {
         if blocking_conditions.into_iter().any(|condition| condition) {
             Self::Vortex
         } else {
@@ -215,7 +215,6 @@ impl<'a> AppendMutationWriter<'a> {
         let can_stage_for_pipeline = !pending_pk_deletions
             && !has_file_on_conflict_deletions
             && !has_on_conflict_deletions
-            && !self.context.has_sort_columns()
             && self.table.metadata().partition_column.is_none()
             && !self.table.has_retention_delete_filters();
 
@@ -249,7 +248,7 @@ impl<'a> AppendMutationWriter<'a> {
             }
             InlineMutationOutcome::Fallback(re_stream) => {
                 prepared_stream = re_stream;
-                let staging_snapshot_id = self.table.new_staging_snapshot_id();
+                let staging_snapshot_id = CayenneTableProvider::new_staging_snapshot_id();
                 let target_size_bytes = self.context.target_file_size_bytes();
                 self.table
                     .clear_staging_snapshot_dir(&staging_snapshot_id)
@@ -334,7 +333,6 @@ impl<'a> AppendMutationWriter<'a> {
         let inline_policy = InlineMutationPolicy::from_blocking_conditions([
             pending_pk_deletions,
             has_file_on_conflict_deletions,
-            self.context.has_sort_columns(),
             self.table.metadata().partition_column.is_some(),
             self.table.has_retention_delete_filters(),
         ]);
@@ -364,13 +362,9 @@ impl<'a> AppendMutationWriter<'a> {
                         .await?;
 
                     let retention_deleted_rows = self.apply_retention_if_configured().await?;
-                    let sorted = self.sort_if_configured().await?;
                     self.table.schedule_post_write_maintenance(
                         Some(stats_acc),
-                        should_refresh_listing_table_after_post_write(
-                            retention_deleted_rows,
-                            sorted,
-                        ),
+                        should_refresh_listing_table_after_post_write(retention_deleted_rows),
                     );
 
                     if retention_deleted_rows > 0 {
@@ -422,12 +416,11 @@ impl<'a> AppendMutationWriter<'a> {
         };
 
         let retention_deleted_rows = self.apply_retention_if_configured().await?;
-        let sorted = self.sort_if_configured().await?;
 
         self.table.schedule_post_write_maintenance(
             Some(write_stats_acc),
             needs_new_snapshot
-                || should_refresh_listing_table_after_post_write(retention_deleted_rows, sorted),
+                || should_refresh_listing_table_after_post_write(retention_deleted_rows),
         );
 
         if retention_deleted_rows > 0 {
@@ -506,7 +499,7 @@ impl<'a> AppendMutationWriter<'a> {
         stream: SendableRecordBatchStream,
         target_size_bytes: usize,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
-        let staging_snapshot_id = self.table.new_staging_snapshot_id();
+        let staging_snapshot_id = CayenneTableProvider::new_staging_snapshot_id();
         self.table
             .clear_staging_snapshot_dir(&staging_snapshot_id)
             .await?;
@@ -644,23 +637,10 @@ impl<'a> AppendMutationWriter<'a> {
         }
         Ok(deleted)
     }
-
-    async fn sort_if_configured(&self) -> Result<bool> {
-        if !self.context.has_sort_columns() {
-            return Ok(false);
-        }
-
-        let target_size_bytes = self.context.target_file_size_bytes();
-        self.table.sort_and_rewrite_data(target_size_bytes).await?;
-        Ok(true)
-    }
 }
 
-fn should_refresh_listing_table_after_post_write(
-    retention_deleted_rows: u64,
-    sorted: bool,
-) -> bool {
-    retention_deleted_rows > 0 || sorted
+fn should_refresh_listing_table_after_post_write(retention_deleted_rows: u64) -> bool {
+    retention_deleted_rows > 0
 }
 
 #[cfg(test)]
@@ -672,10 +652,10 @@ mod tests {
 
     #[test]
     fn inline_policy_requires_simple_append_shape() {
-        assert!(InlineMutationPolicy::from_blocking_conditions([false; 5]).can_inline());
+        assert!(InlineMutationPolicy::from_blocking_conditions([false; 4]).can_inline());
 
-        for blocking_condition_index in 0..5 {
-            let mut blocking_conditions = [false; 5];
+        for blocking_condition_index in 0..4 {
+            let mut blocking_conditions = [false; 4];
             blocking_conditions[blocking_condition_index] = true;
             assert!(
                 !InlineMutationPolicy::from_blocking_conditions(blocking_conditions).can_inline()
@@ -741,9 +721,7 @@ mod tests {
 
     #[test]
     fn refresh_listing_table_only_when_post_write_steps_changed_files() {
-        assert!(!should_refresh_listing_table_after_post_write(0, false));
-        assert!(should_refresh_listing_table_after_post_write(1, false));
-        assert!(should_refresh_listing_table_after_post_write(0, true));
-        assert!(should_refresh_listing_table_after_post_write(1, true));
+        assert!(!should_refresh_listing_table_after_post_write(0));
+        assert!(should_refresh_listing_table_after_post_write(1));
     }
 }

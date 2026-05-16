@@ -81,6 +81,7 @@ async fn test_staged_append_basic_impl(
 }
 
 test_with_backends!(test_cdc_stage_a_does_not_wait_for_prior_finalize_impl);
+test_with_backends!(test_sorted_cdc_stage_a_does_not_wait_for_finalize_impl);
 
 async fn test_cdc_stage_a_does_not_wait_for_prior_finalize_impl(
     fixture: common::TestFixture,
@@ -126,6 +127,84 @@ async fn test_cdc_stage_a_does_not_wait_for_prior_finalize_impl(
             (4, "D".to_string()),
         ]
     );
+
+    Ok(())
+}
+
+async fn test_sorted_cdc_stage_a_does_not_wait_for_finalize_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vortex_config = cayenne::metadata::VortexConfig {
+        sort_columns: vec!["id".to_string()],
+        inline_max_rows: 0,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    let (table, ctx) =
+        setup_table_with_vortex_config(&fixture, "sorted_cdc_stage_a", vortex_config).await;
+    let task_ctx = ctx.task_ctx();
+
+    let write = table
+        .write_cdc_append_stream(batch_stream(make_batch(&[2, 1], &["B", "A"])), &task_ctx)
+        .await?;
+    assert!(
+        write.has_pending_finalize(),
+        "sort_columns must not force CDC writes onto the synchronous path"
+    );
+
+    write.finish().await?;
+
+    let rows = query_all(&ctx, "sorted_cdc_stage_a").await;
+    assert_eq!(rows, vec![(1, "A".to_string()), (2, "B".to_string())]);
+
+    Ok(())
+}
+
+test_with_backends!(test_sort_columns_do_not_rewrite_snapshot_on_write_impl);
+
+async fn test_sort_columns_do_not_rewrite_snapshot_on_write_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vortex_config = cayenne::metadata::VortexConfig {
+        sort_columns: vec!["id".to_string()],
+        inline_max_rows: 0,
+        compaction_trigger_files: 1000,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    let (table, ctx) =
+        setup_table_with_vortex_config(&fixture, "sorted_no_write_sort", vortex_config).await;
+    let snapshot_before = fixture
+        .catalog
+        .get_table("sorted_no_write_sort")
+        .await?
+        .current_snapshot_id;
+
+    ctx.sql("INSERT INTO sorted_no_write_sort VALUES (3, 'C'), (1, 'A'), (2, 'B')")
+        .await?
+        .collect()
+        .await?;
+
+    let snapshot_after = fixture
+        .catalog
+        .get_table("sorted_no_write_sort")
+        .await?
+        .current_snapshot_id;
+    assert_eq!(
+        snapshot_before, snapshot_after,
+        "sort_columns must not trigger a global snapshot rewrite after each write"
+    );
+
+    let rows = query_all(&ctx, "sorted_no_write_sort").await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "A".to_string()),
+            (2, "B".to_string()),
+            (3, "C".to_string()),
+        ]
+    );
+    assert_staging_empty(&staging_dir(&table));
 
     Ok(())
 }

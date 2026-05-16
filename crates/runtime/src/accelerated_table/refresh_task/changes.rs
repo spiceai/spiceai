@@ -77,7 +77,8 @@ impl CdcInsertPlanCache {
         let streaming_plan = Arc::new(StreamingDataUpdateExecutionPlan::new_empty(Arc::clone(
             &target_schema,
         )));
-        let streaming_exec: Arc<dyn ExecutionPlan> = streaming_plan.clone();
+        let streaming_exec: Arc<dyn ExecutionPlan> =
+            Arc::<StreamingDataUpdateExecutionPlan>::clone(&streaming_plan);
         let cast_plan: Arc<dyn ExecutionPlan> = Arc::new(SchemaCastScanExec::new(
             streaming_exec,
             Arc::clone(&target_schema),
@@ -846,18 +847,18 @@ impl RefreshTask {
 
             match op_type {
                 ChangeOperationType::Delete => {
-                    self.process_delete_batch(&change_batch, &row_indices, &ctx, &session_state)
+                    self.process_delete_batch(&change_batch, &row_indices, ctx, session_state)
                         .await?;
                     had_change = true;
                 }
                 ChangeOperationType::Upsert => {
                     pending_finalize = self
-                        .process_upsert_batch(&change_batch, &row_indices, &ctx, &session_state)
+                        .process_upsert_batch(&change_batch, &row_indices, ctx, session_state)
                         .await?;
                     had_change = true;
                 }
                 ChangeOperationType::Truncate => {
-                    self.process_truncate(&ctx, &session_state).await?;
+                    self.process_truncate(ctx, session_state).await?;
                     had_change = true;
                 }
                 ChangeOperationType::Unknown => {

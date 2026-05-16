@@ -162,7 +162,7 @@ impl CayenneStagedAppend {
     /// Publishes current snapshot file changes so newly committed files become visible.
     ///
     pub async fn refresh_listing_table(&self) {
-        self.table.publish_current_snapshot_files_changed().await
+        self.table.publish_current_snapshot_files_changed().await;
     }
 
     /// Executes the full WAL finalize sequence in order.
@@ -530,7 +530,7 @@ impl CayenneTableProvider {
             });
         }
 
-        let staging_snapshot_id = self.new_staging_snapshot_id();
+        let staging_snapshot_id = Self::new_staging_snapshot_id();
         self.clear_staging_snapshot_dir(&staging_snapshot_id)
             .await?;
 

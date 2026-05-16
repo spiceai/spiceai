@@ -1364,13 +1364,11 @@ async fn test_roundtrip_exceeds_byte_threshold(
     Ok(())
 }
 
-/// After the inline memtable checkpoints, the resulting Vortex file plus any
-/// subsequent small writes should be eligible for the new tiered compaction
-/// trigger. Drive ~1.5 K inline-memtable flushes (each producing one Vortex
-/// file), then perform a few more large writes (each above `INLINE_MAX_ROWS`,
-/// bypassing the inline path). With the trigger lowered, compaction should
-/// consolidate them — verified via `SELECT COUNT(*)` end-to-end correctness
-/// and a final visible-file count well below the number of inserts.
+/// Direct Vortex appends should be eligible for the tiered compaction trigger.
+/// Drive several large writes (each above `INLINE_MAX_ROWS`, bypassing the
+/// inline path) with an aggressive trigger so compaction runs during ingestion.
+/// End-to-end row count is the correctness check; the final visible-file count
+/// is emitted as diagnostic context for compaction behavior.
 async fn test_compaction_runs_after_inline_memtable_checkpoint(
     fixture: common::TestFixture,
 ) -> TestResult {

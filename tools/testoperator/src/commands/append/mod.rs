@@ -36,6 +36,12 @@ use test_framework::{
 };
 
 pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
+    if args.test_args.common.concurrency == 0 {
+        return Err(anyhow::anyhow!(
+            "Concurrency should be greater than 0 for an append test"
+        ));
+    }
+
     let query_set = args.test_args.load_query_set()?;
     let query_overrides = args
         .test_args

@@ -42,7 +42,7 @@ limitations under the License.
 //! - [`vortex_format`]: `DeletionFilteringVortexFormat` wrapping
 //!   `vortex_datafusion::VortexFormat` to attach per-file position-based
 //!   deletion vectors and to gate decimal→float predicate pushdown.
-//! - [`sink`]: `CayenneDataSink` — DataFusion `DataSink` adapter that the
+//! - [`sink`]: `CayenneDataSink` — `DataFusion` `DataSink` adapter that the
 //!   regular (non-CDC) write path uses for both append and overwrite modes.
 //! - [`mutation_writer`]: `AppendMutationWriter` — append-side write logic,
 //!   inline-memtable admission, and `write_cdc_pipelined` for the Stage A /

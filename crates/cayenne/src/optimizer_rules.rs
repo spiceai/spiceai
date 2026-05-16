@@ -96,10 +96,10 @@ limitations under the License.
 //! `test_framework::queries::get_chbench_test_queries`.
 
 use arrow::compute::SortOptions;
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, IntervalUnit, SchemaRef};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion::common::{JoinType, NullEquality};
-use datafusion::config::ConfigOptions;
+use datafusion::common::{JoinType, NullEquality, extensions_options};
+use datafusion::config::{ConfigExtension, ConfigOptions};
 use datafusion::error::DataFusionError;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
@@ -170,6 +170,25 @@ pub struct CayenneAntiJoinSortMergeRewriter;
 /// `Precision::Exact` row count exceeding this threshold. Below it, the
 /// in-memory hash table is usually faster than two explicit sort buffers.
 const ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS: usize = 10_000_000;
+const ANTI_JOIN_SORT_MERGE_MEMORY_POOL_FRACTION: f64 = 0.125;
+
+extensions_options! {
+    /// Cayenne optimizer configuration.
+    pub struct CayenneOptimizerConfig {
+        /// Minimum exact LEFT/build-side row count before considering the same-source hash-join to sort-merge rewrite.
+        pub sort_merge_min_rows: usize, default = ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS
+
+        /// Fraction of the query memory pool that the estimated hash-join build side must exceed before rewriting to sort-merge. Set to 0 to disable the memory gate.
+        pub sort_merge_memory_pool_fraction: f64, default = ANTI_JOIN_SORT_MERGE_MEMORY_POOL_FRACTION
+
+        /// Effective query memory pool size in bytes. Runtime wiring sets this from `runtime.query.memory_limit`; direct DataFusion users can leave it unset to use the row-count gate only.
+        pub sort_merge_memory_pool_bytes: Option<usize>, default = None
+    }
+}
+
+impl ConfigExtension for CayenneOptimizerConfig {
+    const PREFIX: &'static str = "cayenne";
+}
 
 impl CayenneAntiJoinSortMergeRewriter {
     /// Create a new `CayenneAntiJoinSortMergeRewriter` optimizer rule.
@@ -197,14 +216,15 @@ impl PhysicalOptimizerRule for CayenneAntiJoinSortMergeRewriter {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         plan.transform_down(|node| {
             let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));
             };
 
-            let Some(sort_merge_join) = try_rewrite_large_same_source_join(hash_join)? else {
+            let Some(sort_merge_join) = try_rewrite_large_same_source_join(hash_join, config)?
+            else {
                 return Ok(Transformed::no(node));
             };
 
@@ -359,6 +379,7 @@ fn filter_additions_for_join(
 
 fn try_rewrite_large_same_source_join(
     hash_join: &HashJoinExec,
+    config: &ConfigOptions,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
     // These same-source joins all share the relevant property: `HashJoinExec`
     // builds the LEFT input into a non-spillable hash table, so a large build
@@ -389,8 +410,32 @@ fn try_rewrite_large_same_source_join(
     let Some(build_row_count) = spillable_rewrite_build_input_exact_rows(hash_join) else {
         return Ok(None);
     };
-    if build_row_count <= ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS {
+    let optimizer_config = cayenne_optimizer_config(config);
+    let row_count_threshold = optimizer_config.sort_merge_min_rows;
+    if build_row_count <= row_count_threshold {
         return Ok(None);
+    }
+
+    let memory_gate_bytes = sort_merge_memory_gate_bytes(&optimizer_config);
+    let mut estimated_build_bytes = None;
+    if let Some(gate_bytes) = memory_gate_bytes {
+        let Some(estimated_bytes) =
+            build_side_memory_estimate(hash_join.left().as_ref(), build_row_count)
+        else {
+            return Ok(None);
+        };
+        if estimated_bytes <= gate_bytes {
+            tracing::debug!(
+                join_type = ?hash_join.join_type(),
+                build_row_count,
+                row_count_threshold,
+                estimated_build_bytes = estimated_bytes,
+                memory_gate_bytes = gate_bytes,
+                "Keeping same-source Cayenne HashJoinExec because estimated build side fits within memory gate"
+            );
+            return Ok(None);
+        }
+        estimated_build_bytes = Some(estimated_bytes);
     }
 
     let sort_options = vec![SortOptions::default(); hash_join.on().len()];
@@ -431,11 +476,111 @@ fn try_rewrite_large_same_source_join(
     tracing::debug!(
         join_type = ?hash_join.join_type(),
         build_row_count,
-        threshold = ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS,
+        row_count_threshold,
+        estimated_build_bytes,
+        memory_gate_bytes,
         "Replacing large same-source Cayenne HashJoinExec with SortMergeJoinExec"
     );
 
     Ok(Some(Arc::new(join)))
+}
+
+fn cayenne_optimizer_config(config: &ConfigOptions) -> CayenneOptimizerConfig {
+    config
+        .extensions
+        .get::<CayenneOptimizerConfig>()
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn sort_merge_memory_gate_bytes(config: &CayenneOptimizerConfig) -> Option<usize> {
+    let fraction = config.sort_merge_memory_pool_fraction;
+    if !fraction.is_finite() || fraction <= 0.0 {
+        return None;
+    }
+
+    config
+        .sort_merge_memory_pool_bytes
+        .map(|pool_bytes| fractional_bytes(pool_bytes, fraction))
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "DataFusion config exposes this memory gate as a fraction; saturating conversion is used for byte thresholds"
+)]
+fn fractional_bytes(bytes: usize, fraction: f64) -> usize {
+    let scaled = bytes as f64 * fraction;
+    if !scaled.is_finite() || scaled >= usize::MAX as f64 {
+        usize::MAX
+    } else if scaled <= 0.0 {
+        0
+    } else {
+        scaled as usize
+    }
+}
+
+fn build_side_memory_estimate(plan: &dyn ExecutionPlan, build_rows: usize) -> Option<usize> {
+    let row_width = plan
+        .schema()
+        .fields()
+        .iter()
+        .try_fold(0_usize, |acc, field| {
+            Some(acc.saturating_add(estimated_arrow_width(field.data_type())?))
+        })?;
+
+    Some(row_width.saturating_mul(build_rows))
+}
+
+fn estimated_arrow_width(data_type: &DataType) -> Option<usize> {
+    match data_type {
+        DataType::Null => Some(0),
+        DataType::Boolean | DataType::Int8 | DataType::UInt8 => Some(1),
+        DataType::Int16 | DataType::UInt16 | DataType::Float16 => Some(2),
+        DataType::Int32
+        | DataType::UInt32
+        | DataType::Float32
+        | DataType::Date32
+        | DataType::Time32(_)
+        | DataType::Interval(IntervalUnit::YearMonth)
+        | DataType::Decimal32(_, _) => Some(4),
+        DataType::Int64
+        | DataType::UInt64
+        | DataType::Float64
+        | DataType::Timestamp(_, _)
+        | DataType::Date64
+        | DataType::Time64(_)
+        | DataType::Duration(_)
+        | DataType::Decimal64(_, _)
+        | DataType::Interval(IntervalUnit::DayTime) => Some(8),
+        DataType::Interval(IntervalUnit::MonthDayNano) | DataType::Decimal128(_, _) => Some(16),
+        DataType::Decimal256(_, _) => Some(32),
+        DataType::FixedSizeBinary(size) => usize::try_from(*size).ok(),
+        DataType::Dictionary(_, value_type) => estimated_arrow_width(value_type)
+            .map(|width| width.saturating_add(std::mem::size_of::<u64>())),
+        DataType::FixedSizeList(field, length) => {
+            let length = usize::try_from(*length).ok()?;
+            estimated_arrow_width(field.data_type()).map(|width| width.saturating_mul(length))
+        }
+        DataType::Struct(fields) => fields.iter().try_fold(0_usize, |acc, field| {
+            Some(acc.saturating_add(estimated_arrow_width(field.data_type())?))
+        }),
+        DataType::RunEndEncoded(_, value_field) => estimated_arrow_width(value_field.data_type())
+            .map(|width| width.saturating_add(std::mem::size_of::<u64>())),
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::List(_)
+        | DataType::ListView(_)
+        | DataType::LargeList(_)
+        | DataType::LargeListView(_)
+        | DataType::Map(_, _)
+        | DataType::Union(_, _) => Some(64),
+    }
 }
 
 fn spillable_rewrite_build_input_exact_rows(hash_join: &HashJoinExec) -> Option<usize> {
@@ -810,8 +955,8 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
 mod tests {
     use super::{
         ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS, CayenneAntiJoinSortMergeRewriter,
-        CayenneDynamicFilterSharing, CayenneJoinRewriter, FilterAddition, apply_filter_additions,
-        plan_schema_fields,
+        CayenneDynamicFilterSharing, CayenneJoinRewriter, CayenneOptimizerConfig, FilterAddition,
+        apply_filter_additions, plan_schema_fields,
     };
     use crate::provider::CayenneAccelerationExec;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1156,9 +1301,34 @@ mod tests {
     }
 
     fn optimize_anti_join_sort_merge(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        optimize_anti_join_sort_merge_with_config(plan, &ConfigOptions::default())
+    }
+
+    fn optimize_anti_join_sort_merge_with_config(
+        plan: Arc<dyn ExecutionPlan>,
+        config: &ConfigOptions,
+    ) -> Arc<dyn ExecutionPlan> {
         CayenneAntiJoinSortMergeRewriter::new()
-            .optimize(plan, &ConfigOptions::default())
+            .optimize(plan, config)
             .expect("anti join sort-merge optimizer should succeed")
+    }
+
+    fn config_with_cayenne_optimizer(
+        sort_merge_min_rows: Option<usize>,
+        sort_merge_memory_pool_fraction: Option<f64>,
+        sort_merge_memory_pool_bytes: Option<usize>,
+    ) -> ConfigOptions {
+        let mut config = ConfigOptions::default();
+        let mut cayenne_config = CayenneOptimizerConfig::default();
+        if let Some(sort_merge_min_rows) = sort_merge_min_rows {
+            cayenne_config.sort_merge_min_rows = sort_merge_min_rows;
+        }
+        if let Some(sort_merge_memory_pool_fraction) = sort_merge_memory_pool_fraction {
+            cayenne_config.sort_merge_memory_pool_fraction = sort_merge_memory_pool_fraction;
+        }
+        cayenne_config.sort_merge_memory_pool_bytes = sort_merge_memory_pool_bytes;
+        config.extensions.insert(cayenne_config);
+        config
     }
 
     fn plan_snapshot(plan: &Arc<dyn ExecutionPlan>) -> String {
@@ -1720,6 +1890,82 @@ mod tests {
         assert!(
             optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
             "same-source anti joins at or below the large-input threshold should stay as hash joins"
+        );
+    }
+
+    #[test]
+    fn leaves_same_source_left_anti_hash_join_when_configured_min_rows_is_higher() {
+        let schema = order_line_schema();
+        let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let right = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::LeftAnti,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config = config_with_cayenne_optimizer(
+            Some(ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS + 2),
+            None,
+            None,
+        );
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "configured min-row threshold should keep smaller build sides as hash joins"
+        );
+    }
+
+    #[test]
+    fn leaves_same_source_left_anti_hash_join_when_build_estimate_fits_memory_gate() {
+        let schema = order_line_schema();
+        let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let right = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::LeftAnti,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(4 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "estimated build side within the configured memory fraction should stay a hash join"
+        );
+    }
+
+    #[test]
+    fn rewrites_same_source_left_anti_hash_join_when_build_estimate_exceeds_memory_gate() {
+        let schema = order_line_schema();
+        let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let right = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::LeftAnti,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(64 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized
+                .as_any()
+                .downcast_ref::<SortMergeJoinExec>()
+                .is_some(),
+            "estimated build side above the configured memory fraction should use sort-merge"
         );
     }
 

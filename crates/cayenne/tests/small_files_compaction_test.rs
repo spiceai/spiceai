@@ -69,11 +69,21 @@ fn aggressive_compaction_config() -> VortexConfig {
     }
 }
 
+fn aggressive_sorted_compaction_config() -> VortexConfig {
+    VortexConfig {
+        sort_columns: vec!["id".to_string()],
+        ..aggressive_compaction_config()
+    }
+}
+
 /// Build a batch of `n` rows whose ids start at `start` and whose values are
 /// derived strings. n must be > `INLINE_MAX_ROWS` (1024) to bypass inlining.
 fn make_batch(schema: &Arc<Schema>, start: i64, n: i64) -> RecordBatch {
     let ids: Vec<i64> = (start..start + n).collect();
-    let values: Vec<String> = ids.iter().map(|i| format!("v_{i}")).collect();
+    let values: Vec<String> = ids
+        .iter()
+        .map(|row_id| value_payload("v", *row_id))
+        .collect();
     RecordBatch::try_new(
         Arc::clone(schema),
         vec![
@@ -82,6 +92,31 @@ fn make_batch(schema: &Arc<Schema>, start: i64, n: i64) -> RecordBatch {
         ],
     )
     .expect("test batch is valid")
+}
+
+fn make_batch_from_ids(schema: &Arc<Schema>, ids: Vec<i64>) -> RecordBatch {
+    let values: Vec<String> = ids
+        .iter()
+        .map(|row_id| value_payload("v", *row_id))
+        .collect();
+    RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(values)),
+        ],
+    )
+    .expect("test batch is valid")
+}
+
+fn value_payload(prefix: &str, row_id: i64) -> String {
+    let row_id = u64::try_from(row_id).expect("test id should be non-negative");
+    format!(
+        "{prefix}_{row_id:020}_{:016x}_{:016x}_{:016x}",
+        row_id.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        row_id.wrapping_mul(0xC2B2_AE3D_27D4_EB4F),
+        row_id.wrapping_mul(0x1656_67B1_9E37_79F9),
+    )
 }
 
 /// Count `.vortex` files in `<data_path>/<table_id>/<current_snapshot_id>`.
@@ -118,6 +153,26 @@ async fn count_rows(ctx: &SessionContext, table_name: &str) -> i64 {
         .downcast_ref::<Int64Array>()
         .expect("count column")
         .value(0)
+}
+
+async fn unordered_ids(ctx: &SessionContext, table_name: &str) -> Vec<i64> {
+    let df = ctx
+        .sql(&format!("SELECT id FROM {table_name}"))
+        .await
+        .expect("select sql planned");
+    let batches = df.collect().await.expect("select collected");
+    let mut ids = Vec::new();
+    for batch in &batches {
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id column");
+        for idx in 0..batch.num_rows() {
+            ids.push(values.value(idx));
+        }
+    }
+    ids
 }
 
 async fn build_table(
@@ -208,6 +263,49 @@ async fn compaction_reduces_file_count_after_n_small_appends(
     Ok(())
 }
 
+test_with_backends!(compaction_sorts_sort_column_tables);
+async fn compaction_sorts_sort_column_tables(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = pk_schema();
+    let (table, ctx, _table_id) = build_table(
+        &fixture,
+        "compaction_sorted",
+        Arc::clone(&schema),
+        None,
+        aggressive_sorted_compaction_config(),
+    )
+    .await;
+
+    let batch_rows = 1500_i64;
+    let batch_count = 8_i64;
+    for batch_idx in 0..batch_count {
+        let start = batch_idx * batch_rows;
+        let mut ids: Vec<i64> = (start..start + batch_rows).collect();
+        ids.reverse();
+        common::insert_batch(&table, make_batch_from_ids(&schema, ids)).await?;
+    }
+
+    assert!(
+        run_compaction(&table).await,
+        "test setup should produce a compaction candidate"
+    );
+
+    let ids = unordered_ids(&ctx, "compaction_sorted").await;
+    assert_eq!(
+        ids.len(),
+        usize::try_from(batch_rows * batch_count).expect("row count fits usize")
+    );
+    for window in ids.windows(2) {
+        assert!(
+            window[0] <= window[1],
+            "sort-column compaction should rewrite rows in non-decreasing id order"
+        );
+    }
+
+    Ok(())
+}
+
 test_with_backends!(compaction_preserves_pk_upsert_semantics);
 async fn compaction_preserves_pk_upsert_semantics(
     fixture: common::TestFixture,
@@ -229,7 +327,10 @@ async fn compaction_preserves_pk_upsert_semantics(
     for batch_idx in 0..4_i64 {
         let start = batch_idx * batch_rows;
         let ids: Vec<i64> = (start..start + batch_rows).collect();
-        let values: Vec<String> = ids.iter().map(|i| format!("first_{i}")).collect();
+        let values: Vec<String> = ids
+            .iter()
+            .map(|row_id| value_payload("first", *row_id))
+            .collect();
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
@@ -243,7 +344,10 @@ async fn compaction_preserves_pk_upsert_semantics(
     for batch_idx in 0..4_i64 {
         let start = batch_idx * batch_rows;
         let ids: Vec<i64> = (start..start + batch_rows).collect();
-        let values: Vec<String> = ids.iter().map(|i| format!("second_{i}")).collect();
+        let values: Vec<String> = ids
+            .iter()
+            .map(|row_id| value_payload("second", *row_id))
+            .collect();
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
@@ -253,6 +357,18 @@ async fn compaction_preserves_pk_upsert_semantics(
         )?;
         common::insert_batch(&table, batch).await?;
     }
+
+    let mut compacted = false;
+    for _ in 0..3 {
+        if !run_compaction(&table).await {
+            break;
+        }
+        compacted = true;
+    }
+    assert!(
+        compacted,
+        "test setup should produce a compaction candidate"
+    );
 
     // Total rows must equal the unique-PK count (4 * 1500 = 6000), not double.
     let total = count_rows(&ctx, "compaction_upsert").await;

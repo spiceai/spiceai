@@ -1403,7 +1403,7 @@ impl CayenneTableProvider {
     }
 
     #[must_use]
-    pub(crate) fn new_staging_snapshot_id(&self) -> String {
+    pub(crate) fn new_staging_snapshot_id() -> String {
         format!("{STAGING_DIR_NAME}/{}", uuid::Uuid::now_v7())
     }
 
@@ -2891,25 +2891,10 @@ impl CayenneTableProvider {
     }
 
     fn snapshot_write_concurrency(&self, session_target_partitions: usize) -> usize {
-        if self.context.has_sort_columns() {
-            let configured_concurrency = self
-                .context
-                .write_concurrency()
-                .unwrap_or(session_target_partitions.max(1));
-            if configured_concurrency > 1 {
-                tracing::debug!(
-                    table = self.table_metadata.table_name.as_str(),
-                    configured_concurrency,
-                    "Using one Cayenne writer partition because sort_columns are configured"
-                );
-            }
-            1
-        } else {
-            self.context
-                .write_concurrency()
-                .unwrap_or(session_target_partitions)
-                .max(1)
-        }
+        self.context
+            .write_concurrency()
+            .unwrap_or(session_target_partitions)
+            .max(1)
     }
 
     /// Create a clone of necessary fields for parallel write tasks.
@@ -3986,7 +3971,8 @@ impl CayenneTableProvider {
             deleted_inlined_row_keys,
         } = on_conflict_deletions;
 
-        let has_file_deletions = !delete_specs.is_empty();
+        let has_file_deletions =
+            !delete_specs.is_empty() || !deleted_pk_i64.is_empty() || !deleted_row_keys.is_empty();
         let has_inlined_deletions =
             !deleted_inlined_pk_i64.is_empty() || !deleted_inlined_row_keys.is_empty();
 
@@ -4268,15 +4254,11 @@ impl CayenneTableProvider {
             self.context.sort_columns()
         );
 
-        // Snapshot the current listing table via ArcSwap (wait-free).
-        let listing_table = self.listing_table.load_full();
-
-        // Create a session context and scan the listing table to get all data
+        // Create a session context and scan the logical table view to get all
+        // currently visible rows. The rewrite commit clears deletion/protected
+        // snapshot state, so the input stream must have already applied it.
         let ctx = self.create_session_context();
-        let df = ctx.read_table(listing_table)?;
-
-        // Get the data as a stream
-        let stream = df.execute_stream().await?;
+        let stream = self.visible_file_stream_for_rewrite(&ctx).await?;
 
         // Sort the stream using our existing sort logic
         let sorted_stream = self.sort_stream(stream)?;
@@ -4360,12 +4342,7 @@ impl CayenneTableProvider {
         }
 
         let (total_rows, chunk_count, _stats_acc) = self
-            .write_to_snapshot(
-                sorted_stream,
-                target_size_bytes,
-                &new_snapshot_id,
-                ctx.state().config().target_partitions(),
-            )
+            .write_to_snapshot(sorted_stream, target_size_bytes, &new_snapshot_id, 1)
             .await?;
 
         if total_rows == 0 {
@@ -4532,15 +4509,15 @@ impl CayenneTableProvider {
         }
 
         {
-            let mut state = self.post_write_maintenance.state.lock();
+            let mut maintenance_state = self.post_write_maintenance.state.lock();
             if let Some(stats) = stats {
-                if let Some(existing) = &state.stats {
+                if let Some(existing) = &maintenance_state.stats {
                     existing.merge_from(&stats);
                 } else {
-                    state.stats = Some(stats);
+                    maintenance_state.stats = Some(stats);
                 }
             }
-            state.refresh_listing |= refresh_listing;
+            maintenance_state.refresh_listing |= refresh_listing;
         }
 
         if self
@@ -4620,7 +4597,9 @@ impl CayenneTableProvider {
         }
 
         let snapshot_id = self.get_current_snapshot_id();
-        let files = self.list_snapshot_files_with_sizes(&snapshot_id).await?;
+        let files = self
+            .list_compaction_candidate_files_with_sizes(&snapshot_id)
+            .await?;
 
         if files.len() < 2 {
             return Ok(false);
@@ -4675,6 +4654,36 @@ impl CayenneTableProvider {
         } else {
             self.list_snapshot_files_with_sizes_local(snapshot_id).await
         }
+    }
+
+    async fn list_compaction_candidate_files_with_sizes(
+        &self,
+        current_snapshot_id: &str,
+    ) -> Result<Vec<(String, u64)>> {
+        let protected_snapshot_ids: Vec<String> = {
+            let guard = self.protected_snapshots.read();
+            guard.keys().cloned().collect()
+        };
+
+        let mut seen_snapshot_ids = HashSet::with_capacity(protected_snapshot_ids.len() + 1);
+        let mut files = Vec::new();
+
+        for snapshot_id in std::iter::once(current_snapshot_id.to_string())
+            .chain(protected_snapshot_ids.into_iter())
+        {
+            if !seen_snapshot_ids.insert(snapshot_id.clone()) {
+                continue;
+            }
+
+            files.extend(
+                self.list_snapshot_files_with_sizes(&snapshot_id)
+                    .await?
+                    .into_iter()
+                    .map(|(path, size)| (format!("{snapshot_id}/{path}"), size)),
+            );
+        }
+
+        Ok(files)
     }
 
     async fn list_snapshot_files_with_sizes_local(
@@ -4758,19 +4767,30 @@ impl CayenneTableProvider {
 
     /// Rewrite the current snapshot into a fresh one, consolidating its files.
     ///
-    /// This mirrors the structure of [`Self::sort_and_rewrite_data`] but does
-    /// not apply a sort transform. The picker has already decided that the
-    /// current snapshot has enough small files to justify a rewrite, so the
-    /// goal here is purely to consolidate.
+    /// When `sort_columns` are configured, compaction sorts the merged stream
+    /// before writing the replacement snapshot. Ordinary writes intentionally
+    /// stay unsorted so CDC/append throughput is `O(write_size)`; the background
+    /// compactor pays the sort cost and restores tight file-level zone maps.
     ///
     /// On success the catalog is atomically pointed at the new snapshot, the
     /// in-memory listing table is swapped, deletion caches are cleared, and
     /// old snapshot dirs are reaped in the background.
     async fn rewrite_current_snapshot_for_compaction(&self) -> Result<()> {
-        let listing_table = self.listing_table.load_full();
         let ctx = self.create_session_context();
-        let df = ctx.read_table(listing_table)?;
-        let stream = df.execute_stream().await?;
+        let mut stream = self.visible_file_stream_for_rewrite(&ctx).await?;
+
+        let target_partitions = if self.context.has_sort_columns() {
+            tracing::info!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                sort_columns = ?self.context.sort_columns(),
+                "Sorting compaction rewrite"
+            );
+            stream = self.sort_stream(stream)?;
+            1
+        } else {
+            ctx.state().config().target_partitions()
+        };
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let is_s3 = self.table_metadata.path.starts_with("s3://");
@@ -4781,7 +4801,6 @@ impl CayenneTableProvider {
         }
 
         let target_size_bytes = self.context.target_file_size_bytes();
-        let target_partitions = ctx.state().config().target_partitions();
         let write_result = self
             .write_to_snapshot(
                 stream,
@@ -4859,6 +4878,20 @@ impl CayenneTableProvider {
         );
 
         Ok(())
+    }
+
+    async fn visible_file_stream_for_rewrite(
+        &self,
+        ctx: &SessionContext,
+    ) -> Result<SendableRecordBatchStream> {
+        if self.cached_inlined_row_count() > 0 {
+            self.checkpoint_inlined_data().await?;
+        }
+
+        let state = ctx.state();
+        let plan = TableProvider::scan(self, &state, None, &[], None).await?;
+        let stream = datafusion_physical_plan::execute_stream(plan, state.task_ctx())?;
+        Ok(stream)
     }
 
     async fn cleanup_failed_compaction_snapshot(&self, new_snapshot_id: &str, is_s3: bool) {
@@ -5332,7 +5365,7 @@ impl CayenneTableProvider {
     /// Acquire the listing fence and publish current-snapshot file changes.
     pub(crate) async fn publish_current_snapshot_files_changed(&self) {
         let _fence = self.listing_fence.write().await;
-        self.publish_current_snapshot_files_changed_under_held_fence()
+        self.publish_current_snapshot_files_changed_under_held_fence();
     }
 
     /// Acquire `listing_fence` for write and return an owned guard.
@@ -8345,7 +8378,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_writer_input_plan_keeps_sorted_writes_single_partition() {
+    async fn test_writer_input_plan_repartitions_sorted_writes() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ctx = SessionContext::new();
         let (provider, _temp_dir) = create_sorted_cayenne_table(
@@ -8364,15 +8397,15 @@ mod tests {
             write_plan
                 .as_any()
                 .downcast_ref::<datafusion_physical_plan::repartition::RepartitionExec>()
-                .is_none(),
-            "sorted writes should preserve one writer partition"
+                .is_some(),
+            "sorted table writes should use the same parallel writer fanout as unsorted writes"
         );
         assert_eq!(
             write_plan
                 .properties()
                 .output_partitioning()
                 .partition_count(),
-            1
+            4
         );
     }
 

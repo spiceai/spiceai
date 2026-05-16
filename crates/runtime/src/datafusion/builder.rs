@@ -28,15 +28,20 @@ use super::{
 use crate::accelerated_table::AcceleratedTable;
 use crate::cluster::ExecutorRegistry;
 use crate::cluster::ResolvedClusterConfig;
+#[cfg(not(windows))]
+use crate::dataaccelerator::upsert_dedup::UpsertDedupTableProvider;
 use crate::{config::ClusterRole, metrics::telemetry::track_bytes_processed, status};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
 #[cfg(not(windows))]
 use cayenne::optimizer_rules::{
     CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneJoinRewriter,
+    CayenneOptimizerConfig,
 };
 #[cfg(not(windows))]
 use cayenne::{CayenneTableProvider, logical_optimizer::CayennePropagateFilterAcrossEquiJoinKeys};
+#[cfg(not(windows))]
+use data_components::poly::PolyTableProvider;
 #[cfg(not(windows))]
 use datafusion::catalog::TableProvider;
 #[cfg(not(windows))]
@@ -152,6 +157,8 @@ pub struct DataFusionBuilder {
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
     url_tables_enabled: bool,
+    cayenne_sort_merge_min_rows: Option<usize>,
+    cayenne_sort_merge_memory_pool_fraction: Option<f64>,
     /// Arbitrary additional analyzer rules.
     additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
     executor_registry: Option<Arc<ExecutorRegistry>>,
@@ -200,6 +207,8 @@ impl DataFusionBuilder {
             io_runtime,
             resource_monitor: None,
             url_tables_enabled: false,
+            cayenne_sort_merge_min_rows: None,
+            cayenne_sort_merge_memory_pool_fraction: None,
             additional_analyzer_rules: vec![],
             executor_registry: None,
             partition_service: None,
@@ -295,6 +304,18 @@ impl DataFusionBuilder {
         self
     }
 
+    #[must_use]
+    pub fn cayenne_sort_merge_min_rows(mut self, min_rows: Option<usize>) -> Self {
+        self.cayenne_sort_merge_min_rows = min_rows;
+        self
+    }
+
+    #[must_use]
+    pub fn cayenne_sort_merge_memory_pool_fraction(mut self, fraction: Option<f64>) -> Self {
+        self.cayenne_sort_merge_memory_pool_fraction = fraction;
+        self
+    }
+
     /// Adds additional analyzer rules to the `DataFusion` instance.
     #[must_use]
     pub fn with_analyzer_rules(mut self, rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>) -> Self {
@@ -342,6 +363,15 @@ impl DataFusionBuilder {
 
         let exact_join_filter_memory_limit =
             configure_hash_join_memory_limits(&mut config, effective_memory_limit);
+
+        #[cfg(not(windows))]
+        {
+            config = config.with_option_extension(cayenne_optimizer_config(
+                self.cayenne_sort_merge_min_rows,
+                self.cayenne_sort_merge_memory_pool_fraction,
+                effective_memory_limit,
+            ));
+        }
 
         let datafusion_ref = super::iceberg_ddl::new_shared_datafusion_ref();
 
@@ -656,19 +686,42 @@ fn insert_cayenne_logical_optimizer_rule(rules: &mut Vec<Arc<dyn OptimizerRule +
 
 #[cfg(not(windows))]
 fn is_cayenne_accelerated_table_provider(provider: &dyn TableProvider) -> bool {
-    if provider.as_any().is::<CayenneTableProvider>() {
+    if is_cayenne_table_provider(provider) {
         return true;
     }
 
     provider
         .as_any()
         .downcast_ref::<AcceleratedTable>()
-        .is_some_and(|table| {
-            table
-                .get_accelerator()
-                .as_any()
-                .is::<CayenneTableProvider>()
-        })
+        .is_some_and(|table| is_cayenne_table_provider(table.get_accelerator().as_ref()))
+}
+
+#[cfg(not(windows))]
+fn is_cayenne_table_provider(provider: &dyn TableProvider) -> bool {
+    if provider.as_any().is::<CayenneTableProvider>() || has_cayenne_accelerator_metadata(provider)
+    {
+        return true;
+    }
+
+    if let Some(poly) = provider.as_any().downcast_ref::<PolyTableProvider>() {
+        return is_cayenne_table_provider(poly.writer().as_ref())
+            || is_cayenne_table_provider(poly.get_federated_table_provider().as_ref());
+    }
+
+    if let Some(dedup) = provider.as_any().downcast_ref::<UpsertDedupTableProvider>() {
+        return is_cayenne_table_provider(dedup.inner().as_ref());
+    }
+
+    false
+}
+
+#[cfg(not(windows))]
+fn has_cayenne_accelerator_metadata(provider: &dyn TableProvider) -> bool {
+    provider
+        .schema()
+        .metadata()
+        .get("spice.accelerator")
+        .is_some_and(|accelerator| accelerator == "cayenne")
 }
 
 pub struct AnalyzerRulesBuilder {
@@ -737,6 +790,26 @@ fn effective_query_memory_limit(memory_limit: Option<u64>) -> u64 {
 
         default_limit
     })
+}
+
+#[cfg(not(windows))]
+fn cayenne_optimizer_config(
+    sort_merge_min_rows: Option<usize>,
+    sort_merge_memory_pool_fraction: Option<f64>,
+    effective_memory_limit: u64,
+) -> CayenneOptimizerConfig {
+    let mut config = CayenneOptimizerConfig::default();
+    if let Some(sort_merge_min_rows) = sort_merge_min_rows {
+        config.sort_merge_min_rows = sort_merge_min_rows;
+    }
+    if let Some(sort_merge_memory_pool_fraction) = sort_merge_memory_pool_fraction {
+        config.sort_merge_memory_pool_fraction = sort_merge_memory_pool_fraction;
+    }
+    config.sort_merge_memory_pool_bytes = Some(match usize::try_from(effective_memory_limit) {
+        Ok(limit) => limit,
+        Err(_) => usize::MAX,
+    });
+    config
 }
 
 fn exact_join_filter_memory_limit(effective_memory_limit: u64) -> usize {
@@ -848,9 +921,11 @@ mod tests {
         record_batch::RecordBatch,
     };
     #[cfg(not(windows))]
+    use cayenne::optimizer_rules::CayenneOptimizerConfig;
+    #[cfg(not(windows))]
     use cayenne::provider::CayenneAccelerationExec;
     #[cfg(not(windows))]
-    use datafusion::catalog::MemTable;
+    use datafusion::catalog::{MemTable, TableProvider};
     use datafusion::optimizer::Analyzer;
     #[cfg(not(windows))]
     use datafusion::{
@@ -866,6 +941,10 @@ mod tests {
     };
     use crate::dataaccelerator::AcceleratorEngineRegistry;
     use crate::status;
+    #[cfg(not(windows))]
+    use data_components::poly::PolyTableProvider;
+    #[cfg(not(windows))]
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     /// Verifies that the default analyzer rules are in the expected order.
@@ -949,6 +1028,52 @@ mod tests {
                 .hash_join_inlist_pushdown_max_size,
             "A larger runtime query memory limit should not raise DataFusion's configured hash join in-list cap"
         );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_registers_cayenne_optimizer_config() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .memory_limit(Some(1_024))
+        .cayenne_sort_merge_min_rows(Some(100_000_000))
+        .cayenne_sort_merge_memory_pool_fraction(Some(0.25))
+        .build();
+
+        let state = df.ctx.state();
+        let config = state
+            .config_options()
+            .extensions
+            .get::<CayenneOptimizerConfig>()
+            .expect("Cayenne optimizer config should be registered");
+
+        assert_eq!(config.sort_merge_min_rows, 100_000_000);
+        assert!((config.sort_merge_memory_pool_fraction - 0.25).abs() < f64::EPSILON);
+        assert_eq!(config.sort_merge_memory_pool_bytes, Some(1_024));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_cayenne_provider_predicate_detects_poly_accelerator_metadata() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let table =
+            Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("memtable"));
+        let provider = PolyTableProvider::new_with_schema_metadata(
+            Arc::clone(&table) as Arc<dyn TableProvider>,
+            table,
+            HashMap::from([("spice.accelerator".to_string(), "cayenne".to_string())]),
+        );
+
+        assert!(super::is_cayenne_accelerated_table_provider(&provider));
     }
 
     /// Builds a full `DataFusion` instance and verifies the analyzer rules on
