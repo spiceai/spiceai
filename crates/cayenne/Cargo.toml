@@ -126,4 +126,29 @@ required-features = ["duckdb-bench"]
 
 [[bench]]
 harness = false
+name = "vs_duckdb_burst"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_upsert"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_groupby"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_join"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_concurrent"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
 name = "compaction_picker"
