@@ -1792,10 +1792,6 @@ impl TableProvider for AcceleratedTable {
         self.accelerator.scan_with_args(state, args).await
     }
 
-    fn statistics(&self) -> Option<datafusion::common::Statistics> {
-        self.accelerator.statistics()
-    }
-
     async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.accelerator.truncate(state).await
     }
