@@ -463,10 +463,12 @@ fn apply_machine_mode(command: &mut Commands) {
         Commands::Chat(args) => args.output = OutputFormat::Json,
         Commands::Refresh(args) => args.output = OutputFormat::Json,
         Commands::Cloud(args) => apply_machine_cloud_mode(&mut args.command),
-        // Nsql is always an interactive REPL — it has no one-shot/non-interactive mode,
-        // so there is no JSON output format to apply.
-        Commands::Nsql(_) => {}
-        Commands::Init(_)
+        // `Nsql` is intentionally excluded: it is always an interactive REPL with
+        // no one-shot/non-interactive mode, so there is no JSON output format to apply.
+        // The remaining commands are lifecycle/manifest-editing commands with no
+        // structured output.
+        Commands::Nsql(_)
+        | Commands::Init(_)
         | Commands::Install(_)
         | Commands::Upgrade(_)
         | Commands::Run(_)
