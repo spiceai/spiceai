@@ -57,6 +57,7 @@ vortex = { workspace = true }
 vortex-datafusion = { workspace = true }
 vortex-scan = { workspace = true }
 vortex-session = { workspace = true }
+duckdb = { workspace = true, features = ["bundled"], optional = true }
 # Force aegis to use pure-rust implementation for ARM64 builds to avoid C compilation issues
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
 aegis = { version = "0.9.3", default-features = false, features = [
@@ -68,12 +69,12 @@ aegis = { version = "0.9.3", default-features = false, features = [
 default = []
 turso = ["dep:turso"]
 partition-table-provider = ["dep:runtime-table-partition"]
+duckdb-bench = ["dep:duckdb"]
 
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 datafusion-federation.workspace = true
 datafusion-functions = { workspace = true }
-duckdb = { workspace = true, features = ["bundled"] }
 insta = { workspace = true, features = ["json"] }
 paste.workspace = true
 rstest = "0.26.1"
@@ -106,18 +107,22 @@ name = "listing_fence_overhead"
 [[bench]]
 harness = false
 name = "vs_duckdb_ingest"
+required-features = ["duckdb-bench"]
 
 [[bench]]
 harness = false
 name = "vs_duckdb_scan"
+required-features = ["duckdb-bench"]
 
 [[bench]]
 harness = false
 name = "vs_duckdb_pk_lookup"
+required-features = ["duckdb-bench"]
 
 [[bench]]
 harness = false
 name = "vs_duckdb_delete"
+required-features = ["duckdb-bench"]
 
 [[bench]]
 harness = false

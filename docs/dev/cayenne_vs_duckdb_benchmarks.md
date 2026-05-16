@@ -7,10 +7,10 @@ retention, throughput — and to catch regressions early.
 
 The comparison has two layers:
 
-| Layer | What it measures | Where it lives | How to run |
-|---|---|---|---|
-| End-to-end spicepod benchmarks | Real spiced ingesting from real sources, queries via Flight | `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/pairs.yaml` references existing yamls under `test/spicepods/` | `testoperator run bench` / `throughput` / `load` / `append` on each side of a pair |
-| In-process micro-benchmarks | Direct `CayenneTableProvider` vs `duckdb::Connection` on identical Arrow input | `crates/cayenne/benches/vs_duckdb_*.rs` | `cargo bench -p cayenne --bench vs_duckdb_ingest` (or the other three) |
+| Layer                          | What it measures                                                               | Where it lives                                                                                                    | How to run                                                                                     |
+| ------------------------------ | ------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| End-to-end spicepod benchmarks | Real spiced ingesting from real sources, queries via Flight                    | `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/pairs.yaml` references existing yamls under `test/spicepods/` | `testoperator run bench` / `throughput` / `load` / `append` on each side of a pair             |
+| In-process micro-benchmarks    | Direct `CayenneTableProvider` vs `duckdb::Connection` on identical Arrow input | `crates/cayenne/benches/vs_duckdb_*.rs`                                                                           | `cargo bench -p cayenne --features duckdb-bench --bench vs_duckdb_ingest` (or the other three) |
 
 ## Layer 1 — Spicepod matrix
 
@@ -61,21 +61,21 @@ accelerator-internal write/read paths directly, with no spiced and no
 Flight. They run identical work against `CayenneTableProvider` and a
 file-backed `duckdb::Connection`.
 
-| Bench | What it measures |
-|---|---|
-| `vs_duckdb_ingest` | Bulk load from parquet and incremental append of N batches |
-| `vs_duckdb_scan` | `COUNT(*)`, full-column `SUM`, range-filtered `SUM` |
-| `vs_duckdb_pk_lookup` | `WHERE id = ?`, `WHERE id IN (...)`, `WHERE id BETWEEN ? AND ?` |
-| `vs_duckdb_delete` | DELETE of ~10% of rows, then scan exercising the deletion-vector filter |
+| Bench                 | What it measures                                                        |
+| --------------------- | ----------------------------------------------------------------------- |
+| `vs_duckdb_ingest`    | Bulk load from parquet and incremental append of N batches              |
+| `vs_duckdb_scan`      | `COUNT(*)`, full-column `SUM`, range-filtered `SUM`                     |
+| `vs_duckdb_pk_lookup` | `WHERE id = ?`, `WHERE id IN (...)`, `WHERE id BETWEEN ? AND ?`         |
+| `vs_duckdb_delete`    | DELETE of ~10% of rows, then scan exercising the deletion-vector filter |
 
 Each bench groups Cayenne and DuckDB measurements together so criterion's
 HTML report shows them on the same chart. To run all four:
 
 ```sh
-cargo bench -p cayenne --bench vs_duckdb_ingest
-cargo bench -p cayenne --bench vs_duckdb_scan
-cargo bench -p cayenne --bench vs_duckdb_pk_lookup
-cargo bench -p cayenne --bench vs_duckdb_delete
+cargo bench -p cayenne --features duckdb-bench --bench vs_duckdb_ingest
+cargo bench -p cayenne --features duckdb-bench --bench vs_duckdb_scan
+cargo bench -p cayenne --features duckdb-bench --bench vs_duckdb_pk_lookup
+cargo bench -p cayenne --features duckdb-bench --bench vs_duckdb_delete
 ```
 
 Shared fixtures (schema, batch generation, parquet materialization,
