@@ -111,6 +111,10 @@ name = "sorted_append_overhead"
 
 [[bench]]
 harness = false
+name = "inner_join_sort_merge_rewrite"
+
+[[bench]]
+harness = false
 name = "vs_duckdb_ingest"
 required-features = ["duckdb-bench"]
 

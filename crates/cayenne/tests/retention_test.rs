@@ -31,8 +31,10 @@ use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog
 use common::TestFixture;
 
 use datafusion::datasource::TableProvider;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 
 use datafusion::prelude::*;
+use datafusion_common::DataFusionError;
 
 use std::sync::Arc;
 
@@ -40,6 +42,7 @@ test_with_backends!(test_retention_filters_apply_on_insert_impl);
 test_with_backends!(test_retention_filters_skip_when_no_matches_impl);
 test_with_backends!(test_time_retention_filter_scan_expiry_impl);
 test_with_backends!(test_time_retention_with_user_filter_impl);
+test_with_backends!(test_time_retention_cdc_stages_before_finalize_impl);
 
 async fn test_retention_filters_apply_on_insert_impl(
     fixture: TestFixture,

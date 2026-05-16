@@ -41,7 +41,7 @@ limitations under the License.
 //! - the table has any on-conflict deletions
 //! - the table has `sort_columns` configured
 //! - the table is partitioned
-//! - the table has retention filters
+//! - the table has write-time retention delete filters
 //!
 //! Those paths can't be safely deferred to Stage B because they require holding
 //! state (deletion vectors, sort order, retention pruning) until the visibility
@@ -217,7 +217,7 @@ impl<'a> AppendMutationWriter<'a> {
             && !has_on_conflict_deletions
             && !self.context.has_sort_columns()
             && self.table.metadata().partition_column.is_none()
-            && !self.table.has_retention_filters();
+            && !self.table.has_retention_delete_filters();
 
         if !can_stage_for_pipeline {
             let _write_guard = write_guard;
@@ -336,7 +336,7 @@ impl<'a> AppendMutationWriter<'a> {
             has_file_on_conflict_deletions,
             self.context.has_sort_columns(),
             self.table.metadata().partition_column.is_some(),
-            self.table.has_retention_filters(),
+            self.table.has_retention_delete_filters(),
         ]);
 
         if inline_policy.can_inline() {
@@ -625,7 +625,7 @@ impl<'a> AppendMutationWriter<'a> {
     }
 
     async fn apply_retention_if_configured(&self) -> Result<u64> {
-        if !self.table.has_retention_filters() {
+        if !self.table.has_retention_delete_filters() {
             return Ok(0);
         }
 

@@ -1494,6 +1494,10 @@ impl CayenneTableProvider {
         !self.retention_filters.is_empty() || self.time_retention_filter_builder.is_some()
     }
 
+    pub(crate) fn has_retention_delete_filters(&self) -> bool {
+        !self.retention_filters.is_empty()
+    }
+
     /// Returns the path to a snapshot directory for this table.
     #[must_use]
     pub(crate) fn snapshot_dir_path_for(&self, snapshot_id: &str) -> std::path::PathBuf {
