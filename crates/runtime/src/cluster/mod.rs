@@ -1976,7 +1976,7 @@ async fn executor_bind_app(
     Ok(())
 }
 
-/// Replays DDL SQL statements on the executor's local DataFusion context.
+/// Replays DDL SQL statements on the executor's local `DataFusion` context.
 ///
 /// Statements are replayed in order. If any statement fails, remaining
 /// statements are skipped because later DDL may depend on earlier ones
@@ -1984,7 +1984,7 @@ async fn executor_bind_app(
 ///
 /// Uses the Spice `QueryBuilder` path (not `ctx.sql()` directly) so that
 /// `DdlAnalyzerRule` runs — routing DDL through the correct Cayenne/Iceberg
-/// physical-plan handlers rather than DataFusion's built-in DDL handlers,
+/// physical-plan handlers rather than `DataFusion`'s built-in DDL handlers,
 /// which don't know about custom catalogs and would fail with errors like
 /// "failed to resolve schema" or "Registering new schemas is not supported".
 ///
