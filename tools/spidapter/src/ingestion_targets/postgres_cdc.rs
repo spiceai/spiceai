@@ -28,7 +28,12 @@ use uuid::Uuid;
 use crate::args::StdioArgs;
 
 pub(crate) const PG_REPLICATION_SLOT_NAME: &str = "spicebench_slot";
-pub(crate) const PG_PUBLICATION_NAME: &str = "spicebench_pub";
+/// Legacy single-publication name kept for teardown cleanup only.
+const PG_PUBLICATION_NAME: &str = "spicebench_pub";
+
+fn pub_name_for_table(table_name: &str) -> String {
+    format!("spicebench_pub_{table_name}")
+}
 
 /// PostgreSQL connection details for the WAL CDC write path.
 #[derive(Debug, Clone)]
@@ -118,7 +123,7 @@ pub(crate) fn generate_postgres_wal_spicepod(
             ("pg_pass".to_string(), pg.password.clone()),
             ("pg_db".to_string(), pg.database.clone()),
             ("pg_sslmode".to_string(), "disable".to_string()),
-            ("pg_publication".to_string(), PG_PUBLICATION_NAME.to_string()),
+            ("pg_publication".to_string(), pub_name_for_table(dataset_name)),
         ]);
 
         let pks = &dataset_config.primary_key_columns;
@@ -255,7 +260,6 @@ pub(crate) async fn setup_postgres_for_wal(
         .await?;
 
     // Drop and recreate tables to ensure clean state on each benchmark run.
-    let table_names: Vec<String> = datasets.keys().cloned().collect();
     for (name, dataset) in datasets {
         let drop_ddl = format!("DROP TABLE IF EXISTS {}.{}", pg.schema, name);
         eprintln!("[stdio] pg WAL setup: {drop_ddl}");
@@ -265,25 +269,23 @@ pub(crate) async fn setup_postgres_for_wal(
         client.execute(&ddl, &[]).await?;
     }
 
-    // Create publication
-    let table_list = table_names
-        .iter()
-        .map(|t| format!("{}.{}", pg.schema, t))
-        .collect::<Vec<_>>()
-        .join(", ");
-    eprintln!("[stdio] pg WAL setup: creating publication '{PG_PUBLICATION_NAME}'");
-    let pub_sql = format!("CREATE PUBLICATION {PG_PUBLICATION_NAME} FOR TABLE {table_list}");
-    match client.execute(&pub_sql, &[]).await {
-        Ok(_) => eprintln!("[stdio] pg WAL setup: created publication '{PG_PUBLICATION_NAME}' for {table_list}"),
-        Err(e) => {
-            let msg = pg_error_message(&e);
-            if msg.contains("already exists") {
-                eprintln!("[stdio] pg WAL setup: publication '{PG_PUBLICATION_NAME}' already exists");
-            } else {
-                eprintln!("[stdio] pg WAL setup: publication error: {msg}");
-                return Err(anyhow::anyhow!("failed to create publication: {msg}"));
-            }
-        }
+    // Create one publication per table so each dataset's replication slot only
+    // receives WAL events from its own table, preventing schema-mismatch errors.
+    for name in datasets.keys() {
+        let pub_name = pub_name_for_table(name);
+        let qualified_table = format!("{}.{}", pg.schema, name);
+        // Drop first for idempotency across benchmark runs.
+        client
+            .execute(&format!("DROP PUBLICATION IF EXISTS {pub_name}"), &[])
+            .await?;
+        let create_pub = format!("CREATE PUBLICATION {pub_name} FOR TABLE {qualified_table}");
+        eprintln!("[stdio] pg WAL setup: {create_pub}");
+        client.execute(&create_pub, &[]).await.map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create publication '{pub_name}': {}",
+                pg_error_message(&e)
+            )
+        })?;
     }
 
     Ok(())
@@ -314,7 +316,17 @@ pub(crate) async fn teardown_postgres(
             eprintln!("[stdio] pg teardown: {drop_slot}");
             client.execute(&drop_slot, &[]).await?;
         }
+
+        let pub_name = pub_name_for_table(name);
+        let drop_pub = format!("DROP PUBLICATION IF EXISTS {pub_name}");
+        eprintln!("[stdio] pg teardown: {drop_pub}");
+        client.execute(&drop_pub, &[]).await?;
     }
+
+    // Drop legacy publication if it exists
+    let drop_legacy_pub = format!("DROP PUBLICATION IF EXISTS {PG_PUBLICATION_NAME}");
+    eprintln!("[stdio] pg teardown: {drop_legacy_pub}");
+    client.execute(&drop_legacy_pub, &[]).await?;
 
     // Drop legacy named slot if it exists
     let legacy_rows = client
