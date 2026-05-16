@@ -38,9 +38,9 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, 
 use tokio::runtime::Runtime;
 
 use common::{
-    CAYENNE_LANES, CayenneFixture, DuckDbFixture, Metastore, cayenne_insert,
-    cayenne_insert_from_parquet, duckdb_insert_parquet, duckdb_upsert_parquet, make_batch, schema,
-    setup_cayenne_pk_for, setup_duckdb_pk, write_parquet,
+    CAYENNE_LANES, CayenneFixture, DuckDbFixture, Metastore, cayenne_insert, duckdb_insert_parquet,
+    duckdb_upsert_parquet, make_batch, schema, setup_cayenne_pk_for, setup_duckdb_pk,
+    write_parquet,
 };
 
 const TABLE_ROWS: usize = 10_000;

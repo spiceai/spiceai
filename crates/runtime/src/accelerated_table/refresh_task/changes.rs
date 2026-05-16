@@ -673,6 +673,7 @@ impl RefreshTask {
         true
     }
 
+    #[cfg(test)]
     async fn write_change(
         &self,
         change_batch: ChangeBatch,
