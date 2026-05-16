@@ -528,3 +528,20 @@ pub static CORRECTNESS_ROUNDS_FAILED: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .with_unit("rounds")
         .build()
 });
+
+// HTAP data freshness metrics
+pub static DATA_FRESHNESS_P99: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("data_freshness_p99_ms")
+        .with_description("P99 data freshness gap between source and accelerator per dataset.")
+        .with_unit("ms")
+        .build()
+});
+
+pub static REPLICATION_LAG_MS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("replication_lag_ms")
+        .with_description("Replication lag from source to accelerator per dataset.")
+        .with_unit("ms")
+        .build()
+});

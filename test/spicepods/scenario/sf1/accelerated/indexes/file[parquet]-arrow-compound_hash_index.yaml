@@ -11,8 +11,6 @@ datasets:
       enabled: true
       engine: arrow
       primary_key: (ps_partkey, ps_suppkey)
-      params:
-        hash_index: enabled
   # lineitem has a compound primary key (l_orderkey, l_linenumber)
   - from: file:data/lineitem.parquet
     name: lineitem
@@ -20,5 +18,3 @@ datasets:
       enabled: true
       engine: arrow
       primary_key: (l_orderkey, l_linenumber)
-      params:
-        hash_index: enabled

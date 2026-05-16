@@ -42,6 +42,8 @@ use runtime::parameters::{ExposedParamLookup, Parameters};
 use secrecy::SecretString;
 
 const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(10);
+const DEFAULT_BOOTSTRAP_BATCH_SIZE: usize = 8192;
+const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
 
 pub fn build_changes_stream(
     params: &Parameters,
@@ -431,6 +433,12 @@ fn replication_params_from_connector_params(
     let status_interval = optional_string(params, "replication_status_interval")
         .and_then(|s| fundu::parse_duration(&s).ok())
         .unwrap_or(DEFAULT_STATUS_INTERVAL);
+    let bootstrap_batch_size = optional_usize_in_range(
+        params,
+        "replication_bootstrap_batch_size",
+        DEFAULT_BOOTSTRAP_BATCH_SIZE,
+        MAX_BOOTSTRAP_BATCH_SIZE,
+    )?;
 
     Ok(ReplicationParams {
         host,
@@ -445,6 +453,7 @@ fn replication_params_from_connector_params(
         initial_snapshot,
         temporary_slot,
         status_interval,
+        bootstrap_batch_size,
     })
 }
 
@@ -466,6 +475,33 @@ fn optional_string(params: &Parameters, key: &str) -> Option<String> {
     match params.get(key).expose() {
         ExposedParamLookup::Present(v) => Some(v.to_string()),
         ExposedParamLookup::Absent(_) => None,
+    }
+}
+
+fn optional_usize_in_range(
+    params: &Parameters,
+    key: &str,
+    default: usize,
+    max: usize,
+) -> std::result::Result<usize, String> {
+    let Some(raw) = optional_string(params, key) else {
+        return Ok(default);
+    };
+
+    match raw.trim().parse::<usize>() {
+        Ok(value) if (1..=max).contains(&value) => Ok(value),
+        Ok(value) => {
+            let user_param = params.user_param(key);
+            Err(format!(
+                "parameter `{user_param}` must be between 1 and {max}, got {value}"
+            ))
+        }
+        Err(parse_error) => {
+            let user_param = params.user_param(key);
+            Err(format!(
+                "parameter `{user_param}` must be a positive integer, got {raw:?}: {parse_error}"
+            ))
+        }
     }
 }
 
@@ -504,4 +540,57 @@ fn extract_primary_keys(provider: &Arc<dyn datafusion::datasource::TableProvider
         }
     }
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params_with_bootstrap_batch_size(value: &str) -> Parameters {
+        Parameters::new(
+            vec![(
+                "replication_bootstrap_batch_size".to_string(),
+                SecretString::from(value),
+            )],
+            "pg",
+            crate::PARAMETERS,
+        )
+    }
+
+    #[test]
+    fn optional_usize_in_range_uses_user_facing_name_for_out_of_range_error() {
+        let params = params_with_bootstrap_batch_size("0");
+
+        let result = optional_usize_in_range(
+            &params,
+            "replication_bootstrap_batch_size",
+            DEFAULT_BOOTSTRAP_BATCH_SIZE,
+            MAX_BOOTSTRAP_BATCH_SIZE,
+        );
+
+        assert_eq!(
+            result,
+            Err("parameter `pg_replication_bootstrap_batch_size` must be between 1 and 1048576, got 0".to_string())
+        );
+    }
+
+    #[test]
+    fn optional_usize_in_range_uses_user_facing_name_for_parse_error() {
+        let params = params_with_bootstrap_batch_size("many");
+
+        let result = optional_usize_in_range(
+            &params,
+            "replication_bootstrap_batch_size",
+            DEFAULT_BOOTSTRAP_BATCH_SIZE,
+            MAX_BOOTSTRAP_BATCH_SIZE,
+        );
+
+        assert!(
+            result
+                .expect_err("invalid bootstrap batch size should return an error")
+                .starts_with(
+                    "parameter `pg_replication_bootstrap_batch_size` must be a positive integer, got \"many\""
+                )
+        );
+    }
 }

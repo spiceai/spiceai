@@ -19,3 +19,4 @@ base64.workspace = true
 pin-project.workspace = true
 http.workspace = true
 sha2.workspace = true
+x509-certificate.workspace = true

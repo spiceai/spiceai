@@ -21,6 +21,7 @@ limitations under the License.
 //! with the `ducklake` extension.
 
 pub mod provider;
+pub mod writer;
 
 /// S3 credential parameters for `DuckLake` connectors.
 ///

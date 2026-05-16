@@ -21,22 +21,15 @@ pub(crate) fn get_acceleration_config_append(
     engine: &str,
     acceleration_params: Option<Params>,
 ) -> Acceleration {
-    // Arrow engine doesn't support indexes, primary keys, or on_conflict
-    let (primary_key, on_conflict, indexes) = if engine == "arrow" {
-        (None, HashMap::new(), HashMap::new())
-    } else {
-        (
-            Some("id".to_string()),
-            [("id".to_string(), OnConflictBehavior::Upsert)]
-                .iter()
-                .cloned()
-                .collect::<HashMap<String, OnConflictBehavior>>(),
-            [("id".to_string(), IndexType::Unique)]
-                .iter()
-                .cloned()
-                .collect::<HashMap<String, IndexType>>(),
-        )
-    };
+    let primary_key = Some("id".to_string());
+    let on_conflict = [("id".to_string(), OnConflictBehavior::Upsert)]
+        .iter()
+        .cloned()
+        .collect::<HashMap<String, OnConflictBehavior>>();
+    let indexes = [("id".to_string(), IndexType::Unique)]
+        .iter()
+        .cloned()
+        .collect::<HashMap<String, IndexType>>();
 
     Acceleration {
         enabled: true,

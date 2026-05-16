@@ -28,7 +28,6 @@ const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Debug, Clone)]
 pub struct MetricSample {
     pub name: String,
-    #[cfg_attr(not(test), expect(dead_code))]
     pub labels: HashMap<String, String>,
     pub value: f64,
     pub metric_type: MetricType,

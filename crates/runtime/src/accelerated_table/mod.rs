@@ -1316,6 +1316,10 @@ impl TableProvider for AcceleratedTable {
         self.accelerator.table_type()
     }
 
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        self.accelerator.statistics()
+    }
+
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
