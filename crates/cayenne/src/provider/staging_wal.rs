@@ -152,10 +152,7 @@ impl CayenneStagedAppend {
 
     /// Publishes current snapshot file changes so newly committed files become visible.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if current snapshot metadata cannot be resolved.
-    pub async fn refresh_listing_table(&self) -> Result<()> {
+    pub async fn refresh_listing_table(&self) {
         self.table.publish_current_snapshot_files_changed().await
     }
 
@@ -163,15 +160,15 @@ impl CayenneStagedAppend {
     ///
     /// # Errors
     ///
-    /// Returns an error if any step in the finalize sequence (write WAL, move files,
-    /// remove WAL, or list-files cache invalidation) fails.
+    /// Returns an error if any fallible step in the finalize sequence (write WAL, move files,
+    /// or remove WAL) fails.
     pub async fn finalize_staged_write(&self) -> Result<()> {
         self.write_wal().await?;
         let _fence = self.table.lock_listing_fence_write_owned().await;
         self.move_staged_files().await?;
         self.remove_wal().await?;
         self.table
-            .publish_current_snapshot_files_changed_under_held_fence()?;
+            .publish_current_snapshot_files_changed_under_held_fence();
         Ok(())
     }
 
@@ -284,8 +281,7 @@ impl PreparedStagedAppend {
     ///
     /// # Errors
     ///
-    /// Returns an error if moving the staged files, removing the WAL, or
-    /// publishing current snapshot file changes fails.
+    /// Returns an error if moving the staged files or removing the WAL fails.
     pub async fn apply_under_barrier(&self) -> Result<()> {
         // Hold the listing fence for the entire move + WAL removal + listing
         // swap sequence. Without this, `CayenneTableProvider::scan()` (which
@@ -295,7 +291,7 @@ impl PreparedStagedAppend {
         self.table.move_files_to_current_snapshot().await?;
         self.table.remove_staging_wal().await?;
         self.table
-            .publish_current_snapshot_files_changed_under_held_fence()?;
+            .publish_current_snapshot_files_changed_under_held_fence();
         Ok(())
     }
 
@@ -313,13 +309,12 @@ impl PreparedStagedAppend {
     ///
     /// # Errors
     ///
-    /// Returns an error if moving the staged files, removing the WAL, or
-    /// publishing current snapshot file changes fails.
+    /// Returns an error if moving the staged files or removing the WAL fails.
     pub async fn apply_under_held_barrier(&self) -> Result<()> {
         self.table.move_files_to_current_snapshot().await?;
         self.table.remove_staging_wal().await?;
         self.table
-            .publish_current_snapshot_files_changed_under_held_fence()?;
+            .publish_current_snapshot_files_changed_under_held_fence();
         Ok(())
     }
 

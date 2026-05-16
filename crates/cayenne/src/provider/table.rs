@@ -4815,7 +4815,7 @@ impl CayenneTableProvider {
     /// list-files cache is therefore enough to make newly moved files visible;
     /// keeping the existing `ListingTable` preserves its file-statistics cache
     /// and removes a rebuild from the write hot path.
-    pub(crate) fn publish_current_snapshot_files_changed_under_held_fence(&self) -> Result<()> {
+    pub(crate) fn publish_current_snapshot_files_changed_under_held_fence(&self) {
         let current_snapshot = self.get_current_snapshot_id();
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
@@ -4830,12 +4830,10 @@ impl CayenneTableProvider {
             snapshot_id = current_snapshot.as_str(),
             "Published current snapshot file changes"
         );
-
-        Ok(())
     }
 
     /// Acquire the listing fence and publish current-snapshot file changes.
-    pub(crate) async fn publish_current_snapshot_files_changed(&self) -> Result<()> {
+    pub(crate) async fn publish_current_snapshot_files_changed(&self) {
         let _fence = self.listing_fence.write().await;
         self.publish_current_snapshot_files_changed_under_held_fence()
     }
