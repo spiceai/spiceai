@@ -173,6 +173,9 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
         plan: LogicalPlan,
         config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>, DataFusionError> {
+
+        return Ok(Transformed::no(plan));
+
         let join = match plan {
             LogicalPlan::Join(j) => j,
             other => return Ok(Transformed::no(other)),
