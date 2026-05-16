@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use super::RefreshTask;
+use crate::accelerated_table::metrics;
 use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::refresh_task::deletion::build_batch_delete_expr_from_change_batch;
 use crate::datafusion::error::{find_datafusion_root, format_datafusion_error};
@@ -37,6 +38,7 @@ use data_components::kafka::{
     rdkafka::types::RDKafkaErrorCode,
 };
 use datafusion::datasource::TableProvider;
+use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
@@ -802,7 +804,7 @@ impl RefreshTask {
                 .await
             {
                 return Err(crate::accelerated_table::Error::FailedToWriteData {
-                    source: datafusion_common::DataFusionError::Execution(error_message),
+                    source: DataFusionError::Execution(error_message),
                 });
             }
 
@@ -888,7 +890,7 @@ impl RefreshTask {
             let cayenne_write = cayenne
                 .write_cdc_append_stream(record_batch_stream, &task_ctx)
                 .await
-                .map_err(datafusion_common::DataFusionError::from)
+                .map_err(DataFusionError::from)
                 .map_err(find_datafusion_root)
                 .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
 
@@ -901,7 +903,7 @@ impl RefreshTask {
             cayenne_write
                 .finish()
                 .await
-                .map_err(datafusion_common::DataFusionError::from)
+                .map_err(DataFusionError::from)
                 .map_err(find_datafusion_root)
                 .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
 
@@ -1228,7 +1230,7 @@ fn spawn_cayenne_finalize(cayenne_write: CayenneCdcWrite) -> PendingApplyFinaliz
             .finish()
             .await
             .map(|_| ())
-            .map_err(datafusion_common::DataFusionError::from)
+            .map_err(DataFusionError::from)
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)
     })
