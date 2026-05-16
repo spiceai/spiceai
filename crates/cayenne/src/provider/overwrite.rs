@@ -182,18 +182,10 @@ impl PreparedOverwrite {
     ///
     /// # Errors
     ///
-    /// Returns an error if updating the in-memory snapshot id or swapping the
-    /// listing table fails. Other steps are best-effort.
+    /// Returns an error if swapping the listing table fails. Other steps are best-effort.
     pub async fn finish(self) -> Result<u64> {
-        self.table
-            .update_current_snapshot_id(&self.new_snapshot_id)?;
-
-        if let Err(e) = self.table.clear_all_deletion_caches() {
-            tracing::warn!(
-                "Failed to clear deletion caches after overwrite for table {}: {e}",
-                self.table.table_name()
-            );
-        }
+        self.table.update_current_snapshot_id(&self.new_snapshot_id);
+        self.table.clear_all_deletion_caches();
 
         self.table
             .update_listing_table_for_snapshot(&self.new_snapshot_id)

@@ -1,8 +1,10 @@
 /*
 Copyright 2025-2026 The Spice.ai OSS Authors
-
+                deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::empty()));
+            }
 Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
+                deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::empty()));
+            }
 You may obtain a copy of the License at
 
      https://www.apache.org/licenses/LICENSE-2.0
@@ -98,7 +100,10 @@ use vortex_datafusion::VortexFormat;
 
 use super::context::CayenneContext;
 use super::deletion_index::{DeletionIndex, KeyDeletionIndex};
-use super::deletion_strategy::{PkDeletionStrategy, PkDeletionStrategyWithCache};
+use super::deletion_strategy::{
+    Int64PkDeletionSnapshot, PkDeletionStrategy, PkDeletionStrategyWithCache,
+    RowConverterDeletionSnapshot,
+};
 use super::vortex_format::DeletionFilteringVortexFormat;
 use arc_swap::ArcSwap;
 
@@ -743,7 +748,7 @@ pub struct CayenneTableProvider {
     /// Optional object store configuration for remote storage (e.g., S3 Express One Zone).
     /// When set, this object store is registered with `SessionContext` for data file operations.
     object_store_config: Option<crate::metadata::ObjectStoreConfig>,
-    /// RuntimeEnv identities where `object_store_config` has already been
+    /// `RuntimeEnv` identities where `object_store_config` has already been
     /// verified/registered. This avoids probing the registry on every scan in
     /// the common case while still handling distinct query runtimes correctly.
     object_store_registered_runtime_envs: Arc<ParkingMutex<HashSet<usize>>>,
@@ -1104,20 +1109,20 @@ impl PkDeletionSnapshot {
 fn pk_deletion_snapshot_for_strategy(strategy: &PkDeletionStrategyWithCache) -> PkDeletionSnapshot {
     match strategy {
         PkDeletionStrategyWithCache::PositionBased { .. } => PkDeletionSnapshot::PositionBased,
-        PkDeletionStrategyWithCache::Int64Pk {
-            cached_deleted_pk,
-            cached_insert_records,
-        } => PkDeletionSnapshot::Int64Pk {
-            deleted_pk_values: cached_deleted_pk.load_full(),
-            insert_records: cached_insert_records.load_full(),
-        },
-        PkDeletionStrategyWithCache::RowConverterBased {
-            cached_deleted_row_keys,
-            cached_insert_records,
-        } => PkDeletionSnapshot::RowConverterBased {
-            deleted_row_keys: cached_deleted_row_keys.load_full(),
-            insert_records: cached_insert_records.load_full(),
-        },
+        PkDeletionStrategyWithCache::Int64Pk { deletion_snapshot } => {
+            let snapshot = deletion_snapshot.load_full();
+            PkDeletionSnapshot::Int64Pk {
+                deleted_pk_values: Arc::clone(&snapshot.deleted_pk),
+                insert_records: Arc::clone(&snapshot.insert_records),
+            }
+        }
+        PkDeletionStrategyWithCache::RowConverterBased { deletion_snapshot } => {
+            let snapshot = deletion_snapshot.load_full();
+            PkDeletionSnapshot::RowConverterBased {
+                deleted_row_keys: Arc::clone(&snapshot.deleted_row_keys),
+                insert_records: Arc::clone(&snapshot.insert_records),
+            }
+        }
     }
 }
 
@@ -1690,7 +1695,7 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if any file move/copy fails.
     pub(crate) async fn move_files_to_current_snapshot(&self) -> Result<()> {
-        let current_snapshot = self.get_current_snapshot_id()?;
+        let current_snapshot = self.get_current_snapshot_id();
 
         if self.table_metadata.path.starts_with("s3://") {
             self.move_staging_files_s3(&current_snapshot).await
@@ -2331,25 +2336,24 @@ impl CayenneTableProvider {
     /// Get the maximum delete sequence number from the cached deletions.
     fn get_max_delete_sequence(&self) -> i64 {
         match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                cached_deleted_pk, ..
-            } => cached_deleted_pk
+            PkDeletionStrategyWithCache::Int64Pk { deletion_snapshot } => deletion_snapshot
                 .load()
+                .deleted_pk
                 .entries()
                 .values()
                 .max()
                 .copied()
                 .unwrap_or(0),
-            PkDeletionStrategyWithCache::RowConverterBased {
-                cached_deleted_row_keys,
-                ..
-            } => cached_deleted_row_keys
-                .load()
-                .entries()
-                .values()
-                .max()
-                .copied()
-                .unwrap_or(0),
+            PkDeletionStrategyWithCache::RowConverterBased { deletion_snapshot } => {
+                deletion_snapshot
+                    .load()
+                    .deleted_row_keys
+                    .entries()
+                    .values()
+                    .max()
+                    .copied()
+                    .unwrap_or(0)
+            }
             PkDeletionStrategyWithCache::PositionBased { .. } => 0,
         }
     }
@@ -2737,8 +2741,8 @@ impl CayenneTableProvider {
     /// a complete keyset of all existing primary keys.
     ///
     /// This method respects ALL deletion caches based on `pk_deletion_strategy`:
-    /// - `Int64Pk`: Uses `cached_deleted_pk_i64` and `cached_insert_records_pk_i64`
-    /// - `RowConverterBased`: Uses `cached_deleted_row_keys` and `cached_insert_records_row_keys`
+    /// - `Int64Pk`: Uses the atomically-published Int64 PK deletion snapshot
+    /// - `RowConverterBased`: Uses the atomically-published row-key deletion snapshot
     /// - `PositionBased`: Uses `cached_deleted_row_ids` (no primary key)
     ///
     /// Rows marked as deleted are excluded unless they were re-inserted with a higher
@@ -2772,17 +2776,16 @@ impl CayenneTableProvider {
         // ArcSwap loads are wait-free; the resulting `Arc<...Index>` is an immutable
         // snapshot of the deletion state at this instant.
         let deleted_pk_i64: Option<Arc<DeletionIndex>> = match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                cached_deleted_pk, ..
-            } => Some(cached_deleted_pk.load_full()),
+            PkDeletionStrategyWithCache::Int64Pk { deletion_snapshot } => {
+                Some(Arc::clone(&deletion_snapshot.load_full().deleted_pk))
+            }
             _ => None,
         };
 
         let deleted_row_keys: Option<Arc<KeyDeletionIndex>> = match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::RowConverterBased {
-                cached_deleted_row_keys,
-                ..
-            } => Some(cached_deleted_row_keys.load_full()),
+            PkDeletionStrategyWithCache::RowConverterBased { deletion_snapshot } => {
+                Some(Arc::clone(&deletion_snapshot.load_full().deleted_row_keys))
+            }
             _ => None,
         };
 
@@ -3551,8 +3554,8 @@ impl CayenneTableProvider {
     /// This function:
     /// 1. Writes deletion vectors for the deleted PKs
     /// 2. Updates the appropriate in-memory cache based on `pk_deletion_strategy`:
-    ///    - `Int64Pk`: Updates `cached_deleted_pk_i64` AND `cached_insert_records_pk_i64`
-    ///    - `RowConverterBased`: Updates `cached_deleted_row_keys` AND `cached_insert_records_row_keys`
+    ///    - `Int64Pk`: Updates deleted PKs and insert records in one snapshot
+    ///    - `RowConverterBased`: Updates deleted row keys and insert records in one snapshot
     ///
     /// For upsert operations, we track both the deletion (with `delete_sequence`) and the
     /// re-insertion (with `insert_sequence` = `delete_sequence` + 1) so that the new row
@@ -3710,68 +3713,57 @@ impl CayenneTableProvider {
         // This follows Iceberg's pattern where deletes are tracked by PK + sequence number.
         // For upserts, we also update insert records so the new row isn't filtered out.
         match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                cached_deleted_pk,
-                cached_insert_records,
-            } => {
-                // Build new deletion + insert snapshots and publish atomically.
+            PkDeletionStrategyWithCache::Int64Pk { deletion_snapshot } => {
+                // Build new deletion + insert snapshots and publish both in one
+                // ArcSwap store so readers never observe mismatched generations.
                 // Writers are serialised by the per-table write lock so the load+rebuild+store
                 // sequence is race-free.
-                let updated_deleted = cached_deleted_pk
-                    .load()
+                let current = deletion_snapshot.load_full();
+                let updated_deleted = current
+                    .deleted_pk
                     .extend_max(deleted_pk_i64.iter().map(|&pk| (pk, delete_sequence)));
                 let deleted_count = updated_deleted.len();
-                cached_deleted_pk.store(Arc::new(updated_deleted));
+                let updated_inserts = current
+                    .insert_records
+                    .extend_max(deleted_pk_i64.iter().map(|&pk| (pk, insert_sequence)));
+                let insert_count = updated_inserts.len();
+                deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_indices(
+                    updated_deleted,
+                    updated_inserts,
+                )));
 
                 tracing::debug!(
-                    "Updated Int64 PK deletion cache with {} keys (seq={}) for table {}",
+                    "Updated Int64 PK deletion cache with {} deleted keys (seq={}) and {} insert records (seq={}) for table {}",
                     deleted_count,
                     delete_sequence,
-                    self.table_metadata.table_name
-                );
-
-                let updated_inserts = cached_insert_records
-                    .load()
-                    .extend_max(deleted_pk_i64.into_iter().map(|pk| (pk, insert_sequence)));
-                let insert_count = updated_inserts.len();
-                cached_insert_records.store(Arc::new(updated_inserts));
-
-                tracing::debug!(
-                    "Updated Int64 PK insert records cache with {} keys (seq={}) for table {}",
                     insert_count,
                     insert_sequence,
                     self.table_metadata.table_name
                 );
             }
-            PkDeletionStrategyWithCache::RowConverterBased {
-                cached_deleted_row_keys,
-                cached_insert_records,
-            } => {
-                let updated_deleted = cached_deleted_row_keys.load().extend_max(
+            PkDeletionStrategyWithCache::RowConverterBased { deletion_snapshot } => {
+                let current = deletion_snapshot.load_full();
+                let updated_deleted = current.deleted_row_keys.extend_max(
                     deleted_row_keys
                         .iter()
                         .map(|key| (key.clone(), delete_sequence)),
                 );
                 let deleted_count = updated_deleted.len();
-                cached_deleted_row_keys.store(Arc::new(updated_deleted));
-
-                tracing::debug!(
-                    "Updated RowConverter deletion cache with {} keys (seq={}) for table {}",
-                    deleted_count,
-                    delete_sequence,
-                    self.table_metadata.table_name
-                );
-
-                let updated_inserts = cached_insert_records.load().extend_max(
+                let updated_inserts = current.insert_records.extend_max(
                     deleted_row_keys
-                        .into_iter()
-                        .map(|key| (key, insert_sequence)),
+                        .iter()
+                        .map(|key| (key.clone(), insert_sequence)),
                 );
                 let insert_count = updated_inserts.len();
-                cached_insert_records.store(Arc::new(updated_inserts));
+                deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_indices(
+                    updated_deleted,
+                    updated_inserts,
+                )));
 
                 tracing::debug!(
-                    "Updated RowConverter insert records cache with {} keys (seq={}) for table {}",
+                    "Updated RowConverter deletion cache with {} deleted keys (seq={}) and {} insert records (seq={}) for table {}",
+                    deleted_count,
+                    delete_sequence,
                     insert_count,
                     insert_sequence,
                     self.table_metadata.table_name
@@ -4019,14 +4011,8 @@ impl CayenneTableProvider {
         }
 
         // Update in-memory state to match the new catalog
-        self.update_current_snapshot_id(&new_snapshot_id)?;
-
-        if let Err(e) = self.clear_all_deletion_caches() {
-            tracing::warn!(
-                "Failed to clear deletion caches after sort rewrite for table {}: {e}",
-                self.table_metadata.table_name
-            );
-        }
+        self.update_current_snapshot_id(&new_snapshot_id);
+        self.clear_all_deletion_caches();
 
         // Old snapshot directories are cleaned up in the background
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
@@ -4142,7 +4128,7 @@ impl CayenneTableProvider {
             return Ok(false);
         }
 
-        let snapshot_id = self.get_current_snapshot_id()?;
+        let snapshot_id = self.get_current_snapshot_id();
         let files = self.list_snapshot_files_with_sizes(&snapshot_id).await?;
 
         if files.len() < 2 {
@@ -4364,14 +4350,8 @@ impl CayenneTableProvider {
             self.listing_table.store(new_listing_table);
         }
 
-        self.update_current_snapshot_id(&new_snapshot_id)?;
-
-        if let Err(e) = self.clear_all_deletion_caches() {
-            tracing::warn!(
-                "Failed to clear deletion caches after compaction for table {}: {e}",
-                self.table_metadata.table_name
-            );
-        }
+        self.update_current_snapshot_id(&new_snapshot_id);
+        self.clear_all_deletion_caches();
 
         // Persist accumulated stats from the rewrite — keeps DataFusion's
         // synchronous statistics path consistent with the new snapshot.
@@ -4550,13 +4530,12 @@ impl CayenneTableProvider {
             PkDeletionStrategyWithCache::PositionBased {
                 cached_deleted_row_ids,
             } => !cached_deleted_row_ids.load().is_empty(),
-            PkDeletionStrategyWithCache::Int64Pk {
-                cached_deleted_pk, ..
-            } => !cached_deleted_pk.load().is_empty(),
-            PkDeletionStrategyWithCache::RowConverterBased {
-                cached_deleted_row_keys,
-                ..
-            } => !cached_deleted_row_keys.load().is_empty(),
+            PkDeletionStrategyWithCache::Int64Pk { deletion_snapshot } => {
+                !deletion_snapshot.load().deleted_pk.is_empty()
+            }
+            PkDeletionStrategyWithCache::RowConverterBased { deletion_snapshot } => {
+                !deletion_snapshot.load().deleted_row_keys.is_empty()
+            }
         }
     }
 
@@ -4571,10 +4550,7 @@ impl CayenneTableProvider {
     /// This should be called after compaction operations that have applied all deletions
     /// and written a clean snapshot.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the protected snapshots lock is poisoned.
-    pub(crate) fn clear_all_deletion_caches(&self) -> Result<()> {
+    pub(crate) fn clear_all_deletion_caches(&self) {
         // Clear caches based on the current strategy.
         // ArcSwap stores publish a fresh empty snapshot atomically; readers see either
         // the old or new state and never block.
@@ -4584,19 +4560,11 @@ impl CayenneTableProvider {
             } => {
                 cached_deleted_row_ids.store(Arc::new(HashMap::new()));
             }
-            PkDeletionStrategyWithCache::Int64Pk {
-                cached_deleted_pk,
-                cached_insert_records,
-            } => {
-                cached_deleted_pk.store(Arc::new(DeletionIndex::empty()));
-                cached_insert_records.store(Arc::new(DeletionIndex::empty()));
+            PkDeletionStrategyWithCache::Int64Pk { deletion_snapshot } => {
+                deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::empty()));
             }
-            PkDeletionStrategyWithCache::RowConverterBased {
-                cached_deleted_row_keys,
-                cached_insert_records,
-            } => {
-                cached_deleted_row_keys.store(Arc::new(KeyDeletionIndex::empty()));
-                cached_insert_records.store(Arc::new(KeyDeletionIndex::empty()));
+            PkDeletionStrategyWithCache::RowConverterBased { deletion_snapshot } => {
+                deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::empty()));
             }
         }
 
@@ -4610,8 +4578,6 @@ impl CayenneTableProvider {
             "Cleared all deletion and insert records caches for table {}",
             self.table_metadata.table_name
         );
-
-        Ok(())
     }
 
     /// Get the current snapshot ID.
@@ -4619,12 +4585,9 @@ impl CayenneTableProvider {
     /// This returns the live snapshot ID which may differ from `table_metadata.current_snapshot_id`
     /// after compaction operations.
     ///
-    /// # Errors
-    ///
-    /// This method keeps a `Result` return type for caller compatibility.
-    pub(super) fn get_current_snapshot_id(&self) -> Result<String> {
+    pub(super) fn get_current_snapshot_id(&self) -> String {
         let guard = self.current_snapshot_id.read();
-        Ok(guard.clone())
+        guard.clone()
     }
 
     /// Update the current snapshot ID after a compaction operation.
@@ -4632,10 +4595,7 @@ impl CayenneTableProvider {
     /// This must be called after `commit_compaction` to keep the in-memory snapshot ID
     /// in sync with the catalog.
     ///
-    /// # Errors
-    ///
-    /// This method keeps a `Result` return type for caller compatibility.
-    pub(crate) fn update_current_snapshot_id(&self, new_snapshot_id: &str) -> Result<()> {
+    pub(crate) fn update_current_snapshot_id(&self, new_snapshot_id: &str) {
         let mut guard = self.current_snapshot_id.write();
         if guard.as_str() != new_snapshot_id {
             self.scan_listing_tables.lock().clear();
@@ -4652,7 +4612,6 @@ impl CayenneTableProvider {
             self.table_metadata.table_name,
             new_snapshot_id
         );
-        Ok(())
     }
 
     /// Refresh in-memory query state by reloading from the catalog (source of truth).
@@ -4728,7 +4687,7 @@ impl CayenneTableProvider {
                 table: self.table_metadata.table_name.clone(),
                 message: format!("Failed to reload table metadata during refresh: {e}"),
             })?;
-        self.update_current_snapshot_id(&fresh_metadata.current_snapshot_id)?;
+        self.update_current_snapshot_id(&fresh_metadata.current_snapshot_id);
 
         // Rebuild the listing table from the fresh snapshot ID on disk.
         self.refresh_listing_table().await?;
@@ -4820,7 +4779,7 @@ impl CayenneTableProvider {
     pub(crate) fn refresh_listing_table_under_held_fence(&self) -> Result<()> {
         // Construct URL to current snapshot using the live snapshot ID
         // (which may differ from table_metadata after compaction)
-        let current_snapshot = self.get_current_snapshot_id()?;
+        let current_snapshot = self.get_current_snapshot_id();
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
@@ -4852,12 +4811,12 @@ impl CayenneTableProvider {
     /// rebuilding the `ListingTable` object.
     ///
     /// `ListingTable::scan()` lists files eagerly on every scan and the table
-    /// path is unchanged for ordinary append commits. Invalidating DataFusion's
+    /// path is unchanged for ordinary append commits. Invalidating `DataFusion`'s
     /// list-files cache is therefore enough to make newly moved files visible;
     /// keeping the existing `ListingTable` preserves its file-statistics cache
     /// and removes a rebuild from the write hot path.
     pub(crate) fn publish_current_snapshot_files_changed_under_held_fence(&self) -> Result<()> {
-        let current_snapshot = self.get_current_snapshot_id()?;
+        let current_snapshot = self.get_current_snapshot_id();
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
@@ -5164,9 +5123,7 @@ impl CayenneTableProvider {
 
         let mut keep_mask = Vec::with_capacity(batch.num_rows());
         match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                cached_deleted_pk, ..
-            } => {
+            PkDeletionStrategyWithCache::Int64Pk { deletion_snapshot } => {
                 let pk_index = *pk_indices.first().ok_or_else(|| Error::Internal {
                     table: self.table_metadata.table_name.clone(),
                     message: "Int64 PK strategy requires a primary key column".to_string(),
@@ -5182,7 +5139,7 @@ impl CayenneTableProvider {
                             batch.column(pk_index).data_type()
                         ),
                     })?;
-                let deleted_pk = cached_deleted_pk.load_full();
+                let deleted_pk = Arc::clone(&deletion_snapshot.load_full().deleted_pk);
 
                 for row_index in 0..batch.num_rows() {
                     if pk_array.is_null(row_index) {
@@ -5203,17 +5160,14 @@ impl CayenneTableProvider {
                     );
                 }
             }
-            PkDeletionStrategyWithCache::RowConverterBased {
-                cached_deleted_row_keys,
-                ..
-            } => {
+            PkDeletionStrategyWithCache::RowConverterBased { deletion_snapshot } => {
                 let converter = self.build_pk_converter(&pk_indices)?;
                 let pk_columns: Vec<_> = pk_indices
                     .iter()
                     .map(|idx| Arc::clone(batch.column(*idx)))
                     .collect();
                 let rows = converter.convert_columns(&pk_columns)?;
-                let deleted_row_keys = cached_deleted_row_keys.load_full();
+                let deleted_row_keys = Arc::clone(&deletion_snapshot.load_full().deleted_row_keys);
 
                 for row_index in 0..batch.num_rows() {
                     if pk_columns.iter().any(|column| column.is_null(row_index)) {
@@ -5303,7 +5257,7 @@ impl CayenneTableProvider {
                 .write_to_snapshot(
                     stream,
                     target_size_bytes,
-                    &self.get_current_snapshot_id()?,
+                    &self.get_current_snapshot_id(),
                     ctx.state().config().target_partitions(),
                 )
                 .await?;
@@ -5786,18 +5740,20 @@ impl CayenneTableProvider {
                     PkDeletionStrategyWithCache::empty_position_based()
                 }
                 PkDeletionStrategy::Int64Pk => PkDeletionStrategyWithCache::Int64Pk {
-                    cached_deleted_pk: Arc::new(ArcSwap::from_pointee(DeletionIndex::empty())),
-                    cached_insert_records: Arc::new(ArcSwap::from_pointee(
-                        DeletionIndex::from_map(insert_records_pk_i64),
+                    deletion_snapshot: Arc::new(ArcSwap::from_pointee(
+                        Int64PkDeletionSnapshot::from_indices(
+                            DeletionIndex::empty(),
+                            DeletionIndex::from_map(insert_records_pk_i64),
+                        ),
                     )),
                 },
                 PkDeletionStrategy::RowConverterBased => {
                     PkDeletionStrategyWithCache::RowConverterBased {
-                        cached_deleted_row_keys: Arc::new(ArcSwap::from_pointee(
-                            KeyDeletionIndex::empty(),
-                        )),
-                        cached_insert_records: Arc::new(ArcSwap::from_pointee(
-                            KeyDeletionIndex::from_map(insert_records_row_keys),
+                        deletion_snapshot: Arc::new(ArcSwap::from_pointee(
+                            RowConverterDeletionSnapshot::from_indices(
+                                KeyDeletionIndex::empty(),
+                                KeyDeletionIndex::from_map(insert_records_row_keys),
+                            ),
                         )),
                     }
                 }
@@ -5870,11 +5826,11 @@ impl CayenneTableProvider {
                     insert_records_pk_i64.len(),
                 );
                 PkDeletionStrategyWithCache::Int64Pk {
-                    cached_deleted_pk: Arc::new(ArcSwap::from_pointee(DeletionIndex::from_map(
-                        int64_pks,
-                    ))),
-                    cached_insert_records: Arc::new(ArcSwap::from_pointee(
-                        DeletionIndex::from_map(insert_records_pk_i64),
+                    deletion_snapshot: Arc::new(ArcSwap::from_pointee(
+                        Int64PkDeletionSnapshot::from_indices(
+                            DeletionIndex::from_map(int64_pks),
+                            DeletionIndex::from_map(insert_records_pk_i64),
+                        ),
                     )),
                 }
             }
@@ -5885,11 +5841,11 @@ impl CayenneTableProvider {
                     insert_records_row_keys.len(),
                 );
                 PkDeletionStrategyWithCache::RowConverterBased {
-                    cached_deleted_row_keys: Arc::new(ArcSwap::from_pointee(
-                        KeyDeletionIndex::from_map(deleted_row_keys),
-                    )),
-                    cached_insert_records: Arc::new(ArcSwap::from_pointee(
-                        KeyDeletionIndex::from_map(insert_records_row_keys),
+                    deletion_snapshot: Arc::new(ArcSwap::from_pointee(
+                        RowConverterDeletionSnapshot::from_indices(
+                            KeyDeletionIndex::from_map(deleted_row_keys),
+                            KeyDeletionIndex::from_map(insert_records_row_keys),
+                        ),
                     )),
                 }
             }
@@ -6462,7 +6418,7 @@ impl TableProvider for CayenneTableProvider {
         // (target_partitions, etc.). The fence still matters because
         // append-mode coordinators move files into the CURRENT snapshot dir.
         let _fence = self.listing_fence.read().await;
-        let current_snapshot_id = self.get_current_snapshot_id()?;
+        let current_snapshot_id = self.get_current_snapshot_id();
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
@@ -6685,11 +6641,7 @@ impl TableProvider for CayenneTableProvider {
         // For appends on local paths, ensure the snapshot directory exists before writing.
         // S3 creates paths on write automatically so this is only needed for local storage.
         if overwrite != InsertOp::Overwrite && !is_s3 {
-            let current_snapshot = self.get_current_snapshot_id().map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to get current snapshot ID: {e}"
-                ))
-            })?;
+            let current_snapshot = self.get_current_snapshot_id();
             let snapshot_dir = Self::snapshot_dir_path(
                 &self.table_metadata.path,
                 &self.table_metadata.table_id,
@@ -7143,25 +7095,30 @@ mod tests {
 
     #[test]
     fn pk_deletion_snapshot_is_stable_after_cache_publish() {
-        let cached_deleted_row_keys = Arc::new(ArcSwap::from_pointee(KeyDeletionIndex::empty()));
-        let cached_insert_records = Arc::new(ArcSwap::from_pointee(KeyDeletionIndex::empty()));
+        let deletion_snapshot =
+            Arc::new(ArcSwap::from_pointee(RowConverterDeletionSnapshot::empty()));
         let strategy = PkDeletionStrategyWithCache::RowConverterBased {
-            cached_deleted_row_keys: Arc::clone(&cached_deleted_row_keys),
-            cached_insert_records,
+            deletion_snapshot: Arc::clone(&deletion_snapshot),
         };
 
-        cached_deleted_row_keys.store(Arc::new(KeyDeletionIndex::from_map(HashMap::from([(
-            Box::<[u8]>::from([42_u8].as_slice()),
-            1_i64,
-        )]))));
+        deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_indices(
+            KeyDeletionIndex::from_map(HashMap::from([(
+                Box::<[u8]>::from([42_u8].as_slice()),
+                1_i64,
+            )])),
+            KeyDeletionIndex::empty(),
+        )));
 
         let scan_snapshot = pk_deletion_snapshot_for_strategy(&strategy);
         assert!(scan_snapshot.has_deletions());
 
-        cached_deleted_row_keys.store(Arc::new(KeyDeletionIndex::from_map(HashMap::from([(
-            Box::<[u8]>::from([99_u8].as_slice()),
-            2_i64,
-        )]))));
+        deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_indices(
+            KeyDeletionIndex::from_map(HashMap::from([(
+                Box::<[u8]>::from([99_u8].as_slice()),
+                2_i64,
+            )])),
+            KeyDeletionIndex::empty(),
+        )));
 
         let PkDeletionSnapshot::RowConverterBased {
             deleted_row_keys, ..
@@ -7171,8 +7128,14 @@ mod tests {
         };
         assert_eq!(deleted_row_keys.get(&[42_u8]), Some(1_i64));
         assert_eq!(deleted_row_keys.get(&[99_u8]), None);
-        assert_eq!(cached_deleted_row_keys.load().get(&[42_u8]), None);
-        assert_eq!(cached_deleted_row_keys.load().get(&[99_u8]), Some(2_i64));
+        assert_eq!(
+            deletion_snapshot.load().deleted_row_keys.get(&[42_u8]),
+            None
+        );
+        assert_eq!(
+            deletion_snapshot.load().deleted_row_keys.get(&[99_u8]),
+            Some(2_i64)
+        );
     }
 
     #[test]
@@ -7592,8 +7555,12 @@ mod tests {
         // Delete pk=2 with del_seq=1
         let deleted_index = DeletionIndex::from_map(HashMap::from([(2_i64, 1_i64)]));
         let strategy = PkDeletionStrategyWithCache::Int64Pk {
-            cached_deleted_pk: Arc::new(ArcSwap::from_pointee(deleted_index.clone())),
-            cached_insert_records: Arc::new(ArcSwap::from_pointee(DeletionIndex::empty())),
+            deletion_snapshot: Arc::new(ArcSwap::from_pointee(
+                Int64PkDeletionSnapshot::from_indices(
+                    deleted_index.clone(),
+                    DeletionIndex::empty(),
+                ),
+            )),
         };
 
         let mut keyset = HashMap::new();
@@ -7627,8 +7594,12 @@ mod tests {
         let deleted_index =
             DeletionIndex::from_map(HashMap::from([(1_i64, 5_i64), (2_i64, 15_i64)]));
         let strategy = PkDeletionStrategyWithCache::Int64Pk {
-            cached_deleted_pk: Arc::new(ArcSwap::from_pointee(deleted_index.clone())),
-            cached_insert_records: Arc::new(ArcSwap::from_pointee(DeletionIndex::empty())),
+            deletion_snapshot: Arc::new(ArcSwap::from_pointee(
+                Int64PkDeletionSnapshot::from_indices(
+                    deleted_index.clone(),
+                    DeletionIndex::empty(),
+                ),
+            )),
         };
 
         let mut keyset = HashMap::new();

@@ -508,7 +508,7 @@ impl CayenneTableProvider {
     /// The WAL file is placed at `{table_path}/{table_id}/_staging/_wal.json`
     /// (local FS) or at the corresponding S3 key.
     pub(crate) async fn write_staging_wal(&self) -> Result<()> {
-        let current_snapshot = self.get_current_snapshot_id()?;
+        let current_snapshot = self.get_current_snapshot_id();
 
         if self.table_path().starts_with("s3://") {
             self.write_staging_wal_s3(&current_snapshot).await?;
@@ -789,7 +789,7 @@ impl CayenneTableProvider {
                 }
             }
 
-            let current_snapshot = self.get_current_snapshot_id()?;
+            let current_snapshot = self.get_current_snapshot_id();
             if current_snapshot != wal.target_snapshot {
                 return Err(Error::IncompleteWrite {
                     table: table_name,
