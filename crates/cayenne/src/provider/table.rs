@@ -676,25 +676,24 @@ impl ColumnStatsAccumulator {
 // every subsequent query — the wrong tradeoff for large-dataset workloads,
 // which are the dominant use case for Cayenne. The right lever for large
 // datasets is `target_vortex_file_size_mb` plus the tiered small-files
-// compaction in `provider::compaction`, not bigger memtables.
+// compaction in `provider::compaction`, not bigger inline flush caps.
 
 /// Maximum number of rows to inline in the metastore instead of writing a Vortex file.
 #[cfg(test)]
 pub(crate) const INLINE_MAX_ROWS: usize = crate::metadata::DEFAULT_INLINE_MAX_ROWS;
 
-/// Maximum rows to keep in the inline level-0 memtable before flushing to Vortex.
+/// Maximum rows to keep inline before flushing to Vortex.
 #[cfg(test)]
-pub(crate) const INLINE_MEMTABLE_MAX_ROWS: i64 = crate::metadata::DEFAULT_INLINE_MEMTABLE_MAX_ROWS;
+pub(crate) const INLINE_FLUSH_MAX_ROWS: i64 = crate::metadata::DEFAULT_INLINE_FLUSH_MAX_ROWS;
 
-/// Maximum inline level-0 entries before flushing to Vortex.
+/// Maximum inline entries before flushing to Vortex.
 #[cfg(test)]
-pub(crate) const INLINE_MEMTABLE_MAX_SEGMENTS: i64 =
-    crate::metadata::DEFAULT_INLINE_MEMTABLE_MAX_SEGMENTS;
+pub(crate) const INLINE_FLUSH_MAX_SEGMENTS: i64 =
+    crate::metadata::DEFAULT_INLINE_FLUSH_MAX_SEGMENTS;
 
 /// Maximum serialized IPC bytes to keep inline before flushing to Vortex.
 #[cfg(test)]
-pub(crate) const INLINE_MEMTABLE_MAX_BYTES: i64 =
-    crate::metadata::DEFAULT_INLINE_MEMTABLE_MAX_BYTES;
+pub(crate) const INLINE_FLUSH_MAX_BYTES: i64 = crate::metadata::DEFAULT_INLINE_FLUSH_MAX_BYTES;
 
 /// Maximum in-memory byte budget while buffering the inline fast-path stream.
 ///
@@ -731,9 +730,9 @@ impl InlineMemtablePressure {
 pub(crate) fn inline_memtable_pressure(stats: InlinedDataStats) -> Option<InlineMemtablePressure> {
     inline_memtable_pressure_with_thresholds(
         stats,
-        INLINE_MEMTABLE_MAX_ROWS,
-        INLINE_MEMTABLE_MAX_SEGMENTS,
-        INLINE_MEMTABLE_MAX_BYTES,
+        INLINE_FLUSH_MAX_ROWS,
+        INLINE_FLUSH_MAX_SEGMENTS,
+        INLINE_FLUSH_MAX_BYTES,
     )
 }
 
@@ -5627,16 +5626,16 @@ impl CayenneTableProvider {
         // `clear_staging_dir`, `ensure_no_incomplete_write`, and the
         // compaction trigger.
         //
-        // Why the threshold is `inline_memtable_max_bytes / inline_max_bytes`:
+        // Why the threshold is `inline_flush_max_bytes / inline_max_bytes`:
         // every `commit_inlined_data_mutation` call from the inline-write
         // path adds at most 1 inline entry, with at most `inline_max_bytes`
         // of IPC payload and at most `inline_max_rows` rows.
         // Cached `inlined_row_count` ≥ number of commits (each commit
         // contributes ≥ 1 row). So:
         //   - commits ≤ cached_rows
-        //   - entries  ≤ commits          ≤ cached_rows < inline_memtable_max_segments
-        //   - bytes    ≤ commits·max_ipc  ≤ cached_rows·max_ipc < inline_memtable_max_bytes
-        // when `cached_rows < inline_memtable_max_bytes / inline_max_bytes`.
+        //   - entries  ≤ commits          ≤ cached_rows < inline_flush_max_segments
+        //   - bytes    ≤ commits·max_ipc  ≤ cached_rows·max_ipc < inline_flush_max_bytes
+        // when `cached_rows < inline_flush_max_bytes / inline_max_bytes`.
         // The bytes bound usually dominates the safe-skip region.
         //
         // For workloads with many small rows per commit (typical CDC: a
@@ -5650,7 +5649,7 @@ impl CayenneTableProvider {
             .unwrap_or(i64::MAX)
             .max(1);
         let safe_skip_threshold: i64 =
-            (self.context.inline_memtable_max_bytes() / inline_max_bytes_i64).max(1);
+            (self.context.inline_flush_max_bytes() / inline_max_bytes_i64).max(1);
         if cached_rows < safe_skip_threshold {
             return Ok(());
         }
@@ -5664,9 +5663,9 @@ impl CayenneTableProvider {
 
         let Some(pressure) = inline_memtable_pressure_with_thresholds(
             stats,
-            self.context.inline_memtable_max_rows(),
-            self.context.inline_memtable_max_segments(),
-            self.context.inline_memtable_max_bytes(),
+            self.context.inline_flush_max_rows(),
+            self.context.inline_flush_max_segments(),
+            self.context.inline_flush_max_bytes(),
         ) else {
             return Ok(());
         };
@@ -7596,9 +7595,9 @@ mod tests {
     #[test]
     fn inline_memtable_pressure_is_absent_below_thresholds() {
         let stats = InlinedDataStats {
-            record_count: INLINE_MEMTABLE_MAX_ROWS - 1,
-            entry_count: INLINE_MEMTABLE_MAX_SEGMENTS,
-            ipc_bytes: INLINE_MEMTABLE_MAX_BYTES - 1,
+            record_count: INLINE_FLUSH_MAX_ROWS - 1,
+            entry_count: INLINE_FLUSH_MAX_SEGMENTS,
+            ipc_bytes: INLINE_FLUSH_MAX_BYTES - 1,
         };
 
         assert_eq!(inline_memtable_pressure(stats), None);
@@ -7608,21 +7607,21 @@ mod tests {
     fn inline_memtable_pressure_detects_thresholds() {
         assert_eq!(
             inline_memtable_pressure(InlinedDataStats {
-                record_count: INLINE_MEMTABLE_MAX_ROWS,
+                record_count: INLINE_FLUSH_MAX_ROWS,
                 ..InlinedDataStats::default()
             }),
             Some(InlineMemtablePressure::Rows)
         );
         assert_eq!(
             inline_memtable_pressure(InlinedDataStats {
-                entry_count: INLINE_MEMTABLE_MAX_SEGMENTS + 1,
+                entry_count: INLINE_FLUSH_MAX_SEGMENTS + 1,
                 ..InlinedDataStats::default()
             }),
             Some(InlineMemtablePressure::Segments)
         );
         assert_eq!(
             inline_memtable_pressure(InlinedDataStats {
-                ipc_bytes: INLINE_MEMTABLE_MAX_BYTES,
+                ipc_bytes: INLINE_FLUSH_MAX_BYTES,
                 ..InlinedDataStats::default()
             }),
             Some(InlineMemtablePressure::IpcBytes)

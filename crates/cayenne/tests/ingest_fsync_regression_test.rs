@@ -965,19 +965,19 @@ fn checkpoint_inlined_pressure_has_cached_fast_path() {
          fast path returns before any catalog work."
     );
 
-    // The fast-path threshold should reference at least one memtable-pressure
+    // The fast-path threshold should reference at least one inline-flush
     // threshold constant. The current implementation uses
-    // `INLINE_MEMTABLE_MAX_BYTES / INLINE_MAX_BYTES` since this is the
+    // `INLINE_FLUSH_MAX_BYTES / INLINE_MAX_BYTES` since this is the
     // tightest of the three (bytes, entries, rows) thresholds when reasoning
     // about an upper bound from cached_rows alone.
     assert!(
-        body.contains("INLINE_MEMTABLE_MAX_BYTES")
-            || body.contains("INLINE_MEMTABLE_MAX_SEGMENTS")
-            || body.contains("INLINE_MEMTABLE_MAX_ROWS"),
+        body.contains("INLINE_FLUSH_MAX_BYTES")
+            || body.contains("INLINE_FLUSH_MAX_SEGMENTS")
+            || body.contains("INLINE_FLUSH_MAX_ROWS"),
         "checkpoint_inlined_data_if_memtable_pressure_exceeded must compare \
          the cached row count against a meaningful threshold constant \
-         (INLINE_MEMTABLE_MAX_BYTES / INLINE_MEMTABLE_MAX_SEGMENTS / \
-         INLINE_MEMTABLE_MAX_ROWS) for the fast path to be a load-bearing \
+         (INLINE_FLUSH_MAX_BYTES / INLINE_FLUSH_MAX_SEGMENTS / \
+         INLINE_FLUSH_MAX_ROWS) for the fast path to be a load-bearing \
          invariant. A bare numeric literal decouples the fast path from \
          the threshold definitions and risks silent drift."
     );

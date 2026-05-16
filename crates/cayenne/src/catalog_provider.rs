@@ -67,12 +67,12 @@ pub struct CayenneCatalogProviderConfig {
     pub inline_max_bytes: Option<usize>,
     /// Maximum Arrow in-memory bytes buffered while deciding whether to inline.
     pub inline_max_buffer_bytes: Option<usize>,
-    /// Maximum inline memtable rows before checkpointing to Vortex.
-    pub inline_memtable_max_rows: Option<i64>,
-    /// Maximum inline memtable entries before checkpointing to Vortex.
-    pub inline_memtable_max_segments: Option<i64>,
-    /// Maximum inline memtable IPC bytes before checkpointing to Vortex.
-    pub inline_memtable_max_bytes: Option<i64>,
+    /// Maximum inline rows before checkpointing to Vortex.
+    pub inline_flush_max_rows: Option<i64>,
+    /// Maximum inline entries before checkpointing to Vortex.
+    pub inline_flush_max_segments: Option<i64>,
+    /// Maximum inline IPC bytes before checkpointing to Vortex.
+    pub inline_flush_max_bytes: Option<i64>,
     /// Primary-key conflict detection behavior for inserts.
     pub pk_conflict_detection: Option<PkConflictDetection>,
 }
@@ -289,14 +289,14 @@ impl CayenneCatalogProvider {
         if let Some(v) = provider_config.inline_max_buffer_bytes {
             config.inline_max_buffer_bytes = v;
         }
-        if let Some(v) = provider_config.inline_memtable_max_rows {
-            config.inline_memtable_max_rows = v.max(0);
+        if let Some(v) = provider_config.inline_flush_max_rows {
+            config.inline_flush_max_rows = v.max(0);
         }
-        if let Some(v) = provider_config.inline_memtable_max_segments {
-            config.inline_memtable_max_segments = v.max(0);
+        if let Some(v) = provider_config.inline_flush_max_segments {
+            config.inline_flush_max_segments = v.max(0);
         }
-        if let Some(v) = provider_config.inline_memtable_max_bytes {
-            config.inline_memtable_max_bytes = v.max(0);
+        if let Some(v) = provider_config.inline_flush_max_bytes {
+            config.inline_flush_max_bytes = v.max(0);
         }
         if let Some(v) = provider_config.pk_conflict_detection {
             config.pk_conflict_detection = v;

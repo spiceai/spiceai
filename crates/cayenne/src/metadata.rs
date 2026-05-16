@@ -26,12 +26,12 @@ pub const DEFAULT_INLINE_MAX_ROWS: usize = 1024;
 pub const DEFAULT_INLINE_MAX_BYTES: usize = 1_048_576;
 /// Default maximum in-memory byte budget while buffering an inline fast-path stream.
 pub const DEFAULT_INLINE_MAX_BUFFER_BYTES: usize = 4 * 1_048_576;
-/// Default maximum rows to keep in the inline level-0 memtable before flushing to Vortex.
-pub const DEFAULT_INLINE_MEMTABLE_MAX_ROWS: i64 = 10_000;
-/// Default maximum inline level-0 entries before flushing to Vortex.
-pub const DEFAULT_INLINE_MEMTABLE_MAX_SEGMENTS: i64 = 64;
+/// Default maximum rows to keep inline before flushing to Vortex.
+pub const DEFAULT_INLINE_FLUSH_MAX_ROWS: i64 = 10_000;
+/// Default maximum inline entries before flushing to Vortex.
+pub const DEFAULT_INLINE_FLUSH_MAX_SEGMENTS: i64 = 64;
 /// Default maximum serialized IPC bytes to keep inline before flushing to Vortex.
-pub const DEFAULT_INLINE_MEMTABLE_MAX_BYTES: i64 = 8 * 1_048_576;
+pub const DEFAULT_INLINE_FLUSH_MAX_BYTES: i64 = 8 * 1_048_576;
 
 /// Metadata about a table in the catalog.
 #[derive(Debug, Clone)]
@@ -355,15 +355,24 @@ pub struct VortexConfig {
     /// Set to 0 to force the normal Vortex write path after the first buffered batch.
     #[serde(default = "default_inline_max_buffer_bytes")]
     pub inline_max_buffer_bytes: usize,
-    /// Maximum inline memtable rows before checkpointing inline data to Vortex.
-    #[serde(default = "default_inline_memtable_max_rows")]
-    pub inline_memtable_max_rows: i64,
-    /// Maximum inline memtable entries before checkpointing inline data to Vortex.
-    #[serde(default = "default_inline_memtable_max_segments")]
-    pub inline_memtable_max_segments: i64,
-    /// Maximum inline memtable IPC bytes before checkpointing inline data to Vortex.
-    #[serde(default = "default_inline_memtable_max_bytes")]
-    pub inline_memtable_max_bytes: i64,
+    /// Maximum inline rows before checkpointing inline data to Vortex.
+    #[serde(
+        default = "default_inline_flush_max_rows",
+        alias = "inline_memtable_max_rows"
+    )]
+    pub inline_flush_max_rows: i64,
+    /// Maximum inline entries before checkpointing inline data to Vortex.
+    #[serde(
+        default = "default_inline_flush_max_segments",
+        alias = "inline_memtable_max_segments"
+    )]
+    pub inline_flush_max_segments: i64,
+    /// Maximum inline IPC bytes before checkpointing inline data to Vortex.
+    #[serde(
+        default = "default_inline_flush_max_bytes",
+        alias = "inline_memtable_max_bytes"
+    )]
+    pub inline_flush_max_bytes: i64,
     /// Whether inserts should scan existing data for primary-key conflicts.
     /// Set to `none` only when the source enforces PK uniqueness.
     #[serde(default)]
@@ -406,16 +415,16 @@ fn default_inline_max_buffer_bytes() -> usize {
     DEFAULT_INLINE_MAX_BUFFER_BYTES
 }
 
-fn default_inline_memtable_max_rows() -> i64 {
-    DEFAULT_INLINE_MEMTABLE_MAX_ROWS
+fn default_inline_flush_max_rows() -> i64 {
+    DEFAULT_INLINE_FLUSH_MAX_ROWS
 }
 
-fn default_inline_memtable_max_segments() -> i64 {
-    DEFAULT_INLINE_MEMTABLE_MAX_SEGMENTS
+fn default_inline_flush_max_segments() -> i64 {
+    DEFAULT_INLINE_FLUSH_MAX_SEGMENTS
 }
 
-fn default_inline_memtable_max_bytes() -> i64 {
-    DEFAULT_INLINE_MEMTABLE_MAX_BYTES
+fn default_inline_flush_max_bytes() -> i64 {
+    DEFAULT_INLINE_FLUSH_MAX_BYTES
 }
 
 impl Default for VortexConfig {
@@ -438,9 +447,9 @@ impl Default for VortexConfig {
             inline_max_rows: default_inline_max_rows(),
             inline_max_bytes: default_inline_max_bytes(),
             inline_max_buffer_bytes: default_inline_max_buffer_bytes(),
-            inline_memtable_max_rows: default_inline_memtable_max_rows(),
-            inline_memtable_max_segments: default_inline_memtable_max_segments(),
-            inline_memtable_max_bytes: default_inline_memtable_max_bytes(),
+            inline_flush_max_rows: default_inline_flush_max_rows(),
+            inline_flush_max_segments: default_inline_flush_max_segments(),
+            inline_flush_max_bytes: default_inline_flush_max_bytes(),
             pk_conflict_detection: PkConflictDetection::default(),
         }
     }

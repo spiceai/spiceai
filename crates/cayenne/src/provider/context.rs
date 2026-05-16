@@ -147,22 +147,22 @@ impl CayenneContext {
         self.config.inline_max_buffer_bytes
     }
 
-    /// Maximum inline memtable rows before checkpointing to Vortex.
+    /// Maximum inline rows before checkpointing to Vortex.
     #[must_use]
-    pub(crate) fn inline_memtable_max_rows(&self) -> i64 {
-        self.config.inline_memtable_max_rows.max(0)
+    pub(crate) fn inline_flush_max_rows(&self) -> i64 {
+        self.config.inline_flush_max_rows.max(0)
     }
 
-    /// Maximum inline memtable entries before checkpointing to Vortex.
+    /// Maximum inline entries before checkpointing to Vortex.
     #[must_use]
-    pub(crate) fn inline_memtable_max_segments(&self) -> i64 {
-        self.config.inline_memtable_max_segments.max(0)
+    pub(crate) fn inline_flush_max_segments(&self) -> i64 {
+        self.config.inline_flush_max_segments.max(0)
     }
 
-    /// Maximum inline memtable IPC bytes before checkpointing to Vortex.
+    /// Maximum inline IPC bytes before checkpointing to Vortex.
     #[must_use]
-    pub(crate) fn inline_memtable_max_bytes(&self) -> i64 {
-        self.config.inline_memtable_max_bytes.max(0)
+    pub(crate) fn inline_flush_max_bytes(&self) -> i64 {
+        self.config.inline_flush_max_bytes.max(0)
     }
 
     /// Primary-key conflict detection behavior for inserts.

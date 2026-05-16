@@ -71,14 +71,14 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("inline_max_buffer_bytes")
         .description("Maximum Arrow in-memory bytes buffered while deciding whether to inline a write. Set to 0 to force the Vortex write path after the first buffered batch. Default: 4194304.")
         .default("4194304"),
-    ParameterSpec::component("inline_memtable_max_rows")
-        .description("Maximum inline memtable rows before checkpointing inline data to Vortex. Default: 10000.")
+    ParameterSpec::component("inline_flush_max_rows")
+        .description("Maximum inline rows before checkpointing inline data to Vortex. Default: 10000.")
         .default("10000"),
-    ParameterSpec::component("inline_memtable_max_segments")
-        .description("Maximum inline memtable entries before checkpointing inline data to Vortex. Default: 64.")
+    ParameterSpec::component("inline_flush_max_segments")
+        .description("Maximum inline entries before checkpointing inline data to Vortex. Default: 64.")
         .default("64"),
-    ParameterSpec::component("inline_memtable_max_bytes")
-        .description("Maximum inline memtable IPC bytes before checkpointing inline data to Vortex. Default: 8388608.")
+    ParameterSpec::component("inline_flush_max_bytes")
+        .description("Maximum inline IPC bytes before checkpointing inline data to Vortex. Default: 8388608.")
         .default("8388608"),
 ];
 
@@ -183,23 +183,23 @@ impl CayenneCatalogConnector {
             .expose()
             .ok()
             .and_then(|v| v.parse::<usize>().ok());
-        let inline_memtable_max_rows = self
+        let inline_flush_max_rows = self
             .params
-            .get("inline_memtable_max_rows")
+            .get("inline_flush_max_rows")
             .expose()
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
             .map(|v| v.max(0));
-        let inline_memtable_max_segments = self
+        let inline_flush_max_segments = self
             .params
-            .get("inline_memtable_max_segments")
+            .get("inline_flush_max_segments")
             .expose()
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
             .map(|v| v.max(0));
-        let inline_memtable_max_bytes = self
+        let inline_flush_max_bytes = self
             .params
-            .get("inline_memtable_max_bytes")
+            .get("inline_flush_max_bytes")
             .expose()
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
@@ -219,9 +219,9 @@ impl CayenneCatalogConnector {
             inline_max_rows,
             inline_max_bytes,
             inline_max_buffer_bytes,
-            inline_memtable_max_rows,
-            inline_memtable_max_segments,
-            inline_memtable_max_bytes,
+            inline_flush_max_rows,
+            inline_flush_max_segments,
+            inline_flush_max_bytes,
         }
     }
 }
@@ -292,6 +292,7 @@ mod tests {
         assert!(display_names.contains(&"cayenne_upload_concurrency".to_string()));
         assert!(display_names.contains(&"cayenne_write_concurrency".to_string()));
         assert!(display_names.contains(&"cayenne_inline_max_rows".to_string()));
+        assert!(display_names.contains(&"cayenne_inline_flush_max_bytes".to_string()));
         assert!(display_names.contains(&"cayenne_pk_conflict_detection".to_string()));
         assert!(
             display_names
@@ -323,7 +324,7 @@ mod tests {
                     SecretString::new("0".to_string().into()),
                 ),
                 (
-                    "cayenne_inline_memtable_max_bytes".to_string(),
+                    "cayenne_inline_flush_max_bytes".to_string(),
                     SecretString::new("2097152".to_string().into()),
                 ),
                 (
@@ -345,7 +346,7 @@ mod tests {
         assert_eq!(config.upload_concurrency, Some(1));
         assert_eq!(config.write_concurrency, Some(8));
         assert_eq!(config.inline_max_rows, Some(0));
-        assert_eq!(config.inline_memtable_max_bytes, Some(2_097_152));
+        assert_eq!(config.inline_flush_max_bytes, Some(2_097_152));
         assert_eq!(
             config.pk_conflict_detection,
             Some(cayenne::metadata::PkConflictDetection::None)
