@@ -92,6 +92,16 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Returns `true` for configuration errors that will not resolve with retries.
+    pub fn is_configuration_error(&self) -> bool {
+        matches!(
+            self,
+            Error::InvalidConfiguration { .. } | Error::InvalidConfigurationNoSource { .. }
+        )
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[cfg(feature = "adbc")]
