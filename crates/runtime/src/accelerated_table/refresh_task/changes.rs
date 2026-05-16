@@ -78,8 +78,10 @@ impl CdcInsertPlanCache {
             &target_schema,
         )));
         let streaming_exec: Arc<dyn ExecutionPlan> = streaming_plan.clone();
-        let cast_plan: Arc<dyn ExecutionPlan> =
-            Arc::new(SchemaCastScanExec::new(streaming_exec, Arc::clone(&target_schema)));
+        let cast_plan: Arc<dyn ExecutionPlan> = Arc::new(SchemaCastScanExec::new(
+            streaming_exec,
+            Arc::clone(&target_schema),
+        ));
         let insert_plan = accelerator
             .insert_into(session_state, cast_plan, InsertOp::Append)
             .await?;
