@@ -385,10 +385,8 @@ async fn build_table_providers_for_schema(
                 let provider = if let Some(fks) = foreign_keys.get(&table_name) {
                     match serde_json::to_string(fks) {
                         Ok(fk_json) => {
-                            let extra = HashMap::from([(
-                                FOREIGN_KEYS_METADATA_KEY.to_string(),
-                                fk_json,
-                            )]);
+                            let extra =
+                                HashMap::from([(FOREIGN_KEYS_METADATA_KEY.to_string(), fk_json)]);
                             Arc::new(MetadataEnrichedTableProvider::new(provider, extra))
                                 as Arc<dyn TableProvider>
                         }
