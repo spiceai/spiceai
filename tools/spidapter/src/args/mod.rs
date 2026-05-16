@@ -22,6 +22,14 @@ pub enum BackendMode {
     Local,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum DeploymentMode {
+    /// Single spiced process (no scheduler/executor split).
+    SingleNode,
+    /// Scheduler + N executor processes with mTLS.
+    Distributed,
+}
+
 #[derive(Subcommand)]
 pub enum Commands {
     /// Run spidapter as a newline-delimited JSON-RPC server over stdio
@@ -148,6 +156,39 @@ pub struct StdioArgs {
     /// Query memory limit to apply to `runtime.query.memory_limit` spicepod configuration (e.g. `150Gi`).
     #[arg(long, env = "SPIDAPTER_QUERY_MEMORY_LIMIT")]
     pub query_memory_limit: Option<String>,
+
+    /// Deployment mode: `single-node` or `distributed` (scheduler + executors).
+    #[arg(long, env = "SPIDAPTER_DEPLOYMENT_MODE", default_value = "distributed")]
+    pub deployment_mode: DeploymentMode,
+
+    /// PostgreSQL host for WAL CDC mode. When set, spidapter writes via the PostgreSQL
+    /// ADBC driver and configures Spice to read via WAL CDC.
+    #[arg(long, env = "PG_HOST")]
+    pub pg_host: Option<String>,
+
+    /// PostgreSQL port for WAL CDC mode.
+    #[arg(long, env = "PG_PORT", default_value = "5432")]
+    pub pg_port: u16,
+
+    /// PostgreSQL username for WAL CDC mode.
+    #[arg(long, env = "PG_USER")]
+    pub pg_user: Option<String>,
+
+    /// PostgreSQL password for WAL CDC mode.
+    #[arg(long, env = "PG_PASSWORD", default_value = "")]
+    pub pg_password: String,
+
+    /// PostgreSQL database name for WAL CDC mode.
+    #[arg(long, env = "PG_DATABASE")]
+    pub pg_database: Option<String>,
+
+    /// PostgreSQL schema for WAL CDC mode.
+    #[arg(long, env = "PG_SCHEMA", default_value = "public")]
+    pub pg_schema: String,
+
+    /// Name or path of the spiced binary to spawn (local backend only).
+    #[arg(long, default_value = "spiced")]
+    pub spiced_binary: String,
 }
 
 #[derive(Parser, Debug, Clone)]

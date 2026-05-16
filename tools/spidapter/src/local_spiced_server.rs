@@ -52,5 +52,13 @@ fn to_stdio_args(args: &LocalSpicedArgs) -> StdioArgs {
         executor_storage_size_gb: None,
         ephemeral_storage_limit_gb: None,
         organization_tag: None,
+        deployment_mode: crate::args::DeploymentMode::Distributed,
+        pg_host: None,
+        pg_port: 5432,
+        pg_user: None,
+        pg_password: String::new(),
+        pg_database: None,
+        pg_schema: "public".to_string(),
+        spiced_binary: "spiced".to_string(),
     }
 }

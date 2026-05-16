@@ -25,6 +25,8 @@ uuid.workspace = true
 yaml = { path = "../../crates/yaml" }
 rustls.workspace = true
 tokio.workspace = true
+tokio-postgres.workspace = true
+urlencoding = "2"
 tonic.workspace = true
 url.workspace = true
 
