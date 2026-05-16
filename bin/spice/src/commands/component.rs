@@ -22,6 +22,8 @@ use clap::{Args, Subcommand, ValueHint};
 use snafu::{ResultExt, ensure};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+// Raw YAML types are used here rather than `spicepod` crate types so that editing
+// a spicepod.yaml file preserves existing comments, whitespace, and field ordering.
 use yaml::{Mapping, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
