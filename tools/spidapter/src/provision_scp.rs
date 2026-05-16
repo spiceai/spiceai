@@ -20,9 +20,11 @@ use spice_cloud_client::types::UpdateAppRequest;
 use system_adapter_protocol::DatasetConfig;
 use uuid::Uuid;
 
+use super::{
+    RunState, SetupConfig, generate_initial_spicepod, post_setup_sink_action, serialize_spicepod,
+};
 use crate::args::StdioArgs;
 use crate::commands;
-use super::{RunState, SetupConfig, generate_initial_spicepod, serialize_spicepod, post_setup_sink_action};
 
 pub(super) async fn provision_scp_app(
     run_id: Uuid,

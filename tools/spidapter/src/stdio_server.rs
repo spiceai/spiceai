@@ -20,8 +20,7 @@ use arrow::datatypes::DataType;
 use async_trait::async_trait;
 use spice_cloud_client::CloudClient;
 use spicepod::component::runtime::{
-    Scheduler,
-    default_max_partition_assignments_per_interval, default_max_partitions_per_executor,
+    Scheduler, default_max_partition_assignments_per_interval, default_max_partitions_per_executor,
     default_partition_assignment_interval, default_partition_discovery_timeout,
 };
 use spicepod::param::{ParamValue, Params};
@@ -941,9 +940,10 @@ mod tests {
         )]);
 
         let args = test_stdio_args();
-        let spicepod = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None, &args)
-            .await
-            .expect("spicepod should generate");
+        let spicepod =
+            generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None, &args)
+                .await
+                .expect("spicepod should generate");
         let spicepod_yaml =
             serialize_spicepod(&spicepod).expect("spicepod should serialize to YAML");
 

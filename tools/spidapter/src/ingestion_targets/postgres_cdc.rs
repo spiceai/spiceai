@@ -52,9 +52,15 @@ impl PgConfig {
         Some(Self {
             host,
             port: args.pg_port,
-            user: args.pg_user.clone().unwrap_or_else(|| "postgres".to_string()),
+            user: args
+                .pg_user
+                .clone()
+                .unwrap_or_else(|| "postgres".to_string()),
             password: args.pg_password.clone(),
-            database: args.pg_database.clone().unwrap_or_else(|| "spicebench".to_string()),
+            database: args
+                .pg_database
+                .clone()
+                .unwrap_or_else(|| "spicebench".to_string()),
             schema: args.pg_schema.clone(),
         })
     }
@@ -78,7 +84,10 @@ impl PgConfig {
     }
 
     pub(crate) fn adbc_kwargs(&self) -> HashMap<String, serde_json::Value> {
-        HashMap::from([("uri".to_string(), serde_json::Value::String(self.adbc_uri()))])
+        HashMap::from([(
+            "uri".to_string(),
+            serde_json::Value::String(self.adbc_uri()),
+        )])
     }
 
     pub(crate) async fn connect(&self) -> anyhow::Result<tokio_postgres::Client> {
@@ -95,7 +104,6 @@ impl PgConfig {
         Ok(client)
     }
 }
-
 
 pub(crate) fn generate_postgres_wal_spicepod(
     run_id: &Uuid,
@@ -116,14 +124,20 @@ pub(crate) fn generate_postgres_wal_spicepod(
 
     for (dataset_name, dataset_config) in datasets {
         let param_map = HashMap::from([
-            ("pg_connection_string".to_string(), pg.libpq_connection_string()),
+            (
+                "pg_connection_string".to_string(),
+                pg.libpq_connection_string(),
+            ),
             ("pg_host".to_string(), pg.host.clone()),
             ("pg_port".to_string(), pg.port.to_string()),
             ("pg_user".to_string(), pg.user.clone()),
             ("pg_pass".to_string(), pg.password.clone()),
             ("pg_db".to_string(), pg.database.clone()),
             ("pg_sslmode".to_string(), "disable".to_string()),
-            ("pg_publication".to_string(), pub_name_for_table(dataset_name)),
+            (
+                "pg_publication".to_string(),
+                pub_name_for_table(dataset_name),
+            ),
         ]);
 
         let pks = &dataset_config.primary_key_columns;
@@ -137,10 +151,7 @@ pub(crate) fn generate_postgres_wal_spicepod(
             Some(pk) => HashMap::from([(pk.clone(), OnConflictBehavior::Upsert)]),
         };
 
-        let mut dataset = Dataset::new(
-            format!("postgres:{dataset_name}"),
-            dataset_name.as_str(),
-        );
+        let mut dataset = Dataset::new(format!("postgres:{dataset_name}"), dataset_name.as_str());
         dataset.params = Some(Params::from_string_map(param_map));
         dataset.acceleration = Some(Acceleration {
             enabled: true,
@@ -253,10 +264,7 @@ pub(crate) async fn setup_postgres_for_wal(
 
     // Create schema
     client
-        .execute(
-            &format!("CREATE SCHEMA IF NOT EXISTS {}", pg.schema),
-            &[],
-        )
+        .execute(&format!("CREATE SCHEMA IF NOT EXISTS {}", pg.schema), &[])
         .await?;
 
     // Drop and recreate tables to ensure clean state on each benchmark run.
@@ -336,8 +344,7 @@ pub(crate) async fn teardown_postgres(
         )
         .await?;
     if !legacy_rows.is_empty() {
-        let drop_legacy =
-            format!("SELECT pg_drop_replication_slot('{PG_REPLICATION_SLOT_NAME}')");
+        let drop_legacy = format!("SELECT pg_drop_replication_slot('{PG_REPLICATION_SLOT_NAME}')");
         eprintln!("[stdio] pg teardown: {drop_legacy}");
         client.execute(&drop_legacy, &[]).await?;
     }

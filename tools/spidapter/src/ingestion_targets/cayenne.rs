@@ -27,8 +27,8 @@ use spicepod::spec::SpicepodDefinition;
 use system_adapter_protocol::{AdbcDriver, DatasetConfig, EtlSinkType, SetupResponse};
 use uuid::Uuid;
 
-use crate::args::StdioArgs;
 use super::super::{RunState, SetupConfig, resolve_aws_region};
+use crate::args::StdioArgs;
 
 pub(crate) fn build_cayenne_setup_response(
     etl_sink_type: Option<EtlSinkType>,

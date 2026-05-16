@@ -18,15 +18,15 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::process::{Child, Command as TokioCommand};
 use system_adapter_protocol::{DatasetConfig, EtlSinkType};
+use tokio::process::{Child, Command as TokioCommand};
 use uuid::Uuid;
 
-use crate::args::StdioArgs;
 use super::{
     LocalProcesses, LocalRunState, RunState, SetupConfig, generate_initial_spicepod,
     post_setup_sink_action, write_local_spicepod,
 };
+use crate::args::StdioArgs;
 
 const LOCAL_BIND_HOST: &str = "0.0.0.0";
 const LOCAL_CONNECT_HOST: &str = "127.0.0.1";
@@ -115,8 +115,7 @@ pub(super) async fn provision_local_single_node(
     let http_url = format!("http://{}:{}", LOCAL_CONNECT_HOST, ports.http);
     let sql_url = format!("{http_url}/v1/sql");
 
-    if let Err(error) =
-        wait_for_local_http_ready(&http_url, &mut child, ready_wait, "spiced").await
+    if let Err(error) = wait_for_local_http_ready(&http_url, &mut child, ready_wait, "spiced").await
     {
         let _ = stop_child_process(&mut child, "spiced").await;
         let _ = cleanup_local_artifacts(&working_dir).await;
@@ -897,7 +896,11 @@ async fn stop_child_process(child: &mut Child, process_name: &str) -> anyhow::Re
 async fn cleanup_local_artifacts(working_dir: &Path) -> anyhow::Result<()> {
     if tokio::fs::metadata(working_dir).await.is_ok() {
         // Preserve log files outside the working dir before deleting it
-        for entry in std::fs::read_dir(working_dir).into_iter().flatten().flatten() {
+        for entry in std::fs::read_dir(working_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
             let path = entry.path();
             if path.extension().map_or(false, |e| e == "log") {
                 let dest = std::env::temp_dir().join(entry.file_name());
