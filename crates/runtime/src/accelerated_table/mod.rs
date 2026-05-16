@@ -1792,7 +1792,7 @@ impl TableProvider for AcceleratedTable {
         let plan = self
             .scan(
                 state,
-                args.projection().map(|p| p.to_vec()).as_ref(),
+                args.projection().map(<[usize]>::to_vec).as_ref(),
                 args.filters().unwrap_or(&[]),
                 args.limit(),
             )
