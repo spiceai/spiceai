@@ -1020,12 +1020,12 @@ async fn test_pending_writer_wal_survives_compaction_trigger_impl(
 // S3-specific regression test for pre-recovery audit with partial upload
 // ============================================================================
 
-/// Test that the S3 pre-recovery audit (list-based) correctly refuses
-/// automated recovery when a WAL references a file that is "missing"
-/// (simulating a partial multipart upload that was never completed).
-///
-/// This is the key S3 edge case for the new pre-recovery audit + automated
-/// recovery feature. The test uses an InMemory object store to simulate S3.
+// Test that the S3 pre-recovery audit (list-based) correctly refuses
+// automated recovery when a WAL references a file that is "missing"
+// (simulating a partial multipart upload that was never completed).
+//
+// This is the key S3 edge case for the new pre-recovery audit + automated
+// recovery feature. The test uses an `InMemory` object store to simulate S3.
 // The S3 pre-recovery audit path is symmetric to the local-FS path tested
 // directly in `test_wal_with_missing_files_blocks_recovery_impl` (Test 16).
 // A full S3 mocked recovery test would require wiring an in-memory object
@@ -1213,11 +1213,13 @@ async fn setup_table_with_compaction(
     fixture: &common::TestFixture,
     table_name: &str,
 ) -> (Arc<CayenneTableProvider>, SessionContext) {
-    let mut vortex_config = cayenne::metadata::VortexConfig::default();
-    vortex_config.compaction_trigger_files = 2;
-    vortex_config.compaction_max_levels = 1;
-    vortex_config.compaction_max_files_per_pick = 2;
-    vortex_config.compaction_background_interval_ms = 0;
+    let vortex_config = cayenne::metadata::VortexConfig {
+        compaction_trigger_files: 2,
+        compaction_max_levels: 1,
+        compaction_max_files_per_pick: 2,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
     setup_table_with_vortex_config(fixture, table_name, vortex_config).await
 }
 

@@ -27,8 +27,8 @@ limitations under the License.
 //!      every commit (~ms on SSD, more on slow disks; doubled at high commit
 //!      rate).
 //!
-//!   2. `write_deletion_file` (provider/delete/vector_io.rs) fsync'd the
-//!      deletion-vector file twice: once via the FileWriter's inner fd, then
+//!   2. `write_deletion_file` (`provider/delete/vector_io.rs`) fsync'd the
+//!      deletion-vector file twice: once via the `FileWriter`'s inner fd, then
 //!      again via a fresh `OpenOptions::write(true).open(...)` + `sync_all()`.
 //!      No data is written between the two calls, so the second is a redundant
 //!      open + fsync on every deletion vector flush.

@@ -54,7 +54,7 @@ use cayenne::{
 };
 use tempfile::TempDir;
 
-/// Build a fresh on-disk SQLite catalog. Returns the catalog handle and
+/// Build a fresh on-disk `SQLite` catalog. Returns the catalog handle and
 /// the tempdir (kept alive by the caller to keep the DB and data dir
 /// rooted).
 async fn fresh_catalog() -> (Arc<CayenneCatalog>, TempDir) {

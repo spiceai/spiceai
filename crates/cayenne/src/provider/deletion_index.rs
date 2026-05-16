@@ -463,7 +463,7 @@ mod tests {
         for pk in 0_i64..n {
             idx = idx.extend_max([(pk, pk + 1)]);
         }
-        assert_eq!(idx.len() as i64, n);
+        assert_eq!(i64::try_from(idx.len()).expect("len fits in i64"), n);
         for pk in 0_i64..n {
             assert_eq!(
                 idx.get(pk),
@@ -531,14 +531,14 @@ mod tests {
         let n = 256_usize;
         for i in 0..n {
             let key: Box<[u8]> = (i as u64).to_le_bytes().to_vec().into_boxed_slice();
-            idx = idx.extend_max([(key, i as i64 + 1)]);
+            idx = idx.extend_max([(key, i64::try_from(i).expect("i fits in i64") + 1)]);
         }
         assert_eq!(idx.len(), n);
         for i in 0..n {
             let key: Box<[u8]> = (i as u64).to_le_bytes().to_vec().into_boxed_slice();
             assert_eq!(
                 idx.get(&key),
-                Some(i as i64 + 1),
+                Some(i64::try_from(i).expect("i fits in i64") + 1),
                 "missing entry for key i={i} after {n} incremental extends",
             );
         }

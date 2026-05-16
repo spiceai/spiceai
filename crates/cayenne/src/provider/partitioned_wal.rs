@@ -598,6 +598,9 @@ mod tests {
             store.get(&tmp_key).await,
             Err(object_store::Error::NotFound { .. })
         ));
-        assert!(store.get(&final_key).await.is_ok());
+        store
+            .get(&final_key)
+            .await
+            .expect("final key exists after WAL commit");
     }
 }

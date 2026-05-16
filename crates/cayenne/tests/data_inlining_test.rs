@@ -1367,7 +1367,7 @@ async fn test_roundtrip_exceeds_byte_threshold(
 /// After the inline memtable checkpoints, the resulting Vortex file plus any
 /// subsequent small writes should be eligible for the new tiered compaction
 /// trigger. Drive ~1.5 K inline-memtable flushes (each producing one Vortex
-/// file), then perform a few more large writes (each above INLINE_MAX_ROWS,
+/// file), then perform a few more large writes (each above `INLINE_MAX_ROWS`,
 /// bypassing the inline path). With the trigger lowered, compaction should
 /// consolidate them — verified via `SELECT COUNT(*)` end-to-end correctness
 /// and a final visible-file count well below the number of inserts.
@@ -1380,10 +1380,12 @@ async fn test_compaction_runs_after_inline_memtable_checkpoint(
     ]));
 
     // Build a table with aggressive compaction settings so the test runs fast.
-    let mut vortex_config = cayenne::metadata::VortexConfig::default();
-    vortex_config.target_vortex_file_size_mb = 1;
-    vortex_config.compaction_trigger_files = 4;
-    vortex_config.compaction_background_interval_ms = 0;
+    let vortex_config = cayenne::metadata::VortexConfig {
+        target_vortex_file_size_mb: 1,
+        compaction_trigger_files: 4,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
 
     let ctx = SessionContext::new();
     let table = Arc::new(

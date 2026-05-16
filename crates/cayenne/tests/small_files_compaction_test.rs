@@ -27,7 +27,7 @@ limitations under the License.
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::{Int64Array, StringArray};
@@ -50,7 +50,7 @@ fn pk_schema() -> Arc<Schema> {
     ]))
 }
 
-/// VortexConfig tuned aggressively for tests: tiny target file size so a few
+/// `VortexConfig` tuned aggressively for tests: tiny target file size so a few
 /// thousand rows immediately count as "small", and a low trigger so 4 small
 /// files are enough to fire compaction.
 fn aggressive_compaction_config() -> VortexConfig {
@@ -70,7 +70,7 @@ fn aggressive_compaction_config() -> VortexConfig {
 }
 
 /// Build a batch of `n` rows whose ids start at `start` and whose values are
-/// derived strings. n must be > INLINE_MAX_ROWS (1024) to bypass inlining.
+/// derived strings. n must be > `INLINE_MAX_ROWS` (1024) to bypass inlining.
 fn make_batch(schema: &Arc<Schema>, start: i64, n: i64) -> RecordBatch {
     let ids: Vec<i64> = (start..start + n).collect();
     let values: Vec<String> = ids.iter().map(|i| format!("v_{i}")).collect();
@@ -85,11 +85,10 @@ fn make_batch(schema: &Arc<Schema>, start: i64, n: i64) -> RecordBatch {
 }
 
 /// Count `.vortex` files in `<data_path>/<table_id>/<current_snapshot_id>`.
-async fn count_vortex_files(data_path: &PathBuf, table_id: &str, snapshot_id: &str) -> usize {
+async fn count_vortex_files(data_path: &Path, table_id: &str, snapshot_id: &str) -> usize {
     let snapshot_dir = data_path.join(table_id).join(snapshot_id);
-    let mut entries = match tokio::fs::read_dir(&snapshot_dir).await {
-        Ok(e) => e,
-        Err(_) => return 0,
+    let Ok(mut entries) = tokio::fs::read_dir(&snapshot_dir).await else {
+        return 0;
     };
     let mut count = 0;
     while let Some(entry) = entries.next_entry().await.expect("read_dir") {
@@ -281,10 +280,12 @@ async fn compaction_idempotent_when_no_candidates(
     let schema = pk_schema();
     // Disable inline triggers via a high trigger_files count, so the first few
     // writes don't auto-compact and we can call compact explicitly.
-    let mut config = VortexConfig::default();
-    config.target_vortex_file_size_mb = 1;
-    config.compaction_trigger_files = 1000;
-    config.compaction_background_interval_ms = 0;
+    let config = VortexConfig {
+        target_vortex_file_size_mb: 1,
+        compaction_trigger_files: 1000,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
 
     let (table, _ctx, table_id) = build_table(
         &fixture,
@@ -340,10 +341,12 @@ async fn compaction_disabled_when_trigger_unreachable(
     // High trigger threshold + small writes → picker keeps returning None →
     // no compaction. Acts as a regression test that the inline trigger does
     // not aggressively rewrite without sufficient small-file pressure.
-    let mut config = VortexConfig::default();
-    config.target_vortex_file_size_mb = 1;
-    config.compaction_trigger_files = 100;
-    config.compaction_background_interval_ms = 0;
+    let config = VortexConfig {
+        target_vortex_file_size_mb: 1,
+        compaction_trigger_files: 100,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
 
     let (table, ctx, table_id) = build_table(
         &fixture,
