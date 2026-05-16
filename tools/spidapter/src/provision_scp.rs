@@ -146,7 +146,6 @@ pub(super) async fn provision_scp_app(
         app_id,
         api_key,
         flight_url,
-        api_url: api_url.to_owned(),
         sql_url,
         cloud,
         pg_config: Box::new(setup_config.pg_config.clone()),

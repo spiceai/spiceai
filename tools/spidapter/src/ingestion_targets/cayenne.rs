@@ -66,6 +66,7 @@ pub(crate) fn build_cayenne_setup_response(
             .filter(|sink_type| matches!(sink_type, EtlSinkType::Adbc))
             .map(|_| "spicebench.bench".to_string()),
         read_driver: None,
+        endpoints: HashMap::new(),
     }
 }
 

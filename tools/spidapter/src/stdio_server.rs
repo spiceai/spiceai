@@ -65,8 +65,6 @@ enum RunState {
         api_key: String,
         /// Flight SQL endpoint URL derived from the cname.
         flight_url: String,
-        /// Normalized API base URL (stored separately from `cloud` to avoid tainted-struct logging).
-        api_url: String,
         /// SQL endpoint URL for DDL execution.
         sql_url: String,
         /// Cloud client used during provisioning (reused for teardown).
@@ -363,6 +361,7 @@ impl Handler for SpidapterHandler {
                     db_kwargs: pg.adbc_kwargs(),
                     catalog_namespace: Some(pg.schema.clone()),
                     read_driver: Some((AdbcDriver::Flightsql, flight_kwargs)),
+                    endpoints: HashMap::new(),
                 }
             }
             IngestionTarget::Cayenne => build_cayenne_setup_response(etl_sink_type, &state),
