@@ -924,9 +924,7 @@ fn checkpoint_inlined_pressure_has_cached_fast_path() {
         TABLE_SRC,
         "checkpoint_inlined_data_if_memtable_pressure_exceeded",
     )
-    .expect(
-        "checkpoint_inlined_data_if_memtable_pressure_exceeded function not found in table.rs",
-    );
+    .expect("checkpoint_inlined_data_if_memtable_pressure_exceeded function not found in table.rs");
 
     // The fast path must use the cached atomic before the catalog call.
     assert!(

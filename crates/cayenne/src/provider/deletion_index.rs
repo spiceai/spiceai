@@ -42,7 +42,7 @@ const MIN_BLOOM_CAPACITY: usize = 64;
 
 /// Frozen deletion index for tables with a single-column Int64 primary key.
 ///
-/// Holds the (pk → delete_sequence) map and an accompanying bloom filter. The bloom
+/// Holds the (pk → `delete_sequence`) map and an accompanying bloom filter. The bloom
 /// filter's bit array is sized for `bloom_capacity` items; the writer tracks that
 /// capacity so `extend_max` can update the bloom incrementally for the common case
 /// where the index grows slowly, only paying a full O(N) rebuild when the entry count
@@ -141,7 +141,7 @@ impl DeletionIndex {
     ///
     /// # Performance
     ///
-    /// The HashMap clone is O(N) per call — unavoidable for the ArcSwap-published-
+    /// The `HashMap` clone is O(N) per call — unavoidable for the `ArcSwap`-published-
     /// snapshot pattern without persistent data structures, which we deliberately
     /// avoid as a dependency. The bloom filter is updated incrementally (O(K) inserts
     /// for K new keys) instead of being rebuilt from scratch every call. A full
@@ -150,7 +150,7 @@ impl DeletionIndex {
     ///
     /// **Why this matters**: a previous revision rebuilt the bloom from scratch on
     /// every `extend_max` call, which is the dominant cost (10K entries ≈ 10K hash
-    /// ops ≈ ~1 ms per call versus ~2 µs for the HashMap clone of the same size).
+    /// ops ≈ ~1 ms per call versus ~2 µs for the `HashMap` clone of the same size).
     /// On high-rate upsert/delete workloads (each producing a small `additions`
     /// batch but operating on a deletion cache that grows over time), the wasted
     /// bloom rebuild work compounds — and is the root cause of the ingestion

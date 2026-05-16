@@ -377,7 +377,7 @@ mod tests {
     fn picker_returns_none_when_total_bytes_below_target() {
         let cfg = default_cfg();
         // 8 small files of 1 MiB each — meets trigger_files but total = 8 MiB,
-        // way below the 128 MiB tier target.
+        // well below the 32 MiB Small-tier byte threshold (target_size / 4).
         let files = entries(&[1024 * 1024; 8]);
         assert!(pick_candidates(files.iter().cloned(), &cfg).is_none());
     }

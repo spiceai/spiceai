@@ -5292,8 +5292,8 @@ impl CayenneTableProvider {
         // the bytes threshold. After the fast path stops, we fall through
         // to the catalog for accurate stats including bytes.
         let cached_rows = self.inlined_row_count.load(Ordering::Relaxed);
-        let safe_skip_threshold: i64 =
-            (INLINE_MEMTABLE_MAX_BYTES / INLINE_MAX_BYTES as i64).max(1);
+        let inline_max_bytes_i64 = i64::try_from(INLINE_MAX_BYTES).unwrap_or(i64::MAX);
+        let safe_skip_threshold: i64 = (INLINE_MEMTABLE_MAX_BYTES / inline_max_bytes_i64).max(1);
         if cached_rows < safe_skip_threshold {
             return Ok(());
         }
