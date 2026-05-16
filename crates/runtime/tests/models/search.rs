@@ -79,7 +79,7 @@ pub struct SearchTestCase {
     pub body: SearchTestType,
     pub should_fail: bool,
     pub skip: bool,
-    /// When true, displayed scores use rounding instead of truncation.
+    /// When true, score ordering uses rounding before tie-breaking.
     /// Use for tests with non-deterministic embeddings (e.g. model2vec/s3vectors)
     /// where raw scores can vary ±0.002 across CI runners.
     pub round_scores: bool,
@@ -287,13 +287,6 @@ fn assert_search_response_snapshot(test_name: &str, resp: Value, round_scores: b
                 normalize_search_response_json(resp, true, round_scores)
             );
         }
-        // S3 Vectors HTTP search results are non-deterministic: the backend may return
-        // different items with the same rounded score across runs, or scores can drift
-        // across a two-decimal rounding boundary. Use structural validation instead of
-        // exact snapshot comparison for these tests.
-        name if use_structural_search_response_validation(name) => {
-            assert_search_response_structure(name, &resp);
-        }
         _ => {
             assert_search_response_scores_descending(test_name, &resp);
             insta::assert_snapshot!(
@@ -322,130 +315,15 @@ fn assert_search_response_scores_descending(test_name: &str, resp: &Value) {
             "{test_name}: result[{index}] score should not be NaN"
         );
         assert!(
+            score.is_finite() && score >= 0.0,
+            "{test_name}: result[{index}] score {score} should be finite and non-negative"
+        );
+        assert!(
             score <= previous_score,
             "{test_name}: result[{index}] score {score} > previous {previous_score} (not descending)"
         );
         previous_score = score;
     }
-}
-
-fn use_structural_search_response_validation(test_name: &str) -> bool {
-    let is_s3_vectors_composite =
-        test_name.starts_with("s3vectors_composite") && !test_name.contains("with_where");
-    let is_s3_vectors_chunking = test_name.starts_with("s3vectors_chunking");
-
-    (is_s3_vectors_composite || is_s3_vectors_chunking) && !test_name.contains("vector_search_sql")
-}
-
-/// Validate the structure and invariants of a search response without asserting exact item content.
-/// Used for S3 Vectors HTTP search tests where the result set is non-deterministic.
-fn assert_search_response_structure(test_name: &str, resp: &Value) {
-    let results = resp
-        .get("results")
-        .and_then(|r| r.as_array())
-        .unwrap_or_else(|| panic!("{test_name}: response should have a 'results' array"));
-
-    assert_eq!(
-        results.len(),
-        4,
-        "{test_name}: expected 4 results, got {}",
-        results.len()
-    );
-
-    let expected_dataset = if test_name.contains("_view") {
-        "qs_view"
-    } else {
-        "qs"
-    };
-
-    let mut prev_score = f64::MAX;
-    for (i, result) in results.iter().enumerate() {
-        // Verify required fields exist
-        assert!(
-            result.get("_score").is_some(),
-            "{test_name}: result[{i}] missing '_score'"
-        );
-        assert!(
-            result.get("matches").is_some(),
-            "{test_name}: result[{i}] missing 'matches'"
-        );
-        assert!(
-            result.get("primary_key").is_some(),
-            "{test_name}: result[{i}] missing 'primary_key'"
-        );
-
-        // Verify dataset name
-        let dataset = result.get("dataset").and_then(|d| d.as_str()).unwrap_or("");
-        assert_eq!(
-            dataset, expected_dataset,
-            "{test_name}: result[{i}] dataset should be '{expected_dataset}', got '{dataset}'"
-        );
-
-        // Verify scores are in descending order and within [0, 1]
-        let score: f64 = result.get("_score").and_then(Value::as_f64).unwrap_or(-1.0);
-        assert!(
-            !score.is_nan(),
-            "{test_name}: result[{i}] score should not be NaN"
-        );
-        assert!(
-            (0.0..=1.0).contains(&score),
-            "{test_name}: result[{i}] score {score} not in [0, 1]"
-        );
-        assert!(
-            score <= prev_score,
-            "{test_name}: result[{i}] score {score} > previous {prev_score} (not descending)"
-        );
-        prev_score = score;
-
-        // Verify matches contain the 'answer' field
-        let matches = result.get("matches").and_then(|m| m.as_object());
-        assert!(
-            matches.is_some_and(|m| m.contains_key("answer")),
-            "{test_name}: result[{i}] matches should contain 'answer'"
-        );
-
-        // For additional_columns tests, verify extra fields are returned.
-        if test_name.contains("additional_columns") {
-            let data = result.get("data").and_then(|d| d.as_object());
-            let primary_key = result.get("primary_key").and_then(|p| p.as_object());
-            assert!(
-                data.is_some_and(|d| !d.is_empty()) || primary_key.is_some_and(|p| p.len() > 1),
-                "{test_name}: result[{i}] data or primary_key should contain requested additional columns"
-            );
-        }
-    }
-}
-
-#[test]
-fn structural_search_response_accepts_additional_columns_in_data() {
-    assert_search_response_structure(
-        "s3vectors_chunking_additional_columns",
-        &json!({
-            "duration_ms": 1,
-            "results": [
-                {"_score": 0.4, "data": {"question": "q1"}, "dataset": "qs", "matches": {"answer": ["a1"]}, "primary_key": {"id": 1}},
-                {"_score": 0.3, "data": {"question": "q2"}, "dataset": "qs", "matches": {"answer": ["a2"]}, "primary_key": {"id": 2}},
-                {"_score": 0.2, "data": {"question": "q3"}, "dataset": "qs", "matches": {"answer": ["a3"]}, "primary_key": {"id": 3}},
-                {"_score": 0.1, "data": {"question": "q4"}, "dataset": "qs", "matches": {"answer": ["a4"]}, "primary_key": {"id": 4}}
-            ]
-        }),
-    );
-}
-
-#[test]
-fn structural_search_response_accepts_additional_columns_in_primary_key() {
-    assert_search_response_structure(
-        "s3vectors_composite_additional_columns",
-        &json!({
-            "duration_ms": 1,
-            "results": [
-                {"_score": 0.4, "dataset": "qs", "matches": {"answer": ["a1"]}, "primary_key": {"id": 1, "question": "q1"}},
-                {"_score": 0.3, "dataset": "qs", "matches": {"answer": ["a2"]}, "primary_key": {"id": 2, "question": "q2"}},
-                {"_score": 0.2, "dataset": "qs", "matches": {"answer": ["a3"]}, "primary_key": {"id": 3, "question": "q3"}},
-                {"_score": 0.1, "dataset": "qs", "matches": {"answer": ["a4"]}, "primary_key": {"id": 4, "question": "q4"}}
-            ]
-        }),
-    );
 }
 
 #[test]
@@ -662,6 +540,41 @@ fn sql_response_normalization_redacts_already_tight_2dp_clusters_without_reorder
     );
 }
 
+#[test]
+fn sql_score_order_validation_catches_descending_order_regressions() {
+    let input = json!([
+        {"id": 1, "_score": 0.2},
+        {"id": 2, "_score": 0.3}
+    ]);
+    let err = ensure_sql_response_scores_descending(
+        "unordered_sql_scores",
+        "SELECT id, _score FROM vector_search(qs, 'second') ORDER BY _score DESC",
+        &input,
+    )
+    .expect_err("unordered score response should fail validation");
+
+    assert!(
+        err.to_string().contains("not descending"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn search_response_normalization_redacts_http_scores() {
+    let normalized = normalize_search_response_json(
+        json!({
+            "duration_ms": 1,
+            "results": [
+                {"_score": 6.331, "dataset": "qs", "matches": {"answer": ["a1"]}, "primary_key": {"id": 1}}
+            ]
+        }),
+        false,
+        false,
+    );
+
+    assert_eq!(normalized["results"][0]["_score"], json!("[score]"));
+}
+
 /// Normalizes vector similarity search response for consistent snapshot testing by replacing dynamic
 /// values such as duration with placeholder.
 fn normalize_search_response_json(
@@ -775,28 +688,7 @@ fn normalize_sql_response_for_snapshot(value: Value, round_scores: bool) -> Valu
         return Value::Array(rows);
     }
 
-    let mut score_keys: Vec<String> = rows
-        .first()
-        .and_then(|row| row.as_object())
-        .map(|obj| {
-            obj.keys()
-                .filter(|k| {
-                    let s = k.as_str();
-                    s == "_score" || s == "_fused_score" || s.starts_with("trunc(")
-                })
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Pick the primary score key deterministically: prefer `_score`, then
-    // `_fused_score`, then `trunc(...)` columns lexicographically. JSON object
-    // iteration otherwise depends on the SQL response shape, which would make
-    // normalization non-deterministic if a row carried multiple score-like
-    // columns.
-    score_keys.sort_by(|a, b| score_key_priority(a).cmp(&score_key_priority(b)));
-
-    let Some(primary_score_key) = score_keys.first().cloned() else {
+    let Some((primary_score_key, score_keys)) = sql_score_keys(&rows) else {
         return Value::Array(rows);
     };
 
@@ -843,6 +735,72 @@ fn normalize_sql_response_for_snapshot(value: Value, round_scores: bool) -> Valu
     }
 
     Value::Array(rows)
+}
+
+fn ensure_sql_response_scores_descending(
+    test_name: &str,
+    sql: &str,
+    value: &Value,
+) -> Result<(), anyhow::Error> {
+    if !sql_orders_by_score_desc(sql) {
+        return Ok(());
+    }
+
+    let Some(rows) = value.as_array() else {
+        return Ok(());
+    };
+    let Some((primary_score_key, _)) = sql_score_keys(rows) else {
+        return Ok(());
+    };
+
+    let mut previous_score = f64::MAX;
+    for (index, row) in rows.iter().enumerate() {
+        let score = row
+            .get(&primary_score_key)
+            .and_then(Value::as_f64)
+            .with_context(|| {
+                format!(
+                    "{test_name}: result[{index}] missing numeric '{primary_score_key}' for ORDER BY score validation"
+                )
+            })?;
+        anyhow::ensure!(
+            !score.is_nan(),
+            "{test_name}: result[{index}] score should not be NaN"
+        );
+        anyhow::ensure!(
+            score <= previous_score,
+            "{test_name}: result[{index}] score {score} > previous {previous_score} (not descending)"
+        );
+        previous_score = score;
+    }
+
+    Ok(())
+}
+
+fn sql_orders_by_score_desc(sql: &str) -> bool {
+    let normalized = sql.to_ascii_lowercase();
+    normalized.contains("order by")
+        && (normalized.contains("_score desc") || normalized.contains("_fused_score desc"))
+}
+
+fn sql_score_keys(rows: &[Value]) -> Option<(String, Vec<String>)> {
+    let mut score_keys: Vec<String> = rows
+        .first()
+        .and_then(Value::as_object)
+        .map(|obj| {
+            obj.keys()
+                .filter(|k| {
+                    let s = k.as_str();
+                    s == "_score" || s == "_fused_score" || s.starts_with("trunc(")
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+
+    score_keys.sort_by(|a, b| score_key_priority(a).cmp(&score_key_priority(b)));
+    let primary_score_key = score_keys.first().cloned()?;
+    Some((primary_score_key, score_keys))
 }
 
 fn should_stabilize_sql_score_order(primary_score_key: &str, scores: &[f64]) -> bool {
@@ -1037,7 +995,7 @@ pub(crate) async fn run_search(
 }
 
 // if `explain_sql`, for any [`SearchTestCase`] that is [`SearchTestType::Sql`], a snapshot will be taken of the associated explain query.
-// if `round_scores`, HTTP search response scores use rounding instead of truncation for display.
+// if `round_scores`, HTTP search response score ordering uses rounding before tie-breaking.
 // Use for tests with non-deterministic embeddings (e.g. model2vec/s3vectors).
 pub(crate) async fn run_search_w_explain(
     app: App,
@@ -1094,7 +1052,9 @@ pub(crate) async fn run_search_w_explain(
                             continue;
                         }
 
-                        let resp = normalize_sql_response_for_snapshot(resp?, ts.round_scores);
+                        let resp = resp?;
+                        ensure_sql_response_scores_descending(&test_name, &sql, &resp)?;
+                        let resp = normalize_sql_response_for_snapshot(resp, ts.round_scores);
                         insta::assert_json_snapshot!(test_name.clone(), resp);
 
                         if explain_sql {
