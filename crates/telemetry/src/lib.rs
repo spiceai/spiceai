@@ -362,6 +362,20 @@ pub fn track_hash_index_lookup_rows(rows: u64, dimensions: &[KeyValue]) {
         .add(rows, dimensions);
 }
 
+static CAYENNE_SCAN_LISTING_TABLE_CACHE_ENTRIES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+pub fn track_cayenne_scan_listing_table_cache_entries(entries: u64, dimensions: &[KeyValue]) {
+    let Some(m) = meter::METER.get() else { return };
+    CAYENNE_SCAN_LISTING_TABLE_CACHE_ENTRIES
+        .get_or_init(|| {
+            m.u64_gauge("cayenne_scan_listing_table_cache_entries")
+                .with_description("Number of entries in the Cayenne scan ListingTable cache.")
+                .with_unit("entries")
+                .build()
+        })
+        .record(entries, dimensions);
+}
+
 static SNAPSHOT_BOOTSTRAP_DURATION_MS: OnceLock<Counter<f64>> = OnceLock::new();
 static SNAPSHOT_BOOTSTRAP_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
 

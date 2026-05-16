@@ -42,6 +42,7 @@ runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-table-partition = { path = "../runtime-table-partition", optional = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
+telemetry = { path = "../telemetry" }
 tokio-rusqlite = { workspace = true }
 serde_json = { workspace = true }
 snafu = { workspace = true }

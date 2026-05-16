@@ -4599,6 +4599,7 @@ impl CayenneTableProvider {
         let mut guard = self.current_snapshot_id.write();
         if guard.as_str() != new_snapshot_id {
             self.scan_listing_tables.lock().clear();
+            self.record_scan_listing_table_cache_entries(0);
         }
         *guard = new_snapshot_id.to_string();
 
@@ -6056,15 +6057,28 @@ impl CayenneTableProvider {
 
         let mut cache = self.scan_listing_tables.lock();
         let listing_table = Arc::clone(cache.entry(key.clone()).or_insert(listing_table));
+        let cache_entries = cache.len();
+        drop(cache);
+        self.record_scan_listing_table_cache_entries(cache_entries);
         tracing::trace!(
             table = %self.table_metadata.table_name,
             snapshot_id,
             target_partitions = key.target_partitions,
             collect_statistics = key.collect_statistics,
-            cache_entries = cache.len(),
+            cache_entries,
             "Cached Cayenne ListingTable for scan"
         );
         Ok(listing_table)
+    }
+
+    fn record_scan_listing_table_cache_entries(&self, cache_entries: usize) {
+        telemetry::track_cayenne_scan_listing_table_cache_entries(
+            u64::try_from(cache_entries).unwrap_or(u64::MAX),
+            &[telemetry::KeyValue::new(
+                "dataset",
+                self.table_metadata.table_name.clone(),
+            )],
+        );
     }
 
     /// Apply partial deletion filter - only deletions with seq > threshold are applied.
