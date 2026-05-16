@@ -45,6 +45,7 @@ test_with_backends!(test_update_multi_column_impl);
 test_with_backends!(test_update_set_null_impl);
 test_with_backends!(test_update_zero_match_impl);
 test_with_backends!(test_update_no_filter_all_rows_impl);
+test_with_backends!(test_update_preserves_inline_append_path_impl);
 
 /// Build a `CayenneTableProvider` with schema (id, name, value) and `id` as PK.
 async fn make_test_table(
@@ -338,6 +339,70 @@ async fn test_update_no_filter_all_rows_impl(
     assert_eq!(values.value(0), 77);
     assert_eq!(values.value(1), 77);
     assert_eq!(values.value(2), 77);
+
+    Ok(())
+}
+
+async fn test_update_preserves_inline_append_path_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let table_name = "upd_inline_writer";
+    let table = make_test_table(&fixture, table_name).await?;
+    let ctx = SessionContext::new();
+    ctx.register_table(table_name, Arc::clone(&table) as _)?;
+    let table_id = fixture.catalog.get_table(table_name).await?.table_id;
+
+    ctx.sql("INSERT INTO upd_inline_writer VALUES (1, 'A', 10), (2, 'B', 20)")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 2);
+
+    let assignments = vec![
+        ("name".to_string(), lit("B-updated")),
+        ("value".to_string(), lit(200_i64)),
+    ];
+    let filters = vec![col("id").eq(lit(2_i64))];
+
+    let plan = table.update(&ctx.state(), assignments, filters).await?;
+    let results = collect(plan, ctx.task_ctx()).await?;
+    let count = extract_u64_count(&results)?;
+    assert_eq!(count, 1);
+
+    let batches = ctx
+        .sql("SELECT id, name, value FROM upd_inline_writer ORDER BY id")
+        .await?
+        .collect()
+        .await?;
+    let rows = &batches[0];
+    let ids = rows
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id col");
+    let names = rows
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name col");
+    let values = rows
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("value col");
+
+    assert_eq!(ids.values(), &[1_i64, 2]);
+    assert_eq!(names.value(0), "A");
+    assert_eq!(names.value(1), "B-updated");
+    assert_eq!(values.values(), &[10_i64, 200]);
+    assert_eq!(fixture.catalog.get_inlined_data_count(&table_id).await?, 2);
+    assert!(
+        fixture
+            .catalog
+            .get_table_delete_files(&table_id)
+            .await?
+            .is_empty()
+    );
 
     Ok(())
 }

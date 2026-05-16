@@ -55,6 +55,7 @@ datafusion-dml = { path = "../datafusion-dml" }
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 datafusion-proto = { workspace = true }
 datafusion-spark.workspace = true
+datafusion-substrait = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
 document_parse = { path = "../document_parse" }
@@ -95,6 +96,8 @@ model_components = { path = "../model_components" }
 moka.workspace = true
 mysql_async = { workspace = true, optional = true }
 notify = "8.2.0"
+arc-swap = "1.7"
+sha2 = { workspace = true }
 ns_lookup = { path = "../ns_lookup" }
 object_store = { workspace = true, features = ["aws", "http", "azure", "gcp"] }
 object_store_occ = { path = "../object_store_occ" }
@@ -160,7 +163,6 @@ secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 blake3 = { workspace = true, optional = true }
 serde_json.workspace = true
-sha2 = { workspace = true, optional = true }
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 spice-cloud-client.workspace = true
@@ -184,6 +186,7 @@ tracing.workspace = true
 tracing-futures.workspace = true
 tracing-subscriber.workspace = true
 turso = { workspace = true, optional = true }
+turso-shared = { workspace = true }
 twox-hash.workspace = true
 url.workspace = true
 util = { path = "../util", features = ["datafusion", "http"] }
@@ -205,6 +208,7 @@ yaml = { path = "../yaml" }
 anyhow.workspace = true
 async-graphql = "7.0.17"
 async-graphql-axum = "7.0.16"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 aws-credential-types = { workspace = true, features = [
     "hardcoded-credentials",
 ] }
@@ -265,7 +269,7 @@ tracing-subscriber.workspace = true
 yaml = { path = "../yaml" }
 
 [features]
-adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "dep:blake3", "dep:sha2", "data_components/adbc", "datafusion-table-providers/adbc-federation"]
+adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "dep:blake3", "data_components/adbc", "datafusion-table-providers/adbc-federation"]
 aws-secrets-manager = ["dep:aws-sdk-sts", "runtime-secrets/aws-secrets-manager"]
 azure-keyvault = ["runtime-secrets/azure-keyvault"]
 hashicorp_vault = ["runtime-secrets/hashicorp_vault"]
@@ -309,6 +313,7 @@ extended_tests = []
 flightsql = ["data_components/flightsql"]
 ftp = ["runtime-object-store/ftp"]
 http-functions = ["runtime-datafusion-udfs/http-functions"]
+rate-control = []
 wasm-functions = ["runtime-datafusion-udfs/wasm-functions"]
 wasm-functions-compile = ["runtime-datafusion-udfs/wasm-functions-compile"]
 iceberg-write = []
@@ -354,6 +359,7 @@ scylladb = ["db_connection_pool/scylladb", "data_components/scylladb"]
 sftp = ["runtime-object-store/sftp"]
 sharepoint = ["data_components/sharepoint"]
 smb = ["runtime-object-store/smb"]
+client_tls = []
 snapshots = ["runtime-acceleration/snapshots"]
 snowflake = [
     "dep:snowflake-api",
@@ -390,3 +396,7 @@ name = "prepared_statement"
 [[bench]]
 harness = false
 name = "flatten_json_properties"
+
+[[bench]]
+harness = false
+name = "cdc_cayenne_inline"

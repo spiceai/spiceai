@@ -1,20 +1,17 @@
 tests:
   bench:
-    spicepod_path: accelerated/file[parquet]-turso[file].yaml
+    spicepod_path: accelerated/mongodb-duckdb[file]-changes.yaml
     query_set: tpch
-    query_overrides: turso
     runner_type: spiceai-dev-runners
     ready_wait: 600
     validate_results: true
   throughput:
-    spicepod_path: accelerated/file[parquet]-turso[file].yaml
-    query_overrides: turso
+    spicepod_path: accelerated/mongodb-duckdb[file]-changes.yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
     ready_wait: 600
   load:
-    spicepod_path: accelerated/file[parquet]-turso[file].yaml
-    query_overrides: turso
+    spicepod_path: accelerated/mongodb-duckdb[file]-changes.yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
     duration: 28800

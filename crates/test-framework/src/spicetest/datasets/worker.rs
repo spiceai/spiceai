@@ -284,6 +284,7 @@ impl SpiceTestQueryWorker {
                                 &mut query_statuses,
                                 &mut row_counts,
                                 queries_to_run,
+                                &start,
                             )
                             .await?
                         {
@@ -435,8 +436,17 @@ impl SpiceTestQueryWorker {
         query_statuses: &mut BTreeMap<Arc<str>, QueryStatus>,
         row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
         queries: &[Query],
+        start: &Instant,
     ) -> Result<bool> {
         for query in queries {
+            // Stop submitting new queries once the duration has elapsed or shutdown
+            // was requested, so the test finishes close to the scheduled duration.
+            if self.shutdown_token.is_cancelled()
+                || matches!(self.end_condition, EndCondition::Duration(d) if start.elapsed() >= d)
+            {
+                break;
+            }
+
             let QueryRunResult {
                 connection_failed,
                 query_failure,

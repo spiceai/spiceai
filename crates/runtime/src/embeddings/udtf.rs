@@ -91,6 +91,9 @@ use {
     search::provider::{SearchQueryProvider, UdtfSource},
 };
 
+#[cfg(feature = "elasticsearch")]
+use crate::accelerated_table::AcceleratedTable;
+
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
 
@@ -591,15 +594,35 @@ impl VectorSearchTableFunc {
             )));
         }
 
+        // For Elasticsearch indexes, normalize the base table provider schema to strip any
+        // List/FixedSizeList columns (e.g. the embedding vector). ES does not return these
+        // columns, so they must be projected out of the base-table schema before
+        // `SearchQueryProvider` builds the join — otherwise Arrow rejects the type mismatch.
+        //
+        // Prefer the federated provider's schema when the top-level table is an
+        // `AcceleratedTable`, since the federated side already has the correct Arrow types
+        // (e.g. FixedSizeList) whereas the accelerator may store them differently.
+        #[cfg(feature = "elasticsearch")]
+        let federated_tbl_storage: Arc<dyn TableProvider>;
+        #[cfg(feature = "elasticsearch")]
+        let normalized_tbl_storage: Arc<dyn TableProvider>;
         // For Elasticsearch indexes, normalize the base table provider schema to match
         // what the ES HTTP client produces (e.g. LargeUtf8 → Utf8). This ensures that
         // HashJoinExec key types match on both sides of the join.
         #[cfg(feature = "elasticsearch")]
-        let normalized_tbl_storage: Arc<dyn TableProvider>;
-        #[cfg(feature = "elasticsearch")]
         let tbl: &Arc<dyn TableProvider> =
             if let Some(es_index) = vector_index.as_any().downcast_ref::<ElasticsearchIndex>() {
-                normalized_tbl_storage = es_index.normalize_source_table(Arc::clone(tbl))?;
+                let source_for_normalize = if let Some(acc) =
+                    find_concrete_table_provider::<AcceleratedTable>(tbl)
+                    && let Some(fed) = acc.get_federated_table_ref().try_table_provider_sync_ref()
+                {
+                    federated_tbl_storage = Arc::clone(fed);
+                    &federated_tbl_storage
+                } else {
+                    tbl
+                };
+                normalized_tbl_storage =
+                    es_index.normalize_source_table(Arc::clone(source_for_normalize))?;
                 &normalized_tbl_storage
             } else {
                 tbl

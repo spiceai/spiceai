@@ -17,17 +17,15 @@ limitations under the License.
 use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
-use async_stream::stream;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::memory::MemoryStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use tokio::sync::{Mutex, RwLock, broadcast};
 
 use datafusion::sql::TableReference;
@@ -230,7 +228,7 @@ impl TryFrom<DataUpdate> for StreamingDataUpdate {
 }
 
 pub struct StreamingDataUpdateExecutionPlan {
-    record_batch_stream: Arc<Mutex<SendableRecordBatchStream>>,
+    record_batch_stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     schema: SchemaRef,
     properties: PlanProperties,
 }
@@ -240,7 +238,7 @@ impl StreamingDataUpdateExecutionPlan {
     pub fn new(record_batch_stream: SendableRecordBatchStream) -> Self {
         let schema = record_batch_stream.schema();
         Self {
-            record_batch_stream: Arc::new(Mutex::new(record_batch_stream)),
+            record_batch_stream: Arc::new(Mutex::new(Some(record_batch_stream))),
             schema: Arc::clone(&schema),
             properties: PlanProperties::new(
                 EquivalenceProperties::new(schema),
@@ -297,19 +295,17 @@ impl ExecutionPlan for StreamingDataUpdateExecutionPlan {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let schema = Arc::clone(&self.schema);
+        let mut stream = self.record_batch_stream.try_lock().map_err(|e| {
+            DataFusionError::Execution(format!(
+                "StreamingDataUpdateExecutionPlan is already executing: {e}"
+            ))
+        })?;
 
-        let record_batch_stream = Arc::clone(&self.record_batch_stream);
-
-        let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), {
-            stream! {
-                let mut stream = record_batch_stream.lock().await;
-                while let Some(batch) = stream.next().await {
-                    yield batch;
-                }
-            }
-        });
-        Ok(Box::pin(stream))
+        stream.take().ok_or_else(|| {
+            DataFusionError::Execution(
+                "StreamingDataUpdateExecutionPlan stream was already consumed".to_string(),
+            )
+        })
     }
 }
 

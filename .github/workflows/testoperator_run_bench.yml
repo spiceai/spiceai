@@ -22,6 +22,7 @@ on:
           - 'tpch[parameterized]'
           - 'tpcds'
           - 'clickbench'
+          - 'chbench'
           - 'scenario'
       scenario_query_file:
         description: 'Path to scenario query file (required when query_set is scenario)'
@@ -63,6 +64,7 @@ on:
           - 'ducklake-catalog'
           - 'turso'
           - 'bigquery'
+          - 'scylladb'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
@@ -225,6 +227,10 @@ jobs:
         uses: ./.github/actions/install-postgres
         with:
           pg-db: ducklake_catalog
+
+      - name: Setup CH-benCH PostgreSQL
+        if: ${{ github.event.inputs.query_set == 'chbench' }}
+        uses: ./.github/actions/setup-chbench-postgres
 
       - name: Start local MinIO for DuckLake
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}

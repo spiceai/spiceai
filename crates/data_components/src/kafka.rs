@@ -78,6 +78,15 @@ pub enum Error {
 
     #[snafu(display("Received empty batch from Kafka topic. The consumer will retry."))]
     EmptyBatch,
+
+    #[snafu(display(
+        "Received Kafka message without payload from topic '{topic}', partition {partition}, offset {offset}"
+    ))]
+    MessageMissingPayload {
+        topic: String,
+        partition: i32,
+        offset: i64,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -487,6 +496,84 @@ impl KafkaConsumer {
         })
     }
 
+    /// Fetch the latest message from a Kafka topic without affecting any existing
+    /// consumer group state.
+    ///
+    /// Creates a temporary consumer, seeks to the latest available message across
+    /// all partitions, reads it, and returns the owned key/value pair.
+    pub async fn fetch_latest_message<K: DeserializeOwned, V: DeserializeOwned>(
+        topic: &str,
+        kafka_config: &KafkaConfig,
+        timeout: Duration,
+    ) -> Result<Option<(Option<K>, V)>> {
+        let temp_group_id = format!("spice-schema-peek-{}", uuid::Uuid::new_v4());
+        let mut peek_config = kafka_config.clone();
+        peek_config.metrics_store = None; // Avoid skewing real consumer metrics
+        let temp_consumer = Self::create(temp_group_id, &peek_config)?;
+
+        // Fetch topic metadata to discover partitions
+        let metadata = temp_consumer
+            .consumer
+            .fetch_metadata(Some(topic), timeout)
+            .context(UnableToRestartTopicSnafu {
+                message: "Failed to fetch topic metadata".to_string(),
+            })?;
+
+        let topic_metadata = metadata
+            .topics()
+            .iter()
+            .find(|t| t.name() == topic)
+            .context(MetadataTopicNotFoundSnafu {
+                topic: topic.to_string(),
+            })?;
+
+        // Find the partition with the highest watermark (most recent data)
+        let mut best_partition: Option<(i32, i64)> = None;
+        for partition in topic_metadata.partitions() {
+            let (low, high) = temp_consumer
+                .consumer
+                .fetch_watermarks(topic, partition.id(), timeout)
+                .context(UnableToRestartTopicSnafu {
+                    message: format!(
+                        "Failed to fetch watermarks for partition {}",
+                        partition.id()
+                    ),
+                })?;
+
+            if high > low {
+                match &best_partition {
+                    Some((_, best_high)) if high <= *best_high => {}
+                    _ => best_partition = Some((partition.id(), high)),
+                }
+            }
+        }
+
+        let Some((partition_id, high_watermark)) = best_partition else {
+            return Ok(None); // No messages available
+        };
+
+        // Manually assign the consumer to read from the latest offset
+        let mut tpl = rdkafka::TopicPartitionList::new();
+        tpl.add_partition_offset(topic, partition_id, Offset::Offset(high_watermark - 1))
+            .context(UnableToRestartTopicSnafu {
+                message: "Failed to configure partition offset".to_string(),
+            })?;
+
+        temp_consumer
+            .consumer
+            .assign(&tpl)
+            .context(UnableToRestartTopicSnafu {
+                message: "Failed to assign partition".to_string(),
+            })?;
+
+        // Read the message with a timeout
+        match tokio::time::timeout(timeout, temp_consumer.next_json::<K, V>()).await {
+            Ok(Ok(Some(msg))) => Ok(Some(msg.into_key_value())),
+            Ok(Ok(None)) | Err(_) => Ok(None),
+            Ok(Err(e)) => Err(e),
+        }
+    }
+
     fn generate_group_id(dataset: &str) -> String {
         format!("spice.ai-{dataset}-{}", uuid::Uuid::new_v4())
     }
@@ -539,6 +626,11 @@ impl<'a, K, V> KafkaMessage<'a, K, V> {
             .store_offset_from_message(&self.msg)
             .context(UnableToCommitMessageSnafu)
     }
+
+    /// Consume the message and return owned key/value data.
+    pub fn into_key_value(self) -> (Option<K>, V) {
+        (self.key, self.value)
+    }
 }
 
 #[async_trait]
@@ -560,6 +652,33 @@ impl MessageBatchCommitter {
     pub fn from_messages<K, V>(
         consumer: &'static KafkaConsumer,
         messages: &[KafkaMessage<'_, K, V>],
+    ) -> Self {
+        let mut max_offsets: HashMap<(String, i32), i64> = HashMap::new();
+
+        for msg in messages {
+            let key = (msg.topic().to_string(), msg.partition());
+            max_offsets
+                .entry(key)
+                .and_modify(|existing| {
+                    if msg.offset() > *existing {
+                        *existing = msg.offset();
+                    }
+                })
+                .or_insert(msg.offset());
+        }
+
+        let offsets = max_offsets
+            .into_iter()
+            .map(|((topic, partition), offset)| (topic, partition, offset))
+            .collect();
+
+        Self { consumer, offsets }
+    }
+
+    #[must_use]
+    pub fn from_borrowed_messages(
+        consumer: &'static KafkaConsumer,
+        messages: &[BorrowedMessage<'_>],
     ) -> Self {
         let mut max_offsets: HashMap<(String, i32), i64> = HashMap::new();
 
@@ -645,7 +764,8 @@ impl Kafka {
         let metrics = Arc::clone(self.consumer.metrics());
         let inner = self
             .consumer
-            .stream_json::<serde_json::Value, serde_json::Value>()
+            .consumer
+            .stream()
             .chunks_timeout(self.batching.0, self.batching.1)
             .map(move |msgs| {
                 let schema = Arc::clone(&schema);
@@ -653,22 +773,20 @@ impl Kafka {
                 // Collect all successful messages, fail on first error
                 let messages: Vec<_> = msgs
                     .into_iter()
-                    .collect::<Result<Vec<_>, _>>()
+                    .map(|msg| msg.context(UnableToReceiveMessageSnafu))
+                    .collect::<Result<Vec<_>>>()
                     .map_err(cdc::StreamError::Kafka)?;
 
                 if messages.is_empty() {
                     return Err(cdc::StreamError::Kafka(Error::EmptyBatch));
                 }
 
-                let change_batch = values_to_change_batch(
-                    messages.iter().map(KafkaMessage::value),
-                    flatten_json.as_ref(),
-                    &schema,
-                );
+                let change_batch =
+                    messages_to_change_batch(&messages, flatten_json.as_ref(), &schema)?;
 
-                let committer = MessageBatchCommitter::from_messages(consumer, &messages);
+                let committer = MessageBatchCommitter::from_borrowed_messages(consumer, &messages);
 
-                change_batch.map(|rb| ChangeEnvelope::new(Box::new(committer), rb, true))
+                Ok(ChangeEnvelope::new(Box::new(committer), change_batch, true))
             });
 
         Box::pin(inject_ready_signal_on_caught_up(
@@ -679,25 +797,88 @@ impl Kafka {
     }
 }
 
+fn messages_to_change_batch(
+    messages: &[BorrowedMessage<'_>],
+    flatten_json: Option<&String>,
+    schema: &Arc<Schema>,
+) -> Result<ChangeBatch, cdc::StreamError> {
+    let payloads = messages
+        .iter()
+        .map(message_payload)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if let Some(delimiter) = flatten_json {
+        let values = payloads
+            .into_iter()
+            .map(|payload| {
+                serde_json::from_slice::<Value>(payload).map_err(|e| {
+                    cdc::StreamError::Kafka(Error::UnableToDeserializeJsonMessage { source: e })
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return values_to_change_batch(values.iter(), Some(delimiter), schema);
+    }
+
+    payloads_to_change_batch(payloads.into_iter(), schema)
+}
+
+fn message_payload<'a>(message: &'a BorrowedMessage<'_>) -> Result<&'a [u8], cdc::StreamError> {
+    message.payload().ok_or_else(|| {
+        cdc::StreamError::Kafka(Error::MessageMissingPayload {
+            topic: message.topic().to_string(),
+            partition: message.partition(),
+            offset: message.offset(),
+        })
+    })
+}
+
+fn payloads_to_change_batch<'a>(
+    payloads: impl Iterator<Item = &'a [u8]>,
+    schema: &Arc<Schema>,
+) -> Result<ChangeBatch, cdc::StreamError> {
+    let values = payloads
+        .map(|payload| {
+            serde_json::from_slice::<Value>(payload).map_err(|e| {
+                cdc::StreamError::Kafka(Error::UnableToDeserializeJsonMessage { source: e })
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if values.is_empty() {
+        return Err(cdc::StreamError::Arrow(
+            "No Kafka message payload found in batch".to_string(),
+        ));
+    }
+
+    values_to_change_batch(values.iter(), None, schema)
+}
+
 fn values_to_change_batch<'a>(
     values: impl Iterator<Item = &'a Value>,
     flatten_json: Option<&String>,
     schema: &Arc<Schema>,
 ) -> Result<ChangeBatch, cdc::StreamError> {
     // Build newline-delimited JSON from all values
-    let json_str: String = values
+    let json_values = values
         .map(|value| match flatten_json {
             Some(delimiter) => dataformat_json::flatten_json_obj(value, delimiter).to_string(),
             None => value.to_string(),
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<Vec<_>>();
+    let json_str = json_values.join("\n");
 
+    json_bytes_to_change_batch(json_str.as_bytes(), schema)
+}
+
+fn json_bytes_to_change_batch(
+    json: &[u8],
+    schema: &Arc<Schema>,
+) -> Result<ChangeBatch, cdc::StreamError> {
     // Convert JSON string to Arrow record batches (ReaderBuilder handles NDJSON).
     // The reader produces batches of up to batch_size rows. Collect all and concatenate
     // to avoid silently dropping rows beyond the first batch.
     let reader = ReaderBuilder::new(Arc::clone(schema))
-        .build(std::io::Cursor::new(json_str.as_bytes()))
+        .build(std::io::Cursor::new(json))
         .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?;
 
     let batches: Vec<_> = reader
@@ -871,6 +1052,26 @@ mod tests {
         assert!(result.is_ok());
         let batch = result.expect("batch");
         assert_eq!(batch.record.num_rows(), 3);
+    }
+
+    #[test]
+    fn test_payloads_to_change_batch_accepts_pretty_json_messages() {
+        let schema = test_schema();
+        let first = br#"{
+            "id": 1,
+            "name": "alice"
+        }"#;
+        let second = br#"{
+            "id": 2,
+            "name": "bob"
+        }"#;
+
+        let result =
+            payloads_to_change_batch([first.as_slice(), second.as_slice()].into_iter(), &schema);
+
+        assert!(result.is_ok());
+        let batch = result.expect("batch");
+        assert_eq!(batch.record.num_rows(), 2);
     }
 
     #[test]

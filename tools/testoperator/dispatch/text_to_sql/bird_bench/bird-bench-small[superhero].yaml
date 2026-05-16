@@ -1,6 +1,6 @@
 tests:
   text_to_sql:
-    - model_name: grok41
+    - model_name: grok420
       benchmark_queryset: bird-bench-small[superhero]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
@@ -10,7 +10,7 @@ tests:
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
       configuration_name: superhero
-    - model_name: grok41
+    - model_name: grok420
       benchmark_queryset: bird-bench-small[superhero]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml

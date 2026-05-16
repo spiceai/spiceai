@@ -93,6 +93,9 @@ pub struct Runtime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_rate_control: Option<SourceRateControl>,
+
     #[serde(default, skip_serializing_if = "is_default")]
     pub functions: Functions,
 }
@@ -168,6 +171,71 @@ pub struct TlsConfig {
 
     /// A PEM encoded private key
     pub key: Option<String>,
+
+    /// Filesystem path to a PEM-encoded CA bundle used to verify client
+    /// certificates when `client_auth_mode` is `request` or `required`.
+    /// Eligible for hot-reload via the same watcher that picks up server
+    /// cert / key rotations.
+    pub client_auth_ca_file: Option<String>,
+
+    /// Inline PEM (or `${ secrets:... }`) form of the client CA bundle.
+    /// Mutually exclusive with `client_auth_ca_file`. Inline material is
+    /// not hot-reloaded.
+    pub client_auth_ca: Option<String>,
+
+    /// How the runtime treats client certificates on the public TLS
+    /// endpoints. Defaults to `none`, which preserves today's behavior
+    /// (the server does not request a client cert during the TLS
+    /// handshake). See [`ClientAuthMode`] for the full mode table.
+    pub client_auth_mode: Option<ClientAuthMode>,
+}
+
+/// How the runtime treats client certificates on the public TLS
+/// endpoints (HTTP, Flight, Metrics).
+///
+/// `None` is the out-of-the-box default and disables client-cert
+/// authentication entirely — the server runs `with_no_client_auth()`
+/// at the rustls layer and does not send a `CertificateRequest`. A
+/// non-conforming client that nonetheless presents a cert is rejected
+/// by rustls as a protocol violation.
+///
+/// `Request` opts in to *optional* mTLS: the server sends
+/// `CertificateRequest` and accepts both no-cert and cert-bearing
+/// handshakes. Presented certs must be signed by
+/// `client_auth_ca` / `client_auth_ca_file` (an invalid cert is still
+/// rejected at the handshake). When a cert is presented it is
+/// promoted to the request's auth principal under
+/// `IdentitySource::Channel`; when absent the request runs as the
+/// anonymous principal. Useful for migration windows and for
+/// audit-only deployments where every cert seen should be recorded
+/// but not enforced.
+///
+/// `Required` enables strict mTLS: the server demands a valid client
+/// cert (verified against `client_auth_ca` / `client_auth_ca_file`)
+/// for every connection on the Flight listener; on the HTTP and
+/// metrics listeners the TLS handshake admits no-cert connections so
+/// Kubernetes liveness / readiness probes and Prometheus scrapes work
+/// without a client cert, but the HTTP route layer 401s any
+/// non-probe request whose connection has no verified client cert.
+///
+/// Whether a presented cert *also* becomes the request's auth
+/// principal is determined separately by whether `runtime.auth` is
+/// configured — see the `IdentitySource` enum at the binary
+/// entrypoint. Briefly:
+///
+/// - `client_auth_mode: required` and no `runtime.auth`
+///   → mTLS-as-identity (the cert is the principal).
+/// - `client_auth_mode: required` plus `runtime.auth`
+///   → mTLS-as-channel (the cert protects the channel; the
+///   API key / OIDC token is the principal).
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub enum ClientAuthMode {
+    #[default]
+    None,
+    Request,
+    Required,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -830,6 +898,10 @@ pub struct Query {
     /// Specifies the compression codec used when spilling data to disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spill_compression: Option<SpillCompression>,
+
+    /// Overrides `DataFusion`'s local query target partition count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_partitions: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -870,6 +942,38 @@ pub struct Scheduler {
     pub partition_discovery_timeout: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct SourceRateControl {
+    /// Root URI for globally persisted source rate-control state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_location: Option<String>,
+
+    /// Optional object store params for source rate-control state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
+
+    /// How often each runtime refreshes and persists per-source rate-control state in object storage.
+    #[serde(default = "default_rate_control_refresh_interval")]
+    pub refresh_interval: String,
+
+    /// Maximum number of concurrent GitHub HTTP requests for this authentication context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_concurrent_connections_limit: Option<usize>,
+}
+
+impl Default for SourceRateControl {
+    fn default() -> Self {
+        Self {
+            state_location: None,
+            params: None,
+            refresh_interval: default_rate_control_refresh_interval(),
+            github_concurrent_connections_limit: None,
+        }
+    }
+}
+
 #[must_use]
 pub fn default_partition_assignment_interval() -> String {
     "30s".to_string()
@@ -888,6 +992,11 @@ pub fn default_max_partitions_per_executor() -> usize {
 #[must_use]
 pub fn default_partition_discovery_timeout() -> String {
     "60s".to_string()
+}
+
+#[must_use]
+pub fn default_rate_control_refresh_interval() -> String {
+    "30s".to_string()
 }
 
 /// Helper struct for deserializing Runtime with custom logic for handling `memory_limit`/`temp_directory` deprecation
@@ -949,6 +1058,8 @@ pub struct RuntimeDeserializer {
     pub metrics: Option<Metrics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_rate_control: Option<SourceRateControl>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub functions: Functions,
 }
@@ -1029,6 +1140,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             },
             metrics: deserializer.metrics,
             scheduler: deserializer.scheduler,
+            source_rate_control: deserializer.source_rate_control,
             functions: deserializer.functions,
         })
     }
@@ -1212,7 +1324,8 @@ mod tests {
             Some(Query {
                 spill_compression: None,
                 temp_directory: None,
-                memory_limit: Some("100MiB".to_string())
+                memory_limit: Some("100MiB".to_string()),
+                target_partitions: None,
             })
         );
 
@@ -1227,7 +1340,8 @@ mod tests {
             Some(Query {
                 spill_compression: None,
                 temp_directory: None,
-                memory_limit: Some("200MiB".to_string())
+                memory_limit: Some("200MiB".to_string()),
+                target_partitions: None,
             })
         );
 
@@ -1243,7 +1357,8 @@ mod tests {
             Some(Query {
                 spill_compression: None,
                 temp_directory: None,
-                memory_limit: Some("200MiB".to_string())
+                memory_limit: Some("200MiB".to_string()),
+                target_partitions: None,
             })
         );
 
@@ -1266,7 +1381,8 @@ mod tests {
             Some(Query {
                 spill_compression: None,
                 temp_directory: Some("/foo".to_string()),
-                memory_limit: None
+                memory_limit: None,
+                target_partitions: None,
             })
         );
 
@@ -1281,7 +1397,8 @@ mod tests {
             Some(Query {
                 spill_compression: None,
                 temp_directory: Some("/bar".to_string()),
-                memory_limit: None
+                memory_limit: None,
+                target_partitions: None,
             })
         );
 
@@ -1297,7 +1414,8 @@ mod tests {
             Some(Query {
                 spill_compression: None,
                 temp_directory: Some("/bar".to_string()),
-                memory_limit: None
+                memory_limit: None,
+                target_partitions: None,
             })
         );
 
@@ -1306,6 +1424,19 @@ mod tests {
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.query, None);
+    }
+
+    #[test]
+    fn test_query_target_partitions() {
+        let yaml = r"
+            query:
+                target_partitions: 64
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(
+            runtime.query.unwrap_or_default().target_partitions,
+            Some(64)
+        );
     }
 
     #[test]
@@ -2264,5 +2395,103 @@ mod tests {
         let mcp = runtime.mcp.expect("mcp section should be present");
         let hosts = mcp.allowed_hosts.expect("allowed_hosts should be set");
         assert_eq!(hosts, vec!["*"]);
+    }
+
+    #[test]
+    fn test_deserialize_tls_client_auth_default_none() {
+        // The bare TLS section omits `client_auth_mode` — it should
+        // deserialize to `None` and the default mode at use sites
+        // should be `ClientAuthMode::None`.
+        let yaml = r"
+            tls:
+              enabled: true
+              certificate_file: /etc/spice/tls/server.crt
+              key_file: /etc/spice/tls/server.key
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let tls = runtime.tls.expect("tls section should be present");
+        assert!(tls.client_auth_mode.is_none());
+        assert!(tls.client_auth_ca_file.is_none());
+        assert!(tls.client_auth_ca.is_none());
+        // Sanity: the enum's `Default` is `None`.
+        assert_eq!(ClientAuthMode::default(), ClientAuthMode::None);
+    }
+
+    #[test]
+    fn test_deserialize_tls_client_auth_required_with_ca() {
+        let yaml = r"
+            tls:
+              enabled: true
+              certificate_file: /etc/spice/tls/server.crt
+              key_file: /etc/spice/tls/server.key
+              client_auth_mode: required
+              client_auth_ca_file: /etc/spice/tls/client-ca.crt
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let tls = runtime.tls.expect("tls section should be present");
+        assert_eq!(tls.client_auth_mode, Some(ClientAuthMode::Required));
+        assert_eq!(
+            tls.client_auth_ca_file.as_deref(),
+            Some("/etc/spice/tls/client-ca.crt")
+        );
+    }
+
+    #[test]
+    fn test_deserialize_tls_client_auth_request_with_ca() {
+        let yaml = r"
+            tls:
+              enabled: true
+              certificate_file: /etc/spice/tls/server.crt
+              key_file: /etc/spice/tls/server.key
+              client_auth_mode: request
+              client_auth_ca_file: /etc/spice/tls/client-ca.crt
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let tls = runtime.tls.expect("tls section should be present");
+        assert_eq!(tls.client_auth_mode, Some(ClientAuthMode::Request));
+    }
+
+    #[test]
+    fn test_deserialize_tls_client_auth_inline_ca() {
+        let yaml = r"
+            tls:
+              enabled: true
+              certificate_file: /etc/spice/tls/server.crt
+              key_file: /etc/spice/tls/server.key
+              client_auth_mode: required
+              client_auth_ca: |
+                -----BEGIN CERTIFICATE-----
+                MIIBhTCCASug...
+                -----END CERTIFICATE-----
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let tls = runtime.tls.expect("tls section should be present");
+        assert_eq!(tls.client_auth_mode, Some(ClientAuthMode::Required));
+        assert!(
+            tls.client_auth_ca
+                .as_deref()
+                .is_some_and(|ca| ca.contains("BEGIN CERTIFICATE"))
+        );
+        assert!(tls.client_auth_ca_file.is_none());
+    }
+
+    #[test]
+    fn test_deserialize_tls_client_auth_unknown_mode_rejected() {
+        // Validates `#[serde(rename_all = "snake_case", deny_unknown_fields)]`
+        // by feeding a non-existent variant. This is the operator-typo
+        // guard that ensures `client_auth_mode: requuired` doesn't
+        // silently fall through to the default `none`.
+        let yaml = r"
+            tls:
+              enabled: true
+              certificate_file: /etc/spice/tls/server.crt
+              key_file: /etc/spice/tls/server.key
+              client_auth_mode: requuired
+        ";
+        let result: Result<Runtime, _> = yaml::from_str(yaml);
+        assert!(
+            result.is_err(),
+            "expected unknown client_auth_mode value to be rejected"
+        );
     }
 }

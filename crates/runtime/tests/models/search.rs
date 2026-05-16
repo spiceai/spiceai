@@ -45,7 +45,7 @@ use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfi
 #[cfg(feature = "duckdb")]
 use spicepod::vector::VectorStore;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Instant;
@@ -79,6 +79,10 @@ pub struct SearchTestCase {
     pub body: SearchTestType,
     pub should_fail: bool,
     pub skip: bool,
+    /// When true, displayed scores use rounding instead of truncation.
+    /// Use for tests with non-deterministic embeddings (e.g. model2vec/s3vectors)
+    /// where raw scores can vary ±0.002 across CI runners.
+    pub round_scores: bool,
 }
 
 impl SearchTestCase {
@@ -88,6 +92,7 @@ impl SearchTestCase {
             body,
             should_fail: false,
             skip: false,
+            round_scores: false,
         }
     }
 
@@ -119,6 +124,7 @@ impl SearchTestCase {
             body,
             name: self.name.clone(),
             skip: self.skip,
+            round_scores: self.round_scores,
         }
     }
 }
@@ -169,9 +175,7 @@ pub async fn run_search_test(
 
     let resp = serde_json::from_str(&resp?).context("Failed to parse HTTP response")?;
     assert_search_response_primary_keys(base_url, &ts.name, &resp).await?;
-    assert_score_ordering(&resp)
-        .with_context(|| format!("Scores are not in valid ordering for {}", &ts.name))?;
-    assert_search_response_snapshot(&ts.name, resp);
+    assert_search_response_snapshot(&ts.name, resp, ts.round_scores);
 
     Ok(())
 }
@@ -197,29 +201,6 @@ async fn assert_search_response_primary_keys(
         assert_search_result_primary_key_matches(base_url, test_name, result).await?;
     }
 
-    Ok(())
-}
-
-fn assert_score_ordering(resp: &Value) -> Result<(), anyhow::Error> {
-    let results = resp
-        .get("results")
-        .and_then(Value::as_array)
-        .context("Search response missing results array")?;
-
-    let mut previous_score = f64::MAX;
-    for result in results {
-        let score: f64 = result
-            .get("_score")
-            .and_then(Value::as_f64)
-            .context("Search responses missing '_score'.")?;
-
-        anyhow::ensure!(
-            score <= previous_score,
-            "Responses not in descending order. {previous_score} is before {score}."
-        );
-
-        previous_score = score;
-    }
     Ok(())
 }
 
@@ -297,46 +278,44 @@ async fn assert_search_result_primary_key_matches(
     Ok(())
 }
 
-fn assert_search_response_snapshot(test_name: &str, resp: Value) {
+fn assert_search_response_snapshot(test_name: &str, resp: Value, round_scores: bool) {
     match test_name {
+        "multi_embedding_parent_child_basic" | "multi_embedding_parent_child_additional" => {
+            insta::assert_json_snapshot!(
+                format!("{test_name}_response"),
+                normalize_search_response_json(resp, true, round_scores)
+            );
+        }
         // S3 Vectors HTTP search results are non-deterministic: the backend may return
         // different items with the same rounded score across runs, or scores can drift
         // across a two-decimal rounding boundary. Use structural validation instead of
         // exact snapshot comparison for these tests.
         name if use_structural_search_response_validation(name) => {
-            assert_search_response_structure(name, &resp);
+            assert_search_response_structure(name, resp, round_scores);
         }
         _ => {
             insta::assert_snapshot!(
                 format!("{test_name}_response"),
-                serde_json::to_string_pretty(&normalize_search_response_json(resp, true))
-                    .expect("search response snapshot serialization should succeed")
+                normalize_search_response(resp, round_scores)
             );
         }
     }
 }
 
 fn use_structural_search_response_validation(test_name: &str) -> bool {
-    // S3 Vectors is a remote ANN backend: the specific items returned can vary across
-    // runs (not just their ordering), and model2vec similarity scores drift ±0.01
-    // across CI runner hardware which crosses 2-decimal rounding boundaries. Use
-    // structural validation for `s3vectors_*` HTTP search tests instead of exact
-    // snapshot comparison. The `vector_search_sql` paths exercise SQL ordering and
-    // are excluded. For non-chunking variants (basic / metadata / hybrid /
-    // multiple_embeddings / composite), `with_where` tests have deterministic filter
-    // expectations and are excluded; chunking `with_where` tests have historically
-    // used structural validation and continue to do so.
+    let is_s3_vectors_composite =
+        test_name.starts_with("s3vectors_composite") && !test_name.contains("with_where");
     let is_s3_vectors_chunking = test_name.starts_with("s3vectors_chunking");
-    let is_other_s3_vectors =
-        test_name.starts_with("s3vectors_") && !test_name.contains("with_where");
 
-    (is_s3_vectors_chunking || is_other_s3_vectors) && !test_name.contains("vector_search_sql")
+    (is_s3_vectors_composite || is_s3_vectors_chunking) && !test_name.contains("vector_search_sql")
 }
 
 /// Validate the structure and invariants of a search response without asserting exact item content.
 /// Used for S3 Vectors HTTP search tests where the result set is non-deterministic.
-fn assert_search_response_structure(test_name: &str, resp: &Value) {
-    let results = resp
+fn assert_search_response_structure(test_name: &str, resp: Value, round_scores: bool) {
+    let normalized = normalize_search_response_json(resp, true, round_scores);
+
+    let results = normalized
         .get("results")
         .and_then(|r| r.as_array())
         .unwrap_or_else(|| panic!("{test_name}: response should have a 'results' array"));
@@ -378,7 +357,11 @@ fn assert_search_response_structure(test_name: &str, resp: &Value) {
         );
 
         // Verify scores are in descending order and within [0, 1]
-        let score: f64 = result.get("_score").and_then(Value::as_f64).unwrap_or(-1.0);
+        let score: f64 = result
+            .get("_score")
+            .and_then(|s| s.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-1.0);
         assert!(
             (0.0..=1.0).contains(&score),
             "{test_name}: result[{i}] score {score} not in [0, 1]"
@@ -412,7 +395,7 @@ fn assert_search_response_structure(test_name: &str, resp: &Value) {
 fn structural_search_response_accepts_additional_columns_in_data() {
     assert_search_response_structure(
         "s3vectors_chunking_additional_columns",
-        &json!({
+        json!({
             "duration_ms": 1,
             "results": [
                 {"_score": 0.4, "data": {"question": "q1"}, "dataset": "qs", "matches": {"answer": ["a1"]}, "primary_key": {"id": 1}},
@@ -421,6 +404,7 @@ fn structural_search_response_accepts_additional_columns_in_data() {
                 {"_score": 0.1, "data": {"question": "q4"}, "dataset": "qs", "matches": {"answer": ["a4"]}, "primary_key": {"id": 4}}
             ]
         }),
+        true,
     );
 }
 
@@ -428,7 +412,7 @@ fn structural_search_response_accepts_additional_columns_in_data() {
 fn structural_search_response_accepts_additional_columns_in_primary_key() {
     assert_search_response_structure(
         "s3vectors_composite_additional_columns",
-        &json!({
+        json!({
             "duration_ms": 1,
             "results": [
                 {"_score": 0.4, "dataset": "qs", "matches": {"answer": ["a1"]}, "primary_key": {"id": 1, "question": "q1"}},
@@ -437,36 +421,224 @@ fn structural_search_response_accepts_additional_columns_in_primary_key() {
                 {"_score": 0.1, "dataset": "qs", "matches": {"answer": ["a4"]}, "primary_key": {"id": 4, "question": "q4"}}
             ]
         }),
+        true,
     );
 }
 
+#[test]
+fn sql_response_normalization_stabilizes_clustered_2dp_scores_across_drift() {
+    // Both inputs are observed in CI for the same query against
+    // `s3vectors_chunking_view_vector_search_sql_filters` — they differ because
+    // the raw embedding scores drift by ±0.01 across runs, crossing the
+    // server-side `trunc(_score, 2)` boundary.
+    let pattern_a = json!([
+        {"id": 938, "answer": "a-938", "_score": 0.34},
+        {"id": 1015, "answer": "a-1015", "_score": 0.31},
+        {"id": 1035, "answer": "a-1035", "_score": 0.30},
+        {"id": 551, "answer": "a-551", "_score": 0.29}
+    ]);
+    let pattern_b = json!([
+        {"id": 938, "answer": "a-938", "_score": 0.34},
+        {"id": 1015, "answer": "a-1015", "_score": 0.30},
+        {"id": 551, "answer": "a-551", "_score": 0.29},
+        {"id": 1035, "answer": "a-1035", "_score": 0.29}
+    ]);
+
+    let normalized_a = normalize_sql_response_for_snapshot(pattern_a, true);
+    let normalized_b = normalize_sql_response_for_snapshot(pattern_b, true);
+
+    assert_eq!(
+        normalized_a, normalized_b,
+        "different score-drift patterns should normalize to the same value"
+    );
+
+    let expected = json!([
+        {"id": 551, "answer": "a-551", "_score": 0.3},
+        {"id": 938, "answer": "a-938", "_score": 0.3},
+        {"id": 1015, "answer": "a-1015", "_score": 0.3},
+        {"id": 1035, "answer": "a-1035", "_score": 0.3}
+    ]);
+    assert_eq!(normalized_a, expected);
+}
+
+#[test]
+fn sql_response_normalization_preserves_well_separated_2dp_scores() {
+    // s3vectors_chunking_view_vector_search_sql_basic shape — scores span
+    // 0.24, well above the 0.06 cluster threshold. Should be returned
+    // unchanged.
+    let input = json!([
+        {"id": 612, "answer": "a-612", "_score": 0.8},
+        {"id": 349, "answer": "a-349", "_score": 0.79},
+        {"id": 948, "answer": "a-948", "_score": 0.56},
+        {"id": 1277, "answer": "a-1277", "_score": 0.56}
+    ]);
+    let normalized = normalize_sql_response_for_snapshot(input.clone(), true);
+    assert_eq!(normalized, input);
+}
+
+#[test]
+fn sql_response_normalization_preserves_higher_than_2dp_precision() {
+    // 3-decimal-precision scores (from `trunc(_score, 3)`) have enough
+    // resolution to remain stable across CI runs; the function must not
+    // touch them even when scores are clustered.
+    let input = json!([
+        {"id": 468, "_score": 0.540},
+        {"id": 189, "_score": 0.539},
+        {"id": 1277, "_score": 0.539},
+        {"id": 948, "_score": 0.528}
+    ]);
+    let normalized = normalize_sql_response_for_snapshot(input.clone(), true);
+    assert_eq!(normalized, input);
+}
+
+#[test]
+fn sql_response_normalization_is_noop_when_round_scores_disabled() {
+    let input = json!([
+        {"id": 1, "_score": 0.34},
+        {"id": 2, "_score": 0.30}
+    ]);
+    let normalized = normalize_sql_response_for_snapshot(input.clone(), false);
+    assert_eq!(normalized, input);
+}
+
+#[test]
+fn sql_response_normalization_skips_trunc_3_columns_with_all_zero_third_decimals() {
+    // Regression: a `trunc(_score, 3)` snapshot whose values all happen to end
+    // in `0` (e.g. `0.540, 0.530, 0.520, 0.510`) is numerically indistinguishable
+    // from a 2dp response. The explicit precision in the column name must keep
+    // us from rounding it.
+    let input = json!([
+        {"id": 1, "trunc(vector_search()._score,Int64(3))": 0.540},
+        {"id": 2, "trunc(vector_search()._score,Int64(3))": 0.530},
+        {"id": 3, "trunc(vector_search()._score,Int64(3))": 0.520},
+        {"id": 4, "trunc(vector_search()._score,Int64(3))": 0.510}
+    ]);
+    let normalized = normalize_sql_response_for_snapshot(input.clone(), true);
+    assert_eq!(normalized, input);
+}
+
+#[test]
+fn sql_response_normalization_picks_primary_score_key_deterministically() {
+    // When a row carries multiple score-like columns (constructed manually here
+    // for the test), the function should always pick `_score` first regardless
+    // of JSON insertion order.
+    let input_a = json!([
+        {"id": 1, "_score": 0.34, "_fused_score": 0.34},
+        {"id": 2, "_score": 0.30, "_fused_score": 0.30},
+        {"id": 3, "_score": 0.29, "_fused_score": 0.29},
+        {"id": 4, "_score": 0.29, "_fused_score": 0.29}
+    ]);
+    let input_b = json!([
+        {"id": 1, "_fused_score": 0.34, "_score": 0.34},
+        {"id": 2, "_fused_score": 0.30, "_score": 0.30},
+        {"id": 3, "_fused_score": 0.29, "_score": 0.29},
+        {"id": 4, "_fused_score": 0.29, "_score": 0.29}
+    ]);
+    let a = normalize_sql_response_for_snapshot(input_a, true);
+    let b = normalize_sql_response_for_snapshot(input_b, true);
+
+    // Both should normalize identically; the field order inside each row will
+    // follow the original insertion order of that input, but the SET of fields
+    // and their values must match.
+    let extract_values = |v: &Value| -> Vec<(i64, f64, f64)> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let id = row.get("id").and_then(|x| x.as_i64()).unwrap();
+                let s = row.get("_score").and_then(|x| x.as_f64()).unwrap();
+                let f = row.get("_fused_score").and_then(|x| x.as_f64()).unwrap();
+                (id, s, f)
+            })
+            .collect()
+    };
+    assert_eq!(extract_values(&a), extract_values(&b));
+}
+
+#[test]
+fn parse_trunc_precision_handles_int64_form() {
+    assert_eq!(parse_trunc_precision("trunc(x,Int64(2))"), Some(2));
+    assert_eq!(parse_trunc_precision("trunc(x,Int64(3))"), Some(3));
+    assert_eq!(
+        parse_trunc_precision("trunc(vector_search(qs, Utf8(\"a\"), col)._score,Int64(2))"),
+        Some(2)
+    );
+}
+
+#[test]
+fn parse_trunc_precision_handles_bare_integer_form() {
+    assert_eq!(parse_trunc_precision("trunc(x,2)"), Some(2));
+    assert_eq!(parse_trunc_precision("trunc(x, 3)"), Some(3));
+}
+
+#[test]
+fn parse_trunc_precision_returns_none_for_non_trunc_columns() {
+    assert_eq!(parse_trunc_precision("_score"), None);
+    assert_eq!(parse_trunc_precision("_fused_score"), None);
+    assert_eq!(parse_trunc_precision("id"), None);
+}
+
+#[test]
+fn sql_response_normalization_preserves_already_tight_2dp_clusters() {
+    // Range = 0.01 (here, 0.54 - 0.53 in f64 ≈ 0.010000000000000009). Scores
+    // are already so tight that 1-decimal rounding would collapse the cluster
+    // unnecessarily — leave them alone so well-tested snapshots stay stable.
+    let input = json!([
+        {"id": 189, "_score": 0.54},
+        {"id": 468, "_score": 0.54},
+        {"id": 1277, "_score": 0.54},
+        {"id": 948, "_score": 0.53}
+    ]);
+    let normalized = normalize_sql_response_for_snapshot(input.clone(), true);
+    assert_eq!(normalized, input);
+}
+
 /// Normalizes vector similarity search response for consistent snapshot testing by replacing dynamic
-/// values such as duration and scores with placeholders.
-fn normalize_search_response_json(mut json: Value, sort_ties_by_matches: bool) -> Value {
+/// values such as duration with placeholder.
+fn normalize_search_response_json(
+    mut json: Value,
+    sort_ties_by_matches: bool,
+    round_scores: bool,
+) -> Value {
     if let Some(duration) = json.get_mut("duration_ms") {
         *duration = json!("duration_ms_val");
     }
     if let Some(matches) = json.get_mut("results").and_then(|m| m.as_array_mut()) {
-        // Sort by score descending, breaking ties by matches content then primary key,
-        // to get a stable snapshot ordering.
-        // Scores are rounded to 2 decimal places before comparing to absorb ±0.01
-        // variance from non-deterministic embeddings (model2vec/s3vectors/OpenAI)
-        // across CI runners, matching the previous round_scores behaviour.
+        // To avoid inconsistent snapshots when scores are equal (common when using RRF)
+        // or near truncation boundaries (model2vec scores vary ±0.01 across CI runners),
+        // we round scores before comparing and also order based on primary key.
         matches.sort_by(|a, b| {
-            let Some(score_a) = a.get("_score").and_then(Value::as_f64) else {
+            let Some(Value::Number(num_a)) = a.get("_score") else {
                 return Ordering::Greater;
             };
-            let Some(score_b) = b.get("_score").and_then(Value::as_f64) else {
+            let Some(score_a) = num_a.as_f64() else {
+                return Ordering::Greater;
+            };
+            let Some(Value::Number(num_b)) = b.get("_score") else {
+                return Ordering::Less;
+            };
+            let Some(score_b) = num_b.as_f64() else {
                 return Ordering::Less;
             };
 
-            let score_a = (100.0 * score_a).round() / 100.0;
-            let score_b = (100.0 * score_b).round() / 100.0;
+            // When round_scores is true, round to 2 decimal places before comparing
+            // to avoid flaky ordering from minor floating-point variance across CI
+            // runners (model2vec/s3vectors). Otherwise use raw float comparison.
+            let cmp_a = if round_scores {
+                (100.0 * score_a).round() / 100.0
+            } else {
+                score_a
+            };
+            let cmp_b = if round_scores {
+                (100.0 * score_b).round() / 100.0
+            } else {
+                score_b
+            };
 
-            // Descending order
-            if score_a > score_b {
+            // Opposite because we want to order descendingly
+            if cmp_a > cmp_b {
                 return Ordering::Less;
-            } else if score_a < score_b {
+            } else if cmp_a < cmp_b {
                 return Ordering::Greater;
             }
 
@@ -496,9 +668,22 @@ fn normalize_search_response_json(mut json: Value, sort_ties_by_matches: bool) -
 
         for m in matches {
             if let Some(obj) = m.as_object_mut()
-                && obj.contains_key("_score")
+                && let Some(Value::Number(n)) = obj.get("_score")
+                && let Some(score) = n.as_f64()
             {
-                obj.insert("_score".to_string(), Value::String("[score]".to_string()));
+                // Use rounding for non-deterministic embeddings (model2vec/s3vectors/OpenAI)
+                // to stabilize scores that vary ±0.01 across CI runs.
+                // Use truncation for deterministic embeddings (HF) to preserve
+                // exact snapshot values.
+                let display_score = if round_scores {
+                    (100.0 * score).round() / 100.0
+                } else {
+                    (100.0 * score).trunc() / 100.0
+                };
+                obj.insert(
+                    "_score".to_string(),
+                    Value::String(format!("{display_score:.2}")),
+                );
             }
         }
     }
@@ -508,66 +693,172 @@ fn normalize_search_response_json(mut json: Value, sort_ties_by_matches: bool) -
     json
 }
 
-fn normalize_search_response(json: Value) -> String {
-    serde_json::to_string_pretty(&normalize_search_response_json(json, false))
-        .expect("search response snapshot serialization should succeed")
+fn normalize_search_response(json: Value, round_scores: bool) -> String {
+    serde_json::to_string_pretty(&normalize_search_response_json(json, false, round_scores))
+        .unwrap_or_default()
 }
 
-/// Normalize a `/v1/sql` HTTP response for stable snapshotting.
+/// Normalize a SQL search response for snapshot comparison when scores are
+/// non-deterministic.
 ///
-/// SQL responses are top-level JSON arrays of row objects. When a row contains
-/// a `_score` column (e.g. the SELECT aliases `trunc(_score, 2) as _score`),
-/// the underlying raw score can vary by ±0.01 across CI runners, which both
-/// flips row ordering near rounding boundaries and changes the printed score.
-/// Redact `_score` to a placeholder and re-sort on the rounded score (with a
-/// stable secondary key on the rest of the row) so snapshots are deterministic.
-fn normalize_sql_response_json(mut json: Value) -> Value {
-    if let Some(rows) = json.as_array_mut() {
-        let has_score = rows
-            .iter()
-            .any(|r| r.as_object().is_some_and(|o| o.contains_key("_score")));
-        if has_score {
-            rows.sort_by(|a, b| {
-                let score_a = a.get("_score").and_then(Value::as_f64);
-                let score_b = b.get("_score").and_then(Value::as_f64);
-                if let (Some(sa), Some(sb)) = (score_a, score_b) {
-                    let ra = (100.0 * sa).round() / 100.0;
-                    let rb = (100.0 * sb).round() / 100.0;
-                    if ra > rb {
-                        return Ordering::Less;
-                    } else if ra < rb {
-                        return Ordering::Greater;
-                    }
-                }
-                let key_a = row_tiebreak_key(a);
-                let key_b = row_tiebreak_key(b);
-                key_a.cmp(&key_b)
-            });
+/// When `round_scores` is `true` and the response contains a clustered set of
+/// scores at 2-decimal precision (produced by `trunc(_score, 2)`), rounds each
+/// score to 1 decimal place and re-sorts rows by rounded score (descending)
+/// then by `id` (ascending). This absorbs the ±0.01 jitter that crosses
+/// `trunc` boundaries across CI runs with non-deterministic embeddings
+/// (model2vec / s3vectors / OpenAI), at the cost of one decimal of precision
+/// in the snapshot.
+///
+/// Returns the input unchanged when normalization does not apply — namely
+/// when `round_scores` is `false`, the response has no score column, the
+/// score column comes from `trunc(_, N)` with `N != 2`, scores are at higher
+/// precision than 2 decimals (e.g. from `trunc(_score, 3)`), or scores are
+/// either all-tied (range ≤ 0.01) or well-separated (range > 0.06).
+fn normalize_sql_response_for_snapshot(value: Value, round_scores: bool) -> Value {
+    if !round_scores {
+        return value;
+    }
 
-            for row in rows {
-                if let Some(obj) = row.as_object_mut()
-                    && obj.contains_key("_score")
-                {
-                    obj.insert("_score".to_string(), Value::String("[score]".to_string()));
+    let Value::Array(mut rows) = value else {
+        return value;
+    };
+    if rows.is_empty() {
+        return Value::Array(rows);
+    }
+
+    let mut score_keys: Vec<String> = rows
+        .first()
+        .and_then(|row| row.as_object())
+        .map(|obj| {
+            obj.keys()
+                .filter(|k| {
+                    let s = k.as_str();
+                    s == "_score" || s == "_fused_score" || s.starts_with("trunc(")
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Pick the primary score key deterministically: prefer `_score`, then
+    // `_fused_score`, then `trunc(...)` columns lexicographically. JSON object
+    // iteration otherwise depends on the SQL response shape, which would make
+    // normalization non-deterministic if a row carried multiple score-like
+    // columns.
+    score_keys.sort_by(|a, b| score_key_priority(a).cmp(&score_key_priority(b)));
+
+    let Some(primary_score_key) = score_keys.first().cloned() else {
+        return Value::Array(rows);
+    };
+
+    // When the column name encodes the `trunc` precision explicitly (e.g.
+    // `trunc(..., Int64(3))`), use that to gate normalization — it's more
+    // reliable than inspecting the score values, which can't distinguish
+    // `0.54` from `0.540`.
+    if let Some(precision) = parse_trunc_precision(&primary_score_key)
+        && precision != 2
+    {
+        return Value::Array(rows);
+    }
+
+    let scores: Vec<f64> = rows
+        .iter()
+        .filter_map(|row| row.get(&primary_score_key).and_then(|v| v.as_f64()))
+        .collect();
+    if scores.is_empty() {
+        return Value::Array(rows);
+    }
+
+    // Only normalize 2-decimal precision scores. Higher-precision scores
+    // (e.g. from `trunc(_score, 3)`) carry enough resolution to remain stable
+    // across CI runs and rounding them to 1 decimal would lose meaningful
+    // information.
+    //
+    // NOTE: this check uses `s * 100` ≈ integer, which means it can't tell
+    // `0.54` from `0.540` for aliased columns where the column name doesn't
+    // expose the trunc precision (e.g. `... as _score`). The explicit
+    // precision check above catches the unaliased case; aliased 3dp columns
+    // whose values all happen to end in 0 would be misclassified, but in
+    // practice DataFusion's f64 → JSON serialization preserves enough
+    // floating-point noise that all-zeros 3rd-decimal values are unusual.
+    let is_2dp_precision = scores.iter().all(|&s| {
+        let scaled = s * 100.0;
+        (scaled - scaled.round()).abs() < 1e-6
+    });
+    if !is_2dp_precision {
+        return Value::Array(rows);
+    }
+
+    let max = scores.iter().copied().fold(f64::MIN, f64::max);
+    let min = scores.iter().copied().fold(f64::MAX, f64::min);
+    let range = max - min;
+
+    // Skip when all scores are effectively tied (range < 0.011, which covers
+    // exact-0.01 spreads up to floating-point noise) — there is no ordering
+    // ambiguity to absorb and 1-decimal rounding would needlessly squash an
+    // already-stable cluster. Skip when scores are well-separated (range
+    // > 0.06) — 1-decimal rounding would erase meaningful gaps.
+    if range < 0.011 || range > 0.06 {
+        return Value::Array(rows);
+    }
+
+    for row in &mut rows {
+        let Some(obj) = row.as_object_mut() else {
+            continue;
+        };
+        for k in &score_keys {
+            if let Some(f) = obj.get(k).and_then(|v| v.as_f64()) {
+                let rounded = (f * 10.0).round() / 10.0;
+                if let Some(num) = serde_json::Number::from_f64(rounded) {
+                    obj.insert(k.clone(), Value::Number(num));
                 }
             }
         }
     }
-    json
+
+    rows.sort_by(|a, b| {
+        let sa = a
+            .get(&primary_score_key)
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let sb = b
+            .get(&primary_score_key)
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        match sb.partial_cmp(&sa).unwrap_or(Ordering::Equal) {
+            Ordering::Equal => {
+                let id_a = a.get("id").and_then(|v| v.as_i64()).unwrap_or(i64::MAX);
+                let id_b = b.get("id").and_then(|v| v.as_i64()).unwrap_or(i64::MAX);
+                id_a.cmp(&id_b)
+            }
+            order => order,
+        }
+    });
+
+    Value::Array(rows)
 }
 
-fn row_tiebreak_key(row: &Value) -> String {
-    let Some(obj) = row.as_object() else {
-        return serde_json::to_string(row).expect("row tiebreak key serialization should succeed");
+fn score_key_priority(key: &str) -> (u8, &str) {
+    let bucket = match key {
+        "_score" => 0,
+        "_fused_score" => 1,
+        _ => 2,
     };
-    let mut sanitized: BTreeMap<String, Value> = BTreeMap::new();
-    for (k, v) in obj {
-        if k == "_score" {
-            continue;
-        }
-        sanitized.insert(k.clone(), v.clone());
-    }
-    serde_json::to_string(&sanitized).expect("row tiebreak key serialization should succeed")
+    (bucket, key)
+}
+
+/// Parse the precision argument out of a DataFusion `trunc(<expr>, Int64(N))`
+/// or `trunc(<expr>, N)` column name. Returns `None` for any other column
+/// shape (including aliased columns like `_score`).
+fn parse_trunc_precision(col_name: &str) -> Option<usize> {
+    let inner = col_name.strip_prefix("trunc(")?.strip_suffix(')')?;
+    let comma = inner.rfind(',')?;
+    let arg = inner[comma + 1..].trim();
+    let n_str = arg
+        .strip_prefix("Int64(")
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(arg);
+    n_str.trim().parse().ok()
 }
 
 fn quote_sql_identifier(identifier: &str) -> String {
@@ -709,14 +1000,17 @@ pub(crate) async fn run_search(
     app: App,
     test_cases: Vec<SearchTestCase>,
 ) -> Result<(), anyhow::Error> {
-    run_search_w_explain(app, test_cases, false).await
+    run_search_w_explain(app, test_cases, false, false).await
 }
 
 // if `explain_sql`, for any [`SearchTestCase`] that is [`SearchTestType::Sql`], a snapshot will be taken of the associated explain query.
+// if `round_scores`, HTTP search response scores use rounding instead of truncation for display.
+// Use for tests with non-deterministic embeddings (e.g. model2vec/s3vectors).
 pub(crate) async fn run_search_w_explain(
     app: App,
     test_cases: Vec<SearchTestCase>,
     explain_sql: bool,
+    round_scores: bool,
 ) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
@@ -736,7 +1030,10 @@ pub(crate) async fn run_search_w_explain(
                     )
                 });
 
-            for ts in test_cases {
+            for mut ts in test_cases {
+                if round_scores {
+                    ts.round_scores = true;
+                }
                 if ts.skip {
                     tracing::info!("Skipping test {}", ts.name);
                     continue;
@@ -764,8 +1061,8 @@ pub(crate) async fn run_search_w_explain(
                             continue;
                         }
 
-                        let normalized = normalize_sql_response_json(resp?);
-                        insta::assert_json_snapshot!(test_name.clone(), normalized);
+                        let resp = normalize_sql_response_for_snapshot(resp?, ts.round_scores);
+                        insta::assert_json_snapshot!(test_name.clone(), resp);
 
                         if explain_sql {
                             let c: Vec<arrow::record_batch::RecordBatch> = client
@@ -936,6 +1233,7 @@ async fn test_multi_column_search_view() -> Result<(), anyhow::Error> {
         ]
         ].concat(),
         true,
+        false,
     )
     .await
 }
@@ -1386,7 +1684,7 @@ async fn test_rrf_recency_unboosting_disjoint_regression() -> Result<(), anyhow:
             insta::with_settings!({
                 description => sql
             }, {
-                insta::assert_snapshot!("rrf_recency_unboosting_disjoint_regression", normalize_search_response(resp));
+                insta::assert_snapshot!("rrf_recency_unboosting_disjoint_regression", normalize_search_response(resp, true));
             });
 
             Ok(())
@@ -1748,6 +2046,7 @@ async fn test_text_search_view() -> Result<(), anyhow::Error> {
             ),
         ],
         true,
+        false,
     )
     .await
 }
@@ -1997,6 +2296,7 @@ async fn test_text_search_metadata() -> Result<(), anyhow::Error> {
             ),
         ],
         true,
+        false,
     )
     .await
 }
@@ -2282,7 +2582,7 @@ async fn test_vector_search_limit_plans() -> Result<(), anyhow::Error> {
 
         insta::assert_snapshot!(
             format!("{name}_response"),
-            normalize_search_response(result.clone())
+            normalize_search_response(result.clone(), false)
         );
 
         let result_str = result

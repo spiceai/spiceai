@@ -684,14 +684,13 @@ impl Runtime {
         {
             Ok(()) => {
                 // Log experimental hash_index warning once per dataset at registration
-                if ds
-                    .acceleration
-                    .as_ref()
-                    .is_some_and(Acceleration::is_hash_index_enabled)
-                {
+                if matches!(
+                    ds.acceleration.as_ref(),
+                    Some(acceleration) if acceleration.is_hash_index_enabled()
+                ) {
                     tracing::warn!(
                         dataset = %ds.name,
-                        "hash_index is enabled for Arrow engine acceleration. Note: hash_index is experimental and may have breaking changes in future releases."
+                        "hash_index is automatically enabled for Arrow acceleration because primary_key or indexes are configured. Note: hash_index is experimental and may have breaking changes in future releases."
                     );
                 }
                 tracing::info!(
@@ -1119,7 +1118,11 @@ impl Runtime {
             && let Some(assignments) = self.partition_assignments()
         {
             let assignments = assignments.read().await;
-            let partition_filters = get_partition_filter_exprs(&ds.name, &assignments);
+            let resolved = ds.name.clone().resolve(
+                crate::datafusion::SPICE_DEFAULT_CATALOG,
+                crate::datafusion::SPICE_DEFAULT_SCHEMA,
+            );
+            let partition_filters = get_partition_filter_exprs(&resolved, &assignments);
             if !partition_filters.is_empty() {
                 tracing::debug!(
                     "For table={}, extracted {} partition filter(s) for assigned partitions.",
