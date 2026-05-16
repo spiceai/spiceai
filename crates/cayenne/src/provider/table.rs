@@ -2822,11 +2822,10 @@ impl CayenneTableProvider {
                 snapshot_id,
             );
 
-            let snapshot_listing_table = Self::create_listing_table(
+            let snapshot_listing_table = self.scan_listing_table_for_config(
                 &snapshot_url,
-                Arc::clone(&self.table_metadata.schema),
-                self.context.file_format(),
-                &self.pk_deletion_strategy,
+                snapshot_id,
+                ctx.state().config(),
             )?;
 
             let snapshot_plan = snapshot_listing_table
@@ -2852,13 +2851,15 @@ impl CayenneTableProvider {
             .await?;
         }
 
-        let inlined_batches = self.read_inlined_batches().await?;
-        self.process_visible_inlined_batches_into_keyset(
-            &inlined_batches,
-            pk_indices,
-            converter,
-            &mut keyset,
-        )?;
+        if self.cached_inlined_row_count() > 0 {
+            let inlined_batches = self.read_inlined_batches().await?;
+            self.process_visible_inlined_batches_into_keyset(
+                &inlined_batches,
+                pk_indices,
+                converter,
+                &mut keyset,
+            )?;
+        }
 
         Ok(keyset)
     }
@@ -4847,6 +4848,39 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Publish file additions/removals in the current snapshot without
+    /// rebuilding the `ListingTable` object.
+    ///
+    /// `ListingTable::scan()` lists files eagerly on every scan and the table
+    /// path is unchanged for ordinary append commits. Invalidating DataFusion's
+    /// list-files cache is therefore enough to make newly moved files visible;
+    /// keeping the existing `ListingTable` preserves its file-statistics cache
+    /// and removes a rebuild from the write hot path.
+    pub(crate) fn publish_current_snapshot_files_changed_under_held_fence(&self) -> Result<()> {
+        let current_snapshot = self.get_current_snapshot_id()?;
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            &current_snapshot,
+        );
+
+        Self::invalidate_list_files_cache(self.context.runtime_env(), &snapshot_dir_url);
+
+        tracing::trace!(
+            table = self.table_metadata.table_name.as_str(),
+            snapshot_id = current_snapshot.as_str(),
+            "Published current snapshot file changes"
+        );
+
+        Ok(())
+    }
+
+    /// Acquire the listing fence and publish current-snapshot file changes.
+    pub(crate) async fn publish_current_snapshot_files_changed(&self) -> Result<()> {
+        let _fence = self.listing_fence.write().await;
+        self.publish_current_snapshot_files_changed_under_held_fence()
+    }
+
     /// Acquire `listing_fence` for write and return an owned guard.
     ///
     /// Used by the cross-partition append coordinator (#10125 step 6) so it
@@ -5991,6 +6025,18 @@ impl CayenneTableProvider {
             protected_snapshot_count = protected_snapshots.len(),
             "Scanning protected snapshots for Cayenne table"
         );
+        tracing::debug!(
+            table = %self.table_metadata.table_name,
+            protected_snapshot_count = protected_snapshots.len(),
+            "Cayenne scan includes protected snapshots"
+        );
+        if protected_snapshots.len() >= 4 {
+            tracing::warn!(
+                table = %self.table_metadata.table_name,
+                protected_snapshot_count = protected_snapshots.len(),
+                "Cayenne scan has high protected snapshot amplification"
+            );
+        }
 
         let mut plans = Vec::with_capacity(protected_snapshots.len());
 

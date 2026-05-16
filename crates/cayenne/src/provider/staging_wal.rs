@@ -150,13 +150,13 @@ impl CayenneStagedAppend {
         self.table.remove_staging_wal().await
     }
 
-    /// Refreshes the listing table so newly committed files become visible.
+    /// Publishes current snapshot file changes so newly committed files become visible.
     ///
     /// # Errors
     ///
-    /// Returns an error if refreshing the listing table fails.
+    /// Returns an error if current snapshot metadata cannot be resolved.
     pub async fn refresh_listing_table(&self) -> Result<()> {
-        self.table.refresh_listing_table().await
+        self.table.publish_current_snapshot_files_changed().await
     }
 
     /// Executes the full WAL finalize sequence in order.
@@ -164,12 +164,14 @@ impl CayenneStagedAppend {
     /// # Errors
     ///
     /// Returns an error if any step in the finalize sequence (write WAL, move files,
-    /// remove WAL, or refresh listing table) fails.
+    /// remove WAL, or list-files cache invalidation) fails.
     pub async fn finalize_staged_write(&self) -> Result<()> {
         self.write_wal().await?;
+        let _fence = self.table.lock_listing_fence_write_owned().await;
         self.move_staged_files().await?;
         self.remove_wal().await?;
-        self.refresh_listing_table().await?;
+        self.table
+            .publish_current_snapshot_files_changed_under_held_fence()?;
         Ok(())
     }
 
@@ -268,7 +270,7 @@ impl PreparedStagedAppend {
     /// Apply the staged write under the caller's append-side barrier.
     ///
     /// Performs, in order: move staged files into the current snapshot
-    /// directory; remove the staging WAL; refresh the in-memory listing table.
+    /// directory; remove the staging WAL; invalidate the list-files cache.
     /// The WAL is removed *before* the listing-table refresh to preserve the
     /// existing crash-safety invariant ("WAL absent ⇒ files moved
     /// successfully"); a crash between WAL removal and listing refresh leaves
@@ -283,7 +285,7 @@ impl PreparedStagedAppend {
     /// # Errors
     ///
     /// Returns an error if moving the staged files, removing the WAL, or
-    /// refreshing the listing table fails.
+    /// publishing current snapshot file changes fails.
     pub async fn apply_under_barrier(&self) -> Result<()> {
         // Hold the listing fence for the entire move + WAL removal + listing
         // swap sequence. Without this, `CayenneTableProvider::scan()` (which
@@ -292,7 +294,8 @@ impl PreparedStagedAppend {
         let _fence = self.table.lock_listing_fence_write_owned().await;
         self.table.move_files_to_current_snapshot().await?;
         self.table.remove_staging_wal().await?;
-        self.table.refresh_listing_table_under_held_fence()?;
+        self.table
+            .publish_current_snapshot_files_changed_under_held_fence()?;
         Ok(())
     }
 
@@ -311,11 +314,12 @@ impl PreparedStagedAppend {
     /// # Errors
     ///
     /// Returns an error if moving the staged files, removing the WAL, or
-    /// reconstructing the listing table fails.
+    /// publishing current snapshot file changes fails.
     pub async fn apply_under_held_barrier(&self) -> Result<()> {
         self.table.move_files_to_current_snapshot().await?;
         self.table.remove_staging_wal().await?;
-        self.table.refresh_listing_table_under_held_fence()?;
+        self.table
+            .publish_current_snapshot_files_changed_under_held_fence()?;
         Ok(())
     }
 

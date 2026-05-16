@@ -25,7 +25,7 @@ limitations under the License.
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -33,6 +33,7 @@ use data_components::RefreshableCatalogProvider;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
 use datafusion::execution::runtime_env::RuntimeEnv;
+use parking_lot::RwLock;
 use snafu::prelude::*;
 
 use crate::catalog::CatalogError;
@@ -230,28 +231,19 @@ impl CayenneCatalogProvider {
     /// Returns the schema provider for a namespace if it exists.
     #[must_use]
     pub fn schema_provider(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        self.schemas
-            .read()
-            .ok()
-            .and_then(|schemas| schemas.get(name).cloned())
+        self.schemas.read().get(name).cloned()
     }
 
     /// Registers or replaces a schema provider for a namespace.
     ///
     /// # Errors
     ///
-    /// Returns an error if the internal schema lock cannot be acquired.
     pub fn register_schema_provider(
         &self,
         name: &str,
         schema: Arc<dyn SchemaProvider>,
     ) -> DFResult<Option<Arc<dyn SchemaProvider>>> {
-        match self.schemas.write() {
-            Ok(mut schemas) => Ok(schemas.insert(name.to_string(), schema)),
-            Err(_) => Err(datafusion::error::DataFusionError::Internal(
-                "Failed to acquire write lock on Cayenne schemas".to_string(),
-            )),
-        }
+        Ok(self.schemas.write().insert(name.to_string(), schema))
     }
 
     fn vortex_config_from_config(provider_config: &CayenneCatalogProviderConfig) -> VortexConfig {
@@ -284,10 +276,7 @@ impl CatalogProvider for CayenneCatalogProvider {
     }
 
     fn schema_names(&self) -> Vec<String> {
-        self.schemas
-            .read()
-            .map(|schemas| schemas.keys().cloned().collect())
-            .unwrap_or_default()
+        self.schemas.read().keys().cloned().collect()
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
@@ -324,10 +313,7 @@ impl RefreshableCatalogProvider for CayenneCatalogProvider {
             }
         }
 
-        let existing_schemas = match self.schemas.read() {
-            Ok(schemas) => schemas.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
+        let existing_schemas = self.schemas.read().clone();
 
         let mut new_schemas: HashMap<String, Arc<dyn SchemaProvider>> = HashMap::new();
         for (ns, full_names) in &grouped {
@@ -374,10 +360,7 @@ impl RefreshableCatalogProvider for CayenneCatalogProvider {
             );
         }
 
-        match self.schemas.write() {
-            Ok(mut schemas) => *schemas = new_schemas,
-            Err(poisoned) => *poisoned.into_inner() = new_schemas,
-        }
+        *self.schemas.write() = new_schemas;
 
         Ok(())
     }
@@ -463,17 +446,11 @@ impl CayenneSchemaProvider {
     }
 
     fn tables_snapshot(&self) -> HashMap<String, Arc<dyn TableProvider>> {
-        match self.tables.read() {
-            Ok(tables) => tables.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
+        self.tables.read().clone()
     }
 
     fn replace_tables(&self, tables: HashMap<String, Arc<dyn TableProvider>>) {
-        match self.tables.write() {
-            Ok(mut existing_tables) => *existing_tables = tables,
-            Err(poisoned) => *poisoned.into_inner() = tables,
-        }
+        *self.tables.write() = tables;
     }
 
     fn refresh_from(&self, source: &Self) {
@@ -551,24 +528,16 @@ impl SchemaProvider for CayenneSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        self.tables
-            .read()
-            .map(|tables| tables.keys().cloned().collect())
-            .unwrap_or_default()
+        self.tables.read().keys().cloned().collect()
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.tables
-            .read()
-            .map(|tables| tables.contains_key(name))
-            .unwrap_or(false)
+        self.tables.read().contains_key(name)
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         // Check in-memory cache first
-        if let Ok(tables) = self.tables.read()
-            && let Some(provider) = tables.get(name)
-        {
+        if let Some(provider) = self.tables.read().get(name) {
             return Ok(Some(Arc::clone(provider)));
         }
 
@@ -576,9 +545,9 @@ impl SchemaProvider for CayenneSchemaProvider {
         let full_name = self.full_table_name(name);
         match Self::load_table(&self.catalog, &full_name, &self.runtime_env).await {
             Ok(Some(provider)) => {
-                if let Ok(mut tables) = self.tables.write() {
-                    tables.insert(name.to_string(), Arc::clone(&provider));
-                }
+                self.tables
+                    .write()
+                    .insert(name.to_string(), Arc::clone(&provider));
                 Ok(Some(provider))
             }
             Ok(None) => Ok(None),
@@ -591,20 +560,10 @@ impl SchemaProvider for CayenneSchemaProvider {
         name: String,
         table: Arc<dyn TableProvider>,
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        match self.tables.write() {
-            Ok(mut tables) => Ok(tables.insert(name, table)),
-            Err(_) => Err(datafusion::error::DataFusionError::Internal(
-                "Failed to acquire write lock on Cayenne tables".to_string(),
-            )),
-        }
+        Ok(self.tables.write().insert(name, table))
     }
 
     fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        match self.tables.write() {
-            Ok(mut tables) => Ok(tables.remove(name)),
-            Err(_) => Err(datafusion::error::DataFusionError::Internal(
-                "Failed to acquire write lock on Cayenne tables".to_string(),
-            )),
-        }
+        Ok(self.tables.write().remove(name))
     }
 }
