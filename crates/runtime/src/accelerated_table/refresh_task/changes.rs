@@ -64,7 +64,6 @@ struct ApplyContext<'a> {
     write_ctx: &'a SessionContext,
     write_session_state: &'a SessionState,
     pending_commit: &'a mut Option<tokio::task::JoinHandle<()>>,
-    commit_timeout: Duration,
 }
 
 /// Extracts the primary key value from the data, as a tuple of (String, Expr).
@@ -619,41 +618,13 @@ impl RefreshTask {
                     );
                 }
 
-                // Wait for the previous burst's commit to land before
-                // spawning this burst's commit. This preserves strict
-                // commit ordering across bursts (LSN/offsets must advance
-                // monotonically) while letting commit(N) overlap with the
-                // next apply(N+1).
-                if let Some(prev) = context.pending_commit.take()
-                    && let Some(error_message) = join_pending_commit(
-                        prev,
-                        context.dataset_name,
-                        self.runtime_status.is_shutdown(),
-                        context.commit_timeout,
-                    )
-                    .await
-                {
-                    self.set_refresh_status(
-                        context.refresh_sql,
-                        status::ComponentStatus::error_with_message(error_message),
-                    )
-                    .await;
-                    return false;
-                }
-
-                let runtime_status = Arc::clone(&self.runtime_status);
-                let commit_dataset = context.dataset_name.clone();
-                *context.pending_commit = Some(tokio::spawn(async move {
-                    for committer in committers {
-                        if let Err(e) = committer.commit().await
-                            && !runtime_status.is_shutdown()
-                        {
-                            tracing::error!(
-                                "Failed to commit CDC change envelope for {commit_dataset}: {e}"
-                            );
-                        }
-                    }
-                }));
+                let previous_commit = context.pending_commit.take();
+                *context.pending_commit = Some(spawn_ordered_commit_task(
+                    previous_commit,
+                    committers,
+                    Arc::clone(&self.runtime_status),
+                    context.dataset_name.clone(),
+                ));
             }
             Err(e) => {
                 let error_message = format_datafusion_error(&e);
@@ -1119,6 +1090,41 @@ async fn join_pending_commit(
             }
         }
     }
+}
+
+fn spawn_ordered_commit_task(
+    previous: Option<tokio::task::JoinHandle<()>>,
+    committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
+    runtime_status: Arc<status::RuntimeStatus>,
+    commit_dataset: TableReference,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Some(previous) = previous {
+            match previous.await {
+                Ok(()) => {}
+                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                Err(e) if e.is_cancelled() && runtime_status.is_shutdown() => {
+                    tracing::debug!(
+                        "Previous CDC commit task for {commit_dataset} was cancelled during shutdown"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Previous CDC commit task for {commit_dataset} ended unexpectedly: {e}"
+                    );
+                }
+            }
+        }
+
+        for committer in committers {
+            if let Err(e) = committer.commit().await
+                && !runtime_status.is_shutdown()
+            {
+                tracing::error!("Failed to commit CDC change envelope for {commit_dataset}: {e}");
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -2518,14 +2524,17 @@ mod tests {
         let dataset_name = TableReference::bare("test");
         let initial_load_completed = Arc::new(AtomicBool::new(false));
         let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
         let mut context = ApplyContext {
             refresh_sql: None,
             dataset_name: &dataset_name,
             caching: None,
             ready_sender: None,
             initial_load_completed: &initial_load_completed,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
             pending_commit: &mut pending_commit,
-            commit_timeout: Duration::from_secs(5),
         };
 
         assert!(
