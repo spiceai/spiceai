@@ -739,13 +739,11 @@ fn normalize_sql_response_for_snapshot_with_sql(
             let score_a = a
                 .get(&primary_score_key)
                 .and_then(Value::as_f64)
-                .map(round_to_one_decimal)
-                .unwrap_or(0.0);
+                .map_or(0.0, round_to_one_decimal);
             let score_b = b
                 .get(&primary_score_key)
                 .and_then(Value::as_f64)
-                .map(round_to_one_decimal)
-                .unwrap_or(0.0);
+                .map_or(0.0, round_to_one_decimal);
             match score_b.partial_cmp(&score_a).unwrap_or(Ordering::Equal) {
                 Ordering::Equal => {
                     let id_a = a.get("id").and_then(Value::as_i64).unwrap_or(i64::MAX);
