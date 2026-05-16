@@ -929,8 +929,11 @@ impl CayenneTableProvider {
             // corruption that lost staged files" (file in neither location).
             // Only the former should self-heal.
             if !self.table_path().starts_with("s3://") && !wal.staged_files.is_empty() {
-                let staging_dir =
-                    Self::snapshot_dir_path(self.table_path(), self.table_id(), &staging_snapshot_id);
+                let staging_dir = Self::snapshot_dir_path(
+                    self.table_path(),
+                    self.table_id(),
+                    &staging_snapshot_id,
+                );
                 let target_dir = Self::snapshot_dir_path(
                     self.table_path(),
                     self.table_id(),
