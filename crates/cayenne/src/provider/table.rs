@@ -28,6 +28,7 @@ use super::delete::{
     CayenneDeletionSink, DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter,
     FileBasedDeletionSink, Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
 };
+use super::mutation_writer::AppendMutationWriter;
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use crate::metadata::{
@@ -94,6 +95,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::task;
 use vortex::dtype::arrow::FromArrowType;
 use vortex_datafusion::VortexFormat;
@@ -104,8 +106,98 @@ use super::deletion_strategy::{
     Int64PkDeletionSnapshot, PkDeletionStrategy, PkDeletionStrategyWithCache,
     RowConverterDeletionSnapshot,
 };
+use super::staging_wal::PreparedStagedAppend;
 use super::vortex_format::DeletionFilteringVortexFormat;
 use arc_swap::ArcSwap;
+
+const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct PostWriteMaintenanceState {
+    stats: Option<Arc<ColumnStatsAccumulator>>,
+    refresh_listing: bool,
+}
+
+impl PostWriteMaintenanceState {
+    fn is_empty(&self) -> bool {
+        self.stats.is_none() && !self.refresh_listing
+    }
+}
+
+#[derive(Default)]
+struct PostWriteMaintenance {
+    state: ParkingMutex<PostWriteMaintenanceState>,
+    scheduled: AtomicBool,
+}
+
+/// Result of a Cayenne CDC append write.
+///
+/// A write can be fully complete when this value is returned, or it can have a
+/// staged append whose WAL is durable but whose file publish still needs to be
+/// finalized. CDC catch-up mode can safely commit the source offset once this
+/// value is returned; callers must still drive [`Self::finish`] to make the
+/// rows visible and release the table write guard.
+#[must_use]
+pub struct CayenneCdcWrite {
+    table: CayenneTableProvider,
+    rows: u64,
+    prepared_append: Option<PreparedStagedAppend>,
+    stats: Option<Arc<ColumnStatsAccumulator>>,
+}
+
+impl CayenneCdcWrite {
+    pub(crate) fn completed(table: CayenneTableProvider, rows: u64) -> Self {
+        Self {
+            table,
+            rows,
+            prepared_append: None,
+            stats: None,
+        }
+    }
+
+    pub(crate) fn prepared_append(
+        table: CayenneTableProvider,
+        rows: u64,
+        prepared_append: PreparedStagedAppend,
+        stats: Arc<ColumnStatsAccumulator>,
+    ) -> Self {
+        Self {
+            table,
+            rows,
+            prepared_append: Some(prepared_append),
+            stats: Some(stats),
+        }
+    }
+
+    /// Returns the number of rows written or staged by this CDC write.
+    #[must_use]
+    pub fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    /// Returns true when the staged append still needs to be made visible.
+    #[must_use]
+    pub fn has_pending_finalize(&self) -> bool {
+        self.prepared_append.is_some()
+    }
+
+    /// Finalize the staged append, if any, and schedule post-write maintenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the staged append cannot be published.
+    pub async fn finish(self) -> Result<u64> {
+        if let Some(prepared_append) = self.prepared_append {
+            prepared_append.apply_under_barrier().await?;
+            let rows = prepared_append.finish().await?;
+            self.table
+                .schedule_post_write_maintenance(self.stats, false);
+            Ok(rows)
+        } else {
+            Ok(self.rows)
+        }
+    }
+}
 
 /// Accumulates per-column statistics across multiple `RecordBatch`es during a write.
 ///
@@ -487,6 +579,62 @@ impl ColumnStatsAccumulator {
         self.row_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    pub(crate) fn merge_from(&self, other: &Self) {
+        let other_row_count = other.row_count();
+        if other_row_count == 0 {
+            return;
+        }
+
+        let (other_columns, other_seeded) = {
+            let Ok(cols) = other.columns.lock() else {
+                tracing::warn!("ColumnStatsAccumulator: mutex poisoned in merge_from(), skipping");
+                return;
+            };
+            let Ok(seeded) = other.columns_seeded.lock() else {
+                tracing::warn!(
+                    "ColumnStatsAccumulator: seeded-mutex poisoned in merge_from(), skipping"
+                );
+                return;
+            };
+            (cols.clone(), seeded.clone())
+        };
+
+        let Ok(mut cols) = self.columns.lock() else {
+            tracing::warn!("ColumnStatsAccumulator: mutex poisoned in merge_from(), skipping");
+            return;
+        };
+        let Ok(mut seeded) = self.columns_seeded.lock() else {
+            tracing::warn!(
+                "ColumnStatsAccumulator: seeded-mutex poisoned in merge_from(), skipping"
+            );
+            return;
+        };
+
+        let _ = self.row_count.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |current| Some(current.saturating_add(other_row_count)),
+        );
+
+        for (idx, other_stats) in other_columns.into_iter().enumerate() {
+            if idx >= cols.len()
+                || idx >= seeded.len()
+                || idx >= self.dtypes.len()
+                || !other_seeded.get(idx).copied().unwrap_or(false)
+            {
+                continue;
+            }
+
+            if seeded[idx] {
+                let existing = std::mem::take(&mut cols[idx]);
+                cols[idx] = existing.merge_unordered(&other_stats, &self.dtypes[idx]);
+            } else {
+                cols[idx] = other_stats;
+                seeded[idx] = true;
+            }
+        }
+    }
+
     pub(crate) fn to_file_statistics_blob_with_row_count(&self) -> Option<(Vec<u8>, i64)> {
         let row_count = self.row_count();
         if row_count == 0 {
@@ -816,6 +964,10 @@ pub struct CayenneTableProvider {
     /// does not spawn one background compaction task per append while a prior
     /// notification is still pending.
     post_write_compaction_scheduled: Arc<AtomicBool>,
+    /// Coalesces write-driven listing refreshes and table-statistics updates
+    /// so CDC catch-up bursts do not synchronously pay metastore/listing work
+    /// on every append.
+    post_write_maintenance: Arc<PostWriteMaintenance>,
     /// Per-table background compaction task, populated by
     /// [`Self::spawn_background_compaction`]. Held by `Arc<OnceLock<…>>` so it
     /// survives [`Self::clone_for_write`] and shares its drop signal across
@@ -1196,6 +1348,38 @@ impl CayenneTableProvider {
     #[must_use]
     pub fn clone_for_write_operations(&self) -> Self {
         self.clone_for_write()
+    }
+
+    /// Append a CDC upsert stream using Cayenne's native writer path.
+    ///
+    /// This bypasses `TableProvider::insert_into`/`DataSinkExec` construction
+    /// for high-frequency CDC bursts. For simple staged appends, the returned
+    /// [`CayenneCdcWrite`] is ready as soon as the staging WAL is durable; the
+    /// caller can commit the source offset before awaiting its final publish.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the CDC append cannot be staged or written.
+    pub async fn write_cdc_append_stream(
+        &self,
+        data: SendableRecordBatchStream,
+        task_context: &Arc<datafusion_execution::TaskContext>,
+    ) -> Result<CayenneCdcWrite> {
+        let target_schema = Arc::clone(&self.table_metadata.schema);
+        let normalized = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&target_schema),
+            data.map(move |batch_result| {
+                batch_result.and_then(|batch| {
+                    arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema))
+                        .map_err(Into::into)
+                })
+            }),
+        ));
+
+        let write_guard = self.write_lock_arc().lock_owned().await;
+        AppendMutationWriter::new(self, &self.context, task_context)
+            .write_cdc_pipelined(normalized, write_guard)
+            .await
     }
 
     /// Returns whether retention filters are configured for this table.
@@ -2197,6 +2381,7 @@ impl CayenneTableProvider {
             new_files_since_last_compaction: Arc::new(AtomicUsize::new(0)),
             compaction_lock: Arc::new(tokio::sync::Mutex::new(())),
             post_write_compaction_scheduled: Arc::new(AtomicBool::new(false)),
+            post_write_maintenance: Arc::new(PostWriteMaintenance::default()),
             background_compactor: Arc::new(std::sync::OnceLock::new()),
         };
 
@@ -2612,6 +2797,7 @@ impl CayenneTableProvider {
             // attempts on the same table coordinate, even across clones.
             compaction_lock: Arc::clone(&self.compaction_lock),
             post_write_compaction_scheduled: Arc::clone(&self.post_write_compaction_scheduled),
+            post_write_maintenance: Arc::clone(&self.post_write_maintenance),
             background_compactor: Arc::clone(&self.background_compactor),
         }
     }
@@ -4109,6 +4295,86 @@ impl CayenneTableProvider {
                 }
             }
         });
+    }
+
+    pub(crate) fn schedule_post_write_maintenance(
+        &self,
+        stats: Option<Arc<ColumnStatsAccumulator>>,
+        refresh_listing: bool,
+    ) {
+        if stats.is_none() && !refresh_listing {
+            return;
+        }
+
+        {
+            let mut state = self.post_write_maintenance.state.lock();
+            if let Some(stats) = stats {
+                if let Some(existing) = &state.stats {
+                    existing.merge_from(&stats);
+                } else {
+                    state.stats = Some(stats);
+                }
+            }
+            state.refresh_listing |= refresh_listing;
+        }
+
+        if self
+            .post_write_maintenance
+            .scheduled
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+
+        let table = self.clone_for_write();
+        tokio::spawn(async move {
+            table.run_post_write_maintenance_loop().await;
+        });
+    }
+
+    async fn run_post_write_maintenance_loop(self) {
+        loop {
+            tokio::time::sleep(POST_WRITE_MAINTENANCE_DEBOUNCE).await;
+
+            let state = {
+                let mut guard = self.post_write_maintenance.state.lock();
+                std::mem::take(&mut *guard)
+            };
+
+            if state.refresh_listing
+                && let Err(e) = self.refresh_listing_table().await
+            {
+                tracing::warn!(
+                    table = self.table_metadata.table_name.as_str(),
+                    "Post-write listing refresh failed: {e}"
+                );
+            }
+
+            let had_stats = state.stats.is_some();
+            if let Some(stats) = state.stats {
+                self.persist_table_stats(&stats).await;
+            }
+
+            if state.refresh_listing || had_stats {
+                self.schedule_post_write_compaction();
+            }
+
+            self.post_write_maintenance
+                .scheduled
+                .store(false, Ordering::Release);
+
+            if self.post_write_maintenance.state.lock().is_empty() {
+                return;
+            }
+
+            if self
+                .post_write_maintenance
+                .scheduled
+                .swap(true, Ordering::AcqRel)
+            {
+                return;
+            }
+        }
     }
 
     /// Single compaction pass — list, pick, rewrite.

@@ -67,7 +67,7 @@ pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEnt
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
 pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
-pub use table::{CayenneTableProvider, CayenneTableProviderBuilder};
+pub use table::{CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder};
 pub use vortex_format::{DeletionFilteringVortexFormat, attach_deletion_vectors_to_config};
 
 // Re-export deletion utilities for advanced use cases

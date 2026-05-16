@@ -82,8 +82,8 @@ pub use metadata::{
 };
 pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 pub use provider::{
-    CayenneContext, CayenneStagedAppend, CayenneTableProvider, CayenneTableProviderBuilder,
-    PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry, PreparedOverwrite,
-    PreparedStagedAppend, TimeRetentionFilterBuilder,
+    CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneTableProvider,
+    CayenneTableProviderBuilder, PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry,
+    PreparedOverwrite, PreparedStagedAppend, TimeRetentionFilterBuilder,
 };
 pub use schema::transform_schema_for_vortex;

@@ -24,6 +24,8 @@ use arrow::array::{
 use arrow::datatypes::DataType;
 use arrow_tools::record_batch::try_cast_to;
 use cache::Caching;
+#[cfg(not(windows))]
+use cayenne::{CayenneCdcWrite, CayenneTableProvider};
 use data_components::arrow::{IndexedMemTable, write::MemTable};
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
 #[cfg(feature = "dynamodb")]
@@ -44,6 +46,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
+use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion_index::IndexedTableProvider;
 use runtime_table_partition::provider::PartitionTableProvider;
@@ -52,8 +55,10 @@ use std::collections::HashSet;
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, RwLock};
+
+type PendingApplyFinalize = tokio::task::JoinHandle<crate::accelerated_table::Result<()>>;
 
 struct ApplyContext<'a> {
     refresh_sql: Option<&'a str>,
@@ -64,7 +69,22 @@ struct ApplyContext<'a> {
     write_ctx: &'a SessionContext,
     write_session_state: &'a SessionState,
     commit_timeout: Duration,
+    pending_finalize: &'a mut Option<PendingApplyFinalize>,
     pending_commit: &'a mut Option<tokio::task::JoinHandle<()>>,
+}
+
+struct WriteChangeOutcome {
+    result: WriteChangeResult,
+    pending_finalize: Option<PendingApplyFinalize>,
+}
+
+impl WriteChangeOutcome {
+    fn new(result: WriteChangeResult, pending_finalize: Option<PendingApplyFinalize>) -> Self {
+        Self {
+            result,
+            pending_finalize,
+        }
+    }
 }
 
 /// Extracts the primary key value from the data, as a tuple of (String, Expr).
@@ -361,6 +381,7 @@ impl RefreshTask {
         // commit(N) overlaps apply(N+1) without accumulating an unbounded chain
         // of tasks if the source-side commit path stalls.
         let mut pending_commit: Option<tokio::task::JoinHandle<()>> = None;
+        let mut pending_finalize: Option<PendingApplyFinalize> = None;
         let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
@@ -410,12 +431,34 @@ impl RefreshTask {
                 write_ctx: &write_ctx,
                 write_session_state: &write_session_state,
                 commit_timeout: cdc_cfg.commit_timeout,
+                pending_finalize: &mut pending_finalize,
                 pending_commit: &mut pending_commit,
             };
             if !self.apply_burst(&mut apply_context, burst).await {
                 rx.close();
                 reader_handle.abort();
                 break;
+            }
+        }
+
+        if let Some(finalize) = pending_finalize.take() {
+            if let Some(error_message) =
+                join_pending_finalize(finalize, &dataset_name, self.runtime_status.is_shutdown())
+                    .await
+            {
+                self.set_refresh_status(
+                    sql.as_deref(),
+                    status::ComponentStatus::error_with_message(error_message),
+                )
+                .await;
+            } else if let Some(cache_provider_ref) = caching.as_ref()
+                && let Some(cache_provider) = cache_provider_ref.upgrade()
+                && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone())
+                && !self.runtime_status.is_shutdown()
+            {
+                tracing::error!(
+                    "Failed to invalidate cached results for dataset {dataset_name}: {e}"
+                );
             }
         }
 
@@ -489,6 +532,17 @@ impl RefreshTask {
         context: &mut ApplyContext<'_>,
         burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
     ) -> bool {
+        let burst_start = Instant::now();
+        let burst_envelopes = u64::try_from(burst.len()).unwrap_or(u64::MAX);
+        let burst_bytes = burst
+            .iter()
+            .map(cdc_item_memory_size)
+            .fold(0_usize, usize::saturating_add);
+        let labels = [KeyValue::new("dataset", context.dataset_name.to_string())];
+        metrics::CDC_APPLY_BURST_ENVELOPES.record(burst_envelopes, &labels);
+        metrics::CDC_APPLY_BURST_BYTES
+            .record(u64::try_from(burst_bytes).unwrap_or(u64::MAX), &labels);
+
         // Walk the burst preserving arrival order, processing contiguous
         // runs of Ok envelopes together and Err items individually so error
         // handling and ordering semantics match the pre-coalesce behavior.
@@ -506,6 +560,8 @@ impl RefreshTask {
                     }
 
                     if !self.apply_envelope_run(context, envelopes).await {
+                        metrics::CDC_APPLY_BURST_DURATION_MS
+                            .record(elapsed_ms(burst_start), &labels);
                         return false;
                     }
                 }
@@ -527,6 +583,7 @@ impl RefreshTask {
                 }
             }
         }
+        metrics::CDC_APPLY_BURST_DURATION_MS.record(elapsed_ms(burst_start), &labels);
         true
     }
 
@@ -557,6 +614,7 @@ impl RefreshTask {
             batches.push(batch);
         }
 
+        let coalesce_start = Instant::now();
         // Fast path: a single envelope (low-load / serial behavior). Skips
         // concat allocation entirely so the no-coalesce path matches the
         // pre-pipelining cost exactly.
@@ -584,7 +642,9 @@ impl RefreshTask {
                 }
             }
         };
+        record_cdc_fixed_cost(context.dataset_name, "coalesce", coalesce_start);
 
+        let write_start = Instant::now();
         match self
             .write_change_with_context(
                 coalesced_batch,
@@ -593,7 +653,9 @@ impl RefreshTask {
             )
             .await
         {
-            Ok(write_result) => {
+            Ok(write_outcome) => {
+                record_cdc_fixed_cost(context.dataset_name, "write", write_start);
+
                 if any_ready {
                     context
                         .initial_load_completed
@@ -605,7 +667,40 @@ impl RefreshTask {
                         .await;
                 }
 
-                if write_result == WriteChangeResult::DataWritten
+                if let Some(previous_finalize) = context.pending_finalize.take() {
+                    let finalize_start = Instant::now();
+                    if let Some(error_message) = join_pending_finalize(
+                        previous_finalize,
+                        context.dataset_name,
+                        self.runtime_status.is_shutdown(),
+                    )
+                    .await
+                    {
+                        self.set_refresh_status(
+                            context.refresh_sql,
+                            status::ComponentStatus::error_with_message(error_message),
+                        )
+                        .await;
+                        return false;
+                    }
+                    record_cdc_fixed_cost(context.dataset_name, "finalize_wait", finalize_start);
+
+                    if let Some(cache_provider_ref) = context.caching
+                        && let Some(cache_provider) = cache_provider_ref.upgrade()
+                        && let Err(e) =
+                            cache_provider.invalidate_for_table(context.dataset_name.clone())
+                        && !self.runtime_status.is_shutdown()
+                    {
+                        tracing::error!(
+                            "Failed to invalidate cached results for dataset {}: {e}",
+                            context.dataset_name
+                        );
+                    }
+                }
+
+                let current_finalize_pending = write_outcome.pending_finalize.is_some();
+                if write_outcome.result == WriteChangeResult::DataWritten
+                    && !current_finalize_pending
                     && let Some(cache_provider_ref) = context.caching
                     && let Some(cache_provider) = cache_provider_ref.upgrade()
                     && let Err(e) =
@@ -618,21 +713,28 @@ impl RefreshTask {
                     );
                 }
 
-                if let Some(previous_commit) = context.pending_commit.take()
-                    && let Some(error_message) = join_pending_commit(
+                if let Some(finalize) = write_outcome.pending_finalize {
+                    *context.pending_finalize = Some(finalize);
+                }
+
+                if let Some(previous_commit) = context.pending_commit.take() {
+                    let commit_wait_start = Instant::now();
+                    if let Some(error_message) = join_pending_commit(
                         previous_commit,
                         context.dataset_name,
                         self.runtime_status.is_shutdown(),
                         context.commit_timeout,
                     )
                     .await
-                {
-                    self.set_refresh_status(
-                        context.refresh_sql,
-                        status::ComponentStatus::error_with_message(error_message),
-                    )
-                    .await;
-                    return false;
+                    {
+                        self.set_refresh_status(
+                            context.refresh_sql,
+                            status::ComponentStatus::error_with_message(error_message),
+                        )
+                        .await;
+                        return false;
+                    }
+                    record_cdc_fixed_cost(context.dataset_name, "commit_wait", commit_wait_start);
                 }
 
                 *context.pending_commit = Some(spawn_ordered_commit_task(
@@ -668,6 +770,7 @@ impl RefreshTask {
         let session_state = ctx.state();
         self.write_change_with_context(change_batch, &ctx, &session_state)
             .await
+            .map(|outcome| outcome.result)
     }
 
     async fn write_change_with_context(
@@ -675,7 +778,7 @@ impl RefreshTask {
         change_batch: ChangeBatch,
         ctx: &SessionContext,
         session_state: &SessionState,
-    ) -> crate::accelerated_table::Result<WriteChangeResult> {
+    ) -> crate::accelerated_table::Result<WriteChangeOutcome> {
         let dataset_name = self.dataset_name.clone();
 
         let sub_batches = group_into_sub_batches(&change_batch);
@@ -688,7 +791,21 @@ impl RefreshTask {
         );
 
         let mut had_change = false;
+        let mut pending_finalize: Option<PendingApplyFinalize> = None;
         for (op_type, row_indices) in sub_batches {
+            if let Some(finalize) = pending_finalize.take()
+                && let Some(error_message) = join_pending_finalize(
+                    finalize,
+                    &self.dataset_name,
+                    self.runtime_status.is_shutdown(),
+                )
+                .await
+            {
+                return Err(crate::accelerated_table::Error::FailedToWriteData {
+                    source: datafusion_common::DataFusionError::Execution(error_message),
+                });
+            }
+
             match op_type {
                 ChangeOperationType::Delete => {
                     self.process_delete_batch(&change_batch, &row_indices, &ctx, &session_state)
@@ -696,7 +813,8 @@ impl RefreshTask {
                     had_change = true;
                 }
                 ChangeOperationType::Upsert => {
-                    self.process_upsert_batch(&change_batch, &row_indices, &ctx, &session_state)
+                    pending_finalize = self
+                        .process_upsert_batch(&change_batch, &row_indices, &ctx, &session_state)
                         .await?;
                     had_change = true;
                 }
@@ -717,9 +835,12 @@ impl RefreshTask {
         }
 
         if had_change {
-            Ok(WriteChangeResult::DataWritten)
+            Ok(WriteChangeOutcome::new(
+                WriteChangeResult::DataWritten,
+                pending_finalize,
+            ))
         } else {
-            Ok(WriteChangeResult::NoChange)
+            Ok(WriteChangeOutcome::new(WriteChangeResult::NoChange, None))
         }
     }
 
@@ -729,7 +850,7 @@ impl RefreshTask {
         row_indices: &[usize],
         ctx: &SessionContext,
         session_state: &SessionState,
-    ) -> crate::accelerated_table::Result<()> {
+    ) -> crate::accelerated_table::Result<Option<PendingApplyFinalize>> {
         let dataset_name = &self.dataset_name;
 
         let data_batch = change_batch.data_batch();
@@ -761,6 +882,32 @@ impl RefreshTask {
             Box::pin(stream::once(async move { Ok(selected_batch) })),
         ));
 
+        #[cfg(not(windows))]
+        if let Some(cayenne) = self.cayenne_accelerator() {
+            let task_ctx = ctx.task_ctx();
+            let cayenne_write = cayenne
+                .write_cdc_append_stream(record_batch_stream, &task_ctx)
+                .await
+                .map_err(datafusion_common::DataFusionError::from)
+                .map_err(find_datafusion_root)
+                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+
+            self.update_last_updated_at();
+
+            if cayenne_write.has_pending_finalize() {
+                return Ok(Some(spawn_cayenne_finalize(cayenne_write)));
+            }
+
+            cayenne_write
+                .finish()
+                .await
+                .map_err(datafusion_common::DataFusionError::from)
+                .map_err(find_datafusion_root)
+                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+
+            return Ok(None);
+        }
+
         let _lock_guard = self.accelerator_write_mutex.lock().await;
 
         // Wrap with SchemaCastScanExec to ensure data types match the accelerator schema
@@ -784,7 +931,14 @@ impl RefreshTask {
 
         self.update_last_updated_at();
 
-        Ok(())
+        Ok(None)
+    }
+
+    #[cfg(not(windows))]
+    fn cayenne_accelerator(&self) -> Option<&CayenneTableProvider> {
+        self.accelerator
+            .as_any()
+            .downcast_ref::<CayenneTableProvider>()
     }
 
     async fn process_truncate(
@@ -912,6 +1066,18 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated_table::R
 fn cdc_item_memory_size(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
     item.as_ref()
         .map_or(0, |env| env.change_batch.record.get_array_memory_size())
+}
+
+fn elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
+fn record_cdc_fixed_cost(dataset_name: &TableReference, phase: &'static str, start: Instant) {
+    let labels = [
+        KeyValue::new("dataset", dataset_name.to_string()),
+        KeyValue::new("phase", phase),
+    ];
+    metrics::CDC_APPLY_FIXED_COST_MS.record(elapsed_ms(start), &labels);
 }
 
 fn select_rows(
@@ -1055,6 +1221,50 @@ fn contiguous_row_span(row_indices: &[usize]) -> Option<(usize, usize)> {
     }
 }
 
+#[cfg(not(windows))]
+fn spawn_cayenne_finalize(cayenne_write: CayenneCdcWrite) -> PendingApplyFinalize {
+    tokio::spawn(async move {
+        cayenne_write
+            .finish()
+            .await
+            .map(|_| ())
+            .map_err(datafusion_common::DataFusionError::from)
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::FailedToWriteDataSnafu)
+    })
+}
+
+async fn join_pending_finalize(
+    handle: PendingApplyFinalize,
+    dataset_name: &TableReference,
+    is_shutdown: bool,
+) -> Option<String> {
+    match handle.await {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) if is_shutdown => {
+            tracing::debug!("CDC apply finalizer for {dataset_name} failed during shutdown: {e}");
+            None
+        }
+        Ok(Err(e)) => {
+            let error_message = format!("CDC apply finalizer for {dataset_name} failed: {e}");
+            tracing::error!("{error_message}");
+            Some(error_message)
+        }
+        Err(e) if e.is_cancelled() && is_shutdown => {
+            tracing::debug!(
+                "CDC apply finalizer for {dataset_name} was cancelled (likely shutdown)"
+            );
+            None
+        }
+        Err(e) => {
+            let error_message =
+                format!("CDC apply finalizer for {dataset_name} ended unexpectedly: {e}");
+            tracing::error!("{error_message}");
+            Some(error_message)
+        }
+    }
+}
+
 /// Await an in-flight commit task spawned by `apply_envelope_run`. Surfaces
 /// panics loudly (we must never silently swallow a commit-task panic — that
 /// would leave the dataset healthy while source-side offsets stop advancing)
@@ -1114,10 +1324,12 @@ fn spawn_ordered_commit_task(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Safe catch-up mode: this task is spawned only after the accelerator
-        // write returns successfully. `apply_envelope_run` has already drained
-        // the previous commit task with timeout/backpressure before spawning
-        // this one, so source progress is acknowledged in order without ever
-        // running ahead of a durable/visible accelerator write.
+        // write returns successfully. For Cayenne staged appends, that return
+        // point is after the staging WAL is durable; file publication may still
+        // be finishing in the apply finalizer. `apply_envelope_run` has already
+        // drained the previous commit task with timeout/backpressure before
+        // spawning this one, so source progress is acknowledged in order
+        // without running ahead of a durable accelerator write.
         for committer in committers {
             if let Err(e) = committer.commit().await
                 && !runtime_status.is_shutdown()
@@ -2524,6 +2736,7 @@ mod tests {
         let log = CommitLog::new();
         let dataset_name = TableReference::bare("test");
         let initial_load_completed = Arc::new(AtomicBool::new(false));
+        let mut pending_finalize = None;
         let mut pending_commit = None;
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
@@ -2536,6 +2749,7 @@ mod tests {
             write_ctx: &write_ctx,
             write_session_state: &write_session_state,
             commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
             pending_commit: &mut pending_commit,
         };
 

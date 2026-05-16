@@ -24,13 +24,15 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_execution::TaskContext;
 use datafusion_physical_plan::{SendableRecordBatchStream, execute_stream};
 use futures::StreamExt;
+use tokio::sync::OwnedMutexGuard;
 
 use super::Result;
 use super::constants::STAGING_DIR_NAME;
 use super::context::CayenneContext;
+use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 use super::table::{
-    CayenneTableProvider, ColumnStatsAccumulator, INLINE_MAX_BUFFER_BYTES, INLINE_MAX_ROWS,
-    PreparedInsertStream,
+    CayenneCdcWrite, CayenneTableProvider, ColumnStatsAccumulator, INLINE_MAX_BUFFER_BYTES,
+    INLINE_MAX_ROWS, OnConflictDeletions, PreparedInsertStream,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +144,79 @@ impl<'a> AppendMutationWriter<'a> {
         }
     }
 
+    pub(super) async fn write_cdc_pipelined(
+        &self,
+        data: SendableRecordBatchStream,
+        write_guard: OwnedMutexGuard<()>,
+    ) -> Result<CayenneCdcWrite> {
+        self.table.ensure_no_incomplete_write().await?;
+
+        let pending_pk_deletions = !self.table.pk_deletion_strategy().is_position_based()
+            && self.table.has_pending_deletions();
+
+        let PreparedInsertStream {
+            stream: mut prepared_stream,
+            on_conflict_deletions,
+        } = self.table.prepare_stream_for_insert(data).await?;
+
+        let has_file_on_conflict_deletions = on_conflict_deletions.has_file_deletions();
+        let has_on_conflict_deletions = !on_conflict_deletions.is_empty();
+        let can_stage_for_pipeline = !pending_pk_deletions
+            && !has_file_on_conflict_deletions
+            && !has_on_conflict_deletions
+            && !self.context.has_sort_columns()
+            && self.table.metadata().partition_column.is_none()
+            && !self.table.has_retention_filters();
+
+        if !can_stage_for_pipeline {
+            let _write_guard = write_guard;
+            let rows = self
+                .write_prepared_stream(
+                    prepared_stream,
+                    on_conflict_deletions,
+                    pending_pk_deletions,
+                    has_file_on_conflict_deletions,
+                )
+                .await?;
+            return Ok(CayenneCdcWrite::completed(
+                self.table.clone_for_write_operations(),
+                rows,
+            ));
+        }
+
+        self.table.clear_staging_dir().await?;
+
+        match self
+            .try_inline_or_restream(prepared_stream, &[], &[])
+            .await?
+        {
+            InlineMutationOutcome::Inlined(rows) => Ok(CayenneCdcWrite::completed(
+                self.table.clone_for_write_operations(),
+                rows,
+            )),
+            InlineMutationOutcome::Fallback(re_stream) => {
+                prepared_stream = re_stream;
+                let target_size_bytes = self.context.target_file_size_bytes();
+                let (rows, writer_ops, stats_acc, prepared_append) = self
+                    .write_staged_append_prepared(prepared_stream, target_size_bytes, write_guard)
+                    .await?;
+
+                tracing::debug!(
+                    "CDC append staged, wrote {} rows to Vortex in {} writer operation(s); WAL is durable",
+                    rows,
+                    writer_ops
+                );
+
+                Ok(CayenneCdcWrite::prepared_append(
+                    self.table.clone_for_write_operations(),
+                    rows,
+                    prepared_append,
+                    stats_acc,
+                ))
+            }
+        }
+    }
+
     pub(super) async fn write(&self, data: SendableRecordBatchStream) -> Result<u64> {
         self.table.ensure_no_incomplete_write().await?;
 
@@ -156,11 +231,28 @@ impl<'a> AppendMutationWriter<'a> {
         }
 
         let PreparedInsertStream {
-            stream: mut prepared_stream,
+            stream: prepared_stream,
             on_conflict_deletions,
         } = self.table.prepare_stream_for_insert(data).await?;
 
         let has_file_on_conflict_deletions = on_conflict_deletions.has_file_deletions();
+
+        self.write_prepared_stream(
+            prepared_stream,
+            on_conflict_deletions,
+            pending_pk_deletions,
+            has_file_on_conflict_deletions,
+        )
+        .await
+    }
+
+    async fn write_prepared_stream(
+        &self,
+        mut prepared_stream: SendableRecordBatchStream,
+        on_conflict_deletions: OnConflictDeletions,
+        pending_pk_deletions: bool,
+        has_file_on_conflict_deletions: bool,
+    ) -> Result<u64> {
         let has_on_conflict_deletions = !on_conflict_deletions.is_empty();
 
         tracing::debug!(
@@ -206,13 +298,13 @@ impl<'a> AppendMutationWriter<'a> {
 
                     let retention_deleted_rows = self.apply_retention_if_configured().await?;
                     let sorted = self.sort_if_configured().await?;
-                    if should_refresh_listing_table_after_post_write(retention_deleted_rows, sorted)
-                    {
-                        self.table.refresh_listing_table().await?;
-                    }
-                    self.table.persist_table_stats(&stats_acc).await;
-
-                    self.table.schedule_post_write_compaction();
+                    self.table.schedule_post_write_maintenance(
+                        Some(stats_acc),
+                        should_refresh_listing_table_after_post_write(
+                            retention_deleted_rows,
+                            sorted,
+                        ),
+                    );
 
                     return Ok(rows);
                 }
@@ -256,20 +348,14 @@ impl<'a> AppendMutationWriter<'a> {
             (rows, stats_acc)
         };
 
-        if needs_new_snapshot {
-            self.table.refresh_listing_table().await?;
-        }
-
         let retention_deleted_rows = self.apply_retention_if_configured().await?;
         let sorted = self.sort_if_configured().await?;
 
-        if should_refresh_listing_table_after_post_write(retention_deleted_rows, sorted) {
-            self.table.refresh_listing_table().await?;
-        }
-
-        self.table.persist_table_stats(&write_stats_acc).await;
-
-        self.table.schedule_post_write_compaction();
+        self.table.schedule_post_write_maintenance(
+            Some(write_stats_acc),
+            needs_new_snapshot
+                || should_refresh_listing_table_after_post_write(retention_deleted_rows, sorted),
+        );
 
         Ok(total_rows)
     }
@@ -309,7 +395,8 @@ impl<'a> AppendMutationWriter<'a> {
                 stats_acc.update(batch);
             }
 
-            self.table.persist_table_stats(&stats_acc).await;
+            self.table
+                .schedule_post_write_maintenance(Some(Arc::new(stats_acc)), false);
 
             if let Err(e) = self
                 .table
@@ -321,8 +408,6 @@ impl<'a> AppendMutationWriter<'a> {
                     self.table.table_name(),
                 );
             }
-
-            self.table.schedule_post_write_compaction();
 
             return Ok(InlineMutationOutcome::Inlined(
                 u64::try_from(buffer.total_rows()).unwrap_or(u64::MAX),
@@ -372,6 +457,53 @@ impl<'a> AppendMutationWriter<'a> {
         staged_append.finalize_staged_write().await?;
 
         Ok(result)
+    }
+
+    async fn write_staged_append_prepared(
+        &self,
+        stream: SendableRecordBatchStream,
+        target_size_bytes: usize,
+        write_guard: OwnedMutexGuard<()>,
+    ) -> Result<(
+        u64,
+        usize,
+        Arc<ColumnStatsAccumulator>,
+        PreparedStagedAppend,
+    )> {
+        self.table
+            .staging_may_have_files()
+            .store(true, Ordering::Release);
+
+        let (rows, writer_ops, stats_acc) = match self
+            .table
+            .write_to_snapshot(
+                stream,
+                target_size_bytes,
+                STAGING_DIR_NAME,
+                self.task_context.session_config().target_partitions(),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                if let Err(cleanup_err) = self.table.clear_staging_dir().await {
+                    tracing::warn!(
+                        "Failed to clean staging dir after write error for table {}: {cleanup_err}",
+                        self.table.table_name(),
+                    );
+                }
+                return Err(e);
+            }
+        };
+
+        let staged_append = CayenneStagedAppend::from_staged_append(
+            self.table.clone_for_write_operations(),
+            write_guard,
+            rows,
+        );
+        let prepared_append = staged_append.prepare().await?;
+
+        Ok((rows, writer_ops, stats_acc, prepared_append))
     }
 
     async fn apply_retention_if_configured(&self) -> Result<u64> {
