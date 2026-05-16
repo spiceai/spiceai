@@ -1,0 +1,20 @@
+---
+source: crates/runtime/tests/ducklake/mod.rs
+expression: plan
+---
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                                                       |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                                                                                                                                  |
+|               |  Projection: o.id, c.name, o.total                                                                                                                                                                                                         |
+|               |   Inner Join:  Filter: o.customer_id = c.id                                                                                                                                                                                                |
+|               |     SubqueryAlias: o                                                                                                                                                                                                                       |
+|               |       TableScan: rw_lake.main.orders projection=[id, customer_id, total]                                                                                                                                                                   |
+|               |     SubqueryAlias: c                                                                                                                                                                                                                       |
+|               |       TableScan: rw_lake.main.customers projection=[id, name]                                                                                                                                                                              |
+| physical_plan | SchemaCastScanExec                                                                                                                                                                                                                         |
+|               |   CooperativeExec                                                                                                                                                                                                                          |
+|               |     BytesProcessedExec                                                                                                                                                                                                                     |
+|               |       VirtualExecutionPlan name=duckdb compute_context=:memory: base_sql=SELECT "o"."id", "c"."name", "o"."total" FROM "ducklake"."main"."orders" AS "o" INNER JOIN "ducklake"."main"."customers" AS "c" ON ("o"."customer_id" = "c"."id") |
+|               |                                                                                                                                                                                                                                            |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

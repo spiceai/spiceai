@@ -17,9 +17,12 @@ limitations under the License.
 //! Pretty printing utilities for Arrow `RecordBatch`es with data type display.
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::error::ArrowError;
+use arrow::util::display::{ArrayFormatter, FormatOptions};
 use arrow::util::pretty::pretty_format_batches;
+use std::fmt::Write;
+use std::sync::Arc;
 
 /// Formats Arrow `RecordBatch`es with data types displayed below column names.
 ///
@@ -32,10 +35,137 @@ pub fn format_batches_with_types(batches: &[RecordBatch]) -> Result<String, Arro
     }
 
     let schema = batches[0].schema();
-    let formatted = pretty_format_batches(batches)?;
+    let type_strings: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| format_data_type(f.data_type()))
+        .collect();
+
+    // Pad column names so Arrow allocates enough width to fit the type strings.
+    let padded_batches = with_padded_names_for_types(batches, &type_strings)?;
+    let formatted = pretty_format_batches(&padded_batches)?;
     let output = formatted.to_string();
 
     Ok(insert_type_row(&output, &schema))
+}
+
+/// Formats Arrow `RecordBatch`es in expanded view: each row becomes a vertical
+/// stack of `column | value` lines, separated by a `-[ RECORD n ]-` divider.
+///
+/// This mirrors `PostgreSQL`'s `\x` (expanded) display mode and is useful when
+/// tables are wider than the terminal.
+///
+/// # Errors
+///
+/// Returns an error if any cell value cannot be formatted.
+pub fn format_batches_expanded(batches: &[RecordBatch]) -> Result<String, ArrowError> {
+    if batches.is_empty() {
+        return Ok(String::new());
+    }
+
+    let schema = batches[0].schema();
+    let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    // Label column width is the widest column name in the (first) batch schema.
+    // The `{name:<name_width$}` format specifier pads in Unicode scalars
+    // (chars), not bytes, so `name_width` must use `chars().count()`.
+    // This does not account for terminal display width (e.g. CJK wide
+    // glyphs, combining marks, zero-width joiners can still misalign);
+    // computing true display width would require a unicode-width helper.
+    let name_width = field_names
+        .iter()
+        .map(|n| n.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    let format_opts = FormatOptions::default().with_display_error(true);
+    let mut out = String::new();
+    let mut record_num: usize = 0;
+
+    for batch in batches {
+        // We index `formatters` by the column position derived from the first
+        // batch's schema, so all batches must share that schema.
+        if batch.schema() != schema {
+            return Err(ArrowError::SchemaError(
+                "cannot format results: result batches have differing schemas".to_string(),
+            ));
+        }
+        let formatters = batch
+            .columns()
+            .iter()
+            .map(|c| ArrayFormatter::try_new(c.as_ref(), &format_opts))
+            .collect::<Result<Vec<_>, ArrowError>>()?;
+
+        for row_idx in 0..batch.num_rows() {
+            record_num += 1;
+            write_record_header(&mut out, record_num, name_width);
+            for (col_idx, name) in field_names.iter().enumerate() {
+                let value = formatters[col_idx].value(row_idx).to_string();
+                write_record_line(&mut out, name, name_width, &value);
+            }
+        }
+    }
+
+    // Trim trailing newline for consistency with `format_batches_with_types`.
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    Ok(out)
+}
+
+/// Write the `-[ RECORD n ]-...` separator at the start of an expanded record.
+fn write_record_header(out: &mut String, record_num: usize, name_width: usize) {
+    // Layout: `-[ RECORD <n> ]` then dashes filling out to where the `|` would go,
+    // followed by `-` and a newline.  The `|` column for values lands at
+    // `name_width + 1`, so the header is at least that wide.
+    let label = format!("-[ RECORD {record_num} ]");
+    // Always render at least 3 trailing dashes so the divider reads clearly even
+    // for narrow column names.
+    let min_trailing = 3;
+    let target_width = (name_width + 2).max(label.len() + min_trailing);
+    let trailing = target_width.saturating_sub(label.len());
+    let _ = writeln!(out, "{label}{dashes}", dashes = "-".repeat(trailing));
+}
+
+/// Write a single `name | value` row.  Multi-line values are continued on
+/// subsequent lines, aligned under the value column.
+fn write_record_line(out: &mut String, name: &str, name_width: usize, value: &str) {
+    let mut lines = value.split('\n');
+    let first = lines.next().unwrap_or("");
+    let _ = writeln!(out, "{name:<name_width$} | {first}");
+    for cont in lines {
+        // Continuation lines: blank name column, still anchored at the `|`.
+        let _ = writeln!(out, "{blank:<name_width$} | {cont}", blank = "");
+    }
+}
+
+/// Returns copies of `batches` whose schema has each column name padded with
+/// trailing spaces so that `pretty_format_batches` will allocate a column width
+/// at least as wide as the corresponding type string.  The original schema
+/// (with unpadded names) is used for the displayed header row.
+fn with_padded_names_for_types(
+    batches: &[RecordBatch],
+    type_strings: &[String],
+) -> Result<Vec<RecordBatch>, ArrowError> {
+    let schema = batches[0].schema();
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .zip(type_strings.iter())
+        .map(|(field, type_str)| {
+            let name = field.name();
+            let padded_name = if name.len() < type_str.len() {
+                format!("{name:<width$}", width = type_str.len())
+            } else {
+                name.clone()
+            };
+            Field::new(padded_name, field.data_type().clone(), field.is_nullable())
+        })
+        .collect();
+    let padded_schema = Arc::new(Schema::new(fields));
+    batches
+        .iter()
+        .map(|batch| RecordBatch::try_new(Arc::clone(&padded_schema), batch.columns().to_vec()))
+        .collect()
 }
 
 /// Insert a type row after the header row in the formatted table,
@@ -311,5 +441,192 @@ mod tests {
         let separator = "+----+------+--+";
         let widths = parse_column_widths(separator);
         assert_eq!(widths, vec![4, 6, 2]);
+    }
+
+    #[test]
+    fn test_format_batches_expanded_basic() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("Alice"), Some("Bob")])),
+            ],
+        )
+        .expect("creating test batch");
+
+        let formatted = format_batches_expanded(&[batch]).expect("formatting should succeed");
+
+        assert!(
+            formatted.contains("-[ RECORD 1 ]"),
+            "missing RECORD 1 header in:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("-[ RECORD 2 ]"),
+            "missing RECORD 2 header in:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("id"),
+            "missing column name `id` in:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("name"),
+            "missing column name `name` in:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("Alice"),
+            "missing value `Alice` in:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("Bob"),
+            "missing value `Bob` in:\n{formatted}"
+        );
+        // Records are separated by the divider line, so RECORD 1's header
+        // should appear before RECORD 2's header.
+        let p1 = formatted.find("-[ RECORD 1 ]").expect("RECORD 1 header");
+        let p2 = formatted.find("-[ RECORD 2 ]").expect("RECORD 2 header");
+        assert!(p1 < p2);
+    }
+
+    #[test]
+    fn test_format_batches_expanded_empty() {
+        let formatted = format_batches_expanded(&[]).expect("formatting should succeed");
+        assert!(formatted.is_empty());
+    }
+
+    #[test]
+    fn test_format_batches_expanded_null_value() {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec![None::<&str>]))],
+        )
+        .expect("creating test batch");
+
+        let formatted = format_batches_expanded(&[batch]).expect("formatting should succeed");
+        assert!(formatted.contains("-[ RECORD 1 ]"));
+        assert!(formatted.contains("name"));
+    }
+
+    #[test]
+    fn test_format_batches_expanded_multiline_value_alignment() {
+        // A Utf8 value that contains embedded newlines should be split across
+        // continuation rows, with the label column blank but the `|` still
+        // anchored under the first row's `|`.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("note", DataType::Utf8, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["line1\nline2\nline3"])),
+                Arc::new(Int32Array::from(vec![7])),
+            ],
+        )
+        .expect("creating test batch");
+
+        let formatted = format_batches_expanded(&[batch]).expect("formatting should succeed");
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        // The first value row, plus 2 continuation rows, plus the id row.
+        // Layout (name_width = 4):
+        //   note | line1
+        //        | line2
+        //        | line3
+        //   id   | 7
+        let note_row = lines
+            .iter()
+            .find(|l| l.starts_with("note "))
+            .expect("note row");
+        let pipe_col = note_row.find('|').expect("pipe in note row");
+        let cont1 = lines
+            .iter()
+            .find(|l| l.contains("| line2"))
+            .expect("first continuation");
+        let cont2 = lines
+            .iter()
+            .find(|l| l.contains("| line3"))
+            .expect("second continuation");
+        let id_row = lines.iter().find(|l| l.starts_with("id ")).expect("id row");
+
+        assert_eq!(cont1.find('|'), Some(pipe_col), "continuation 1 misaligned");
+        assert_eq!(cont2.find('|'), Some(pipe_col), "continuation 2 misaligned");
+        assert_eq!(id_row.find('|'), Some(pipe_col), "id row misaligned");
+        // Continuation rows have a blank label column.
+        let label = &cont1[..pipe_col];
+        assert!(
+            label.chars().all(|c| c == ' '),
+            "continuation label should be blank, got {label:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_batches_expanded_rejects_schema_mismatch() {
+        let s1 = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let s2 = Arc::new(Schema::new(vec![Field::new("b", DataType::Int32, false)]));
+        let b1 = RecordBatch::try_new(s1, vec![Arc::new(Int32Array::from(vec![1]))]).expect("b1");
+        let b2 = RecordBatch::try_new(s2, vec![Arc::new(Int32Array::from(vec![2]))]).expect("b2");
+
+        let err = format_batches_expanded(&[b1, b2]).expect_err("schema mismatch should error");
+        assert!(
+            matches!(err, ArrowError::SchemaError(_)),
+            "expected SchemaError, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_batches_expanded_record_numbering_across_batches() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let mk_batch = |vals: Vec<i32>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vals)) as _],
+            )
+            .expect("creating test batch")
+        };
+
+        let formatted = format_batches_expanded(&[mk_batch(vec![10, 20]), mk_batch(vec![30])])
+            .expect("formatting should succeed");
+
+        // Three records total across two batches: numbering must be continuous.
+        assert!(formatted.contains("-[ RECORD 1 ]"));
+        assert!(formatted.contains("-[ RECORD 2 ]"));
+        assert!(formatted.contains("-[ RECORD 3 ]"));
+        assert!(!formatted.contains("-[ RECORD 4 ]"));
+    }
+
+    #[test]
+    fn test_type_wider_than_column_name() {
+        // "id" (2 chars) with type "varchar" (7 chars): the type must not overflow its cell.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec![Some("1")])),
+                Arc::new(arrow::array::StringArray::from(vec![Some("Alice")])),
+            ],
+        )
+        .expect("creating test batch");
+
+        let formatted = format_batches_with_types(&[batch]).expect("formatting should succeed");
+
+        // Every line must have the same length (borders are straight columns).
+        let lines: Vec<&str> = formatted.lines().collect();
+        let first_len = lines[0].len();
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(
+                line.len(),
+                first_len,
+                "line {i} has different width than line 0:\n{formatted}"
+            );
+        }
     }
 }

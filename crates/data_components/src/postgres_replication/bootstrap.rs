@@ -47,9 +47,6 @@ use super::{
 };
 use crate::cdc::{ChangeBatch, ChangeEnvelope, StreamError, changes_schema};
 
-/// Rows per emitted batch when streaming the initial snapshot query.
-const BOOTSTRAP_BATCH_SIZE: usize = 1024;
-
 /// Input for [`snapshot_stream`]. Grouped into a struct to keep the function
 /// signature below clippy's `too_many_arguments` threshold and to make the
 /// callers easier to read.
@@ -78,6 +75,7 @@ pub fn snapshot_stream(
         metrics,
     } = input;
     let dataset_name_clone = dataset_name.clone();
+    let bootstrap_batch_size = params.bootstrap_batch_size;
 
     Ok(try_stream! {
         // Build the TLS connector inside the stream because it's an async
@@ -191,7 +189,7 @@ pub fn snapshot_stream(
             total_rows += 1;
             metrics.add_bootstrap_rows(1);
 
-            if rows_in_batch >= BOOTSTRAP_BATCH_SIZE {
+            if rows_in_batch >= bootstrap_batch_size {
                 let batch = finish_batch(
                     &dataset_schema,
                     &mut builders,

@@ -18,8 +18,13 @@ use std::{collections::HashMap, sync::Arc};
 
 use app::App;
 
-use datafusion::{execution::FunctionRegistry, logical_expr::Expr, sql::TableReference};
+use datafusion::{
+    execution::FunctionRegistry,
+    logical_expr::Expr,
+    sql::{ResolvedTableReference, TableReference},
+};
 use datafusion_proto::bytes::Serializeable;
+use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use runtime_proto::{
     AllocateInitialPartitionsRequest, cluster_service_client::ClusterServiceClient,
 };
@@ -177,7 +182,7 @@ pub async fn executor_request_initial_partitions(
     mut client: ClusterServiceClient<Channel>,
     executor_url: String,
     registry: &(dyn FunctionRegistry + Send + Sync),
-) -> Result<HashMap<TableReference, Vec<Expr>>> {
+) -> Result<HashMap<ResolvedTableReference, Vec<Expr>>> {
     let response = client
         .allocate_initial_partitions(AllocateInitialPartitionsRequest { executor_url })
         .await
@@ -187,7 +192,8 @@ pub async fn executor_request_initial_partitions(
     let mut result = HashMap::new();
 
     for (table_name, partitions) in response.table_partitions {
-        let table_ref = TableReference::parse_str(&table_name);
+        let resolved = TableReference::parse_str(&table_name)
+            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
         let mut exprs = Vec::new();
 
         for item in partitions.items {
@@ -196,7 +202,7 @@ pub async fn executor_request_initial_partitions(
             exprs.push(expr);
         }
 
-        result.insert(table_ref, exprs);
+        result.insert(resolved, exprs);
     }
 
     Ok(result)

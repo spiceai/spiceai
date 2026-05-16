@@ -22,21 +22,16 @@ limitations under the License.
 //! `plans/consolidate-cluster-state-into-cluster-json.md`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use app::spicepod::component::runtime::Scheduler as SchedulerConfig;
-use aws_sdk_credential_bridge::object_store_builder::S3ObjectStoreBuilder;
-use datafusion::execution::object_store::ObjectStoreRegistry;
 use object_store::ObjectStore;
-use runtime_object_store::registry::SpiceObjectStoreRegistry;
-use runtime_parameters::{ParameterSpec, Parameters};
-use runtime_secrets::{Secrets, get_params_with_secrets};
+use runtime_secrets::Secrets;
 use snafu::prelude::*;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use url::Url;
 use uuid::Uuid;
 
 use crate::Runtime;
@@ -53,31 +48,8 @@ const HEARTBEAT_DIVISOR: u64 = 3;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to parse scheduler state location {location}: {source}"))]
-    InvalidStateLocation {
-        location: String,
-        source: url::ParseError,
-    },
-
-    #[snafu(display("Failed to initialize scheduler state object store for {location}: {source}"))]
-    ObjectStoreInit {
-        location: String,
-        source: datafusion::error::DataFusionError,
-    },
-
-    #[snafu(display(
-        "Failed to build S3 object store for scheduler state at {location}: {source}"
-    ))]
-    S3ObjectStoreInit {
-        location: String,
-        source: aws_sdk_credential_bridge::object_store_builder::S3ObjectStoreBuilderError,
-    },
-
-    #[snafu(display(
-        "Failed to initialize local filesystem for scheduler state at {location}: {source}"
-    ))]
-    LocalFileSystemInit {
-        location: String,
+    #[snafu(display("Failed to initialize scheduler state object store: {source}"))]
+    ObjectStoreState {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
@@ -373,25 +345,6 @@ impl SchedulerRegistryRunner {
     }
 }
 
-static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
-    vec![
-        ParameterSpec::component("region").secret(),
-        ParameterSpec::component("endpoint").secret(),
-        ParameterSpec::component("key").secret(),
-        ParameterSpec::component("secret").secret(),
-        ParameterSpec::component("session_token").secret(),
-        ParameterSpec::component("auth")
-            .description("Configures the authentication method for S3. Supported methods are: iam_role, key.")
-            .default("iam_role")
-            .one_of(&["iam_role", "key"])
-            .secret(),
-        ParameterSpec::runtime("client_timeout")
-            .description("The timeout setting for S3 client."),
-        ParameterSpec::runtime("allow_http")
-            .description("Allow HTTP protocol for S3 endpoint."),
-    ]
-});
-
 pub(super) async fn build_object_store(
     rt: &Runtime,
     state_location: &str,
@@ -412,93 +365,17 @@ pub async fn build_object_store_internal(
     state_location: &str,
     config: &SchedulerConfig,
 ) -> Result<(Arc<dyn ObjectStore>, String)> {
-    let url = Url::parse(state_location).context(InvalidStateLocationSnafu {
-        location: state_location,
-    })?;
-
-    if url.scheme() == "file" {
-        let local_path = match url.host_str() {
-            Some(host) => {
-                let path_suffix = url.path().trim_start_matches('/');
-                if path_suffix.is_empty() {
-                    std::path::PathBuf::from(host)
-                } else {
-                    std::path::PathBuf::from(format!("{host}/{path_suffix}"))
-                }
-            }
-            None => std::path::PathBuf::from(url.path()),
-        };
-
-        std::fs::create_dir_all(&local_path).map_err(|e| Error::LocalFileSystemInit {
-            location: local_path.display().to_string(),
-            source: Box::new(e),
-        })?;
-
-        let store: Arc<dyn ObjectStore> = Arc::new(
-            object_store_occ::LocalConditionalPut::new(&local_path).map_err(|e| {
-                Error::LocalFileSystemInit {
-                    location: local_path.display().to_string(),
-                    source: Box::new(e),
-                }
-            })?,
-        );
-
-        return Ok((store, String::new()));
-    }
-
-    let base_prefix = url.path().trim_matches('/').to_string();
-
-    let store: Arc<dyn ObjectStore> = if url.scheme() == "s3" {
-        let params = config
-            .params
-            .as_ref()
-            .map(spicepod::param::Params::as_string_map);
-        let s3_params = build_s3_parameters(secrets, params.as_ref()).await;
-
-        S3ObjectStoreBuilder::from_url(&url, io_runtime)
-            .context(S3ObjectStoreInitSnafu {
-                location: url.to_string(),
-            })?
-            .with_secret_params(&s3_params.to_secret_map())
-            .context(S3ObjectStoreInitSnafu {
-                location: url.to_string(),
-            })?
-            .build()
-            .await
-            .context(S3ObjectStoreInitSnafu {
-                location: url.to_string(),
-            })?
-    } else {
-        SpiceObjectStoreRegistry::new(io_runtime)
-            .get_store(&url)
-            .context(ObjectStoreInitSnafu {
-                location: url.to_string(),
-            })?
-    };
-
-    Ok((store, base_prefix))
-}
-
-async fn build_s3_parameters(
-    secrets: Arc<RwLock<Secrets>>,
-    params: Option<&HashMap<String, String>>,
-) -> Parameters {
-    let default_params = || Parameters::new(vec![], "s3", &S3_PARAMETERS);
-    match params {
-        Some(p) => {
-            let secret_params = get_params_with_secrets(Arc::clone(&secrets), p).await;
-            Parameters::try_new(
-                "scheduler",
-                secret_params.into_iter().collect(),
-                "s3",
-                secrets,
-                &S3_PARAMETERS,
-            )
-            .await
-            .unwrap_or_else(|_| default_params())
-        }
-        None => default_params(),
-    }
+    crate::object_store_state::build_object_store(
+        secrets,
+        io_runtime,
+        state_location,
+        config.params.as_ref(),
+        "scheduler state",
+    )
+    .await
+    .map_err(|source| Error::ObjectStoreState {
+        source: Box::new(source),
+    })
 }
 
 fn now_ms() -> Result<u64> {

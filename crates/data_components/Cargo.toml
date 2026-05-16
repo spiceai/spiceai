@@ -16,6 +16,7 @@ arrow.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-flight.workspace = true
+arrow-row.workspace = true
 arrow_tools = { path = "../arrow_tools" }
 async-stream.workspace = true
 async-trait.workspace = true
@@ -72,6 +73,7 @@ imap = { workspace = true, optional = true }
 indexmap.workspace = true
 logos.workspace = true
 mysql_async = { workspace = true, optional = true }
+mongodb = { workspace = true, optional = true }
 mailparse = { workspace = true, optional = true }
 num_cpus = "1.16"
 object_store = { workspace = true }
@@ -152,7 +154,7 @@ dynamodb = [
 flightsql = []
 imap = ["dep:charset", "dep:imap", "dep:mailparse"]
 kafka = ["dep:rdkafka"]
-mongodb = ["datafusion-table-providers/mongodb"]
+mongodb = ["dep:mongodb", "datafusion-table-providers/mongodb"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
 mysql = [
     "dep:mysql_async",
@@ -212,3 +214,8 @@ required-features = ["bench"]
 [[bench]]
 harness = false
 name = "object_filter"
+
+[[bench]]
+harness = false
+name = "mongodb_change_stream"
+required-features = ["mongodb"]

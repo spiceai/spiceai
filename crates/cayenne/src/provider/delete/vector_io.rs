@@ -174,7 +174,47 @@ impl<'a> DeletionVectorWriter<'a> {
             }
 
             let deletion_dir = self.table_snapshot_deletion_dir();
-            tokio::fs::create_dir_all(&deletion_dir).await?;
+            let snapshot_dir = deletion_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| Error::Internal {
+                    table: self.table.path.clone(),
+                    message: format!(
+                        "Deletion vector directory '{}' has no snapshot parent",
+                        deletion_dir.display()
+                    ),
+                })?;
+
+            // Ensure the deletions/ subdirectory exists.
+            // If we just created it, sync its parent (the snapshot directory)
+            // so the subdir entry is durable on local FS.
+            //
+            // This is required for the same contract we now enforce for
+            // snapshot directories themselves (ensure_snapshot_dir_exists)
+            // and for the _partitioned_wal/ coordination directory:
+            // on POSIX, mkdir in a directory updates the parent's metadata.
+            // A crash immediately after this create_dir_all but before the
+            // subsequent file write + file fsync + catalog record could
+            // otherwise leave a catalog entry pointing at a deletions/
+            // directory whose creation was lost.
+            //
+            // The sync is one-time per snapshot (first deletion vector
+            // written to it). Subsequent deletions reuse the directory.
+            let sync_snapshot_parent = match tokio::fs::create_dir(&deletion_dir).await {
+                Ok(()) => true,
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    tokio::fs::create_dir_all(&deletion_dir).await?;
+                    true
+                }
+                Err(source) => return Err(Error::IoError { source }),
+            };
+            if sync_snapshot_parent {
+                let table = self.table.path.clone();
+                tokio::task::spawn_blocking(move || std::fs::File::open(&snapshot_dir)?.sync_all())
+                    .await
+                    .map_err(|source| Error::TaskPanicked { table, source })??;
+            }
 
             let file_path = Self::deletion_file_path(&deletion_dir);
 
@@ -473,6 +513,17 @@ async fn write_deletion_file(
         let mut writer = FileWriter::try_new(file, &schema)?;
         writer.write(&batch)?;
         writer.finish()?;
+
+        // Ensure the deletion vector file content is durable before we record
+        // a pointer to it in the catalog. A crash without this sync could leave
+        // a zero-length or partial .arrow file while the catalog transaction
+        // that references it has committed (or is about to). On recovery,
+        // readers would then hit a missing/corrupt deletion vector for a
+        // "committed" delete — either erroring or (worse) returning deleted rows.
+        // This is the exact durability requirement we enforce for data files
+        // and WAL markers in the append path.
+        let f = std::fs::OpenOptions::new().write(true).open(&output_path)?;
+        f.sync_all()?;
 
         let metadata = std::fs::metadata(&output_path)?;
 

@@ -59,7 +59,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
+        uses: spiceai/spiceio/.github/actions/setup@e31c63cbe88a6e284fc187875261106a05034775 # v0.5.4
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -85,7 +85,7 @@ jobs:
       - name: Run cargo check
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-        run: cargo check --all-targets --features adbc,aws-secrets-manager,keyring-secret-store,models,release,mcp,snapshots --workspace --exclude libnfs --locked
+        run: cargo check --all-targets --features adbc,aws-secrets-manager,keyring-secret-store,models,release,mcp,snapshots,rate-control --workspace --exclude libnfs --locked
 
       - name: Validate datafusion-table-providers commit
         run: bash .github/scripts/validate_table_providers_commit.sh
@@ -127,7 +127,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
+        uses: spiceai/spiceio/.github/actions/setup@e31c63cbe88a6e284fc187875261106a05034775 # v0.5.4
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}

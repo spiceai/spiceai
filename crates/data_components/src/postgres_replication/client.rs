@@ -134,6 +134,7 @@ fn wal_stream(
         let mut first_emitted = !mark_ready_on_first;
         let mut client_slot: Option<ReplicationClient> = initial_client;
         let mut backoff = super::resilience::Backoff::default_for_stream();
+        let mut last_emitted_commit_lsn = confirmed_flush.load(Ordering::Relaxed);
 
         // Outer reconnect loop: runs until we hit a fatal error or the stream
         // reaches a natural end (rare — Postgres replication slots are
@@ -225,35 +226,24 @@ fn wal_stream(
                                     "schema mismatch for {dataset_name}: {e}"
                                 )))?;
                             }
+                            decoder.apply_declared_primary_keys(rel.relation_id, &primary_keys);
                         }
                         DecodedMessage::Insert { relation_id, tuple } => {
-                            let rel = resolve_relation_with_declared_pks(
-                                &decoder,
-                                relation_id,
-                                &primary_keys,
-                            )?;
+                            let rel = resolve_relation(&decoder, relation_id)?;
                             txn.get_or_insert_with(|| TransactionBuffer::new(0))
-                                .push_insert(&rel, tuple);
+                                .push_insert(rel, tuple);
                             metrics.inc_insert();
                         }
                         DecodedMessage::Update { relation_id, new, .. } => {
-                            let rel = resolve_relation_with_declared_pks(
-                                &decoder,
-                                relation_id,
-                                &primary_keys,
-                            )?;
+                            let rel = resolve_relation(&decoder, relation_id)?;
                             txn.get_or_insert_with(|| TransactionBuffer::new(0))
-                                .push_update(&rel, new);
+                                .push_update(rel, new);
                             metrics.inc_update();
                         }
                         DecodedMessage::Delete { relation_id, old } => {
-                            let rel = resolve_relation_with_declared_pks(
-                                &decoder,
-                                relation_id,
-                                &primary_keys,
-                            )?;
+                            let rel = resolve_relation(&decoder, relation_id)?;
                             txn.get_or_insert_with(|| TransactionBuffer::new(0))
-                                .push_delete(&rel, old);
+                                .push_delete(rel, old);
                             metrics.inc_delete();
                         }
                         DecodedMessage::Truncate { relation_ids } => {
@@ -281,11 +271,7 @@ fn wal_stream(
                                     unreachable!();
                                 }
                             };
-                            let rel = match resolve_relation_with_declared_pks(
-                                &decoder,
-                                relation_id,
-                                &primary_keys,
-                            ) {
+                            let rel = match resolve_relation(&decoder, relation_id) {
                                 Ok(r) => r,
                                 Err(e) => {
                                     Err(StreamError::External(format!(
@@ -296,7 +282,7 @@ fn wal_stream(
                                 }
                             };
                             txn.get_or_insert_with(|| TransactionBuffer::new(0))
-                                .push_truncate(&rel);
+                                .push_truncate(rel);
                             tracing::info!(
                                 dataset = %dataset_name,
                                 relation_id,
@@ -354,6 +340,7 @@ fn wal_stream(
                             end_lsn.0,
                             is_ready,
                         );
+                        last_emitted_commit_lsn = end_lsn.0;
                         yield envelope;
                     } else {
                         // Empty transaction — still advance the LSN.
@@ -366,17 +353,23 @@ fn wal_stream(
                     metrics.set_confirmed_flush_lsn(applied);
                     client.update_applied_lsn(Lsn(applied));
                 }
-                ReplicationEvent::KeepAlive { wal_end, reply_requested, .. } => {
+                ReplicationEvent::KeepAlive { wal_end, reply_requested: _, .. } => {
                     metrics.set_server_wal_end(wal_end.0);
-                    if reply_requested {
-                        // CRITICAL: only acknowledge the LSN we have actually
-                        // applied — NOT the server's current wal_end. ACKing
-                        // beyond what's been persisted to the accelerator would
-                        // let Postgres recycle WAL we still need, and a restart
-                        // could skip un-applied changes.
-                        let applied = confirmed_flush.load(Ordering::Relaxed);
-                        client.update_applied_lsn(Lsn(applied));
-                    }
+                    // KeepAlive `wal_end` can advance even when this publication
+                    // emitted no table changes. If no decoded transaction is
+                    // pending, all source changes visible to this stream up to
+                    // `wal_end` are either applied or irrelevant to this dataset,
+                    // so it is safe to let Postgres recycle retained WAL through
+                    // that point. During a pending transaction, keep reporting the
+                    // last applied commit LSN so we never ACK past buffered rows.
+                    let applied = keepalive_applied_lsn(
+                        &confirmed_flush,
+                        txn.is_some(),
+                        last_emitted_commit_lsn,
+                        wal_end.0,
+                    );
+                    metrics.set_confirmed_flush_lsn(applied);
+                    client.update_applied_lsn(Lsn(applied));
                 }
                 ReplicationEvent::Message { .. } => {}
                 ReplicationEvent::StoppedAt { reached } => {
@@ -409,31 +402,35 @@ fn pg_epoch_to_system_time(pg_micros: i64) -> std::time::SystemTime {
     }
 }
 
-/// Clone the cached pgoutput `Relation` and rewrite `is_key` so that *only*
-/// the dataset's declared primary-key columns are treated as keys.
+/// Borrow the cached pgoutput `Relation`. The relation cache has already had
+/// its key flags rewritten so that *only* the dataset's declared primary-key
+/// columns are treated as keys.
 ///
 /// Why: with `REPLICA IDENTITY FULL`, Postgres flags every column as key
 /// (used to match the old tuple during DELETE/UPDATE). That would explode
 /// `ChangeBatch.primary_keys` and include types the delete path can't handle
 /// (floats, dates). The dataset config already tells us which columns are the
 /// real PK — use that.
-fn resolve_relation_with_declared_pks(
+fn resolve_relation(
     decoder: &Decoder,
     relation_id: u32,
-    declared_pks: &[String],
-) -> std::result::Result<super::pgoutput::Relation, StreamError> {
-    let mut rel = decoder
-        .relation(relation_id)
-        .ok_or_else(|| {
-            StreamError::External(format!("change event before Relation for id {relation_id}"))
-        })?
-        .clone();
-    if !declared_pks.is_empty() {
-        for col in &mut rel.columns {
-            col.is_key = declared_pks.iter().any(|pk| pk == &col.name);
-        }
+) -> std::result::Result<&super::pgoutput::Relation, StreamError> {
+    decoder.relation(relation_id).ok_or_else(|| {
+        StreamError::External(format!("change event before Relation for id {relation_id}"))
+    })
+}
+
+fn keepalive_applied_lsn(
+    confirmed_flush: &AtomicU64,
+    transaction_pending: bool,
+    last_emitted_commit_lsn: u64,
+    wal_end: u64,
+) -> u64 {
+    let applied = confirmed_flush.load(Ordering::Acquire);
+    if !transaction_pending && applied >= last_emitted_commit_lsn {
+        advance(confirmed_flush, wal_end);
     }
-    Ok(rel)
+    confirmed_flush.load(Ordering::Relaxed)
 }
 
 fn advance(flush: &AtomicU64, to: u64) {
@@ -488,4 +485,39 @@ fn validate_relation_against_schema(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keepalive_advances_filtered_lsn_when_idle() {
+        let confirmed = AtomicU64::new(100);
+
+        let applied = keepalive_applied_lsn(&confirmed, false, 100, 250);
+
+        assert_eq!(applied, 250);
+        assert_eq!(confirmed.load(Ordering::Relaxed), 250);
+    }
+
+    #[test]
+    fn keepalive_does_not_advance_past_uncommitted_emitted_envelope() {
+        let confirmed = AtomicU64::new(100);
+
+        let applied = keepalive_applied_lsn(&confirmed, false, 200, 250);
+
+        assert_eq!(applied, 100);
+        assert_eq!(confirmed.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn keepalive_does_not_advance_past_pending_transaction() {
+        let confirmed = AtomicU64::new(100);
+
+        let applied = keepalive_applied_lsn(&confirmed, true, 100, 250);
+
+        assert_eq!(applied, 100);
+        assert_eq!(confirmed.load(Ordering::Relaxed), 100);
+    }
 }

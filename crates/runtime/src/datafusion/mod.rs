@@ -2412,15 +2412,15 @@ impl DataFusion {
             }
         }
 
-        // For append mode without time_column, check if source provides append_stream
-        // Skip this check for Cayenne which has its own validation (supports primary_key or time_column)
-        if refresh_mode == RefreshMode::Append
-            && dataset.time_column.is_none()
-            && acceleration_settings.engine != Engine::Cayenne
-        {
+        // For append mode without time_column, attach the source's append_stream
+        // when available (e.g. Kafka). This enables streaming append into any
+        // accelerator engine, including Cayenne. When the source does not
+        // provide an append_stream, Cayenne falls back to its own validation
+        // (supports primary_key); other engines require time_column.
+        if refresh_mode == RefreshMode::Append && dataset.time_column.is_none() {
             if let Some(append_stream) = source.append_stream(source_table_provider) {
                 accelerated_table_builder.append_stream(append_stream);
-            } else {
+            } else if acceleration_settings.engine != Engine::Cayenne {
                 return Err(Error::AppendRequiresTimeColumn {
                     from: dataset.from.clone(),
                 });
@@ -2921,7 +2921,7 @@ impl DataFusion {
 
         let federated_table_provider = federated_read_table.table_provider().await;
 
-        let source_table_provider = match dataset.access() {
+        let source_table_provider: Arc<dyn TableProvider> = match dataset.access() {
             AccessMode::Read => federated_table_provider,
             AccessMode::ReadWrite | AccessMode::ReadWriteCreate => source
                 .read_write_provider(dataset)
@@ -3805,9 +3805,17 @@ async fn wait_until_dependent_tables_are_ready(
             .into_iter()
             .map(|(key, value)| (resolve_table_reference(key), value))
             .collect::<std::collections::HashMap<_, _>>();
+        let catalog_statuses = runtime_status.get_catalog_statuses();
 
         if let Some(not_ready_table) = dependent_tables.iter().find(|dependent_table| {
-            statuses.get(dependent_table) != Some(&status::ComponentStatus::Ready)
+            if let Some(s) = statuses.get(dependent_table) {
+                s != &status::ComponentStatus::Ready
+            } else {
+                // Table not tracked as a dataset or view (e.g. a catalog table).
+                // Consider it ready if its catalog is registered and ready.
+                let catalog = dependent_table.catalog.as_ref();
+                catalog_statuses.get(catalog) != Some(&status::ComponentStatus::Ready)
+            }
         }) {
             tracing::debug!(
                 "Dependent table {not_ready_table} is not ready for {table}. Retrying..."
@@ -3829,6 +3837,14 @@ async fn build_snapshot_creation_config(
         Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>,
     >,
 ) -> Result<Option<SnapshotCreationConfig>> {
+    // `refresh_mode: snapshot` is a read-only snapshot consumer. Even when the
+    // dataset uses `acceleration.snapshots: enabled` (which normally enables
+    // both bootstrap and creation), snapshot refresh mode must not publish new
+    // snapshots or run the refresh-complete snapshot creation path.
+    if matches!(refresh_mode, RefreshMode::Snapshot) {
+        return Ok(None);
+    }
+
     let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
         || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
     let snapshot_trigger = &acceleration_settings.snapshots_trigger;
@@ -4329,6 +4345,64 @@ mod tests {
             .await;
 
             assert!(result.expect("config should exist").is_none());
+        }
+
+        #[tokio::test]
+        async fn test_snapshot_refresh_mode_is_reader_only() {
+            let dataset = create_test_dataset(None).await;
+            let acceleration = create_acceleration_with_trigger(
+                Some("file:///tmp".to_string()),
+                Engine::DuckDB,
+                Some(SnapshotsTrigger::RefreshComplete),
+                None,
+                &dataset.runtime().secrets(),
+            );
+            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let snapshot_path = temp_dir.path().join("snapshot.db");
+
+            let result = build_snapshot_creation_config(
+                &dataset,
+                &acceleration,
+                RefreshMode::Snapshot,
+                AccelerationLayout::file(snapshot_path),
+                None,
+            )
+            .await;
+
+            assert!(
+                result.expect("snapshot reader should not error").is_none(),
+                "refresh_mode: snapshot must not create a snapshot creation config"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_snapshot_refresh_mode_ignores_create_trigger_validation() {
+            let dataset = create_test_dataset(None).await;
+            let acceleration = create_acceleration_with_trigger(
+                Some("file:///tmp".to_string()),
+                Engine::DuckDB,
+                Some(SnapshotsTrigger::StreamBatches),
+                Some("not-a-valid-batch-count".to_string()),
+                &dataset.runtime().secrets(),
+            );
+            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let snapshot_path = temp_dir.path().join("snapshot.db");
+
+            let result = build_snapshot_creation_config(
+                &dataset,
+                &acceleration,
+                RefreshMode::Snapshot,
+                AccelerationLayout::file(snapshot_path),
+                None,
+            )
+            .await;
+
+            assert!(
+                result
+                    .expect("snapshot reader should ignore creation trigger config")
+                    .is_none(),
+                "refresh_mode: snapshot should ignore snapshot creation trigger settings"
+            );
         }
 
         #[tokio::test]

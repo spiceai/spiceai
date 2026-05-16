@@ -1,0 +1,11 @@
+---
+source: crates/cayenne/src/optimizer_rules.rs
+expression: plan_snapshot(optimized)
+---
+HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=ExactLeftAccumulator, on=[(top_id@0, nested_left_id@0)]
+  DataSourceExec: partitions=1, partition_sizes=[0]
+  HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=ExactLeftAccumulator, on=[(nested_left_id@0, nested_right_id@0)]
+    CayenneAccelerationExec
+      DataSourceExec: partitions=1, partition_sizes=[0]
+    CayenneAccelerationExec
+      DataSourceExec: partitions=1, partition_sizes=[0]

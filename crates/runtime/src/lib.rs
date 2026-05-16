@@ -40,11 +40,12 @@ use worker::WorkerRegistry;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::datafusion::DataFusion;
 use crate::datafusion::error::format_datafusion_error;
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::model::LLMResponsesModelStore;
 use crate::{auth::EndpointAuth, dataconnector::DataConnector};
 
 use ::datafusion::error::DataFusionError;
-use ::datafusion::sql::{TableReference, sqlparser};
+use ::datafusion::sql::{ResolvedTableReference, TableReference, sqlparser};
 use app::App;
 use datafusion_proto::bytes::Serializeable;
 
@@ -60,6 +61,7 @@ use futures::{
     Stream, TryFutureExt,
     future::{join_all, try_join_all},
 };
+use governor::RateLimiter;
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
 use llms::rerank::RerankerModelStore;
@@ -113,6 +115,7 @@ mod metrics;
 pub mod metrics_reader;
 mod metrics_server;
 pub mod model;
+mod object_store_state;
 mod opentelemetry;
 pub mod otel_push_exporter;
 pub mod resource_monitor;
@@ -139,7 +142,8 @@ mod udtfs;
 mod view;
 mod worker;
 
-pub type PartitionAssignments = HashMap<TableReference, Vec<::datafusion::logical_expr::Expr>>;
+pub type PartitionAssignments =
+    HashMap<ResolvedTableReference, Vec<::datafusion::logical_expr::Expr>>;
 pub type SharedPartitionAssignments = Arc<RwLock<PartitionAssignments>>;
 
 #[derive(Debug, Snafu)]
@@ -720,7 +724,8 @@ impl Runtime {
 
             // Handle removed partitions
             for (table_name, partitions) in &removed_partitions {
-                let table_ref = TableReference::parse_str(table_name);
+                let table_ref = TableReference::parse_str(table_name)
+                    .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
                 if let Some(current_partitions) = guard.get_mut(&table_ref) {
                     for partition_bytes in partitions {
                         if let Ok(partition_expr) =
@@ -738,7 +743,8 @@ impl Runtime {
 
             // Handle new partitions
             for (table_name, partitions) in &new_partitions {
-                let table_ref = TableReference::parse_str(table_name);
+                let table_ref = TableReference::parse_str(table_name)
+                    .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
                 let current_partitions = guard.entry(table_ref.clone()).or_default();
                 for partition_bytes in partitions {
                     if let Ok(partition_expr) = ::datafusion_expr::Expr::from_bytes_with_registry(
@@ -771,10 +777,11 @@ impl Runtime {
 
             // Update all affected tables
             for table_name in affected_tables {
-                let table_ref = TableReference::parse_str(table_name);
+                let resolved = TableReference::parse_str(table_name)
+                    .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
 
                 if let Err(e) = self
-                    .update_partition_refresh_sql(table_ref.clone(), &assignments)
+                    .update_partition_refresh_sql(resolved.clone(), &assignments)
                     .await
                 {
                     tracing::warn!("Failed to update partition refresh SQL for {table_name}: {e}");
@@ -789,22 +796,27 @@ impl Runtime {
 
     pub(crate) async fn update_partition_refresh_sql(
         &self,
-        table: TableReference,
+        table: ResolvedTableReference,
         assignments: &PartitionAssignments,
     ) -> Result<()> {
         let partition_filters =
             crate::cluster::partition::get_partition_filter_exprs(&table, assignments);
 
+        let table_ref = TableReference::full(
+            Arc::<str>::clone(&table.catalog),
+            Arc::<str>::clone(&table.schema),
+            Arc::<str>::clone(&table.table),
+        );
         if let Err(e) = self
             .datafusion()
-            .update_partition_filters(table.clone(), partition_filters)
+            .update_partition_filters(table_ref.clone(), partition_filters)
             .await
         {
             tracing::error!("Failed to update partition filters for {table}: {e}");
         } else {
             tracing::info!("Updated partition assignments for {table}");
             // Trigger a refresh to load the data for the new partitions
-            if let Err(e) = self.datafusion().refresh_table(&table, None).await {
+            if let Err(e) = self.datafusion().refresh_table(&table_ref, None).await {
                 tracing::warn!(
                     "Failed to trigger refresh for {table} after updating partitions: {e}"
                 );
@@ -1029,7 +1041,7 @@ impl Runtime {
                         metrics_server::cluster::ClusterMetricsCollector::new(
                             Arc::clone(peers),
                             Arc::clone(executor_registry),
-                            self.df.cluster_config.client_tls_config().cloned(),
+                            self.df.cluster_config.client_tls_config(),
                             self.df.cluster_config.node_id(),
                             local_metrics_collector,
                         ),
@@ -1148,6 +1160,7 @@ impl Runtime {
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
         let auth = endpoint_auth.http_auth.clone();
+        let identity_source = endpoint_auth.identity_source;
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 
@@ -1161,6 +1174,7 @@ impl Runtime {
                     cloned_config.into(),
                     cloned_tls_config,
                     auth,
+                    identity_source,
                     Some(http_shutdown),
                 )
                 .map_err(Error::from),
@@ -1171,6 +1185,8 @@ impl Runtime {
         let metrics_endpoint = self.metrics_endpoint;
         let prometheus_registry = self.prometheus_registry.clone();
         let cloned_tls_config = tls_config.clone();
+        let metrics_rate_limiter =
+            Arc::new(RateLimiter::direct(self.rate_limits.metrics_endpoint_limit));
 
         let metrics_future = self
             .start_runtime_task(METRICS_SERVER, None, async move {
@@ -1179,6 +1195,7 @@ impl Runtime {
                     prometheus_registry,
                     cloned_tls_config,
                     cluster_collector,
+                    Some(metrics_rate_limiter),
                 )
                 .await
                 .context(UnableToStartMetricsServerSnafu)

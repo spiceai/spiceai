@@ -16,6 +16,7 @@ aws-config.workspace = true
 aws-credential-types.workspace = true
 aws-sdk-dynamodb.workspace = true
 bollard = "0.18.1"
+chbench-driver = { path = "../chbench-driver" }
 clap.workspace = true
 duckdb = { workspace = true, features = ["bundled"] }
 futures.workspace = true
@@ -28,10 +29,13 @@ serde_json.workspace = true
 yaml = { path = "../../crates/yaml" }
 spiceai.workspace = true
 spicepod = { path = "../../crates/spicepod" }
+system-adapter-protocol.workspace = true
 test-framework = { path = "../../crates/test-framework" }
 rand.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+url.workspace = true
+uuid.workspace = true
 
 [features]
 default = ["append"]

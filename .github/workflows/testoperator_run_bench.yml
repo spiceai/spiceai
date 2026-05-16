@@ -22,6 +22,7 @@ on:
           - 'tpch[parameterized]'
           - 'tpcds'
           - 'clickbench'
+          - 'chbench'
           - 'scenario'
       scenario_query_file:
         description: 'Path to scenario query file (required when query_set is scenario)'
@@ -63,6 +64,7 @@ on:
           - 'ducklake-catalog'
           - 'turso'
           - 'bigquery'
+          - 'scylladb'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
@@ -226,6 +228,10 @@ jobs:
         with:
           pg-db: ducklake_catalog
 
+      - name: Setup CH-benCH PostgreSQL
+        if: ${{ github.event.inputs.query_set == 'chbench' }}
+        uses: ./.github/actions/setup-chbench-postgres
+
       - name: Start local MinIO for DuckLake
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
         run: |
@@ -252,7 +258,7 @@ jobs:
       - name: Bootstrap DuckLake TPCH SF1 catalog
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
         run: |
-          python -m pip install --upgrade 'duckdb==1.4.4' minio
+          python -m pip install --upgrade duckdb minio
 
           python <<'PY'
           import duckdb

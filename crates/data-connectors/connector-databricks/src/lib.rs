@@ -48,12 +48,13 @@ use runtime::component::dataset::Dataset;
 use runtime::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
+    DataConnectorResult, NewDataConnectorResult, http_rate_control,
 };
 use runtime::parameters::{ParameterSpec, Parameters};
 use runtime::token_providers::databricks::{
     AuthCredentials, DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
 };
+use runtime_rate_control::RateController;
 use runtime_secrets::get_params_with_secrets;
 use secrecy::ExposeSecret;
 use secrecy::SecretString;
@@ -67,6 +68,7 @@ use token_provider::registry::TokenProviderRegistry;
 use token_provider::{StaticTokenProvider, TokenProvider};
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
+use url::Url;
 
 // ============================================================================
 // Data Connector Error Types
@@ -143,7 +145,7 @@ pub const PARAMETERS: &[ParameterSpec] = &[
 
     // Connection / resilience tuning (sql_warehouse mode)
     ParameterSpec::runtime("max_concurrent_requests")
-        .description("Maximum number of concurrent HTTP requests to the SQL Warehouse API.")
+        .description("Maximum number of concurrent HTTP requests to the Databricks endpoint. Also controls the SQL Warehouse API request semaphore in sql_warehouse mode.")
         .default("8"),
     ParameterSpec::runtime("http_max_retries")
         .description("Maximum number of HTTP-level retries for transient failures (429, 5xx).")
@@ -158,6 +160,14 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("disable_on_permanent_error")
         .description("When true, non-retryable errors (401, 403, 404) permanently disable the connector to prevent a thundering herd of failed requests.")
         .default("true"),
+    ParameterSpec::runtime("requests_per_second_limit")
+        .description("Maximum number of HTTP requests per second to the Databricks endpoint. Overrides runtime.params.http_requests_per_second_limit when set."),
+    ParameterSpec::runtime("requests_per_minute_limit")
+        .description("Maximum number of HTTP requests per minute to the Databricks endpoint. Overrides runtime.params.http_requests_per_minute_limit when set."),
+    ParameterSpec::runtime("rate_control_jitter_min")
+        .description("Minimum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_min when set. Accepts durations such as '5ms' or '0ms'. Defaults to 5ms when a request-rate limit is configured, otherwise 0ms."),
+    ParameterSpec::runtime("rate_control_jitter_max")
+        .description("Maximum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms."),
 
     ParameterSpec::component("token")
         .secret()
@@ -264,6 +274,7 @@ impl Databricks {
         io_runtime: Handle,
         token_provider_registry: Arc<TokenProviderRegistry>,
         shared_semaphore: Option<Arc<Semaphore>>,
+        rate_controller: Option<Arc<RateController>>,
     ) -> Result<Self> {
         let mode = params.get("mode").expose().ok().unwrap_or_default();
         let endpoint = params
@@ -288,10 +299,11 @@ impl Databricks {
                     Self::get_token_provider(endpoint, auth_credentials, token_provider_registry)
                         .await?;
 
-                let uc_client = match UnityCatalogClient::new(
+                let uc_client = match UnityCatalogClient::new_with_rate_controller(
                     Endpoint(endpoint.to_string()),
                     Some(Arc::clone(&token_provider)),
                     shared_semaphore.clone(),
+                    rate_controller.clone(),
                 ) {
                     Ok(client) => Some(Arc::new(client)),
                     Err(error) => {
@@ -319,15 +331,17 @@ impl Databricks {
                         Arc::new(data_components::schema_discovery::NoPermissionsCheck)
                     };
 
-                let read_provider = DatabricksSqlWarehouse::with_config_semaphore_and_permissions(
-                    endpoint,
-                    sql_warehouse_id,
-                    token_provider,
-                    sql_warehouse_config,
-                    shared_semaphore,
-                    permissions,
-                )
-                .context(UnableToConstructDatabricksSqlWarehouseSnafu)?;
+                let read_provider =
+                    DatabricksSqlWarehouse::with_config_semaphore_permissions_and_rate_controller(
+                        endpoint,
+                        sql_warehouse_id,
+                        token_provider,
+                        sql_warehouse_config,
+                        shared_semaphore,
+                        permissions,
+                        rate_controller,
+                    )
+                    .context(UnableToConstructDatabricksSqlWarehouseSnafu)?;
                 let metrics = Some(Arc::clone(read_provider.metrics()));
 
                 Ok(Self {
@@ -361,10 +375,11 @@ impl Databricks {
                     }
                 };
 
-                let uc_client = match UnityCatalogClient::new(
+                let uc_client = match UnityCatalogClient::new_with_rate_controller(
                     Endpoint(endpoint.to_string()),
                     Some(Arc::clone(&token_provider)),
                     None,
+                    rate_controller.clone(),
                 ) {
                     Ok(client) => Some(Arc::new(client)),
                     Err(error) => {
@@ -415,6 +430,7 @@ impl Databricks {
                     token_provider_registry,
                     cluster_id,
                     databricks_use_ssl,
+                    rate_controller,
                 )
                 .await
             }
@@ -506,14 +522,16 @@ impl Databricks {
         token_provider_registry: Arc<TokenProviderRegistry>,
         cluster_id: &SecretString,
         databricks_use_ssl: bool,
+        rate_controller: Option<Arc<RateController>>,
     ) -> Result<Self> {
         let read_provider = match auth_credentials {
             AuthCredentials::Token(token) => Arc::new(
-                DatabricksSparkConnect::new(
+                DatabricksSparkConnect::new_with_rate_controller(
                     endpoint.to_string(),
                     cluster_id.expose_secret().to_string(),
                     token.expose_secret().to_string(),
                     databricks_use_ssl,
+                    rate_controller.clone(),
                 )
                 .await
                 .context(UnableToConstructDatabricksSparkSnafu)?,
@@ -529,11 +547,12 @@ impl Databricks {
                 .await?;
 
                 Arc::new(
-                    DatabricksSparkConnect::from_token_provider(
+                    DatabricksSparkConnect::from_token_provider_with_rate_controller(
                         endpoint.to_string(),
                         cluster_id.expose_secret().to_string(),
                         databricks_use_ssl,
                         token_provider,
+                        rate_controller.clone(),
                     )
                     .await
                     .context(UnableToConstructDatabricksSparkSnafu)?,
@@ -546,11 +565,12 @@ impl Databricks {
                         .await?;
 
                 Arc::new(
-                    DatabricksSparkConnect::from_token_provider(
+                    DatabricksSparkConnect::from_token_provider_with_rate_controller(
                         endpoint.to_string(),
                         cluster_id.expose_secret().to_string(),
                         databricks_use_ssl,
                         token_provider,
+                        rate_controller.clone(),
                     )
                     .await
                     .context(UnableToConstructDatabricksSparkSnafu)?,
@@ -739,6 +759,106 @@ impl Databricks {
     }
 }
 
+fn databricks_rate_control_url(endpoint: &str) -> Result<Url> {
+    let endpoint = endpoint.trim_end_matches('/');
+    let endpoint_url = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("https://{endpoint}")
+    };
+
+    Url::parse(&endpoint_url).map_err(|source| Error::InvalidConfiguration {
+        message: format!("Invalid Databricks endpoint '{endpoint}': {source}"),
+    })
+}
+
+async fn reserve_databricks_rate_controller<S: std::hash::BuildHasher>(
+    params: &Parameters,
+    runtime_rate_control_params: Option<&HashMap<String, String, S>>,
+    rate_control_registry: Arc<http_rate_control::HttpRateControlRegistry>,
+    component: &ConnectorComponent,
+) -> DataConnectorResult<Option<http_rate_control::SharedRateControllerReservation>> {
+    let ConnectorComponent::Dataset(dataset) = component else {
+        return Ok(None);
+    };
+
+    let endpoint = params.get("endpoint").expose().ok_or_else(|p| {
+        DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: CONNECTOR_NAME.to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: format!("A required parameter was missing: {}", p.0),
+        }
+    })?;
+    let base_url = databricks_rate_control_url(endpoint).map_err(|source| {
+        DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: CONNECTOR_NAME.to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: source.to_string(),
+        }
+    })?;
+    let rate_control = http_rate_control::resolve_config(
+        params,
+        runtime_rate_control_params,
+        dataset,
+        CONNECTOR_NAME,
+    )?;
+
+    Arc::clone(&rate_control_registry)
+        .reserve_shared_rate_controller(&base_url, &rate_control, dataset, CONNECTOR_NAME)
+        .await
+        .map(Some)
+}
+
+async fn shared_databricks_catalog_rate_controller(
+    params: &Parameters,
+    runtime: &Arc<Runtime>,
+    catalog: &Catalog,
+) -> CatalogResult<Option<Arc<RateController>>> {
+    let endpoint = params.get("endpoint").expose().ok_or_else(|p| {
+        CatalogError::InvalidConfigurationNoSource {
+            connector: CONNECTOR_NAME.to_string(),
+            connector_component: ConnectorComponent::from(catalog),
+            message: format!("A required parameter was missing: {}", p.0),
+        }
+    })?;
+    let base_url = databricks_rate_control_url(endpoint).map_err(|source| {
+        CatalogError::InvalidConfigurationNoSource {
+            connector: CONNECTOR_NAME.to_string(),
+            connector_component: ConnectorComponent::from(catalog),
+            message: source.to_string(),
+        }
+    })?;
+    let connector_component = ConnectorComponent::from(catalog);
+    let rate_control = http_rate_control::resolve_config_for_component(
+        params,
+        Some(&catalog.app.runtime.params),
+        &connector_component,
+        CONNECTOR_NAME,
+    )
+    .map_err(|source| CatalogError::UnableToGetCatalogProvider {
+        connector: CONNECTOR_NAME.to_string(),
+        connector_component: ConnectorComponent::from(catalog),
+        source: source.into(),
+    })?;
+
+    runtime
+        .http_rate_control_registry()
+        .shared_rate_controller_for_component(
+            &base_url,
+            &rate_control,
+            catalog.app.name.as_str(),
+            &connector_component,
+            CONNECTOR_NAME,
+        )
+        .await
+        .map(|shared| shared.controller)
+        .map_err(|source| CatalogError::UnableToGetCatalogProvider {
+            connector: CONNECTOR_NAME.to_string(),
+            connector_component: ConnectorComponent::from(catalog),
+            source: source.into(),
+        })
+}
+
 // ============================================================================
 // Data Connector Factory
 // ============================================================================
@@ -817,14 +937,42 @@ impl DataConnectorFactory for DatabricksFactory {
                     None
                 };
 
-                let databricks = Databricks::new(
+                let runtime_rate_control_params =
+                    params.app.as_ref().map(|app| app.runtime.params.clone());
+                let rate_control_reservation = reserve_databricks_rate_controller(
+                    &params.parameters,
+                    runtime_rate_control_params.as_ref(),
+                    runtime.http_rate_control_registry(),
+                    &params.component,
+                )
+                .await?;
+                let rate_controller = rate_control_reservation
+                    .as_ref()
+                    .and_then(|reservation| reservation.shared().controller.clone());
+
+                let databricks_result = Databricks::new(
                     params.parameters,
                     params.io_runtime,
                     runtime.token_provider_registry(),
                     shared_semaphore,
+                    rate_controller,
                 )
-                .await?;
-                Ok(Arc::new(databricks) as Arc<dyn DataConnector>)
+                .await;
+
+                match databricks_result {
+                    Ok(databricks) => {
+                        if let Some(reservation) = rate_control_reservation {
+                            reservation.commit().await;
+                        }
+                        Ok(Arc::new(databricks) as Arc<dyn DataConnector>)
+                    }
+                    Err(error) => {
+                        if let Some(reservation) = rate_control_reservation {
+                            reservation.rollback().await;
+                        }
+                        Err(error.into())
+                    }
+                }
             })
         } else {
             Box::pin(async move {
@@ -1247,6 +1395,17 @@ pub const CATALOG_PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("sql_warehouse_id")
         .secret()
         .description("The SQL Warehouse ID to use when 'mode' is set to 'sql_warehouse'"),
+    ParameterSpec::runtime("max_concurrent_requests")
+        .description("Maximum number of concurrent HTTP requests to the Databricks endpoint. Also controls the SQL Warehouse API request semaphore in sql_warehouse mode.")
+        .default("8"),
+    ParameterSpec::runtime("requests_per_second_limit")
+        .description("Maximum number of HTTP requests per second to the Databricks endpoint. Overrides runtime.params.http_requests_per_second_limit when set."),
+    ParameterSpec::runtime("requests_per_minute_limit")
+        .description("Maximum number of HTTP requests per minute to the Databricks endpoint. Overrides runtime.params.http_requests_per_minute_limit when set."),
+    ParameterSpec::runtime("rate_control_jitter_min")
+        .description("Minimum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_min when set. Accepts durations such as '5ms' or '0ms'. Defaults to 5ms when a request-rate limit is configured, otherwise 0ms."),
+    ParameterSpec::runtime("rate_control_jitter_max")
+        .description("Maximum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms."),
 
     // Databricks M2M Service Principal credentials
     ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
@@ -1351,7 +1510,7 @@ impl CatalogConnector for DatabricksCatalog {
                 }
             })?;
 
-        let token_provider = match auth_credentials {
+        let token_provider: Arc<dyn TokenProvider> = match auth_credentials {
             AuthCredentials::Token(token) => Arc::new(StaticTokenProvider::new(token.clone())),
             AuthCredentials::ServicePrincipal(client_id, client_secret) => {
                 Databricks::get_m2m_token_provider(
@@ -1380,15 +1539,6 @@ impl CatalogConnector for DatabricksCatalog {
             })?,
         };
 
-        let unity_catalog =
-            UnityCatalogClient::new(Endpoint(endpoint.to_string()), Some(token_provider), None)
-                .map_err(|source| CatalogError::UnableToGetCatalogProvider {
-                    connector: "databricks".to_string(),
-                    source: Box::new(source),
-                    connector_component: ConnectorComponent::from(catalog),
-                })?;
-        let client = Arc::new(unity_catalog);
-
         // Copy the catalog params into the dataset params, and allow user to override
         let mut dataset_params: HashMap<String, SecretString> =
             get_params_with_secrets(runtime.secrets(), &catalog.params).await;
@@ -1413,6 +1563,22 @@ impl CatalogConnector for DatabricksCatalog {
             connector_component: ConnectorComponent::from(catalog),
             source,
         })?;
+
+        let rate_controller =
+            shared_databricks_catalog_rate_controller(&params, &runtime, catalog).await?;
+
+        let unity_catalog = UnityCatalogClient::new_with_rate_controller(
+            Endpoint(endpoint.to_string()),
+            Some(Arc::clone(&token_provider)),
+            None,
+            rate_controller.clone(),
+        )
+        .map_err(|source| CatalogError::UnableToGetCatalogProvider {
+            connector: "databricks".to_string(),
+            source: Box::new(source),
+            connector_component: ConnectorComponent::from(catalog),
+        })?;
+        let client = Arc::new(unity_catalog);
 
         let mode = self.params.get("mode").expose().ok();
         let (table_creator, table_reference_creator) = if mode == Some("delta_lake") {
@@ -1460,6 +1626,7 @@ impl CatalogConnector for DatabricksCatalog {
                 runtime.tokio_io_runtime(),
                 runtime.token_provider_registry(),
                 shared_semaphore,
+                rate_controller,
             )
             .await
             .map_err(|source| CatalogError::UnableToGetCatalogProvider {
@@ -1536,6 +1703,42 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         sync::Mutex,
     };
+
+    #[test]
+    fn databricks_parameters_include_http_rate_control() {
+        for parameter_name in [
+            "max_concurrent_requests",
+            "requests_per_second_limit",
+            "requests_per_minute_limit",
+            "rate_control_jitter_min",
+            "rate_control_jitter_max",
+        ] {
+            assert!(
+                PARAMETERS
+                    .iter()
+                    .any(|parameter| parameter.name == parameter_name),
+                "missing Databricks data connector parameter {parameter_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn databricks_catalog_parameters_include_http_rate_control() {
+        for parameter_name in [
+            "max_concurrent_requests",
+            "requests_per_second_limit",
+            "requests_per_minute_limit",
+            "rate_control_jitter_min",
+            "rate_control_jitter_max",
+        ] {
+            assert!(
+                CATALOG_PARAMETERS
+                    .iter()
+                    .any(|parameter| parameter.name == parameter_name),
+                "missing Databricks catalog connector parameter {parameter_name}"
+            );
+        }
+    }
 
     #[derive(Clone)]
     struct MockRead {

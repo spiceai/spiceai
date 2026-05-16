@@ -84,8 +84,9 @@ static TEST_MODEL_CREATORS: LazyLock<Vec<(&'static str, AsyncModelCreator)>> = L
                 "xai",
                 Box::new(|| {
                     Box::pin(async {
-                        create::create_xai("grok-3")
-                            .map_err(|e| anyhow::anyhow!("failed to create 'grok-3' from xAI: {e}"))
+                        create::create_xai("grok-4.3").map_err(|e| {
+                            anyhow::anyhow!("failed to create 'grok-4.3' from xAI: {e}")
+                        })
                     })
                 }),
             ),

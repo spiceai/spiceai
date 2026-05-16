@@ -20,7 +20,7 @@ mod startup;
 
 use std::collections::HashMap;
 
-use datafusion::sql::TableReference;
+use datafusion::sql::ResolvedTableReference;
 use datafusion_expr::Expr;
 use snafu::Snafu;
 
@@ -99,10 +99,15 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Multiple assigned partitions are combined with OR (union semantics), then returned
 /// as a single-element `Vec<Expr>` so that applying them via `.filter()` is correct.
 /// Returns an empty `Vec` if no partitions are assigned.
+///
+/// The caller is responsible for resolving the table reference to a
+/// `ResolvedTableReference` (e.g. against the default catalog/schema) before
+/// calling this function, so that bare, partial, and fully-qualified references
+/// all produce the same key and match correctly against the assignments map.
 #[expect(clippy::implicit_hasher)]
 pub fn get_partition_filter_exprs(
-    tbl: &TableReference,
-    assignments: &HashMap<TableReference, Vec<Expr>>,
+    tbl: &ResolvedTableReference,
+    assignments: &HashMap<ResolvedTableReference, Vec<Expr>>,
 ) -> Vec<Expr> {
     let partitions = assignments.get(tbl).cloned().unwrap_or_default();
     if partitions.is_empty() {

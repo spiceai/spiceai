@@ -484,12 +484,15 @@ impl ExecutionPlan for IndexerExec {
                     let mut b = batch;
 
                     // Verify the incoming batch fields match the advertised schema.
-                    // Uses fields-only comparison to tolerate metadata differences.
-                    if b.schema().fields() != advertised_schema.fields() {
+                    // Ignore field and schema-level metadata.
+                    if let Err(e) = arrow_tools::schema::verify_schema(
+                        advertised_schema.fields(),
+                        b.schema().fields(),
+                    ) {
                         let exp = schema_signature(advertised_schema.as_ref());
                         let got = schema_signature(b.schema().as_ref());
                         return Err(DataFusionError::Execution(format!(
-                            "Input stream produced batch with unexpected schema. \
+                            "Input stream produced batch with unexpected schema ({e}). \
                             Expected fields ({}): {} \
                             Got fields ({}): {}",
                             advertised_schema.fields().len(),
@@ -511,11 +514,14 @@ impl ExecutionPlan for IndexerExec {
                                 b = out
                                     .pop()
                                     .unwrap_or_else(|| unreachable!("length is checked"));
-                                if b.schema().fields() != schema_before.fields() {
+                                if let Err(e) = arrow_tools::schema::verify_schema(
+                                    schema_before.fields(),
+                                    b.schema().fields(),
+                                ) {
                                     let exp = schema_signature(schema_before.as_ref());
                                     let got = schema_signature(b.schema().as_ref());
                                     return Err(DataFusionError::Execution(format!(
-                                        "Index {} changed schema. \
+                                        "Index {} changed schema ({e}). \
                                         Expected fields ({}): {} \
                                         Got fields ({}): {}",
                                         idx.name(),
@@ -603,7 +609,10 @@ impl ExecutionPlan for IndexerExec {
     }
 }
 
-/// Helper for better diagnostics when schema is mismatched.
+/// Returns a human-readable summary of schema fields for use in error messages.
+/// Intentionally omits field metadata so that the output reflects only the structural
+/// shape (name, type, nullability) — this keeps error messages readable and avoids
+/// exposing internal index metadata to users.
 fn schema_signature(s: &Schema) -> String {
     use std::fmt::Write;
     let mut buf = String::new();
@@ -1127,6 +1136,67 @@ mod test {
         assert!(msg.contains("extra: Int64"));
 
         assert_eq!(1, idx_add.compute_index_calls());
+    }
+
+    /// Regression test for #10223: a field-level metadata difference (e.g. FTS attaching
+    /// metadata to indexed fields) must not trigger a false "unexpected schema" error.
+    /// Arrow's `Field` `PartialEq` includes field-level metadata, so the old `fields() != fields()`
+    /// check would fail even when names, types, and nullability are identical.
+    #[tokio::test]
+    async fn pipeline_tolerates_field_level_metadata_difference() {
+        let ctx = get_ctx();
+
+        // Index callback that rebuilds the batch with extra field-level metadata on one field,
+        // simulating what FTS does when it marks indexed columns. The column data is identical;
+        // only the metadata attached to the Field differs.
+        let idx = Arc::new(TestIndex::new(
+            vec!["id".to_string()],
+            Some(|batches| {
+                let b = batches.into_iter().next().expect("one batch");
+                // Rebuild the schema with metadata added to the first field only.
+                let new_fields: Vec<Field> = b
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        if i == 0 {
+                            let mut meta = f.metadata().clone();
+                            meta.insert("fts_index_marker".to_string(), "enabled".to_string());
+                            f.as_ref().clone().with_metadata(meta)
+                        } else {
+                            f.as_ref().clone()
+                        }
+                    })
+                    .collect();
+                let new_schema = Arc::new(Schema::new(new_fields));
+                let columns: Vec<ArrayRef> = (0..b.num_columns())
+                    .map(|i| Arc::clone(b.column(i)))
+                    .collect();
+                let out = RecordBatch::try_new(new_schema, columns)
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                Ok(vec![out])
+            }),
+        ));
+
+        let table = mem_table_from_batches(vec![one_row_batch()]);
+        let provider = IndexedTableProvider::new(table)
+            .add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>);
+
+        ctx.register_table(
+            "field_meta_diff_table",
+            Arc::new(provider) as Arc<dyn TableProvider>,
+        )
+        .expect("valid");
+
+        let df = ctx.table("field_meta_diff_table").await.expect("valid");
+        // Must succeed — field-level metadata differences are benign.
+        let results = df
+            .collect()
+            .await
+            .expect("field-level metadata difference should not error");
+        assert_eq!(results.len(), 1);
+        assert_eq!(1, idx.compute_index_calls());
     }
 
     /// Regression test for #10223: a metadata-only schema difference introduced
