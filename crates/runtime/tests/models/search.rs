@@ -446,6 +446,32 @@ fn sql_response_normalization_redacts_trunc_3_columns_without_reordering() {
 }
 
 #[test]
+fn sql_response_normalization_preserves_aliased_trunc_3_order() {
+    let input = json!([
+        {"id": 4, "_score": 0.540},
+        {"id": 3, "_score": 0.530},
+        {"id": 2, "_score": 0.520},
+        {"id": 1, "_score": 0.510}
+    ]);
+    let normalized = normalize_sql_response_for_snapshot_with_sql(
+        input,
+        true,
+        Some(
+            "SELECT id, trunc(_score, 3) AS _score FROM vector_search(qs, 'second') ORDER BY _score DESC",
+        ),
+    );
+    assert_eq!(
+        normalized,
+        json!([
+            {"id": 4, "_score": "[score]"},
+            {"id": 3, "_score": "[score]"},
+            {"id": 2, "_score": "[score]"},
+            {"id": 1, "_score": "[score]"}
+        ])
+    );
+}
+
+#[test]
 fn sql_response_normalization_picks_primary_score_key_deterministically() {
     // When a row carries multiple score-like columns (constructed manually here
     // for the test), the function should always pick `_score` first regardless
@@ -681,6 +707,14 @@ fn normalize_search_response(json: Value, round_scores: bool) -> String {
 ///
 /// Returns the input unchanged when the response has no score-like column.
 fn normalize_sql_response_for_snapshot(value: Value, round_scores: bool) -> Value {
+    normalize_sql_response_for_snapshot_with_sql(value, round_scores, None)
+}
+
+fn normalize_sql_response_for_snapshot_with_sql(
+    value: Value,
+    round_scores: bool,
+    sql: Option<&str>,
+) -> Value {
     let Value::Array(mut rows) = value else {
         return value;
     };
@@ -700,7 +734,7 @@ fn normalize_sql_response_for_snapshot(value: Value, round_scores: bool) -> Valu
         return Value::Array(rows);
     }
 
-    if round_scores && should_stabilize_sql_score_order(&primary_score_key, &scores) {
+    if round_scores && should_stabilize_sql_score_order(&primary_score_key, &scores, sql) {
         rows.sort_by(|a, b| {
             let score_a = a
                 .get(&primary_score_key)
@@ -803,8 +837,14 @@ fn sql_score_keys(rows: &[Value]) -> Option<(String, Vec<String>)> {
     Some((primary_score_key, score_keys))
 }
 
-fn should_stabilize_sql_score_order(primary_score_key: &str, scores: &[f64]) -> bool {
-    if let Some(precision) = parse_trunc_precision(primary_score_key)
+fn should_stabilize_sql_score_order(
+    primary_score_key: &str,
+    scores: &[f64],
+    sql: Option<&str>,
+) -> bool {
+    if let Some(precision) = sql
+        .and_then(|sql| aliased_sql_trunc_precision(sql, primary_score_key))
+        .or_else(|| parse_trunc_precision(primary_score_key))
         && precision != 2
     {
         return false;
@@ -823,6 +863,29 @@ fn should_stabilize_sql_score_order(primary_score_key: &str, scores: &[f64]) -> 
     let range = max - min;
 
     (0.011..=0.06).contains(&range)
+}
+
+fn aliased_sql_trunc_precision(sql: &str, primary_score_key: &str) -> Option<usize> {
+    let compact_sql: String = sql
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    let unquoted_alias = format!("as{primary_score_key}");
+    let quoted_alias = format!("as\"{primary_score_key}\"");
+
+    for precision in 0..=9 {
+        let bare_precision = format!("trunc({primary_score_key},{precision})");
+        let int64_precision = format!("trunc({primary_score_key},int64({precision}))");
+        if [bare_precision, int64_precision].iter().any(|trunc_expr| {
+            compact_sql.contains(&format!("{trunc_expr}{unquoted_alias}"))
+                || compact_sql.contains(&format!("{trunc_expr}{quoted_alias}"))
+        }) {
+            return Some(precision);
+        }
+    }
+
+    None
 }
 
 fn round_to_one_decimal(score: f64) -> f64 {
@@ -1054,7 +1117,11 @@ pub(crate) async fn run_search_w_explain(
 
                         let resp = resp?;
                         ensure_sql_response_scores_descending(&test_name, &sql, &resp)?;
-                        let resp = normalize_sql_response_for_snapshot(resp, ts.round_scores);
+                        let resp = normalize_sql_response_for_snapshot_with_sql(
+                            resp,
+                            ts.round_scores,
+                            Some(&sql),
+                        );
                         insta::assert_json_snapshot!(test_name.clone(), resp);
 
                         if explain_sql {
