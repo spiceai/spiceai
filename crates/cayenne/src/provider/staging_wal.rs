@@ -841,7 +841,20 @@ impl CayenneTableProvider {
         if !self.staging_wal_present().load(Ordering::Acquire)
             && !self.staging_may_have_files().load(Ordering::Acquire)
         {
-            return Ok(());
+            if self.table_path().starts_with("s3://") {
+                return Ok(());
+            }
+
+            let staging_root =
+                Self::snapshot_dir_path(self.table_path(), self.table_id(), STAGING_DIR_NAME);
+            let mut entries = match tokio::fs::read_dir(&staging_root).await {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(Error::IoError { source: e }),
+            };
+            if entries.next_entry().await?.is_none() {
+                return Ok(());
+            }
         }
 
         let mut located_wals = self.read_staging_wals().await?;
