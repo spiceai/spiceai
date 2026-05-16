@@ -16,6 +16,7 @@ limitations under the License.
 #![allow(clippy::implicit_hasher)]
 
 use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
+use crate::{embeddings::params::get_params_spec, parameters::Parameters};
 use bytes::Bytes;
 use cache::CacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
@@ -31,10 +32,6 @@ use llms::bedrock::{
     },
 };
 use runtime_secrets::{Secrets, get_params_with_secrets};
-use crate::{
-    embeddings::params::get_params_spec,
-    parameters::Parameters,
-};
 
 #[cfg(feature = "models")]
 use llms::embeddings::candle::{download_hf_file, tei::TeiEmbed};
@@ -61,8 +58,6 @@ use tokio::sync::RwLock;
 use url::Url;
 
 pub type EmbeddingModelStore = HashMap<String, Arc<dyn Embed>>;
-
-
 
 pub async fn try_to_embedding(
     component: &spicepod::component::embeddings::Embeddings,
@@ -102,9 +97,7 @@ pub async fn try_to_embedding(
         param_spec,
     )
     .await
-    .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
-        source: e,
-    })?;
+    .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel { source: e })?;
 
     match prefix {
         EmbeddingPrefix::Azure => azure(
@@ -240,7 +233,10 @@ fn google(
         });
     };
 
-    let dimensions: Option<u32> = params.get("dimensions").expose().ok()
+    let dimensions: Option<u32> = params
+        .get("dimensions")
+        .expose()
+        .ok()
         .map(|d| d.parse::<u32>())
         .transpose()
         // Only error if user provided dimensions.
@@ -278,7 +274,10 @@ async fn bedrock(
         .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel { source: e })?;
 
     if model_id.starts_with("amazon.titan-embed") {
-        let normalize = params.get("normalize").expose().ok()
+        let normalize = params
+            .get("normalize")
+            .expose()
+            .ok()
             .map(|s| s.parse::<bool>())
             .transpose()
             .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
@@ -286,7 +285,10 @@ async fn bedrock(
             })?
             .unwrap_or(true);
 
-        let Some(dimensions) = params.get("dimensions").expose().ok()
+        let Some(dimensions) = params
+            .get("dimensions")
+            .expose()
+            .ok()
             .map(|s| s.parse::<u32>())
             .transpose()
             .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
@@ -311,8 +313,11 @@ async fn bedrock(
             bedrock::embed::new_titan_v2(client, normalize, dimensions).set_cache(embeddings_cache),
         ) as Arc<dyn Embed>)
     } else if model_id.starts_with("cohere.embed") {
-        let truncate = if let Some(truncate_str) =
-            params.get("truncate_mode").expose().ok().or_else(|| params.get("truncate").expose().ok())
+        let truncate = if let Some(truncate_str) = params
+            .get("truncate_mode")
+            .expose()
+            .ok()
+            .or_else(|| params.get("truncate").expose().ok())
         {
             CohereEmbeddingTruncate::from_str(truncate_str)
                 .boxed()
@@ -345,7 +350,10 @@ async fn bedrock(
             .set_cache(embeddings_cache),
         ) as Arc<dyn Embed>)
     } else if model_id.starts_with("amazon.nova-2-multimodal-embeddings") {
-        let Some(dimensions) = params.get("dimensions").expose().ok()
+        let Some(dimensions) = params
+            .get("dimensions")
+            .expose()
+            .ok()
             .map(|s| s.parse::<u32>())
             .transpose()
             .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
@@ -379,8 +387,11 @@ async fn bedrock(
             })?
             .unwrap_or_default();
 
-        let truncate = if let Some(truncate_str) =
-            params.get("truncate_mode").expose().ok().or_else(|| params.get("truncate").expose().ok())
+        let truncate = if let Some(truncate_str) = params
+            .get("truncate_mode")
+            .expose()
+            .ok()
+            .or_else(|| params.get("truncate").expose().ok())
         {
             NovaTruncationMode::from_str(truncate_str)
                 .boxed()
@@ -638,7 +649,9 @@ async fn openai(
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     // If parameter is from secret store, it will have `openai_` prefix
     let openai_usage_tier = params
-        .get("usage_tier").expose().ok()
+        .get("usage_tier")
+        .expose()
+        .ok()
         .map(UsageTier::from_str)
         .transpose()?;
 
@@ -646,12 +659,9 @@ async fn openai(
         llms::openai::new_openai_client(
             model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string()),
             params.get("endpoint").expose().ok(),
-            params
-                .get("api_key").expose().ok(),
-            params
-                .get("org_id").expose().ok(),
-            params
-                .get("project_id").expose().ok(),
+            params.get("api_key").expose().ok(),
+            params.get("org_id").expose().ok(),
+            params.get("project_id").expose().ok(),
             openai_usage_tier,
         ),
         openai_usage_tier.map(Into::into),

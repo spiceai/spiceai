@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 pub mod common;
-pub mod params;
 pub mod connector;
 pub mod execution_plan;
+pub mod params;
 
 pub mod index;
 pub mod metrics;

@@ -21,12 +21,12 @@ const AZURE_PARAM_LEN: usize = 5;
 pub const PARAMETERS: &[ParameterSpec] = &AZURE_PARAMETERS;
 
 pub(crate) const AZURE_PARAMETERS: [ParameterSpec; AZURE_PARAM_LEN] = [
-    ParameterSpec::runtime("endpoint")
-        .description("The Azure OpenAI resource endpoint, e.g., https://resource-name.openai.azure.com."),
+    ParameterSpec::runtime("endpoint").description(
+        "The Azure OpenAI resource endpoint, e.g., https://resource-name.openai.azure.com.",
+    ),
     ParameterSpec::component("api_version")
         .description("The API version used for the Azure OpenAI service."),
-    ParameterSpec::component("deployment_name")
-        .description("The name of the model deployment."),
+    ParameterSpec::component("deployment_name").description("The name of the model deployment."),
     ParameterSpec::component("api_key")
         .secret()
         .description("The Azure OpenAI API key."),

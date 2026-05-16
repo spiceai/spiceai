@@ -23,8 +23,8 @@ pub mod huggingface;
 pub mod model2vec;
 pub mod openai;
 
-use spicepod::component::embeddings::EmbeddingPrefix;
 pub use crate::parameters::ParameterSpec;
+use spicepod::component::embeddings::EmbeddingPrefix;
 
 /// Returns the parameter specifications for a given embedding source.
 #[must_use]

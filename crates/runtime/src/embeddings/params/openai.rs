@@ -27,10 +27,8 @@ pub(crate) const OPENAI_PARAMETERS: [ParameterSpec; OPENAI_PARAM_LEN] = [
     ParameterSpec::component("api_key")
         .secret()
         .description("The OpenAI API key."),
-    ParameterSpec::component("org_id")
-        .description("The OpenAI organization ID."),
-    ParameterSpec::component("project_id")
-        .description("The OpenAI project ID."),
+    ParameterSpec::component("org_id").description("The OpenAI organization ID."),
+    ParameterSpec::component("project_id").description("The OpenAI project ID."),
     ParameterSpec::component("usage_tier")
         .description("The current usage tier for the OpenAI account: 'free', 'tier1'-'tier5'.")
         .one_of(&["free", "tier1", "tier2", "tier3", "tier4", "tier5"])

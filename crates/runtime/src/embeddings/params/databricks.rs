@@ -21,14 +21,18 @@ const DATABRICKS_PARAM_LEN: usize = 4;
 pub const PARAMETERS: &[ParameterSpec] = &DATABRICKS_PARAMETERS;
 
 pub(crate) const DATABRICKS_PARAMETERS: [ParameterSpec; DATABRICKS_PARAM_LEN] = [
-    ParameterSpec::component("endpoint")
-        .description("The Databricks workspace endpoint, e.g., dbc-a12cd3e4-56f7.cloud.databricks.com."),
+    ParameterSpec::component("endpoint").description(
+        "The Databricks workspace endpoint, e.g., dbc-a12cd3e4-56f7.cloud.databricks.com.",
+    ),
     ParameterSpec::component("token")
         .secret()
         .description("The Databricks API token."),
-    ParameterSpec::component("client_id")
-        .description("The Databricks Service Principal Client ID. Cannot be used with databricks_token."),
+    ParameterSpec::component("client_id").description(
+        "The Databricks Service Principal Client ID. Cannot be used with databricks_token.",
+    ),
     ParameterSpec::component("client_secret")
         .secret()
-        .description("The Databricks Service Principal Client Secret. Cannot be used with databricks_token."),
+        .description(
+            "The Databricks Service Principal Client Secret. Cannot be used with databricks_token.",
+        ),
 ];
