@@ -471,7 +471,6 @@ mod tests {
             &["spice", "cloud", "metrics", "--output", "json"],
             &["spice", "cloud", "logs", "--output", "json"],
             &["spice", "cloud", "deploy", "--output", "json"],
-
             &["spice", "cloud", "secrets", "list", "--output", "json"],
             &[
                 "spice", "cloud", "secrets", "set", "name", "value", "--output", "json",
