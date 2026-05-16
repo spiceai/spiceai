@@ -48,12 +48,13 @@ limitations under the License.
 //!    excluded — their semantics require the *absence* of a match, so sharing
 //!    the filter would drop rows the anti-join is supposed to preserve).
 //!
-//! 3. **Same-source anti / semi-join sort-merge rewrite.** `DataFusion` does not
-//!    create dynamic filters for anti joins, and q21's `NOT EXISTS` self-join
-//!    can leave large `HashJoinInput[N]` reservations behind.
+//! 3. **Same-source large-join sort-merge rewrite.** `DataFusion` does not
+//!    create dynamic filters for anti joins, and q21's multi-way same-source
+//!    joins can leave large `HashJoinInput[N]` reservations behind when the
+//!    exact dynamic-filter budget is exhausted.
 //!    [`CayenneAntiJoinSortMergeRewriter`] rewrites same-source Cayenne
-//!    `LeftAnti` / `RightAnti` / `LeftSemi` / `RightSemi` `HashJoinExec` nodes
-//!    to `SortMergeJoinExec` with explicit spillable `SortExec` inputs above a
+//!    `Inner` / outer / semi / anti `HashJoinExec` nodes to
+//!    `SortMergeJoinExec` with explicit spillable `SortExec` inputs above a
 //!    10M-row build-side threshold. Sort-merge preserves the join semantics for
 //!    each of these types without materializing a full non-spillable hash table
 //!    on the LEFT input (`HashJoinExec`'s build side, regardless of join type).
@@ -152,15 +153,15 @@ impl std::fmt::Debug for CayenneDynamicFilterSharing {
     }
 }
 
-/// Rewrites same-source Cayenne anti and semi joins from hash join to
+/// Rewrites same-source large Cayenne joins from hash join to
 /// sort-merge join when the build side is large enough to risk OOM.
 ///
 /// `DataFusion`'s `HashJoinExec` always materializes its left input as the
-/// non-spillable build side regardless of join type. For q21's correlated
-/// `NOT EXISTS` self-join (a `LeftAnti`) that build side can be a large
-/// multi-way `order_line` result; the same shape arises in `EXISTS` /
-/// `IN (subquery)` constructs that decorrelate into `LeftSemi`. Sort-merge
-/// preserves the join semantics for each of these types while keeping the
+/// non-spillable build side regardless of join type. For q21, that build side
+/// can be a large multi-way `order_line` result not only for `NOT EXISTS` /
+/// `EXISTS` decorrelations, but also for ordinary same-source equi-joins when
+/// exact dynamic filtering is disabled by its shared memory cap. Sort-merge
+/// preserves the join semantics for supported equi-join types while keeping the
 /// build side spillable.
 #[derive(Default)]
 pub struct CayenneAntiJoinSortMergeRewriter;
@@ -203,7 +204,7 @@ impl PhysicalOptimizerRule for CayenneAntiJoinSortMergeRewriter {
                 return Ok(Transformed::no(node));
             };
 
-            let Some(sort_merge_join) = try_rewrite_same_source_anti_join(hash_join)? else {
+            let Some(sort_merge_join) = try_rewrite_large_same_source_join(hash_join)? else {
                 return Ok(Transformed::no(node));
             };
 
@@ -356,16 +357,23 @@ fn filter_additions_for_join(
     (left_additions, right_additions)
 }
 
-fn try_rewrite_same_source_anti_join(
+fn try_rewrite_large_same_source_join(
     hash_join: &HashJoinExec,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
-    // Same-source `LeftAnti`/`RightAnti`/`LeftSemi`/`RightSemi` joins all
-    // share the relevant property: `HashJoinExec` builds the LEFT input into
-    // a non-spillable hash table, so a large build side risks OOM. Sort-merge
-    // is spillable and preserves the join semantics for each of these types.
+    // These same-source joins all share the relevant property: `HashJoinExec`
+    // builds the LEFT input into a non-spillable hash table, so a large build
+    // side risks OOM. Sort-merge is spillable and preserves the join semantics
+    // for each of these types.
     if !matches!(
         hash_join.join_type(),
-        JoinType::LeftAnti | JoinType::RightAnti | JoinType::LeftSemi | JoinType::RightSemi,
+        JoinType::Inner
+            | JoinType::Left
+            | JoinType::Right
+            | JoinType::Full
+            | JoinType::LeftAnti
+            | JoinType::RightAnti
+            | JoinType::LeftSemi
+            | JoinType::RightSemi,
     ) {
         return Ok(None);
     }
@@ -424,7 +432,7 @@ fn try_rewrite_same_source_anti_join(
         join_type = ?hash_join.join_type(),
         build_row_count,
         threshold = ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS,
-        "Replacing same-source Cayenne anti/semi HashJoinExec with SortMergeJoinExec"
+        "Replacing large same-source Cayenne HashJoinExec with SortMergeJoinExec"
     );
 
     Ok(Some(Arc::new(join)))
@@ -432,13 +440,8 @@ fn try_rewrite_same_source_anti_join(
 
 fn spillable_rewrite_build_input_exact_rows(hash_join: &HashJoinExec) -> Option<usize> {
     // `HashJoinExec` materializes the LEFT input as the (non-spillable) build
-    // hash table regardless of join type — including `*Anti` and `*Semi`.
-    let build_input = match hash_join.join_type() {
-        JoinType::LeftAnti | JoinType::RightAnti | JoinType::LeftSemi | JoinType::RightSemi => {
-            hash_join.left()
-        }
-        _ => return None,
-    };
+    // hash table regardless of join type.
+    let build_input = hash_join.left();
 
     match build_input.partition_statistics(None).ok()?.num_rows {
         Precision::Exact(row_count) => Some(row_count),
@@ -1581,6 +1584,52 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_same_source_inner_hash_join_to_sort_merge_when_build_side_is_large() {
+        let schema = order_line_schema();
+        let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let right = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+
+        let optimized = optimize_anti_join_sort_merge(join);
+        let sort_merge = optimized
+            .as_any()
+            .downcast_ref::<SortMergeJoinExec>()
+            .expect("large same-source Cayenne inner join should use sort-merge join");
+
+        assert_eq!(JoinType::Inner, sort_merge.join_type());
+    }
+
+    #[test]
+    fn rewrites_same_source_left_hash_join_to_sort_merge_when_build_side_is_large() {
+        let schema = order_line_schema();
+        let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let right = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::Left,
+            NullEquality::NullEqualsNothing,
+        ));
+
+        let optimized = optimize_anti_join_sort_merge(join);
+        let sort_merge = optimized
+            .as_any()
+            .downcast_ref::<SortMergeJoinExec>()
+            .expect("large same-source Cayenne left join should use sort-merge join");
+
+        assert_eq!(JoinType::Left, sort_merge.join_type());
+    }
+
+    #[test]
     fn rewrites_same_source_multi_key_left_anti_hash_join_to_sort_merge() {
         let schema = order_line_schema();
         let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
@@ -1623,6 +1672,28 @@ mod tests {
         assert!(
             optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
             "anti joins over unrelated sources should stay as hash joins"
+        );
+    }
+
+    #[test]
+    fn leaves_unrelated_inner_hash_join_unchanged() {
+        let schema = order_line_schema();
+        let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let right = large_exact_cayenne_file_exec(&schema, "other_order_line.vortex");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+
+        let optimized = optimize_anti_join_sort_merge(join);
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "inner joins over unrelated sources should stay as hash joins"
         );
     }
 
