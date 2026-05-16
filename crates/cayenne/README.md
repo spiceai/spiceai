@@ -387,28 +387,52 @@ SELECT * FROM users WHERE id > 100
 
 Deletion vectors, protected snapshots, inlined data union, and time-retention filters are all applied transparently.
 
-## DuckLake specification alignment
+## Relationship to the DuckLake specification
 
-Cayenne's table-metadata layout aligns with a subset of the DuckLake v0.3 specification so a Cayenne catalog can be reasoned about (and partially read) using DuckLake tooling.
+Cayenne shares some shape with the [DuckLake v1.0 specification](https://ducklake.select/docs/stable/specification/introduction) — both store transactional table metadata in a SQL database and put data in object storage — but the two formats are not interchangeable. The differences are deliberate, driven by Cayenne's use of the Vortex columnar format and the runtime's HTAP / CDC workloads.
 
-### Implemented
+### Shared concepts
 
-- Table metadata management with sequence-numbered operations
+- Transactional catalog database (Cayenne supports SQLite or Turso; DuckLake also allows DuckDB, Postgres, MySQL).
+- Sequence-numbered snapshots for visibility ordering.
+- Per-table partition metadata and per-snapshot data layout.
+- Delete-file references decoupled from data files (so deletes don't rewrite data).
+- Inline data table for small-write absorption (`cayenne_inlined_data` mirrors `ducklake_inlined_data_tables` in concept).
+
+### Major divergences from DuckLake v1.0
+
+| Area                        | DuckLake v1.0                                                                                                                        | Cayenne                                                                                                                                                                        |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Data file format**        | Parquet (mandated)                                                                                                                   | Vortex                                                                                                                                                                         |
+| **Catalog table prefix**    | `ducklake_`                                                                                                                          | `cayenne_`                                                                                                                                                                     |
+| **Data file metadata**      | Explicit `ducklake_data_file` row per file with column stats in `ducklake_file_column_stats`                                         | No explicit data-file table; Cayenne lets DataFusion's `ListingTable` enumerate Vortex files in each snapshot directory. Table-level stats only in `cayenne_table_statistics`. |
+| **Snapshot model**          | Dedicated `ducklake_snapshot` + `ducklake_snapshot_changes` change log                                                               | `current_snapshot_id` field on `cayenne_table` plus `cayenne_snapshot_sequence` for protected-snapshot routing                                                                 |
+| **Schema representation**   | Column-level rows in `ducklake_column`, evolution via `ducklake_schema_versions`, `ducklake_column_mapping`, `ducklake_name_mapping` | Schema stored as a JSON blob (`schema_json`) on `cayenne_table`; schema evolution is intentionally simplified                                                                  |
+| **Namespaces / schemas**    | `ducklake_schema` supports nested namespaces                                                                                         | Flat table namespace                                                                                                                                                           |
+| **Upsert / PK semantics**   | Snapshot-based merge                                                                                                                 | Iceberg-style PK insert tracking in `cayenne_insert_record`, paired with `cayenne_inlined_delete` tombstones                                                                   |
+| **GC**                      | `ducklake_files_scheduled_for_deletion` work queue                                                                                   | Old-snapshot cleanup triggered inline by compaction/sort/overwrite paths                                                                                                       |
+| **Views, SQL macros, tags** | First-class (`ducklake_view`, `ducklake_macro*`, `ducklake_tag`, `ducklake_column_tag`)                                              | Not implemented                                                                                                                                                                |
+| **Sort metadata**           | `ducklake_sort_expression`, `ducklake_sort_info`                                                                                     | `sort_columns` is a per-dataset config field, not a catalog table                                                                                                              |
+| **Variant column stats**    | `ducklake_file_variant_stats`                                                                                                        | Not implemented                                                                                                                                                                |
+
+### What Cayenne implements relative to its own goals
+
+- Table metadata with sequence-numbered operations
 - Position- and key-based delete files
-- Partition metadata (composite partition keys)
-- File compaction (tiered small-files picker + background compactor)
-- Sequence-based snapshot visibility
+- Composite partition keys (single partition column via current public API)
+- Tiered small-files compaction (inline + background)
+- Inline-data memtable with per-write and cumulative-flush thresholds
+- CDC apply pipelining with debounced post-write maintenance
+- Protected-snapshot scan routing for upsert correctness
 
-### Minimal / simplified
+### Not implemented (and not currently planned)
 
-- Schema evolution (simplified)
-- Statistics tracking (loaded from Vortex footers; column-level)
-
-### Not implemented (future)
-
-- Snapshot expiration / time-travel queries
-- Column mapping
+- Schema evolution at column-row granularity (column adds / drops / renames / mappings)
+- SQL macros, views, table/column tags
+- Snapshot expiration and time-travel queries
 - Full MVCC
+
+If interoperability with a DuckLake catalog reader is a requirement, Cayenne is not the right tool. If a Vortex-native, CDC-friendly accelerator backed by SQLite or Turso fits the workload, Cayenne is purpose-built for that.
 
 ## Database schema
 
@@ -622,10 +646,13 @@ in this crate.
 
 ### Lakehouse formats and metadata catalogs
 
-- **DuckLake** — DuckDB's specification for a SQL-catalogued lakehouse. Cayenne's
-  table-metadata layout, snapshot-sequence model, and partition representation
-  align with a subset of this spec.
-  - [DuckLake Specification](https://ducklake.select/)
+- **DuckLake** — DuckDB's specification for a SQL-catalogued lakehouse. Cayenne
+  shares high-level shape with DuckLake (transactional metadata catalog plus
+  object-store data) but diverges substantively (Vortex instead of Parquet,
+  no per-file data-file table, JSON-blob schema instead of column-level rows,
+  no views/macros/tags). See the *Relationship to the DuckLake specification*
+  section above for the full table-by-table comparison against v1.0.
+  - [DuckLake Specification v1.0](https://ducklake.select/docs/stable/specification/introduction)
   - DuckDB blog: *"Announcing DuckLake"* — <https://duckdb.org/2025/05/27/ducklake.html>
 - **Apache Iceberg** — table format with sequence-number-driven snapshot
   visibility and position/equality delete files. Cayenne's
@@ -692,5 +719,9 @@ in this crate.
 
 ## References
 
-- [DuckLake Specification](https://ducklake.select/)
+- [DuckLake Specification v1.0](https://ducklake.select/docs/stable/specification/introduction)
+- [DuckLake Tables (v1.0)](https://ducklake.select/docs/stable/specification/tables/overview)
 - [Vortex Format](https://github.com/spiraldb/vortex)
+- [Apache Iceberg Specification](https://iceberg.apache.org/spec/)
+- [Apache Arrow](https://arrow.apache.org/)
+- [Apache DataFusion](https://datafusion.apache.org/)
