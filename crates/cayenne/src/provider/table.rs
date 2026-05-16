@@ -914,6 +914,11 @@ pub struct CayenneTableProvider {
     ///
     /// Uses `tokio::sync::Mutex` because the lock is held across `.await` points during insert operations.
     write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes staged append visibility flips after Stage A has durably
+    /// written its isolated staging WAL. CDC pipelining releases `write_lock`
+    /// after Stage A, then Stage B takes this lock for move + listing cache
+    /// invalidation so readers still observe one ordered visibility boundary.
+    visibility_lock: Arc<tokio::sync::Mutex<()>>,
     /// Optional object store configuration for remote storage (e.g., S3 Express One Zone).
     /// When set, this object store is registered with `SessionContext` for data file operations.
     object_store_config: Option<crate::metadata::ObjectStoreConfig>,
@@ -979,6 +984,11 @@ pub struct CayenneTableProvider {
     /// staging. The `write_lock` serializes writers, so the flag is a reliable
     /// "we left it clean" signal between appends in the same process.
     staging_may_have_files: Arc<AtomicBool>,
+    /// Staging snapshot IDs whose WALs belong to prepared appends in this
+    /// process. `ensure_no_incomplete_write` ignores these WALs so CDC Stage A
+    /// can continue while a previous Stage B is pending; after restart the set
+    /// is empty, so the same WALs are treated as crash-recovery input.
+    inflight_staging_appends: Arc<ParkingMutex<HashSet<String>>>,
     /// Serializes concurrent compaction passes on this table so a write-driven
     /// inline trigger and the background scheduler can't both rewrite the
     /// current snapshot at the same time. Held across the *entire* trigger
@@ -1385,6 +1395,44 @@ impl CayenneTableProvider {
     #[must_use]
     pub(crate) fn write_lock_arc(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.write_lock)
+    }
+
+    #[must_use]
+    pub(crate) fn visibility_lock_arc(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.visibility_lock)
+    }
+
+    #[must_use]
+    pub(crate) fn new_staging_snapshot_id(&self) -> String {
+        format!("{STAGING_DIR_NAME}/{}", uuid::Uuid::now_v7())
+    }
+
+    pub(crate) fn register_inflight_staging_append(&self, staging_snapshot_id: &str) {
+        if staging_snapshot_id != STAGING_DIR_NAME {
+            self.inflight_staging_appends
+                .lock()
+                .insert(staging_snapshot_id.to_string());
+        }
+    }
+
+    pub(crate) fn unregister_inflight_staging_append(&self, staging_snapshot_id: &str) {
+        if staging_snapshot_id != STAGING_DIR_NAME {
+            self.inflight_staging_appends
+                .lock()
+                .remove(staging_snapshot_id);
+        }
+    }
+
+    pub(crate) fn staging_append_is_inflight(&self, staging_snapshot_id: &str) -> bool {
+        staging_snapshot_id != STAGING_DIR_NAME
+            && self
+                .inflight_staging_appends
+                .lock()
+                .contains(staging_snapshot_id)
+    }
+
+    pub(crate) fn has_inflight_staging_appends(&self) -> bool {
+        !self.inflight_staging_appends.lock().is_empty()
     }
 
     pub(crate) fn staging_wal_present(&self) -> &AtomicBool {
@@ -1922,6 +1970,38 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Clear one isolated staging snapshot directory.
+    ///
+    /// CDC pipeline Stage A uses a unique child under `_staging/` so a later
+    /// burst can write its staged files without deleting a prior burst that is
+    /// still waiting for Stage B. The legacy `_staging/` path keeps the old
+    /// whole-directory cleanup semantics through [`Self::clear_staging_dir`].
+    pub(crate) async fn clear_staging_snapshot_dir(&self, staging_snapshot_id: &str) -> Result<()> {
+        if staging_snapshot_id == STAGING_DIR_NAME {
+            return self.clear_staging_dir().await;
+        }
+
+        if self.table_metadata.path.starts_with("s3://") {
+            if let Some(prefix) = self.snapshot_object_store_prefix(staging_snapshot_id)? {
+                self.delete_prefix_with_object_store(&prefix).await?;
+            }
+        } else {
+            let staging_dir = Self::snapshot_dir_path(
+                &self.table_metadata.path,
+                &self.table_metadata.table_id,
+                staging_snapshot_id,
+            );
+            match tokio::fs::remove_dir_all(&staging_dir).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            tokio::fs::create_dir_all(&staging_dir).await?;
+        }
+
+        Ok(())
+    }
+
     /// Move all files from the staging directory into the current snapshot directory.
     ///
     /// On local filesystems `rename()` is used, which is atomic on the same filesystem
@@ -1935,12 +2015,22 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if any file move/copy fails.
     pub(crate) async fn move_files_to_current_snapshot(&self) -> Result<()> {
+        self.move_staged_files_to_current_snapshot(STAGING_DIR_NAME)
+            .await
+    }
+
+    pub(crate) async fn move_staged_files_to_current_snapshot(
+        &self,
+        staging_snapshot_id: &str,
+    ) -> Result<()> {
         let current_snapshot = self.get_current_snapshot_id();
 
         if self.table_metadata.path.starts_with("s3://") {
-            self.move_staging_files_s3(&current_snapshot).await
+            self.move_staging_files_s3(staging_snapshot_id, &current_snapshot)
+                .await
         } else {
-            self.move_staging_files_local(&current_snapshot).await
+            self.move_staging_files_local(staging_snapshot_id, &current_snapshot)
+                .await
         }
     }
 
@@ -1961,11 +2051,15 @@ impl CayenneTableProvider {
     /// while individual renames are still only in the page cache — a crash
     /// would then leave the catalog blind to staged files that "should" be in
     /// the snapshot.
-    async fn move_staging_files_local(&self, current_snapshot: &str) -> Result<()> {
+    async fn move_staging_files_local(
+        &self,
+        staging_snapshot_id: &str,
+        current_snapshot: &str,
+    ) -> Result<()> {
         let staging_dir = Self::snapshot_dir_path(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
-            STAGING_DIR_NAME,
+            staging_snapshot_id,
         );
         let target_dir = Self::snapshot_dir_path(
             &self.table_metadata.path,
@@ -2033,10 +2127,14 @@ impl CayenneTableProvider {
     /// prefix first, then staging originals are deleted. If interrupted after copies
     /// but before deletes, data exists in both locations (safe — deduplicated by PK
     /// or idempotent for append-only tables).
-    async fn move_staging_files_s3(&self, current_snapshot: &str) -> Result<()> {
+    async fn move_staging_files_s3(
+        &self,
+        staging_snapshot_id: &str,
+        current_snapshot: &str,
+    ) -> Result<()> {
         let config = self.require_object_store()?;
 
-        let Some(staging_prefix) = self.snapshot_object_store_prefix(STAGING_DIR_NAME)? else {
+        let Some(staging_prefix) = self.snapshot_object_store_prefix(staging_snapshot_id)? else {
             return Ok(());
         };
         let Some(target_prefix) = self.snapshot_object_store_prefix(current_snapshot)? else {
@@ -2438,6 +2536,7 @@ impl CayenneTableProvider {
             pk_row_converter,
             pk_column_indices,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
             object_store_config,
             object_store_registered_runtime_envs: Arc::new(ParkingMutex::new(
                 object_store_registered_runtime_envs,
@@ -2447,6 +2546,7 @@ impl CayenneTableProvider {
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
             staging_wal_present: Arc::new(AtomicBool::new(true)),
             staging_may_have_files: Arc::new(AtomicBool::new(true)),
+            inflight_staging_appends: Arc::new(ParkingMutex::new(HashSet::new())),
             new_files_since_last_compaction: Arc::new(AtomicUsize::new(0)),
             compaction_lock: Arc::new(tokio::sync::Mutex::new(())),
             post_write_compaction_scheduled: Arc::new(AtomicBool::new(false)),
@@ -2851,6 +2951,7 @@ impl CayenneTableProvider {
             pk_row_converter: self.pk_row_converter.as_ref().map(Arc::clone),
             pk_column_indices: self.pk_column_indices.clone(),
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
+            visibility_lock: Arc::clone(&self.visibility_lock),
             object_store_config: self.object_store_config.clone(),
             object_store_registered_runtime_envs: Arc::clone(
                 &self.object_store_registered_runtime_envs,
@@ -2861,6 +2962,7 @@ impl CayenneTableProvider {
             inlined_row_count: Arc::clone(&self.inlined_row_count),
             staging_wal_present: Arc::clone(&self.staging_wal_present),
             staging_may_have_files: Arc::clone(&self.staging_may_have_files),
+            inflight_staging_appends: Arc::clone(&self.inflight_staging_appends),
             new_files_since_last_compaction: Arc::clone(&self.new_files_since_last_compaction),
             // Shared so inline (write-driven) and background compaction
             // attempts on the same table coordinate, even across clones.
@@ -5264,10 +5366,18 @@ impl CayenneTableProvider {
     /// scope).
     #[must_use]
     pub fn staging_wal_path_for_recovery(&self) -> std::path::PathBuf {
+        self.staging_wal_path_for_recovery_for(STAGING_DIR_NAME)
+    }
+
+    #[must_use]
+    pub(crate) fn staging_wal_path_for_recovery_for(
+        &self,
+        staging_snapshot_id: &str,
+    ) -> std::path::PathBuf {
         let staging_dir = Self::snapshot_dir_path(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
-            STAGING_DIR_NAME,
+            staging_snapshot_id,
         );
         staging_dir.join(STAGING_WAL_FILENAME)
     }

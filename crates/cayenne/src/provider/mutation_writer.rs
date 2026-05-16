@@ -237,7 +237,10 @@ impl<'a> AppendMutationWriter<'a> {
             ));
         }
 
-        self.table.clear_staging_dir().await?;
+        let staging_snapshot_id = self.table.new_staging_snapshot_id();
+        self.table
+            .clear_staging_snapshot_dir(&staging_snapshot_id)
+            .await?;
 
         match self
             .try_inline_or_restream(prepared_stream, &[], &[])
@@ -254,7 +257,12 @@ impl<'a> AppendMutationWriter<'a> {
                 prepared_stream = re_stream;
                 let target_size_bytes = self.context.target_file_size_bytes();
                 let (rows, writer_ops, stats_acc, prepared_append) = self
-                    .write_staged_append_prepared(prepared_stream, target_size_bytes, write_guard)
+                    .write_staged_append_prepared(
+                        prepared_stream,
+                        target_size_bytes,
+                        write_guard,
+                        staging_snapshot_id,
+                    )
                     .await?;
 
                 tracing::debug!(
@@ -543,6 +551,7 @@ impl<'a> AppendMutationWriter<'a> {
         stream: SendableRecordBatchStream,
         target_size_bytes: usize,
         write_guard: OwnedMutexGuard<()>,
+        staging_snapshot_id: String,
     ) -> Result<(
         u64,
         usize,
@@ -558,14 +567,18 @@ impl<'a> AppendMutationWriter<'a> {
             .write_to_snapshot(
                 stream,
                 target_size_bytes,
-                STAGING_DIR_NAME,
+                &staging_snapshot_id,
                 self.task_context.session_config().target_partitions(),
             )
             .await
         {
             Ok(result) => result,
             Err(e) => {
-                if let Err(cleanup_err) = self.table.clear_staging_dir().await {
+                if let Err(cleanup_err) = self
+                    .table
+                    .clear_staging_snapshot_dir(&staging_snapshot_id)
+                    .await
+                {
                     tracing::warn!(
                         "Failed to clean staging dir after write error for table {}: {cleanup_err}",
                         self.table.table_name(),
@@ -575,9 +588,10 @@ impl<'a> AppendMutationWriter<'a> {
             }
         };
 
-        let staged_append = CayenneStagedAppend::from_staged_append(
+        let staged_append = CayenneStagedAppend::from_staged_append_in(
             self.table.clone_for_write_operations(),
             write_guard,
+            staging_snapshot_id,
             rows,
         );
         let prepared_append = staged_append.prepare().await?;
