@@ -41,6 +41,49 @@ use datafusion_table_providers::util::{
 use duckdb::Connection;
 use tempfile::TempDir;
 
+/// Which Cayenne metastore backend to use in a fixture.
+///
+/// `Sqlite` is Cayenne's default (no `cayenne_metastore` param). `Turso` is
+/// available when the bench is built with `--features turso` and matches
+/// `cayenne_metastore: turso` in spicepods. The DuckDB side is unaffected;
+/// pairing a `Turso` Cayenne fixture against the same DuckDB fixture isolates
+/// the metastore's contribution to overall numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metastore {
+    Sqlite,
+    #[cfg(feature = "turso")]
+    Turso,
+}
+
+impl Metastore {
+    /// Stable lane label used in `BenchmarkId`s.
+    #[must_use]
+    pub fn lane(self) -> &'static str {
+        match self {
+            Metastore::Sqlite => "cayenne",
+            #[cfg(feature = "turso")]
+            Metastore::Turso => "cayenne_turso",
+        }
+    }
+
+    fn connection_string(self, db_path: &Path) -> String {
+        let path = db_path.to_string_lossy();
+        match self {
+            Metastore::Sqlite => format!("sqlite://{path}"),
+            #[cfg(feature = "turso")]
+            Metastore::Turso => format!("libsql://{path}"),
+        }
+    }
+}
+
+/// All Cayenne lanes a bench should run. Compile-time gated on the `turso`
+/// feature so benches built without it cleanly drop to a single lane.
+pub const CAYENNE_LANES: &[Metastore] = &[
+    Metastore::Sqlite,
+    #[cfg(feature = "turso")]
+    Metastore::Turso,
+];
+
 /// Canonical schema for the comparison benches.
 ///
 /// Three columns chosen to mirror the shape of a TPC-H `customer` / `orders`
@@ -57,6 +100,9 @@ pub fn schema() -> Arc<Schema> {
 }
 
 /// Build a deterministic batch of `rows` rows starting at `start_id`.
+///
+/// `name` is unique per row (`name_{id}`) so GROUP BY on `name` yields one
+/// group per row. Use [`make_batch_grouped`] when low cardinality is wanted.
 pub fn make_batch(schema: Arc<Schema>, start_id: i64, rows: usize) -> RecordBatch {
     let ids: Vec<i64> = (0..rows as i64).map(|i| start_id + i).collect();
     let names: Vec<String> = ids.iter().map(|id| format!("name_{id}")).collect();
@@ -73,6 +119,58 @@ pub fn make_batch(schema: Arc<Schema>, start_id: i64, rows: usize) -> RecordBatc
     .expect("batch")
 }
 
+/// Build a deterministic batch with `groups` distinct `name` values, used by
+/// the GROUP BY bench so the aggregation kernel produces a bounded number of
+/// output groups regardless of row count.
+pub fn make_batch_grouped(
+    schema: Arc<Schema>,
+    start_id: i64,
+    rows: usize,
+    groups: usize,
+) -> RecordBatch {
+    let group_count = groups.max(1);
+    let ids: Vec<i64> = (0..rows as i64).map(|i| start_id + i).collect();
+    let names: Vec<String> = (0..rows)
+        .map(|i| format!("group_{}", i % group_count))
+        .collect();
+    let values: Vec<i64> = ids.iter().map(|id| id * 100).collect();
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(names)),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )
+    .expect("batch")
+}
+
+/// Build a small "dimension" batch for the join bench. `id` is a foreign key
+/// into the fact table; `region` is a 4-way low-cardinality dimension.
+pub fn make_dim_batch(schema: Arc<Schema>, rows: usize) -> RecordBatch {
+    const REGIONS: [&str; 4] = ["NA", "EU", "APAC", "LATAM"];
+    let ids: Vec<i64> = (0..rows as i64).collect();
+    let regions: Vec<&str> = (0..rows).map(|i| REGIONS[i % REGIONS.len()]).collect();
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(regions)),
+        ],
+    )
+    .expect("dim batch")
+}
+
+/// Schema for the dim table used by the join bench.
+pub fn dim_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+    ]))
+}
+
 /// Write a single record batch to a parquet file so both engines can ingest
 /// from the same on-disk source — the realistic Spice ingestion path.
 pub fn write_parquet(batch: &RecordBatch, path: &Path) {
@@ -83,7 +181,10 @@ pub fn write_parquet(batch: &RecordBatch, path: &Path) {
     writer.close().expect("close");
 }
 
-/// A clean Cayenne table backed by a fresh SQLite metastore + temp data dir.
+/// A clean Cayenne table backed by a fresh metastore + temp data dir.
+///
+/// The backend (`SQLite` or `Turso`) is selected at fixture-creation time
+/// via [`Metastore`] so each bench can run multiple metastore lanes.
 pub struct CayenneFixture {
     pub _temp_dir: TempDir,
     pub table: Arc<CayenneTableProvider>,
@@ -91,24 +192,53 @@ pub struct CayenneFixture {
 }
 
 pub async fn setup_cayenne(table_name: &str) -> CayenneFixture {
-    setup_cayenne_with_pk(table_name, vec![], None).await
+    setup_cayenne_with(table_name, Metastore::Sqlite, vec![], None, schema()).await
 }
 
 pub async fn setup_cayenne_pk(table_name: &str) -> CayenneFixture {
-    setup_cayenne_with_pk(
+    setup_cayenne_with(
         table_name,
+        Metastore::Sqlite,
         vec!["id".to_string()],
         Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
+        schema(),
     )
     .await
 }
 
-async fn setup_cayenne_with_pk(
+/// Build a Cayenne fixture with a chosen metastore backend (default `schema()`).
+pub async fn setup_cayenne_for(table_name: &str, metastore: Metastore) -> CayenneFixture {
+    setup_cayenne_with(table_name, metastore, vec![], None, schema()).await
+}
+
+/// Build a Cayenne fixture with a chosen metastore backend AND a single-column
+/// `id` primary key with upsert on-conflict resolution.
+pub async fn setup_cayenne_pk_for(table_name: &str, metastore: Metastore) -> CayenneFixture {
+    setup_cayenne_with(
+        table_name,
+        metastore,
+        vec!["id".to_string()],
+        Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+        schema(),
+    )
+    .await
+}
+
+/// Build a Cayenne fixture that uses the dim-table schema (for the join bench).
+pub async fn setup_cayenne_dim_for(table_name: &str, metastore: Metastore) -> CayenneFixture {
+    setup_cayenne_with(table_name, metastore, vec![], None, dim_schema()).await
+}
+
+async fn setup_cayenne_with(
     table_name: &str,
+    metastore: Metastore,
     primary_key: Vec<String>,
     on_conflict: Option<OnConflict>,
+    table_schema: Arc<Schema>,
 ) -> CayenneFixture {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let data_path = temp_dir.path().join("data");
@@ -117,7 +247,7 @@ async fn setup_cayenne_with_pk(
         .expect("data dir");
     let db_path = temp_dir.path().join("catalog.db");
     let catalog = Arc::new(
-        CayenneCatalog::new(format!("sqlite://{}", db_path.to_string_lossy())).expect("catalog"),
+        CayenneCatalog::new(metastore.connection_string(&db_path)).expect("catalog"),
     );
     catalog.init().await.expect("catalog init");
 
@@ -126,7 +256,7 @@ async fn setup_cayenne_with_pk(
             Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
             CreateTableOptions {
                 table_name: table_name.to_string(),
-                schema: schema(),
+                schema: table_schema,
                 primary_key,
                 on_conflict,
                 base_path: data_path.to_string_lossy().to_string(),
@@ -156,6 +286,16 @@ pub struct DuckDbFixture {
     pub conn: Connection,
 }
 
+impl DuckDbFixture {
+    /// Path to the on-disk `.duckdb` file. Used by the concurrent bench to
+    /// open a second connection from a background thread (DuckDB connections
+    /// are not `Send`).
+    #[must_use]
+    pub fn db_path(&self) -> PathBuf {
+        self._temp_dir.path().join("duck.db")
+    }
+}
+
 pub fn setup_duckdb(table_name: &str) -> DuckDbFixture {
     setup_duckdb_with_pk(table_name, false)
 }
@@ -177,6 +317,98 @@ fn setup_duckdb_with_pk(table_name: &str, with_pk: bool) -> DuckDbFixture {
         _temp_dir: temp_dir,
         conn,
     }
+}
+
+/// DuckDB fixture for the join bench: a `t` fact table (default schema) and
+/// a `d` dim table (id, region). Both engines see the same shape so the
+/// resulting join plans are directly comparable.
+pub fn setup_duckdb_with_dim(fact_table: &str, dim_table: &str) -> DuckDbFixture {
+    let fixture = setup_duckdb(fact_table);
+    fixture
+        .conn
+        .execute_batch(&format!(
+            "CREATE TABLE {dim_table} (id BIGINT NOT NULL, region VARCHAR NOT NULL);"
+        ))
+        .expect("duckdb create dim table");
+    fixture
+}
+
+/// Upsert via DuckDB's `INSERT ... ON CONFLICT DO UPDATE`. Apples-to-apples
+/// with Cayenne's `OnConflict::Upsert` on the `id` primary key.
+pub fn duckdb_upsert_parquet(conn: &Connection, table_name: &str, parquet_path: &Path) {
+    conn.execute_batch(&format!(
+        "INSERT INTO {table_name} SELECT * FROM read_parquet('{}') \
+         ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, value = EXCLUDED.value;",
+        parquet_path.display()
+    ))
+    .expect("duckdb upsert parquet");
+}
+
+/// Insert a small VALUES tuple list — used by the burst bench to mirror the
+/// fine-grained per-burst insert path without paying parquet decode cost.
+pub fn duckdb_insert_rows(conn: &Connection, table_name: &str, batch: &RecordBatch) {
+    use arrow::array::{Array, Int64Array, StringArray};
+
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("ids");
+    let names = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("names");
+    let values = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("values");
+
+    let mut sql = format!("INSERT INTO {table_name} VALUES ");
+    for i in 0..batch.num_rows() {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!(
+            "({}, '{}', {})",
+            ids.value(i),
+            names.value(i).replace('\'', "''"),
+            values.value(i)
+        ));
+    }
+    sql.push(';');
+    conn.execute_batch(&sql).expect("duckdb insert rows");
+}
+
+/// Insert the rows of `batch` into DuckDB's dim table.
+pub fn duckdb_insert_dim_rows(conn: &Connection, table_name: &str, batch: &RecordBatch) {
+    use arrow::array::{Array, Int64Array, StringArray};
+
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("ids");
+    let regions = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("regions");
+
+    let mut sql = format!("INSERT INTO {table_name} VALUES ");
+    for i in 0..batch.num_rows() {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!(
+            "({}, '{}')",
+            ids.value(i),
+            regions.value(i).replace('\'', "''"),
+        ));
+    }
+    sql.push(';');
+    conn.execute_batch(&sql).expect("duckdb insert dim rows");
 }
 
 /// Bulk-insert via DuckDB's native parquet loader. This is DuckDB's
@@ -270,6 +502,25 @@ pub async fn cayenne_query(table: &Arc<CayenneTableProvider>, sql: &str) -> Vec<
         .expect("register table");
     let df = ctx.sql(sql).await.expect("cayenne sql");
     df.collect().await.expect("cayenne collect")
+}
+
+/// Run a SQL query against two Cayenne tables registered as `t` and `d`.
+/// Used by the join bench so the SQL matches the DuckDB form.
+pub async fn cayenne_query_join(
+    fact: &Arc<CayenneTableProvider>,
+    dim: &Arc<CayenneTableProvider>,
+    sql: &str,
+) -> Vec<RecordBatch> {
+    use datafusion::datasource::TableProvider;
+    use datafusion::prelude::SessionContext;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::clone(fact) as Arc<dyn TableProvider>)
+        .expect("register fact");
+    ctx.register_table("d", Arc::clone(dim) as Arc<dyn TableProvider>)
+        .expect("register dim");
+    let df = ctx.sql(sql).await.expect("cayenne join sql");
+    df.collect().await.expect("cayenne join collect")
 }
 
 /// Capture optimized and executed plans for a Cayenne/DuckDB query pair.
