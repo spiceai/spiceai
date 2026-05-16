@@ -440,19 +440,19 @@ mod tests {
     fn test_single_section_deserialization() {
         let yaml = "
 tests:
-  bench:
-    spicepod_path: s3[parquet]-turso[file].yaml
-    query_set: tpch
-    ready_wait: 300
-    runner_type: spiceai-dev-runners
-  load:
-    spicepod_path: s3[parquet]-turso[file].yaml
-    query_set: tpch
-    ready_wait: 300
-    runner_type: spiceai-dev-runners
-    concurrency: 128
-    duration: 1800
-    random_param_set_count: 1000
+    bench:
+        spicepod_path: s3[parquet]-turso[file].yaml
+        query_set: tpch
+        ready_wait: 300
+        runner_type: spiceai-dev-runners
+    load:
+        spicepod_path: s3[parquet]-turso[file].yaml
+        query_set: tpch
+        ready_wait: 300
+        runner_type: spiceai-dev-runners
+        concurrency: 128
+        duration: 1800
+        random_param_set_count: 1000
     append:
         spicepod_path: file[parquet]-cayenne[file]-append.yaml
         query_set: tpch
