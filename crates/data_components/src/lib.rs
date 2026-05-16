@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::{
     catalog::{CatalogProvider, Session},
-    common::Constraints,
+    common::{Constraints, Statistics},
     datasource::{TableProvider, TableType},
     error::Result as DataFusionResult,
     logical_expr::{LogicalPlan, TableProviderFilterPushDown, dml::InsertOp},
@@ -220,6 +220,10 @@ impl TableProvider for MetadataEnrichedTableProvider {
         filters: Vec<Expr>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.inner.update(state, assignments, filters).await
+    }
+
+    fn statistics(&self) -> Option<Statistics> {
+        self.inner.statistics()
     }
 }
 

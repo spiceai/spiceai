@@ -383,13 +383,24 @@ async fn build_table_providers_for_schema(
         match table_creator.table_provider(table_ref).await {
             Ok(provider) => {
                 let provider = if let Some(fks) = foreign_keys.get(&table_name) {
-                    if let Ok(fk_json) = serde_json::to_string(fks) {
-                        let extra =
-                            HashMap::from([(FOREIGN_KEYS_METADATA_KEY.to_string(), fk_json)]);
-                        Arc::new(MetadataEnrichedTableProvider::new(provider, extra))
-                            as Arc<dyn TableProvider>
-                    } else {
-                        provider
+                    match serde_json::to_string(fks) {
+                        Ok(fk_json) => {
+                            let extra = HashMap::from([(
+                                FOREIGN_KEYS_METADATA_KEY.to_string(),
+                                fk_json,
+                            )]);
+                            Arc::new(MetadataEnrichedTableProvider::new(provider, extra))
+                                as Arc<dyn TableProvider>
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                schema = %schema_name,
+                                table = %table_name,
+                                error = %e,
+                                "Failed to serialize foreign key metadata for table {schema_name}.{table_name}; registering without FK metadata"
+                            );
+                            provider
+                        }
                     }
                 } else {
                     provider
