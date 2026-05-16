@@ -601,6 +601,7 @@ impl QuerySet {
                     "chbench_q18",
                     "chbench_q19",
                     "chbench_q20",
+                    "chbench_q21",
                     "chbench_q22",
                 ]
             }
@@ -1217,7 +1218,6 @@ pub fn get_chbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query>
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 22
     );
     // q15 excluded: requires a `revenue1` view
-    // q21 excluded: multi-way JOIN + anti-join exhausts HashJoin memory (can't spill)
 
     match overrides {
         // No engine-specific overrides yet
