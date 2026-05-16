@@ -210,7 +210,7 @@ fn is_json_output(cmd: &Commands) -> bool {
             cloud::CloudCommands::Metrics(x) => x.output == OutputFormat::Json,
             cloud::CloudCommands::Logs(x) => x.output == OutputFormat::Json,
             cloud::CloudCommands::Deploy(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Rollback(x) => x.output == OutputFormat::Json,
+
             cloud::CloudCommands::Secrets(cloud::SecretsCommands::List(x)) => {
                 x.output == OutputFormat::Json
             }
@@ -477,7 +477,6 @@ mod tests {
             &["spice", "cloud", "metrics", "--output", "json"],
             &["spice", "cloud", "logs", "--output", "json"],
             &["spice", "cloud", "deploy", "--output", "json"],
-            &["spice", "cloud", "rollback", "--output", "json"],
             &["spice", "cloud", "secrets", "list", "--output", "json"],
             &[
                 "spice", "cloud", "secrets", "set", "name", "value", "--output", "json",
