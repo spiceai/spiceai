@@ -26,8 +26,8 @@ use crate::types::{
     ApiKeysResponse, App, AppsResponse, AuthContext, AuthExchangeResponse, ContainerImagesResponse,
     CreateAppRequest, CreateDeploymentRequest, Deployment, DeploymentsResponse, LogsResponse,
     MetricsResponse, OAuthTokenRequest, OAuthTokenResponse, RegenerateApiKeyRequest,
-    RegenerateApiKeyResponse, RegionsResponse, RollbackRequest, Secret, SecretsResponse,
-    SetSecretRequest, UpdateAppRequest,
+    RegenerateApiKeyResponse, RegionsResponse, Secret, SecretsResponse, SetSecretRequest,
+    UpdateAppRequest,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
@@ -355,25 +355,6 @@ impl CloudClient {
             .client
             .get(&url)
             .bearer_auth(self.token_str())
-            .send()
-            .await
-            .context(HttpRequestSnafu)?;
-
-        self.handle_response(response).await
-    }
-
-    /// Rollback to a previous deployment.
-    pub async fn rollback(&self, app_id: i64, target_deployment_id: i64) -> Result<Deployment> {
-        let url = format!("{}/v1/apps/{}/rollback", self.base_url, app_id);
-        let request = RollbackRequest {
-            target_deployment_id,
-        };
-
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(self.token_str())
-            .json(&request)
             .send()
             .await
             .context(HttpRequestSnafu)?;
