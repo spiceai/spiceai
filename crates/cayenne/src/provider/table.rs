@@ -1407,28 +1407,30 @@ impl CayenneTableProvider {
         format!("{STAGING_DIR_NAME}/{}", uuid::Uuid::now_v7())
     }
 
+    #[must_use]
+    fn is_staging_snapshot_id(snapshot_id: &str) -> bool {
+        snapshot_id == STAGING_DIR_NAME
+            || snapshot_id
+                .strip_prefix(STAGING_DIR_NAME)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    }
+
     pub(crate) fn register_inflight_staging_append(&self, staging_snapshot_id: &str) {
-        if staging_snapshot_id != STAGING_DIR_NAME {
-            self.inflight_staging_appends
-                .lock()
-                .insert(staging_snapshot_id.to_string());
-        }
+        self.inflight_staging_appends
+            .lock()
+            .insert(staging_snapshot_id.to_string());
     }
 
     pub(crate) fn unregister_inflight_staging_append(&self, staging_snapshot_id: &str) {
-        if staging_snapshot_id != STAGING_DIR_NAME {
-            self.inflight_staging_appends
-                .lock()
-                .remove(staging_snapshot_id);
-        }
+        self.inflight_staging_appends
+            .lock()
+            .remove(staging_snapshot_id);
     }
 
     pub(crate) fn staging_append_is_inflight(&self, staging_snapshot_id: &str) -> bool {
-        staging_snapshot_id != STAGING_DIR_NAME
-            && self
-                .inflight_staging_appends
-                .lock()
-                .contains(staging_snapshot_id)
+        self.inflight_staging_appends
+            .lock()
+            .contains(staging_snapshot_id)
     }
 
     pub(crate) fn has_inflight_staging_appends(&self) -> bool {
@@ -1977,10 +1979,6 @@ impl CayenneTableProvider {
     /// still waiting for Stage B. The legacy `_staging/` path keeps the old
     /// whole-directory cleanup semantics through [`Self::clear_staging_dir`].
     pub(crate) async fn clear_staging_snapshot_dir(&self, staging_snapshot_id: &str) -> Result<()> {
-        if staging_snapshot_id == STAGING_DIR_NAME {
-            return self.clear_staging_dir().await;
-        }
-
         if self.table_metadata.path.starts_with("s3://") {
             if let Some(prefix) = self.snapshot_object_store_prefix(staging_snapshot_id)? {
                 self.delete_prefix_with_object_store(&prefix).await?;
@@ -1996,7 +1994,6 @@ impl CayenneTableProvider {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
-            tokio::fs::create_dir_all(&staging_dir).await?;
         }
 
         Ok(())
@@ -2014,11 +2011,6 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if any file move/copy fails.
-    pub(crate) async fn move_files_to_current_snapshot(&self) -> Result<()> {
-        self.move_staged_files_to_current_snapshot(STAGING_DIR_NAME)
-            .await
-    }
-
     pub(crate) async fn move_staged_files_to_current_snapshot(
         &self,
         staging_snapshot_id: &str,
@@ -2871,7 +2863,7 @@ impl CayenneTableProvider {
         // the cheap early-out in the compaction trigger. Only count files
         // landed in the live snapshot; staging writes are tracked separately
         // via the staging_may_have_files flag.
-        if snapshot_id != STAGING_DIR_NAME && writer_ops > 0 {
+        if !Self::is_staging_snapshot_id(snapshot_id) && writer_ops > 0 {
             self.record_current_snapshot_files_added(writer_ops);
         }
 
@@ -5358,15 +5350,6 @@ impl CayenneTableProvider {
     #[must_use]
     pub fn table_path_str(&self) -> &str {
         &self.table_metadata.path
-    }
-
-    /// Return this partition's staging WAL path for top-level recovery
-    /// records. Local-filesystem only — S3-backed tables return the same
-    /// shape but recovery is not yet wired for object stores (#10125 step 6
-    /// scope).
-    #[must_use]
-    pub fn staging_wal_path_for_recovery(&self) -> std::path::PathBuf {
-        self.staging_wal_path_for_recovery_for(STAGING_DIR_NAME)
     }
 
     #[must_use]

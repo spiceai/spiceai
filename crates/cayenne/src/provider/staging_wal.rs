@@ -99,17 +99,9 @@ impl std::fmt::Debug for CayenneStagedAppend {
 }
 
 impl CayenneStagedAppend {
-    pub(crate) fn from_staged_append(
-        table: CayenneTableProvider,
-        write_guard: OwnedMutexGuard<()>,
-        row_count: u64,
-    ) -> Self {
-        Self::from_staged_append_in(table, write_guard, STAGING_DIR_NAME.to_string(), row_count)
-    }
-
     pub(crate) fn from_staged_append_in(
         table: CayenneTableProvider,
-        write_guard: OwnedMutexGuard<()>,
+        write_guard: Option<OwnedMutexGuard<()>>,
         staging_snapshot_id: String,
         row_count: u64,
     ) -> Self {
@@ -121,19 +113,17 @@ impl CayenneStagedAppend {
         }
     }
 
-    pub(crate) fn from_existing_staging(table: CayenneTableProvider) -> Self {
-        Self {
-            table,
-            write_guard: None,
-            staging_snapshot_id: STAGING_DIR_NAME.to_string(),
-            row_count: 0,
-        }
-    }
-
     /// Returns the number of rows staged for commit.
     #[must_use]
     pub fn row_count(&self) -> u64 {
         self.row_count
+    }
+
+    /// Returns the local filesystem path to this append's staging WAL.
+    #[must_use]
+    pub fn staging_wal_path(&self) -> std::path::PathBuf {
+        self.table
+            .staging_wal_path_for_recovery_for(&self.staging_snapshot_id)
     }
 
     /// Writes the staging WAL for the current `_staging/` files.
@@ -227,18 +217,10 @@ impl CayenneStagedAppend {
         self.table
             .write_staging_wal_for(&self.staging_snapshot_id)
             .await?;
-        if self.staging_snapshot_id != STAGING_DIR_NAME {
-            self.table
-                .register_inflight_staging_append(&self.staging_snapshot_id);
-        }
-        let write_guard = if self.staging_snapshot_id == STAGING_DIR_NAME {
-            self.write_guard
-        } else {
-            None
-        };
+        self.table
+            .register_inflight_staging_append(&self.staging_snapshot_id);
         Ok(PreparedStagedAppend {
             table: self.table,
-            write_guard,
             staging_snapshot_id: self.staging_snapshot_id,
             row_count: self.row_count,
         })
@@ -277,7 +259,6 @@ impl CayenneStagedAppend {
 /// [`CayenneTableProvider::ensure_no_incomplete_write`].
 pub struct PreparedStagedAppend {
     table: CayenneTableProvider,
-    write_guard: Option<OwnedMutexGuard<()>>,
     staging_snapshot_id: String,
     row_count: u64,
 }
@@ -286,7 +267,6 @@ impl std::fmt::Debug for PreparedStagedAppend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedStagedAppend")
             .field("table", &self.table.table_name())
-            .field("has_write_guard", &self.write_guard.is_some())
             .field("staging_snapshot_id", &self.staging_snapshot_id)
             .field("row_count", &self.row_count)
             .finish()
@@ -439,10 +419,9 @@ impl PreparedStagedAppend {
     /// Finish a prepared append after [`Self::apply_under_barrier`] or
     /// [`Self::apply_in_txn`] has succeeded.
     ///
-    /// Releases the per-table write guard and returns the row count. For the
-    /// append path, all visibility work has already happened in
-    /// `apply_under_barrier`; this is purely a typestate transition that makes
-    /// the `Drop` of the write guard explicit.
+    /// Returns the row count. For the append path, all visibility work has
+    /// already happened in `apply_under_barrier`; this is purely a typestate
+    /// transition for callers that drive the staged lifecycle explicitly.
     ///
     /// # Errors
     ///
@@ -457,7 +436,6 @@ impl PreparedStagedAppend {
         // Async kept so a future cross-partition coordinator can call
         // `prep.finish().await` uniformly without callers having to know
         // whether finish is sync or async for this mode.
-        let _ = self.write_guard;
         Ok(self.row_count)
     }
 
@@ -472,13 +450,20 @@ impl PreparedStagedAppend {
     ///
     /// Returns an error if clearing the staging directory fails.
     pub async fn rollback(self) -> Result<()> {
-        // Same ordering rationale as `CayenneStagedAppend::rollback`: hold
-        // the write guard until after the staging directory is cleared so
-        // other writers can't transiently observe a leftover WAL between
-        // guard release and cleanup.
-        let _write_guard = self.write_guard;
-        self.table.clear_staging_dir().await
-        // _write_guard drops here.
+        self.table
+            .clear_staging_snapshot_dir(&self.staging_snapshot_id)
+            .await?;
+        self.table
+            .unregister_inflight_staging_append(&self.staging_snapshot_id);
+        if !self.table.has_inflight_staging_appends() {
+            self.table
+                .staging_wal_present()
+                .store(false, Ordering::Release);
+            self.table
+                .staging_may_have_files()
+                .store(false, Ordering::Release);
+        }
+        Ok(())
     }
 }
 
@@ -507,11 +492,6 @@ struct LocatedStagingWal {
 }
 
 impl CayenneTableProvider {
-    /// Create a staging WAL handle for data already written to `_staging/`.
-    pub(crate) fn staged_append_for_existing_staging(&self) -> CayenneStagedAppend {
-        CayenneStagedAppend::from_existing_staging(self.clone_for_write())
-    }
-
     /// Stage an append into Cayenne without making the new rows visible.
     ///
     /// This path supports append-only semantics and returns a handle that allows
@@ -551,22 +531,39 @@ impl CayenneTableProvider {
             });
         }
 
-        self.clear_staging_dir().await?;
+        let staging_snapshot_id = self.new_staging_snapshot_id();
+        self.clear_staging_snapshot_dir(&staging_snapshot_id).await?;
 
         self.staging_may_have_files().store(true, Ordering::Release);
 
-        let (row_count, _writer_ops, _stats_acc) = self
+        let (row_count, _writer_ops, _stats_acc) = match self
             .write_to_snapshot(
                 prepared_insert.stream,
                 self.target_file_size_bytes(),
-                STAGING_DIR_NAME,
+                &staging_snapshot_id,
                 target_partitions,
             )
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                if let Err(cleanup_err) = self
+                    .clear_staging_snapshot_dir(&staging_snapshot_id)
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to clean staging dir after staged append write error for table {}: {cleanup_err}",
+                        self.table_name(),
+                    );
+                }
+                return Err(e);
+            }
+        };
 
-        Ok(CayenneStagedAppend::from_staged_append(
+        Ok(CayenneStagedAppend::from_staged_append_in(
             self.clone_for_write(),
-            write_guard,
+            Some(write_guard),
+            staging_snapshot_id,
             row_count,
         ))
     }
@@ -582,10 +579,6 @@ impl CayenneTableProvider {
     ///
     /// The WAL file is placed at `{table_path}/{table_id}/_staging/_wal.json`
     /// (local FS) or at the corresponding S3 key.
-    pub(crate) async fn write_staging_wal(&self) -> Result<()> {
-        self.write_staging_wal_for(STAGING_DIR_NAME).await
-    }
-
     pub(crate) async fn write_staging_wal_for(&self, staging_snapshot_id: &str) -> Result<()> {
         let current_snapshot = self.get_current_snapshot_id();
 
@@ -760,10 +753,6 @@ impl CayenneTableProvider {
     /// This signals that all staged files have been moved successfully. If this
     /// removal fails, the WAL is stale (files already moved) and will be detected
     /// as a false positive on next open — harmless but logged.
-    pub(crate) async fn remove_staging_wal(&self) -> Result<()> {
-        self.remove_staging_wal_for(STAGING_DIR_NAME).await
-    }
-
     pub(crate) async fn remove_staging_wal_for(&self, staging_snapshot_id: &str) -> Result<()> {
         if self.table_path().starts_with("s3://") {
             let config = self.require_object_store()?;
@@ -826,15 +815,13 @@ impl CayenneTableProvider {
                     );
                     // Non-fatal: data files are already durable. A lingering WAL is conservative.
                 }
-                if staging_snapshot_id != STAGING_DIR_NAME {
-                    match tokio::fs::remove_dir(&staging_dir).await {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => tracing::debug!(
-                            "Failed to remove empty staging dir for table {}: {e}",
-                            self.table_name(),
-                        ),
-                    }
+                match tokio::fs::remove_dir(&staging_dir).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => tracing::debug!(
+                        "Failed to remove empty staging dir for table {}: {e}",
+                        self.table_name(),
+                    ),
                 }
             }
         }
@@ -851,18 +838,10 @@ impl CayenneTableProvider {
     ///
     /// Returns [`Error::IncompleteWrite`] if a staging WAL file is found.
     pub(crate) async fn ensure_no_incomplete_write(&self) -> Result<()> {
-        if !self.staging_wal_present().load(Ordering::Acquire) {
-            if self.table_path().starts_with("s3://") {
-                return Ok(());
-            }
-            let staging_dir =
-                Self::snapshot_dir_path(self.table_path(), self.table_id(), STAGING_DIR_NAME);
-            let wal_path = staging_dir.join(STAGING_WAL_FILENAME);
-            match tokio::fs::try_exists(&wal_path).await {
-                Ok(true) => {}
-                Ok(false) => return Ok(()),
-                Err(e) => return Err(Error::IoError { source: e }),
-            }
+        if !self.staging_wal_present().load(Ordering::Acquire)
+            && !self.staging_may_have_files().load(Ordering::Acquire)
+        {
+            return Ok(());
         }
 
         let mut located_wals = self.read_staging_wals().await?;
@@ -1132,10 +1111,12 @@ impl CayenneTableProvider {
         }
 
         // WAL absent, or only process-local in-flight WALs remain. When no
-        // in-flight append is known, correct the flag so future writes take
-        // the fast path (no S3 GET / FS read). Unparseable committed WALs are
-        // errors above; only uncommitted tmp WALs are ignored.
+        // in-flight append is known, clear any orphan pre-WAL staging files
+        // and correct the flags so future writes take the fast path. Unparseable
+        // committed WALs are errors above; only uncommitted tmp WALs are ignored.
         if !self.has_inflight_staging_appends() {
+            self.staging_may_have_files().store(true, Ordering::Release);
+            self.clear_staging_dir().await?;
             self.staging_wal_present().store(false, Ordering::Release);
         }
         Ok(())
@@ -1151,12 +1132,23 @@ impl CayenneTableProvider {
 
     async fn read_staging_wals_local(&self) -> Result<Vec<LocatedStagingWal>> {
         let mut wals = Vec::new();
-        if let Some(wal) = self.read_staging_wal_local_at(STAGING_DIR_NAME).await? {
-            wals.push(wal);
-        }
-
         let staging_root =
             Self::snapshot_dir_path(self.table_path(), self.table_id(), STAGING_DIR_NAME);
+        let top_level_wal = staging_root.join(STAGING_WAL_FILENAME);
+        match tokio::fs::try_exists(&top_level_wal).await {
+            Ok(true) => {
+                let location = top_level_wal.to_string_lossy().to_string();
+                return Err(Error::IncompleteWrite {
+                    table: self.table_name().to_string(),
+                    message: format!(
+                        "Found unsupported top-level staging WAL at '{location}'. Cayenne staged appends now use isolated '_staging/<id>/' directories. Manual resolution is required."
+                    ),
+                });
+            }
+            Ok(false) => {}
+            Err(e) => return Err(Error::IoError { source: e }),
+        }
+
         let mut entries = match tokio::fs::read_dir(&staging_root).await {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(wals),
@@ -1227,7 +1219,13 @@ impl CayenneTableProvider {
                 continue;
             };
             let staging_snapshot_id = if relative == STAGING_WAL_FILENAME {
-                STAGING_DIR_NAME.to_string()
+                return Err(Error::IncompleteWrite {
+                    table: self.table_name().to_string(),
+                    message: format!(
+                        "Found unsupported top-level staging WAL at '{}'. Cayenne staged appends now use isolated '_staging/<id>/' prefixes. Manual resolution is required.",
+                        meta.location,
+                    ),
+                });
             } else if let Some(child) = relative.strip_suffix(&format!("/{STAGING_WAL_FILENAME}")) {
                 format!("{STAGING_DIR_NAME}/{child}")
             } else {
