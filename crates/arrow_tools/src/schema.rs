@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
+use arrow::array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::common::DFSchema;
 use snafu::prelude::*;
@@ -146,6 +147,43 @@ pub fn expand_views_schema(schema: &Schema) -> Schema {
         .collect();
 
     Schema::new_with_metadata(transformed_fields, schema.metadata().clone())
+}
+
+/// Cast any columns whose type differs from the target schema (e.g. `Utf8View` → `LargeUtf8`).
+///
+/// Returns the batch unchanged if the column count differs from the target schema.
+pub fn cast_view_columns(
+    batch: RecordBatch,
+    target_schema: &Arc<Schema>,
+) -> Result<RecordBatch, arrow::error::ArrowError> {
+    if batch.num_columns() != target_schema.fields().len() {
+        return Ok(batch);
+    }
+
+    if batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(target_schema.fields().iter())
+        .all(|(s, t)| s.data_type() == t.data_type())
+    {
+        return Ok(batch);
+    }
+
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(target_schema.fields().iter())
+        .map(|(col, target_field)| {
+            if col.data_type() == target_field.data_type() {
+                Ok(Arc::clone(col))
+            } else {
+                arrow::compute::cast(col, target_field.data_type())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    RecordBatch::try_new(Arc::clone(target_schema), columns)
 }
 
 /// Replaces Arrow `Dictionary`-encoded fields with the dictionary's value type.

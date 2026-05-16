@@ -337,7 +337,7 @@ impl Service {
                 match batch_result {
                     Ok(batch) => {
                         // Cast view columns to match the expanded schema we advertised.
-                        let batch = cast_view_columns(batch, &schema)
+                        let batch = arrow_tools::schema::cast_view_columns(batch, &schema)
                             .map_err(|e| Status::internal(e.to_string()))?;
                         let (dicts, batch_data) = encoder
                             .encode(&batch, &mut dict_tracker, &options, &mut compression_context)
@@ -373,36 +373,6 @@ impl Service {
         let scoped_stream = request_context.scope_stream(stream);
         Response::from_parts(metadata, scoped_stream.boxed(), extensions)
     }
-}
-
-fn cast_view_columns(
-    batch: RecordBatch,
-    target_schema: &Arc<Schema>,
-) -> Result<RecordBatch, arrow::error::ArrowError> {
-    if batch
-        .schema()
-        .fields()
-        .iter()
-        .zip(target_schema.fields().iter())
-        .all(|(s, t)| s.data_type() == t.data_type())
-    {
-        return Ok(batch);
-    }
-
-    let columns = batch
-        .columns()
-        .iter()
-        .zip(target_schema.fields().iter())
-        .map(|(col, target_field)| {
-            if col.data_type() == target_field.data_type() {
-                Ok(Arc::clone(col))
-            } else {
-                arrow::compute::cast(col, target_field.data_type())
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    RecordBatch::try_new(Arc::clone(target_schema), columns)
 }
 
 pub(crate) fn record_batches_to_flight_stream(
@@ -845,7 +815,6 @@ impl Default for RateLimits {
 
 #[cfg(test)]
 mod tests {
-    use super::cast_view_columns;
     use arrow::array::{Array, RecordBatch};
     use arrow::{
         array::{
@@ -854,6 +823,7 @@ mod tests {
         },
         datatypes::{DataType, Field, Schema},
     };
+    use arrow_tools::schema::cast_view_columns;
     use std::sync::Arc;
 
     fn schema(fields: Vec<(&str, DataType)>) -> Arc<Schema> {
