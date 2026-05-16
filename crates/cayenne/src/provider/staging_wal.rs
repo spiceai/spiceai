@@ -107,7 +107,7 @@ impl CayenneStagedAppend {
     ) -> Self {
         Self {
             table,
-            write_guard: Some(write_guard),
+            write_guard,
             staging_snapshot_id,
             row_count,
         }
@@ -247,12 +247,11 @@ impl CayenneStagedAppend {
 /// A staged append that has been [prepared](CayenneStagedAppend::prepare) for
 /// commit.
 ///
-/// Holds the staging WAL on disk and the per-table write guard. Completing the
-/// commit is a two-step dance:
+/// Holds the staging WAL on disk. Completing the commit is a two-step dance:
 ///
 /// 1. [`Self::apply_under_barrier`] (append path) or [`Self::apply_in_txn`]
 ///    (overwrite path, future work) performs the visibility flip.
-/// 2. [`Self::finish`] releases the guard and returns the row count.
+/// 2. [`Self::finish`] returns the row count.
 ///
 /// Dropping a `PreparedStagedAppend` without calling `finish` or `rollback`
 /// leaves the staging WAL on disk; the next write attempt will fail at
@@ -469,9 +468,9 @@ impl PreparedStagedAppend {
 
 /// Staging WAL (Write-Ahead Log) entry.
 ///
-/// Written to `_staging/_wal.json` after all data files are staged but before
-/// the move-to-snapshot operation begins. Records the intent so that an
-/// interrupted move can be detected on the next table open.
+/// Written to `_staging/<id>/_wal.json` after all data files are staged but
+/// before the move-to-snapshot operation begins. Records the intent so that
+/// an interrupted move can be detected on the next table open.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct StagingWal {
     /// The table this WAL entry belongs to.
@@ -577,7 +576,7 @@ impl CayenneTableProvider {
     ///
     /// # Layout
     ///
-    /// The WAL file is placed at `{table_path}/{table_id}/_staging/_wal.json`
+    /// The WAL file is placed at `{table_path}/{table_id}/_staging/<id>/_wal.json`
     /// (local FS) or at the corresponding S3 key.
     pub(crate) async fn write_staging_wal_for(&self, staging_snapshot_id: &str) -> Result<()> {
         let current_snapshot = self.get_current_snapshot_id();
@@ -601,6 +600,7 @@ impl CayenneTableProvider {
     ) -> Result<()> {
         let staging_dir =
             Self::snapshot_dir_path(self.table_path(), self.table_id(), staging_snapshot_id);
+        Self::ensure_snapshot_dir_exists(&staging_dir).await?;
 
         // Collect staged data file names (exclude WAL bookkeeping files).
         let mut staged_files = Vec::new();

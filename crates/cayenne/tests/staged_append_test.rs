@@ -1196,6 +1196,42 @@ fn staging_dir(table: &CayenneTableProvider) -> PathBuf {
         .join(STAGING_DIR_NAME)
 }
 
+fn staging_child_dir(table: &CayenneTableProvider, child: &str) -> PathBuf {
+    staging_dir(table).join(child)
+}
+
+fn write_manual_staging_wal(
+    table: &CayenneTableProvider,
+    child: &str,
+    wal_content: &serde_json::Value,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let staging = staging_child_dir(table, child);
+    std::fs::create_dir_all(&staging)?;
+    let wal_path = staging.join(STAGING_WAL_FILENAME);
+    std::fs::write(&wal_path, serde_json::to_string_pretty(wal_content)?)?;
+    Ok(wal_path)
+}
+
+fn staging_wal_paths(table: &CayenneTableProvider) -> Vec<PathBuf> {
+    let root = staging_dir(table);
+    if !root.exists() {
+        return Vec::new();
+    }
+
+    std::fs::read_dir(root)
+        .expect("read staging dir")
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let file_type = entry.file_type().ok()?;
+            if !file_type.is_dir() {
+                return None;
+            }
+            let wal_path = entry.path().join(STAGING_WAL_FILENAME);
+            wal_path.exists().then_some(wal_path)
+        })
+        .collect()
+}
+
 /// Assert that `_staging/` is empty (no files).
 fn assert_staging_empty(staging: &std::path::Path) {
     if !staging.exists() {

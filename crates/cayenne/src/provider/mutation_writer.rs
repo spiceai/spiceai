@@ -75,7 +75,6 @@ use futures::StreamExt;
 use tokio::sync::OwnedMutexGuard;
 
 use super::Result;
-use super::constants::STAGING_DIR_NAME;
 use super::context::CayenneContext;
 use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 use super::table::{
@@ -237,11 +236,6 @@ impl<'a> AppendMutationWriter<'a> {
             ));
         }
 
-        let staging_snapshot_id = self.table.new_staging_snapshot_id();
-        self.table
-            .clear_staging_snapshot_dir(&staging_snapshot_id)
-            .await?;
-
         match self
             .try_inline_or_restream(prepared_stream, &[], &[])
             .await?
@@ -255,12 +249,16 @@ impl<'a> AppendMutationWriter<'a> {
             }
             InlineMutationOutcome::Fallback(re_stream) => {
                 prepared_stream = re_stream;
+                let staging_snapshot_id = self.table.new_staging_snapshot_id();
                 let target_size_bytes = self.context.target_file_size_bytes();
+                    self.table
+                        .clear_staging_snapshot_dir(&staging_snapshot_id)
+                        .await?;
                 let (rows, writer_ops, stats_acc, prepared_append) = self
                     .write_staged_append_prepared(
                         prepared_stream,
                         target_size_bytes,
-                        write_guard,
+                            Some(write_guard),
                         staging_snapshot_id,
                     )
                     .await?;
@@ -332,8 +330,6 @@ impl<'a> AppendMutationWriter<'a> {
         );
 
         let needs_new_snapshot = pending_pk_deletions || has_file_on_conflict_deletions;
-
-        self.table.clear_staging_dir().await?;
 
         let inline_policy = InlineMutationPolicy::from_blocking_conditions([
             pending_pk_deletions,
@@ -510,8 +506,13 @@ impl<'a> AppendMutationWriter<'a> {
         stream: SendableRecordBatchStream,
         target_size_bytes: usize,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
+        let staging_snapshot_id = self.table.new_staging_snapshot_id();
+        self.table
+            .clear_staging_snapshot_dir(&staging_snapshot_id)
+            .await?;
+
         // We are about to (or have started to) write Vortex files into the
-        // staging directory. Mark it "dirty" so the next clear_staging_dir
+        // staging directory. Mark it "dirty" so recovery/root cleanup
         // (on this or a future writer, or on recovery after a crash) will
         // actually perform the cleanup instead of taking the fast path.
         self.table
@@ -523,14 +524,18 @@ impl<'a> AppendMutationWriter<'a> {
             .write_to_snapshot(
                 stream,
                 target_size_bytes,
-                STAGING_DIR_NAME,
+                &staging_snapshot_id,
                 self.task_context.session_config().target_partitions(),
             )
             .await
         {
             Ok(result) => result,
             Err(e) => {
-                if let Err(cleanup_err) = self.table.clear_staging_dir().await {
+                if let Err(cleanup_err) = self
+                    .table
+                    .clear_staging_snapshot_dir(&staging_snapshot_id)
+                    .await
+                {
                     tracing::warn!(
                         "Failed to clean staging dir after write error for table {}: {cleanup_err}",
                         self.table.table_name(),
@@ -540,7 +545,12 @@ impl<'a> AppendMutationWriter<'a> {
             }
         };
 
-        let staged_append = self.table.staged_append_for_existing_staging();
+        let staged_append = CayenneStagedAppend::from_staged_append_in(
+            self.table.clone_for_write_operations(),
+            None,
+            staging_snapshot_id,
+            result.0,
+        );
         staged_append.finalize_staged_write().await?;
 
         Ok(result)
@@ -550,7 +560,7 @@ impl<'a> AppendMutationWriter<'a> {
         &self,
         stream: SendableRecordBatchStream,
         target_size_bytes: usize,
-        write_guard: OwnedMutexGuard<()>,
+            write_guard: Option<OwnedMutexGuard<()>>,
         staging_snapshot_id: String,
     ) -> Result<(
         u64,
@@ -590,7 +600,7 @@ impl<'a> AppendMutationWriter<'a> {
 
         let staged_append = CayenneStagedAppend::from_staged_append_in(
             self.table.clone_for_write_operations(),
-            write_guard,
+                write_guard,
             staging_snapshot_id.clone(),
             rows,
         );

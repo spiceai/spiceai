@@ -107,6 +107,10 @@ name = "listing_fence_overhead"
 
 [[bench]]
 harness = false
+name = "sorted_append_overhead"
+
+[[bench]]
+harness = false
 name = "vs_duckdb_ingest"
 required-features = ["duckdb-bench"]
 
