@@ -532,7 +532,8 @@ impl CayenneTableProvider {
         }
 
         let staging_snapshot_id = self.new_staging_snapshot_id();
-        self.clear_staging_snapshot_dir(&staging_snapshot_id).await?;
+        self.clear_staging_snapshot_dir(&staging_snapshot_id)
+            .await?;
 
         self.staging_may_have_files().store(true, Ordering::Release);
 
@@ -547,9 +548,8 @@ impl CayenneTableProvider {
         {
             Ok(result) => result,
             Err(e) => {
-                if let Err(cleanup_err) = self
-                    .clear_staging_snapshot_dir(&staging_snapshot_id)
-                    .await
+                if let Err(cleanup_err) =
+                    self.clear_staging_snapshot_dir(&staging_snapshot_id).await
                 {
                     tracing::warn!(
                         "Failed to clean staging dir after staged append write error for table {}: {cleanup_err}",
