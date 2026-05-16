@@ -251,14 +251,14 @@ impl<'a> AppendMutationWriter<'a> {
                 prepared_stream = re_stream;
                 let staging_snapshot_id = self.table.new_staging_snapshot_id();
                 let target_size_bytes = self.context.target_file_size_bytes();
-                    self.table
-                        .clear_staging_snapshot_dir(&staging_snapshot_id)
-                        .await?;
+                self.table
+                    .clear_staging_snapshot_dir(&staging_snapshot_id)
+                    .await?;
                 let (rows, writer_ops, stats_acc, prepared_append) = self
                     .write_staged_append_prepared(
                         prepared_stream,
                         target_size_bytes,
-                            Some(write_guard),
+                        Some(write_guard),
                         staging_snapshot_id,
                     )
                     .await?;
@@ -560,7 +560,7 @@ impl<'a> AppendMutationWriter<'a> {
         &self,
         stream: SendableRecordBatchStream,
         target_size_bytes: usize,
-            write_guard: Option<OwnedMutexGuard<()>>,
+        write_guard: Option<OwnedMutexGuard<()>>,
         staging_snapshot_id: String,
     ) -> Result<(
         u64,
@@ -600,7 +600,7 @@ impl<'a> AppendMutationWriter<'a> {
 
         let staged_append = CayenneStagedAppend::from_staged_append_in(
             self.table.clone_for_write_operations(),
-                write_guard,
+            write_guard,
             staging_snapshot_id.clone(),
             rows,
         );

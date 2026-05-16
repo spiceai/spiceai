@@ -298,20 +298,15 @@ async fn test_wal_blocks_table_open_impl(
         .collect()
         .await?;
 
-    // Plant a fake WAL file in _staging/ to simulate interrupted move
-    let staging = staging_dir(&table);
-    std::fs::create_dir_all(&staging)?;
+    // Plant a fake WAL file in an isolated staging dir to simulate interrupted move
     let wal_content = serde_json::json!({
         "table_name": "wal_open",
         "target_snapshot": "fake_snapshot_id",
         "staged_files": ["part-0.vortex", "part-1.vortex"],
         "created_at": "2026-02-28T00:00:00Z"
     });
-    std::fs::write(
-        staging.join(STAGING_WAL_FILENAME),
-        serde_json::to_string_pretty(&wal_content)?,
-    )?;
-    assert!(staging.join(STAGING_WAL_FILENAME).exists());
+    let wal_path = write_manual_staging_wal(&table, "manual-open", &wal_content)?;
+    assert!(wal_path.exists());
 
     // Try to re-open the table — should fail with IncompleteWrite
     let meta = table.metadata();
@@ -348,19 +343,14 @@ async fn test_wal_blocks_new_writes_impl(
         .await?;
     assert_eq!(row_count(&ctx, "wal_write").await, 1);
 
-    // Plant a WAL file
-    let staging = staging_dir(&table);
-    std::fs::create_dir_all(&staging)?;
+    // Plant a WAL file in an isolated staging dir
     let wal_content = serde_json::json!({
         "table_name": "wal_write",
         "target_snapshot": "fake_snapshot_id",
         "staged_files": ["part-0.vortex"],
         "created_at": "2026-02-28T00:00:00Z"
     });
-    std::fs::write(
-        staging.join(STAGING_WAL_FILENAME),
-        serde_json::to_string_pretty(&wal_content)?,
-    )?;
+    write_manual_staging_wal(&table, "manual-write", &wal_content)?;
 
     // Attempt another write — should fail
     let result = ctx
@@ -396,9 +386,8 @@ async fn test_wal_removed_on_successful_append_impl(
 
     // After successful write, WAL must NOT exist
     let staging = staging_dir(&table);
-    let wal_path = staging.join(STAGING_WAL_FILENAME);
     assert!(
-        !wal_path.exists(),
+        staging_wal_paths(&table).is_empty(),
         "WAL file should be removed after successful append"
     );
 
@@ -462,11 +451,11 @@ async fn test_wal_persists_on_move_failure_impl(
         "Insert should fail when snapshot directory is corrupted"
     );
 
-    // Step 4: Verify WAL persists in _staging/ after the failed move
-    let staging = staging_dir(&table);
-    let wal_path = staging.join(STAGING_WAL_FILENAME);
-    assert!(
-        wal_path.exists(),
+    // Step 4: Verify WAL persists in an isolated staging dir after the failed move.
+    let wal_paths = staging_wal_paths(&table);
+    assert_eq!(
+        wal_paths.len(),
+        1,
         "WAL file should persist after a failed move — indicates incomplete write"
     );
 
@@ -490,15 +479,13 @@ async fn test_prepared_lifecycle_matches_commit_impl(
     // Drive the staged-append API directly, then walk the three-phase lifecycle.
     let staged = begin_staged_append_with_rows(&table, &[(1, "Alice"), (2, "Bob")]).await?;
     let staged_rows = staged.row_count();
+    let wal_path = staged.staging_wal_path();
 
     let prepared: PreparedStagedAppend = staged.prepare().await?;
 
     // After prepare(), the WAL exists and the staged data is NOT yet visible.
     let staging = staging_dir(&table);
-    assert!(
-        staging.join(STAGING_WAL_FILENAME).exists(),
-        "prepare() must write the staging WAL"
-    );
+    assert!(wal_path.exists(), "prepare() must write the staging WAL");
     assert_eq!(
         row_count(&ctx, "lifecycle_parity").await,
         0,
@@ -512,7 +499,7 @@ async fn test_prepared_lifecycle_matches_commit_impl(
     // preserves the invariant that "WAL absent ⇒ files moved successfully"; a
     // crash between WAL removal and listing refresh is self-healing.
     assert!(
-        !staging.join(STAGING_WAL_FILENAME).exists(),
+        !wal_path.exists(),
         "apply_under_barrier() must remove the staging WAL"
     );
     assert_eq!(
@@ -558,8 +545,9 @@ async fn test_prepared_rollback_clears_staging_impl(
     let (table, ctx) = setup_table(&fixture, "lifecycle_rollback").await;
 
     let staged = begin_staged_append_with_rows(&table, &[(10, "X"), (11, "Y")]).await?;
+    let wal_path = staged.staging_wal_path();
     let prepared = staged.prepare().await?;
-    assert!(staging_dir(&table).join(STAGING_WAL_FILENAME).exists());
+    assert!(wal_path.exists());
 
     prepared.rollback().await?;
 
@@ -594,10 +582,13 @@ async fn test_wal_atomic_appearance_impl(
     let (table, _ctx) = setup_table(&fixture, "wal_atomic").await;
 
     let staged = begin_staged_append_with_rows(&table, &[(1, "Alice")]).await?;
+    let final_path = staged.staging_wal_path();
+    let staging = final_path
+        .parent()
+        .expect("WAL path has parent")
+        .to_path_buf();
     let prepared = staged.prepare().await?;
 
-    let staging = staging_dir(&table);
-    let final_path = staging.join(STAGING_WAL_FILENAME);
     let tmp_path = staging.join(STAGING_WAL_TMP_FILENAME);
 
     assert!(
@@ -687,7 +678,11 @@ async fn test_leftover_tmp_not_moved_to_snapshot_impl(
     // Begin a staged append, then plant a tmp before the commit phase walks
     // the staging dir. The tmp is junk that must be excluded from the move.
     let staged = begin_staged_append_with_rows(&table, &[(2, "Bob")]).await?;
-    let staging = staging_dir(&table);
+    let staging = staged
+        .staging_wal_path()
+        .parent()
+        .expect("WAL path has parent")
+        .to_path_buf();
     std::fs::write(staging.join(STAGING_WAL_TMP_FILENAME), b"prior crashed tmp")?;
     staged.commit().await?;
 
@@ -728,13 +723,16 @@ async fn test_leftover_tmp_excluded_from_staged_files_impl(
     // Stage some data, then plant a stray tmp before prepare()
     let staged =
         begin_staged_append_with_rows(&table, &[(1, "Alice"), (2, "Bob"), (3, "Carol")]).await?;
-    let staging = staging_dir(&table);
+    let final_path = staged.staging_wal_path();
+    let staging = final_path
+        .parent()
+        .expect("WAL path has parent")
+        .to_path_buf();
     std::fs::write(staging.join(STAGING_WAL_TMP_FILENAME), b"junk")?;
 
     let prepared = staged.prepare().await?;
 
-    let content =
-        std::fs::read_to_string(staging.join(STAGING_WAL_FILENAME)).expect("read final WAL");
+    let content = std::fs::read_to_string(&final_path).expect("read final WAL");
     let parsed: serde_json::Value = serde_json::from_str(&content).expect("WAL must parse");
     let files = parsed["staged_files"]
         .as_array()
@@ -777,28 +775,32 @@ async fn test_repeated_wal_writes_are_atomic_impl(
 
     let staging = staging_dir(&table);
     assert!(
-        !staging.join(STAGING_WAL_FILENAME).exists(),
+        staging_wal_paths(&table).is_empty(),
         "WAL must not persist after a successful commit"
     );
 
     // Drive a second insert; after the prepare() the WAL exists and parses.
     let staged = begin_staged_append_with_rows(&table, &[(2, "B")]).await?;
+    let first_wal_path = staged.staging_wal_path();
     let prepared = staged.prepare().await?;
-    let first_content =
-        std::fs::read_to_string(staging.join(STAGING_WAL_FILENAME)).expect("read 1st WAL");
+    let first_content = std::fs::read_to_string(&first_wal_path).expect("read 1st WAL");
     serde_json::from_str::<serde_json::Value>(&first_content).expect("1st WAL parses");
     prepared.rollback().await?;
 
     // Drive a third staged append from scratch — the WAL must be a fresh,
     // valid document, not a half-overwritten remnant of the previous one.
     let staged = begin_staged_append_with_rows(&table, &[(3, "C"), (4, "D")]).await?;
+    let second_wal_path = staged.staging_wal_path();
+    let second_staging = second_wal_path
+        .parent()
+        .expect("WAL path has parent")
+        .to_path_buf();
     let prepared = staged.prepare().await?;
-    let second_content =
-        std::fs::read_to_string(staging.join(STAGING_WAL_FILENAME)).expect("read 2nd WAL");
+    let second_content = std::fs::read_to_string(&second_wal_path).expect("read 2nd WAL");
     let parsed: serde_json::Value = serde_json::from_str(&second_content).expect("2nd WAL parses");
     assert_eq!(parsed["table_name"], "wal_atomic_replace");
     assert!(
-        !staging.join(STAGING_WAL_TMP_FILENAME).exists(),
+        !second_staging.join(STAGING_WAL_TMP_FILENAME).exists(),
         "Tmp file must be renamed away by prepare()"
     );
 
@@ -851,18 +853,13 @@ async fn test_wal_with_missing_files_blocks_recovery_impl(
 
     // Plant a WAL that references files that exist nowhere on disk —
     // simulates the "filesystem corruption that lost staged files" scenario.
-    let staging = staging_dir(&table);
-    std::fs::create_dir_all(&staging)?;
     let wal_content = serde_json::json!({
         "table_name": "wal_corrupt",
         "target_snapshot": "missing_snapshot_id",
         "staged_files": ["part-000.vortex", "part-001.vortex"],
         "created_at": "2026-03-01T12:00:00Z"
     });
-    std::fs::write(
-        staging.join(STAGING_WAL_FILENAME),
-        serde_json::to_string_pretty(&wal_content)?,
-    )?;
+    write_manual_staging_wal(&table, "manual-corrupt", &wal_content)?;
 
     // Attempt a fresh write — the audit must refuse to silently recover
     // the corrupt WAL, so the write fails.
@@ -942,18 +939,13 @@ async fn test_wal_with_files_in_snapshot_self_heals_impl(
     // Plant a WAL referencing those (already-moved) files. Staging is
     // empty — the audit should still recognise the files in the snapshot
     // and let recovery unlink the stale WAL.
-    let staging = staging_dir(&table);
-    std::fs::create_dir_all(&staging)?;
     let wal_content = serde_json::json!({
         "table_name": "wal_benign",
         "target_snapshot": &meta.current_snapshot_id,
         "staged_files": &vortex_files,
         "created_at": "2026-03-01T12:00:00Z"
     });
-    std::fs::write(
-        staging.join(STAGING_WAL_FILENAME),
-        serde_json::to_string_pretty(&wal_content)?,
-    )?;
+    let wal_path = write_manual_staging_wal(&table, "manual-benign", &wal_content)?;
 
     // A subsequent staged write must succeed — recovery removes the stale
     // WAL because the audit verifies every WAL-listed file is reachable in
@@ -963,7 +955,7 @@ async fn test_wal_with_files_in_snapshot_self_heals_impl(
     staged.commit().await?;
 
     assert!(
-        !staging.join(STAGING_WAL_FILENAME).exists(),
+        !wal_path.exists(),
         "auto-recovery must unlink the stale WAL once it has verified that \
          all listed files are accounted for in the snapshot"
     );
@@ -1025,9 +1017,8 @@ async fn test_writer_wal_survives_inline_compaction_impl(
     assert_eq!(total, usize::try_from(large_rows).expect("row count fits"));
 
     // No leftover WAL.
-    let staging = staging_dir(&table);
     assert!(
-        !staging.join(STAGING_WAL_FILENAME).exists(),
+        staging_wal_paths(&table).is_empty(),
         "writer's WAL must be removed after successful commit across compaction boundary"
     );
 

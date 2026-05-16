@@ -91,7 +91,10 @@ fn schema() -> Arc<Schema> {
 
 fn make_batch(schema: Arc<Schema>, start: i64, rows: usize) -> RecordBatch {
     let ids = (start..start + rows as i64).collect::<Vec<_>>();
-    let names = ids.iter().map(|id| format!("name_{id}")).collect::<Vec<_>>();
+    let names = ids
+        .iter()
+        .map(|id| format!("name_{id}"))
+        .collect::<Vec<_>>();
     RecordBatch::try_new(
         schema,
         vec![
