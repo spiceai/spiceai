@@ -225,7 +225,7 @@ impl PartitionStore {
     pub async fn set_unassigned_partitions(
         &self,
         table: &TableReference,
-        partition_values: Vec<HashMap<String, String>>,
+        partition_values: Vec<HashMap<String, Option<String>>>,
         partition_expressions: Vec<String>,
     ) -> Result<()> {
         let key = normalized_table_name(table);
@@ -1018,8 +1018,8 @@ mod tests {
         pm.initialize_metadata(&table, vec!["region".to_string()])
             .await
             .expect("init");
-        let values: Vec<HashMap<String, String>> = (0..50)
-            .map(|i| HashMap::from([("region".to_string(), format!("r-{i}"))]))
+        let values: Vec<HashMap<String, Option<String>>> = (0..50)
+            .map(|i| HashMap::from([("region".to_string(), Some(format!("r-{i}")))]))
             .collect();
         pm.set_unassigned_partitions(&table, values.clone(), vec![])
             .await

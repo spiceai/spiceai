@@ -454,7 +454,14 @@ async fn route_batch_and_assign_unseen(
             let partition_value: PartitionValue = partition_expr_keys
                 .iter()
                 .zip(scalar_values.iter())
-                .map(|(expr_key, scalar)| (expr_key.clone(), scalar_to_sql_literal(scalar)))
+                .map(|(expr_key, scalar)| {
+                    let val = if scalar.is_null() {
+                        None
+                    } else {
+                        Some(scalar_to_sql_literal(scalar))
+                    };
+                    (expr_key.clone(), val)
+                })
                 .collect();
             Some((scalar_values, partition_value, sub_batch))
         })

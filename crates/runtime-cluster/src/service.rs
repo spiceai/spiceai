@@ -585,7 +585,7 @@ fn resolved_equality(a: &TableReference, b: &TableReference) -> bool {
 }
 
 /// Sort a `PartitionValue` into a deterministic `Vec<(k, v)>` for equality comparisons.
-fn sorted_kv(p: &PartitionValue) -> Vec<(String, String)> {
+fn sorted_kv(p: &PartitionValue) -> Vec<(String, Option<String>)> {
     let mut v: Vec<_> = p.clone().into_iter().collect();
     v.sort();
     v
@@ -1176,7 +1176,7 @@ mod tests {
     }
 
     fn pv(key: &str, val: &str) -> PartitionValue {
-        HashMap::from([(key.to_string(), val.to_string())])
+        HashMap::from([(key.to_string(), Some(val.to_string()))])
     }
 
     async fn setup_table(store: &PartitionStore, table: &str, partitions: Vec<PartitionMetadata>) {
