@@ -83,7 +83,7 @@ use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::on_conflict::OnConflict;
-use futures::{StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream};
 use object_store::path::Path as ObjectStorePath;
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use roaring::RoaringBitmap;
@@ -108,6 +108,7 @@ use super::vortex_format::DeletionFilteringVortexFormat;
 use arc_swap::ArcSwap;
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
+const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
 
 #[derive(Default)]
 struct PostWriteMaintenanceState {
@@ -1718,17 +1719,24 @@ impl CayenneTableProvider {
                 source: e,
             })?;
 
-        for meta in objects {
-            config
-                .store
-                .delete(&meta.location)
-                .await
-                .map_err(|e| Error::ObjectStore {
-                    operation: "delete object from snapshot cleanup",
-                    table: self.table_metadata.table_name.clone(),
-                    source: e,
-                })?;
-        }
+        let store = Arc::clone(&config.store);
+        let table_name = self.table_metadata.table_name.clone();
+        stream::iter(objects.into_iter().map(Ok::<_, Error>))
+            .try_for_each_concurrent(OBJECT_STORE_MOVE_CONCURRENCY, |meta| {
+                let store = Arc::clone(&store);
+                let table_name = table_name.clone();
+                async move {
+                    store
+                        .delete(&meta.location)
+                        .await
+                        .map_err(|e| Error::ObjectStore {
+                            operation: "delete object from snapshot cleanup",
+                            table: table_name,
+                            source: e,
+                        })
+                }
+            })
+            .await?;
 
         Ok(())
     }
@@ -2152,8 +2160,7 @@ impl CayenneTableProvider {
             return Ok(());
         }
 
-        // Phase 1: copy data objects to target prefix (skip WAL file)
-        let mut copied_locations = Vec::with_capacity(objects.len());
+        let mut file_moves = Vec::with_capacity(objects.len());
         for meta in &objects {
             let relative = meta
                 .location
@@ -2177,45 +2184,63 @@ impl CayenneTableProvider {
             }
             let target_path =
                 ObjectStorePath::from(format!("{}{relative}", target_prefix.as_ref()));
+            file_moves.push((meta.location.clone(), target_path));
+        }
 
-            config
-                .store
-                .copy(&meta.location, &target_path)
-                .await
-                .map_err(|e| {
+        // Phase 1: copy data objects to target prefix. Keep Phase 2 separate so
+        // an interrupted move never deletes a staging original before every
+        // target copy has succeeded.
+        let store = Arc::clone(&config.store);
+        let table_name = self.table_metadata.table_name.clone();
+        stream::iter(file_moves.iter().cloned().map(Ok::<_, Error>))
+            .try_for_each_concurrent(OBJECT_STORE_MOVE_CONCURRENCY, |(source, target)| {
+            let store = Arc::clone(&store);
+            let table_name = table_name.clone();
+            async move {
+                store.copy(&source, &target).await.map_err(|e| {
                     // On S3, a copy failure for a file listed in a leftover staging WAL
                     // is often caused by a partial/incomplete multipart upload (crash
                     // during a large Vortex file upload). The recovery will fail for
                     // this WAL (safe), but we emit a clear error to aid diagnosis.
                     Error::ObjectStore {
                         operation: "copy staging file to snapshot (may be partial multipart upload from interrupted write)",
-                        table: self.table_metadata.table_name.clone(),
+                        table: table_name,
                         source: e,
                     }
-                })?;
-            copied_locations.push(meta.location.clone());
-        }
+                })
+            }
+            })
+            .await?;
 
-        // Phase 2: delete staging originals
-        for location in &copied_locations {
-            config
-                .store
-                .delete(location)
-                .await
-                .map_err(|e| Error::ObjectStore {
+        // Phase 2: delete staging originals.
+        let store = Arc::clone(&config.store);
+        let table_name = self.table_metadata.table_name.clone();
+        stream::iter(
+            file_moves
+                .iter()
+                .map(|(source, _)| source.clone())
+                .map(Ok::<_, Error>),
+        )
+        .try_for_each_concurrent(OBJECT_STORE_MOVE_CONCURRENCY, |source| {
+            let store = Arc::clone(&store);
+            let table_name = table_name.clone();
+            async move {
+                store.delete(&source).await.map_err(|e| Error::ObjectStore {
                     operation: "delete staging file after copy",
-                    table: self.table_metadata.table_name.clone(),
+                    table: table_name,
                     source: e,
-                })?;
-        }
+                })
+            }
+        })
+        .await?;
 
         tracing::debug!(
             "Moved {} file(s) from staging to snapshot {current_snapshot} (S3) for table {}",
-            copied_locations.len(),
+            file_moves.len(),
             self.table_metadata.table_name,
         );
 
-        self.record_current_snapshot_files_added(copied_locations.len());
+        self.record_current_snapshot_files_added(file_moves.len());
 
         Ok(())
     }
@@ -3594,7 +3619,12 @@ impl CayenneTableProvider {
             };
 
         let mut keep_mask = Vec::with_capacity(batch.num_rows());
-        let mut row_keys: Vec<OwnedRow> = Vec::with_capacity(batch.num_rows());
+        let mut kept_keys: HashSet<OwnedRow> = HashSet::with_capacity(batch.num_rows());
+        let mut row_keys: Vec<OwnedRow> = if ctx.upsert_options.is_default() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(batch.num_rows())
+        };
         let mut delete_specs: HashMap<i64, Vec<i64>> = HashMap::new();
         let mut deleted_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
@@ -3619,11 +3649,9 @@ impl CayenneTableProvider {
                 });
             }
 
-            if let Some(existing) = ctx.existing_keys.get(&key) {
+            let keep_row = if let Some(existing) = ctx.existing_keys.get(&key) {
                 match ctx.on_conflict {
-                    OnConflict::DoNothingAll | OnConflict::DoNothing(_) => {
-                        keep_mask.push(false);
-                    }
+                    OnConflict::DoNothingAll | OnConflict::DoNothing(_) => false,
                     OnConflict::Upsert(_) => {
                         let is_inlined_conflict = existing.source == RowSource::Inlined;
                         match &self.pk_deletion_strategy {
@@ -3655,14 +3683,20 @@ impl CayenneTableProvider {
                                 .or_default()
                                 .push(existing.row_id);
                         }
-                        keep_mask.push(true);
+                        true
                     }
                 }
             } else {
-                keep_mask.push(true);
-            }
+                true
+            };
 
-            row_keys.push(key);
+            if keep_row {
+                kept_keys.insert(key.clone());
+            }
+            keep_mask.push(keep_row);
+            if !ctx.upsert_options.is_default() {
+                row_keys.push(key);
+            }
         }
 
         if !ctx.upsert_options.is_default() {
@@ -3688,10 +3722,16 @@ impl CayenneTableProvider {
                     seen.insert(key.clone(), row_idx);
                 }
             }
+
+            kept_keys = row_keys
+                .iter()
+                .zip(&keep_mask)
+                .filter(|(_, keep)| **keep)
+                .map(|(key, _)| key.clone())
+                .collect();
         }
 
-        let (filtered_batch, kept_keys) =
-            Self::filter_validated_batch(batch, keep_mask, &row_keys)?;
+        let filtered_batch = Self::filter_validated_batch(batch, keep_mask)?;
 
         Ok(BatchValidationResult {
             filtered_batch,
@@ -3707,27 +3747,19 @@ impl CayenneTableProvider {
     fn filter_validated_batch(
         batch: RecordBatch,
         keep_mask: Vec<bool>,
-        row_keys: &[OwnedRow],
-    ) -> Result<(Option<RecordBatch>, HashSet<OwnedRow>)> {
+    ) -> Result<Option<RecordBatch>> {
         if keep_mask.iter().all(|v| !*v) {
-            return Ok((None, HashSet::new()));
+            return Ok(None);
         }
 
-        let kept_keys: HashSet<OwnedRow> = row_keys
-            .iter()
-            .zip(&keep_mask)
-            .filter(|(_, keep)| **keep)
-            .map(|(key, _)| key.clone())
-            .collect();
-
         if keep_mask.iter().all(|v| *v) {
-            return Ok((Some(batch), kept_keys));
+            return Ok(Some(batch));
         }
 
         let filter_array = arrow::array::BooleanArray::from(keep_mask);
         let filtered_batch = arrow::compute::filter_record_batch(&batch, &filter_array)?;
 
-        Ok((Some(filtered_batch), kept_keys))
+        Ok(Some(filtered_batch))
     }
 
     fn adjust_cached_inlined_row_count(&self, delta: i64) {
