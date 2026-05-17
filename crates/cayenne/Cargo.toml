@@ -155,6 +155,10 @@ name = "cached_table_statistics_wide"
 
 [[bench]]
 harness = false
+name = "deletion_index_extend_map_clone"
+
+[[bench]]
+harness = false
 name = "vs_duckdb_ingest"
 required-features = ["duckdb-bench"]
 
