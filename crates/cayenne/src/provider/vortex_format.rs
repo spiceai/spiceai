@@ -95,7 +95,6 @@ impl std::fmt::Debug for DeletionFilteringVortexFormat {
 /// - The modified `FileScanConfig` with `VortexAccessPlan` extensions attached to files with deletions
 /// - A boolean indicating if any deletions were attached
 ///
-#[expect(clippy::implicit_hasher)]
 pub fn attach_deletion_vectors_to_config(
     mut config: FileScanConfig,
     deletion_cache: &ArcSwap<PositionBitmap>,

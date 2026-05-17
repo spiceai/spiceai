@@ -189,7 +189,7 @@ impl RowConverterDeletionSnapshot {
 /// Determines which cache and filter execution plan to use at query time.
 /// Chosen based on the table's primary key configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PkDeletionStrategy {
+pub(crate) enum PkDeletionStrategy {
     /// No primary key - use position-based deletion with `RoaringBitmap`.
     /// Requires `CoalescePartitionsExec` to ensure consistent ordering.
     PositionBased,
@@ -211,7 +211,7 @@ pub enum PkDeletionStrategy {
 /// All caches are `Arc<ArcSwap<…>>`. Read paths take a wait-free `load_full()`; writers
 /// build a fresh snapshot and `store` it.
 #[derive(Debug, Clone)]
-pub enum PkDeletionStrategyWithCache {
+pub(crate) enum PkDeletionStrategyWithCache {
     /// Position-based deletion tracking using `RoaringBitmap` per file.
     PositionBased {
         /// Maps data file path -> `RoaringBitmap` of file-local row positions.
