@@ -389,11 +389,15 @@ impl DataFusionBuilder {
             // and accumulator budget are only configured for supported targets.
             // Windows keeps DataFusion's standard hash-join dynamic filters.
             clamp_maximum_shared_inlist_memory_bytes(exact_join_filter_memory_limit);
-            state = with_cayenne_logical_optimizer(state);
-            state = state
-                .with_physical_optimizer_rule(Arc::new(CayenneDynamicFilterSharing::new()))
-                .with_physical_optimizer_rule(Arc::new(CayenneAntiJoinSortMergeRewriter::new()))
-                .with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
+
+            // PERF INVESTIGATION: All new Cayenne optimizer rules disabled.
+            // Re-enable one at a time to isolate regression.
+            // Round 1: all off (baseline)
+            // state = with_cayenne_logical_optimizer(state);                                        // CayennePropagateFilterAcrossEquiJoinKeys
+            // state = state.with_physical_optimizer_rule(Arc::new(CayenneDynamicFilterSharing::new()));   // CayenneDynamicFilterSharing
+            // state = state.with_physical_optimizer_rule(Arc::new(CayenneAntiJoinSortMergeRewriter::new())); // CayenneAntiJoinSortMergeRewriter
+            // state = state.with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));           // CayenneJoinRewriter
+            tracing::info!("Cayenne optimizer rules: ALL DISABLED for perf investigation");
         }
         #[cfg(windows)]
         {

@@ -51,7 +51,9 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions as df_expr;
 use datafusion_physical_expr::projection::ProjectionExprs;
-use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
+use datafusion_physical_plan::filter_pushdown::FilterPushdownPropagation;
+#[allow(unused_imports)]
+use datafusion_physical_plan::filter_pushdown::PushedDown;
 use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use object_store::{ObjectMeta, ObjectStore};
@@ -442,45 +444,54 @@ impl FileSource for CayenneVortexFileSource {
         filters: Vec<Arc<dyn PhysicalExpr>>,
         config: &ConfigOptions,
     ) -> DFResult<FilterPushdownPropagation<Arc<dyn FileSource>>> {
-        let schema = self.inner.table_schema().file_schema();
-        let mut safe_filters = Vec::new();
-        let mut safe_filter_indexes = Vec::new();
-        let mut pushdown_results = vec![PushedDown::No; filters.len()];
+        // PERF INVESTIGATION: Decimal pushdown guard disabled — pass all filters through.
+        // let schema = self.inner.table_schema().file_schema();
+        // let mut safe_filters = Vec::new();
+        // let mut safe_filter_indexes = Vec::new();
+        // let mut pushdown_results = vec![PushedDown::No; filters.len()];
+        //
+        // for (index, filter) in filters.into_iter().enumerate() {
+        //     if contains_decimal_to_floating_cast(filter.as_ref(), schema) {
+        //         tracing::debug!(
+        //             %filter,
+        //             "Skipping Vortex predicate pushdown for decimal-to-floating cast"
+        //         );
+        //         continue;
+        //     }
+        //
+        //     safe_filter_indexes.push(index);
+        //     safe_filters.push(filter);
+        // }
+        //
+        // if safe_filters.is_empty() {
+        //     return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+        //         pushdown_results,
+        //     ));
+        // }
+        //
+        // let inner_propagation = self.inner.try_pushdown_filters(safe_filters, config)?;
+        //
+        // for (safe_index, result) in safe_filter_indexes
+        //     .into_iter()
+        //     .zip(inner_propagation.filters.into_iter())
+        // {
+        //     pushdown_results[safe_index] = result;
+        // }
+        //
+        // let mut propagation =
+        //     FilterPushdownPropagation::with_parent_pushdown_result(pushdown_results);
+        // if let Some(updated_node) = inner_propagation.updated_node {
+        //     propagation = propagation.with_updated_node(Arc::new(Self::new(updated_node)) as _);
+        // }
+        //
+        // Ok(propagation)
 
-        for (index, filter) in filters.into_iter().enumerate() {
-            if contains_decimal_to_floating_cast(filter.as_ref(), schema) {
-                tracing::debug!(
-                    %filter,
-                    "Skipping Vortex predicate pushdown for decimal-to-floating cast"
-                );
-                continue;
-            }
-
-            safe_filter_indexes.push(index);
-            safe_filters.push(filter);
-        }
-
-        if safe_filters.is_empty() {
-            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-                pushdown_results,
-            ));
-        }
-
-        let inner_propagation = self.inner.try_pushdown_filters(safe_filters, config)?;
-
-        for (safe_index, result) in safe_filter_indexes
-            .into_iter()
-            .zip(inner_propagation.filters.into_iter())
-        {
-            pushdown_results[safe_index] = result;
-        }
-
+        let inner_propagation = self.inner.try_pushdown_filters(filters, config)?;
         let mut propagation =
-            FilterPushdownPropagation::with_parent_pushdown_result(pushdown_results);
+            FilterPushdownPropagation::with_parent_pushdown_result(inner_propagation.filters);
         if let Some(updated_node) = inner_propagation.updated_node {
             propagation = propagation.with_updated_node(Arc::new(Self::new(updated_node)) as _);
         }
-
         Ok(propagation)
     }
 
@@ -488,14 +499,15 @@ impl FileSource for CayenneVortexFileSource {
         &self,
         projection: &ProjectionExprs,
     ) -> DFResult<Option<Arc<dyn FileSource>>> {
-        let schema = self.inner.table_schema().file_schema();
-        if contains_decimal_to_floating_projection(projection, schema) {
-            tracing::debug!(
-                %projection,
-                "Skipping Vortex projection pushdown for decimal-to-floating cast"
-            );
-            return Ok(None);
-        }
+        // PERF INVESTIGATION: Decimal projection guard disabled — pass through.
+        // let schema = self.inner.table_schema().file_schema();
+        // if contains_decimal_to_floating_projection(projection, schema) {
+        //     tracing::debug!(
+        //         %projection,
+        //         "Skipping Vortex projection pushdown for decimal-to-floating cast"
+        //     );
+        //     return Ok(None);
+        // }
 
         self.inner
             .try_pushdown_projection(projection)
@@ -503,12 +515,14 @@ impl FileSource for CayenneVortexFileSource {
     }
 }
 
+#[allow(dead_code)]
 fn contains_decimal_to_floating_projection(projection: &ProjectionExprs, schema: &Schema) -> bool {
     projection
         .iter()
         .any(|expr| contains_decimal_to_floating_cast(expr.expr.as_ref(), schema))
 }
 
+#[allow(dead_code)]
 fn contains_decimal_to_floating_cast(expr: &dyn PhysicalExpr, schema: &Schema) -> bool {
     if let Some(cast) = expr.as_any().downcast_ref::<df_expr::CastExpr>() {
         let casts_to_floating = matches!(cast.cast_type(), DataType::Float32 | DataType::Float64);
