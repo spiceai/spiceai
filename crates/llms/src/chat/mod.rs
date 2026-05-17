@@ -24,9 +24,8 @@ use secrecy::SecretString;
 use snafu::ResultExt;
 use snafu::Snafu;
 use spicepod::component::model::ModelSource;
-#[cfg(feature = "local_llm")]
 use std::path::Path;
-#[cfg(feature = "local_llm")]
+#[cfg(any(feature = "local_llm", test))]
 use std::path::PathBuf;
 use std::pin::Pin;
 #[cfg(feature = "local_llm")]
@@ -156,6 +155,14 @@ pub enum Error {
         "Failed to load a file specified for the model. Could not find the file: {file_url}. Verify the `files` parameters for the model, and try again."
     ))]
     ModelFileMissing { file_url: String },
+
+    #[snafu(display(
+        "Refusing to load model weight file '{path}': '.{extension}' is a Python pickle format \
+         that executes arbitrary code on load (CVE-class: untrusted pickle deserialization → RCE). \
+         Convert the model to `.safetensors` or `.gguf`, or set `params.trust_pickle: true` if the \
+         file source is fully trusted."
+    ))]
+    UnsafePickleWeight { path: String, extension: String },
 
     #[snafu(display(
         "Invalid parameters for model '{model}': {source} Verify the model parameters, and try again."
@@ -758,4 +765,92 @@ pub async fn create_local_model(
     )
     .await
     .map(|x| Arc::new(x) as Arc<dyn Chat>)
+}
+
+/// File extensions that are conventionally Python pickle by `PyTorch`'s
+/// ecosystem and that are unsafe to load from any source the operator
+/// does not fully trust. Pickle deserialization is RCE by design.
+const PICKLE_WEIGHT_EXTENSIONS: &[&str] = &["bin", "pt", "pth", "ckpt"];
+
+/// Reject any weight path whose extension lands in [`PICKLE_WEIGHT_EXTENSIONS`]
+/// unless the caller has explicitly opted in via `trust_pickle = true`.
+///
+/// `weights` is expected to be the same slice of paths that will be handed
+/// to the model loader. Returns [`Error::UnsafePickleWeight`] on the first
+/// match, so the message identifies the offending file.
+///
+/// # Errors
+///
+/// Returns [`Error::UnsafePickleWeight`] when `trust_pickle` is `false`
+/// and any path has a pickle-class extension.
+pub fn reject_unsafe_weight_formats<P: AsRef<Path>>(
+    weights: &[P],
+    trust_pickle: bool,
+) -> Result<()> {
+    if trust_pickle {
+        return Ok(());
+    }
+    for w in weights {
+        let path = w.as_ref();
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            let ext = ext.to_ascii_lowercase();
+            if PICKLE_WEIGHT_EXTENSIONS.contains(&ext.as_str()) {
+                return Err(Error::UnsafePickleWeight {
+                    path: path.to_string_lossy().into_owned(),
+                    extension: ext,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_pickle_extensions_by_default() {
+        for ext in PICKLE_WEIGHT_EXTENSIONS {
+            let path = PathBuf::from(format!("/models/pytorch_model.{ext}"));
+            let err = reject_unsafe_weight_formats(&[path], false)
+                .expect_err(&format!("expected rejection for .{ext}"));
+            assert!(matches!(err, Error::UnsafePickleWeight { .. }));
+        }
+    }
+
+    #[test]
+    fn allows_safe_extensions() {
+        for ext in ["safetensors", "gguf", "ggml", "onnx"] {
+            let path = PathBuf::from(format!("/models/weights.{ext}"));
+            reject_unsafe_weight_formats(&[path], false)
+                .unwrap_or_else(|e| panic!("expected ok for .{ext}, got {e:?}"));
+        }
+    }
+
+    #[test]
+    fn opt_in_allows_pickle_extensions() {
+        let paths = [
+            PathBuf::from("/m/a.pt"),
+            PathBuf::from("/m/pytorch_model.bin"),
+        ];
+        reject_unsafe_weight_formats(&paths, true).expect("opt-in should allow pickle");
+    }
+
+    #[test]
+    fn extension_check_is_case_insensitive() {
+        let path = PathBuf::from("/m/Pytorch_Model.PT");
+        let err = reject_unsafe_weight_formats(&[path], false)
+            .expect_err("case-insensitive .PT must be rejected");
+        match err {
+            Error::UnsafePickleWeight { extension, .. } => assert_eq!(extension, "pt"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extensionless_path_is_ignored() {
+        let path = PathBuf::from("/m/no_extension_here");
+        reject_unsafe_weight_formats(&[path], false).expect("no extension → no rejection");
+    }
 }

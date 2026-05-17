@@ -117,6 +117,41 @@ impl ExecutorConnection {
 
 pub type TablePartitions = HashMap<TableReference, Vec<Expr>>;
 
+/// Append-only log of DDL SQL statements applied to the cluster.
+///
+/// Used to replay DDL on executors that join after the statements were originally executed.
+/// Each statement is stored in executor-compatible form (e.g. `IF NOT EXISTS`/`IF EXISTS`).
+///
+/// The version is the count of statements in the log. `statements_since(version)` returns
+/// all statements appended after that version.
+#[derive(Debug, Default)]
+struct DdlLog {
+    statements: Vec<String>,
+}
+
+impl DdlLog {
+    /// Appends a DDL SQL statement. Returns the new version (count of statements).
+    fn append(&mut self, sql: String) -> u64 {
+        self.statements.push(sql);
+        self.statements.len() as u64
+    }
+
+    /// Returns all statements appended after `since_version`.
+    fn statements_since(&self, since_version: u64) -> &[String] {
+        let idx = usize::try_from(since_version).unwrap_or(usize::MAX);
+        if idx >= self.statements.len() {
+            &[]
+        } else {
+            &self.statements[idx..]
+        }
+    }
+
+    /// Returns all statements and the current version.
+    fn snapshot(&self) -> (&[String], u64) {
+        (&self.statements, self.statements.len() as u64)
+    }
+}
+
 /// Registry for tracking executor control stream connections.
 ///
 /// Schedulers use this registry to:
@@ -130,6 +165,7 @@ pub struct ExecutorRegistry {
 
     /// Map of `executor_id` -> `FlightSqlClient`
     /// An executor may be in `connections` and not in `flight_sql_clients` (e.g. during initial connection).
+    /// An executor with a `FlightSqlClient` is considered "ready" — the scheduler can route queries to it.
     flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
 
     /// Map of `executor_id` -> table partitions for that executor
@@ -140,6 +176,9 @@ pub struct ExecutorRegistry {
     accelerations_partition_store: Arc<PartitionStore>,
 
     federated_partition_store: Arc<PartitionStore>,
+
+    /// Append-only log of DDL SQL statements applied to the cluster.
+    ddl_log: Arc<RwLock<DdlLog>>,
 }
 
 impl ExecutorRegistry {
@@ -155,6 +194,7 @@ impl ExecutorRegistry {
             partitions: Arc::new(RwLock::new(HashMap::new())),
             accelerations_partition_store,
             federated_partition_store,
+            ddl_log: Arc::new(RwLock::new(DdlLog::default())),
         }
     }
 
@@ -166,6 +206,31 @@ impl ExecutorRegistry {
     #[must_use]
     pub fn federated_partition_store(&self) -> Arc<PartitionStore> {
         Arc::clone(&self.federated_partition_store)
+    }
+
+    /// Appends a DDL SQL statement to the cluster DDL log.
+    ///
+    /// Must be called **before** forwarding to executors so that a concurrent
+    /// `GetAppDefinition` will include the statement in its snapshot.
+    pub async fn append_ddl(&self, sql: String) {
+        let version = self.ddl_log.write().await.append(sql);
+        tracing::debug!(ddl_version = version, "Appended DDL to cluster log");
+    }
+
+    /// Returns a snapshot of all DDL statements and the current version.
+    pub async fn ddl_snapshot(&self) -> (Vec<String>, u64) {
+        let log = self.ddl_log.read().await;
+        let (stmts, version) = log.snapshot();
+        (stmts.to_vec(), version)
+    }
+
+    /// Returns DDL statements appended after `since_version`.
+    pub async fn ddl_statements_since(&self, since_version: u64) -> Vec<String> {
+        self.ddl_log
+            .read()
+            .await
+            .statements_since(since_version)
+            .to_vec()
     }
 
     /// Registers an executor connection.
@@ -241,9 +306,20 @@ impl ExecutorRegistry {
         self.partitions.read().await.clone()
     }
 
-    /// Returns the number of executors that currently have a `FlightSqlClient`.
+    /// Returns the number of executors that currently have a `FlightSqlClient` — i.e. the
+    /// scheduler can route queries to them. This is the "ready executor count" used by
+    /// `/v1/ready` query-param gating.
     pub async fn flight_sql_clients_count(&self) -> usize {
         self.flight_sql_clients.read().await.len()
+    }
+
+    /// Returns the number of executors currently registered via control stream.
+    ///
+    /// An executor is "registered" once its control stream is open but may not yet be "ready"
+    /// (queryable via `FlightSQL`) — the window between `register()` and the executor's first
+    /// `AllocateInitialPartitions` RPC. Used as the denominator for `/v1/ready` percentage gating.
+    pub async fn connected_executor_count(&self) -> usize {
+        self.connections.read().await.len()
     }
 
     /// Returns the list of currently connected executor IDs.
@@ -628,6 +704,58 @@ mod tests {
         assert_eq!(executors, vec!["executor-1", "executor-3"]);
     }
 
+    fn dummy_flight_sql_client() -> FlightSqlClient {
+        use arrow_flight::flight_service_client::FlightServiceClient;
+        use arrow_flight::sql::client::FlightSqlServiceClient;
+        use flight_client::cookie::CookieService;
+        use tonic::transport::Endpoint;
+
+        // FlightSqlClient wraps a tonic channel; these tests only exercise the registry's
+        // bookkeeping, not actual flight calls. Build one with `connect_lazy` to a
+        // non-routable address so no connection is ever attempted.
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let cookie_channel = CookieService::new(channel, Arc::new(CookieStore::new()));
+        FlightSqlServiceClient::new_from_inner(FlightServiceClient::new(cookie_channel))
+    }
+
+    #[tokio::test]
+    async fn test_ready_and_connected_count_tracking() {
+        let registry = make_registry().await;
+
+        assert_eq!(registry.connected_executor_count().await, 0);
+        assert_eq!(registry.flight_sql_clients_count().await, 0);
+
+        // Control stream opens for three executors → connected, but not yet ready.
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        let (tx3, _rx3) = mpsc::channel(1);
+        registry.register("e1".to_string(), tx1).await;
+        registry.register("e2".to_string(), tx2).await;
+        registry.register("e3".to_string(), tx3).await;
+        assert_eq!(registry.connected_executor_count().await, 3);
+        assert_eq!(registry.flight_sql_clients_count().await, 0);
+
+        // Two of them complete the handshake (AllocateInitialPartitions) → ready.
+        registry
+            .insert_flight_sql_client("e1".to_string(), dummy_flight_sql_client())
+            .await;
+        registry
+            .insert_flight_sql_client("e2".to_string(), dummy_flight_sql_client())
+            .await;
+        assert_eq!(registry.connected_executor_count().await, 3);
+        assert_eq!(registry.flight_sql_clients_count().await, 2);
+
+        // Unregister one ready executor — both counts drop.
+        registry.unregister("e2").await;
+        assert_eq!(registry.connected_executor_count().await, 2);
+        assert_eq!(registry.flight_sql_clients_count().await, 1);
+
+        // Unregister the not-yet-ready executor — connected drops, ready unchanged.
+        registry.unregister("e3").await;
+        assert_eq!(registry.connected_executor_count().await, 1);
+        assert_eq!(registry.flight_sql_clients_count().await, 1);
+    }
+
     #[tokio::test]
     async fn test_unregister_nonexistent() {
         let registry = make_registry().await;
@@ -707,5 +835,55 @@ mod tests {
         assert_eq!(ready.len(), 1);
         assert!(ready.contains_key("exec-2"));
         assert!(!ready.contains_key("exec-1"));
+    }
+
+    #[tokio::test]
+    async fn test_ddl_log_empty() {
+        let registry = make_registry().await;
+        let (stmts, version) = registry.ddl_snapshot().await;
+        assert!(stmts.is_empty());
+        assert_eq!(version, 0);
+        assert!(registry.ddl_statements_since(0).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ddl_log_append_and_snapshot() {
+        let registry = make_registry().await;
+
+        registry
+            .append_ddl("CREATE SCHEMA IF NOT EXISTS \"cat\".\"s1\"".to_string())
+            .await;
+        registry
+            .append_ddl(
+                "CREATE TABLE IF NOT EXISTS \"cat\".\"s1\".\"t1\" (id BIGINT NOT NULL)".to_string(),
+            )
+            .await;
+
+        let (stmts, version) = registry.ddl_snapshot().await;
+        assert_eq!(version, 2);
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("CREATE SCHEMA"));
+        assert!(stmts[1].contains("CREATE TABLE"));
+    }
+
+    #[tokio::test]
+    async fn test_ddl_log_statements_since() {
+        let registry = make_registry().await;
+        registry.append_ddl("stmt0".to_string()).await;
+        registry.append_ddl("stmt1".to_string()).await;
+        registry.append_ddl("stmt2".to_string()).await;
+
+        assert_eq!(
+            registry.ddl_statements_since(0).await,
+            vec!["stmt0", "stmt1", "stmt2"]
+        );
+        assert_eq!(
+            registry.ddl_statements_since(1).await,
+            vec!["stmt1", "stmt2"]
+        );
+        assert_eq!(registry.ddl_statements_since(2).await, vec!["stmt2"]);
+        assert!(registry.ddl_statements_since(3).await.is_empty());
+        // Beyond end returns empty
+        assert!(registry.ddl_statements_since(100).await.is_empty());
     }
 }

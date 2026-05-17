@@ -30,7 +30,7 @@ use crate::{
 };
 use ::datafusion::optimizer::AnalyzerRule;
 use ::datafusion::prelude::SessionConfig;
-use ::datafusion::sql::TableReference;
+use ::datafusion::sql::ResolvedTableReference;
 use app::App;
 use ballista_core::config::ShuffleFormat as BallistaShuffleFormat;
 use ballista_core::extension::SessionConfigExt;
@@ -59,7 +59,9 @@ use futures::future::try_join_all;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
-use runtime_proto::{GetAppDefinitionRequest, GetSchedulersRequest, TaskCancelInfo};
+use runtime_proto::{
+    GetAppDefinitionRequest, GetDdlCatchupRequest, GetSchedulersRequest, TaskCancelInfo,
+};
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
 use std::collections::{HashMap, HashSet};
@@ -112,7 +114,7 @@ pub enum DistributedNode {
         ///
         /// This is populated during startup when the executor registers with the scheduler.
         /// It contains the list of partition filters (expressions) that this executor is responsible for.
-        partition_assignments: Arc<RwLock<HashMap<TableReference, Vec<Expr>>>>,
+        partition_assignments: Arc<RwLock<HashMap<ResolvedTableReference, Vec<Expr>>>>,
     },
 }
 
@@ -1136,7 +1138,10 @@ pub async fn initialize_cluster_executor(
             source: format!("Failed to get app definition from scheduler: {status}").into(),
         })?;
 
-    let app_json = response.into_inner().app_json;
+    let get_app_response = response.into_inner();
+    let app_json = get_app_response.app_json;
+    let ddl_statements = get_app_response.ddl_statements;
+    let ddl_version = get_app_response.ddl_version;
 
     let app_def: App = serde_json::from_str(&app_json)
         .boxed()
@@ -1510,7 +1515,41 @@ pub async fn initialize_cluster_executor(
         rt.set_partition_assignments(initial_partitions).await;
 
         // Bind the already-fetched app and initialize secrets for object store configuration
+        let executor_id_for_catchup = executor_id.clone();
         executor_bind_app(&rt, executor_id, app_def, client_tls_config).await?;
+
+        // Replay DDL statements from the scheduler to create tables/schemas
+        // that were added via DDL after cluster start (e.g. CREATE TABLE on a Cayenne catalog).
+        if !ddl_statements.is_empty() {
+            tracing::info!(
+                "Replaying {} DDL statement(s) from scheduler (version {ddl_version})",
+                ddl_statements.len(),
+            );
+            replay_ddl_statements(&rt, &ddl_statements).await;
+        }
+
+        // Catch up any DDL created between GetAppDefinition and now (TOCTOU window).
+        match cluster_client
+            .get_ddl_catchup(GetDdlCatchupRequest {
+                executor_id: executor_id_for_catchup,
+                since_version: ddl_version,
+            })
+            .await
+        {
+            Ok(response) => {
+                let catchup = response.into_inner().ddl_statements;
+                if !catchup.is_empty() {
+                    tracing::info!(
+                        "Replaying {} DDL catch-up statement(s) from scheduler",
+                        catchup.len()
+                    );
+                    replay_ddl_statements(&rt, &catchup).await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to get DDL catch-up from scheduler: {e}");
+            }
+        }
 
         executor_bind_object_stores(Arc::clone(&rt)).await?;
 
@@ -1935,6 +1974,45 @@ async fn executor_bind_app(
     Arc::clone(rt).load_datasets().await;
 
     Ok(())
+}
+
+/// Replays DDL SQL statements on the executor's local `DataFusion` context.
+///
+/// Statements are replayed in order. If any statement fails, remaining
+/// statements are skipped because later DDL may depend on earlier ones
+/// (e.g. `CREATE TABLE` depends on `CREATE SCHEMA`).
+///
+/// Uses the Spice `QueryBuilder` path (not `ctx.sql()` directly) so that
+/// `DdlAnalyzerRule` runs — routing DDL through the correct Cayenne/Iceberg
+/// physical-plan handlers rather than `DataFusion`'s built-in DDL handlers,
+/// which don't know about custom catalogs and would fail with errors like
+/// "failed to resolve schema" or "Registering new schemas is not supported".
+///
+/// Returns the number of successfully replayed statements.
+async fn replay_ddl_statements(rt: &Runtime, statements: &[String]) -> usize {
+    use futures::TryStreamExt as _;
+    let df = rt.datafusion();
+    for (i, sql) in statements.iter().enumerate() {
+        let error: Option<String> = match df.query_builder(sql).build().run().await {
+            Err(e) => Some(e.to_string()),
+            Ok(query_result) => query_result
+                .data
+                .try_collect::<Vec<_>>()
+                .await
+                .err()
+                .map(|e| e.to_string()),
+        };
+        if let Some(e) = error {
+            tracing::warn!(
+                sql,
+                "Failed to replay DDL statement ({}/{}) — skipping remaining: {e}",
+                i + 1,
+                statements.len()
+            );
+            return i;
+        }
+    }
+    statements.len()
 }
 
 /// For each registered dataset on the cluster executor, asks its data

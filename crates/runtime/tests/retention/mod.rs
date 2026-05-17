@@ -174,6 +174,41 @@ async fn refresh_table(rt: Arc<Runtime>, table_name: &str) -> Result<(), anyhow:
     Ok(())
 }
 
+/// Polls `sql` until it returns `expected_rows` (the retention task runs on a
+/// background interval, so the row count may not drop immediately after
+/// `refresh_table` returns). Returns the matching batches once observed, or
+/// errors after `timeout`. The entire poll loop — including any in-flight
+/// query and the inter-attempt sleep — is bounded by `timeout` via
+/// `tokio::time::timeout_at`, so a slow query cannot extend the total runtime
+/// past the deadline.
+async fn wait_for_retention_applied(
+    rt: &Runtime,
+    sql: &str,
+    expected_rows: usize,
+    timeout: std::time::Duration,
+) -> Result<Vec<RecordBatch>, anyhow::Error> {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    let polled = tokio::time::timeout_at(deadline, async {
+        loop {
+            let query = rt.datafusion().query_builder(sql).build().run().await?;
+            let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
+            let count: usize = results.iter().map(RecordBatch::num_rows).sum();
+            if count == expected_rows {
+                return Ok::<_, anyhow::Error>(results);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    polled.unwrap_or_else(|_| {
+        Err(anyhow::anyhow!(
+            "retention did not apply within {timeout:?} for `{sql}` (expected {expected_rows} rows)"
+        ))
+    })
+}
+
 #[tokio::test]
 async fn test_retention_sql() -> Result<(), anyhow::Error> {
     let _ = rustls::crypto::CryptoProvider::install_default(
@@ -223,17 +258,23 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
             refresh_table(Arc::clone(&cloned_rt), "nation").await?;
             refresh_table(Arc::clone(&cloned_rt), "taxi_trips").await?;
 
-            for (sql, snapshot_name) in [
+            for (sql, snapshot_name, expected_rows) in [
                 (
                     "SELECT n_nationkey, n_name, n_regionkey FROM nation",
                     "retention_sql",
+                    3usize,
                 ),
-                ("SELECT VendorID, Airport_fee, tpep_pickup_datetime, passenger_count, trip_distance FROM taxi_trips", "retention_sql_and_time_column"),
+                ("SELECT VendorID, Airport_fee, tpep_pickup_datetime, passenger_count, trip_distance FROM taxi_trips", "retention_sql_and_time_column", 4usize),
             ] {
-                let query = rt.datafusion().query_builder(sql).build().run().await?;
-
-                let results: Vec<RecordBatch> =
-                    query.data.try_collect::<Vec<RecordBatch>>().await?;
+                // Retention runs on a 200ms interval after refresh completes, so
+                // wait for it to apply before snapshotting.
+                let results = wait_for_retention_applied(
+                    &rt,
+                    sql,
+                    expected_rows,
+                    std::time::Duration::from_secs(10),
+                )
+                .await?;
 
                 let results_str =
                     arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
