@@ -3332,14 +3332,14 @@ impl CayenneTableProvider {
 
     fn top_level_statistics_only(stats: &Statistics, inexact: bool) -> Statistics {
         let num_rows = if inexact {
-            stats.num_rows.clone().to_inexact()
+            stats.num_rows.to_inexact()
         } else {
-            stats.num_rows.clone()
+            stats.num_rows
         };
         let total_byte_size = if inexact {
-            stats.total_byte_size.clone().to_inexact()
+            stats.total_byte_size.to_inexact()
         } else {
-            stats.total_byte_size.clone()
+            stats.total_byte_size
         };
 
         Statistics {
