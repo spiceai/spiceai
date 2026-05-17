@@ -103,7 +103,7 @@ use super::context::CayenneContext;
 use super::deletion_index::{DeletionIndex, KeyDeletionIndex};
 use super::deletion_strategy::{
     Int64PkDeletionSnapshot, PkDeletionStrategy, PkDeletionStrategyWithCache,
-    RowConverterDeletionSnapshot,
+    PositionDeletionVector, RowConverterDeletionSnapshot,
 };
 use super::staging_wal::PreparedStagedAppend;
 use super::vortex_format::DeletionFilteringVortexFormat;
@@ -6720,14 +6720,13 @@ impl CayenneTableProvider {
                     total_deletions,
                     per_file_row_ids.len(),
                 );
-                // Wrap each per-file bitmap in an Arc so future snapshot
-                // publishes only have to clone the small outer
-                // `HashMap<String, Arc<RoaringBitmap>>` (string keys + 8-byte
-                // pointers) instead of every file's full bitmap data. See
-                // `PositionBitmap`'s docstring for the perf rationale.
-                let cached_map: HashMap<String, Arc<RoaringBitmap>> = per_file_row_ids
+                // Wrap each per-file deletion vector in an Arc so future snapshot
+                // publishes only clone the small outer map entries, not every
+                // file's full bitmap/access-plan data. See `PositionBitmap`'s
+                // docstring for the perf rationale.
+                let cached_map = per_file_row_ids
                     .into_iter()
-                    .map(|(path, bitmap)| (path, Arc::new(bitmap)))
+                    .map(|(path, bitmap)| (path, Arc::new(PositionDeletionVector::new(bitmap))))
                     .collect();
                 PkDeletionStrategyWithCache::PositionBased {
                     cached_deleted_row_ids: Arc::new(ArcSwap::from_pointee(cached_map)),

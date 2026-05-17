@@ -26,21 +26,88 @@ limitations under the License.
 use super::deletion_index::{DeletionIndex, KeyDeletionIndex};
 use super::{Error, Result};
 use arc_swap::ArcSwap;
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
+use vortex_datafusion::VortexAccessPlan;
+use vortex_scan::Selection;
 
-/// Position-based deletion bitmap keyed by data file path.
+/// Position-based deletion state for a single data file.
 ///
-/// The per-file `RoaringBitmap` is `Arc`-wrapped so that publishing a fresh
+/// Keeps the compact `RoaringBitmap` for write-side set operations and a
+/// prebuilt `VortexAccessPlan` for scan planning. Building the access plan
+/// converts the u32 bitmap into Vortex's u64 `RoaringTreemap`, so doing it once
+/// when a deletion snapshot is published avoids rebuilding the treemap for
+/// every file on every scan.
+pub(crate) struct PositionDeletionVector {
+    row_ids: RoaringBitmap,
+    access_plan: Arc<VortexAccessPlan>,
+}
+
+impl PositionDeletionVector {
+    #[must_use]
+    pub(crate) fn new(row_ids: RoaringBitmap) -> Self {
+        let exclude: RoaringTreemap = row_ids.iter().map(u64::from).collect();
+        let access_plan = Arc::new(
+            VortexAccessPlan::default().with_selection(Selection::ExcludeRoaring(exclude)),
+        );
+
+        Self {
+            row_ids,
+            access_plan,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.row_ids.is_empty()
+    }
+
+    #[must_use]
+    pub(crate) fn len(&self) -> u64 {
+        self.row_ids.len()
+    }
+
+    #[must_use]
+    pub(crate) fn contains(&self, row_id: u32) -> bool {
+        self.row_ids.contains(row_id)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.row_ids.iter()
+    }
+
+    #[must_use]
+    pub(crate) fn to_bitmap(&self) -> RoaringBitmap {
+        self.row_ids.clone()
+    }
+
+    #[must_use]
+    pub(crate) fn access_plan(&self) -> Arc<VortexAccessPlan> {
+        Arc::clone(&self.access_plan)
+    }
+}
+
+impl fmt::Debug for PositionDeletionVector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PositionDeletionVector")
+            .field("deleted_rows", &self.row_ids.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Position-based deletion cache keyed by data file path.
+///
+/// The per-file deletion state is `Arc`-wrapped so that publishing a fresh
 /// snapshot through `ArcSwap` only clones a `HashMap<String, Arc<…>>`
-/// (cheap — small string keys + 8-byte Arc pointers), not the bitmap data
-/// itself. Without the inner `Arc`, every per-batch delete on a
+/// (cheap — small string keys + 8-byte Arc pointers), not the bitmap/access-plan
+/// data itself. Without the inner `Arc`, every per-batch delete on a
 /// position-based table cloned every file's full bitmap on each commit,
-/// turning the write into O(total deleted rows) per call. The shared inner
-/// type lets readers and writers share unchanged bitmaps for free; only
-/// entries that the writer actually updates allocate a new `Arc`.
-pub type PositionBitmap = HashMap<String, Arc<RoaringBitmap>>;
+/// turning the write into O(total deleted rows) per call. The shared inner type
+/// lets readers and writers share unchanged entries for free; only entries that
+/// the writer actually updates allocate a new `Arc`.
+pub type PositionBitmap = HashMap<String, Arc<PositionDeletionVector>>;
 
 /// Atomically-published deletion state for single-column `Int64` primary keys.
 #[derive(Debug, Clone)]
