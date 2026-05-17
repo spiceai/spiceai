@@ -510,7 +510,13 @@ async fn route_batch_and_assign_unseen(
             let new_pred = partition_phys_exprs
                 .iter()
                 .zip(scalar_values.iter())
-                .map(|((logical_expr, _), scalar)| logical_expr.clone().eq(lit(scalar.clone())))
+                .map(|((logical_expr, _), scalar)| {
+                    if scalar.is_null() {
+                        logical_expr.clone().is_null()
+                    } else {
+                        logical_expr.clone().eq(lit(scalar.clone()))
+                    }
+                })
                 .reduce(Expr::and);
 
             if let Some(new_pred) = new_pred {

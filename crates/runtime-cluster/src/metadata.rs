@@ -99,7 +99,11 @@ pub async fn partition_value_to_bytes(
     let mut expr: Option<Expr> = None;
     for (partition_expr, val) in p {
         let partition_by = resolver.try_parse_expr(tbl, &partition_expr).await?;
-        let e = partition_by.eq(lit(val));
+        let e = if val == "NULL" {
+            partition_by.is_null()
+        } else {
+            partition_by.eq(lit(val))
+        };
         expr = match expr {
             Some(existing) => Some(existing.and(e)),
             None => Some(e),
@@ -180,16 +184,21 @@ impl TablePartitionMetadata {
             let partition_predicate = partition_value
                 .iter()
                 .map(|(proj, lit)| {
-                    // Ensure lit is same type as proj
                     let col = ctx.parse_sql_expr(proj, &df_schema)?;
+                    let parsed_lit = ctx.parse_sql_expr(lit, &df_schema)?;
+                    // NULL partition values need IS NULL, not = NULL
+                    // (SQL: `col = NULL` is always UNKNOWN, never TRUE)
+                    if matches!(&parsed_lit, Expr::Literal(s, _) if s.is_null()) {
+                        return Ok(col.is_null());
+                    }
                     let col_type = col.get_type(&df_schema)?;
-                    let mut lit = ctx.parse_sql_expr(lit, &df_schema)?;
-                    if let Expr::Literal(ref s, None) = lit
+                    let mut lit_expr = parsed_lit;
+                    if let Expr::Literal(ref s, None) = lit_expr
                         && s.data_type() != col_type
                     {
-                        lit = lit.cast_to(&col_type, &df_schema)?;
+                        lit_expr = lit_expr.cast_to(&col_type, &df_schema)?;
                     }
-                    Ok(col.eq(lit))
+                    Ok(col.eq(lit_expr))
                 })
                 .collect::<Result<Vec<Expr>, DataFusionError>>()?
                 .into_iter()

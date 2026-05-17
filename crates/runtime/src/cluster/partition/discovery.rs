@@ -97,11 +97,15 @@ pub(crate) async fn query_source_partitions(
             let mut value_parts = HashMap::new();
             for col_idx in 0..num_cols {
                 let column = batch.column(col_idx);
-                let value_str = arrow::util::display::array_value_to_string(column, row_idx)
-                    .boxed()
-                    .context(PartitionDiscoverySnafu {
-                        table: table_name.clone(),
-                    })?;
+                let value_str = if column.is_null(row_idx) {
+                    "NULL".to_string()
+                } else {
+                    arrow::util::display::array_value_to_string(column, row_idx)
+                        .boxed()
+                        .context(PartitionDiscoverySnafu {
+                            table: table_name.clone(),
+                        })?
+                };
                 if let Some(pname) = partitioning.get(col_idx).map(|p| p.expression.clone()) {
                     value_parts.insert(pname, value_str);
                 }
@@ -253,8 +257,9 @@ fn try_static_partition_values(partitioning: &[PartitionedBy]) -> Option<Vec<Par
 /// querying the source table.
 ///
 /// Currently supported expressions:
-///   - `bucket(N, col)` — produces `["0", "1", …, "N-1"]`. `N` must be a
-///     positive integer literal (zero and negative values are rejected).
+///   - `bucket(N, col)` — produces `["0", "1", …, "N-1", "NULL"]`. `N` must
+///     be a positive integer literal (zero and negative values are rejected).
+///     The `"NULL"` entry covers rows where the column value is NULL.
 ///
 /// Returns `Some(values)` if the expression can be resolved statically, `None`
 /// otherwise.  Add new match arms here to support additional expressions.
@@ -266,13 +271,15 @@ fn try_static_values_for_expr(expression: &str) -> Option<Vec<String>> {
         .ok()?;
 
     match &expr {
-        // bucket(N, column) → 0..N-1
+        // bucket(N, column) → 0..N-1, plus NULL for rows where column is NULL
         ast::Expr::Function(func) if is_function_named(func, "bucket") => {
             let n = extract_first_int_arg(func)?;
             if n <= 0 || n > MAX_NUM_BUCKETS {
                 return None;
             }
-            Some((0..n).map(|i| i.to_string()).collect())
+            let mut values: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+            values.push("NULL".to_string());
+            Some(values)
         }
 
         // Future extensions:
@@ -315,21 +322,22 @@ mod tests {
 
     #[test]
     fn test_try_static_values_for_expr_bucket() {
-        // Valid bucket expressions
+        // Valid bucket expressions — includes NULL partition for rows where column is NULL
         let vals = try_static_values_for_expr("bucket(50, organization_id)").expect("should parse");
-        assert_eq!(vals.len(), 50);
+        assert_eq!(vals.len(), 51); // 0..49 + NULL
         assert_eq!(vals[0], "0");
         assert_eq!(vals[49], "49");
+        assert_eq!(vals[50], "NULL");
 
         let vals = try_static_values_for_expr("bucket( 5 , c_name)").expect("should parse");
-        assert_eq!(vals.len(), 5);
+        assert_eq!(vals.len(), 6); // 0..4 + NULL
 
         let vals = try_static_values_for_expr("BUCKET(10, user_id)").expect("should parse");
-        assert_eq!(vals.len(), 10);
+        assert_eq!(vals.len(), 11); // 0..9 + NULL
 
-        // bucket(1, col) → single partition ["0"]
+        // bucket(1, col) → two partitions: ["0", "NULL"]
         let vals = try_static_values_for_expr("bucket(1, col)").expect("should parse");
-        assert_eq!(vals, vec!["0"]);
+        assert_eq!(vals, vec!["0", "NULL"]);
 
         // bucket(0, col) is meaningless → None
         assert!(try_static_values_for_expr("bucket(0, col)").is_none());
@@ -353,7 +361,7 @@ mod tests {
         }];
 
         let values = try_static_partition_values(&partitioning).expect("should resolve statically");
-        assert_eq!(values.len(), 3);
+        assert_eq!(values.len(), 4); // 0, 1, 2, NULL
         for i in 0..3 {
             let expected: HashMap<String, String> =
                 [("bucket(3, org_id)".to_string(), i.to_string())]
@@ -361,6 +369,15 @@ mod tests {
                     .collect();
             assert!(values.contains(&expected), "missing partition value {i}");
         }
+        // NULL partition for rows where org_id is NULL
+        let null_expected: HashMap<String, String> =
+            [("bucket(3, org_id)".to_string(), "NULL".to_string())]
+                .into_iter()
+                .collect();
+        assert!(
+            values.contains(&null_expected),
+            "missing NULL partition value"
+        );
     }
 
     #[test]
