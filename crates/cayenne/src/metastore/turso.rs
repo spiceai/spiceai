@@ -552,6 +552,24 @@ impl MetastoreBackend for TursoMetastore {
         Ok(())
     }
 
+    async fn execute_transaction_batch(&self, sql: &str) -> CatalogResult<()> {
+        let conn_arc = self.get_conn().await?;
+        let guard = conn_arc.lock().await;
+        let conn = guard.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Turso connection not initialized".to_string(),
+        })?;
+        let batch_sql = format!("BEGIN CONCURRENT; {sql}; COMMIT;");
+
+        if let Err(e) = conn.execute_batch(&batch_sql).await {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Err(CatalogError::Database {
+                message: format!("Failed to execute transaction batch: {e}"),
+            });
+        }
+
+        Ok(())
+    }
+
     async fn query_row<F, T>(&self, params: QueryRowParams<'_>, f: F) -> CatalogResult<T>
     where
         F: FnOnce(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,

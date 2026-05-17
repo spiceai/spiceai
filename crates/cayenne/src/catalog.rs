@@ -404,6 +404,16 @@ pub trait MetadataCatalog: Send + Sync {
     /// Remove all inlined data for a table (called after checkpoint flushes to Vortex).
     async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()>;
 
+    /// Remove all inlined data and inlined deletes for a table atomically.
+    ///
+    /// Implementations may override this to use a single backend transaction or
+    /// batch call. The default preserves the existing behavior for implementors
+    /// that do not have a combined primitive.
+    async fn clear_inlined_data_and_deletes(&self, table_id: &str) -> CatalogResult<()> {
+        self.clear_inlined_data(table_id).await?;
+        self.clear_inlined_deletes(table_id).await
+    }
+
     /// Add a small batch of delete identifiers inlined in the metastore.
     async fn add_inlined_delete(&self, delete: InlinedDelete) -> CatalogResult<String>;
 

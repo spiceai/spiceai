@@ -567,6 +567,29 @@ impl MetastoreBackend for SqliteMetastore {
         Ok(())
     }
 
+    async fn execute_transaction_batch(&self, sql: &str) -> CatalogResult<()> {
+        let conn = self.get_conn().await?;
+        let guard = conn.lock().await;
+        let batch_sql = format!("BEGIN TRANSACTION; {sql}; COMMIT;");
+
+        guard
+            .call(move |conn| {
+                conn.execute_batch(&batch_sql).or_else(|error| {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                })?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to execute transaction batch: {e}"),
+                },
+            )?;
+
+        Ok(())
+    }
+
     async fn query_row<F, T>(&self, params: QueryRowParams<'_>, f: F) -> CatalogResult<T>
     where
         F: FnOnce(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,

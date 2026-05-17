@@ -82,6 +82,15 @@ impl MetastoreImpl {
         }
     }
 
+    /// Helper to execute a transactional batch on metastore, working with both `SQLite` and Turso
+    pub(crate) async fn execute_transaction_batch_helper(&self, sql: &str) -> CatalogResult<()> {
+        match self {
+            MetastoreImpl::Sqlite(m) => m.execute_transaction_batch(sql).await,
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(m) => m.execute_transaction_batch(sql).await,
+        }
+    }
+
     /// Helper to query multiple rows from metastore, working with both `SQLite` and Turso
     pub(crate) async fn query_helper<F, T>(
         &self,
@@ -1701,6 +1710,18 @@ impl MetadataCatalog for CayenneCatalog {
                 sql: "DELETE FROM cayenne_inlined_data WHERE table_id = ?1",
                 params: vec![MetastoreValue::Text(table_id.to_string())],
             })
+            .await
+    }
+
+    async fn clear_inlined_data_and_deletes(&self, table_id: &str) -> CatalogResult<()> {
+        let table_id_literal = sql_text_literal(table_id);
+        let batch_sql = format!(
+            "DELETE FROM cayenne_inlined_data WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_inlined_delete WHERE table_id = {table_id_literal};"
+        );
+
+        self.metastore
+            .execute_transaction_batch_helper(&batch_sql)
             .await
     }
 
@@ -3650,6 +3671,99 @@ mod tests {
             .expect("Failed to add delete file");
 
         table_id
+    }
+
+    #[tokio::test]
+    async fn test_clear_inlined_data_and_deletes_clears_both_tables() {
+        let test_db = format!(
+            "sqlite://./.test_clear_inline_metadata_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "clear_inline_metadata".to_string(),
+                schema,
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: "/tmp/clear_inline_metadata".to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("Failed to create table");
+
+        catalog
+            .add_inlined_data(InlinedData {
+                inlined_id: String::new(),
+                table_id: table_id.clone(),
+                partition_key: None,
+                data_ipc: vec![1, 2, 3],
+                record_count: 3,
+                sequence_number: 1,
+                created_at: String::new(),
+            })
+            .await
+            .expect("Failed to add inlined data");
+        catalog
+            .add_inlined_delete(InlinedDelete {
+                inlined_id: String::new(),
+                table_id: table_id.clone(),
+                delete_ipc: vec![4, 5, 6],
+                delete_count: 2,
+                sequence_number: 2,
+                created_at: String::new(),
+            })
+            .await
+            .expect("Failed to add inlined delete");
+
+        assert_eq!(
+            catalog
+                .get_inlined_data_count(&table_id)
+                .await
+                .expect("Failed to get inlined data count"),
+            3
+        );
+        assert_eq!(
+            catalog
+                .get_inlined_deletes(&table_id)
+                .await
+                .expect("Failed to get inlined deletes")
+                .len(),
+            1
+        );
+
+        catalog
+            .clear_inlined_data_and_deletes(&table_id)
+            .await
+            .expect("Failed to clear inline metadata");
+
+        assert_eq!(
+            catalog
+                .get_inlined_data_count(&table_id)
+                .await
+                .expect("Failed to get inlined data count after clear"),
+            0
+        );
+        assert!(
+            catalog
+                .get_inlined_deletes(&table_id)
+                .await
+                .expect("Failed to get inlined deletes after clear")
+                .is_empty()
+        );
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
     }
 
     /// Issue #10125 — `commit_compaction_in_txn` applied to a single partition

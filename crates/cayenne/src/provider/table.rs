@@ -5831,10 +5831,7 @@ impl CayenneTableProvider {
 
     async fn clear_inlined_metadata_after_checkpoint(&self) -> Result<()> {
         self.catalog
-            .clear_inlined_data(&self.table_metadata.table_id)
-            .await?;
-        self.catalog
-            .clear_inlined_deletes(&self.table_metadata.table_id)
+            .clear_inlined_data_and_deletes(&self.table_metadata.table_id)
             .await?;
         self.inlined_row_count.store(0, Ordering::Relaxed);
         Ok(())

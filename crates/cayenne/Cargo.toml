@@ -127,6 +127,10 @@ name = "checkpoint_fence_stall"
 
 [[bench]]
 harness = false
+name = "metastore_connection_contention"
+
+[[bench]]
+harness = false
 name = "vs_duckdb_ingest"
 required-features = ["duckdb-bench"]
 
