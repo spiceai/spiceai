@@ -32,9 +32,7 @@ use cache::Caching;
 #[cfg(not(windows))]
 use cayenne::logical_optimizer::CayennePropagateFilterAcrossEquiJoinKeys;
 #[cfg(not(windows))]
-use cayenne::optimizer_rules::{
-    CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneJoinRewriter,
-};
+use cayenne::optimizer_rules::{CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing};
 #[cfg(not(windows))]
 use datafusion::optimizer::{Optimizer, OptimizerRule};
 use datafusion::{
@@ -392,8 +390,7 @@ impl DataFusionBuilder {
             state = with_cayenne_logical_optimizer(state);
             state = state
                 .with_physical_optimizer_rule(Arc::new(CayenneDynamicFilterSharing::new()))
-                .with_physical_optimizer_rule(Arc::new(CayenneAntiJoinSortMergeRewriter::new()))
-                .with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
+                .with_physical_optimizer_rule(Arc::new(CayenneAntiJoinSortMergeRewriter::new()));
         }
         #[cfg(windows)]
         {
@@ -1168,7 +1165,7 @@ mod tests {
     /// downcast to the default `HashJoinExec` type.
     #[test]
     #[cfg(not(windows))]
-    fn test_built_datafusion_registers_cayenne_join_rewriter_after_datafusion_rules() {
+    fn test_built_datafusion_registers_cayenne_rules_after_datafusion_rules() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1192,10 +1189,6 @@ mod tests {
             .iter()
             .position(|name| *name == "SanityCheckPlan")
             .expect("DataFusion sanity check rule should be registered");
-        let cayenne_rewriter_position = rule_names
-            .iter()
-            .position(|name| *name == "CayenneJoinRewriter")
-            .expect("Cayenne join rewriter should be registered");
         let cayenne_filter_sharing_position = rule_names
             .iter()
             .position(|name| *name == "CayenneDynamicFilterSharing")
@@ -1206,24 +1199,12 @@ mod tests {
             .expect("Cayenne anti join sort-merge rewriter should be registered");
 
         assert!(
-            sanity_check_position < cayenne_rewriter_position,
-            "CayenneJoinRewriter must run after DataFusion's built-in physical optimizer rules"
-        );
-        assert!(
             sanity_check_position < cayenne_filter_sharing_position,
             "CayenneDynamicFilterSharing must run after DataFusion's built-in physical optimizer rules"
         );
         assert!(
-            cayenne_filter_sharing_position < cayenne_rewriter_position,
-            "CayenneDynamicFilterSharing must run before CayenneJoinRewriter so it can inspect DataFusion's default HashJoinExec nodes"
-        );
-        assert!(
             cayenne_filter_sharing_position < cayenne_anti_sort_merge_position,
             "CayenneDynamicFilterSharing must run before CayenneAntiJoinSortMergeRewriter so anti joins can still receive shared scan filters"
-        );
-        assert!(
-            cayenne_anti_sort_merge_position < cayenne_rewriter_position,
-            "CayenneAntiJoinSortMergeRewriter must run before CayenneJoinRewriter so anti joins are not recreated with the hash-join accumulator"
         );
     }
 
