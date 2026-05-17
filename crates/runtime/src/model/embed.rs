@@ -40,8 +40,6 @@ use llms::embeddings::{Embed, Error as EmbedError};
 use llms::model2vec::Model2Vec;
 use llms::openai::embed::OpenaiEmbed;
 use llms::openai::{DEFAULT_EMBEDDING_MODEL, UsageTier};
-#[cfg(feature = "models")]
-use secrecy::SecretBox;
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::{embeddings::EmbeddingPrefix, model::ModelFileType};
@@ -175,29 +173,33 @@ fn model2vec(
         });
     };
 
-    let hf_token = params
-        .get("hf_token")
-        .map(secrecy::ExposeSecret::expose_secret);
+    let hf_token = params.get("hf_token").expose().ok();
 
-    let subfolder = params
-        .get("subfolder")
-        .map(secrecy::ExposeSecret::expose_secret);
+    let subfolder = params.get("subfolder").expose().ok();
 
     let normalize = params
         .get("normalize")
-        .and_then(|ss| ss.expose_secret().parse::<bool>().ok());
+        .expose()
+        .ok()
+        .and_then(|ss| ss.parse::<bool>().ok());
 
     let parallelism = params
         .get("parallelism")
-        .and_then(|ss| ss.expose_secret().parse::<usize>().ok());
+        .expose()
+        .ok()
+        .and_then(|ss| ss.parse::<usize>().ok());
 
     let embed_max_token_length = params
         .get("embed_max_token_length")
-        .and_then(|ss| ss.expose_secret().parse::<usize>().ok());
+        .expose()
+        .ok()
+        .and_then(|ss| ss.parse::<usize>().ok());
 
     let embed_custom_batch_size = params
         .get("embed_custom_batch_size")
-        .and_then(|ss| ss.expose_secret().parse::<usize>().ok());
+        .expose()
+        .ok()
+        .and_then(|ss| ss.parse::<usize>().ok());
 
     Model2Vec::from_params(
         &model_id,
@@ -571,10 +573,7 @@ async fn file(
             source: "No 'tokenizer_path' parameter provided".into(),
         })?
         .clone();
-    let pooling = params
-        .get("pooling")
-        .map(SecretBox::expose_secret)
-        .map(String::from);
+    let pooling = params.get("pooling").expose().ok().map(String::from);
     let max_seq_len = max_seq_length_from_params(params)?;
     Ok(Arc::new(
         TeiEmbed::from_local(
@@ -836,9 +835,10 @@ fn max_seq_length_from_params(
 ) -> Result<Option<usize>, EmbedError> {
     params
         .get("max_seq_length")
+        .expose()
+        .ok()
         .map(|s| {
-            secrecy::ExposeSecret::expose_secret(s)
-                .parse()
+            s.parse()
                 .boxed()
                 .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
                     source: format!("Failed to parse 'max_seq_length' parameter: {e}").into(),
