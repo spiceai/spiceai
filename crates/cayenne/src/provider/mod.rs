@@ -775,6 +775,14 @@ mod tests {
             .await
             .expect("Failed to insert data");
 
+        // Ordinary writes are intentionally unsorted for throughput.
+        // Compaction (sort_and_rewrite_data) sorts the data and flushes inline
+        // rows to Vortex files with tight zone-map bounds.
+        table
+            .sort_and_rewrite_data(128 * 1024 * 1024)
+            .await
+            .expect("Failed to sort and rewrite data");
+
         // Verify data is sorted by timestamp, then by id
         let ctx = SessionContext::new();
         let scan_plan = table
