@@ -742,58 +742,58 @@ fn normalize_search_response_json(
             });
         } else {
             matches.sort_by(|a, b| {
-            let Some(Value::Number(num_a)) = a.get("_score") else {
-                return Ordering::Greater;
-            };
-            let Some(score_a) = num_a.as_f64() else {
-                return Ordering::Greater;
-            };
-            let Some(Value::Number(num_b)) = b.get("_score") else {
-                return Ordering::Less;
-            };
-            let Some(score_b) = num_b.as_f64() else {
-                return Ordering::Less;
-            };
+                let Some(Value::Number(num_a)) = a.get("_score") else {
+                    return Ordering::Greater;
+                };
+                let Some(score_a) = num_a.as_f64() else {
+                    return Ordering::Greater;
+                };
+                let Some(Value::Number(num_b)) = b.get("_score") else {
+                    return Ordering::Less;
+                };
+                let Some(score_b) = num_b.as_f64() else {
+                    return Ordering::Less;
+                };
 
-            // When round_scores is true, round to 2 decimal places before comparing
-            // to avoid flaky ordering from minor floating-point variance across CI
-            // runners (model2vec/s3vectors). Otherwise use raw float comparison.
-            let cmp_a = if round_scores {
-                (100.0 * score_a).round() / 100.0
-            } else {
-                score_a
-            };
-            let cmp_b = if round_scores {
-                (100.0 * score_b).round() / 100.0
-            } else {
-                score_b
-            };
+                // When round_scores is true, round to 2 decimal places before comparing
+                // to avoid flaky ordering from minor floating-point variance across CI
+                // runners (model2vec/s3vectors). Otherwise use raw float comparison.
+                let cmp_a = if round_scores {
+                    (100.0 * score_a).round() / 100.0
+                } else {
+                    score_a
+                };
+                let cmp_b = if round_scores {
+                    (100.0 * score_b).round() / 100.0
+                } else {
+                    score_b
+                };
 
-            // Opposite because we want to order descendingly
-            if cmp_a > cmp_b {
-                return Ordering::Less;
-            } else if cmp_a < cmp_b {
-                return Ordering::Greater;
-            }
-
-            if sort_ties_by_matches {
-                let matches_a = a.get("matches").map(json_tiebreak_key).unwrap_or_default();
-                let matches_b = b.get("matches").map(json_tiebreak_key).unwrap_or_default();
-                let matches_cmp = matches_a.cmp(&matches_b);
-                if matches_cmp != Ordering::Equal {
-                    return matches_cmp;
+                // Opposite because we want to order descendingly
+                if cmp_a > cmp_b {
+                    return Ordering::Less;
+                } else if cmp_a < cmp_b {
+                    return Ordering::Greater;
                 }
-            }
 
-            let Some(Value::Object(a_pks)) = a.get("primary_key") else {
-                return Ordering::Equal;
-            };
-            let Some(Value::Object(b_pks)) = b.get("primary_key") else {
-                return Ordering::Equal;
-            };
-            let primary_key_a = json_tiebreak_key(&Value::Object(a_pks.clone()));
-            let primary_key_b = json_tiebreak_key(&Value::Object(b_pks.clone()));
-            primary_key_b.cmp(&primary_key_a)
+                if sort_ties_by_matches {
+                    let matches_a = a.get("matches").map(json_tiebreak_key).unwrap_or_default();
+                    let matches_b = b.get("matches").map(json_tiebreak_key).unwrap_or_default();
+                    let matches_cmp = matches_a.cmp(&matches_b);
+                    if matches_cmp != Ordering::Equal {
+                        return matches_cmp;
+                    }
+                }
+
+                let Some(Value::Object(a_pks)) = a.get("primary_key") else {
+                    return Ordering::Equal;
+                };
+                let Some(Value::Object(b_pks)) = b.get("primary_key") else {
+                    return Ordering::Equal;
+                };
+                let primary_key_a = json_tiebreak_key(&Value::Object(a_pks.clone()));
+                let primary_key_b = json_tiebreak_key(&Value::Object(b_pks.clone()));
+                primary_key_b.cmp(&primary_key_a)
             });
         }
 
@@ -834,7 +834,12 @@ fn search_result_snapshot_key(result: &Value, sort_ties_by_matches: bool) -> Str
             .map(json_tiebreak_key)
             .unwrap_or_default(),
     );
-    parts.push(result.get("matches").map(json_tiebreak_key).unwrap_or_default());
+    parts.push(
+        result
+            .get("matches")
+            .map(json_tiebreak_key)
+            .unwrap_or_default(),
+    );
     parts.join("\u{1f}")
 }
 
