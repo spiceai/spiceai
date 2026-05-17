@@ -1178,11 +1178,7 @@ mod tests {
     }
 
     fn memory_exec_with_type(column_name: &str, data_type: DataType) -> Arc<dyn ExecutionPlan> {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            column_name,
-            data_type,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new(column_name, data_type, false)]));
         MemorySourceConfig::try_new_exec(&[vec![]], schema, None)
             .expect("memory exec should be valid")
     }
