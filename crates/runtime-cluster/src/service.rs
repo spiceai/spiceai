@@ -455,12 +455,12 @@ impl PartitionService {
                 }
             };
 
-        let existing: HashSet<Vec<(String, String)>> = existing_partitions
+        let existing: HashSet<Vec<(String, Option<String>)>> = existing_partitions
             .iter()
             .map(|p| sorted_kv(&p.partition_value))
             .collect();
 
-        let source_set: HashSet<Vec<(String, String)>> =
+        let source_set: HashSet<Vec<(String, Option<String>)>> =
             source_partitions.iter().map(sorted_kv).collect();
 
         let new: Vec<PartitionValue> = source_partitions
