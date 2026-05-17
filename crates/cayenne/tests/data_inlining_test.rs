@@ -1605,6 +1605,16 @@ async fn test_inlined_cache_generation_invariants(fixture: common::TestFixture) 
         gen_after_checkpoint > gen_after_second,
         "generation must be bumped after checkpoint: before={gen_after_second} after={gen_after_checkpoint}"
     );
+    let table_id = fixture
+        .catalog
+        .get_table("inlined_cache_gen")
+        .await?
+        .table_id;
+    assert_eq!(
+        fixture.catalog.get_inlined_data_count(&table_id).await?,
+        0,
+        "checkpoint clear must remove inlined rows from the metastore"
+    );
 
     // Post-checkpoint scan: inline data was flushed to Vortex, so the
     // table must still return all 5 rows (now from the file layer).
@@ -1622,6 +1632,11 @@ async fn test_inlined_cache_generation_invariants(fixture: common::TestFixture) 
     assert_eq!(
         count3, 5,
         "post-checkpoint scan must still return 5 rows (now from Vortex files)"
+    );
+    assert_eq!(
+        table.inlined_generation(),
+        gen_after_checkpoint,
+        "post-checkpoint scans must not bump the inline generation"
     );
 
     Ok(())

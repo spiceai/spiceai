@@ -505,16 +505,8 @@ impl<'a> AppendMutationWriter<'a> {
                 self.table
                     .schedule_post_write_maintenance(Some(Arc::new(stats_acc)), false);
 
-                if let Err(e) = self
-                    .table
-                    .checkpoint_inlined_data_if_memtable_pressure_exceeded()
-                    .await
-                {
-                    tracing::warn!(
-                        "Auto-checkpoint of inline memtable failed for {}: {e}",
-                        self.table.table_name(),
-                    );
-                }
+                self.table
+                    .schedule_inline_checkpoint_if_memtable_pressure_exceeded();
 
                 return Ok(InlineMutationOutcome::Inlined {
                     rows: u64::try_from(buffer.total_rows()).unwrap_or(u64::MAX),

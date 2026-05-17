@@ -111,6 +111,7 @@ use arc_swap::ArcSwap;
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
 const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
+const PK_KEYSET_CACHE_MAX_ENTRIES: usize = 1_000_000;
 
 #[derive(Default)]
 struct PostWriteMaintenanceState {
@@ -985,6 +986,11 @@ pub struct CayenneTableProvider {
     /// Delete paths invalidate this cache because arbitrary predicates can
     /// remove keys without telling us which keys were affected.
     pk_keyset_cache: Arc<ParkingMutex<Option<HashMap<OwnedRow, RowLocation>>>>,
+    /// Coalesces inline-memtable checkpoint checks spawned after inline writes.
+    /// The check takes `write_lock` in the background after the scheduling
+    /// writer returns, so inline commits do not hold the writer lock while
+    /// flushing the memtable to Vortex.
+    inline_checkpoint_scheduled: Arc<AtomicBool>,
     /// Cached inlined row count. Maintained while the process is running so
     /// append-heavy inline CDC writes don't query the metastore after every
     /// burst just to decide whether to checkpoint.
@@ -2803,6 +2809,7 @@ impl CayenneTableProvider {
             )),
             protected_snapshots: Arc::new(RwLock::new(protected_snapshots)),
             pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
+            inline_checkpoint_scheduled: Arc::new(AtomicBool::new(false)),
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
             inlined_generation: Arc::new(AtomicU64::new(0)),
             inlined_cache: Arc::new(ArcSwap::new(Arc::new(InlinedCache {
@@ -3235,6 +3242,7 @@ impl CayenneTableProvider {
             current_snapshot_id: Arc::clone(&self.current_snapshot_id),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             pk_keyset_cache: Arc::clone(&self.pk_keyset_cache),
+            inline_checkpoint_scheduled: Arc::clone(&self.inline_checkpoint_scheduled),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
             inlined_generation: Arc::clone(&self.inlined_generation),
             inlined_cache: Arc::clone(&self.inlined_cache),
@@ -3342,6 +3350,17 @@ impl CayenneTableProvider {
     }
 
     fn store_cached_pk_keyset(&self, keyset: HashMap<OwnedRow, RowLocation>) {
+        if keyset.len() > PK_KEYSET_CACHE_MAX_ENTRIES {
+            tracing::debug!(
+                table = self.table_metadata.table_name.as_str(),
+                key_count = keyset.len(),
+                max_key_count = PK_KEYSET_CACHE_MAX_ENTRIES,
+                "Skipping primary-key keyset cache because it exceeds the configured in-memory cap"
+            );
+            *self.pk_keyset_cache.lock() = None;
+            return;
+        }
+
         *self.pk_keyset_cache.lock() = Some(keyset);
     }
 
@@ -3358,6 +3377,18 @@ impl CayenneTableProvider {
         let Some(keyset) = guard.as_mut() else {
             return;
         };
+
+        if keyset.len().saturating_add(keys.len()) > PK_KEYSET_CACHE_MAX_ENTRIES {
+            tracing::debug!(
+                table = self.table_metadata.table_name.as_str(),
+                key_count = keyset.len(),
+                incoming_key_count = keys.len(),
+                max_key_count = PK_KEYSET_CACHE_MAX_ENTRIES,
+                "Clearing primary-key keyset cache because the write would exceed the in-memory cap"
+            );
+            *guard = None;
+            return;
+        }
 
         let location = RowLocation {
             source,
@@ -4712,6 +4743,38 @@ impl CayenneTableProvider {
         });
     }
 
+    pub(crate) fn schedule_inline_checkpoint_if_memtable_pressure_exceeded(&self) {
+        if self
+            .inline_checkpoint_scheduled
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+
+        let table = self.clone_for_write();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let result = async {
+                let _write_guard = table.write_lock.lock().await;
+                table
+                    .checkpoint_inlined_data_if_memtable_pressure_exceeded()
+                    .await
+            }
+            .await;
+
+            table
+                .inline_checkpoint_scheduled
+                .store(false, Ordering::Release);
+
+            if let Err(e) = result {
+                tracing::warn!(
+                    table = table.table_metadata.table_name.as_str(),
+                    "Auto-checkpoint of inline memtable failed: {e}"
+                );
+            }
+        });
+    }
+
     pub(crate) fn schedule_post_write_maintenance(
         &self,
         stats: Option<Arc<ColumnStatsAccumulator>>,
@@ -5567,6 +5630,8 @@ impl CayenneTableProvider {
         );
 
         Self::invalidate_list_files_cache(self.context.runtime_env(), &snapshot_dir_url);
+        self.scan_listing_tables.lock().clear();
+        self.record_scan_listing_table_cache_entries(0);
 
         tracing::trace!(
             table = self.table_metadata.table_name.as_str(),
@@ -6080,51 +6145,48 @@ impl CayenneTableProvider {
         let ctx = self.create_session_context();
         let stream = datafusion_physical_plan::execute_stream(mem_exec, ctx.task_ctx())?;
 
-        let stats = if self.pk_deletion_strategy.is_position_based() {
-            let target_size_bytes = self.context.target_file_size_bytes();
-            let (_rows, _ops, stats) = self
-                .write_to_snapshot(
-                    stream,
-                    target_size_bytes,
-                    &self.get_current_snapshot_id(),
-                    ctx.state().config().target_partitions(),
-                )
-                .await?;
-            stats
-        } else {
-            let sequence_number = self
-                .catalog
-                .increment_sequence_number(&self.table_metadata.table_id)
-                .await?;
-            let (_rows, stats) = self
-                .insert_to_new_snapshot_with_sequence(
-                    stream,
-                    sequence_number,
-                    ctx.state().config().target_partitions(),
-                )
-                .await?;
+        // Hold the listing fence across the visibility flip: for position-based
+        // tables the checkpoint writes directly into the current snapshot
+        // directory, and for PK tables it publishes a protected snapshot. In
+        // both cases, clearing the inline metastore rows must be indivisible
+        // with making the Vortex files visible to scans, or a reader can see
+        // both copies of the same rows.
+        let stats = {
+            let _fence = self.listing_fence.write().await;
+
+            let stats = if self.pk_deletion_strategy.is_position_based() {
+                let target_size_bytes = self.context.target_file_size_bytes();
+                let (_rows, _ops, stats) = self
+                    .write_to_snapshot(
+                        stream,
+                        target_size_bytes,
+                        &self.get_current_snapshot_id(),
+                        ctx.state().config().target_partitions(),
+                    )
+                    .await?;
+                stats
+            } else {
+                let sequence_number = self
+                    .catalog
+                    .increment_sequence_number(&self.table_metadata.table_id)
+                    .await?;
+                let (_rows, stats) = self
+                    .insert_to_new_snapshot_with_sequence(
+                        stream,
+                        sequence_number,
+                        ctx.state().config().target_partitions(),
+                    )
+                    .await?;
+                stats
+            };
+
+            self.clear_inlined_metadata_after_checkpoint().await?;
+            self.refresh_listing_table_under_held_fence()?;
             stats
         };
 
         // Persist table stats from the checkpoint write (best-effort; logs on error).
         self.persist_table_stats(&stats).await;
-
-        // Hold the listing fence across BOTH the catalog clear and the
-        // listing-table swap. Without bracketing, a scan that starts between
-        // the clear and the refresh observes the metastore as already empty
-        // of inlined rows AND the listing table as still pointing at the old
-        // snapshot (missing the freshly-checkpointed Vortex file) — so the
-        // just-checkpointed rows disappear from the visible state briefly.
-        // The fence write blocks new readers for the duration of these two
-        // catalog ops (microseconds in the typical case), so concurrent
-        // scans always observe either the pre-checkpoint state (old listing
-        // + inlined data) or the post-checkpoint state (new listing + no
-        // inlined data).
-        {
-            let _fence = self.listing_fence.write().await;
-            self.clear_inlined_metadata_after_checkpoint().await?;
-            self.refresh_listing_table_under_held_fence()?;
-        }
 
         Ok(u64::try_from(total_rows).unwrap_or(u64::MAX))
     }

@@ -607,6 +607,9 @@ fn exact_join_filter_build_estimate(hash_join: &HashJoinExec) -> Option<(usize, 
         .iter()
         .try_fold(0_usize, |width, (left_key, _)| {
             let data_type = left_key.data_type(build_schema.as_ref()).ok()?;
+            if !supports_exact_join_filter_fallback(&data_type) {
+                return None;
+            }
             Some(width.saturating_add(estimated_arrow_width(&data_type)?))
         })?;
 
@@ -614,6 +617,35 @@ fn exact_join_filter_build_estimate(hash_join: &HashJoinExec) -> Option<(usize, 
         build_row_count,
         build_row_count.saturating_mul(join_key_width),
     ))
+}
+
+fn supports_exact_join_filter_fallback(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+    )
 }
 
 fn should_rewrite_with_exact_accumulator(hash_join: &HashJoinExec, config: &ConfigOptions) -> bool {
@@ -631,7 +663,7 @@ fn should_rewrite_with_exact_accumulator(hash_join: &HashJoinExec, config: &Conf
         exact_join_filter_build_estimate(hash_join)
     else {
         tracing::debug!(
-            "Keeping HashJoinExec default accumulator because exact build-side join-key statistics are unavailable"
+            "Keeping HashJoinExec default accumulator because exact build-side join-key statistics or fallback-compatible key types are unavailable"
         );
         return false;
     };
@@ -1142,9 +1174,13 @@ mod tests {
     }
 
     fn memory_exec(column_name: &str) -> Arc<dyn ExecutionPlan> {
+        memory_exec_with_type(column_name, DataType::Int32)
+    }
+
+    fn memory_exec_with_type(column_name: &str, data_type: DataType) -> Arc<dyn ExecutionPlan> {
         let schema = Arc::new(Schema::new(vec![Field::new(
             column_name,
-            DataType::Int32,
+            data_type,
             false,
         )]));
         MemorySourceConfig::try_new_exec(&[vec![]], schema, None)
@@ -1514,6 +1550,23 @@ mod tests {
         assert!(
             optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
             "Estimated exact join-filter bytes above the budget should keep DataFusion's default accumulator"
+        );
+    }
+
+    #[test]
+    fn leaves_hash_join_with_unsupported_exact_fallback_type_unchanged() {
+        let left = memory_exec_with_type("left_id", DataType::Boolean);
+        let right = Arc::new(CayenneAccelerationExec::new(memory_exec_with_type(
+            "right_id",
+            DataType::Boolean,
+        )));
+        let join = Arc::new(hash_join(left, right, "left_id", "right_id"));
+
+        let optimized = optimize(join);
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "Join-key types without a real exhausted-memory fallback should keep DataFusion's default accumulator"
         );
     }
 

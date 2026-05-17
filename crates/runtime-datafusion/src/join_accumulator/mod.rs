@@ -365,9 +365,10 @@ impl ColumnBounds for ExactColumnBounds {
             .collect::<DataFusionResult<HashSet<ScalarValue>>>()?;
 
         if unique_values.is_empty() {
-            // No values collected - return a no-op filter (always true)
-            tracing::debug!("ExactLeftAccumulator collected no values, returning no-op filter.");
-            return Ok(literal_true());
+            tracing::debug!(
+                "ExactLeftAccumulator collected no build-side values, returning always-false filter."
+            );
+            return Ok(literal_false());
         }
 
         let expr_values = unique_values
@@ -521,9 +522,9 @@ impl RangeBounds {
     fn physical_expr(&self, left_expr: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
         if self.intervals.is_empty() {
             tracing::debug!(
-                "ExactLeftAccumulator range fallback has no non-null values, returning no-op filter."
+                "ExactLeftAccumulator range fallback has no non-null values, returning always-false filter."
             );
-            return literal_true();
+            return literal_false();
         }
 
         if !self.supports_range_filter {
@@ -1144,6 +1145,10 @@ fn literal_true() -> Arc<dyn PhysicalExpr> {
     Arc::new(Literal::new(ScalarValue::Boolean(Some(true))))
 }
 
+fn literal_false() -> Arc<dyn PhysicalExpr> {
+    Arc::new(Literal::new(ScalarValue::Boolean(Some(false))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1180,6 +1185,15 @@ mod tests {
             .downcast_ref::<Literal>()
             .expect("Should downcast to Literal");
         let expected_value = ScalarValue::Boolean(Some(true));
+        assert_eq!(literal_expr.value(), &expected_value);
+    }
+
+    fn assert_literal_false(physical_expr: &Arc<dyn PhysicalExpr>) {
+        let literal_expr = physical_expr
+            .as_any()
+            .downcast_ref::<Literal>()
+            .expect("Should downcast to Literal");
+        let expected_value = ScalarValue::Boolean(Some(false));
         assert_eq!(literal_expr.value(), &expected_value);
     }
 
@@ -1288,7 +1302,7 @@ mod tests {
 
     #[test]
     fn test_exact_left_accumulator_empty_batch() {
-        // Test that updating with an empty batch does not cause errors and results in an always-true filter
+        // Test that updating with an empty batch does not cause errors and produces an always-false filter.
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
         let empty_batch = RecordBatch::try_new(
             Arc::new(schema),
@@ -1311,7 +1325,7 @@ mod tests {
             .physical_expr(left_expr)
             .expect("Should create physical expr");
 
-        assert_literal_true(&physical_expr);
+        assert_literal_false(&physical_expr);
     }
 
     #[test]
@@ -1661,7 +1675,7 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_left_accumulator_memory_noop_with_only_nulls() {
+    fn test_exact_left_accumulator_memory_false_with_only_nulls() {
         let batch = create_nullable_uint64_batch(vec![None, None]);
 
         let left_expr = col("a", &batch.schema()).expect("Should create column expr");
@@ -1677,7 +1691,7 @@ mod tests {
             .physical_expr(left_expr)
             .expect("Should create physical expr");
 
-        assert_literal_true(&physical_expr);
+        assert_literal_false(&physical_expr);
     }
 
     #[test]
