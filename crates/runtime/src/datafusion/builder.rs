@@ -814,23 +814,10 @@ pub(crate) fn default_extension_planners(
 #[cfg(test)]
 mod tests {
     #[cfg(not(windows))]
-    use arrow::{
-        array::{ArrayRef, Int32Array},
-        datatypes::{DataType, Field, Schema},
-        record_batch::RecordBatch,
-    };
-    #[cfg(not(windows))]
-    use cayenne::provider::CayenneAccelerationExec;
+    use arrow::datatypes::{DataType, Field, Schema};
     #[cfg(not(windows))]
     use datafusion::catalog::MemTable;
     use datafusion::optimizer::Analyzer;
-    #[cfg(not(windows))]
-    use datafusion::{
-        common::{JoinType, NullEquality},
-        datasource::memory::MemorySourceConfig,
-        physical_expr::expressions::col,
-        physical_plan::{ExecutionPlan, displayable, joins::HashJoinExec, joins::PartitionMode},
-    };
 
     use super::{
         DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES, DataFusionBuilder,
@@ -1160,9 +1147,8 @@ mod tests {
         });
     }
 
-    /// Cayenne rewrites `HashJoinExec` to use a custom accumulator type, so it
-    /// must run after `DataFusion`'s built-in physical optimizer rules that
-    /// downcast to the default `HashJoinExec` type.
+    /// Cayenne physical optimizer rules must run after `DataFusion`'s built-in
+    /// physical optimizer rules.
     #[test]
     #[cfg(not(windows))]
     fn test_built_datafusion_registers_cayenne_rules_after_datafusion_rules() {
@@ -1205,76 +1191,6 @@ mod tests {
         assert!(
             cayenne_filter_sharing_position < cayenne_anti_sort_merge_position,
             "CayenneDynamicFilterSharing must run before CayenneAntiJoinSortMergeRewriter so anti joins can still receive shared scan filters"
-        );
-    }
-
-    #[cfg(not(windows))]
-    fn memory_exec(column_name: &str) -> Arc<dyn ExecutionPlan> {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            column_name,
-            DataType::Int32,
-            false,
-        )]));
-        let values: ArrayRef = Arc::new(Int32Array::from(vec![1]));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![values])
-            .expect("memory exec batch should be valid");
-        MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)
-            .expect("memory exec should be valid")
-    }
-
-    #[cfg(not(windows))]
-    fn cayenne_backed_join() -> Arc<dyn ExecutionPlan> {
-        let left = memory_exec("left_id");
-        let right: Arc<dyn ExecutionPlan> =
-            Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
-
-        Arc::new(
-            HashJoinExec::try_new(
-                Arc::clone(&left),
-                Arc::clone(&right),
-                vec![(
-                    col("left_id", &left.schema()).expect("left join key should exist"),
-                    col("right_id", &right.schema()).expect("right join key should exist"),
-                )],
-                None,
-                &JoinType::Inner,
-                None,
-                PartitionMode::Partitioned,
-                NullEquality::NullEqualsNothing,
-            )
-            .expect("hash join should be valid"),
-        )
-    }
-
-    #[test]
-    #[cfg(not(windows))]
-    fn test_built_datafusion_applies_cayenne_join_rewriter_to_physical_plan() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        let handle = rt.handle().clone();
-
-        let df = DataFusionBuilder::new(
-            status::RuntimeStatus::new(),
-            Arc::new(AcceleratorEngineRegistry::default()),
-            handle,
-        )
-        .build();
-
-        let state = df.ctx.state();
-        let mut plan = cayenne_backed_join();
-        for optimizer in state.physical_optimizers() {
-            plan = optimizer
-                .optimize(plan, state.config_options())
-                .expect("physical optimizer should succeed");
-        }
-
-        let plan = displayable(plan.as_ref()).indent(true).to_string();
-
-        assert!(
-            plan.contains("accumulator=ExactLeftAccumulator"),
-            "Runtime physical optimizer stack should rewrite Cayenne-backed joins: {plan}"
         );
     }
 }
