@@ -1473,3 +1473,117 @@ async fn test_compaction_runs_after_inline_memtable_checkpoint(
 
     Ok(())
 }
+
+// ─── inline-memtable cache invalidation ────────────────────────────────────
+
+test_with_backends!(test_inlined_cache_generation_invariants);
+
+/// Verify that the inline-memtable cache generation counter is bumped correctly.
+///
+/// The generation is the key signal read by `read_inlined_batches` to decide
+/// whether it can return the in-process cached `Vec<RecordBatch>` instead of
+/// re-reading and re-decoding from the metastore. This test checks that:
+///
+/// 1. The counter starts at 0.
+/// 2. Each successful inline write bumps it.
+/// 3. Scans after successive writes return correct row counts (exercises the
+///    cache-hit path because the second scan sees the same generation as the
+///    previous `read_inlined_batches` call).
+async fn test_inlined_cache_generation_invariants(fixture: common::TestFixture) -> TestResult {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            cayenne::metadata::CreateTableOptions {
+                table_name: "inlined_cache_gen".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: fixture.data_path.to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: Default::default(),
+            },
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    ctx.register_table(
+        "inlined_cache_gen",
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    )?;
+
+    // Generation starts at 0 (no writes yet).
+    assert_eq!(table.inlined_generation(), 0, "initial generation must be 0");
+
+    // First inline write — generation should increase.
+    let batch1 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )?;
+    common::insert_batch(&table, batch1).await?;
+    let gen_after_first = table.inlined_generation();
+    assert!(
+        gen_after_first > 0,
+        "generation must be bumped after first inline write, got {gen_after_first}"
+    );
+
+    // Second inline write — generation must increase again.
+    let batch2 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![4_i64, 5])),
+            Arc::new(StringArray::from(vec!["d", "e"])),
+        ],
+    )?;
+    common::insert_batch(&table, batch2).await?;
+    let gen_after_second = table.inlined_generation();
+    assert!(
+        gen_after_second > gen_after_first,
+        "generation must be bumped after second inline write: before={gen_after_first} after={gen_after_second}"
+    );
+
+    // A scan exercises the cache-hit path on the second call. Both scans must
+    // return the same correct row count.
+    let df = ctx.sql("SELECT COUNT(*) AS c FROM inlined_cache_gen").await?;
+    let results = df.collect().await?;
+    let batch = arrow::compute::concat_batches(&results[0].schema(), &results)?;
+    let count = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count col")
+        .value(0);
+    assert_eq!(count, 5, "scan must see all 5 inlined rows");
+
+    // Second scan — should hit the cache (same generation) and return identical count.
+    let df2 = ctx.sql("SELECT COUNT(*) AS c FROM inlined_cache_gen").await?;
+    let results2 = df2.collect().await?;
+    let batch2 = arrow::compute::concat_batches(&results2[0].schema(), &results2)?;
+    let count2 = batch2
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count col")
+        .value(0);
+    assert_eq!(
+        count2, 5,
+        "cache-hit scan must also return 5 rows (same generation)"
+    );
+
+    // Generation must not have changed between the two scans (no writes occurred).
+    assert_eq!(
+        table.inlined_generation(),
+        gen_after_second,
+        "generation must not change between scans with no writes"
+    );
+
+    Ok(())
+}

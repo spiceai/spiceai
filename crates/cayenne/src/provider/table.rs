@@ -91,7 +91,7 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::task;
 use vortex::dtype::arrow::FromArrowType;
@@ -126,6 +126,21 @@ impl PostWriteMaintenanceState {
 struct PostWriteMaintenance {
     state: ParkingMutex<PostWriteMaintenanceState>,
     scheduled: AtomicBool,
+}
+
+/// Cached result of [`CayenneTableProvider::read_inlined_batches`].
+///
+/// The cache is keyed by an `inlined_generation` counter that is incremented
+/// (with `Release` ordering) by every `commit_inlined_data_mutation` and
+/// `clear_inlined_metadata_after_checkpoint` call. A cache entry is valid only
+/// when its stored `generation` equals the live counter — guaranteeing that any
+/// write or checkpoint immediately invalidates the cache without a lock.
+struct InlinedCache {
+    /// Generation at the time this entry was built.
+    generation: u64,
+    /// Pre-decoded `RecordBatch`es. Each batch shares Arrow buffer ownership
+    /// via `Arc`, so cloning the `Vec` is cheap (one refcount per array).
+    batches: Arc<Vec<RecordBatch>>,
 }
 
 /// Result of a Cayenne CDC append write.
@@ -954,6 +969,21 @@ pub struct CayenneTableProvider {
     /// append-heavy inline CDC writes don't query the metastore after every
     /// burst just to decide whether to checkpoint.
     inlined_row_count: Arc<AtomicI64>,
+    /// Inline-memtable cache generation counter.
+    ///
+    /// Incremented (with `Release` ordering) by every
+    /// `commit_inlined_data_mutation` and
+    /// `clear_inlined_metadata_after_checkpoint`. [`Self::inlined_cache`] is
+    /// valid only when its stored generation matches this counter.
+    inlined_generation: Arc<AtomicU64>,
+    /// Cached deserialized inline-memtable batches.
+    ///
+    /// A generation-matched hit in [`Self::read_inlined_batches`] avoids the
+    /// Arrow IPC decode and two metastore round-trips that the function would
+    /// otherwise pay on every scan. Stored as `Arc<ArcSwap<…>>` so writer
+    /// clones (via [`Self::clone_for_write`]) share the same cache entry and
+    /// can invalidate it for all concurrent readers with a single store.
+    inlined_cache: Arc<ArcSwap<InlinedCache>>,
     /// Approximate count of new Vortex files created in the *current* snapshot
     /// since the last successful compaction pass (or since table open).
     /// Used as a cheap early-out in `run_one_compaction_pass` so that during
@@ -2561,6 +2591,12 @@ impl CayenneTableProvider {
             protected_snapshots: Arc::new(RwLock::new(protected_snapshots)),
             pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
+            inlined_generation: Arc::new(AtomicU64::new(0)),
+            inlined_cache: Arc::new(ArcSwap::new(Arc::new(InlinedCache {
+                // Sentinel: first `read_inlined_batches` call always misses.
+                generation: u64::MAX,
+                batches: Arc::new(Vec::new()),
+            }))),
             staging_wal_present: Arc::new(AtomicBool::new(true)),
             staging_may_have_files: Arc::new(AtomicBool::new(true)),
             inflight_staging_appends: Arc::new(ParkingMutex::new(HashSet::new())),
@@ -2962,6 +2998,8 @@ impl CayenneTableProvider {
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             pk_keyset_cache: Arc::clone(&self.pk_keyset_cache),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
+            inlined_generation: Arc::clone(&self.inlined_generation),
+            inlined_cache: Arc::clone(&self.inlined_cache),
             staging_wal_present: Arc::clone(&self.staging_wal_present),
             staging_may_have_files: Arc::clone(&self.staging_may_have_files),
             inflight_staging_appends: Arc::clone(&self.inflight_staging_appends),
@@ -3971,6 +4009,11 @@ impl CayenneTableProvider {
         let appended_rows = i64::try_from(appended_rows).unwrap_or(i64::MAX);
         let removed_rows = i64::try_from(removed_rows).unwrap_or(i64::MAX);
         self.adjust_cached_inlined_row_count(appended_rows.saturating_sub(removed_rows));
+
+        // Invalidate the inlined-batch cache. The Release ordering guarantees
+        // that any concurrent `read_inlined_batches` Acquire-loading the new
+        // generation will observe all catalog changes committed above.
+        self.inlined_generation.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
@@ -5583,37 +5626,78 @@ impl CayenneTableProvider {
         self.inlined_row_count.load(Ordering::Relaxed)
     }
 
+    /// Returns the current inline-memtable cache generation counter.
+    ///
+    /// Monotonically increasing: bumped after every `commit_inlined_data_mutation`
+    /// (write path) and `clear_inlined_metadata_after_checkpoint` (flush path).
+    /// Exposed for testing cache-invalidation invariants.
+    #[must_use]
+    pub fn inlined_generation(&self) -> u64 {
+        self.inlined_generation.load(Ordering::Relaxed)
+    }
+
     /// Read visible inlined data for this table and return as `RecordBatch`es.
     ///
     /// Used at scan time to union inlined data with the file-based data. For
     /// primary-key tables this still honors legacy metastore-inlined delete
     /// markers, while new inline mutations rewrite `cayenne_inlined_data` rows
     /// directly.
+    ///
+    /// # Caching
+    ///
+    /// The result is cached keyed by `inlined_generation`. Writers bump the
+    /// generation (with `Release` ordering) after every successful catalog
+    /// commit, so a cache hit requires no metastore I/O and no Arrow IPC
+    /// decode — it is one atomic load and one `Arc::clone`.
+    ///
+    /// On a cache miss the function rebuilds from the metastore and stores the
+    /// decoded batches in `inlined_cache`. Concurrent misses are safe: each
+    /// produces identical results for the same generation, and the last
+    /// `ArcSwap::store` wins without corrupting data.
     pub(crate) async fn read_inlined_batches(&self) -> Result<Vec<RecordBatch>> {
+        // Acquire-load the generation so we observe all catalog writes that
+        // happened before the corresponding Release bump.
+        let current_gen = self.inlined_generation.load(Ordering::Acquire);
+        let cached = self.inlined_cache.load();
+        if cached.generation == current_gen {
+            // Cache hit: each RecordBatch clone is cheap (Arc refcount on Arrow buffers).
+            return Ok((*cached.batches).clone());
+        }
+
+        // Cache miss: rebuild from the metastore.
         let inlined = self
             .catalog
             .get_inlined_data(&self.table_metadata.table_id)
             .await?;
 
-        if inlined.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let inlined_deletions = self.load_inlined_deletion_maps().await?;
-        let mut batches = Vec::new();
-        for entry in &inlined {
-            let entry_batches = deserialize_ipc_to_batch(&entry.data_ipc)
-                .map_err(|e| super::Error::Arrow { source: e })?;
-            for batch in entry_batches {
-                if let Some(filtered) = self.filter_inlined_batch_for_deletions(
-                    batch,
-                    entry.sequence_number,
-                    &inlined_deletions,
-                )? {
-                    batches.push(filtered);
+        let batches = if inlined.is_empty() {
+            Vec::new()
+        } else {
+            let inlined_deletions = self.load_inlined_deletion_maps().await?;
+            let mut batches = Vec::new();
+            for entry in &inlined {
+                let entry_batches = deserialize_ipc_to_batch(&entry.data_ipc)
+                    .map_err(|e| super::Error::Arrow { source: e })?;
+                for batch in entry_batches {
+                    if let Some(filtered) = self.filter_inlined_batch_for_deletions(
+                        batch,
+                        entry.sequence_number,
+                        &inlined_deletions,
+                    )? {
+                        batches.push(filtered);
+                    }
                 }
             }
-        }
+            batches
+        };
+
+        // Store the rebuilt entry. If a writer bumped the generation between
+        // the `load` above and now, the cached entry will simply miss on the
+        // next read and be rebuilt — no data is lost or corrupted.
+        self.inlined_cache.store(Arc::new(InlinedCache {
+            generation: current_gen,
+            batches: Arc::new(batches.clone()),
+        }));
 
         Ok(batches)
     }
@@ -5866,6 +5950,9 @@ impl CayenneTableProvider {
             .clear_inlined_data_and_deletes(&self.table_metadata.table_id)
             .await?;
         self.inlined_row_count.store(0, Ordering::Relaxed);
+        // Invalidate the inlined-batch cache so subsequent scans see the now-empty
+        // metastore immediately rather than serving the pre-checkpoint batches.
+        self.inlined_generation.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
