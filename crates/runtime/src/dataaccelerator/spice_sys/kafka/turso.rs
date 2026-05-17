@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use super::super::offsets::{deserialize_offsets, serialize_merged_offsets, serialize_offsets};
+use super::super::offsets;
 use super::{Error, KAFKA_TABLE_NAME, KafkaMetadata, KafkaSys, Result};
 use crate::dataaccelerator::turso::TursoConnectionPool;
 use data_components::kafka::KafkaOffset;
@@ -31,7 +31,7 @@ impl KafkaSys {
         let consumer_group_id = metadata.consumer_group_id.clone();
         let topic = metadata.topic.clone();
         let schema_json = Self::serialize_schema(&metadata.schema)?;
-        let offsets_json = serialize_offsets(&metadata.offsets)?;
+        let offsets_json = offsets::serialize_offsets(&metadata.offsets)?;
 
         let conn = pool.connect().await.map_err(Error::external)?;
 
@@ -70,8 +70,10 @@ impl KafkaSys {
     ) -> Result<Option<KafkaMetadata>> {
         let dataset_name = self.dataset_name.clone();
         let conn = pool.connect().await.map_err(Error::external)?;
-        ensure_kafka_table(&conn).await?;
-        self.schema_ensured.mark_ensured();
+        if self.schema_needs_ensure() {
+            ensure_kafka_table(&conn).await?;
+            self.mark_schema_ensured();
+        }
         let query = format!(
             "SELECT consumer_group_id, topic, schema_json, offsets_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = ?"
         );
@@ -95,7 +97,7 @@ impl KafkaSys {
             consumer_group_id,
             topic,
             schema,
-            offsets: deserialize_offsets(offsets_json.as_deref())?,
+            offsets: offsets::deserialize_offsets(offsets_json.as_deref())?,
         }))
     }
 
@@ -123,7 +125,8 @@ impl KafkaSys {
             ))
         })?;
         let existing_offsets_json = row.get::<Option<String>>(0).map_err(Error::external)?;
-        let offsets_json = serialize_merged_offsets(existing_offsets_json.as_deref(), offsets)?;
+        let offsets_json =
+            offsets::serialize_merged_offsets(existing_offsets_json.as_deref(), offsets)?;
 
         let update = format!(
             "UPDATE {KAFKA_TABLE_NAME} SET offsets_json = ?1, updated_at = CURRENT_TIMESTAMP WHERE dataset_name = ?2"

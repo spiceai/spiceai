@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::super::offsets::{deserialize_offsets, serialize_merged_offsets, serialize_offsets};
+use super::super::offsets;
 use super::{DEBEZIUM_KAFKA_TABLE_NAME, DebeziumKafkaMetadata, DebeziumKafkaSys, Error, Result};
 use data_components::debezium::change_event;
 use data_components::kafka::KafkaOffset;
@@ -35,7 +35,7 @@ impl DebeziumKafkaSys {
             serde_json::to_string(&metadata.primary_keys).map_err(Error::external)?;
         let schema_fields =
             serde_json::to_string(&metadata.schema_fields).map_err(Error::external)?;
-        let offsets_json = serialize_offsets(&metadata.offsets)?;
+        let offsets_json = offsets::serialize_offsets(&metadata.offsets)?;
 
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
@@ -87,6 +87,7 @@ impl DebeziumKafkaSys {
         pool: &SqliteConnectionPool,
     ) -> Result<Option<DebeziumKafkaMetadata>> {
         let dataset_name = self.dataset_name.clone();
+        let schema_needs_ensure = self.schema_needs_ensure();
 
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
@@ -95,10 +96,12 @@ impl DebeziumKafkaSys {
             });
         };
 
-        let metadata = conn
+        let row = conn
             .conn
             .call(move |conn| {
-                ensure_debezium_kafka_table(conn)?;
+                if schema_needs_ensure {
+                    ensure_debezium_kafka_table(conn)?;
+                }
 
                 let query = format!(
                     "SELECT consumer_group_id, topic, primary_keys, schema_fields, offsets_json FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"
@@ -113,28 +116,13 @@ impl DebeziumKafkaSys {
                     let schema_fields: String = row.get(3)?;
                     let offsets_json: Option<String> = row.get(4)?;
 
-                    let primary_keys: Vec<String> = serde_json::from_str(&primary_keys)
-                        .map_err(|err| {
-                            tracing::warn!("Failed to deserialize primary_keys from SQLite: {err}");
-                            rusqlite::Error::InvalidQuery
-                        })?;
-                    let schema_fields: Vec<change_event::Field> = serde_json::from_str(&schema_fields)
-                        .map_err(|err| {
-                            tracing::warn!("Failed to deserialize schema_fields from SQLite: {err}");
-                            rusqlite::Error::InvalidQuery
-                        })?;
-
-                    Ok(Some(DebeziumKafkaMetadata {
+                    Ok(Some((
                         consumer_group_id,
                         topic,
                         primary_keys,
                         schema_fields,
-                        offsets: deserialize_offsets(offsets_json.as_deref())
-                            .map_err(|err| {
-                                tracing::warn!("Failed to deserialize Debezium Kafka offsets from SQLite: {err}");
-                                rusqlite::Error::InvalidQuery
-                            })?,
-                    }))
+                        offsets_json,
+                    )))
                 } else {
                     Ok(None)
                 }
@@ -142,8 +130,23 @@ impl DebeziumKafkaSys {
             .await
             .map_err(Error::external)?;
 
-        self.schema_ensured.mark_ensured();
-        Ok(metadata)
+        if schema_needs_ensure {
+            self.mark_schema_ensured();
+        }
+
+        let Some((consumer_group_id, topic, primary_keys, schema_fields, offsets_json)) = row
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(DebeziumKafkaMetadata {
+            consumer_group_id,
+            topic,
+            primary_keys: serde_json::from_str(&primary_keys).map_err(Error::external)?,
+            schema_fields: serde_json::from_str::<Vec<change_event::Field>>(&schema_fields)
+                .map_err(Error::external)?,
+            offsets: offsets::deserialize_offsets(offsets_json.as_deref())?,
+        }))
     }
 
     pub(super) async fn upsert_offsets_sqlite(
@@ -172,7 +175,7 @@ impl DebeziumKafkaSys {
                 );
                 let existing_offsets_json: Option<String> =
                     conn.query_row(&query, [&dataset_name], |row| row.get(0))?;
-                let offsets_json = serialize_merged_offsets(
+                let offsets_json = offsets::serialize_merged_offsets(
                     existing_offsets_json.as_deref(),
                     &new_offsets,
                 )

@@ -18,7 +18,7 @@ use datafusion_table_providers::sql::db_connection_pool::{
     dbconnection::sqliteconn::SqliteConnection, sqlitepool::SqliteConnectionPool,
 };
 
-use super::super::offsets::{deserialize_offsets, serialize_merged_offsets, serialize_offsets};
+use super::super::offsets;
 use super::{Error, KAFKA_TABLE_NAME, KafkaSys, Result};
 use crate::dataconnector::kafka::KafkaMetadata;
 use data_components::kafka::KafkaOffset;
@@ -30,7 +30,7 @@ impl KafkaSys {
         metadata: &KafkaMetadata,
     ) -> Result<()> {
         let schema_json = Self::serialize_schema(&metadata.schema)?;
-        let offsets_json = serialize_offsets(&metadata.offsets)?;
+        let offsets_json = offsets::serialize_offsets(&metadata.offsets)?;
         let dataset_name = self.dataset_name.clone();
         let consumer_group_id = metadata.consumer_group_id.clone();
         let topic = metadata.topic.clone();
@@ -75,6 +75,7 @@ impl KafkaSys {
         pool: &SqliteConnectionPool,
     ) -> Result<Option<KafkaMetadata>> {
         let dataset_name = self.dataset_name.clone();
+        let schema_needs_ensure = self.schema_needs_ensure();
 
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
@@ -83,10 +84,12 @@ impl KafkaSys {
             });
         };
 
-        let metadata = conn
+        let row = conn
             .conn
             .call(move |conn| {
-                ensure_kafka_table(conn)?;
+                if schema_needs_ensure {
+                    ensure_kafka_table(conn)?;
+                }
 
                 let query = format!(
                     "SELECT consumer_group_id, topic, schema_json, offsets_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = ?"
@@ -100,20 +103,7 @@ impl KafkaSys {
                     let schema_json: String = row.get(2)?;
                     let offsets_json: Option<String> = row.get(3)?;
 
-                    Ok(Some(KafkaMetadata {
-                        consumer_group_id,
-                        topic,
-                        schema: KafkaSys::deserialize_schema(&schema_json)
-                            .map_err(|err| {
-                                tracing::warn!("Failed to deserialize Kafka schema from SQLite: {err}");
-                                rusqlite::Error::InvalidQuery
-                            })?,
-                        offsets: deserialize_offsets(offsets_json.as_deref())
-                            .map_err(|err| {
-                                tracing::warn!("Failed to deserialize Kafka offsets from SQLite: {err}");
-                                rusqlite::Error::InvalidQuery
-                            })?,
-                    }))
+                    Ok(Some((consumer_group_id, topic, schema_json, offsets_json)))
                 } else {
                     Ok(None)
                 }
@@ -121,8 +111,20 @@ impl KafkaSys {
             .await
             .map_err(Error::external)?;
 
-        self.schema_ensured.mark_ensured();
-        Ok(metadata)
+        if schema_needs_ensure {
+            self.mark_schema_ensured();
+        }
+
+        let Some((consumer_group_id, topic, schema_json, offsets_json)) = row else {
+            return Ok(None);
+        };
+
+        Ok(Some(KafkaMetadata {
+            consumer_group_id,
+            topic,
+            schema: KafkaSys::deserialize_schema(&schema_json)?,
+            offsets: offsets::deserialize_offsets(offsets_json.as_deref())?,
+        }))
     }
 
     pub(super) async fn upsert_offsets_sqlite(
@@ -151,11 +153,14 @@ impl KafkaSys {
                 );
                 let existing_offsets_json: Option<String> =
                     conn.query_row(&query, [&dataset_name], |row| row.get(0))?;
-                let offsets_json = serialize_merged_offsets(existing_offsets_json.as_deref(), &new_offsets)
-                    .map_err(|err| {
-                        tracing::warn!("Failed to merge Kafka offsets from SQLite: {err}");
-                        rusqlite::Error::InvalidQuery
-                    })?;
+                let offsets_json = offsets::serialize_merged_offsets(
+                    existing_offsets_json.as_deref(),
+                    &new_offsets,
+                )
+                .map_err(|err| {
+                    tracing::warn!("Failed to merge Kafka offsets from SQLite: {err}");
+                    rusqlite::Error::InvalidQuery
+                })?;
                 let update = format!(
                     "UPDATE {KAFKA_TABLE_NAME} SET offsets_json = ?1, updated_at = CURRENT_TIMESTAMP WHERE dataset_name = ?2"
                 );
@@ -424,7 +429,7 @@ mod tests {
         let conn = rusqlite::Connection::open(db_path).expect("to open sqlite test db");
         let update =
             format!("UPDATE {KAFKA_TABLE_NAME} SET offsets_json = ?1 WHERE dataset_name = ?2");
-        conn.execute(&update, ["not-json", ds.name.as_ref()])
+        conn.execute(&update, rusqlite::params!["not-json", ds.name.to_string()])
             .expect("to corrupt offsets_json");
 
         kafka_sys
