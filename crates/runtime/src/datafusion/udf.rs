@@ -159,9 +159,7 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     #[cfg(feature = "geo")]
     if geo_enabled(runtime).await {
         geodatafusion::register(ctx);
-        tracing::info!(
-            "Registered geodatafusion spatial UDFs (runtime.params.geo=enabled)"
-        );
+        tracing::info!("Registered geodatafusion spatial UDFs (runtime.params.geo=enabled)");
     }
 
     in_tracing_context_async(register_user_functions(runtime, ctx)).await;
@@ -804,6 +802,37 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "geo")]
+    const SPATIAL_QUERY: &str = "SELECT ST_AsText(ST_Point(0.0, 0.0)) AS geom";
+
+    #[cfg(feature = "geo")]
+    async fn run_spatial_query(
+        runtime: &crate::Runtime,
+    ) -> anyhow::Result<Vec<datafusion::arrow::array::RecordBatch>> {
+        use futures::TryStreamExt as _;
+
+        let query_result = runtime
+            .datafusion()
+            .query_builder(SPATIAL_QUERY)
+            .build()
+            .run()
+            .await?;
+
+        Ok(query_result.data.try_collect().await?)
+    }
+
+    #[cfg(feature = "geo")]
+    async fn assert_spatial_query_unavailable(runtime: &crate::Runtime, case_name: &str) {
+        let Err(error) = run_spatial_query(runtime).await else {
+            panic!("spatial UDF query should fail when {case_name}");
+        };
+        let error_message = error.to_string().to_lowercase();
+        assert!(
+            error_message.contains("st_astext"),
+            "spatial UDF query failed for an unexpected reason when {case_name}: {error_message}"
+        );
+    }
+
     #[test]
     fn registered_scalar_udf_name_detects_case_insensitive_collision() {
         let ctx = SessionContext::new();
@@ -813,6 +842,55 @@ mod tests {
             registered_scalar_udf_name(&ctx, "CUSTOM_FN").as_deref(),
             Some("custom_fn")
         );
+    }
+
+    #[cfg(feature = "geo")]
+    #[tokio::test]
+    async fn register_udfs_registers_geo_udfs_only_when_enabled() -> anyhow::Result<()> {
+        let default_runtime = crate::Runtime::builder()
+            .with_app(app::AppBuilder::new("geo_default").build())
+            .build()
+            .await;
+        assert_spatial_query_unavailable(&default_runtime, "runtime.params.geo is unset").await;
+
+        let disabled_runtime = crate::Runtime::builder()
+            .with_app(
+                app::AppBuilder::new("geo_disabled")
+                    .with_runtime_params(HashMap::from([(
+                        "geo".to_string(),
+                        "disabled".to_string(),
+                    )]))
+                    .build(),
+            )
+            .build()
+            .await;
+        assert_spatial_query_unavailable(&disabled_runtime, "runtime.params.geo is disabled").await;
+
+        let enabled_runtime = crate::Runtime::builder()
+            .with_app(
+                app::AppBuilder::new("geo_enabled")
+                    .with_runtime_params(HashMap::from([(
+                        "geo".to_string(),
+                        "enabled".to_string(),
+                    )]))
+                    .build(),
+            )
+            .build()
+            .await;
+
+        let batches = run_spatial_query(&enabled_runtime).await?;
+        datafusion::assert_batches_eq!(
+            &[
+                "+------------+",
+                "| geom       |",
+                "+------------+",
+                "| POINT(0 0) |",
+                "+------------+",
+            ],
+            &batches
+        );
+
+        Ok(())
     }
 
     #[test]
