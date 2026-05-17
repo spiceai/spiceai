@@ -114,7 +114,7 @@ pub struct CayenneDeletionSink {
 impl CayenneDeletionSink {
     /// Create a new deletion sink.
     #[expect(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         table_metadata: TableMetadata,
         catalog: Arc<dyn MetadataCatalog>,
         listing_table: Arc<ArcSwap<ListingTable>>,
