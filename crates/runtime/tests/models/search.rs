@@ -472,6 +472,30 @@ fn sql_response_normalization_preserves_aliased_trunc_3_order() {
 }
 
 #[test]
+fn sql_response_normalization_stabilizes_exact_score_ties() {
+    let input = json!([
+        {"id": 495, "trunc(text_search()._score,Int64(3))": 6.331},
+        {"id": 494, "trunc(text_search()._score,Int64(3))": 6.331},
+        {"id": 499, "trunc(text_search()._score,Int64(3))": 6.192}
+    ]);
+    let normalized = normalize_sql_response_for_snapshot_with_sql(
+        input,
+        false,
+        Some(
+            "SELECT id, trunc(_score, 3) FROM text_search(qs, 'angles', question) ORDER BY _score DESC",
+        ),
+    );
+    assert_eq!(
+        normalized,
+        json!([
+            {"id": 494, "trunc(text_search()._score,Int64(3))": "[score]"},
+            {"id": 495, "trunc(text_search()._score,Int64(3))": "[score]"},
+            {"id": 499, "trunc(text_search()._score,Int64(3))": "[score]"}
+        ])
+    );
+}
+
+#[test]
 fn sql_response_normalization_respects_id_desc_tie_breaker() {
     let input = json!([
         {"id": 2, "_score": 0.34},
@@ -802,19 +826,34 @@ fn normalize_sql_response_for_snapshot_with_sql(
         return Value::Array(rows);
     }
 
+    let should_stabilize_score_order =
+        round_scores && should_stabilize_sql_score_order(&primary_score_key, &scores, sql);
+    let should_stabilize_exact_ties = has_duplicate_scores(&scores);
+
     if let Some(tie_breaker) = sql_score_tie_breaker(sql)
-        && round_scores
-        && should_stabilize_sql_score_order(&primary_score_key, &scores, sql)
+        && (should_stabilize_score_order || should_stabilize_exact_ties)
     {
         rows.sort_by(|a, b| {
             let score_a = a
                 .get(&primary_score_key)
                 .and_then(Value::as_f64)
-                .map_or(0.0, round_to_one_decimal);
+                .map_or(0.0, |score| {
+                    if should_stabilize_score_order {
+                        round_to_one_decimal(score)
+                    } else {
+                        score
+                    }
+                });
             let score_b = b
                 .get(&primary_score_key)
                 .and_then(Value::as_f64)
-                .map_or(0.0, round_to_one_decimal);
+                .map_or(0.0, |score| {
+                    if should_stabilize_score_order {
+                        round_to_one_decimal(score)
+                    } else {
+                        score
+                    }
+                });
             match score_b.partial_cmp(&score_a).unwrap_or(Ordering::Equal) {
                 Ordering::Equal => {
                     let id_a = a.get("id").and_then(Value::as_i64).unwrap_or(i64::MAX);
@@ -841,6 +880,15 @@ fn normalize_sql_response_for_snapshot_with_sql(
     }
 
     Value::Array(rows)
+}
+
+fn has_duplicate_scores(scores: &[f64]) -> bool {
+    scores.iter().enumerate().any(|(index, score)| {
+        scores
+            .iter()
+            .skip(index + 1)
+            .any(|other_score| score.total_cmp(other_score) == Ordering::Equal)
+    })
 }
 
 fn ensure_sql_response_scores_descending(

@@ -1,11 +1,22 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: "serde_json::to_string_pretty(&normalize_search_response_json(resp,\ntrue)).expect(\"search response snapshot serialization should succeed\")"
-snapshot_kind: text
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
+    {
+      "_score": "[score]",
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": [
+          "In general basic characters welcome. Clearly lively friends con"
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 1
+      }
+    },
     {
       "_score": "[score]",
       "dataset": "spice.public.cached_search",
@@ -28,18 +39,6 @@ snapshot_kind: text
       },
       "primary_key": {
         "cp_catalog_page_sk": 3
-      }
-    },
-    {
-      "_score": "[score]",
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": [
-          "In general basic characters welcome. Clearly lively friends con"
-        ]
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 1
       }
     },
     {
@@ -83,11 +82,11 @@ snapshot_kind: text
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Good questions borrow only base children. Remarkably present "
+          "Practical schools might put twice interested, strong organizations. Regulatory"
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 19
+        "cp_catalog_page_sk": 17
       }
     },
     {
@@ -107,11 +106,11 @@ snapshot_kind: text
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Necessary, major terms give still now joint thoughts. Only considerable wome"
+          "Good questions borrow only base children. Remarkably present "
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 14
+        "cp_catalog_page_sk": 19
       }
     },
     {
@@ -119,11 +118,11 @@ snapshot_kind: text
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Practical schools might put twice interested, strong organizations. Regulatory"
+          "Necessary, major terms give still now joint thoughts. Only considerable wome"
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 17
+        "cp_catalog_page_sk": 14
       }
     },
     {

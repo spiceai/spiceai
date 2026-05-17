@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: "serde_json::to_string_pretty(&normalize_search_response_json(resp,\ntrue)).expect(\"search response snapshot serialization should succeed\")"
-snapshot_kind: text
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -16,6 +15,18 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 708
+      }
+    },
+    {
+      "_score": "[score]",
+      "dataset": "qs",
+      "matches": {
+        "question": [
+          "\\((-6) \\div (-2)\\)"
+        ]
+      },
+      "primary_key": {
+        "id": 1324
       }
     },
     {
@@ -40,18 +51,6 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 1323
-      }
-    },
-    {
-      "_score": "[score]",
-      "dataset": "qs",
-      "matches": {
-        "question": [
-          "\\((-6) \\div (-2)\\)"
-        ]
-      },
-      "primary_key": {
-        "id": 1324
       }
     }
   ]

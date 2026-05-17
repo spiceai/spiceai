@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: "serde_json::to_string_pretty(&normalize_search_response_json(resp,\ntrue)).expect(\"search response snapshot serialization should succeed\")"
-snapshot_kind: text
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -24,16 +23,16 @@ snapshot_kind: text
     {
       "_score": "[score]",
       "data": {
-        "question": "Evaluate the function \\( h(x) = -3x - 4 \\) at the given values:\na. \\( h(7) \\)\nb. \\( h(-4) \\)"
+        "question": "In which of the following compounds, cations are present in tetrahedral voids?  \na. ZnS  \nb. SrF₂  \nc. NaBr  \nd. Na₂O"
       },
       "dataset": "qs",
       "matches": {
-        "answer": [
-          "a. \\( h(7) = -3(7) - 4 = -21 - 4 = \\boxed{-25} \\)\nb. \\( h(-4) = -3(-4) - 4 = 12 - 4 = \\boxed{8} \\)"
+        "question": [
+          "In which of the following compounds, cations are present in tetrahedral voids?  \na. ZnS  \nb. SrF₂  \nc. NaBr  \nd. Na₂O"
         ]
       },
       "primary_key": {
-        "id": 255
+        "id": 539
       }
     },
     {
@@ -54,16 +53,16 @@ snapshot_kind: text
     {
       "_score": "[score]",
       "data": {
-        "question": "In which of the following compounds, cations are present in tetrahedral voids?  \na. ZnS  \nb. SrF₂  \nc. NaBr  \nd. Na₂O"
+        "question": "Evaluate the function \\( h(x) = -3x - 4 \\) at the given values:\na. \\( h(7) \\)\nb. \\( h(-4) \\)"
       },
       "dataset": "qs",
       "matches": {
-        "question": [
-          "In which of the following compounds, cations are present in tetrahedral voids?  \na. ZnS  \nb. SrF₂  \nc. NaBr  \nd. Na₂O"
+        "answer": [
+          "a. \\( h(7) = -3(7) - 4 = -21 - 4 = \\boxed{-25} \\)\nb. \\( h(-4) = -3(-4) - 4 = 12 - 4 = \\boxed{8} \\)"
         ]
       },
       "primary_key": {
-        "id": 539
+        "id": 255
       }
     }
   ]

@@ -1,11 +1,25 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: "serde_json::to_string_pretty(&normalize_search_response_json(resp,\ntrue)).expect(\"search response snapshot serialization should succeed\")"
-snapshot_kind: text
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
+    {
+      "_score": "[score]",
+      "data": {
+        "question": "In which of the following compounds, cations are present in tetrahedral voids?  \na. ZnS  \nb. SrF₂  \nc. NaBr  \nd. Na₂O"
+      },
+      "dataset": "qs",
+      "matches": {
+        "question": [
+          "In which of the following compounds, cations are present in tetrahedral voids?  \na. ZnS  \nb. SrF₂  \nc. NaBr  \nd. Na₂O"
+        ]
+      },
+      "primary_key": {
+        "id": 539
+      }
+    },
     {
       "_score": "[score]",
       "data": {
@@ -34,21 +48,6 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 454
-      }
-    },
-    {
-      "_score": "[score]",
-      "data": {
-        "question": "In which of the following compounds, cations are present in tetrahedral voids?  \na. ZnS  \nb. SrF₂  \nc. NaBr  \nd. Na₂O"
-      },
-      "dataset": "qs",
-      "matches": {
-        "question": [
-          "In which of the following compounds, cations are present in tetrahedral voids?  \na. ZnS  \nb. SrF₂  \nc. NaBr  \nd. Na₂O"
-        ]
-      },
-      "primary_key": {
-        "id": 539
       }
     },
     {

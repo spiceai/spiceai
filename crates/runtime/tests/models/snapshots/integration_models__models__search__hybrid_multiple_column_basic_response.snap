@@ -1,23 +1,10 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: "serde_json::to_string_pretty(&normalize_search_response_json(resp,\ntrue)).expect(\"search response snapshot serialization should succeed\")"
-snapshot_kind: text
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
-    {
-      "_score": "[score]",
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\)."
-        ]
-      },
-      "primary_key": {
-        "id": 772
-      }
-    },
     {
       "_score": "[score]",
       "dataset": "qs",
@@ -35,11 +22,23 @@ snapshot_kind: text
       "dataset": "qs",
       "matches": {
         "question": [
-          "Yasenia is 3 years older than Xavier. How old is Yasenia when Xavier is 18 years old?"
+          "\\((-6) \\div (-2)\\)"
         ]
       },
       "primary_key": {
-        "id": 1323
+        "id": 1324
+      }
+    },
+    {
+      "_score": "[score]",
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\)."
+        ]
+      },
+      "primary_key": {
+        "id": 772
       }
     },
     {
@@ -47,11 +46,11 @@ snapshot_kind: text
       "dataset": "qs",
       "matches": {
         "question": [
-          "\\((-6) \\div (-2)\\)"
+          "Yasenia is 3 years older than Xavier. How old is Yasenia when Xavier is 18 years old?"
         ]
       },
       "primary_key": {
-        "id": 1324
+        "id": 1323
       }
     }
   ]

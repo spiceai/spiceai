@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: "serde_json::to_string_pretty(&normalize_search_response_json(resp,\ntrue)).expect(\"search response snapshot serialization should succeed\")"
-snapshot_kind: text
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -35,11 +34,11 @@ snapshot_kind: text
       "dataset": "qs",
       "matches": {
         "question": [
-          "How is microsporidia infection typically acquired?"
+          "Which of the following is an intensive property of a system?"
         ]
       },
       "primary_key": {
-        "id": 446
+        "id": 1289
       }
     },
     {
@@ -47,11 +46,11 @@ snapshot_kind: text
       "dataset": "qs",
       "matches": {
         "question": [
-          "Which of the following is an intensive property of a system?"
+          "How is microsporidia infection typically acquired?"
         ]
       },
       "primary_key": {
-        "id": 1289
+        "id": 446
       }
     }
   ]

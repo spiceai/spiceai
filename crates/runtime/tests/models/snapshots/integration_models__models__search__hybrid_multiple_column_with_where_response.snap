@@ -1,23 +1,10 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: "serde_json::to_string_pretty(&normalize_search_response_json(resp,\ntrue)).expect(\"search response snapshot serialization should succeed\")"
-snapshot_kind: text
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
-    {
-      "_score": "[score]",
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
-        ]
-      },
-      "primary_key": {
-        "id": 890
-      }
-    },
     {
       "_score": "[score]",
       "dataset": "qs",
@@ -28,6 +15,18 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 938
+      }
+    },
+    {
+      "_score": "[score]",
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
+        ]
+      },
+      "primary_key": {
+        "id": 890
       }
     },
     {
