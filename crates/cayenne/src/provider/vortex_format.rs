@@ -87,7 +87,7 @@ impl std::fmt::Debug for DeletionFilteringVortexFormat {
 /// # Arguments
 ///
 /// * `config` - The file scan configuration to modify
-/// * `deletion_cache` - Shared cache of per-file deletion vectors (file path -> deleted row indices)
+/// * `deletion_cache` - Shared cache of per-file deletion vectors and access plans
 ///
 /// # Returns
 ///
@@ -142,7 +142,7 @@ pub fn attach_deletion_vectors_to_config(
 /// # Arguments
 ///
 /// * `file` - The partitioned file to potentially modify
-/// * `deletion_map` - Map of file path to deletion bitmap
+/// * `deletion_map` - Map of file path to cached deletion vector state
 ///
 /// # Returns
 ///

@@ -107,7 +107,7 @@ impl fmt::Debug for PositionDeletionVector {
 /// turning the write into O(total deleted rows) per call. The shared inner type
 /// lets readers and writers share unchanged entries for free; only entries that
 /// the writer actually updates allocate a new `Arc`.
-pub type PositionBitmap = HashMap<String, Arc<PositionDeletionVector>>;
+pub(crate) type PositionBitmap = HashMap<String, Arc<PositionDeletionVector>>;
 
 /// Atomically-published deletion state for single-column `Int64` primary keys.
 #[derive(Debug, Clone)]
@@ -290,7 +290,7 @@ impl PkDeletionStrategyWithCache {
 
     /// Returns the position-based deletion cache, if this is a `PositionBased` strategy.
     #[must_use]
-    pub fn position_based_cache(&self) -> Option<&Arc<ArcSwap<PositionBitmap>>> {
+    pub(crate) fn position_based_cache(&self) -> Option<&Arc<ArcSwap<PositionBitmap>>> {
         match self {
             Self::PositionBased {
                 cached_deleted_row_ids,

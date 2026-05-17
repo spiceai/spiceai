@@ -246,10 +246,8 @@ fn bench_in_list_delete(c: &mut Criterion) {
             &rows,
             |b, &_| {
                 b.iter(|| {
-                    let v = duckdb_query_scalar(
-                        &df.conn,
-                        "SELECT SUM(value) FROM in_list_del_bench",
-                    );
+                    let v =
+                        duckdb_query_scalar(&df.conn, "SELECT SUM(value) FROM in_list_del_bench");
                     black_box(v);
                 });
             },

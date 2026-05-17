@@ -633,10 +633,9 @@ impl CayenneDeletionSink {
         let mut cache_updates: HashMap<String, Arc<PositionDeletionVector>> = HashMap::new();
 
         for (file_path, incoming_row_ids) in row_ids.iter().filter(|(_, ids)| !ids.is_empty()) {
-            // Take an immutable snapshot of the existing bitmap (Arc clone is
-            // O(1)) so we can read existing positions for the "is this new?"
-            // check and combined-IDs build without cloning the bitmap data.
-            // If absent, work against an empty placeholder.
+            // Take an immutable snapshot of the existing deletion vector so we
+            // can read existing positions for the "is this new?" check and
+            // combined-IDs build without cloning unchanged bitmap data.
             let existing_deletion = existing_deletions.get(file_path);
 
             // Deduplicate incoming row IDs first to avoid over-counting and redundant writes.
