@@ -74,13 +74,13 @@ use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion_physical_plan::ExecutionPlan;
-use datafusion_physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::collect;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::union::UnionExec;
+use datafusion_physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::{StreamExt, TryStreamExt, stream};
@@ -1531,7 +1531,10 @@ impl OnConflictValidationStream {
             .map_err(datafusion_common::DataFusionError::from)?;
 
         for (data_file_id, rows) in batch_delete_specs {
-            self.delete_specs.entry(data_file_id).or_default().extend(rows);
+            self.delete_specs
+                .entry(data_file_id)
+                .or_default()
+                .extend(rows);
         }
 
         self.deleted_pk_i64.extend(deleted_pk_i64);
