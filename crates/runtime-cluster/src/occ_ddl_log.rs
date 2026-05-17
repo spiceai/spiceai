@@ -21,10 +21,9 @@ limitations under the License.
 //! multi-scheduler clusters — concurrent appends are serialised by
 //! the OCC retry loop.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
-use datafusion_ddl::ddl_log::{self, DdlLog};
+use datafusion_ddl::ddl_log::{DdlLog, Error as DdlLogError, Result as DdlLogResult};
+use std::sync::Arc;
 
 use crate::cluster_state::{ClusterStateStore, MutationOutcome};
 
@@ -44,41 +43,42 @@ impl OccDdlLog {
 
 #[async_trait]
 impl DdlLog for OccDdlLog {
-    async fn append(&self, sql: String) -> ddl_log::Result<()> {
+    async fn append(&self, sql: String) -> DdlLogResult<()> {
+        let value = sql.clone();
         self.cluster_state
             .mutate(move |state| {
-                state.ddl_log.push(sql.clone());
+                state.ddl_log.push(value.clone());
                 MutationOutcome::Apply
             })
             .await
-            .map_err(|e| ddl_log::Error::AppendFailed {
+            .map_err(|e| DdlLogError::AppendFailed {
                 source: Box::new(e),
-                statement: sql,
+                statement: sql.clone(),
             })?;
         Ok(())
     }
 
-    async fn snapshot(&self) -> ddl_log::Result<(Vec<String>, u64)> {
-        let state =
-            self.cluster_state
-                .read()
-                .await
-                .map_err(|e| ddl_log::Error::SnapshotFailed {
-                    source: Box::new(e),
-                })?;
+    async fn snapshot(&self) -> DdlLogResult<(Vec<String>, u64)> {
+        let state = self
+            .cluster_state
+            .read()
+            .await
+            .map_err(|e| DdlLogError::SnapshotFailed {
+                source: Box::new(e),
+            })?;
         let version = u64::try_from(state.ddl_log.len()).unwrap_or(u64::MAX);
         Ok((state.ddl_log.clone(), version))
     }
 
-    async fn statements_since(&self, since_version: u64) -> ddl_log::Result<Vec<String>> {
-        let state =
-            self.cluster_state
-                .read()
-                .await
-                .map_err(|e| ddl_log::Error::ReadSinceFailed {
-                    since_version,
-                    source: Box::new(e),
-                })?;
+    async fn statements_since(&self, since_version: u64) -> DdlLogResult<Vec<String>> {
+        let state = self
+            .cluster_state
+            .read()
+            .await
+            .map_err(|e| DdlLogError::ReadSinceFailed {
+                since_version,
+                source: Box::new(e),
+            })?;
         let idx = usize::try_from(since_version).unwrap_or(usize::MAX);
         if idx >= state.ddl_log.len() {
             Ok(Vec::new())
