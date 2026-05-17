@@ -520,19 +520,19 @@ impl RangeBounds {
     }
 
     fn physical_expr(&self, left_expr: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
-        if self.intervals.is_empty() {
-            tracing::debug!(
-                "ExactLeftAccumulator range fallback has no non-null values, returning always-false filter."
-            );
-            return literal_false();
-        }
-
         if !self.supports_range_filter {
             tracing::debug!(
                 supports_range_filter = self.supports_range_filter,
                 "ExactLeftAccumulator could not create range fallback, returning no-op filter."
             );
             return literal_true();
+        }
+
+        if self.intervals.is_empty() {
+            tracing::debug!(
+                "ExactLeftAccumulator range fallback has no non-null values, returning always-false filter."
+            );
+            return literal_false();
         }
 
         let mut range_expr = self
