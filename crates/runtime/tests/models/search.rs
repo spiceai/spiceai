@@ -693,6 +693,34 @@ fn search_response_normalization_redacts_http_scores() {
     assert_eq!(normalized["results"][0]["_score"], json!("[score]"));
 }
 
+#[test]
+fn search_response_normalization_stabilizes_rounded_http_results_by_primary_key() {
+    let normalized = normalize_search_response_json(
+        json!({
+            "duration_ms": 1,
+            "results": [
+                {"_score": 0.80, "dataset": "qs", "matches": {"answer": ["a"]}, "primary_key": {"id": 2}},
+                {"_score": 0.79, "dataset": "qs", "matches": {"answer": ["b"]}, "primary_key": {"id": 1}}
+            ]
+        }),
+        false,
+        true,
+    );
+
+    let ids: Vec<i64> = normalized["results"]
+        .as_array()
+        .expect("normalized results should be an array")
+        .iter()
+        .map(|result| {
+            result["primary_key"]["id"]
+                .as_i64()
+                .expect("normalized result should contain primary key id")
+        })
+        .collect();
+
+    assert_eq!(ids, vec![1, 2]);
+}
+
 /// Normalizes vector similarity search response for consistent snapshot testing by replacing dynamic
 /// values such as duration with placeholder.
 fn normalize_search_response_json(
@@ -704,10 +732,16 @@ fn normalize_search_response_json(
         *duration = json!("duration_ms_val");
     }
     if let Some(matches) = json.get_mut("results").and_then(|m| m.as_array_mut()) {
-        // To avoid inconsistent snapshots when scores are equal (common when using RRF)
-        // or near truncation boundaries (model2vec scores vary ±0.01 across CI runners),
-        // we round scores before comparing and also order based on primary key.
-        matches.sort_by(|a, b| {
+        // Score ordering is validated before normalization. For snapshots whose
+        // scores are rounded/redacted, sort by stable row content so tiny score
+        // drift cannot reorder otherwise identical results across runners.
+        if round_scores {
+            matches.sort_by(|a, b| {
+                search_result_snapshot_key(a, sort_ties_by_matches)
+                    .cmp(&search_result_snapshot_key(b, sort_ties_by_matches))
+            });
+        } else {
+            matches.sort_by(|a, b| {
             let Some(Value::Number(num_a)) = a.get("_score") else {
                 return Ordering::Greater;
             };
@@ -760,7 +794,8 @@ fn normalize_search_response_json(
             let primary_key_a = json_tiebreak_key(&Value::Object(a_pks.clone()));
             let primary_key_b = json_tiebreak_key(&Value::Object(b_pks.clone()));
             primary_key_b.cmp(&primary_key_a)
-        });
+            });
+        }
 
         for m in matches {
             if let Some(obj) = m.as_object_mut()
@@ -781,6 +816,26 @@ fn json_tiebreak_key(value: &Value) -> String {
     let mut normalized = value.clone();
     sort_json_keys(&mut normalized);
     serde_json::to_string(&normalized).expect("JSON tiebreak key serialization should succeed")
+}
+
+fn search_result_snapshot_key(result: &Value, sort_ties_by_matches: bool) -> String {
+    let mut parts = Vec::new();
+    if sort_ties_by_matches {
+        parts.push(
+            result
+                .get("matches")
+                .map(json_tiebreak_key)
+                .unwrap_or_default(),
+        );
+    }
+    parts.push(
+        result
+            .get("primary_key")
+            .map(json_tiebreak_key)
+            .unwrap_or_default(),
+    );
+    parts.push(result.get("matches").map(json_tiebreak_key).unwrap_or_default());
+    parts.join("\u{1f}")
 }
 
 fn normalize_search_response(json: Value, round_scores: bool) -> String {
