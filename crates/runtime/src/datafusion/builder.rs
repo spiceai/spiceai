@@ -95,7 +95,6 @@ use runtime_datafusion::{
         ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer,
         data_source_tree_display::DataSourceTreeDisplayOptimizer,
     },
-    join_accumulator::DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES,
     schema_provider::SpiceSchemaProvider,
     url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
 };
@@ -140,6 +139,8 @@ pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock
 
     RwLock::new(df_config)
 });
+
+const EXACT_JOIN_FILTER_MEMORY_POOL_FRACTION_DENOMINATOR: u64 = 8;
 
 pub struct DataFusionBuilder {
     config: SessionConfig,
@@ -816,9 +817,7 @@ fn cayenne_optimizer_config(
 }
 
 fn exact_join_filter_memory_limit(effective_memory_limit: u64) -> usize {
-    let default_limit =
-        u64::try_from(DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES).unwrap_or(u64::MAX);
-    let limit = effective_memory_limit.min(default_limit);
+    let limit = effective_memory_limit / EXACT_JOIN_FILTER_MEMORY_POOL_FRACTION_DENOMINATOR;
 
     match usize::try_from(limit) {
         Ok(limit) => limit,
@@ -939,13 +938,13 @@ mod tests {
     };
 
     use super::{
-        DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES, DataFusionBuilder,
-        configure_hash_join_memory_limits, exact_join_filter_memory_limit,
+        DataFusionBuilder, configure_hash_join_memory_limits, exact_join_filter_memory_limit,
     };
     use crate::dataaccelerator::AcceleratorEngineRegistry;
     use crate::status;
     #[cfg(not(windows))]
     use data_components::poly::PolyTableProvider;
+    use runtime_datafusion::join_accumulator::DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES;
     #[cfg(not(windows))]
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -974,19 +973,23 @@ mod tests {
     #[test]
     fn test_exact_join_filter_memory_limit_respects_runtime_query_memory_limit() {
         assert_eq!(
-            1_024,
+            128,
             exact_join_filter_memory_limit(1_024),
-            "Exact dynamic join filters should use one shared runtime query memory budget"
+            "Exact dynamic join filters should use a fraction of the shared runtime query memory budget"
+        );
+
+        let high_memory_limit = u64::try_from(DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES)
+            .expect("default in-list memory limit should fit in u64")
+            .saturating_mul(16);
+        assert_eq!(
+            DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES.saturating_mul(2),
+            exact_join_filter_memory_limit(high_memory_limit),
+            "Exact dynamic join filters should scale above the historical default on larger memory pools"
         );
         assert_eq!(
-            DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES,
-            exact_join_filter_memory_limit(u64::MAX),
-            "Exact dynamic join filters should keep the existing hard cap when the query memory limit is larger"
-        );
-        assert_eq!(
-            1,
+            0,
             exact_join_filter_memory_limit(1),
-            "Very small memory limits should still be represented exactly by the shared budget"
+            "Very small memory limits should not exceed the configured memory fraction"
         );
     }
 
@@ -1000,7 +1003,7 @@ mod tests {
 
         let exact_join_filter_memory_limit = configure_hash_join_memory_limits(&mut config, 2_048);
 
-        assert_eq!(2_048, exact_join_filter_memory_limit);
+        assert_eq!(256, exact_join_filter_memory_limit);
         assert_eq!(
             512,
             config
@@ -1020,8 +1023,8 @@ mod tests {
             configure_hash_join_memory_limits(&mut config, 1_000_000);
 
         assert_eq!(
-            1_000_000, exact_join_filter_memory_limit,
-            "A larger runtime query memory limit should be available to the shared exact join-filter budget"
+            125_000, exact_join_filter_memory_limit,
+            "A larger runtime query memory limit should scale the shared exact join-filter budget"
         );
         assert_eq!(
             1_000,
@@ -1062,7 +1065,7 @@ mod tests {
         assert_eq!(config.sort_merge_min_rows, 100_000_000);
         assert!((config.sort_merge_memory_pool_fraction - 0.25).abs() < f64::EPSILON);
         assert_eq!(config.sort_merge_memory_pool_bytes, Some(1_024));
-        assert_eq!(config.exact_join_filter_max_bytes, 1_024);
+        assert_eq!(config.exact_join_filter_max_bytes, 128);
     }
 
     #[test]

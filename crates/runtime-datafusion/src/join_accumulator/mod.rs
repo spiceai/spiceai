@@ -57,9 +57,10 @@ use datafusion::{
 pub const DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES: usize = 128 * 1024 * 1024; // 128Mb - can store approximately 32 million i32 keys.
 const DEFAULT_MAXIMUM_BLOOM_FILTER_MEMORY_BYTES: usize = 8 * 1024 * 1024;
 const MAXIMUM_RANGE_INTERVALS: usize = 64;
+const UNCONFIGURED_SHARED_INLIST_MEMORY_BYTES: usize = usize::MAX;
 
 static MAXIMUM_SHARED_INLIST_MEMORY_BYTES: AtomicUsize =
-    AtomicUsize::new(DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES);
+    AtomicUsize::new(UNCONFIGURED_SHARED_INLIST_MEMORY_BYTES);
 static CURRENT_INLIST_MEMORY_BYTES: AtomicUsize = AtomicUsize::new(0);
 // The exact in-list path reserves against one process-wide budget shared across
 // all accumulator instances. This keeps dynamic join filters bounded under query
@@ -67,7 +68,10 @@ static CURRENT_INLIST_MEMORY_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 #[must_use]
 pub fn maximum_shared_inlist_memory_bytes() -> usize {
-    MAXIMUM_SHARED_INLIST_MEMORY_BYTES.load(AtomicOrdering::Relaxed)
+    match MAXIMUM_SHARED_INLIST_MEMORY_BYTES.load(AtomicOrdering::Relaxed) {
+        UNCONFIGURED_SHARED_INLIST_MEMORY_BYTES => DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES,
+        limit => limit,
+    }
 }
 
 /// Conservatively clamps the process-wide exact in-list reservation budget.
@@ -78,7 +82,18 @@ pub fn maximum_shared_inlist_memory_bytes() -> usize {
 /// in one process, use the strictest configured limit instead of letting the
 /// most recent builder raise the shared budget for existing instances.
 pub fn clamp_maximum_shared_inlist_memory_bytes(limit: usize) {
-    MAXIMUM_SHARED_INLIST_MEMORY_BYTES.fetch_min(limit, AtomicOrdering::Relaxed);
+    let configured_limit = limit.min(UNCONFIGURED_SHARED_INLIST_MEMORY_BYTES.saturating_sub(1));
+    let _ = MAXIMUM_SHARED_INLIST_MEMORY_BYTES.fetch_update(
+        AtomicOrdering::Relaxed,
+        AtomicOrdering::Relaxed,
+        |current| {
+            Some(if current == UNCONFIGURED_SHARED_INLIST_MEMORY_BYTES {
+                configured_limit
+            } else {
+                current.min(configured_limit)
+            })
+        },
+    );
 }
 
 #[derive(Debug)]
