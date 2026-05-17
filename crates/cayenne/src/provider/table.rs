@@ -112,6 +112,7 @@ use arc_swap::ArcSwap;
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
 const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
 const PK_KEYSET_CACHE_MAX_ENTRIES: usize = 1_000_000;
+const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
 
 #[derive(Default)]
 struct PostWriteMaintenanceState {
@@ -3301,15 +3302,50 @@ impl CayenneTableProvider {
     }
 
     fn cached_table_statistics_for_optimizer(&self) -> Option<Statistics> {
-        let stats = {
-            let guard = self.table_statistics.read();
-            guard.clone()?
-        };
+        let has_pending_visibility_changes =
+            self.has_pending_deletions() || self.inlined_row_count.load(Ordering::Relaxed) > 0;
 
-        if self.has_pending_deletions() || self.inlined_row_count.load(Ordering::Relaxed) > 0 {
+        let guard = self.table_statistics.read();
+        let stats = guard.as_ref()?;
+
+        if stats.column_statistics.len() > TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT {
+            tracing::trace!(
+                table = self.table_metadata.table_name.as_str(),
+                column_count = stats.column_statistics.len(),
+                full_column_sync_limit = TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT,
+                "Returning top-level table statistics only for wide table"
+            );
+            return Some(Self::top_level_statistics_only(
+                stats,
+                has_pending_visibility_changes,
+            ));
+        }
+
+        let stats = stats.clone();
+
+        if has_pending_visibility_changes {
             Some(Self::statistics_to_inexact(stats))
         } else {
             Some(stats)
+        }
+    }
+
+    fn top_level_statistics_only(stats: &Statistics, inexact: bool) -> Statistics {
+        let num_rows = if inexact {
+            stats.num_rows.clone().to_inexact()
+        } else {
+            stats.num_rows.clone()
+        };
+        let total_byte_size = if inexact {
+            stats.total_byte_size.clone().to_inexact()
+        } else {
+            stats.total_byte_size.clone()
+        };
+
+        Statistics {
+            num_rows,
+            total_byte_size,
+            column_statistics: Vec::new(),
         }
     }
 
