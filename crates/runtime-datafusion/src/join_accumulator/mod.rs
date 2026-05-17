@@ -330,7 +330,7 @@ impl ColumnBounds for ExactColumnBounds {
     /// If the exact in-list exceeds its memory budget, return the accumulated
     /// range/bloom fallback. The Cayenne optimizer only installs this exact
     /// accumulator for inner joins with null-equals-nothing semantics, which
-    /// keeps the fallback in the same safety envelope as DataFusion's native
+    /// keeps the fallback in the same safety envelope as `DataFusion`'s native
     /// min/max dynamic filter while bounding the exact in-list allocation.
     ///
     /// The `CoalescePartitionsExec` + iterative flatten wrapper detection added
