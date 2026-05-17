@@ -1614,7 +1614,7 @@ impl RefreshTask {
             )
             .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?
-            .filter(col(tc).is_null())
+            .filter(ident(tc).is_null())
             .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?
             .collect()
@@ -2139,12 +2139,12 @@ pub fn max_timestamp_df(
 
     let expr = if needs_cast {
         cast(
-            col(format!(r#""{column}""#)),
+            ident(column),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
         )
         .alias("a")
     } else {
-        col(format!(r#""{column}""#)).alias("a")
+        ident(column).alias("a")
     };
 
     accelerator_df(accelerator, &ctx)?
@@ -2497,6 +2497,49 @@ mod tests {
             .expect("UInt32Array")
             .value(0);
         assert_eq!(max_val, 42, "UInt32: expected max value 42");
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_mixed_case_time_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "DateUpdated",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                1_000_000_000,
+                3_000_000_000,
+                2_000_000_000,
+            ]))],
+        )
+        .expect("batch should be created");
+
+        let mem_table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+            .expect("mem table should be created");
+        let accelerator: Arc<dyn TableProvider> = Arc::new(mem_table);
+
+        let ctx = SessionContext::new();
+        let df = max_timestamp_df(&accelerator, ctx.clone(), "DateUpdated")
+            .expect("dataframe should be created");
+        let results = collect(
+            df.create_physical_plan()
+                .await
+                .expect("physical plan should be created"),
+            ctx.task_ctx(),
+        )
+        .await
+        .expect("query should succeed");
+
+        let batch = results.into_iter().next().expect("at least one batch");
+        let max_value = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("TimestampNanosecondArray")
+            .value(0);
+        assert_eq!(max_value, 3_000_000_000);
     }
 
     /// Verifies that `max_timestamp_df` uses sort+limit on raw string (no CAST)

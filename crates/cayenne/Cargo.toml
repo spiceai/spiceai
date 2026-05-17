@@ -115,6 +115,18 @@ name = "inner_join_sort_merge_rewrite"
 
 [[bench]]
 harness = false
+name = "staging_move_concurrency"
+
+[[bench]]
+harness = false
+name = "column_stats_contention"
+
+[[bench]]
+harness = false
+name = "checkpoint_fence_stall"
+
+[[bench]]
+harness = false
 name = "vs_duckdb_ingest"
 required-features = ["duckdb-bench"]
 
