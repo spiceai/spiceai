@@ -58,6 +58,7 @@ datafusion-spark.workspace = true
 datafusion-substrait = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
+tokio-postgres = { workspace = true, optional = true }
 document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [
     "bundled",
@@ -348,7 +349,7 @@ postgres = [
     "data_components/postgres",
     "datafusion-table-providers/postgres",
 ]
-postgres-accel = ["postgres"]
+postgres-accel = ["postgres", "dep:tokio-postgres"]
 
 s3_vectors = [
     "data_components/s3_vectors",

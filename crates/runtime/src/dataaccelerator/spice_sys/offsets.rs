@@ -21,8 +21,6 @@ use std::{
 
 use data_components::kafka::KafkaOffset;
 
-use super::{Error, Result};
-
 #[derive(Default)]
 pub(crate) struct OffsetSchemaState {
     ensured: AtomicBool,
@@ -38,46 +36,87 @@ impl OffsetSchemaState {
     }
 }
 
-pub(crate) fn serialize_offsets(offsets: &[KafkaOffset]) -> Result<String> {
-    serde_json::to_string(offsets).map_err(Error::external)
-}
-
-pub(crate) fn deserialize_offsets(offsets_json: Option<&str>) -> Result<Vec<KafkaOffset>> {
-    offsets_json.map_or_else(
-        || Ok(Vec::new()),
-        |offsets_json| serde_json::from_str(offsets_json).map_err(Error::external),
-    )
-}
-
-pub(crate) fn serialize_merged_offsets(
-    offsets_json: Option<&str>,
-    offsets: &[KafkaOffset],
-) -> Result<String> {
-    let existing_offsets = deserialize_offsets(offsets_json)?;
-    let merged_offsets = merge_offsets(existing_offsets, offsets);
-    serialize_offsets(&merged_offsets)
-}
-
-fn merge_offsets(existing_offsets: Vec<KafkaOffset>, offsets: &[KafkaOffset]) -> Vec<KafkaOffset> {
-    let mut merged_offsets: HashMap<(String, i32), KafkaOffset> = existing_offsets
-        .into_iter()
-        .map(|offset| ((offset.topic.clone(), offset.partition), offset))
-        .collect();
-
-    for offset in offsets {
-        merged_offsets
-            .entry((offset.topic.clone(), offset.partition))
-            .and_modify(|existing_offset| {
-                existing_offset.offset = existing_offset.offset.max(offset.offset);
-            })
-            .or_insert_with(|| offset.clone());
-    }
-
-    let mut offsets = merged_offsets.into_values().collect::<Vec<_>>();
+/// Sort offsets by (topic, partition) for deterministic comparison and
+/// storage order.
+pub(crate) fn sort_offsets(offsets: &mut [KafkaOffset]) {
     offsets.sort_by(|left, right| {
         left.topic
             .cmp(&right.topic)
             .then(left.partition.cmp(&right.partition))
     });
-    offsets
+}
+
+/// Diagnostic helper: walk the incoming offsets against the prior set, log a
+/// warning whenever an offset goes backward, and return the merged result.
+///
+/// The per-partition storage tables use `MAX(...)`/`GREATEST(...)` ON CONFLICT
+/// for the authoritative resolution; this function exists purely to surface
+/// regressions to operators. A backward offset usually points at a buggy
+/// upstream producer or unexpected out-of-order redelivery.
+pub(crate) fn merge_offsets(
+    dataset_name: &str,
+    existing: Vec<KafkaOffset>,
+    incoming: &[KafkaOffset],
+) -> Vec<KafkaOffset> {
+    let mut merged: HashMap<(String, i32), KafkaOffset> = existing
+        .into_iter()
+        .map(|offset| ((offset.topic.clone(), offset.partition), offset))
+        .collect();
+
+    for offset in incoming {
+        merged
+            .entry((offset.topic.clone(), offset.partition))
+            .and_modify(|existing_offset| {
+                if offset.offset < existing_offset.offset {
+                    tracing::warn!(
+                        dataset = %dataset_name,
+                        topic = %offset.topic,
+                        partition = offset.partition,
+                        existing_offset = existing_offset.offset,
+                        incoming_offset = offset.offset,
+                        "Kafka offset went backward for partition; keeping the higher value. \
+                         This usually indicates a buggy upstream producer or out-of-order \
+                         redelivery."
+                    );
+                }
+                existing_offset.offset = existing_offset.offset.max(offset.offset);
+            })
+            .or_insert_with(|| offset.clone());
+    }
+
+    let mut out: Vec<KafkaOffset> = merged.into_values().collect();
+    sort_offsets(&mut out);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn off(topic: &str, partition: i32, offset: i64) -> KafkaOffset {
+        KafkaOffset {
+            topic: topic.to_string(),
+            partition,
+            offset,
+        }
+    }
+
+    #[test]
+    fn merge_takes_max_per_partition() {
+        let existing = vec![off("t", 0, 10), off("t", 1, 20)];
+        let incoming = vec![off("t", 0, 15), off("t", 1, 5), off("t", 2, 1)];
+        let merged = merge_offsets("ds", existing, &incoming);
+        assert_eq!(
+            merged,
+            vec![off("t", 0, 15), off("t", 1, 20), off("t", 2, 1)]
+        );
+    }
+
+    #[test]
+    fn merge_preserves_other_topics_partitions() {
+        let existing = vec![off("a", 0, 10), off("b", 0, 20)];
+        let incoming = vec![off("a", 0, 11)];
+        let merged = merge_offsets("ds", existing, &incoming);
+        assert_eq!(merged, vec![off("a", 0, 11), off("b", 0, 20)]);
+    }
 }

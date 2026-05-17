@@ -19,9 +19,17 @@ limitations under the License.
 //!     `consumer_group_id` TEXT,
 //!     `topic` TEXT,
 //!     `schema_json` TEXT,
-//!     `offsets_json` TEXT,
 //!     `created_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP`,
 //!     `updated_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP` ON UPDATE `CURRENT_TIMESTAMP`,
+//! );
+//!
+//! CREATE TABLE `spice_sys_kafka_offsets` (
+//!     `dataset_name` TEXT NOT NULL,
+//!     `topic` TEXT NOT NULL,
+//!     `partition_id` INTEGER NOT NULL,
+//!     `partition_offset` BIGINT NOT NULL,
+//!     `updated_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP`,
+//!     PRIMARY KEY (`dataset_name`, `topic`, `partition_id`),
 //! );
 
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
@@ -36,6 +44,7 @@ use crate::{
 use data_components::kafka::KafkaOffset;
 
 const KAFKA_TABLE_NAME: &str = "spice_sys_kafka";
+const KAFKA_OFFSETS_TABLE_NAME: &str = "spice_sys_kafka_offsets";
 
 #[cfg(feature = "duckdb")]
 mod duckdb;

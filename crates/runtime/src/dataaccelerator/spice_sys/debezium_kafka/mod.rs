@@ -20,9 +20,17 @@ limitations under the License.
 //!     `topic` TEXT,
 //!     `primary_keys` TEXT,
 //!     `schema_fields` TEXT,
-//!     `offsets_json` TEXT,
 //!     `created_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP`,
 //!     `updated_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP` ON UPDATE `CURRENT_TIMESTAMP`,
+//! );
+//!
+//! CREATE TABLE `spice_sys_debezium_kafka_offsets` (
+//!     `dataset_name` TEXT NOT NULL,
+//!     `topic` TEXT NOT NULL,
+//!     `partition_id` INTEGER NOT NULL,
+//!     `partition_offset` BIGINT NOT NULL,
+//!     `updated_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP`,
+//!     PRIMARY KEY (`dataset_name`, `topic`, `partition_id`),
 //! );
 
 use super::{
@@ -35,6 +43,7 @@ use crate::{
 use data_components::kafka::KafkaOffset;
 
 const DEBEZIUM_KAFKA_TABLE_NAME: &str = "spice_sys_debezium_kafka";
+const DEBEZIUM_KAFKA_OFFSETS_TABLE_NAME: &str = "spice_sys_debezium_kafka_offsets";
 
 #[cfg(feature = "duckdb")]
 mod duckdb;

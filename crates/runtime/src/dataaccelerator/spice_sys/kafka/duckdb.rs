@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::super::offsets;
-use super::{Error, KAFKA_TABLE_NAME, KafkaMetadata, KafkaSys, Result};
+use super::super::offsets::{self, sort_offsets};
+use super::{Error, KAFKA_OFFSETS_TABLE_NAME, KAFKA_TABLE_NAME, KafkaMetadata, KafkaSys, Result};
 use data_components::kafka::KafkaOffset;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use std::sync::Arc;
@@ -31,35 +31,33 @@ impl KafkaSys {
             .map_err(Error::external)?
             .get_underlying_conn_mut();
 
-        ensure_kafka_table(duckdb_conn)?;
+        ensure_kafka_tables(duckdb_conn)?;
         self.schema_ensured.mark_ensured();
 
         let schema_json = Self::serialize_schema(&metadata.schema)?;
-        let offsets_json = offsets::serialize_offsets(&metadata.offsets)?;
 
+        let tx = duckdb_conn.transaction().map_err(Error::external)?;
         let upsert = format!(
-            "INSERT INTO {KAFKA_TABLE_NAME} (dataset_name, consumer_group_id, topic, schema_json, offsets_json, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, now(), now())
+            "INSERT INTO {KAFKA_TABLE_NAME} (dataset_name, consumer_group_id, topic, schema_json, created_at, updated_at)
+             VALUES (?, ?, ?, ?, now(), now())
              ON CONFLICT (dataset_name) DO UPDATE SET
                 consumer_group_id = excluded.consumer_group_id,
                 topic = excluded.topic,
                 schema_json = excluded.schema_json,
-                offsets_json = excluded.offsets_json,
                 updated_at = now()"
         );
-
-        duckdb_conn
-            .execute(
-                &upsert,
-                [
-                    &self.dataset_name,
-                    &metadata.consumer_group_id,
-                    &metadata.topic,
-                    &schema_json,
-                    &offsets_json,
-                ],
-            )
-            .map_err(Error::external)?;
+        tx.execute(
+            &upsert,
+            duckdb::params![
+                self.dataset_name,
+                metadata.consumer_group_id,
+                metadata.topic,
+                schema_json,
+            ],
+        )
+        .map_err(Error::external)?;
+        upsert_offsets_tx(&tx, &self.dataset_name, &metadata.offsets)?;
+        tx.commit().map_err(Error::external)?;
 
         Ok(())
     }
@@ -74,31 +72,34 @@ impl KafkaSys {
             .get_underlying_conn_mut();
 
         if self.schema_needs_ensure() {
-            ensure_kafka_table(duckdb_conn)?;
+            ensure_kafka_tables(duckdb_conn)?;
             self.mark_schema_ensured();
         }
 
         let query = format!(
-            "SELECT consumer_group_id, topic, schema_json, offsets_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = ?"
+            "SELECT consumer_group_id, topic, schema_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = ?"
         );
         let mut stmt = duckdb_conn.prepare(&query).map_err(Error::external)?;
         let mut rows = stmt.query([&self.dataset_name]).map_err(Error::external)?;
 
-        if let Some(row) = rows.next().map_err(Error::external)? {
-            let consumer_group_id: String = row.get(0).map_err(Error::external)?;
-            let topic: String = row.get(1).map_err(Error::external)?;
-            let schema_json: String = row.get(2).map_err(Error::external)?;
-            let offsets_json: Option<String> = row.get(3).map_err(Error::external)?;
+        let Some(row) = rows.next().map_err(Error::external)? else {
+            return Ok(None);
+        };
 
-            Ok(Some(KafkaMetadata {
-                consumer_group_id,
-                topic,
-                schema: KafkaSys::deserialize_schema(&schema_json)?,
-                offsets: offsets::deserialize_offsets(offsets_json.as_deref())?,
-            }))
-        } else {
-            Ok(None)
-        }
+        let consumer_group_id: String = row.get(0).map_err(Error::external)?;
+        let topic: String = row.get(1).map_err(Error::external)?;
+        let schema_json: String = row.get(2).map_err(Error::external)?;
+        drop(rows);
+        drop(stmt);
+
+        let offsets = load_offsets(duckdb_conn, &self.dataset_name)?;
+
+        Ok(Some(KafkaMetadata {
+            consumer_group_id,
+            topic,
+            schema: KafkaSys::deserialize_schema(&schema_json)?,
+            offsets,
+        }))
     }
 
     pub(super) fn upsert_offsets_duckdb(
@@ -111,54 +112,100 @@ impl KafkaSys {
             .map_err(Error::external)?
             .get_underlying_conn_mut();
 
-        if self.schema_ensured.needs_ensure() {
-            ensure_kafka_table(duckdb_conn)?;
-            self.schema_ensured.mark_ensured();
+        if self.schema_needs_ensure() {
+            ensure_kafka_tables(duckdb_conn)?;
+            self.mark_schema_ensured();
         }
 
-        let query = format!("SELECT offsets_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = ?");
-        let existing_offsets_json: Option<String> = duckdb_conn
-            .query_row(&query, [&self.dataset_name], |row| row.get(0))
-            .map_err(Error::external)?;
-        let offsets_json =
-            offsets::serialize_merged_offsets(existing_offsets_json.as_deref(), offsets)?;
-        let update = format!(
-            "UPDATE {KAFKA_TABLE_NAME} SET offsets_json = ?, updated_at = now() WHERE dataset_name = ?"
-        );
-        let changed = duckdb_conn
-            .execute(&update, [&offsets_json, &self.dataset_name])
-            .map_err(Error::external)?;
-
-        if changed == 0 {
-            return Err(Error::external(format!(
-                "Kafka sidecar metadata for dataset {} does not exist",
-                self.dataset_name
-            )));
+        // Diagnostic-only: surface a warn log when an offset regresses.
+        if let Ok(prior) = load_offsets(duckdb_conn, &self.dataset_name) {
+            let _ = offsets::merge_offsets(&self.dataset_name, prior, offsets);
         }
 
+        let tx = duckdb_conn.transaction().map_err(Error::external)?;
+        upsert_offsets_tx(&tx, &self.dataset_name, offsets)?;
+        tx.commit().map_err(Error::external)?;
         Ok(())
     }
 }
 
-fn ensure_kafka_table(conn: &mut duckdb::Connection) -> Result<()> {
-    let create_table = format!(
+fn ensure_kafka_tables(conn: &mut duckdb::Connection) -> Result<()> {
+    let create_metadata = format!(
         "CREATE TABLE IF NOT EXISTS {KAFKA_TABLE_NAME} (
             dataset_name TEXT PRIMARY KEY,
             consumer_group_id TEXT,
             topic TEXT,
             schema_json TEXT,
-            offsets_json TEXT,
             created_at TIMESTAMP,
             updated_at TIMESTAMP
         )"
     );
-    conn.execute(&create_table, []).map_err(Error::external)?;
+    conn.execute(&create_metadata, [])
+        .map_err(Error::external)?;
 
-    let add_offsets =
-        format!("ALTER TABLE {KAFKA_TABLE_NAME} ADD COLUMN IF NOT EXISTS offsets_json TEXT");
-    conn.execute(&add_offsets, []).map_err(Error::external)?;
-
+    let create_offsets = format!(
+        "CREATE TABLE IF NOT EXISTS {KAFKA_OFFSETS_TABLE_NAME} (
+            dataset_name TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            partition_id INTEGER NOT NULL,
+            partition_offset BIGINT NOT NULL,
+            updated_at TIMESTAMP,
+            PRIMARY KEY (dataset_name, topic, partition_id)
+        )"
+    );
+    conn.execute(&create_offsets, [])
+        .map_err(Error::external)?;
     Ok(())
+}
+
+fn upsert_offsets_tx(
+    tx: &duckdb::Transaction<'_>,
+    dataset_name: &str,
+    offsets: &[KafkaOffset],
+) -> Result<()> {
+    if offsets.is_empty() {
+        return Ok(());
+    }
+    let stmt_sql = format!(
+        "INSERT INTO {KAFKA_OFFSETS_TABLE_NAME}
+            (dataset_name, topic, partition_id, partition_offset, updated_at)
+         VALUES (?, ?, ?, ?, now())
+         ON CONFLICT (dataset_name, topic, partition_id) DO UPDATE SET
+            partition_offset = GREATEST(excluded.partition_offset, partition_offset),
+            updated_at = now()"
+    );
+    let mut stmt = tx.prepare(&stmt_sql).map_err(Error::external)?;
+    for offset in offsets {
+        stmt.execute(duckdb::params![
+            dataset_name,
+            offset.topic,
+            offset.partition,
+            offset.offset,
+        ])
+        .map_err(Error::external)?;
+    }
+    Ok(())
+}
+
+fn load_offsets(conn: &duckdb::Connection, dataset_name: &str) -> Result<Vec<KafkaOffset>> {
+    let query = format!(
+        "SELECT topic, partition_id, partition_offset FROM {KAFKA_OFFSETS_TABLE_NAME} WHERE dataset_name = ?"
+    );
+    let mut stmt = conn.prepare(&query).map_err(Error::external)?;
+    let rows = stmt
+        .query_map([dataset_name], |row| {
+            Ok(KafkaOffset {
+                topic: row.get(0)?,
+                partition: row.get(1)?,
+                offset: row.get(2)?,
+            })
+        })
+        .map_err(Error::external)?;
+    let mut out: Vec<KafkaOffset> = rows
+        .collect::<duckdb::Result<_>>()
+        .map_err(Error::external)?;
+    sort_offsets(&mut out);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -188,7 +235,6 @@ mod tests {
             .build()
             .expect("to create dataset");
 
-        // Use a unique temp directory for each test to avoid parallel test interference
         let temp_dir = TempDir::new().expect("to create temp dir");
         let db_path = temp_dir.path().join("kafka_test.db");
 
@@ -326,5 +372,73 @@ mod tests {
             result.expect("to get empty metadata").is_none(),
             "Should return None for nonexistent dataset"
         );
+    }
+
+    /// Regression for finding #2: upsert_offsets must succeed even when no
+    /// metadata row exists.
+    #[tokio::test]
+    async fn test_duckdb_offsets_update_succeeds_without_metadata_row() {
+        let (ds, _temp_dir) =
+            create_test_dataset("test_duckdb_offsets_no_metadata").await;
+        let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
+            .await
+            .expect("to create KafkaSys");
+
+        kafka_sys
+            .upsert_offsets(&[KafkaOffset {
+                topic: "test-topic".to_string(),
+                partition: 0,
+                offset: 42,
+            }])
+            .await
+            .expect("upsert_offsets should succeed without metadata row");
+    }
+
+    /// Regression for finding #1 part b: per-partition INSERT ON CONFLICT
+    /// keeps the highest offset when racing concurrent writers on the same
+    /// partition.
+    #[tokio::test]
+    async fn test_duckdb_concurrent_same_partition_keeps_max() {
+        let (ds, _temp_dir) =
+            create_test_dataset("test_duckdb_concurrent_same_partition").await;
+        let kafka_sys = Arc::new(
+            KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
+                .await
+                .expect("to create KafkaSys"),
+        );
+        kafka_sys
+            .upsert(&create_test_metadata())
+            .await
+            .expect("seed");
+
+        let mut handles = Vec::new();
+        for off in [10_i64, 50, 30, 100, 70, 5] {
+            let kafka_sys = Arc::clone(&kafka_sys);
+            handles.push(tokio::spawn(async move {
+                kafka_sys
+                    .upsert_offsets(&[KafkaOffset {
+                        topic: "test-topic".to_string(),
+                        partition: 0,
+                        offset: off,
+                    }])
+                    .await
+                    .expect("upsert");
+            }));
+        }
+        for h in handles {
+            h.await.expect("join");
+        }
+
+        let retrieved = kafka_sys
+            .get()
+            .await
+            .expect("retrieve")
+            .expect("exist");
+        let p0 = retrieved
+            .offsets
+            .iter()
+            .find(|o| o.partition == 0 && o.topic == "test-topic")
+            .expect("partition 0 present");
+        assert_eq!(p0.offset, 100);
     }
 }
