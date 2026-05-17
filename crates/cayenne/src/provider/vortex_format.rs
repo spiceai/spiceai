@@ -32,6 +32,7 @@ use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
+use super::deletion_strategy::PositionBitmap;
 use arc_swap::ArcSwap;
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
@@ -55,7 +56,6 @@ use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, Pushe
 use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use object_store::{ObjectMeta, ObjectStore};
-use super::deletion_strategy::PositionBitmap;
 use vortex_datafusion::VortexFormat;
 /// A wrapper around `VortexFormat` that injects per-file deletion vectors.
 ///
@@ -179,10 +179,7 @@ impl DeletionFilteringVortexFormat {
     ///
     /// * `inner` - The underlying `VortexFormat` to delegate to.
     /// * `deletion_cache` - Shared cache of per-file deletion vectors.
-    pub fn new(
-        inner: Arc<VortexFormat>,
-        deletion_cache: Arc<ArcSwap<PositionBitmap>>,
-    ) -> Self {
+    pub fn new(inner: Arc<VortexFormat>, deletion_cache: Arc<ArcSwap<PositionBitmap>>) -> Self {
         Self {
             inner,
             deletion_cache,

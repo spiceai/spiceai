@@ -22,8 +22,8 @@ limitations under the License.
 
 use super::super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use super::CayenneDeletionSink;
-use crate::provider::deletion_strategy::PositionDeletionVector;
 use crate::provider::Error;
+use crate::provider::deletion_strategy::PositionDeletionVector;
 use crate::provider::utils::convert_to_u64_box;
 use datafusion::datasource::listing::ListingTable;
 use datafusion::execution::context::SessionContext;
@@ -361,7 +361,9 @@ impl CayenneDeletionSink {
         // ArcSwap load is wait-free; the snapshot is immutable for the lifetime of `current`.
         let already_deleted = {
             let current = cached_deleted_row_ids.load();
-            current.get(file_path).map(|deletion_vector| deletion_vector.access_plan())
+            current
+                .get(file_path)
+                .map(|deletion_vector| deletion_vector.access_plan())
         };
 
         // Open the Vortex file directly using the session
@@ -653,8 +655,9 @@ impl CayenneDeletionSink {
             new_deletion_count += newly_added_for_file;
 
             // Deletion vector must contain ALL deleted positions (existing + new).
-            let mut combined_ids: Vec<u64> = existing_deletion
-                .map_or_else(Vec::new, |deletion| deletion.iter().map(u64::from).collect());
+            let mut combined_ids: Vec<u64> = existing_deletion.map_or_else(Vec::new, |deletion| {
+                deletion.iter().map(u64::from).collect()
+            });
             combined_ids.extend(unique_new_row_ids.iter().copied());
             combined_ids.sort_unstable();
             combined_ids.dedup();
@@ -666,10 +669,10 @@ impl CayenneDeletionSink {
             // Pre-build updated cache bitmap (u32 representable positions only).
             // Clone only THIS file's bitmap; unchanged file bitmaps remain
             // shared through their existing `Arc`s in the outer map snapshot.
-            let mut updated_bitmap = existing_deletion.map_or_else(
-                RoaringBitmap::new,
-                |deletion_vector| deletion_vector.to_bitmap(),
-            );
+            let mut updated_bitmap = existing_deletion
+                .map_or_else(RoaringBitmap::new, |deletion_vector| {
+                    deletion_vector.to_bitmap()
+                });
             updated_bitmap.extend(
                 unique_new_row_ids
                     .iter()
