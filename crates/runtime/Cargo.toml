@@ -187,6 +187,7 @@ tracing.workspace = true
 tracing-futures.workspace = true
 tracing-subscriber.workspace = true
 turso = { workspace = true, optional = true }
+turso-shared = { workspace = true }
 twox-hash.workspace = true
 url.workspace = true
 util = { path = "../util", features = ["datafusion", "http"] }

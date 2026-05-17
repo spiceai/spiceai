@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod partitioned_insert_strategy;
 pub mod s3;
 pub mod snapshot_engine;
 
@@ -160,6 +161,22 @@ fn parse_usize(acceleration: &Acceleration, key: &str, default: usize) -> usize 
                 default
             })
         })
+}
+
+fn parse_optional_usize<'a>(
+    acceleration: &Acceleration,
+    keys: &'a [&'a str],
+) -> Option<(&'a str, usize)> {
+    keys.iter().find_map(|&key| {
+        acceleration.params.get(key).and_then(|v| {
+            v.parse::<usize>().map_or_else(|_| {
+                tracing::warn!(
+                    "An invalid '{key}' value was provided: '{v}'. Expected a positive integer, ignoring the value. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+                );
+                None
+            }, |value| Some((key, value)))
+            })
+    })
 }
 
 /// Returns true if the path is a local filesystem path (not a remote object store).
@@ -423,27 +440,41 @@ impl CayenneAccelerator {
                     .collect();
             }
 
-            // Parse upload concurrency for parallel file writes
-            let parsed_upload_concurrency = parse_usize(
+            if let Some((upload_concurrency_key, parsed_upload_concurrency)) = parse_optional_usize(
                 acceleration,
-                "cayenne_upload_concurrency",
-                config.upload_concurrency,
-            );
-            if parsed_upload_concurrency == 0 {
-                tracing::warn!(
-                    "Invalid cayenne_upload_concurrency value of 0. Using minimum value of 1."
-                );
-                config.upload_concurrency = 1;
-            } else {
-                config.upload_concurrency = parsed_upload_concurrency;
+                &["cayenne_upload_concurrency", "upload_concurrency"],
+            ) {
+                if parsed_upload_concurrency == 0 {
+                    tracing::warn!(
+                        "Invalid {upload_concurrency_key} value of 0. Using minimum value of 1."
+                    );
+                    config.upload_concurrency = 1;
+                } else {
+                    config.upload_concurrency = parsed_upload_concurrency;
+                }
+            }
+
+            if let Some((write_concurrency_key, parsed_write_concurrency)) = parse_optional_usize(
+                acceleration,
+                &["cayenne_write_concurrency", "write_concurrency"],
+            ) {
+                if parsed_write_concurrency == 0 {
+                    tracing::warn!(
+                        "Invalid {write_concurrency_key} value of 0. Using minimum value of 1."
+                    );
+                    config.write_concurrency = Some(1);
+                } else {
+                    config.write_concurrency = Some(parsed_write_concurrency);
+                }
             }
 
             tracing::debug!(
-                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, sort_columns={:?}, compression_strategy={:?}",
+                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}",
                 config.footer_cache_mb,
                 config.segment_cache_mb,
                 config.target_vortex_file_size_mb,
                 config.upload_concurrency,
+                config.write_concurrency,
                 config.sort_columns,
                 config.compression_strategy
             );
@@ -731,8 +762,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    11,
-    { S3_PARAMS_LEN + 11 },
+    12,
+    { S3_PARAMS_LEN + 12 },
 >(
     S3_PARAMETERS,
     [
@@ -765,8 +796,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["btrblocks", "zstd"])
             .default("btrblocks"),
         ParameterSpec::component("upload_concurrency")
-            .description("Maximum number of concurrent file uploads when writing multiple Vortex files. Default: 4.")
-            .default("4"),
+            .description("Maximum number of concurrent file uploads when writing multiple Vortex files. Defaults to available CPU parallelism."),
+        ParameterSpec::component("write_concurrency")
+            .description("Optional writer partition override for unsorted Cayenne ingests. Defaults to runtime.query.target_partitions."),
     ],
 );
 
@@ -1248,12 +1280,22 @@ impl DataAccelerator for CayenneAccelerator {
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?;
 
-            // Create a new catalog - it will use WAL mode and busy timeout internally
-            let catalog = Arc::new(
+            // Create a new catalog - it will use WAL mode and busy timeout internally.
+            // We keep both a concrete and a trait-object handle: the trait
+            // object goes to the per-partition CayenneTableProviders (which use
+            // the MetadataCatalog API), while the concrete handle is needed by
+            // `CayennePartitionedInsertStrategy` to open a shared
+            // MetastoreTransaction across all partitions (issue #10125).
+            let catalog_concrete: Arc<cayenne::CayenneCatalog> = Arc::new(
                 cayenne::CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
                     .boxed()
                     .context(AccelerationInitializationFailedSnafu)?,
-            ) as Arc<dyn cayenne::MetadataCatalog>;
+            );
+            // Promote to a trait object for the existing per-partition callers.
+            // The coercion from Arc<CayenneCatalog> to Arc<dyn MetadataCatalog>
+            // happens via the unsizing rule on the let-binding's declared type.
+            let catalog: Arc<dyn cayenne::MetadataCatalog> =
+                Arc::<cayenne::CayenneCatalog>::clone(&catalog_concrete);
 
             // Initialize the catalog (creates tables if needed)
             catalog
@@ -1307,12 +1349,22 @@ impl DataAccelerator for CayenneAccelerator {
                 runtime_env,
             ));
 
-            // Wrap the base table provider with partitioning logic
+            // Wrap the base table provider with partitioning logic, installing
+            // the Cayenne-specific cross-partition insert strategy so that
+            // overwrite-mode writes batch every partition's catalog mutation
+            // into a single MetastoreTransaction (#10125).
+            let insert_strategy = Arc::new(
+                partitioned_insert_strategy::CayennePartitionedInsertStrategy::new(
+                    Arc::clone(&catalog_concrete),
+                    PathBuf::from(&dir_path),
+                ),
+            );
             let partition_provider = Arc::new(
                 PartitionTableProvider::new(creator, partition_by, Arc::clone(&arrow_schema))
                     .await
                     .boxed()
-                    .context(AccelerationCreationFailedSnafu)?,
+                    .context(AccelerationCreationFailedSnafu)?
+                    .with_insert_strategy(insert_strategy),
             );
 
             // Wrap with upsert deduplication if needed based on on_conflict settings

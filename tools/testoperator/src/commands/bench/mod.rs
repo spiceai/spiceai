@@ -14,11 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{RowCounts, get_app_and_start_request};
-use crate::{
-    args::DatasetTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper,
-    wait_test_and_memory,
-};
+use super::{RowCounts, get_app_and_start_request, load_app};
+use crate::{args::DatasetTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper};
 use chbench_driver::ChBenchDriver as _;
 use std::{
     path::Path,
@@ -72,20 +69,57 @@ pub(crate) fn emit_acceleration_size_if_applicable(
 }
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
-    let (app, start_request) = get_app_and_start_request(&args.common).await?;
+    // Two SUT acquisition paths: when a system adapter is configured, delegate
+    // setup() to it over JSON-RPC; otherwise spawn a local `spiced` as before.
+    // The rest of the benchmark flow is identical apart from a few
+    // local-spawn-only side metrics (process memory, on-disk acceleration size)
+    // that we skip when the SUT lives elsewhere.
+    let (app, spiced_instance, system_adapter_session) = if args.common.is_system_adapter() {
+        let app = load_app(&args.common).await?;
+        let (instance, session) = crate::system_adapter::acquire(&args.common).await?;
+        (app, instance, Some(session))
+    } else {
+        let (app, start_request) = get_app_and_start_request(&args.common).await?;
 
-    // For chbench, prepare the Postgres source database (schema + seed data) before starting spiced.
-    let query_set = args.load_query_set()?;
-    if query_set == test_framework::queries::QuerySet::ChBench {
-        let scale_factor = args.scale_factor.unwrap_or(1.0);
-        prepare_chbench_source(scale_factor, None).await?;
+        // For chbench, prepare the Postgres source database (schema + seed data) before starting spiced.
+        let query_set = args.load_query_set()?;
+        if query_set == test_framework::queries::QuerySet::ChBench {
+            let scale_factor = args.scale_factor.unwrap_or(1.0);
+            prepare_chbench_source(scale_factor).await?;
+        }
+
+        let instance = SpicedInstance::start(start_request).await?;
+        (app, instance, None)
+    };
+
+    // From here on, we may early-return on errors but must still run adapter
+    // teardown if one was opened. Wrap the rest of the run in an inner helper
+    // whose `Result` we hold onto, run teardown unconditionally, then return.
+    let result = run_inner(args, app, spiced_instance).await;
+
+    if let Some(session) = system_adapter_session {
+        session.teardown().await;
     }
 
-    let mut spiced_instance = SpicedInstance::start(start_request).await?;
+    result
+}
+
+async fn run_inner(
+    args: &DatasetTestArgs,
+    app: App,
+    mut spiced_instance: SpicedInstance,
+) -> anyhow::Result<RowCounts> {
     let ready_wait_start = Instant::now();
 
+    // Process-memory tracking is only meaningful when testoperator owns the
+    // spiced subprocess. For SUTs acquired via a system adapter, the
+    // adapter's `metrics()` RPC is the canonical source of SUT-side resource
+    // usage, so we skip the local watcher entirely.
     let memory_token = CancellationToken::new();
-    let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
+    let memory_readings = spiced_instance
+        .process()
+        .ok()
+        .map(|process| process.watch_memory(&memory_token));
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
@@ -102,18 +136,21 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let testoperator_commit_sha = git::get_commit_sha();
     let branch_name = git::get_branch_name();
 
+    let query_set = args.load_query_set()?;
+    let mut benchmark_attributes = vec![
+        KeyValue::new("service.name", "testoperator"),
+        KeyValue::new("type", "benchmark_query"),
+        KeyValue::new("name", app.name.clone()),
+        KeyValue::new("spiced_version", spiced_version),
+        KeyValue::new("query_set", query_set.to_string()),
+        KeyValue::new("testoperator_commit_sha", testoperator_commit_sha),
+        KeyValue::new("spiced_commit_sha", spiced_commit_sha),
+        KeyValue::new("branch_name", branch_name),
+        KeyValue::new("scale_factor", args.scale_factor.unwrap_or(1.0).to_string()),
+    ];
+    benchmark_attributes.extend(super::run_mode_attributes(&args.common, args));
     let benchmark_resource = Resource::builder_empty()
-        .with_attributes(vec![
-            KeyValue::new("service.name", "testoperator"),
-            KeyValue::new("type", "benchmark_query"),
-            KeyValue::new("name", app.name.clone()),
-            KeyValue::new("spiced_version", spiced_version),
-            KeyValue::new("query_set", query_set.to_string()),
-            KeyValue::new("testoperator_commit_sha", testoperator_commit_sha),
-            KeyValue::new("spiced_commit_sha", spiced_commit_sha),
-            KeyValue::new("branch_name", branch_name),
-            KeyValue::new("scale_factor", args.scale_factor.unwrap_or(1.0).to_string()),
-        ])
+        .with_attributes(benchmark_attributes)
         .build();
 
     // Create telemetry with resource upfront, before any metrics calls
@@ -157,13 +194,31 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     let benchmark_test = benchmark_test.start()?;
 
-    let test = wait_test_and_memory!(benchmark_test, memory_token, memory_readings);
+    let test = match benchmark_test.wait().await {
+        Ok(test) => test,
+        Err(e) => {
+            // Best-effort memory drain on failure, mirroring `wait_test_and_memory!`
+            // for the local-spawn case. For adapter-acquired SUTs there's no local
+            // process being watched, so skip the call entirely.
+            if let Some(handle) = memory_readings {
+                let _ = observe_memory(memory_token, handle).await;
+            }
+            return Err(e);
+        }
+    };
 
     let row_counts = test.validate_returned_row_counts()?;
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Benchmark)?;
     let test_succeeded = test.succeeded();
     let mut spiced_instance = test.end()?;
-    let (max_memory, median_memory) = observe_memory(memory_token, memory_readings).await?;
+    // Only present when a local spiced subprocess is being watched. For
+    // adapter-acquired SUTs we deliberately leave this as `None` rather than
+    // recording a misleading 0.0 — the adapter's own metrics RPC is the right
+    // source of SUT-side resource numbers.
+    let memory_usage = match memory_readings {
+        Some(handle) => Some(observe_memory(memory_token, handle).await?),
+        None => None,
+    };
 
     let mut failures = Vec::new();
     for query in &metrics.metrics {
@@ -197,12 +252,23 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     crate::metrics::READY_DURATION.record(ready_wait_duration.as_millis().try_into()?, &[]);
     crate::metrics::TEST_DURATION
         .record((metrics.finished_at - metrics.started_at).try_into()?, &[]);
-    crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
-    crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
+    if let Some((max_memory, median_memory)) = memory_usage {
+        crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
+        crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
+    }
 
-    emit_acceleration_size_if_applicable(&app, &spiced_instance.get_tempdir_path()?)?;
+    // On-disk acceleration size only applies to the local-spawn path (the SUT
+    // tempdir is testoperator's own). When the SUT lives elsewhere there's
+    // nothing to measure from here.
+    if let Ok(tempdir_path) = spiced_instance.get_tempdir_path() {
+        emit_acceleration_size_if_applicable(&app, &tempdir_path)?;
+    }
 
-    let records = metrics.with_memory_usage(max_memory).build_records()?;
+    let metrics = match memory_usage {
+        Some((max_memory, _)) => metrics.with_memory_usage(max_memory),
+        None => metrics,
+    };
+    let records = metrics.build_records()?;
     print_batches(&records)?;
 
     let health_report = health_monitor.stop().await;
@@ -213,6 +279,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     telemetry.emit().await?;
 
     spiced_instance.stop()?;
+
     let health_report = health_report?;
     let mut error_messages = Vec::new();
 
@@ -280,10 +347,8 @@ fn chbench_source_from_env() -> anyhow::Result<chbench_driver::PostgresSourceCon
 /// Postgres, create the schema and load seed data.
 ///
 /// `scale_factor` maps to TPC-C warehouses (must be a positive integer >= 1).
-/// `duration` overrides the default OLTP workload duration when set.
 pub(crate) async fn prepare_chbench_source(
     scale_factor: f64,
-    duration: Option<Duration>,
 ) -> anyhow::Result<chbench_driver::PostgresChBenchDriver> {
     if scale_factor < 1.0 || scale_factor.fract() != 0.0 {
         anyhow::bail!(
@@ -296,14 +361,11 @@ pub(crate) async fn prepare_chbench_source(
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let warehouses = scale_factor as usize;
     let terminals = warehouses * 10;
-    let mut config = chbench_driver::ChBenchConfig {
+    let config = chbench_driver::ChBenchConfig {
         warehouses,
         terminals,
         ..Default::default()
     };
-    if let Some(d) = duration {
-        config.duration = d;
-    }
 
     println!(
         "Preparing chbench source (SF{scale_factor}: {warehouses} warehouse(s), {terminals} terminal(s))..."

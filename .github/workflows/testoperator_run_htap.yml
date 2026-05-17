@@ -1,5 +1,5 @@
-name: HTAP(CH-benCHmark) tests
-run-name: htap - ${{ github.event.inputs.spicepod_path }} - SF${{ github.event.inputs.scale_factor }} - ${{ github.event.inputs.duration }}s
+name: htap benchmark tests
+run-name: CH-BenCHmark - ${{ github.event.inputs.spicepod_path }} - SF${{ github.event.inputs.scale_factor }} - ${{ github.event.inputs.duration }}s
 
 on:
   workflow_dispatch:
@@ -37,7 +37,7 @@ on:
           - 'spiceai-dev-large-runners'
 jobs:
   run-htap:
-    name: Run HTAP(CH-benCHmark)
+    name: Run CH-BenCHmark
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
     steps:
@@ -59,6 +59,13 @@ jobs:
             exit 1
           fi
           echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced

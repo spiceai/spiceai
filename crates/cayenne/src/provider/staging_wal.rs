@@ -31,10 +31,34 @@ limitations under the License.
 //! If the process crashes during step 2, the WAL file survives and is detected
 //! on the next table open or write attempt, alerting the operator to a potentially inconsistent
 //! state.
+//!
+//! # Two-phase commit lifecycle
+//!
+//! For cross-partition coordination (issue #10125), the staged-append surface is
+//! split into a three-phase lifecycle:
+//!
+//! - [`CayenneStagedAppend::prepare`] writes the staging WAL and returns a
+//!   [`PreparedStagedAppend`] receipt.
+//! - [`PreparedStagedAppend::apply_under_barrier`] performs the file move,
+//!   WAL removal, and listing-table refresh that make the staged rows visible.
+//!   For single-partition use the receipt acquires the listing-table write lock
+//!   itself; the cross-partition coordinator (future work) will own the lock
+//!   externally.
+//! - [`PreparedStagedAppend::apply_in_txn`] is reserved for the overwrite path,
+//!   where the visibility flip is a catalog pointer mutation inside a shared
+//!   [`crate::metastore::MetastoreTransaction`]. For the append lifecycle it is
+//!   a no-op.
+//! - [`PreparedStagedAppend::finish`] releases the write guard and returns the
+//!   row count.
+//!
+//! The legacy one-shot [`CayenneStagedAppend::commit`] is reimplemented in terms
+//! of this lifecycle and remains observably identical to the previous behavior.
 
+use super::PartitionedWal;
 use super::Result;
 use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME};
 use super::table::CayenneTableProvider;
+use crate::metastore::MetastoreTransaction;
 use crate::provider::Error;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::TryStreamExt;
@@ -47,6 +71,10 @@ use tokio::sync::OwnedMutexGuard;
 /// - Granular orchestration via `write_wal`, `move_staged_files`,
 ///   `remove_wal`, and `refresh_listing_table`
 /// - One-shot orchestration via `finalize_staged_write`
+/// - Two-phase commit via [`CayenneStagedAppend::prepare`] →
+///   [`PreparedStagedAppend::apply_under_barrier`] → [`PreparedStagedAppend::finish`].
+///   The two-phase API is what the cross-partition coordinator uses; for single-partition
+///   callers it is equivalent to [`CayenneStagedAppend::commit`].
 ///
 /// `begin_staged_append` returns this handle after writing data into `_staging/`
 /// so external consumers can synchronize writes and call `commit` only when ready.
@@ -125,8 +153,8 @@ impl CayenneStagedAppend {
     /// # Errors
     ///
     /// Returns an error if refreshing the listing table fails.
-    pub fn refresh_listing_table(&self) -> Result<()> {
-        self.table.refresh_listing_table()
+    pub async fn refresh_listing_table(&self) -> Result<()> {
+        self.table.refresh_listing_table().await
     }
 
     /// Executes the full WAL finalize sequence in order.
@@ -139,19 +167,48 @@ impl CayenneStagedAppend {
         self.write_wal().await?;
         self.move_staged_files().await?;
         self.remove_wal().await?;
-        self.refresh_listing_table()?;
+        self.refresh_listing_table().await?;
         Ok(())
     }
 
     /// Commits the staged append, making the new rows visible to readers.
     ///
+    /// Equivalent to [`Self::prepare`] → [`PreparedStagedAppend::apply_under_barrier`]
+    /// → [`PreparedStagedAppend::finish`], run sequentially. Single-partition
+    /// callers should use this; the cross-partition coordinator drives the
+    /// three phases explicitly so it can hold a cross-partition barrier across
+    /// every prepared partition's `apply_under_barrier` call.
+    ///
     /// # Errors
     ///
     /// Returns an error if the finalize sequence fails.
     pub async fn commit(self) -> Result<u64> {
-        self.finalize_staged_write().await?;
-        let _ = self.write_guard;
-        Ok(self.row_count)
+        let prepared = self.prepare().await?;
+        prepared.apply_under_barrier().await?;
+        prepared.finish().await
+    }
+
+    /// Prepare the staged append for commit.
+    ///
+    /// Writes the staging WAL — a durable record of the intent to move the
+    /// already-staged files into the current snapshot directory. After this
+    /// returns, the caller owns the lifecycle: it must either complete the
+    /// commit via [`PreparedStagedAppend::apply_under_barrier`] (and then
+    /// [`PreparedStagedAppend::finish`]) or [`PreparedStagedAppend::rollback`]
+    /// the receipt. Dropping the receipt without finishing leaves the WAL on
+    /// disk and will block subsequent writes via
+    /// [`CayenneTableProvider::ensure_no_incomplete_write`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing the staging WAL fails.
+    pub async fn prepare(self) -> Result<PreparedStagedAppend> {
+        self.table.write_staging_wal().await?;
+        Ok(PreparedStagedAppend {
+            table: self.table,
+            write_guard: self.write_guard,
+            row_count: self.row_count,
+        })
     }
 
     /// Discards the staged append and removes any staged files.
@@ -160,8 +217,194 @@ impl CayenneStagedAppend {
     ///
     /// Returns an error if clearing the staging directory fails.
     pub async fn rollback(self) -> Result<()> {
-        let _ = self.write_guard;
+        // Hold the per-table write guard until after the staging directory is
+        // cleared. Dropping the guard first would let another writer acquire
+        // the lock mid-cleanup and transiently observe an `IncompleteWrite`
+        // or leftover WAL.
+        let _write_guard = self.write_guard;
         self.table.clear_staging_dir().await
+        // _write_guard drops here, after cleanup completes.
+    }
+}
+
+/// A staged append that has been [prepared](CayenneStagedAppend::prepare) for
+/// commit.
+///
+/// Holds the staging WAL on disk and the per-table write guard. Completing the
+/// commit is a two-step dance:
+///
+/// 1. [`Self::apply_under_barrier`] (append path) or [`Self::apply_in_txn`]
+///    (overwrite path, future work) performs the visibility flip.
+/// 2. [`Self::finish`] releases the guard and returns the row count.
+///
+/// Dropping a `PreparedStagedAppend` without calling `finish` or `rollback`
+/// leaves the staging WAL on disk; the next write attempt will fail at
+/// [`CayenneTableProvider::ensure_no_incomplete_write`].
+pub struct PreparedStagedAppend {
+    table: CayenneTableProvider,
+    write_guard: Option<OwnedMutexGuard<()>>,
+    row_count: u64,
+}
+
+impl std::fmt::Debug for PreparedStagedAppend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedStagedAppend")
+            .field("table", &self.table.table_name())
+            .field("has_write_guard", &self.write_guard.is_some())
+            .field("row_count", &self.row_count)
+            .finish()
+    }
+}
+
+impl PreparedStagedAppend {
+    /// Returns the number of rows staged for commit.
+    #[must_use]
+    pub fn row_count(&self) -> u64 {
+        self.row_count
+    }
+
+    /// Apply the staged write under the caller's append-side barrier.
+    ///
+    /// Performs, in order: move staged files into the current snapshot
+    /// directory; remove the staging WAL; refresh the in-memory listing table.
+    /// The WAL is removed *before* the listing-table refresh to preserve the
+    /// existing crash-safety invariant ("WAL absent ⇒ files moved
+    /// successfully"); a crash between WAL removal and listing refresh leaves
+    /// the data on disk and is self-healing on the next listing refresh
+    /// trigger.
+    ///
+    /// Single-partition path. Acquires this partition's `listing_fence` for
+    /// write internally. The cross-partition append coordinator (#10125 step
+    /// 6) uses [`Self::apply_under_held_barrier`] instead so it can hold the
+    /// fences on every participating partition for one shared barrier window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if moving the staged files, removing the WAL, or
+    /// refreshing the listing table fails.
+    pub async fn apply_under_barrier(&self) -> Result<()> {
+        // Hold the listing fence for the entire move + WAL removal + listing
+        // swap sequence. Without this, `CayenneTableProvider::scan()` (which
+        // holds `listing_fence.read()` across DataFusion's listing call) can
+        // interleave with the move and observe a torn directory snapshot.
+        let _fence = self.table.lock_listing_fence_write_owned().await;
+        self.table.move_files_to_current_snapshot().await?;
+        self.table.remove_staging_wal().await?;
+        self.table.refresh_listing_table_under_held_fence()?;
+        Ok(())
+    }
+
+    /// Apply the staged write ASSUMING the caller already holds this
+    /// partition's `listing_fence` for write.
+    ///
+    /// Same observable effect as [`Self::apply_under_barrier`] but skips the
+    /// internal fence acquisition. Used by the cross-partition append
+    /// coordinator (#10125 step 6), which locks fences on every participating
+    /// partition (sorted to keep concurrent coordinators deadlock-free) for
+    /// the duration of one barrier window, calls this method on each, and
+    /// releases the fences together. Readers going through `scan()` either
+    /// see the pre-barrier state on every partition or the post-barrier
+    /// state on every partition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if moving the staged files, removing the WAL, or
+    /// reconstructing the listing table fails.
+    pub async fn apply_under_held_barrier(&self) -> Result<()> {
+        self.table.move_files_to_current_snapshot().await?;
+        self.table.remove_staging_wal().await?;
+        self.table.refresh_listing_table_under_held_fence()?;
+        Ok(())
+    }
+
+    /// Returns the partition's catalog `table_id`. Used by the cross-partition
+    /// coordinator to populate the top-level WAL.
+    #[must_use]
+    pub fn table_id(&self) -> &str {
+        self.table.table_id()
+    }
+
+    /// Returns this partition's absolute staging-WAL path, used by the
+    /// cross-partition coordinator to record what the top-level WAL refers
+    /// to.
+    #[must_use]
+    pub fn staging_wal_path(&self) -> std::path::PathBuf {
+        self.table.staging_wal_path_for_recovery()
+    }
+
+    /// Acquire this partition's listing fence for write, returning an owned
+    /// guard the coordinator holds across the cross-partition barrier.
+    pub async fn lock_listing_fence_write_owned(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.table.lock_listing_fence_write_owned().await
+    }
+
+    /// Apply the staged write inside the caller's metastore transaction.
+    ///
+    /// Reserved for the cross-partition overwrite path (future work for issue
+    /// #10125), where the visibility flip is a catalog pointer mutation that
+    /// must be batched with other partitions' mutations inside a shared
+    /// [`MetastoreTransaction`]. The append-mode lifecycle has no catalog
+    /// mutation, so this is a no-op today; it is exposed now to fix the API
+    /// shape that the coordinator will consume.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog mutation fails. The append-mode
+    /// implementation never returns an error.
+    #[expect(
+        clippy::unused_async,
+        reason = "API symmetry / forward-compat — see body"
+    )]
+    pub async fn apply_in_txn(&self, _txn: &mut dyn MetastoreTransaction) -> Result<()> {
+        // Async kept for API symmetry with `PreparedOverwrite::apply_in_txn`
+        // and for forward-compat: any future append-mode catalog mutation
+        // would live here and need `.await`.
+        Ok(())
+    }
+
+    /// Finish a prepared append after [`Self::apply_under_barrier`] or
+    /// [`Self::apply_in_txn`] has succeeded.
+    ///
+    /// Releases the per-table write guard and returns the row count. For the
+    /// append path, all visibility work has already happened in
+    /// `apply_under_barrier`; this is purely a typestate transition that makes
+    /// the `Drop` of the write guard explicit.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible. Returns a `Result` for symmetry with future
+    /// extensions (e.g. publishing per-partition statistics inside `finish`)
+    /// and for forward-compatibility with the cross-partition coordinator.
+    #[expect(
+        clippy::unused_async,
+        reason = "API symmetry / forward-compat — see body"
+    )]
+    pub async fn finish(self) -> Result<u64> {
+        // Async kept so a future cross-partition coordinator can call
+        // `prep.finish().await` uniformly without callers having to know
+        // whether finish is sync or async for this mode.
+        let _ = self.write_guard;
+        Ok(self.row_count)
+    }
+
+    /// Discards the prepared append.
+    ///
+    /// Clears the staging directory (which removes the WAL along with the
+    /// staged files). Use this when, after [`CayenneStagedAppend::prepare`]
+    /// returns successfully, downstream coordination determines the commit
+    /// must not proceed (e.g. another partition's prepare failed).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if clearing the staging directory fails.
+    pub async fn rollback(self) -> Result<()> {
+        // Same ordering rationale as `CayenneStagedAppend::rollback`: hold
+        // the write guard until after the staging directory is cleared so
+        // other writers can't transiently observe a leftover WAL between
+        // guard release and cleanup.
+        let _write_guard = self.write_guard;
+        self.table.clear_staging_dir().await
+        // _write_guard drops here.
     }
 }
 
@@ -201,6 +444,7 @@ impl CayenneTableProvider {
     pub async fn begin_staged_append(
         &self,
         data: SendableRecordBatchStream,
+        target_partitions: usize,
     ) -> Result<CayenneStagedAppend> {
         let write_guard = self.write_lock_arc().lock_owned().await;
 
@@ -233,6 +477,7 @@ impl CayenneTableProvider {
                 prepared_insert.stream,
                 self.target_file_size_bytes(),
                 STAGING_DIR_NAME,
+                target_partitions,
             )
             .await?;
 
@@ -295,9 +540,18 @@ impl CayenneTableProvider {
         })?;
         tokio::fs::write(&wal_path, content.as_bytes()).await?;
 
-        // fsync the WAL file to ensure it is durable before we begin moving files.
+        // fsync the WAL file content.
         let file = tokio::fs::File::open(&wal_path).await?;
         file.sync_all().await?;
+
+        // fsync the staging directory so that the directory entry for the newly
+        // written WAL file (and any data files previously written to this staging
+        // dir by `write_to_snapshot`) are durably persisted. This completes the
+        // "prepare" phase durability: the staging WAL record that lists the files
+        // to be moved is only considered durably written after its own directory
+        // entry is safe. Matches the full tmp+rename+dir-fsync pattern used for
+        // `PartitionedWal` and the syncs we perform after move and after WAL removal.
+        Self::sync_snapshot_dir(&staging_dir).await?;
 
         tracing::debug!(
             "Wrote staging WAL for table {} with {} file(s) targeting snapshot {target_snapshot}",
@@ -405,14 +659,32 @@ impl CayenneTableProvider {
             let staging_dir =
                 Self::snapshot_dir_path(self.table_path(), self.table_id(), STAGING_DIR_NAME);
             let wal_path = staging_dir.join(STAGING_WAL_FILENAME);
-            match tokio::fs::remove_file(&wal_path).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            let removed = match tokio::fs::remove_file(&wal_path).await {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true, // already gone = success state
                 Err(e) => {
                     tracing::warn!(
                         "Failed to remove staging WAL for table {}: {e}",
                         self.table_name(),
                     );
+                    false
+                }
+            };
+
+            if removed {
+                // Durability: after removing the WAL marker (the "commit success" signal),
+                // fsync the staging directory so the unlink is persisted. A crash without
+                // this sync could make the removal non-durable, causing a false-positive
+                // "incomplete write" detection on the next open even though the data move
+                // succeeded and was synced. This completes the "WAL absent = durably
+                // committed" contract for local FS staged appends (symmetric to the
+                // sync after data file moves).
+                if let Err(e) = Self::sync_snapshot_dir(&staging_dir).await {
+                    tracing::warn!(
+                        "Failed to sync staging dir after WAL removal for table {}: {e} (data is safe; may see stale WAL on restart)",
+                        self.table_name(),
+                    );
+                    // Non-fatal: data files are already durable. A lingering WAL is conservative.
                 }
             }
         }
@@ -438,13 +710,32 @@ impl CayenneTableProvider {
         if let Some((wal, wal_location)) = wal {
             // Automated recovery attempt will be implemented in the future — for now we just error with details to help the operator resolve the issue.
 
+            // Best-effort enrichment: if this per-partition incomplete write was part
+            // of a cross-partition commit (i.e. a `PartitionedWal` record references
+            // this partition's table_id), include the commit_id in the error message.
+            // This helps operators correlate "incomplete write" errors across multiple
+            // partitions of the same logical table and points them at the
+            // `_partitioned_wal/` directory for manual resolution.
+            let mut extra = String::new();
+            if let Ok(all_pw) =
+                PartitionedWal::read_all_in(std::path::Path::new(self.table_path())).await
+            {
+                for (pw, _) in all_pw {
+                    if pw.partitions.iter().any(|e| e.table_id == self.table_id()) {
+                        extra = format!(" (part of cross-partition commit {})", pw.commit_id);
+                        break;
+                    }
+                }
+            }
+
             return Err(Error::IncompleteWrite {
                 table: self.table_name().to_string(),
                 message: format!(
-                    "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Some files may have been partially written and require manual resolution. The WAL file is located at '{wal_location}'.",
+                    "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Some files may have been partially written and require manual resolution. The WAL file is located at '{wal_location}'.{}",
                     wal.staged_files.len(),
                     wal.target_snapshot,
                     wal.created_at,
+                    extra,
                 ),
             });
         }

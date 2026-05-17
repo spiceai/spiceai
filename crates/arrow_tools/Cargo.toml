@@ -20,3 +20,8 @@ tracing.workspace = true
 insta = {workspace = true, features = ["json"]}
 arrow-json.workspace = true
 serde_json.workspace = true
+criterion = { version = "0.7", features = ["html_reports"] }
+
+[[bench]]
+name = "truncate"
+harness = false
