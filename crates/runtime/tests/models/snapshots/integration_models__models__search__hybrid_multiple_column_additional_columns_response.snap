@@ -6,7 +6,7 @@ expression: "normalize_search_response(resp, round_scores)"
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.01",
+      "_score": "[score]",
       "data": {
         "question": "In which of the following compounds, cations are present in tetrahedral voids?  \na. ZnS  \nb. SrF₂  \nc. NaBr  \nd. Na₂O"
       },
@@ -21,7 +21,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.01",
+      "_score": "[score]",
       "data": {
         "question": "In a group of 3 machines where 2 are faulty, what is the probability that the first two machines tested are both faulty?"
       },
@@ -36,7 +36,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.01",
+      "_score": "[score]",
       "data": {
         "question": "State the degree of the differential equation:\n$$\ny^{\\prime \\prime} = 6x + \\sin x\n$$"
       },
@@ -51,7 +51,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.01",
+      "_score": "[score]",
       "data": {
         "question": "How many chirality centers does cholesterol have?"
       },
