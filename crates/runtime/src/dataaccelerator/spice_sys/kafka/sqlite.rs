@@ -421,8 +421,7 @@ mod tests {
     /// existed yet. With per-partition storage the offsets always land.
     #[tokio::test]
     async fn test_sqlite_offsets_update_succeeds_without_metadata_row() {
-        let (ds, _temp_dir) =
-            create_test_dataset("test_sqlite_offsets_no_metadata").await;
+        let (ds, _temp_dir) = create_test_dataset("test_sqlite_offsets_no_metadata").await;
         let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
             .await
             .expect("to create KafkaSys");
@@ -448,8 +447,7 @@ mod tests {
     /// disjoint partitions must keep every writer's data.
     #[tokio::test]
     async fn test_sqlite_concurrent_upserts_do_not_lose_partitions() {
-        let (ds, _temp_dir) =
-            create_test_dataset("test_sqlite_concurrent_upserts").await;
+        let (ds, _temp_dir) = create_test_dataset("test_sqlite_concurrent_upserts").await;
         let kafka_sys = Arc::new(
             KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
                 .await
@@ -509,8 +507,7 @@ mod tests {
     /// (topic, partition), the storage layer must keep the highest offset.
     #[tokio::test]
     async fn test_sqlite_concurrent_same_partition_keeps_max() {
-        let (ds, _temp_dir) =
-            create_test_dataset("test_sqlite_concurrent_same_partition").await;
+        let (ds, _temp_dir) = create_test_dataset("test_sqlite_concurrent_same_partition").await;
         let kafka_sys = Arc::new(
             KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
                 .await
@@ -582,11 +579,7 @@ mod tests {
             .await
             .expect("backward upsert");
 
-        let retrieved = kafka_sys
-            .get()
-            .await
-            .expect("retrieve")
-            .expect("exist");
+        let retrieved = kafka_sys.get().await.expect("retrieve").expect("exist");
         let p0 = retrieved
             .offsets
             .iter()
