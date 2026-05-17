@@ -131,6 +131,14 @@ name = "metastore_connection_contention"
 
 [[bench]]
 harness = false
+name = "validate_on_conflict_buffering"
+
+[[bench]]
+harness = false
+name = "apply_on_conflict_per_row_alloc"
+
+[[bench]]
+harness = false
 name = "vs_duckdb_ingest"
 required-features = ["duckdb-bench"]
 

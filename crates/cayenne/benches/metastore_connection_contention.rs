@@ -188,8 +188,7 @@ fn bench_metastore_connection_contention(c: &mut Criterion) {
     let mut group = c.benchmark_group("metastore_connection_contention");
     for &(rtt_label, rtt) in RTTS {
         for &n in TABLE_COUNTS {
-            let commits_total =
-                u64::try_from(n * COMMITS_PER_WORKER).unwrap_or(u64::MAX);
+            let commits_total = u64::try_from(n * COMMITS_PER_WORKER).unwrap_or(u64::MAX);
             group.throughput(Throughput::Elements(commits_total));
 
             let id = format!("N={n}/{rtt_label}");

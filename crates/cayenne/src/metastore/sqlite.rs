@@ -31,27 +31,55 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
 
 const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_delete_file_table_path ON cayenne_delete_file(table_id, path)";
-const READ_CONNECTION_COUNT: usize = 4;
 
-/// `SQLite`-based metastore backend with a persistent connection.
+/// Round-robin connection pool for the [`SqliteMetastore`].
 ///
-/// Uses `tokio-rusqlite` to maintain a long-lived connection to the database,
-/// eliminating the overhead of opening/closing connections for each operation.
+/// `SQLite` WAL mode allows concurrent readers and serializes writers at the
+/// engine level. Having K independent connections means N concurrent callers
+/// spread across K slots: for N ≤ K every caller finds a free slot immediately;
+/// for N > K callers share proportionally, reducing the per-table wait from
+/// O(N·RTT) to O(⌈N/K⌉·RTT).
+///
+/// Pool size is `min(available_parallelism, 8)` (minimum 2). Beyond 8,
+/// `SQLite`'s WAL write serialization is typically the limiting factor anyway.
+struct SqliteConnectionPool {
+    conns: Vec<Arc<Mutex<tokio_rusqlite::Connection>>>,
+    next: AtomicUsize,
+}
+
+impl SqliteConnectionPool {
+    /// Acquire a connection using round-robin with try-first heuristic.
+    ///
+    /// Tries each slot starting from the round-robin index; returns the first
+    /// slot that is immediately free (`try_lock_owned` succeeds). Falls back to
+    /// `lock_owned().await` on the starting slot if all slots appear busy.
+    async fn acquire(&self) -> OwnedMutexGuard<tokio_rusqlite::Connection> {
+        let n = self.conns.len();
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % n;
+        for i in 0..n {
+            let idx = (start + i) % n;
+            if let Ok(guard) = Arc::clone(&self.conns[idx]).try_lock_owned() {
+                return guard;
+            }
+        }
+        Arc::clone(&self.conns[start]).lock_owned().await
+    }
+}
+
+/// `SQLite`-based metastore backend with a persistent connection pool.
+///
+/// Maintains K independent `tokio-rusqlite` connections to eliminate the
+/// single-mutex serialization bottleneck that capped cross-table CDC
+/// throughput at one commit per RTT regardless of table count.
 pub struct SqliteMetastore {
     connection_string: String,
-    /// Cached writer connection behind a mutex.
+    /// Round-robin pool of K independent connections shared across all
+    /// operations (reads, writes, and transactions).
     ///
-    /// The [`Mutex`] ensures exclusive access to the underlying
-    /// `tokio_rusqlite::Connection` for writes and multi-statement
-    /// transactions. Read-only queries use [`Self::read_conns`] so catalog
-    /// reads for other tables are not serialized behind an unrelated writer's
-    /// connection mutex.
-    ///
-    /// Lazily initialized on first use via [`OnceCell`].
-    writer_conn: OnceCell<Arc<Mutex<tokio_rusqlite::Connection>>>,
-    /// Small pool of read-only connections selected round-robin.
-    read_conns: OnceCell<Vec<Arc<Mutex<tokio_rusqlite::Connection>>>>,
-    next_read_conn: AtomicUsize,
+    /// K = `min(available_parallelism, 8)` (minimum 2). Lazily initialised on
+    /// first use. `begin_transaction` holds an [`OwnedMutexGuard`] on one pool
+    /// slot for the full transaction lifetime.
+    pool: OnceCell<Arc<SqliteConnectionPool>>,
 }
 
 /// Convert a `tokio_rusqlite::Error` to a `CatalogError`, distinguishing constraint violations.
@@ -88,9 +116,7 @@ impl SqliteMetastore {
     pub fn new(connection_string: impl Into<String>) -> Self {
         Self {
             connection_string: connection_string.into(),
-            writer_conn: OnceCell::new(),
-            read_conns: OnceCell::new(),
-            next_read_conn: AtomicUsize::new(0),
+            pool: OnceCell::new(),
         }
     }
 
@@ -101,7 +127,7 @@ impl SqliteMetastore {
             .unwrap_or(&self.connection_string)
     }
 
-    /// Open a configured SQLite connection.
+    /// Open a configured `SQLite` connection.
     ///
     /// The connection is configured with performance optimizations:
     /// - WAL mode for non-blocking reads/writes
@@ -170,27 +196,28 @@ impl SqliteMetastore {
         Ok(conn)
     }
 
-    async fn get_writer_conn(&self) -> CatalogResult<Arc<Mutex<tokio_rusqlite::Connection>>> {
-        self.writer_conn
-            .get_or_try_init(|| async { Ok(Arc::new(Mutex::new(self.open_connection().await?))) })
-            .await
-            .map(Arc::clone)
-    }
-
-    async fn get_read_conn(&self) -> CatalogResult<Arc<Mutex<tokio_rusqlite::Connection>>> {
-        let conns = self
-            .read_conns
+    /// Return the connection pool, initialising it lazily on first call.
+    ///
+    /// Opens K = `min(available_parallelism, 8)` (minimum 2) connections once
+    /// and reuses them for the lifetime of the metastore. All operations draw
+    /// from the same pool; `begin_transaction` holds an [`OwnedMutexGuard`]
+    /// on the acquired slot for the full transaction lifetime.
+    async fn pool(&self) -> CatalogResult<&Arc<SqliteConnectionPool>> {
+        self.pool
             .get_or_try_init(|| async {
-                let mut conns = Vec::with_capacity(READ_CONNECTION_COUNT);
-                for _ in 0..READ_CONNECTION_COUNT {
+                let k = std::thread::available_parallelism()
+                    .map_or(4, |n| n.get().min(8))
+                    .max(2);
+                let mut conns = Vec::with_capacity(k);
+                for _ in 0..k {
                     conns.push(Arc::new(Mutex::new(self.open_connection().await?)));
                 }
-                Ok(conns)
+                Ok(Arc::new(SqliteConnectionPool {
+                    conns,
+                    next: AtomicUsize::new(0),
+                }))
             })
-            .await?;
-
-        let idx = self.next_read_conn.fetch_add(1, Ordering::Relaxed) % conns.len();
-        Ok(Arc::clone(&conns[idx]))
+            .await
     }
 
     /// Schema for the `cayenne_table` table.
@@ -447,8 +474,7 @@ fn to_sqlite_value(value: &MetastoreValue) -> rusqlite::types::Value {
 #[async_trait]
 impl MetastoreBackend for SqliteMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
-        let conn = self.get_writer_conn().await?;
-        let guard = conn.lock().await;
+        let guard = self.pool().await?.acquire().await;
 
         guard
             .call(|conn| {
@@ -500,11 +526,11 @@ impl MetastoreBackend for SqliteMetastore {
         // This catches incompatible metadata databases from previous versions.
         // Drop the guard before validation — the callback acquires it per-table.
         drop(guard);
-        let validate_conn = self.get_read_conn().await?;
+        let pool_ref = Arc::clone(self.pool().await?);
         super::validate_existing_schema(|table_name| {
-            let conn = Arc::clone(&validate_conn);
+            let pool = Arc::clone(&pool_ref);
             async move {
-                let g = conn.lock().await;
+                let g = pool.acquire().await;
                 g.call(move |conn| {
                     let mut stmt = conn.prepare(&format!("PRAGMA table_info('{table_name}')"))?;
                     let columns: Vec<String> = stmt
@@ -526,8 +552,7 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
-        let conn = self.get_writer_conn().await?;
-        let guard = conn.lock().await;
+        let guard = self.pool().await?.acquire().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.iter().map(to_sqlite_value).collect();
@@ -548,8 +573,7 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn execute_batch(&self, sql: &str) -> CatalogResult<()> {
-        let conn = self.get_writer_conn().await?;
-        let guard = conn.lock().await;
+        let guard = self.pool().await?.acquire().await;
         let sql_owned = sql.to_string();
 
         guard
@@ -568,15 +592,13 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn execute_transaction_batch(&self, sql: &str) -> CatalogResult<()> {
-        let conn = self.get_writer_conn().await?;
-        let guard = conn.lock().await;
+        let guard = self.pool().await?.acquire().await;
         let batch_sql = format!("BEGIN TRANSACTION; {sql}; COMMIT;");
 
         guard
             .call(move |conn| {
-                conn.execute_batch(&batch_sql).or_else(|error| {
+                conn.execute_batch(&batch_sql).inspect_err(|_| {
                     let _ = conn.execute_batch("ROLLBACK");
-                    Err(error)
                 })?;
                 Ok::<_, rusqlite::Error>(())
             })
@@ -595,8 +617,7 @@ impl MetastoreBackend for SqliteMetastore {
         F: FnOnce(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        let conn = self.get_read_conn().await?;
-        let guard = conn.lock().await;
+        let guard = self.pool().await?.acquire().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.iter().map(to_sqlite_value).collect();
@@ -639,8 +660,7 @@ impl MetastoreBackend for SqliteMetastore {
         F: Fn(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        let conn = self.get_read_conn().await?;
-        let guard = conn.lock().await;
+        let guard = self.pool().await?.acquire().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.iter().map(to_sqlite_value).collect();
@@ -691,8 +711,7 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn begin_transaction(&self) -> CatalogResult<Box<dyn MetastoreTransaction>> {
-        let conn = self.get_writer_conn().await?;
-        let guard = conn.lock_owned().await;
+        let guard = self.pool().await?.acquire().await;
 
         guard
             .call(|conn| {
@@ -710,8 +729,12 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn shutdown(&self) -> CatalogResult<()> {
-        // Get the existing connection if it was initialized
-        if let Some(conn) = self.writer_conn.get() {
+        // WAL checkpoint and optimize on the first connection only.
+        // Multiple concurrent checkpoints on the same WAL would conflict;
+        // a single checkpoint covers the shared file.
+        if let Some(pool) = self.pool.get()
+            && let Some(conn) = pool.conns.first()
+        {
             let guard = conn.lock().await;
             guard
                 .call(|conn| {
@@ -744,12 +767,10 @@ impl MetastoreBackend for SqliteMetastore {
                         message: format!("Failed to shutdown catalog: {e}"),
                     },
                 )?;
-
-            // Note: We intentionally do not explicitly close the connection here.
-            // Closing a cloned handle would leave a closed connection stored in the
-            // OnceCell, and any subsequent use of the metastore would see a closed
-            // connection and fail. Instead, we rely on normal drop semantics to
-            // clean up the background connection when the metastore is dropped.
+            // Note: We intentionally do not explicitly close the connections here.
+            // Closing pool connections while other pool slots remain open would be
+            // inconsistent; instead we rely on normal drop semantics to clean up
+            // the background connections when the metastore is dropped.
         }
 
         Ok(())
