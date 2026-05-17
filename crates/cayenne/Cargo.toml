@@ -139,6 +139,10 @@ name = "apply_on_conflict_per_row_alloc"
 
 [[bench]]
 harness = false
+name = "compaction_sort_serialization"
+
+[[bench]]
+harness = false
 name = "vs_duckdb_ingest"
 required-features = ["duckdb-bench"]
 
