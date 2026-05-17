@@ -147,7 +147,9 @@ fn serialize_ipc(batch: &RecordBatch) -> Vec<u8> {
 /// stream into one or more `RecordBatch`es.
 fn deserialize_ipc(blob: &[u8]) -> Vec<RecordBatch> {
     let reader = StreamReader::try_new(blob, None).expect("ipc reader");
-    reader.collect::<arrow::error::Result<Vec<_>>>().expect("decode")
+    reader
+        .collect::<arrow::error::Result<Vec<_>>>()
+        .expect("decode")
 }
 
 /// Lane A: today's per-scan pattern — re-deserialize the IPC blob on
@@ -175,7 +177,9 @@ fn bench_inline_memtable_read(c: &mut Criterion) {
         let blob = serialize_ipc(&batch);
         let cached = Arc::new(vec![batch.clone()]);
 
-        group.throughput(Throughput::Elements(u64::try_from(rows).unwrap_or(u64::MAX)));
+        group.throughput(Throughput::Elements(
+            u64::try_from(rows).unwrap_or(u64::MAX),
+        ));
 
         group.bench_with_input(
             BenchmarkId::new("current_decode_per_scan", rows),

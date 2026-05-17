@@ -1518,7 +1518,11 @@ async fn test_inlined_cache_generation_invariants(fixture: common::TestFixture) 
     )?;
 
     // Generation starts at 0 (no writes yet).
-    assert_eq!(table.inlined_generation(), 0, "initial generation must be 0");
+    assert_eq!(
+        table.inlined_generation(),
+        0,
+        "initial generation must be 0"
+    );
 
     // First inline write — generation should increase.
     let batch1 = RecordBatch::try_new(
@@ -1552,7 +1556,9 @@ async fn test_inlined_cache_generation_invariants(fixture: common::TestFixture) 
 
     // A scan exercises the cache-hit path on the second call. Both scans must
     // return the same correct row count.
-    let df = ctx.sql("SELECT COUNT(*) AS c FROM inlined_cache_gen").await?;
+    let df = ctx
+        .sql("SELECT COUNT(*) AS c FROM inlined_cache_gen")
+        .await?;
     let results = df.collect().await?;
     let batch = arrow::compute::concat_batches(&results[0].schema(), &results)?;
     let count = batch
@@ -1564,7 +1570,9 @@ async fn test_inlined_cache_generation_invariants(fixture: common::TestFixture) 
     assert_eq!(count, 5, "scan must see all 5 inlined rows");
 
     // Second scan — should hit the cache (same generation) and return identical count.
-    let df2 = ctx.sql("SELECT COUNT(*) AS c FROM inlined_cache_gen").await?;
+    let df2 = ctx
+        .sql("SELECT COUNT(*) AS c FROM inlined_cache_gen")
+        .await?;
     let results2 = df2.collect().await?;
     let batch2 = arrow::compute::concat_batches(&results2[0].schema(), &results2)?;
     let count2 = batch2

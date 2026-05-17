@@ -147,6 +147,10 @@ name = "inline_memtable_read_overhead"
 
 [[bench]]
 harness = false
+name = "inline_upsert_rewrite_overhead"
+
+[[bench]]
+harness = false
 name = "vs_duckdb_ingest"
 required-features = ["duckdb-bench"]
 

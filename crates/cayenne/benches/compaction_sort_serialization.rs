@@ -150,7 +150,8 @@ fn make_row(idx: usize) -> Row {
 fn per_row_work(row: &Row, acc: u64) -> u64 {
     let mut sink = [0u8; 16];
     sink.copy_from_slice(&row._payload);
-    let mixed = u64::from_le_bytes(sink[..8].try_into().expect("8 bytes")).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mixed = u64::from_le_bytes(sink[..8].try_into().expect("8 bytes"))
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
     acc.wrapping_add(mixed ^ row.sort_key as u64).rotate_left(7)
 }
 
@@ -243,9 +244,13 @@ fn bench_compaction_sort_serialization(c: &mut Criterion) {
     for &n in ROW_COUNTS {
         group.throughput(Throughput::Elements(u64::try_from(n).unwrap_or(u64::MAX)));
 
-        group.bench_with_input(BenchmarkId::new("serial_sort_then_write", n), &n, |b, &n| {
-            b.iter(|| serial_sort_then_write(black_box(n)));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("serial_sort_then_write", n),
+            &n,
+            |b, &n| {
+                b.iter(|| serial_sort_then_write(black_box(n)));
+            },
+        );
 
         group.bench_with_input(
             BenchmarkId::new("parallel_write_unsorted", n),
