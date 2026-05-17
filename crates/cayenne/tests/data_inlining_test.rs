@@ -1593,5 +1593,36 @@ async fn test_inlined_cache_generation_invariants(fixture: common::TestFixture) 
         "generation must not change between scans with no writes"
     );
 
+    // Checkpoint flushes inline data to Vortex and clears the metastore rows;
+    // this must bump the generation so the next read_inlined_batches misses
+    // the stale cache entry and sees an empty inline set.
+    table
+        .checkpoint_inlined_data()
+        .await
+        .expect("checkpoint_inlined_data should succeed");
+    let gen_after_checkpoint = table.inlined_generation();
+    assert!(
+        gen_after_checkpoint > gen_after_second,
+        "generation must be bumped after checkpoint: before={gen_after_second} after={gen_after_checkpoint}"
+    );
+
+    // Post-checkpoint scan: inline data was flushed to Vortex, so the
+    // table must still return all 5 rows (now from the file layer).
+    let df3 = ctx
+        .sql("SELECT COUNT(*) AS c FROM inlined_cache_gen")
+        .await?;
+    let results3 = df3.collect().await?;
+    let batch3 = arrow::compute::concat_batches(&results3[0].schema(), &results3)?;
+    let count3 = batch3
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count col")
+        .value(0);
+    assert_eq!(
+        count3, 5,
+        "post-checkpoint scan must still return 5 rows (now from Vortex files)"
+    );
+
     Ok(())
 }

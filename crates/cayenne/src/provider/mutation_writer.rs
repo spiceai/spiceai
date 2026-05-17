@@ -72,13 +72,14 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_execution::TaskContext;
 use datafusion_physical_plan::{SendableRecordBatchStream, execute_stream};
 use futures::StreamExt;
+use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::OwnedMutexGuard;
 
 use super::Result;
 use super::context::CayenneContext;
 use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 use super::table::{
-    CayenneCdcWrite, CayenneTableProvider, ColumnStatsAccumulator, OnConflictDeletions,
+    CayenneCdcWrite, CayenneTableProvider, ColumnStatsAccumulator, PostValidationState,
     PreparedInsertStream,
 };
 
@@ -170,8 +171,24 @@ impl InlineBatchBuffer {
 }
 
 enum InlineMutationOutcome {
-    Inlined(u64),
+    Inlined {
+        rows: u64,
+        post_validation: PostValidationState,
+    },
     Fallback(SendableRecordBatchStream),
+}
+
+fn take_post_validation(
+    post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
+) -> PostValidationState {
+    post_validation.lock().take().unwrap_or_default()
+}
+
+fn restore_post_validation(
+    post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
+    state: PostValidationState,
+) {
+    *post_validation.lock() = Some(state);
 }
 
 pub(super) struct AppendMutationWriter<'a> {
@@ -204,17 +221,13 @@ impl<'a> AppendMutationWriter<'a> {
         let pending_pk_deletions = !self.table.pk_deletion_strategy().is_position_based()
             && self.table.has_pending_deletions();
 
-        let PreparedInsertStream {
-            stream: mut prepared_stream,
-            on_conflict_deletions,
-            validated_keys,
-        } = self.table.prepare_stream_for_insert(data).await?;
+        let prepared = self.table.prepare_stream_for_insert(data).await?;
+        let post_validation = prepared.post_validation();
+        let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
+        let mut prepared_stream = prepared.stream;
 
-        let has_file_on_conflict_deletions = on_conflict_deletions.has_file_deletions();
-        let has_on_conflict_deletions = !on_conflict_deletions.is_empty();
         let can_stage_for_pipeline = !pending_pk_deletions
-            && !has_file_on_conflict_deletions
-            && !has_on_conflict_deletions
+            && !may_have_on_conflict_deletions
             && self.table.metadata().partition_column.is_none()
             && !self.table.has_retention_delete_filters();
 
@@ -223,10 +236,9 @@ impl<'a> AppendMutationWriter<'a> {
             let rows = self
                 .write_prepared_stream(
                     prepared_stream,
-                    on_conflict_deletions,
+                    post_validation,
                     pending_pk_deletions,
-                    has_file_on_conflict_deletions,
-                    validated_keys,
+                    may_have_on_conflict_deletions,
                 )
                 .await?;
             return Ok(CayenneCdcWrite::completed(
@@ -236,11 +248,15 @@ impl<'a> AppendMutationWriter<'a> {
         }
 
         match self
-            .try_inline_or_restream(prepared_stream, &[], &[])
+            .try_inline_or_restream(prepared_stream, &post_validation)
             .await?
         {
-            InlineMutationOutcome::Inlined(rows) => {
-                self.table.record_inlined_pk_keys(&validated_keys);
+            InlineMutationOutcome::Inlined {
+                rows,
+                post_validation,
+            } => {
+                self.table
+                    .record_inlined_pk_keys(&post_validation.validated_keys);
                 Ok(CayenneCdcWrite::completed(
                     self.table.clone_for_write_operations(),
                     rows,
@@ -273,7 +289,7 @@ impl<'a> AppendMutationWriter<'a> {
                     rows,
                     prepared_append,
                     stats_acc,
-                    validated_keys,
+                    take_post_validation(&post_validation).validated_keys,
                 ))
             }
         }
@@ -292,20 +308,16 @@ impl<'a> AppendMutationWriter<'a> {
             );
         }
 
-        let PreparedInsertStream {
-            stream: prepared_stream,
-            on_conflict_deletions,
-            validated_keys,
-        } = self.table.prepare_stream_for_insert(data).await?;
-
-        let has_file_on_conflict_deletions = on_conflict_deletions.has_file_deletions();
+        let prepared = self.table.prepare_stream_for_insert(data).await?;
+        let post_validation = prepared.post_validation();
+        let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
+        let prepared_stream = prepared.stream;
 
         self.write_prepared_stream(
             prepared_stream,
-            on_conflict_deletions,
+            post_validation,
             pending_pk_deletions,
-            has_file_on_conflict_deletions,
-            validated_keys,
+            may_have_on_conflict_deletions,
         )
         .await
     }
@@ -313,88 +325,48 @@ impl<'a> AppendMutationWriter<'a> {
     async fn write_prepared_stream(
         &self,
         mut prepared_stream: SendableRecordBatchStream,
-        on_conflict_deletions: OnConflictDeletions,
+        post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
         pending_pk_deletions: bool,
-        has_file_on_conflict_deletions: bool,
-        validated_keys: std::collections::HashSet<arrow_row::OwnedRow>,
+        may_have_on_conflict_deletions: bool,
     ) -> Result<u64> {
-        let has_on_conflict_deletions = !on_conflict_deletions.is_empty();
+        let has_on_conflict_deletions = may_have_on_conflict_deletions;
 
         tracing::debug!(
-            "write_all_append: delete_specs={} files, deleted_keys={} keys, pending_deletions={}, on_conflict_deletions={}",
-            on_conflict_deletions.file_delete_specs_count(),
-            on_conflict_deletions.deleted_key_count(),
+            "write_all_append: pending_deletions={}, on_conflict_deletions_possible={}",
             pending_pk_deletions,
             has_on_conflict_deletions
         );
 
-        let needs_new_snapshot = pending_pk_deletions || has_file_on_conflict_deletions;
-
         let inline_policy = InlineMutationPolicy::from_blocking_conditions([
             pending_pk_deletions,
-            has_file_on_conflict_deletions,
+            false,
             self.table.metadata().partition_column.is_some(),
             self.table.has_retention_delete_filters(),
         ]);
 
         if inline_policy.can_inline() {
             match self
-                .try_inline_or_restream(
-                    prepared_stream,
-                    &on_conflict_deletions.deleted_inlined_pk_i64,
-                    &on_conflict_deletions.deleted_inlined_row_keys,
-                )
+                .try_inline_or_restream(prepared_stream, &post_validation)
                 .await?
             {
-                InlineMutationOutcome::Inlined(rows) => {
-                    self.table.record_inlined_pk_keys(&validated_keys);
+                InlineMutationOutcome::Inlined {
+                    rows,
+                    post_validation,
+                } => {
+                    self.table
+                        .record_inlined_pk_keys(&post_validation.validated_keys);
                     return Ok(rows);
                 }
                 InlineMutationOutcome::Fallback(re_stream) => {
                     prepared_stream = re_stream;
-                    let target_size_bytes = self.context.target_file_size_bytes();
-                    let (rows, _writer_ops, stats_acc) = self
-                        .write_staged_append(prepared_stream, target_size_bytes)
-                        .await?;
-
-                    self.table
-                        .apply_on_conflict_deletions(on_conflict_deletions)
-                        .await?;
-
-                    let retention_deleted_rows = self.apply_retention_if_configured().await?;
-                    self.table.schedule_post_write_maintenance(
-                        Some(stats_acc),
-                        should_refresh_listing_table_after_post_write(retention_deleted_rows),
-                    );
-
-                    if retention_deleted_rows > 0 {
-                        self.table.clear_cached_pk_keyset();
-                    } else {
-                        self.table.record_file_pk_keys(&validated_keys);
-                    }
-
-                    return Ok(rows);
                 }
             }
         }
 
-        let (total_rows, write_stats_acc) = if needs_new_snapshot {
-            self.table
-                .apply_on_conflict_deletions(on_conflict_deletions)
-                .await?;
+        let needs_new_snapshot = pending_pk_deletions || may_have_on_conflict_deletions;
 
-            let new_sequence = self
-                .table
-                .catalog()
-                .increment_sequence_number(self.table.table_id())
-                .await?;
-
-            self.table
-                .insert_to_new_snapshot_with_sequence(
-                    prepared_stream,
-                    new_sequence,
-                    self.task_context.session_config().target_partitions(),
-                )
+        let (total_rows, write_stats_acc, validated_keys) = if needs_new_snapshot {
+            self.write_new_snapshot_after_validation(prepared_stream, &post_validation)
                 .await?
         } else {
             let target_size_bytes = self.context.target_file_size_bytes();
@@ -408,11 +380,16 @@ impl<'a> AppendMutationWriter<'a> {
                 writer_ops
             );
 
+            let PostValidationState {
+                on_conflict_deletions,
+                validated_keys,
+            } = take_post_validation(&post_validation);
+
             self.table
                 .apply_on_conflict_deletions(on_conflict_deletions)
                 .await?;
 
-            (rows, stats_acc)
+            (rows, stats_acc, validated_keys)
         };
 
         let retention_deleted_rows = self.apply_retention_if_configured().await?;
@@ -432,11 +409,60 @@ impl<'a> AppendMutationWriter<'a> {
         Ok(total_rows)
     }
 
+    async fn write_new_snapshot_after_validation(
+        &self,
+        prepared_stream: SendableRecordBatchStream,
+        post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
+    ) -> Result<(
+        u64,
+        Arc<ColumnStatsAccumulator>,
+        std::collections::HashSet<arrow_row::OwnedRow>,
+    )> {
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let target_size_bytes = self.context.target_file_size_bytes();
+        let (rows, writer_ops, stats_acc) = self
+            .table
+            .write_to_snapshot(
+                prepared_stream,
+                target_size_bytes,
+                &new_snapshot_id,
+                self.task_context.session_config().target_partitions(),
+            )
+            .await?;
+
+        tracing::debug!(
+            "Insert to deferred-validation snapshot {} completed, wrote {} rows to Vortex in {} writer operation(s)",
+            new_snapshot_id,
+            rows,
+            writer_ops
+        );
+
+        let PostValidationState {
+            on_conflict_deletions,
+            validated_keys,
+        } = take_post_validation(post_validation);
+
+        self.table
+            .apply_on_conflict_deletions(on_conflict_deletions)
+            .await?;
+
+        let new_sequence = self
+            .table
+            .catalog()
+            .increment_sequence_number(self.table.table_id())
+            .await?;
+
+        self.table
+            .publish_written_snapshot_with_sequence(&new_snapshot_id, new_sequence)
+            .await?;
+
+        Ok((rows, stats_acc, validated_keys))
+    }
+
     async fn try_inline_or_restream(
         &self,
         mut prepared_stream: SendableRecordBatchStream,
-        deleted_inlined_pk_i64: &[i64],
-        deleted_inlined_row_keys: &[Box<[u8]>],
+        post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
     ) -> Result<InlineMutationOutcome> {
         let schema = prepared_stream.schema();
         let mut buffer = InlineBatchBuffer::new(
@@ -452,42 +478,52 @@ impl<'a> AppendMutationWriter<'a> {
             }
         }
 
-        if buffer.should_continue_buffering() && buffer.total_rows() == 0 {
-            return Ok(InlineMutationOutcome::Inlined(0));
-        }
+        if buffer.should_continue_buffering() {
+            let state = take_post_validation(post_validation);
 
-        if buffer.should_continue_buffering()
-            && self
-                .table
-                .try_inline_batches_with_inlined_deletions(
-                    buffer.batches(),
-                    deleted_inlined_pk_i64,
-                    deleted_inlined_row_keys,
-                )
-                .await?
-        {
-            let stats_acc = ColumnStatsAccumulator::new(&schema);
-            for batch in buffer.batches() {
-                stats_acc.update(batch);
+            if buffer.total_rows() == 0 {
+                return Ok(InlineMutationOutcome::Inlined {
+                    rows: 0,
+                    post_validation: state,
+                });
             }
 
-            self.table
-                .schedule_post_write_maintenance(Some(Arc::new(stats_acc)), false);
-
-            if let Err(e) = self
-                .table
-                .checkpoint_inlined_data_if_memtable_pressure_exceeded()
-                .await
+            if !state.on_conflict_deletions.has_file_deletions()
+                && self
+                    .table
+                    .try_inline_batches_with_inlined_deletions(
+                        buffer.batches(),
+                        &state.on_conflict_deletions.deleted_inlined_pk_i64,
+                        &state.on_conflict_deletions.deleted_inlined_row_keys,
+                    )
+                    .await?
             {
-                tracing::warn!(
-                    "Auto-checkpoint of inline memtable failed for {}: {e}",
-                    self.table.table_name(),
-                );
+                let stats_acc = ColumnStatsAccumulator::new(&schema);
+                for batch in buffer.batches() {
+                    stats_acc.update(batch);
+                }
+
+                self.table
+                    .schedule_post_write_maintenance(Some(Arc::new(stats_acc)), false);
+
+                if let Err(e) = self
+                    .table
+                    .checkpoint_inlined_data_if_memtable_pressure_exceeded()
+                    .await
+                {
+                    tracing::warn!(
+                        "Auto-checkpoint of inline memtable failed for {}: {e}",
+                        self.table.table_name(),
+                    );
+                }
+
+                return Ok(InlineMutationOutcome::Inlined {
+                    rows: u64::try_from(buffer.total_rows()).unwrap_or(u64::MAX),
+                    post_validation: state,
+                });
             }
 
-            return Ok(InlineMutationOutcome::Inlined(
-                u64::try_from(buffer.total_rows()).unwrap_or(u64::MAX),
-            ));
+            restore_post_validation(post_validation, state);
         }
 
         let re_stream = buffer.into_chained_stream(prepared_stream, self.task_context)?;

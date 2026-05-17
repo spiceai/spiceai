@@ -74,7 +74,7 @@ use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion_physical_plan::ExecutionPlan;
-use datafusion_physical_plan::SendableRecordBatchStream;
+use datafusion_physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::collect;
 use datafusion_physical_plan::filter::FilterExec;
@@ -90,8 +90,10 @@ use roaring::RoaringBitmap;
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::task;
 use vortex::dtype::arrow::FromArrowType;
@@ -128,7 +130,22 @@ struct PostWriteMaintenance {
     scheduled: AtomicBool,
 }
 
-/// Cached result of [`CayenneTableProvider::read_inlined_batches`].
+/// Per-entry decoded view of one metastore inline-data row.
+///
+/// Pairs the original [`InlinedData`] envelope (needed to build rewrites
+/// without a second metastore round-trip) with the pre-decoded,
+/// deletion-filtered `RecordBatch`es for that entry.
+struct InlinedViewEntry {
+    /// Original metastore envelope; provides `inlined_id`, `sequence_number`,
+    /// and other fields required to reconstruct a rewrite.
+    envelope: InlinedData,
+    /// Batches already decoded from IPC and filtered through the deletion map.
+    /// Empty when all rows in this entry were removed by the deletion filter.
+    batches: Vec<RecordBatch>,
+}
+
+/// Cached result of [`CayenneTableProvider::read_inlined_batches`] and
+/// [`CayenneTableProvider::cached_inlined_view`].
 ///
 /// The cache is keyed by an `inlined_generation` counter that is incremented
 /// (with `Release` ordering) by every `commit_inlined_data_mutation` and
@@ -138,9 +155,12 @@ struct PostWriteMaintenance {
 struct InlinedCache {
     /// Generation at the time this entry was built.
     generation: u64,
-    /// Pre-decoded `RecordBatch`es. Each batch shares Arrow buffer ownership
-    /// via `Arc`, so cloning the `Vec` is cheap (one refcount per array).
+    /// Flattened `RecordBatch`es across all entries. Each batch shares Arrow
+    /// buffer ownership via `Arc`, so cloning the `Vec` is cheap.
     batches: Arc<Vec<RecordBatch>>,
+    /// Per-entry view used by the upsert-rewrite path to avoid a second
+    /// metastore round-trip and re-decode.
+    view: Arc<Vec<InlinedViewEntry>>,
 }
 
 /// Result of a Cayenne CDC append write.
@@ -1278,8 +1298,39 @@ struct BatchValidationResult {
 
 pub(crate) struct PreparedInsertStream {
     pub(crate) stream: SendableRecordBatchStream,
-    pub(crate) on_conflict_deletions: OnConflictDeletions,
-    pub(crate) validated_keys: HashSet<OwnedRow>,
+    post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
+    may_have_on_conflict_deletions: bool,
+}
+
+impl PreparedInsertStream {
+    fn immediate(stream: SendableRecordBatchStream) -> Self {
+        Self {
+            stream,
+            post_validation: Arc::new(ParkingMutex::new(Some(PostValidationState::default()))),
+            may_have_on_conflict_deletions: false,
+        }
+    }
+
+    fn deferred(
+        stream: SendableRecordBatchStream,
+        post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
+        may_have_on_conflict_deletions: bool,
+    ) -> Self {
+        Self {
+            stream,
+            post_validation,
+            may_have_on_conflict_deletions,
+        }
+    }
+
+    pub(crate) fn post_validation(&self) -> Arc<ParkingMutex<Option<PostValidationState>>> {
+        Arc::clone(&self.post_validation)
+    }
+
+    #[must_use]
+    pub(crate) const fn may_have_on_conflict_deletions(&self) -> bool {
+        self.may_have_on_conflict_deletions
+    }
 }
 
 #[derive(Default)]
@@ -1374,11 +1425,10 @@ fn pk_deletion_snapshot_for_strategy(strategy: &PkDeletionStrategyWithCache) -> 
     }
 }
 
-/// Result of on-conflict validation containing deleted PK information.
-struct OnConflictValidationResult {
-    filtered_batches: Vec<RecordBatch>,
-    on_conflict_deletions: OnConflictDeletions,
-    kept_keys: HashSet<OwnedRow>,
+#[derive(Default)]
+pub(crate) struct PostValidationState {
+    pub(crate) on_conflict_deletions: OnConflictDeletions,
+    pub(crate) validated_keys: HashSet<OwnedRow>,
 }
 
 struct OnConflictContext<'a> {
@@ -1388,6 +1438,189 @@ struct OnConflictContext<'a> {
     upsert_options: &'a UpsertOptions,
     existing_keys: &'a HashMap<OwnedRow, RowLocation>,
     incoming_keys: &'a HashSet<OwnedRow>,
+}
+
+struct OnConflictValidationStream {
+    table: CayenneTableProvider,
+    inner: SendableRecordBatchStream,
+    schema: SchemaRef,
+    pk_indices: Vec<usize>,
+    converter: RowConverter,
+    on_conflict: OnConflict,
+    upsert_options: UpsertOptions,
+    existing_keys: Option<HashMap<OwnedRow, RowLocation>>,
+    incoming_keys: HashSet<OwnedRow>,
+    kept_keys: HashSet<OwnedRow>,
+    delete_specs: HashMap<i64, Vec<i64>>,
+    deleted_pk_i64: Vec<i64>,
+    deleted_row_keys: Vec<Box<[u8]>>,
+    deleted_inlined_pk_i64: Vec<i64>,
+    deleted_inlined_row_keys: Vec<Box<[u8]>>,
+    post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
+    finalized: bool,
+}
+
+impl OnConflictValidationStream {
+    fn new(
+        table: CayenneTableProvider,
+        inner: SendableRecordBatchStream,
+        pk_indices: Vec<usize>,
+        converter: RowConverter,
+        existing_keys: HashMap<OwnedRow, RowLocation>,
+        on_conflict: OnConflict,
+        post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
+    ) -> Self {
+        let schema = inner.schema();
+        let upsert_options = on_conflict.get_upsert_options();
+        Self {
+            table,
+            inner,
+            schema,
+            pk_indices,
+            converter,
+            on_conflict,
+            upsert_options,
+            existing_keys: Some(existing_keys),
+            incoming_keys: HashSet::with_capacity(1024),
+            kept_keys: HashSet::with_capacity(1024),
+            delete_specs: HashMap::new(),
+            deleted_pk_i64: Vec::new(),
+            deleted_row_keys: Vec::new(),
+            deleted_inlined_pk_i64: Vec::new(),
+            deleted_inlined_row_keys: Vec::new(),
+            post_validation,
+            finalized: false,
+        }
+    }
+
+    fn process_batch(
+        &mut self,
+        batch: RecordBatch,
+    ) -> datafusion_common::Result<Option<RecordBatch>> {
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+
+        let existing_keys = self.existing_keys.as_ref().ok_or_else(|| {
+            datafusion_common::DataFusionError::Internal(format!(
+                "On-conflict validation for table {} was polled after finalization",
+                self.table.table_name()
+            ))
+        })?;
+
+        let mut ctx = OnConflictContext {
+            pk_indices: &self.pk_indices,
+            converter: &self.converter,
+            on_conflict: &self.on_conflict,
+            upsert_options: &self.upsert_options,
+            existing_keys,
+            incoming_keys: &self.incoming_keys,
+        };
+
+        let BatchValidationResult {
+            filtered_batch,
+            delete_specs: batch_delete_specs,
+            kept_keys,
+            deleted_pk_i64,
+            deleted_row_keys,
+            deleted_inlined_pk_i64,
+            deleted_inlined_row_keys,
+        } = self
+            .table
+            .apply_on_conflict_to_batch(batch, &mut ctx)
+            .map_err(datafusion_common::DataFusionError::from)?;
+
+        for (data_file_id, rows) in batch_delete_specs {
+            self.delete_specs.entry(data_file_id).or_default().extend(rows);
+        }
+
+        self.deleted_pk_i64.extend(deleted_pk_i64);
+        self.deleted_row_keys.extend(deleted_row_keys);
+        self.deleted_inlined_pk_i64.extend(deleted_inlined_pk_i64);
+        self.deleted_inlined_row_keys
+            .extend(deleted_inlined_row_keys);
+
+        self.incoming_keys.extend(kept_keys.iter().cloned());
+        self.kept_keys.extend(kept_keys);
+
+        Ok(filtered_batch)
+    }
+
+    fn store_existing_keyset(&mut self) {
+        if let Some(existing_keys) = self.existing_keys.take() {
+            self.table.store_cached_pk_keyset(existing_keys);
+        }
+    }
+
+    fn finish_success(&mut self) {
+        if self.finalized {
+            return;
+        }
+
+        self.store_existing_keyset();
+        let post_validation = PostValidationState {
+            on_conflict_deletions: OnConflictDeletions {
+                delete_specs: std::mem::take(&mut self.delete_specs),
+                deleted_pk_i64: std::mem::take(&mut self.deleted_pk_i64),
+                deleted_row_keys: std::mem::take(&mut self.deleted_row_keys),
+                deleted_inlined_pk_i64: std::mem::take(&mut self.deleted_inlined_pk_i64),
+                deleted_inlined_row_keys: std::mem::take(&mut self.deleted_inlined_row_keys),
+            },
+            validated_keys: std::mem::take(&mut self.kept_keys),
+        };
+        *self.post_validation.lock() = Some(post_validation);
+        self.finalized = true;
+    }
+
+    fn finish_after_error(&mut self) {
+        if self.finalized {
+            return;
+        }
+
+        self.store_existing_keyset();
+        self.finalized = true;
+    }
+}
+
+impl Unpin for OnConflictValidationStream {}
+
+impl futures::Stream for OnConflictValidationStream {
+    type Item = datafusion_common::Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.finalized {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    this.finish_success();
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    this.finish_after_error();
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Ready(Some(Ok(batch))) => match this.process_batch(batch) {
+                    Ok(Some(filtered_batch)) => return Poll::Ready(Some(Ok(filtered_batch))),
+                    Ok(None) => continue,
+                    Err(err) => {
+                        this.finish_after_error();
+                        return Poll::Ready(Some(Err(err)));
+                    }
+                },
+            }
+        }
+    }
+}
+
+impl RecordBatchStream for OnConflictValidationStream {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
 }
 
 impl std::fmt::Debug for CayenneTableProvider {
@@ -2593,9 +2826,10 @@ impl CayenneTableProvider {
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
             inlined_generation: Arc::new(AtomicU64::new(0)),
             inlined_cache: Arc::new(ArcSwap::new(Arc::new(InlinedCache {
-                // Sentinel: first `read_inlined_batches` call always misses.
+                // Sentinel: first `read_inlined_batches` / `cached_inlined_view` call always misses.
                 generation: u64::MAX,
                 batches: Arc::new(Vec::new()),
+                view: Arc::new(Vec::new()),
             }))),
             staging_wal_present: Arc::new(AtomicBool::new(true)),
             staging_may_have_files: Arc::new(AtomicBool::new(true)),
@@ -2738,6 +2972,30 @@ impl CayenneTableProvider {
         // See the doc comment above for why we do NOT update current_snapshot.
 
         Ok((total_rows, stats_acc))
+    }
+
+    pub(crate) async fn publish_written_snapshot_with_sequence(
+        &self,
+        snapshot_id: &str,
+        sequence_number: i64,
+    ) -> CatalogResult<()> {
+        let is_s3 = self.table_metadata.path.starts_with("s3://");
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(snapshot_id);
+            Self::sync_snapshot_dir(&snapshot_dir).await?;
+        }
+
+        self.catalog
+            .set_snapshot_sequence(&self.table_metadata.table_id, snapshot_id, sequence_number)
+            .await?;
+
+        let max_delete_seq = self.get_max_delete_sequence();
+        {
+            let mut guard = self.protected_snapshots.write();
+            guard.insert(snapshot_id.to_string(), max_delete_seq);
+        }
+
+        Ok(())
     }
 
     /// Get the maximum delete sequence number from the cached deletions.
@@ -3487,11 +3745,7 @@ impl CayenneTableProvider {
         stream: SendableRecordBatchStream,
     ) -> Result<PreparedInsertStream> {
         let Some(pk_indices) = self.primary_key_indices()? else {
-            return Ok(PreparedInsertStream {
-                stream,
-                on_conflict_deletions: OnConflictDeletions::default(),
-                validated_keys: HashSet::new(),
-            });
+            return Ok(PreparedInsertStream::immediate(stream));
         };
 
         if self.context.pk_conflict_detection() == PkConflictDetection::None {
@@ -3499,11 +3753,7 @@ impl CayenneTableProvider {
                 table = %self.table_metadata.table_name,
                 "Skipping Cayenne primary-key conflict detection for append"
             );
-            return Ok(PreparedInsertStream {
-                stream,
-                on_conflict_deletions: OnConflictDeletions::default(),
-                validated_keys: HashSet::new(),
-            });
+            return Ok(PreparedInsertStream::immediate(stream));
         }
 
         let converter = self.build_pk_converter(&pk_indices)?;
@@ -3524,113 +3774,29 @@ impl CayenneTableProvider {
             existing_keys
         };
 
-        let validation_result = self
-            .validate_on_conflict(stream, &pk_indices, &converter, &existing_keys)
-            .await;
-        self.store_cached_pk_keyset(existing_keys);
-        let validation_result = validation_result?;
-
-        // Build a new stream from the validated batches.
-        let schema = validation_result.filtered_batches.first().map_or_else(
-            || Arc::clone(&self.table_metadata.schema),
-            RecordBatch::schema,
-        );
-        let validated_stream = RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            futures::stream::iter(validation_result.filtered_batches.into_iter().map(Ok)),
-        );
-
-        Ok(PreparedInsertStream {
-            stream: Box::pin(validated_stream) as SendableRecordBatchStream,
-            on_conflict_deletions: validation_result.on_conflict_deletions,
-            validated_keys: validation_result.kept_keys,
-        })
-    }
-
-    /// Validate incoming batches against primary key uniqueness and configured on-conflict behavior.
-    ///
-    /// Returns filtered batches (with dropped rows removed) and a map of deletion vector specs
-    /// keyed by `data_file_id`.
-    async fn validate_on_conflict(
-        &self,
-        mut stream: SendableRecordBatchStream,
-        pk_indices: &[usize],
-        converter: &RowConverter,
-        existing_keys: &HashMap<OwnedRow, RowLocation>,
-    ) -> Result<OnConflictValidationResult> {
-        let mut incoming_keys: HashSet<OwnedRow> = HashSet::with_capacity(1024);
-        let mut all_kept_keys: HashSet<OwnedRow> = HashSet::with_capacity(1024);
-        let mut filtered_batches = Vec::new();
-        let mut delete_specs: HashMap<i64, Vec<i64>> = HashMap::new();
-        let mut all_deleted_pk_i64: Vec<i64> = Vec::new();
-        let mut all_deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
-        let mut all_deleted_inlined_pk_i64: Vec<i64> = Vec::new();
-        let mut all_deleted_inlined_row_keys: Vec<Box<[u8]>> = Vec::new();
-
-        // Use configured on_conflict or default to DoNothingAll (silently drops duplicates).
-        // When a primary key is configured without explicit on_conflict, this ensures
-        // inserts succeed without unique constraint errors.
         let on_conflict = self
             .table_metadata
             .on_conflict
             .clone()
             .unwrap_or(OnConflict::DoNothingAll);
-        let upsert_options = on_conflict.get_upsert_options();
 
-        while let Some(batch_result) = stream.next().await {
-            let batch = batch_result?;
+        let may_have_on_conflict_deletions = matches!(on_conflict, OnConflict::Upsert(_));
+        let post_validation = Arc::new(ParkingMutex::new(None));
+        let validation_stream = OnConflictValidationStream::new(
+            self.clone_for_write(),
+            stream,
+            pk_indices,
+            converter,
+            existing_keys,
+            on_conflict,
+            Arc::clone(&post_validation),
+        );
 
-            if batch.num_rows() == 0 {
-                continue;
-            }
-
-            let mut ctx = OnConflictContext {
-                pk_indices,
-                converter,
-                on_conflict: &on_conflict,
-                upsert_options: &upsert_options,
-                existing_keys,
-                incoming_keys: &incoming_keys,
-            };
-
-            let BatchValidationResult {
-                filtered_batch,
-                delete_specs: batch_delete_specs,
-                kept_keys,
-                deleted_pk_i64,
-                deleted_row_keys,
-                deleted_inlined_pk_i64,
-                deleted_inlined_row_keys,
-            } = self.apply_on_conflict_to_batch(batch, &mut ctx)?;
-
-            for (data_file_id, rows) in batch_delete_specs {
-                delete_specs.entry(data_file_id).or_default().extend(rows);
-            }
-
-            all_deleted_pk_i64.extend(deleted_pk_i64);
-            all_deleted_row_keys.extend(deleted_row_keys);
-            all_deleted_inlined_pk_i64.extend(deleted_inlined_pk_i64);
-            all_deleted_inlined_row_keys.extend(deleted_inlined_row_keys);
-
-            incoming_keys.extend(kept_keys.iter().cloned());
-            all_kept_keys.extend(kept_keys);
-
-            if let Some(batch) = filtered_batch {
-                filtered_batches.push(batch);
-            }
-        }
-
-        Ok(OnConflictValidationResult {
-            filtered_batches,
-            on_conflict_deletions: OnConflictDeletions {
-                delete_specs,
-                deleted_pk_i64: all_deleted_pk_i64,
-                deleted_row_keys: all_deleted_row_keys,
-                deleted_inlined_pk_i64: all_deleted_inlined_pk_i64,
-                deleted_inlined_row_keys: all_deleted_inlined_row_keys,
-            },
-            kept_keys: all_kept_keys,
-        })
+        Ok(PreparedInsertStream::deferred(
+            Box::pin(validation_stream) as SendableRecordBatchStream,
+            post_validation,
+            may_have_on_conflict_deletions,
+        ))
     }
 
     fn apply_on_conflict_to_batch(
@@ -3925,36 +4091,26 @@ impl CayenneTableProvider {
             return Ok(InlinedDataRewrite::default());
         }
 
-        let inlined_data = self
-            .catalog
-            .get_inlined_data(&self.table_metadata.table_id)
-            .await?;
-        if inlined_data.is_empty() {
+        // Use the generation-keyed cache to avoid a second metastore round-trip
+        // and IPC re-decode on every upsert. The batches in each entry are
+        // already deletion-map-filtered, so we skip that step here.
+        let view = self.cached_inlined_view().await?;
+        if view.is_empty() {
             return Ok(InlinedDataRewrite::default());
         }
 
-        let legacy_inlined_deletions = self.load_inlined_deletion_maps().await?;
         let mut rewrite = InlinedDataRewrite::default();
 
-        for entry in inlined_data {
-            let batches = deserialize_ipc_to_batch(&entry.data_ipc)?;
-            let mut rewritten_batches = Vec::with_capacity(batches.len());
-            let mut original_rows = 0_usize;
+        for entry in view.iter() {
+            // `entry.batches` are already deletion-map filtered; count visible rows.
+            let original_rows: usize = entry.batches.iter().map(RecordBatch::num_rows).sum();
+            let mut rewritten_batches = Vec::with_capacity(entry.batches.len());
             let mut remaining_rows = 0_usize;
             let mut entry_removed_rows = 0_usize;
 
-            for batch in batches {
-                original_rows += batch.num_rows();
-                let Some(visible_batch) = self.filter_inlined_batch_for_deletions(
-                    batch,
-                    entry.sequence_number,
-                    &legacy_inlined_deletions,
-                )?
-                else {
-                    continue;
-                };
+            for batch in &entry.batches {
                 let (filtered_batch, removed_rows) = self.filter_inlined_batch_for_pk_deletions(
-                    visible_batch,
+                    batch.clone(),
                     &deleted_pk_i64,
                     &deleted_row_keys,
                 )?;
@@ -3971,12 +4127,14 @@ impl CayenneTableProvider {
 
             rewrite.removed_rows += original_rows.saturating_sub(remaining_rows);
             if remaining_rows == 0 {
-                rewrite.deleted_inlined_ids.push(entry.inlined_id);
+                rewrite
+                    .deleted_inlined_ids
+                    .push(entry.envelope.inlined_id.clone());
             } else {
                 rewrite
                     .updated_data
                     .push(Self::rewritten_inlined_data_entry(
-                        &entry,
+                        &entry.envelope,
                         &rewritten_batches,
                         remaining_rows,
                     )?);
@@ -5658,48 +5816,90 @@ impl CayenneTableProvider {
         // Acquire-load the generation so we observe all catalog writes that
         // happened before the corresponding Release bump.
         let current_gen = self.inlined_generation.load(Ordering::Acquire);
-        let cached = self.inlined_cache.load();
-        if cached.generation == current_gen {
-            // Cache hit: each RecordBatch clone is cheap (Arc refcount on Arrow buffers).
-            return Ok((*cached.batches).clone());
+        {
+            let cached = self.inlined_cache.load();
+            if cached.generation == current_gen {
+                // Cache hit: each RecordBatch clone is cheap (Arc refcount on Arrow buffers).
+                return Ok((*cached.batches).clone());
+            }
         }
+        // Cache miss: populate both `batches` and `view` together.
+        self.populate_inlined_cache(current_gen).await?;
+        Ok((*self.inlined_cache.load().batches).clone())
+    }
 
-        // Cache miss: rebuild from the metastore.
+    /// Return the per-entry inline view, building and caching it on first access
+    /// for the current `inlined_generation`.
+    ///
+    /// Unlike [`Self::read_inlined_batches`], which flattens all entries into a
+    /// single `Vec<RecordBatch>`, this returns the full per-entry structure
+    /// including the original [`InlinedData`] envelope — enabling the upsert-
+    /// rewrite path to reconstruct updated entries without a second metastore
+    /// round-trip or IPC re-decode.
+    async fn cached_inlined_view(&self) -> Result<Arc<Vec<InlinedViewEntry>>> {
+        let current_gen = self.inlined_generation.load(Ordering::Acquire);
+        {
+            let cached = self.inlined_cache.load();
+            if cached.generation == current_gen {
+                return Ok(Arc::clone(&cached.view));
+            }
+        }
+        self.populate_inlined_cache(current_gen).await?;
+        Ok(Arc::clone(&self.inlined_cache.load().view))
+    }
+
+    /// Fetch inlined data from the metastore, decode, apply the deletion map,
+    /// and store both the flattened batch list and the per-entry view in
+    /// `inlined_cache` under `generation`.
+    ///
+    /// If a concurrent writer bumps the generation between the caller's
+    /// `Acquire` load and this store, the stored entry will simply miss on the
+    /// next read and be rebuilt — no data is lost or corrupted.
+    async fn populate_inlined_cache(&self, generation: u64) -> Result<()> {
         let inlined = self
             .catalog
             .get_inlined_data(&self.table_metadata.table_id)
             .await?;
 
-        let batches = if inlined.is_empty() {
+        let view: Vec<InlinedViewEntry> = if inlined.is_empty() {
             Vec::new()
         } else {
             let inlined_deletions = self.load_inlined_deletion_maps().await?;
-            let mut batches = Vec::new();
-            for entry in &inlined {
+            let mut view = Vec::with_capacity(inlined.len());
+            for entry in inlined {
                 let entry_batches = deserialize_ipc_to_batch(&entry.data_ipc)
                     .map_err(|e| super::Error::Arrow { source: e })?;
+                let mut filtered_batches = Vec::with_capacity(entry_batches.len());
                 for batch in entry_batches {
                     if let Some(filtered) = self.filter_inlined_batch_for_deletions(
                         batch,
                         entry.sequence_number,
                         &inlined_deletions,
                     )? {
-                        batches.push(filtered);
+                        filtered_batches.push(filtered);
                     }
                 }
+                view.push(InlinedViewEntry {
+                    batches: filtered_batches,
+                    envelope: entry,
+                });
             }
-            batches
+            view
         };
 
-        // Store the rebuilt entry. If a writer bumped the generation between
-        // the `load` above and now, the cached entry will simply miss on the
-        // next read and be rebuilt — no data is lost or corrupted.
+        let batches: Vec<RecordBatch> = view
+            .iter()
+            .flat_map(|e| e.batches.iter().cloned())
+            .collect();
+
+        // Store the rebuilt entry. Concurrent misses are safe — the last store wins.
         self.inlined_cache.store(Arc::new(InlinedCache {
-            generation: current_gen,
-            batches: Arc::new(batches.clone()),
+            generation,
+            batches: Arc::new(batches),
+            view: Arc::new(view),
         }));
 
-        Ok(batches)
+        Ok(())
     }
 
     async fn load_inlined_deletion_maps(&self) -> Result<InlinedDeletionMaps> {
@@ -5853,7 +6053,11 @@ impl CayenneTableProvider {
     ///
     /// Reads all inlined data entries, concatenates them into a single stream,
     /// writes to Vortex, and clears the inlined data in the metastore.
-    pub(crate) async fn checkpoint_inlined_data(&self) -> Result<u64> {
+    ///
+    /// Exposed as `#[doc(hidden)] pub` for integration tests that need to
+    /// directly trigger a checkpoint and observe the generation bump.
+    #[doc(hidden)]
+    pub async fn checkpoint_inlined_data(&self) -> Result<u64> {
         let batches = self.read_inlined_batches().await?;
         if batches.is_empty() {
             let stats = self
