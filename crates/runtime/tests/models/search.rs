@@ -755,24 +755,10 @@ fn normalize_search_response_json(
                     return Ordering::Less;
                 };
 
-                // When round_scores is true, round to 2 decimal places before comparing
-                // to avoid flaky ordering from minor floating-point variance across CI
-                // runners (model2vec/s3vectors). Otherwise use raw float comparison.
-                let cmp_a = if round_scores {
-                    (100.0 * score_a).round() / 100.0
-                } else {
-                    score_a
-                };
-                let cmp_b = if round_scores {
-                    (100.0 * score_b).round() / 100.0
-                } else {
-                    score_b
-                };
-
                 // Opposite because we want to order descendingly
-                if cmp_a > cmp_b {
+                if score_a > score_b {
                     return Ordering::Less;
-                } else if cmp_a < cmp_b {
+                } else if score_a < score_b {
                     return Ordering::Greater;
                 }
 
