@@ -524,7 +524,7 @@ impl CayenneTableProvider {
 
         let prepared_insert = self.prepare_stream_for_insert(data).await?;
 
-        if !prepared_insert.on_conflict_deletions.is_empty() {
+        if prepared_insert.may_have_on_conflict_deletions() {
             return Err(Error::Unsupported {
                 operation: "staged append for Cayenne upsert or on-conflict writes",
             });

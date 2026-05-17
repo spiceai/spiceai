@@ -370,6 +370,7 @@ impl DataFusionBuilder {
                 self.cayenne_sort_merge_min_rows,
                 self.cayenne_sort_merge_memory_pool_fraction,
                 effective_memory_limit,
+                exact_join_filter_memory_limit,
             ));
         }
 
@@ -797,6 +798,7 @@ fn cayenne_optimizer_config(
     sort_merge_min_rows: Option<usize>,
     sort_merge_memory_pool_fraction: Option<f64>,
     effective_memory_limit: u64,
+    exact_join_filter_memory_limit: usize,
 ) -> CayenneOptimizerConfig {
     let mut config = CayenneOptimizerConfig::default();
     if let Some(sort_merge_min_rows) = sort_merge_min_rows {
@@ -809,6 +811,7 @@ fn cayenne_optimizer_config(
         Ok(limit) => limit,
         Err(_) => usize::MAX,
     });
+    config.exact_join_filter_max_bytes = exact_join_filter_memory_limit;
     config
 }
 
@@ -1059,6 +1062,7 @@ mod tests {
         assert_eq!(config.sort_merge_min_rows, 100_000_000);
         assert!((config.sort_merge_memory_pool_fraction - 0.25).abs() < f64::EPSILON);
         assert_eq!(config.sort_merge_memory_pool_bytes, Some(1_024));
+        assert_eq!(config.exact_join_filter_max_bytes, 1_024);
     }
 
     #[test]

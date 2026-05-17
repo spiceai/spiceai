@@ -114,7 +114,9 @@ use datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
-use runtime_datafusion::join_accumulator::ExactLeftAccumulator;
+use runtime_datafusion::join_accumulator::{
+    DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES, ExactLeftAccumulator,
+};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -183,6 +185,9 @@ extensions_options! {
 
         /// Effective query memory pool size in bytes. Runtime wiring sets this from `runtime.query.memory_limit`; direct DataFusion users can leave it unset to use the row-count gate only.
         pub sort_merge_memory_pool_bytes: Option<usize>, default = None
+
+        /// Maximum estimated LEFT/build-side join-key bytes before preserving DataFusion's default hash-join accumulator instead of using Cayenne's exact in-list accumulator.
+        pub exact_join_filter_max_bytes: usize, default = DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES
     }
 }
 
@@ -594,6 +599,56 @@ fn spillable_rewrite_build_input_exact_rows(hash_join: &HashJoinExec) -> Option<
     }
 }
 
+fn exact_join_filter_build_estimate(hash_join: &HashJoinExec) -> Option<(usize, usize)> {
+    let build_row_count = spillable_rewrite_build_input_exact_rows(hash_join)?;
+    let build_schema = hash_join.left().schema();
+    let join_key_width = hash_join
+        .on()
+        .iter()
+        .try_fold(0_usize, |width, (left_key, _)| {
+            let data_type = left_key.data_type(build_schema.as_ref()).ok()?;
+            Some(width.saturating_add(estimated_arrow_width(&data_type)?))
+        })?;
+
+    Some((
+        build_row_count,
+        build_row_count.saturating_mul(join_key_width),
+    ))
+}
+
+fn should_rewrite_with_exact_accumulator(hash_join: &HashJoinExec, config: &ConfigOptions) -> bool {
+    if *hash_join.join_type() != JoinType::Inner {
+        tracing::debug!(
+            join_type = ?hash_join.join_type(),
+            "Keeping HashJoinExec default accumulator because DataFusion only pushes join dynamic filters through inner joins"
+        );
+        return false;
+    }
+
+    let optimizer_config = cayenne_optimizer_config(config);
+    let max_build_bytes = optimizer_config.exact_join_filter_max_bytes;
+    let Some((build_row_count, estimated_build_bytes)) =
+        exact_join_filter_build_estimate(hash_join)
+    else {
+        tracing::debug!(
+            "Keeping HashJoinExec default accumulator because exact build-side join-key statistics are unavailable"
+        );
+        return false;
+    };
+
+    if estimated_build_bytes > max_build_bytes {
+        tracing::debug!(
+            build_row_count,
+            estimated_build_bytes,
+            max_build_bytes,
+            "Keeping HashJoinExec default accumulator because estimated exact join-filter memory exceeds the configured budget"
+        );
+        return false;
+    }
+
+    true
+}
+
 fn join_key_ordering(
     keys: impl Iterator<Item = Arc<dyn PhysicalExpr>>,
     sort_options: &[SortOptions],
@@ -907,7 +962,7 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
     fn optimize(
         &self,
         plan: std::sync::Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         // For each `HashJoinExec`, determine if probe side is a `CayenneAccelerationExec` with a Cayenne accelerator
         // If so, that `HashJoinExec` can be replaced with one which uses a `ExactLeftAccumulator` so we can push down exact dynamic filter bounds into Cayenne
@@ -936,6 +991,10 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
             }
 
             if hash_join.null_equality() != NullEquality::NullEqualsNothing {
+                return Ok(Transformed::no(node));
+            }
+
+            if !should_rewrite_with_exact_accumulator(hash_join, config) {
                 return Ok(Transformed::no(node));
             }
 
@@ -1289,8 +1348,15 @@ mod tests {
     }
 
     fn optimize(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        optimize_with_config(plan, &ConfigOptions::default())
+    }
+
+    fn optimize_with_config(
+        plan: Arc<dyn ExecutionPlan>,
+        config: &ConfigOptions,
+    ) -> Arc<dyn ExecutionPlan> {
         CayenneJoinRewriter::new()
-            .optimize(plan, &ConfigOptions::default())
+            .optimize(plan, config)
             .expect("optimizer should succeed")
     }
 
@@ -1327,6 +1393,16 @@ mod tests {
             cayenne_config.sort_merge_memory_pool_fraction = sort_merge_memory_pool_fraction;
         }
         cayenne_config.sort_merge_memory_pool_bytes = sort_merge_memory_pool_bytes;
+        config.extensions.insert(cayenne_config);
+        config
+    }
+
+    fn config_with_exact_join_filter_max_bytes(max_bytes: usize) -> ConfigOptions {
+        let mut config = ConfigOptions::default();
+        let cayenne_config = CayenneOptimizerConfig {
+            exact_join_filter_max_bytes: max_bytes,
+            ..CayenneOptimizerConfig::default()
+        };
         config.extensions.insert(cayenne_config);
         config
     }
@@ -1381,6 +1457,63 @@ mod tests {
         assert!(
             optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
             "Null-equal joins should keep the default accumulator to preserve probe NULL matches"
+        );
+    }
+
+    #[test]
+    fn leaves_non_inner_hash_join_unchanged() {
+        let left = memory_exec("left_id");
+        let right = Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "left_id",
+            "right_id",
+            JoinType::LeftSemi,
+            NullEquality::NullEqualsNothing,
+        ));
+
+        let optimized = optimize(join);
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "Non-inner joins should keep DataFusion's default accumulator"
+        );
+    }
+
+    #[test]
+    fn leaves_hash_join_with_unknown_build_stats_unchanged() {
+        let schema = order_line_schema();
+        let left = file_exec(&schema, "left.vortex", None);
+        let right = cayenne_file_exec(&schema, "right.vortex", None);
+        let join = Arc::new(hash_join(left, right, "order_id", "order_id"));
+
+        let optimized = optimize(join);
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "Joins without exact build-side row statistics should keep DataFusion's default accumulator"
+        );
+    }
+
+    #[test]
+    fn leaves_large_exact_build_side_unchanged() {
+        let schema = order_line_schema();
+        let left = file_exec_with_statistics(
+            &schema,
+            "left.vortex",
+            None,
+            Statistics::new_unknown(&schema).with_num_rows(Precision::Exact(2)),
+        );
+        let right = cayenne_file_exec(&schema, "right.vortex", None);
+        let join = Arc::new(hash_join(left, right, "order_id", "order_id"));
+        let config = config_with_exact_join_filter_max_bytes(8);
+
+        let optimized = optimize_with_config(join, &config);
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "Estimated exact join-filter bytes above the budget should keep DataFusion's default accumulator"
         );
     }
 

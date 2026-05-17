@@ -80,7 +80,6 @@ use super::context::CayenneContext;
 use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 use super::table::{
     CayenneCdcWrite, CayenneTableProvider, ColumnStatsAccumulator, PostValidationState,
-    PreparedInsertStream,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

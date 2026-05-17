@@ -1353,29 +1353,6 @@ impl OnConflictDeletions {
             || !self.deleted_pk_i64.is_empty()
             || !self.deleted_row_keys.is_empty()
     }
-
-    #[must_use]
-    pub(crate) fn has_inlined_deletions(&self) -> bool {
-        !self.deleted_inlined_pk_i64.is_empty() || !self.deleted_inlined_row_keys.is_empty()
-    }
-
-    #[must_use]
-    pub(crate) fn is_empty(&self) -> bool {
-        !self.has_file_deletions() && !self.has_inlined_deletions()
-    }
-
-    #[must_use]
-    pub(crate) fn file_delete_specs_count(&self) -> usize {
-        self.delete_specs.len()
-    }
-
-    #[must_use]
-    pub(crate) fn deleted_key_count(&self) -> usize {
-        self.deleted_pk_i64.len()
-            + self.deleted_row_keys.len()
-            + self.deleted_inlined_pk_i64.len()
-            + self.deleted_inlined_row_keys.len()
-    }
 }
 
 #[derive(Clone)]
@@ -1609,7 +1586,7 @@ impl futures::Stream for OnConflictValidationStream {
                 }
                 Poll::Ready(Some(Ok(batch))) => match this.process_batch(batch) {
                     Ok(Some(filtered_batch)) => return Poll::Ready(Some(Ok(filtered_batch))),
-                    Ok(None) => continue,
+                    Ok(None) => {}
                     Err(err) => {
                         this.finish_after_error();
                         return Poll::Ready(Some(Err(err)));
