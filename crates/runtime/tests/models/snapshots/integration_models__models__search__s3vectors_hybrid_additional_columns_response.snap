@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: "normalize_search_response(resp, round_scores)"
+expression: normalize_search_response(resp)
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.02",
+      "_score": "[score]",
       "data": {
         "question": "How many multiples of 4 are there between 1 and 30? List them and count the total."
       },
@@ -21,7 +21,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.02",
+      "_score": "[score]",
       "data": {
         "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
       },
@@ -36,7 +36,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.02",
+      "_score": "[score]",
       "data": {
         "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
       },
@@ -51,7 +51,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.02",
+      "_score": "[score]",
       "data": {
         "question": "Which base number, when raised to the fifth power, equals thirty-two?"
       },

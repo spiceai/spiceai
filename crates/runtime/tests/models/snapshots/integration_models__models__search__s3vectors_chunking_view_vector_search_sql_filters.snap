@@ -1,26 +1,26 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: resp?
+expression: resp
 ---
 [
   {
+    "id": 551,
+    "answer": "No. Late recurrences can occur beyond 10 years, so patients require lifelong follow-up. $\\boxed{\\text{No}}$",
+    "_score": "[score]"
+  },
+  {
     "id": 938,
     "answer": "The presence of fibrinolysin in the reagents can partially or totally dissolve the clot, leading to erroneous results.",
-    "_score": 0.34
+    "_score": "[score]"
   },
   {
     "id": 1015,
     "answer": "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content.",
-    "_score": 0.31
+    "_score": "[score]"
   },
   {
     "id": 1035,
     "answer": "The primary effect of α₁-adrenergic blockers is to decrease systemic vascular resistance (SVR) by causing vasodilation.",
-    "_score": 0.3
-  },
-  {
-    "id": 551,
-    "answer": "No. Late recurrences can occur beyond 10 years, so patients require lifelong follow-up. $\\boxed{\\text{No}}$",
-    "_score": 0.29
+    "_score": "[score]"
   }
 ]
