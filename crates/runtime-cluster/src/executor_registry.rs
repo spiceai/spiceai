@@ -26,6 +26,7 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
 use datafusion::{catalog::TableProvider, sql::TableReference};
+use datafusion_ddl::ddl_log::{self, DdlLog};
 use datafusion_expr::{Expr, TableScan};
 use flight_client::cookie::CookieStore;
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;
@@ -117,41 +118,6 @@ impl ExecutorConnection {
 
 pub type TablePartitions = HashMap<TableReference, Vec<Expr>>;
 
-/// Append-only log of DDL SQL statements applied to the cluster.
-///
-/// Used to replay DDL on executors that join after the statements were originally executed.
-/// Each statement is stored in executor-compatible form (e.g. `IF NOT EXISTS`/`IF EXISTS`).
-///
-/// The version is the count of statements in the log. `statements_since(version)` returns
-/// all statements appended after that version.
-#[derive(Debug, Default)]
-struct DdlLog {
-    statements: Vec<String>,
-}
-
-impl DdlLog {
-    /// Appends a DDL SQL statement. Returns the new version (count of statements).
-    fn append(&mut self, sql: String) -> u64 {
-        self.statements.push(sql);
-        self.statements.len() as u64
-    }
-
-    /// Returns all statements appended after `since_version`.
-    fn statements_since(&self, since_version: u64) -> &[String] {
-        let idx = usize::try_from(since_version).unwrap_or(usize::MAX);
-        if idx >= self.statements.len() {
-            &[]
-        } else {
-            &self.statements[idx..]
-        }
-    }
-
-    /// Returns all statements and the current version.
-    fn snapshot(&self) -> (&[String], u64) {
-        (&self.statements, self.statements.len() as u64)
-    }
-}
-
 /// Registry for tracking executor control stream connections.
 ///
 /// Schedulers use this registry to:
@@ -177,8 +143,8 @@ pub struct ExecutorRegistry {
 
     federated_partition_store: Arc<PartitionStore>,
 
-    /// Append-only log of DDL SQL statements applied to the cluster.
-    ddl_log: Arc<RwLock<DdlLog>>,
+    /// Append-only DDL log shared across the cluster.
+    ddl_log: Arc<dyn DdlLog>,
 }
 
 impl ExecutorRegistry {
@@ -187,6 +153,7 @@ impl ExecutorRegistry {
     pub fn new(
         accelerations_partition_store: Arc<PartitionStore>,
         federated_partition_store: Arc<PartitionStore>,
+        ddl_log: Arc<dyn DdlLog>,
     ) -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
@@ -194,7 +161,7 @@ impl ExecutorRegistry {
             partitions: Arc::new(RwLock::new(HashMap::new())),
             accelerations_partition_store,
             federated_partition_store,
-            ddl_log: Arc::new(RwLock::new(DdlLog::default())),
+            ddl_log,
         }
     }
 
@@ -212,25 +179,30 @@ impl ExecutorRegistry {
     ///
     /// Must be called **before** forwarding to executors so that a concurrent
     /// `GetAppDefinition` will include the statement in its snapshot.
-    pub async fn append_ddl(&self, sql: String) {
-        let version = self.ddl_log.write().await.append(sql);
-        tracing::debug!(ddl_version = version, "Appended DDL to cluster log");
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ddl_log::Error`] if the underlying persistence fails.
+    pub async fn append_ddl(&self, sql: String) -> ddl_log::Result<()> {
+        self.ddl_log.append(sql).await
     }
 
     /// Returns a snapshot of all DDL statements and the current version.
-    pub async fn ddl_snapshot(&self) -> (Vec<String>, u64) {
-        let log = self.ddl_log.read().await;
-        let (stmts, version) = log.snapshot();
-        (stmts.to_vec(), version)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ddl_log::Error`] if the underlying read fails.
+    pub async fn ddl_snapshot(&self) -> ddl_log::Result<(Vec<String>, u64)> {
+        self.ddl_log.snapshot().await
     }
 
     /// Returns DDL statements appended after `since_version`.
-    pub async fn ddl_statements_since(&self, since_version: u64) -> Vec<String> {
-        self.ddl_log
-            .read()
-            .await
-            .statements_since(since_version)
-            .to_vec()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ddl_log::Error`] if the underlying read fails.
+    pub async fn ddl_statements_since(&self, since_version: u64) -> ddl_log::Result<Vec<String>> {
+        self.ddl_log.statements_since(since_version).await
     }
 
     /// Registers an executor connection.
@@ -633,9 +605,12 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let cs = Arc::new(ClusterStateStore::new(store, ""));
         cs.bootstrap().await.expect("bootstrap");
+        let ddl_log: Arc<dyn DdlLog> =
+            Arc::new(crate::occ_ddl_log::OccDdlLog::new(Arc::clone(&cs)));
         ExecutorRegistry::new(
             Arc::new(PartitionStore::accelerations(Arc::clone(&cs))),
             Arc::new(PartitionStore::catalog(Arc::clone(&cs))),
+            ddl_log,
         )
     }
 
@@ -773,10 +748,16 @@ mod tests {
     #[tokio::test]
     async fn test_ddl_log_empty() {
         let registry = make_registry().await;
-        let (stmts, version) = registry.ddl_snapshot().await;
+        let (stmts, version) = registry.ddl_snapshot().await.expect("snapshot");
         assert!(stmts.is_empty());
         assert_eq!(version, 0);
-        assert!(registry.ddl_statements_since(0).await.is_empty());
+        assert!(
+            registry
+                .ddl_statements_since(0)
+                .await
+                .expect("since")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -785,14 +766,16 @@ mod tests {
 
         registry
             .append_ddl("CREATE SCHEMA IF NOT EXISTS \"cat\".\"s1\"".to_string())
-            .await;
+            .await
+            .expect("append");
         registry
             .append_ddl(
                 "CREATE TABLE IF NOT EXISTS \"cat\".\"s1\".\"t1\" (id BIGINT NOT NULL)".to_string(),
             )
-            .await;
+            .await
+            .expect("append");
 
-        let (stmts, version) = registry.ddl_snapshot().await;
+        let (stmts, version) = registry.ddl_snapshot().await.expect("snapshot");
         assert_eq!(version, 2);
         assert_eq!(stmts.len(), 2);
         assert!(stmts[0].contains("CREATE SCHEMA"));
@@ -802,21 +785,45 @@ mod tests {
     #[tokio::test]
     async fn test_ddl_log_statements_since() {
         let registry = make_registry().await;
-        registry.append_ddl("stmt0".to_string()).await;
-        registry.append_ddl("stmt1".to_string()).await;
-        registry.append_ddl("stmt2".to_string()).await;
+        registry
+            .append_ddl("stmt0".to_string())
+            .await
+            .expect("append");
+        registry
+            .append_ddl("stmt1".to_string())
+            .await
+            .expect("append");
+        registry
+            .append_ddl("stmt2".to_string())
+            .await
+            .expect("append");
 
         assert_eq!(
-            registry.ddl_statements_since(0).await,
+            registry.ddl_statements_since(0).await.expect("since"),
             vec!["stmt0", "stmt1", "stmt2"]
         );
         assert_eq!(
-            registry.ddl_statements_since(1).await,
+            registry.ddl_statements_since(1).await.expect("since"),
             vec!["stmt1", "stmt2"]
         );
-        assert_eq!(registry.ddl_statements_since(2).await, vec!["stmt2"]);
-        assert!(registry.ddl_statements_since(3).await.is_empty());
+        assert_eq!(
+            registry.ddl_statements_since(2).await.expect("since"),
+            vec!["stmt2"]
+        );
+        assert!(
+            registry
+                .ddl_statements_since(3)
+                .await
+                .expect("since")
+                .is_empty()
+        );
         // Beyond end returns empty
-        assert!(registry.ddl_statements_since(100).await.is_empty());
+        assert!(
+            registry
+                .ddl_statements_since(100)
+                .await
+                .expect("since")
+                .is_empty()
+        );
     }
 }

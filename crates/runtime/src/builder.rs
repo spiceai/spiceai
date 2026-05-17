@@ -300,6 +300,9 @@ impl RuntimeBuilder {
                             let executor_registry = Arc::new(ExecutorRegistry::new(
                                 Arc::clone(&accelerations_partitions_store),
                                 Arc::clone(&catalog_partitions_store),
+                                Arc::new(runtime_cluster::OccDdlLog::new(Arc::clone(
+                                    &cluster_state,
+                                ))),
                             ));
                             let partition_service = Arc::new(PartitionService::new(
                                 Arc::clone(&accelerations_partitions_store),
@@ -344,6 +347,7 @@ impl RuntimeBuilder {
                     let executor_registry = Arc::new(ExecutorRegistry::new(
                         Arc::clone(&accelerations_partitions_store),
                         Arc::clone(&catalog_partitions_store),
+                        Arc::new(runtime_cluster::OccDdlLog::new(Arc::clone(&cluster_state))),
                     ));
                     let partition_service = Arc::new(PartitionService::new(
                         Arc::clone(&accelerations_partitions_store),

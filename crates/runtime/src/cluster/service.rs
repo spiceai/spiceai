@@ -317,7 +317,11 @@ impl ClusterService for ClusterServiceImpl {
         };
 
         // Snapshot the DDL log so the executor can replay DDL-created tables/schemas.
-        let (ddl_statements, ddl_version) = self.executor_registry.ddl_snapshot().await;
+        let (ddl_statements, ddl_version) = self
+            .executor_registry
+            .ddl_snapshot()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to snapshot DDL log: {e}")))?;
 
         Ok(Response::new(GetAppDefinitionResponse {
             app_json,
@@ -754,7 +758,8 @@ impl ClusterService for ClusterServiceImpl {
         let ddl_statements = self
             .executor_registry
             .ddl_statements_since(request.since_version)
-            .await;
+            .await
+            .map_err(|e| Status::internal(format!("Failed to read DDL catch-up: {e}")))?;
 
         Ok(Response::new(GetDdlCatchupResponse { ddl_statements }))
     }
@@ -1071,6 +1076,7 @@ mod tests {
             Arc::new(runtime_cluster::PartitionStore::catalog(Arc::clone(
                 &cluster_state,
             ))),
+            Arc::new(runtime_cluster::OccDdlLog::new(Arc::clone(&cluster_state))),
         ));
 
         ClusterServiceImpl::new(

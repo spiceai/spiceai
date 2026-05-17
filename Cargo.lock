@@ -5713,7 +5713,9 @@ dependencies = [
  "arrow",
  "async-trait",
  "datafusion",
+ "snafu",
  "spicepod",
+ "tokio",
 ]
 
 [[package]]
@@ -15903,6 +15905,7 @@ dependencies = [
  "bytes",
  "data_components",
  "datafusion",
+ "datafusion-ddl",
  "datafusion-expr",
  "datafusion-proto",
  "flight_client",

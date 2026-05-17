@@ -21,6 +21,7 @@ async-trait.workspace = true
 bytes.workspace = true
 data_components = { path = "../data_components" }
 datafusion.workspace = true
+datafusion-ddl = { path = "../datafusion-ddl" }
 datafusion-expr = { workspace = true }
 datafusion-proto = { workspace = true }
 flight_client = { path = "../flight_client" }

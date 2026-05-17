@@ -305,6 +305,7 @@ mod tests {
         Arc::new(ExecutorRegistry::new(
             Arc::new(PartitionStore::accelerations(Arc::clone(&cs))),
             Arc::new(PartitionStore::catalog(Arc::clone(&cs))),
+            Arc::new(runtime_cluster::OccDdlLog::new(Arc::clone(&cs))),
         ))
     }
 

@@ -27,6 +27,7 @@ pub mod executor_registry;
 pub mod executor_selection;
 pub mod flight_config;
 pub mod metadata;
+pub mod occ_ddl_log;
 pub mod scheduler_task_config;
 pub mod service;
 pub mod store;
@@ -41,5 +42,6 @@ pub use metadata::{
     PartitionMetadata, PartitionValue, TablePartitionMetadata, normalized_table_name,
     partition_value_to_bytes,
 };
+pub use occ_ddl_log::OccDdlLog;
 pub use service::{AssignmentConfig, PartitionService};
 pub use store::{AllocationResult, AssignmentRequest, CopyAssignmentsResult, PartitionStore};

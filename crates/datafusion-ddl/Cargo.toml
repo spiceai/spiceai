@@ -12,4 +12,6 @@ version.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
+snafu.workspace = true
 spicepod = { path = "../spicepod" }
+tokio = { workspace = true, features = ["sync"] }

@@ -74,6 +74,15 @@ pub struct ClusterState {
     /// Partition metadata for catalog/federated tables.
     #[serde(default)]
     pub catalog: HashMap<NormalizedTableName, TablePartitionMetadata>,
+
+    /// Append-only log of DDL SQL statements applied to the cluster.
+    ///
+    /// Used to replay DDL on executors that join after the statements were
+    /// originally executed. Each statement is stored in executor-compatible
+    /// form (e.g. `IF NOT EXISTS`/`IF EXISTS`). The version is the count
+    /// of statements in the log.
+    #[serde(default)]
+    pub ddl_log: Vec<String>,
 }
 
 impl ClusterState {
@@ -85,6 +94,7 @@ impl ClusterState {
             schedulers: HashMap::new(),
             accelerations: HashMap::new(),
             catalog: HashMap::new(),
+            ddl_log: Vec::new(),
         }
     }
 }

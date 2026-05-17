@@ -298,7 +298,14 @@ impl ExecutionPlan for IcebergCreateSchemaExec {
                     &df_schema_name,
                     if_not_exists,
                 );
-                registry.append_ddl(forward_sql.clone()).await;
+                registry
+                    .append_ddl(forward_sql.clone())
+                    .await
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Failed to append DDL to cluster log: {e}"
+                        ))
+                    })?;
                 forward_ddl_to_executors(registry, &forward_sql).await?;
             }
 
@@ -984,7 +991,12 @@ async fn synchronize_distributed_write_through_registration(
             dataset_options,
             partition_expr_sql,
         )?;
-        registry.append_ddl(forward_sql.clone()).await;
+        registry
+            .append_ddl(forward_sql.clone())
+            .await
+            .map_err(|e| {
+                DataFusionError::Execution(format!("Failed to append DDL to cluster log: {e}"))
+            })?;
         forward_ddl_to_executors(registry, &forward_sql).await?;
     }
 
