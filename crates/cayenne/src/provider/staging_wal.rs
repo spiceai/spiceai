@@ -858,7 +858,18 @@ impl CayenneTableProvider {
         }
 
         let mut located_wals = self.read_staging_wals().await?;
-        located_wals.sort_by(|left, right| left.wal.created_at.cmp(&right.wal.created_at));
+        // Sort by the staging snapshot id rather than `wal.created_at`. The
+        // staging snapshot id is derived from `Uuid::now_v7()` (see
+        // `CayenneTableProvider::new_staging_snapshot_id`), which is
+        // monotonic in ms-precision creation time AND strictly unique even
+        // when two partitions race within the same millisecond. Sorting by
+        // the RFC3339 string in `created_at` is ms-precision (or coarser on
+        // some platforms) and admits ties — under contention the first-
+        // failure short-circuit at `:898` could otherwise abandon a later-
+        // tied recovery candidate. UUID v7's encoded ordering also resists
+        // small clock skew across partitions.
+        located_wals
+            .sort_by(|left, right| left.staging_snapshot_id.cmp(&right.staging_snapshot_id));
 
         let mut recovered_any = false;
         for located_wal in located_wals {

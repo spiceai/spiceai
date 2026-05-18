@@ -115,8 +115,7 @@ fn build_schema(payload_columns: usize) -> Arc<Schema> {
 
 fn build_batch(schema: &Arc<Schema>, rows: usize) -> RecordBatch {
     let ids: Vec<i64> = (0..rows as i64).collect();
-    let mut columns: Vec<arrow::array::ArrayRef> =
-        Vec::with_capacity(schema.fields().len());
+    let mut columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(schema.fields().len());
     columns.push(Arc::new(Int64Array::from(ids)));
     // Payload columns: a different deterministic int per (row, col). Anything
     // big enough that read-all-columns has a non-trivial cost.
@@ -141,8 +140,7 @@ async fn build_fixture(payload_columns: usize, rows: usize) -> Fixture {
         .expect("data dir");
     let db_path = temp_dir.path().join("catalog.db");
     let catalog: Arc<dyn MetadataCatalog> = Arc::new(
-        CayenneCatalog::new(format!("sqlite://{}", db_path.to_string_lossy()))
-            .expect("catalog"),
+        CayenneCatalog::new(format!("sqlite://{}", db_path.to_string_lossy())).expect("catalog"),
     );
     catalog.init().await.expect("catalog init");
 
@@ -220,10 +218,7 @@ fn bench_key_probe_scan(c: &mut Criterion) {
                     rt.block_on(async {
                         let deleted = fixture
                             .table
-                            .delete_matched_rows_by_key_probe(
-                                matched_keys.clone(),
-                                &key_columns,
-                            )
+                            .delete_matched_rows_by_key_probe(matched_keys.clone(), &key_columns)
                             .await
                             .expect("narrow delete");
                         black_box(deleted);
@@ -243,10 +238,7 @@ fn bench_key_probe_scan(c: &mut Criterion) {
                     rt.block_on(async {
                         let deleted = fixture
                             .table
-                            .delete_matched_rows_by_key_probe(
-                                matched_keys.clone(),
-                                &key_columns,
-                            )
+                            .delete_matched_rows_by_key_probe(matched_keys.clone(), &key_columns)
                             .await
                             .expect("wide delete");
                         black_box(deleted);

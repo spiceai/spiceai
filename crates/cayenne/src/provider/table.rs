@@ -1804,65 +1804,60 @@ impl CayenneTableProvider {
     /// Protected snapshots (those containing data written after deletions) are preserved
     /// alongside the current snapshot to prevent data loss for queries that reference them.
     pub(crate) async fn trigger_old_snapshot_cleanup(&self, current_snapshot: &str) {
+        // Grace period before physically removing the old snapshot
+        // directories. Scans hold `listing_fence.read()` during plan-build
+        // (file paths are resolved against the old snapshot) but execute
+        // the plan AFTER the fence is released. If cleanup races ahead of
+        // plan execution the scan opens files that have been unlinked and
+        // fails with NotFound. Sleeping `OLD_SNAPSHOT_CLEANUP_GRACE` before
+        // deleting lets every plan that began under the old listing table
+        // finish opening its files.
+        const OLD_SNAPSHOT_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
         // Collect protected snapshot IDs to preserve during cleanup
         let protected_snapshot_ids: HashSet<String> = {
             let guard = self.protected_snapshots.read();
             guard.keys().cloned().collect()
         };
 
-        // Grace period before physically removing the old snapshot
-        // directories. Scans hold `listing_fence.read()` during plan-build
-        // (file paths are resolved against the old snapshot) but execute
-        // the plan AFTER the fence is released. If cleanup races ahead of
-        // plan execution the scan opens files that have been unlinked and
-        // fails with NotFound. Spawning the cleanup with a grace sleep lets
-        // every plan that began under the old listing table finish opening
-        // its files.
-        const OLD_SNAPSHOT_CLEANUP_GRACE: std::time::Duration =
-            std::time::Duration::from_secs(30);
-
-        let table_path = self.table_metadata.path.clone();
-        let table_id = self.table_metadata.table_id.clone();
-        let current_snapshot = current_snapshot.to_string();
-        let is_s3 = table_path.starts_with("s3://");
-        let object_store_config = self.table_metadata.object_store_config.clone();
-
-        tokio::spawn(async move {
+        if self.table_metadata.path.starts_with("s3://") {
+            // S3 cleanup uses `self.cleanup_old_snapshots_s3` which holds
+            // `&self`; sleep + cleanup are awaited inline. The compaction
+            // caller is itself a background task, so blocking it for
+            // `OLD_SNAPSHOT_CLEANUP_GRACE` only delays the next compaction
+            // cycle, not user writes or scans.
             tokio::time::sleep(OLD_SNAPSHOT_CLEANUP_GRACE).await;
-            if is_s3 {
-                if let Err(err) = Self::cleanup_old_snapshots_s3_static(
-                    &table_path,
-                    &table_id,
-                    &current_snapshot,
-                    &protected_snapshot_ids,
-                    object_store_config.as_ref(),
-                )
+            if let Err(err) = self
+                .cleanup_old_snapshots_s3(current_snapshot, &protected_snapshot_ids)
                 .await
-                {
-                    tracing::warn!(
-                        "Failed to cleanup old S3 snapshots for table {}: {err}"
-                    );
-                }
-            } else {
-                let table_path_inner = table_path.clone();
-                let table_id_inner = table_id.clone();
-                let snapshot_inner = current_snapshot.clone();
+            {
+                tracing::warn!(
+                    "Failed to cleanup old S3 snapshots for table {}: {err}",
+                    &self.table_metadata.table_id
+                );
+            }
+        } else {
+            let table_path = self.table_metadata.path.clone();
+            let table_id = self.table_metadata.table_id.clone();
+            let current_snapshot = current_snapshot.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep(OLD_SNAPSHOT_CLEANUP_GRACE).await;
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Err(e) = Self::cleanup_old_snapshots_blocking(
-                        &table_path_inner,
-                        &table_id_inner,
-                        &snapshot_inner,
+                        &table_path,
+                        &table_id,
+                        &current_snapshot,
                         &protected_snapshot_ids,
                     ) {
                         tracing::warn!(
                             "Failed to cleanup old snapshots for table {}: {e}",
-                            table_id_inner
+                            table_id
                         );
                     }
                 })
                 .await;
-            }
-        });
+            });
+        }
     }
 
     /// Construct the path to a snapshot directory.
@@ -7802,6 +7797,7 @@ impl CayenneTableProvider {
             self.table_metadata.path.clone(),
             Arc::clone(self.context.runtime_env()),
             Arc::clone(&self.write_lock),
+            Arc::clone(&self.listing_fence),
         ));
         Ok(Arc::new(DeletionExec::new(Arc::new(
             PkKeysetInvalidatingDeletionSink {
