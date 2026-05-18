@@ -23,6 +23,7 @@ use crate::request::DatabricksAuthExtension;
 use crate::{search::search_engine, status::RuntimeStatus};
 
 use crate::Runtime;
+use crate::cluster::ExecutorRegistry;
 use crate::config;
 #[cfg(feature = "openapi")]
 use crate::http::v1::{
@@ -500,10 +501,15 @@ pub(crate) fn routes(
     authenticated_router = authenticated_router
         .route_layer(middleware::from_fn(super::mtls::require_channel_identity));
 
+    // The executor registry only exists when the runtime is in scheduler role; it is `None`
+    // otherwise. `/v1/ready`'s executor gating reads it through this layer.
+    let executor_registry: Option<Arc<ExecutorRegistry>> = rt.df.executor_registry().cloned();
+
     let unauthenticated_router = Router::new()
         .route("/health", get(|| async { "ok\n" }))
         .route("/v1/ready", get(v1::ready::get))
         .layer(Extension(Arc::clone(&rt.status)))
+        .layer(Extension(executor_registry))
         .route_layer(RequestBodyLimitLayer::new(HEALTH_REQUEST_BODY_LIMIT));
 
     unauthenticated_router

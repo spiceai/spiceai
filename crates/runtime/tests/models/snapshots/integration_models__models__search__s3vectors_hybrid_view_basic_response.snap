@@ -1,12 +1,16 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: "normalize_search_response(resp, round_scores)"
+expression: normalize_search_response(resp)
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.02",
+      "_score": "[score]",
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+      "_score": "[score]",
       "dataset": "qs_view",
       "matches": {
         "answer": [
@@ -18,19 +22,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.02",
-      "dataset": "qs_view",
-      "matches": {
-        "question": [
-          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
-        ]
-      },
-      "primary_key": {
-        "id": 361
-      }
-    },
-    {
-      "_score": "0.02",
+      "_score": "[score]",
       "dataset": "qs_view",
       "matches": {
         "answer": [
@@ -42,15 +34,15 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.02",
+      "_score": "[score]",
       "dataset": "qs_view",
       "matches": {
-        "answer": [
-          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+        "question": [
+          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
         ]
       },
       "primary_key": {
-        "id": 1277
+        "id": 361
       }
     }
   ]

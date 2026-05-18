@@ -26,6 +26,7 @@ pub mod completions;
 pub mod connect;
 pub mod dataset;
 pub mod datasets;
+pub mod feedback;
 pub mod init;
 pub mod install;
 pub mod login;

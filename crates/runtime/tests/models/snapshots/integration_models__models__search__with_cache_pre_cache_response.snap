@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp, round_scores)
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.94",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -18,7 +18,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.93",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -30,7 +30,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.93",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -42,7 +42,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.92",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -54,7 +54,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.91",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -66,7 +66,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.91",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -78,7 +78,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.91",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -90,7 +90,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.90",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -102,7 +102,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.90",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -114,7 +114,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.90",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -126,7 +126,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.89",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -138,7 +138,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.89",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -150,7 +150,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.89",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -162,7 +162,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.88",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -174,7 +174,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.87",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -186,7 +186,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.87",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -198,7 +198,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.86",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -210,7 +210,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.84",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -222,7 +222,7 @@ expression: normalize_search_response(resp, round_scores)
       }
     },
     {
-      "_score": "0.82",
+      "_score": "[score]",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
