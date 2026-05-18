@@ -30,7 +30,7 @@ use std::{fmt, io::IsTerminal};
 
 pub use client::CloudClient;
 pub use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
-use spice_cloud_client::types::{AppKind, IngestionMetrics, UpdateChannel};
+use spice_cloud_client::types::{AppKind, IngestionMetrics, PodMetrics, UpdateChannel};
 
 /// Arguments for the cloud command.
 #[derive(Args, Debug)]
@@ -117,9 +117,6 @@ pub enum CloudCommands {
 
     /// Inspect current deployment status
     Inspect(InspectArgs),
-
-    /// Rollback to a previous deployment
-    Rollback(RollbackArgs),
 
     /// Show API keys for an app
     #[command(name = "api-keys")]
@@ -339,21 +336,6 @@ pub struct InspectArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
     pub app: Option<String>,
-
-    /// Output format
-    #[arg(long, short = 'o', default_value = "table")]
-    pub output: OutputFormat,
-}
-
-#[derive(Args, Debug)]
-pub struct RollbackArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
-
-    /// Target deployment ID to rollback to
-    #[arg(long)]
-    pub target: Option<i64>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -709,7 +691,6 @@ pub async fn execute(_ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
         CloudCommands::Delete(delete_cmd) => execute_delete(delete_cmd).await,
         CloudCommands::Deploy(deploy_args) => execute_deploy(deploy_args).await,
         CloudCommands::Inspect(inspect_args) => execute_inspect(inspect_args).await,
-        CloudCommands::Rollback(rollback_args) => execute_rollback(rollback_args).await,
         CloudCommands::ApiKeys(api_keys_args) => execute_api_keys(api_keys_args).await,
         CloudCommands::Metrics(metrics_args) => execute_metrics(metrics_args).await,
     }
@@ -1599,38 +1580,6 @@ async fn execute_inspect(args: &InspectArgs) -> Result<()> {
     Ok(())
 }
 
-async fn execute_rollback(args: &RollbackArgs) -> Result<()> {
-    let client = CloudClient::new()?;
-    let app_name = require_app(args.app.as_deref())?;
-
-    let target_id = if let Some(id) = args.target {
-        id
-    } else {
-        // Get the second-to-last deployment
-        let deployments = client.list_deployments(&app_name, 2, None).await?;
-        if deployments.len() < 2 {
-            return InvalidArgumentSnafu {
-                message: "No previous deployment to rollback to",
-            }
-            .fail();
-        }
-        deployments[1].id
-    };
-
-    let deployment = client.rollback(&app_name, target_id).await?;
-
-    if args.output == OutputFormat::Json {
-        return write_json(&deployment);
-    }
-
-    println!(
-        "\x1b[32m✓ Rollback to deployment {} initiated (new deployment: {})\x1b[0m",
-        target_id, deployment.id
-    );
-
-    Ok(())
-}
-
 async fn execute_api_keys(args: &ApiKeysArgs) -> Result<()> {
     let client = CloudClient::new()?;
     let app_name = require_app(args.app.as_deref())?;
@@ -1686,32 +1635,11 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
         println!("No metrics available for {app_name}");
         return Ok(());
     }
-    let mut table = TableOutput::new(vec![
-        "POD",
-        "CPU %",
-        "MEMORY",
-        "DISK USED",
-        "DISK AVAIL",
-        "DISK CAP",
-    ]);
+    let has_window = args.window.is_some();
+
+    let mut table = TableOutput::new(metrics_table_headers());
     for (pod, m) in &response.metrics {
-        table.add_row(vec![
-            pod.clone(),
-            m.cpu_usage_percent
-                .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
-            m.memory_usage_bytes.map_or_else(
-                || "-".to_string(),
-                |v| bytes::NumBytes::from_bytes(v).to_string(),
-            ),
-            m.disk_read_bytes
-                .map_or_else(|| "-".to_string(), bytes::format_bytes_f64),
-            m.disk_read_operations
-                .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
-            m.disk_write_bytes
-                .map_or_else(|| "-".to_string(), bytes::format_bytes_f64),
-            m.disk_write_operations
-                .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
-        ]);
+        table.add_row(metrics_table_row(pod, m, has_window));
     }
     table.print();
 
@@ -1746,6 +1674,40 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn metrics_table_headers() -> Vec<&'static str> {
+    vec![
+        "POD",
+        "CPU %",
+        "MEMORY",
+        "DISK READ",
+        "READ OPS",
+        "DISK WRITE",
+        "WRITE OPS",
+    ]
+}
+
+fn metrics_table_row(pod: &str, m: &PodMetrics, _has_window: bool) -> Vec<String> {
+    vec![
+        pod.to_string(),
+        m.cpu_usage_percent
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
+        m.memory_usage_bytes
+            .map_or_else(|| "-".to_string(), format_bytes),
+        m.disk_read_bytes
+            .map_or_else(|| "-".to_string(), bytes::format_bytes_f64),
+        m.disk_read_operations
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
+        m.disk_write_bytes
+            .map_or_else(|| "-".to_string(), bytes::format_bytes_f64),
+        m.disk_write_operations
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
+    ]
+}
+
+fn format_bytes(bytes: u64) -> String {
+    bytes::NumBytes::from_bytes(bytes).to_string()
 }
 
 // ============================================================================
@@ -1787,6 +1749,69 @@ fn require_app(flag_value: Option<&str>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metrics_table_row_matches_header_count() {
+        // Regression for #9989: row was emitting one more cell than the header
+        // had columns, so the `disk_write_operations` value rendered without a
+        // label and the disk columns were captioned with unrelated names.
+        let headers = metrics_table_headers();
+
+        let none_metrics = PodMetrics::default();
+        let none_row = metrics_table_row("pod-none", &none_metrics, false);
+        assert_eq!(
+            none_row.len(),
+            headers.len(),
+            "row count must match header count when fields are None"
+        );
+
+        let full_metrics = PodMetrics {
+            cpu_usage_percent: Some(123.4),
+            memory_usage_bytes: Some(1024 * 1024 * 1024),
+            disk_read_bytes: Some(2048.0),
+            disk_read_operations: Some(11.0),
+            disk_write_bytes: Some(4096.0),
+            disk_write_operations: Some(22.0),
+        };
+        let full_row = metrics_table_row("pod-full", &full_metrics, true);
+        assert_eq!(
+            full_row.len(),
+            headers.len(),
+            "row count must match header count when fields are populated"
+        );
+    }
+
+    #[test]
+    fn metrics_table_headers_label_every_disk_column() {
+        // Regression for #9989: the original labels "DISK USED / DISK AVAIL /
+        // DISK CAP" were both wrong (they described capacity, not I/O) and
+        // omitted `disk_write_operations` entirely. Lock the labels in.
+        let headers = metrics_table_headers();
+        assert_eq!(
+            headers,
+            vec![
+                "POD",
+                "CPU %",
+                "MEMORY",
+                "DISK READ",
+                "READ OPS",
+                "DISK WRITE",
+                "WRITE OPS",
+            ]
+        );
+    }
+
+    #[test]
+    fn metrics_table_row_renders_dash_for_missing_values() {
+        let m = PodMetrics::default();
+        let row = metrics_table_row("p", &m, false);
+        // Pod name is always present; the six metric cells should be "-".
+        assert_eq!(row[0], "p");
+        assert!(
+            row[1..].iter().all(|cell| cell == "-"),
+            "missing metric cells should render as '-', got: {row:?}"
+        );
+    }
 
     #[test]
     fn login_chooser_requires_tty() {

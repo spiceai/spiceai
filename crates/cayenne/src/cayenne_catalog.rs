@@ -19,7 +19,7 @@ limitations under the License.
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use super::metadata::{
     CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    PartitionMetadata, TableMetadata, TableStatistics,
+    PartitionMetadata, PkConflictDetection, TableMetadata, TableStatistics,
 };
 use super::metastore::sqlite::SqliteMetastore;
 #[cfg(feature = "turso")]
@@ -29,6 +29,7 @@ use super::metastore::{
     QueryParams, QueryRowParams,
 };
 use async_trait::async_trait;
+use datafusion_table_providers::util::on_conflict::OnConflict;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -78,6 +79,15 @@ impl MetastoreImpl {
             MetastoreImpl::Sqlite(m) => m.execute(params).await,
             #[cfg(feature = "turso")]
             MetastoreImpl::Turso(m) => m.execute(params).await,
+        }
+    }
+
+    /// Helper to execute a transactional batch on metastore, working with both `SQLite` and Turso
+    pub(crate) async fn execute_transaction_batch_helper(&self, sql: &str) -> CatalogResult<()> {
+        match self {
+            MetastoreImpl::Sqlite(m) => m.execute_transaction_batch(sql).await,
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(m) => m.execute_transaction_batch(sql).await,
         }
     }
 
@@ -285,6 +295,71 @@ impl CayenneCatalog {
             })
     }
 
+    /// Apply an overwrite commit's catalog mutations inside the caller's
+    /// `MetastoreTransaction`, without opening a new transaction.
+    ///
+    /// Like [`Self::commit_compaction_in_txn`], this is the building block for
+    /// cross-partition atomic commits; the coordinator opens one transaction,
+    /// calls this method per participating partition, then commits.
+    ///
+    /// Differs from `commit_compaction_in_txn` in that overwrite REPLACES all
+    /// of a table's contents, so anything keyed on the old snapshot must be
+    /// dropped atomically with the pointer flip:
+    ///
+    /// 1. `DELETE FROM cayenne_delete_file       WHERE table_id = ?`
+    /// 2. `DELETE FROM cayenne_insert_record     WHERE table_id = ?`
+    /// 3. `DELETE FROM cayenne_snapshot_sequence WHERE table_id = ?`
+    /// 4. `DELETE FROM cayenne_inlined_data      WHERE table_id = ?`
+    /// 5. `DELETE FROM cayenne_inlined_delete    WHERE table_id = ?`
+    /// 6. `DELETE FROM cayenne_table_statistics  WHERE table_id = ?`
+    /// 7. `UPDATE cayenne_table SET current_snapshot_id = ? WHERE table_id = ?`
+    ///
+    /// Without (4)-(6) in the same transaction, a crash between the pointer
+    /// flip and the (separate, post-commit) clears in `PreparedOverwrite::finish`
+    /// would leave the catalog pointing at the new snapshot while inlined
+    /// rows from the old snapshot continued to surface in scans (which UNION
+    /// the listing table with inlined data) and stale table stats biased
+    /// the query planner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::InvalidOperationNoSource`] if either UUID is
+    /// malformed.
+    /// Returns [`CatalogError::FailedToSetCurrentSnapshot`] if the
+    /// `execute_batch` call against the borrowed transaction fails.
+    pub async fn commit_overwrite_in_txn(
+        &self,
+        txn: &mut dyn MetastoreTransaction,
+        table_id: &str,
+        new_snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        for (name, value) in [("table_id", table_id), ("new_snapshot_id", new_snapshot_id)] {
+            if uuid::Uuid::parse_str(value).is_err() {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!("{name} is not a valid UUID: {value}"),
+                });
+            }
+        }
+
+        let table_id_literal = sql_text_literal(table_id);
+        let new_snapshot_id_literal = sql_text_literal(new_snapshot_id);
+        let batch_sql = format!(
+            "DELETE FROM cayenne_delete_file WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_insert_record WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_snapshot_sequence WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_inlined_data WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_inlined_delete WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_table_statistics WHERE table_id = {table_id_literal}; \
+             UPDATE cayenne_table SET current_snapshot_id = {new_snapshot_id_literal} WHERE table_id = {table_id_literal};"
+        );
+
+        txn.execute_batch(&batch_sql)
+            .await
+            .map_err(|e| CatalogError::FailedToSetCurrentSnapshot {
+                source: Box::new(e),
+            })
+    }
+
     async fn validate_existing_table_configuration(
         &self,
         table_name: &str,
@@ -439,6 +514,8 @@ impl MetadataCatalog for CayenneCatalog {
     async fn create_table(&self, options: CreateTableOptions) -> CatalogResult<String> {
         let table_name = options.table_name.clone();
         let base_path = options.base_path.clone();
+
+        validate_create_table_options(&options)?;
 
         // Check if table already exists first (read-only check)
         let existing_table_id: Option<String> = self
@@ -1170,9 +1247,27 @@ impl MetadataCatalog for CayenneCatalog {
         //    after compaction since all data is merged into the new snapshot
         // 4. Update snapshot pointer - commits the new snapshot as active
         //
-        // If interrupted between these, the old snapshot remains active with
-        // no delete files, which is safe (just loses the pending deletions,
-        // but data is not corrupted).
+        // Devil's advocate (to be really sure): one could worry that clearing the
+        // delete files *before* advancing the snapshot pointer opens a window where
+        // a concurrent query on the old snapshot would lose its deletion vectors.
+        // This is prevented by the `listing_fence` + `protected_snapshots` mechanism
+        // (queries that started on the old snapshot hold a protected entry, so the
+        // old snapshot directory is not cleaned until they finish, and they captured
+        // the delete files at scan start time).
+        //
+        // If the process crashes anywhere in the batch or before the background
+        // cleanup runs, the worst observable state is "old snapshot still current,
+        // but its delete files are gone from the catalog". This means any deletions
+        // that were pending at compaction time are lost (the rows that should have
+        // been deleted are still visible until the next successful compaction),
+        // but **no deleted row is ever resurrected after it was once successfully
+        // deleted in a prior snapshot**, and no data file is ever lost. This is an
+        // acceptable "at-least-once deletion" anomaly for a best-effort compaction
+        // system, and is the documented tradeoff.
+        //
+        // The new snapshot is always written + fsynced *before* this catalog
+        // transaction is even attempted, so a crash before the pointer move leaves
+        // an orphaned (but harmless) new snapshot directory.
         //
         // The transaction may fail with SQLITE_BUSY/SQLITE_LOCKED conflicts at
         // commit time (especially with Turso's BEGIN CONCURRENT). Retry a few
@@ -1223,6 +1318,59 @@ impl MetadataCatalog for CayenneCatalog {
         Err(CatalogError::InvalidOperationNoSource {
             message: format!(
                 "commit_compaction exhausted {max_attempts} attempts without success or a terminal error"
+            ),
+        })
+    }
+
+    async fn commit_overwrite(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()> {
+        // Same retry-on-conflict shape as commit_compaction; the only
+        // additional work happens inside the transaction via
+        // commit_overwrite_in_txn below.
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+        if max_attempts == 0 {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "commit_overwrite requires at least one attempt".to_string(),
+            });
+        }
+
+        for attempt in 1..=max_attempts {
+            let mut tx = self.begin_transaction().await.map_err(|e| {
+                CatalogError::FailedToSetCurrentSnapshot {
+                    source: Box::new(e),
+                }
+            })?;
+
+            match self
+                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id)
+                .await
+            {
+                Ok(()) => match tx.commit().await {
+                    Ok(()) => return Ok(()),
+                    Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
+                        let delay = retry_backoff_delay(attempt);
+                        tracing::debug!(
+                            attempt,
+                            max_attempts,
+                            ?delay,
+                            "Retrying overwrite transaction after commit conflict"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(e) => {
+                        return Err(CatalogError::FailedToSetCurrentSnapshot {
+                            source: Box::new(e),
+                        });
+                    }
+                },
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+
+        Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "commit_overwrite exhausted {max_attempts} attempts without success or a terminal error"
             ),
         })
     }
@@ -1562,6 +1710,18 @@ impl MetadataCatalog for CayenneCatalog {
                 sql: "DELETE FROM cayenne_inlined_data WHERE table_id = ?1",
                 params: vec![MetastoreValue::Text(table_id.to_string())],
             })
+            .await
+    }
+
+    async fn clear_inlined_data_and_deletes(&self, table_id: &str) -> CatalogResult<()> {
+        let table_id_literal = sql_text_literal(table_id);
+        let batch_sql = format!(
+            "DELETE FROM cayenne_inlined_data WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_inlined_delete WHERE table_id = {table_id_literal};"
+        );
+
+        self.metastore
+            .execute_transaction_batch_helper(&batch_sql)
             .await
     }
 
@@ -2096,6 +2256,23 @@ fn configuration_matches(stored: &TableMetadata, options: &CreateTableOptions) -
     }
 
     true
+}
+
+fn validate_create_table_options(options: &CreateTableOptions) -> CatalogResult<()> {
+    if matches!(
+        options.vortex_config.pk_conflict_detection,
+        PkConflictDetection::None
+    ) && matches!(options.on_conflict, Some(OnConflict::Upsert(_)))
+    {
+        return Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "cayenne_pk_conflict_detection=none cannot be combined with on_conflict=upsert on table {}: upsert requires conflict detection. Either remove on_conflict or set pk_conflict_detection=auto.",
+                options.table_name
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 /// Logs a warning describing exactly which configuration fields differ between the
@@ -3494,6 +3671,99 @@ mod tests {
             .expect("Failed to add delete file");
 
         table_id
+    }
+
+    #[tokio::test]
+    async fn test_clear_inlined_data_and_deletes_clears_both_tables() {
+        let test_db = format!(
+            "sqlite://./.test_clear_inline_metadata_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "clear_inline_metadata".to_string(),
+                schema,
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: "/tmp/clear_inline_metadata".to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("Failed to create table");
+
+        catalog
+            .add_inlined_data(InlinedData {
+                inlined_id: String::new(),
+                table_id: table_id.clone(),
+                partition_key: None,
+                data_ipc: vec![1, 2, 3],
+                record_count: 3,
+                sequence_number: 1,
+                created_at: String::new(),
+            })
+            .await
+            .expect("Failed to add inlined data");
+        catalog
+            .add_inlined_delete(InlinedDelete {
+                inlined_id: String::new(),
+                table_id: table_id.clone(),
+                delete_ipc: vec![4, 5, 6],
+                delete_count: 2,
+                sequence_number: 2,
+                created_at: String::new(),
+            })
+            .await
+            .expect("Failed to add inlined delete");
+
+        assert_eq!(
+            catalog
+                .get_inlined_data_count(&table_id)
+                .await
+                .expect("Failed to get inlined data count"),
+            3
+        );
+        assert_eq!(
+            catalog
+                .get_inlined_deletes(&table_id)
+                .await
+                .expect("Failed to get inlined deletes")
+                .len(),
+            1
+        );
+
+        catalog
+            .clear_inlined_data_and_deletes(&table_id)
+            .await
+            .expect("Failed to clear inline metadata");
+
+        assert_eq!(
+            catalog
+                .get_inlined_data_count(&table_id)
+                .await
+                .expect("Failed to get inlined data count after clear"),
+            0
+        );
+        assert!(
+            catalog
+                .get_inlined_deletes(&table_id)
+                .await
+                .expect("Failed to get inlined deletes after clear")
+                .is_empty()
+        );
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
     }
 
     /// Issue #10125 — `commit_compaction_in_txn` applied to a single partition

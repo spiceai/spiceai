@@ -191,10 +191,98 @@ fn bench_concurrent_load_under_publish(c: &mut Criterion) {
     group.finish();
 }
 
+/// Micro-bench that quantifies the per-call cost of `DeletionIndex::extend_max`
+/// as the cumulative deletion-cache size grows. This is the exact hot path
+/// hit by every PK-aware upsert / delete on a table that accumulates
+/// deletion entries.
+///
+/// A previous revision rebuilt the bloom filter from scratch on every call
+/// (iterating ALL existing entries to re-hash). That made per-call work
+/// O(N) where N is the cumulative cache size. Across M writes the cost was
+/// O(M·N) — quadratic in the cache size, the root cause of the
+/// user-reported ~200% ingestion regression.
+///
+/// The current implementation keeps amortized cost at O(K) per call by:
+///   - Tracking `bloom_capacity` and only rebuilding the bloom when entry
+///     count crosses `2 * bloom_capacity` (geometric amortization).
+///   - Inserting only newly-added keys into a clone of the existing bloom
+///     in the common path.
+///
+/// This bench runs `extend_max` at several pre-populated cache sizes and
+/// reports per-call latency. Watch for these signals on regression:
+///   - The 10K/100K/1M curves diverging from constant time (returning to
+///     O(N)) is the regression returning.
+///   - Sudden jumps at `2^k`-boundaries are the (intentional) amortized
+///     full-rebuild cost; they should still be much cheaper than the
+///     pre-fix worst case.
+fn bench_extend_max_at_growing_cache_sizes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("deletion_index_extend_max_growth");
+    group.throughput(Throughput::Elements(1));
+
+    // For each pre-populated size, time one extend_max call that adds K=1
+    // new key (the common per-row upsert pattern). Cache sizes are picked
+    // to span small (typical CDC), medium, and large (long-lived table)
+    // workloads.
+    for n in [100_usize, 1_000, 10_000, 100_000] {
+        let mut seed_map = HashMap::with_capacity(n);
+        for i in 0..n {
+            seed_map.insert(i as i64, 1_i64);
+        }
+        let base = DeletionIndex::from_map(seed_map);
+
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter(|| {
+                // Always extend with one fresh key past the seeded range, so
+                // every iteration takes the Vacant branch. (If we extended
+                // with an existing key, the Occupied branch would short-
+                // circuit and obscure the new-key bloom-insert work.)
+                let next = base.extend_max([((n as i64) + 1, 2)]);
+                black_box(next);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Companion bench that quantifies the *opposite* end of the workload:
+/// many small extend_max calls in a row from an empty start. This is the
+/// "high-rate CDC into a fresh table" pattern that catches the O(N²)
+/// cumulative regression — naive iteration time grows quadratically with N
+/// if the bloom is rebuilt from scratch on every call, but stays linear
+/// (one bloom rebuild per doubling) with the current amortized
+/// implementation.
+fn bench_extend_max_cumulative_from_empty(c: &mut Criterion) {
+    let mut group = c.benchmark_group("deletion_index_extend_max_cumulative");
+
+    for total in [128_usize, 1_024, 8_192] {
+        group.throughput(Throughput::Elements(total as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(total), &total, |b, &total| {
+            b.iter(|| {
+                // Re-build from empty on every iteration so the cumulative
+                // work is observable; the benchmark reports total time
+                // divided by Throughput=total, giving "per-row insert"
+                // latency. With the regression (O(N²) cumulative) the per-
+                // row number grows linearly with `total`; with the fix it
+                // stays roughly flat.
+                let mut idx = DeletionIndex::empty();
+                for i in 0..total as i64 {
+                    idx = idx.extend_max([(i, 1)]);
+                }
+                black_box(idx);
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_int64_probe,
     bench_row_keys_probe,
-    bench_concurrent_load_under_publish
+    bench_concurrent_load_under_publish,
+    bench_extend_max_at_growing_cache_sizes,
+    bench_extend_max_cumulative_from_empty,
 );
 criterion_main!(benches);

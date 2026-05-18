@@ -21,7 +21,7 @@ use spice::commands::acceleration::{AccelerationArgs, SnapshotArgs, SnapshotsArg
 use spice::commands::component::{ComponentSection, SingletonSection};
 use spice::commands::{
     acceleration, add, catalogs, chat, cloud, cluster, completions, component, connect, dataset,
-    datasets, init, install, login, models, nsql, pods, query, refresh, run, search, sql, status,
+    feedback, init, install, login, models, nsql, pods, query, refresh, run, search, sql, status,
     trace, upgrade, validate, version, workers,
 };
 use spice::output::OutputFormat;
@@ -231,6 +231,9 @@ enum Commands {
 
     // ── Tooling ──────────────────────────────────────────────────────────────
     Completions(completions::CompletionsArgs),
+
+    /// Open the Spice.ai community Slack to share feedback
+    Feedback(feedback::FeedbackArgs),
 }
 
 fn main() {
@@ -492,7 +495,8 @@ fn apply_machine_mode(command: &mut Commands) {
         | Commands::Metadata(_)
         | Commands::Login(_)
         | Commands::Cluster(_)
-        | Commands::Completions(_) => {}
+        | Commands::Completions(_)
+        | Commands::Feedback(_) => {}
     }
 }
 
@@ -531,7 +535,6 @@ fn apply_machine_cloud_mode(command: &mut cloud::CloudCommands) {
         cloud::CloudCommands::Logs(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::Deploy(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::Inspect(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Rollback(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::ApiKeys(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::Metrics(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::Secrets(command) => match command {
@@ -655,7 +658,7 @@ fn is_json_output(cmd: &Commands) -> bool {
             cloud::CloudCommands::Metrics(x) => x.output == OutputFormat::Json,
             cloud::CloudCommands::Logs(x) => x.output == OutputFormat::Json,
             cloud::CloudCommands::Deploy(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Rollback(x) => x.output == OutputFormat::Json,
+
             cloud::CloudCommands::Secrets(cloud::SecretsCommands::List(x)) => {
                 x.output == OutputFormat::Json
             }
@@ -870,6 +873,9 @@ fn run_cli(cli: Cli) -> Result<()> {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(validate::execute(&args))?;
+        }
+        Commands::Feedback(args) => {
+            feedback::execute(&args)?;
         }
     }
 
@@ -1377,7 +1383,6 @@ mod tests {
             &["spice", "cloud", "metrics", "--output", "json"],
             &["spice", "cloud", "logs", "--output", "json"],
             &["spice", "cloud", "deploy", "--output", "json"],
-            &["spice", "cloud", "rollback", "--output", "json"],
             &["spice", "cloud", "secrets", "list", "--output", "json"],
             &[
                 "spice", "cloud", "secrets", "set", "name", "value", "--output", "json",
