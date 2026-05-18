@@ -2604,6 +2604,21 @@ impl CayenneTableProvider {
             protected_snapshot_ids.len()
         );
 
+        // Parse the current snapshot UUID7 unix timestamp. Directories with a
+        // UUID7 timestamp >= this might be in-flight writes that started after compaction committed
+        // but haven't added themselves to `protected_snapshots` yet.
+        let current_snapshot_unix = uuid::Uuid::parse_str(current_snapshot_id)
+            .ok()
+            .and_then(|u| u.get_timestamp())
+            .map(|ts| ts.to_unix());
+
+        if current_snapshot_unix.is_none() {
+            tracing::warn!(
+                "Unable to extract UUID7 timestamp from current snapshot '{}'; in-flight write protection disabled",
+                current_snapshot_id
+            );
+        }
+
         // Read all entries in the table directory using blocking I/O
         let entries =
             std::fs::read_dir(&table_dir).map_err(|source| CatalogError::IoError { source })?;
@@ -2633,6 +2648,28 @@ impl CayenneTableProvider {
                     snapshot_id
                 );
                 continue;
+            }
+
+            // Skip directories whose UUID7 timestamp is >= the current snapshot.
+            // These might be in-flight writes. Deleting them would cause the writer's final rename to fail with ENOENT.
+            if let Some(current_unix) = current_snapshot_unix {
+                let dir_unix = uuid::Uuid::parse_str(snapshot_id)
+                    .ok()
+                    .and_then(|u| u.get_timestamp())
+                    .map(|ts| ts.to_unix());
+
+                match dir_unix {
+                    Some(ts) if ts >= current_unix => {
+                        tracing::debug!("Keeping snapshot: {snapshot_id} (newer than current)");
+                        continue;
+                    }
+                    None => {
+                        tracing::warn!(
+                            "Unable to extract UUID7 timestamp from snapshot '{snapshot_id}'",
+                        );
+                    }
+                    _ => {}
+                }
             }
 
             // Delete the old snapshot directory using blocking I/O
@@ -8118,6 +8155,7 @@ mod tests {
     use rstest::rstest;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use tempfile::TempDir;
     use test_framework::arrow_record_batch_gen::*;
 
     #[test]
@@ -9194,5 +9232,103 @@ mod tests {
             }
             Ok(completed) => panic!("read fence acquired despite held write fence: {completed:?}"),
         }
+    }
+
+    // =================================
+    // UUID7 snapshot timestamp parsing
+    // =================================
+
+    #[test]
+    fn uuid7_snapshot_timestamp_is_extractable_and_ordered() {
+        // Simulate two snapshot IDs created at different times via Uuid::now_v7().
+        let older = uuid::Uuid::now_v7();
+        // Advance the embedded timestamp by creating a second UUID slightly later.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let newer = uuid::Uuid::now_v7();
+
+        let ts_older = older
+            .get_timestamp()
+            .expect("UUID v7 should have an extractable timestamp")
+            .to_unix();
+        let ts_newer = newer
+            .get_timestamp()
+            .expect("UUID v7 should have an extractable timestamp")
+            .to_unix();
+
+        assert!(
+            ts_older <= ts_newer,
+            "older UUID7 timestamp must be <= newer UUID7 timestamp"
+        );
+
+        // Verify round-trip through string representation (as used by cleanup).
+        let older_str = older.to_string();
+        let newer_str = newer.to_string();
+
+        let parsed_older_ts = uuid::Uuid::parse_str(&older_str)
+            .expect("valid UUID string")
+            .get_timestamp()
+            .expect("parsed UUID v7 should yield a timestamp")
+            .to_unix();
+        let parsed_newer_ts = uuid::Uuid::parse_str(&newer_str)
+            .expect("valid UUID string")
+            .get_timestamp()
+            .expect("parsed UUID v7 should yield a timestamp")
+            .to_unix();
+
+        assert!(
+            parsed_older_ts <= parsed_newer_ts,
+            "timestamp ordering must survive string round-trip"
+        );
+    }
+
+    #[test]
+    fn cleanup_skips_snapshots_newer_than_current() {
+        let tmp = TempDir::new().expect("create temp dir");
+        let table_path = tmp.path().to_str().expect("valid UTF-8 path");
+        let table_id = uuid::Uuid::now_v7().to_string();
+
+        // Create the table directory.
+        let table_dir = tmp.path().join(&table_id);
+        std::fs::create_dir_all(&table_dir).expect("create table dir");
+
+        // Create 3 snapshot directories:
+        // - old_snapshot (older than current) → should be deleted
+        // - current_snapshot → should be kept
+        // - newer_snapshot (newer than current, simulating in-flight write) → should be kept
+        let old_snapshot = uuid::Uuid::now_v7().to_string();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let current_snapshot = uuid::Uuid::now_v7().to_string();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let newer_snapshot = uuid::Uuid::now_v7().to_string();
+
+        std::fs::create_dir(table_dir.join(&old_snapshot)).expect("create old snapshot dir");
+        std::fs::create_dir(table_dir.join(&current_snapshot)).expect("create current dir");
+        std::fs::create_dir(table_dir.join(&newer_snapshot)).expect("create newer dir");
+
+        let protected: HashSet<String> = HashSet::new();
+
+        CayenneTableProvider::cleanup_old_snapshots_blocking(
+            table_path,
+            &table_id,
+            &current_snapshot,
+            &protected,
+        )
+        .expect("cleanup should succeed");
+
+        // old_snapshot should be deleted
+        assert!(
+            !table_dir.join(&old_snapshot).exists(),
+            "old snapshot should be deleted"
+        );
+        // current_snapshot should be kept
+        assert!(
+            table_dir.join(&current_snapshot).exists(),
+            "current snapshot must be preserved"
+        );
+        // newer_snapshot should be kept (in-flight write protection)
+        assert!(
+            table_dir.join(&newer_snapshot).exists(),
+            "snapshot newer than current must be preserved (in-flight write)"
+        );
     }
 }
