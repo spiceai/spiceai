@@ -80,7 +80,7 @@ use std::{
 pub(crate) mod settings;
 
 /// Creates a [`DuckDBTableProviderFactory`] with standard Spice settings (dialect, timezone,
-/// index scan tuning, function deny-list). All DuckDB accelerator consumers should use this
+/// index scan tuning, function deny-list). All `DuckDB` accelerator consumers should use this
 /// to avoid divergent configurations.
 pub(crate) fn create_factory() -> DuckDBTableProviderFactory {
     DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
