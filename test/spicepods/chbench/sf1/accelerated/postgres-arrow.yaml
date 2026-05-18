@@ -130,6 +130,6 @@ datasets:
       pg_replication_slot: spice_supplier
     acceleration:
       <<: *arrow_accel
-      primary_key: s_suppkey
+      primary_key: su_suppkey
       on_conflict:
-        s_suppkey: upsert
+        su_suppkey: upsert

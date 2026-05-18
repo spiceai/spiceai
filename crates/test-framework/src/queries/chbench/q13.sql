@@ -1,14 +1,14 @@
-select
-    c_count, count(*) as custdist
-from
-    (select c_id, count(o_id) as c_count
-     from customer left outer join orders on (
+SELECT
+    c_count, count(*) AS custdist
+FROM
+    (SELECT c_id, count(o_id) AS c_count
+     FROM customer LEFT OUTER JOIN orders ON (
          c_w_id = o_w_id
-         and c_d_id = o_d_id
-         and c_id = o_c_id
-         and o_carrier_id > 8)
-     group by c_id) as c_orders
-group by
+         AND c_d_id = o_d_id
+         AND c_id = o_c_id
+         AND o_carrier_id > 8)
+     GROUP BY c_id) AS c_orders
+GROUP BY
     c_count
-order by
-    custdist desc, c_count desc;
+ORDER BY
+    custdist DESC, c_count DESC;

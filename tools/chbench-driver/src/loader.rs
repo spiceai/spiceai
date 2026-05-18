@@ -590,7 +590,7 @@ async fn load_supplier(client: &Client, rng: &mut impl Rng) -> Result<()> {
     const SUPPLIER_COUNT: i64 = 10_000;
     println!("  loading supplier ({SUPPLIER_COUNT} rows)");
     let mut sink = BatchSink::new(
-        "INSERT INTO supplier (s_suppkey, s_name, s_address, s_nationkey, s_phone, s_acctbal, s_comment) VALUES",
+        "INSERT INTO supplier (su_suppkey, su_name, su_address, su_nationkey, su_phone, su_acctbal, su_comment) VALUES",
     );
     let mut row = String::new();
 
