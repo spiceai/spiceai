@@ -75,7 +75,7 @@ use std::sync::Arc;
 /// snapshot scan path share the full `deleted_pks` index across snapshots
 /// instead of rebuilding a filtered [`DeletionIndex`] per snapshot — the
 /// `min_seq` is a single integer compared against the deletion sequence
-/// number returned by the existing bloom-prefiltered HashMap probe, so it
+/// number returned by the existing bloom-prefiltered `HashMap` probe, so it
 /// adds at most one comparison per confirmed match (which the bloom
 /// rejects most non-matching probes from reaching). `None` means apply every
 /// deletion in `deleted_pks` (main scan path).

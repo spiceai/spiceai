@@ -1916,6 +1916,11 @@ impl MetadataCatalog for CayenneCatalog {
         insert_pk_bytes_list: Vec<Vec<u8>>,
         insert_sequence: i64,
     ) -> CatalogResult<()> {
+        // SQLite param limit chunking (mirrors add_insert_records_batch).
+        const PARAMS_PER_ROW: usize = 4;
+        const MAX_PARAMS: usize = 32_000;
+        const MAX_ROWS_PER_CHUNK: usize = MAX_PARAMS / PARAMS_PER_ROW;
+
         // Atomic replacement for the legacy `add_delete_file × N` +
         // `add_insert_records_batch` sequence in `apply_on_conflict_deletions`.
         // See `crates/cayenne/benches/apply_on_conflict_rpc_ceiling.rs` for the
@@ -1938,11 +1943,6 @@ impl MetadataCatalog for CayenneCatalog {
                 });
             }
         }
-
-        // SQLite param limit chunking (mirrors add_insert_records_batch).
-        const PARAMS_PER_ROW: usize = 4;
-        const MAX_PARAMS: usize = 32_000;
-        const MAX_ROWS_PER_CHUNK: usize = MAX_PARAMS / PARAMS_PER_ROW;
 
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
         if max_attempts == 0 {
