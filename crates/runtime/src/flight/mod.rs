@@ -298,7 +298,12 @@ impl Service {
     ) -> (BoxStream<'static, Result<FlightData, Status>>, CacheStatus) {
         // Reuse the same options for all messages
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
-        let schema = query_result.data.schema();
+        let raw_schema = query_result.data.schema();
+
+        // Expand Utf8View → LargeUtf8 and BinaryView → LargeBinary so the
+        // schema header matches what we advertise in GetFlightInfo and what
+        // clients (e.g. ADBC) expect after seeing that advertisement.
+        let schema = Arc::new(arrow_tools::schema::expand_views_schema(&raw_schema));
 
         // Pre-compute schema flight data once
         let mut dict_tracker = DictionaryTracker::new(true); // Set to true to handle dictionaries
@@ -331,6 +336,9 @@ impl Service {
             while let Some(batch_result) = data_stream.next().await {
                 match batch_result {
                     Ok(batch) => {
+                        // Cast view columns to match the expanded schema we advertised.
+                        let batch = arrow_tools::schema::cast_view_columns(batch, &schema)
+                            .map_err(|e| Status::internal(e.to_string()))?;
                         let (dicts, batch_data) = encoder
                             .encode(&batch, &mut dict_tracker, &options, &mut compression_context)
                             .map_err(|e| Status::internal(e.to_string()))?;

@@ -291,7 +291,7 @@ impl FlightSqlService {
                     Ok(batch) => {
                         // Cast view types to their non-view equivalents to match
                         // the expanded schema we advertised in GetFlightInfo.
-                        let batch = cast_view_columns(batch, &schema)
+                        let batch = arrow_tools::schema::cast_view_columns(batch, &schema)
                             .map_err(|e| Status::internal(e.to_string()))?;
                         let (dicts, batch_data) = encoder
                             .encode(
@@ -315,42 +315,4 @@ impl FlightSqlService {
 
         Ok(stream.boxed())
     }
-}
-
-/// Cast any columns whose type differs from the target schema (e.g.
-/// `Utf8View` → `LargeUtf8`).
-fn cast_view_columns(
-    batch: arrow::array::RecordBatch,
-    target_schema: &Arc<Schema>,
-) -> Result<arrow::array::RecordBatch, arrow::error::ArrowError> {
-    use arrow::compute::cast;
-
-    if batch.num_columns() != target_schema.fields().len() {
-        return Ok(batch);
-    }
-
-    if batch
-        .schema()
-        .fields()
-        .iter()
-        .zip(target_schema.fields().iter())
-        .all(|(s, t)| s.data_type() == t.data_type())
-    {
-        return Ok(batch);
-    }
-
-    let columns = batch
-        .columns()
-        .iter()
-        .zip(target_schema.fields().iter())
-        .map(|(col, target_field)| {
-            if col.data_type() == target_field.data_type() {
-                Ok(Arc::clone(col))
-            } else {
-                cast(col, target_field.data_type())
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    arrow::array::RecordBatch::try_new(Arc::clone(target_schema), columns)
 }
