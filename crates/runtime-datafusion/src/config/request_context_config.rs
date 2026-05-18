@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 //! `ConfigExtension` that carries `RequestContext` trace fields through
-//! transport boundaries that round-trip a DataFusion `SessionConfig` as
+//! transport boundaries that round-trip a `DataFusion` `SessionConfig` as
 //! opaque key/value pairs — primarily the Ballista `TaskDefinition` props
 //! used to ship per-job session config to executors.
 //!

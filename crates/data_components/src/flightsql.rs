@@ -67,6 +67,7 @@ use crate::Read;
 /// from the typed `Arc<RequestContext>` extension on the
 /// [`TaskContext`]'s session config, if one is present. The fixed `01`
 /// trace flag marks the trace as sampled.
+#[must_use]
 pub fn trace_parent_from_task_context(context: &TaskContext) -> Option<String> {
     let request_context = context.session_config().get_extension::<RequestContext>()?;
     let tp = request_context.trace_parent().as_ref()?;
@@ -482,7 +483,7 @@ impl FlightSqlExec {
     }
 
     /// Set an explicit W3C `traceparent` header value to forward on each
-    /// outgoing FlightSQL call. Useful when the plan-creation path has
+    /// outgoing `FlightSQL` call. Useful when the plan-creation path has
     /// access to an `Arc<RequestContext>` but the executor-side
     /// `TaskContext` will not (e.g. when this `ExecutionPlan` is shipped
     /// to a remote executor via Ballista codecs).
@@ -721,9 +722,10 @@ impl ExecutionPlan for FlightSqlExec {
             client.set_header("traceparent", value);
         }
 
-        let inner = query_to_stream(client, sql, Arc::clone(&self.cookie_store)).map(
-            move |result| result.and_then(|batch| coerce_batch_to_schema(&batch, &target_schema)),
-        );
+        let inner =
+            query_to_stream(client, sql, Arc::clone(&self.cookie_store)).map(move |result| {
+                result.and_then(|batch| coerce_batch_to_schema(&batch, &target_schema))
+            });
 
         let timed_stream = stream! {
             futures::pin_mut!(inner);

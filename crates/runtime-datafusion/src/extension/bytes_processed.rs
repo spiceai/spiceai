@@ -18,6 +18,7 @@ limitations under the License.
 #![allow(clippy::missing_panics_doc)]
 
 //! Adds telemetry to leaf nodes (i.e. `TableScans`) to track the number of bytes scanned during query execution.
+use crate::extension::request_context::resolve_request_context;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::Statistics;
@@ -46,7 +47,6 @@ use datafusion::{
     },
 };
 use futures::{Stream, StreamExt};
-use crate::extension::request_context::resolve_request_context;
 use opentelemetry::KeyValue;
 use runtime_request_context::RequestContext;
 use std::pin::Pin;
@@ -300,8 +300,7 @@ impl ExecutionPlan for BytesProcessedExec {
         let stream = self.input_exec.execute(partition, Arc::clone(&context))?;
         let schema = stream.schema();
 
-        let Some(request_context) =
-            resolve_request_context(&context, self.fallback_to_new_context)
+        let Some(request_context) = resolve_request_context(&context, self.fallback_to_new_context)
         else {
             // This should never happen if all queries are run through the query builder, so if it does its a bug we need to catch in development.
             panic!(
@@ -656,10 +655,8 @@ mod tests {
                 .expect("observed protocol mutex should not be poisoned") = protocol;
         }));
 
-        let capturing_exec = Arc::new(BytesProcessedExec::new(
-            exec,
-            Arc::clone(&capture_protocol),
-        )) as Arc<dyn ExecutionPlan>;
+        let capturing_exec = Arc::new(BytesProcessedExec::new(exec, Arc::clone(&capture_protocol)))
+            as Arc<dyn ExecutionPlan>;
 
         let _ = collect(capturing_exec, ctx.task_ctx()).await?;
 

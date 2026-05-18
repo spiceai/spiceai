@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Shared resolution for an `Arc<RequestContext>` from a DataFusion
+//! Shared resolution for an `Arc<RequestContext>` from a `DataFusion`
 //! [`TaskContext`].
 //!
 //! Establishes a canonical lookup order for any Spice exec node that needs
@@ -90,8 +90,10 @@ mod tests {
         let typed = Arc::new(
             RequestContextBuilder::new(Protocol::FlightSQL)
                 .with_trace_parent(Some(TraceParent {
-                    trace_id: TraceId::from_hex("00000000000000000000000000000001").unwrap(),
-                    span_id: SpanId::from_hex("0000000000000001").unwrap(),
+                    trace_id: TraceId::from_hex("00000000000000000000000000000001")
+                        .expect("hardcoded trace_id is valid hex"),
+                    span_id: SpanId::from_hex("0000000000000001")
+                        .expect("hardcoded span_id is valid hex"),
                 }))
                 .build(),
         );
@@ -106,7 +108,8 @@ mod tests {
             .with_extension(Arc::clone(&typed))
             .with_option_extension(config_ext);
 
-        let resolved = resolve_request_context(&task_context(config), false).unwrap();
+        let resolved = resolve_request_context(&task_context(config), false)
+            .expect("typed extension should resolve");
         assert!(matches!(resolved.protocol(), Protocol::FlightSQL));
         // Same Arc — typed extension wins.
         assert!(Arc::ptr_eq(&resolved, &typed));
@@ -121,26 +124,36 @@ mod tests {
         };
         let config = SessionConfig::new().with_option_extension(config_ext);
 
-        let resolved = resolve_request_context(&task_context(config), false).unwrap();
+        let resolved = resolve_request_context(&task_context(config), false)
+            .expect("config extension should resolve");
         assert!(matches!(resolved.protocol(), Protocol::Http));
-        let tp = resolved.trace_parent().as_ref().unwrap();
+        let tp = resolved
+            .trace_parent()
+            .as_ref()
+            .expect("trace_parent should be populated from config");
         assert_eq!(
             tp.trace_id,
-            TraceId::from_hex("0123456789abcdef0123456789abcdef").unwrap()
+            TraceId::from_hex("0123456789abcdef0123456789abcdef")
+                .expect("hardcoded trace_id is valid hex")
         );
-        assert_eq!(tp.span_id, SpanId::from_hex("0123456789abcdef").unwrap());
+        assert_eq!(
+            tp.span_id,
+            SpanId::from_hex("0123456789abcdef").expect("hardcoded span_id is valid hex")
+        );
     }
 
     #[test]
     fn returns_none_when_unpopulated_and_no_fallback() {
-        let config = SessionConfig::new().with_option_extension(SpiceRequestContextConfig::default());
+        let config =
+            SessionConfig::new().with_option_extension(SpiceRequestContextConfig::default());
         assert!(resolve_request_context(&task_context(config), false).is_none());
     }
 
     #[test]
     fn returns_internal_when_fallback_requested() {
         let config = SessionConfig::new();
-        let resolved = resolve_request_context(&task_context(config), true).unwrap();
+        let resolved = resolve_request_context(&task_context(config), true)
+            .expect("fallback should produce internal context");
         assert!(matches!(resolved.protocol(), Protocol::Internal));
     }
 }

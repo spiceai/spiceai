@@ -278,10 +278,11 @@ impl ExecutionPlan for PartialAggregationFlightSqlExec {
             client.set_header("traceparent", value);
         }
 
-        let stream = query_to_stream(client, query.sql, Arc::clone(&self.cookie_store))
-            .map(move |result: std::result::Result<_, DataFusionError>| {
+        let stream = query_to_stream(client, query.sql, Arc::clone(&self.cookie_store)).map(
+            move |result: std::result::Result<_, DataFusionError>| {
                 result.and_then(|batch| remap_batch(&batch, &column_mapping, &target_schema))
-            });
+            },
+        );
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
