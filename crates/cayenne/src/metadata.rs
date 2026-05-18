@@ -283,6 +283,7 @@ impl PkConflictDetection {
 
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VortexConfig {
     /// Footer cache size in MB.
     ///
