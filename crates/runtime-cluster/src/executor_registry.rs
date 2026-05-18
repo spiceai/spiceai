@@ -426,30 +426,21 @@ impl ExecutorRegistry {
     /// one `FlightSQL` table provider per selected executor. The caller decides whether the
     /// table should actually be partitioned (e.g. `AcceleratedPartitionProvider` checks
     /// `AcceleratedTable` downcast in the runtime crate).
-    ///
-    /// This function is called from a synchronous `TablePartitionProvider::get_partitions`
-    /// implementation during `DataFusion` query planning, which runs on Tokio runtime threads.
-    /// `block_in_place` moves the current thread out of the Tokio worker pool for the
-    /// duration of the lock acquisitions, preventing async task starvation.
     #[must_use]
     pub fn resolve_accelerated_partitions(
         &self,
         table: &TableReference,
         schema: &SchemaRef,
     ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
-        tokio::task::block_in_place(|| {
-            let connections = self.connections.blocking_read();
-            let flight_sql_clients = self.flight_sql_clients.blocking_read();
-
-            let executors = ready_executors(&connections, &flight_sql_clients);
-
-            get_partitions_from_store(
-                &self.accelerations_partition_store,
-                &executors,
-                table,
-                schema,
-            )
-        })
+        let connections = self.connections.blocking_read();
+        let flight_sql_clients = self.flight_sql_clients.blocking_read();
+        let executors = ready_executors(&connections, &flight_sql_clients);
+        get_partitions_from_store(
+            &self.accelerations_partition_store,
+            &executors,
+            table,
+            schema,
+        )
     }
 }
 
@@ -616,20 +607,15 @@ impl TablePartitionProvider for FederatedPartitionProvider {
         table: &TableReference,
         schema: &SchemaRef,
     ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
-        // `get_partitions` is called synchronously from DataFusion analyzer rules on Tokio
-        // runtime threads. Use `block_in_place` to move the thread out of the worker pool
-        // while holding the locks, preventing async task starvation.
-        tokio::task::block_in_place(|| {
-            let connections = self.connections.blocking_read();
-            let flight_sql_clients = self.flight_sql_clients.blocking_read();
+        let connections = self.connections.blocking_read();
+        let flight_sql_clients = self.flight_sql_clients.blocking_read();
 
-            let executors = ready_executors(&connections, &flight_sql_clients);
+        let executors = ready_executors(&connections, &flight_sql_clients);
 
-            get_partitions_from_store(&self.partition_store, &executors, table, schema)
-                .into_iter()
-                .map(|(provider, _)| (provider, vec![])) // For now, do not need partition values. Executors only have required data.
-                .collect()
-        })
+        get_partitions_from_store(&self.partition_store, &executors, table, schema)
+            .into_iter()
+            .map(|(provider, _)| (provider, vec![]))
+            .collect()
     }
 }
 
