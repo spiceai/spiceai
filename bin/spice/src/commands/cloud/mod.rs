@@ -28,7 +28,7 @@ use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use snafu::ResultExt;
 use std::{fmt, io::IsTerminal};
 
-pub use client::CloudClient;
+pub use client::{CloudClient, is_device_authorization_denied_error};
 pub use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
 use spice_cloud_client::{
     endpoints::{data_region_name, normalize_data_region},
@@ -967,7 +967,16 @@ async fn execute_login_device_flow(open_browser: bool) -> Result<()> {
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        if let Some(response) = client.exchange_code(&auth_code).await? {
+        let response = match client.exchange_code(&auth_code).await {
+            Ok(response) => response,
+            Err(error) if is_device_authorization_denied_error(&error) => return Err(error),
+            Err(error) => {
+                tracing::debug!("Failed to poll device login status; retrying: {error}");
+                continue;
+            }
+        };
+
+        if let Some(response) = response {
             if response.access_denied {
                 return InvalidArgumentSnafu {
                     message: "Access denied",
@@ -1319,7 +1328,7 @@ async fn execute_logs(args: &LogsArgs) -> Result<()> {
 async fn execute_create(cmd: &CreateCommands) -> Result<()> {
     match cmd {
         CreateCommands::App(args) => {
-            validate_create_app_args(args)?;
+            let create_region = validate_create_app_args(args)?;
 
             let client = CloudClient::new()?;
             let spicepod_content = if let Some(path) = args.spicepod.as_deref() {
@@ -1328,7 +1337,6 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
                 None
             };
 
-            let create_region = normalize_create_app_region(&args.region)?;
             let app = client
                 .create_app(
                     &args.name,
@@ -1412,8 +1420,8 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
     Ok(())
 }
 
-fn validate_create_app_args(args: &CreateAppArgs) -> Result<()> {
-    let _ = normalize_create_app_region(&args.region)?;
+fn validate_create_app_args(args: &CreateAppArgs) -> Result<String> {
+    let region = normalize_create_app_region(&args.region)?;
 
     if args.kind == AppKind::Cluster {
         if args.replicas != Some(1) {
@@ -1443,7 +1451,7 @@ fn validate_create_app_args(args: &CreateAppArgs) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(region)
 }
 
 async fn execute_get(cmd: &GetCommands) -> Result<()> {

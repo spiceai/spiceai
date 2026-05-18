@@ -458,6 +458,7 @@ pub struct OAuthTokenResponse {
     pub token_type: String,
 }
 
+// Debug is intentionally not derived: app_api_key must not appear in logs or error output.
 #[derive(Serialize, Deserialize)]
 pub struct AuthContext {
     pub username: String,

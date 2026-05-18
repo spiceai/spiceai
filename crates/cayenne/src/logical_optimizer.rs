@@ -905,6 +905,11 @@ mod tests {
         num_rows: usize,
     }
 
+    #[derive(Debug)]
+    struct NoStatsTable {
+        inner: MemTable,
+    }
+
     impl StatMemTable {
         fn try_new(
             schema: Arc<Schema>,
@@ -914,6 +919,14 @@ mod tests {
             Ok(Self {
                 inner: MemTable::try_new(schema, batches)?,
                 num_rows,
+            })
+        }
+    }
+
+    impl NoStatsTable {
+        fn try_new(schema: Arc<Schema>, batches: Vec<Vec<RecordBatch>>) -> Result<Self> {
+            Ok(Self {
+                inner: MemTable::try_new(schema, batches)?,
             })
         }
     }
@@ -948,6 +961,35 @@ mod tests {
                 total_byte_size: Precision::Absent,
                 column_statistics: vec![],
             })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TableProvider for NoStatsTable {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> Arc<Schema> {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn datafusion::catalog::Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+
+        fn statistics(&self) -> Option<Statistics> {
+            None
         }
     }
 
@@ -1204,7 +1246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_stats_propagation_matches_unoptimized_results() -> Result<()> {
+    async fn stats_less_provider_propagation_matches_unoptimized_results() -> Result<()> {
         let ctx = SessionContext::new();
         let nation_schema = Arc::new(Schema::new(vec![
             Field::new("n_nationkey", DataType::Int64, false),
@@ -1232,11 +1274,14 @@ mod tests {
 
         ctx.register_table(
             "nation",
-            Arc::new(MemTable::try_new(nation_schema, vec![vec![nation_batch]])?),
+            Arc::new(NoStatsTable::try_new(
+                nation_schema,
+                vec![vec![nation_batch]],
+            )?),
         )?;
         ctx.register_table(
             "supplier",
-            Arc::new(MemTable::try_new(
+            Arc::new(NoStatsTable::try_new(
                 supplier_schema,
                 vec![vec![supplier_batch]],
             )?),

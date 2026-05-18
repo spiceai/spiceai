@@ -273,7 +273,7 @@ fn main() {
     let mut cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {
-            if raw_args_enable_machine_mode() {
+            if raw_args_enable_machine_mode() && should_write_machine_clap_error(&error) {
                 let exit_code = error.exit_code();
                 write_machine_clap_error(&error);
                 std::process::exit(exit_code);
@@ -728,6 +728,15 @@ fn write_machine_clap_error(error: &clap::Error) {
         Ok(body) => eprintln!("{body}"),
         Err(_) => eprintln!("{MACHINE_ERROR_SERIALIZATION_FAILED}"),
     }
+}
+
+fn should_write_machine_clap_error(error: &clap::Error) -> bool {
+    !matches!(
+        error.kind(),
+        clap::error::ErrorKind::DisplayHelp
+            | clap::error::ErrorKind::DisplayVersion
+            | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    )
 }
 
 fn write_machine_error(error: &spice::error::Error) {
@@ -1185,6 +1194,31 @@ mod tests {
         };
 
         assert_eq!(machine_error_code(&error), "invalid_argument");
+    }
+
+    #[test]
+    fn machine_mode_keeps_help_and_version_as_clap_display() {
+        for args in [
+            ["spice", "--machine", "--help"],
+            ["spice", "--machine", "--version"],
+        ] {
+            let Err(error) = Cli::try_parse_from(args) else {
+                panic!("help/version should be clap display");
+            };
+            assert!(
+                !should_write_machine_clap_error(&error),
+                "machine mode should not convert clap display output to JSON"
+            );
+        }
+    }
+
+    #[test]
+    fn machine_mode_writes_json_for_real_parse_errors() {
+        let Err(error) = Cli::try_parse_from(["spice", "--machine", "unknown-command"]) else {
+            panic!("unknown command should be a parse error");
+        };
+
+        assert!(should_write_machine_clap_error(&error));
     }
 
     #[test]
