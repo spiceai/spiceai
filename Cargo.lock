@@ -21467,16 +21467,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vortex-array-macros"
-version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?branch=spiceai-52#e8869db2cfc6b3251646ee669f6a56679e1849c7"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "vortex-btrblocks"
 version = "0.1.0"
 source = "git+https://github.com/spiceai/vortex.git?rev=c765c90de6e1adccb822d0bddfe67d6738cc0d39#c765c90de6e1adccb822d0bddfe67d6738cc0d39"
