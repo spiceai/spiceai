@@ -17,7 +17,7 @@ limitations under the License.
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use aws_sdk_credential_bridge::S3CredentialProvider;
@@ -84,12 +84,18 @@ struct S3StyleState {
     logged: HashSet<String>,
 }
 
+/// Process-wide state for S3 URL style auto-detection. Shared across every
+/// [`SpiceObjectStoreRegistry`] instance so the dedup `logged` set (and any
+/// cached `VirtualHosted` detections) survive registry creation — otherwise
+/// per-dataset registries (created via [`default_runtime_env`] and similar)
+/// each re-emit the same auto-detection log on first lookup.
+static S3_STYLE_STATE: LazyLock<Mutex<S3StyleState>> =
+    LazyLock::new(|| Mutex::new(S3StyleState::default()));
+
 #[derive(Debug)]
 pub struct SpiceObjectStoreRegistry {
     inner: DefaultObjectStoreRegistry,
     io_runtime: Handle,
-    /// State for S3 URL style auto-detection caching and logging.
-    s3_style_state: Mutex<S3StyleState>,
 }
 
 impl SpiceObjectStoreRegistry {
@@ -98,7 +104,6 @@ impl SpiceObjectStoreRegistry {
         Self {
             inner: DefaultObjectStoreRegistry::new(),
             io_runtime,
-            s3_style_state: Mutex::new(S3StyleState::default()),
         }
     }
 
@@ -182,7 +187,7 @@ impl SpiceObjectStoreRegistry {
                     S3UrlStyle::Path
                 } else if let Some(ep) = endpoint {
                     // Non-IP custom endpoint — cached result or DNS probe.
-                    self.resolve_s3_url_style(bucket_name, ep)
+                    Self::resolve_s3_url_style(bucket_name, ep)
                 } else {
                     // No custom endpoint (standard AWS) — vhost.
                     S3UrlStyle::VirtualHosted
@@ -200,11 +205,10 @@ impl SpiceObjectStoreRegistry {
     /// Only definitive results ([`S3UrlStyle::VirtualHosted`], from a successful
     /// DNS resolution) are cached. [`S3UrlStyle::Path`] results are not cached
     /// because a DNS failure may be transient — a later probe could succeed.
-    fn resolve_s3_url_style(&self, bucket_name: &str, endpoint: &str) -> S3UrlStyle {
+    fn resolve_s3_url_style(bucket_name: &str, endpoint: &str) -> S3UrlStyle {
         // Fast path: return cached result without doing any I/O.
         {
-            let state = self
-                .s3_style_state
+            let state = S3_STYLE_STATE
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(&cached) = state.cache.get(endpoint) {
@@ -222,8 +226,7 @@ impl SpiceObjectStoreRegistry {
         };
 
         // Re-acquire lock for double-check and state update.
-        let mut state = self
-            .s3_style_state
+        let mut state = S3_STYLE_STATE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
