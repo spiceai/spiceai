@@ -91,6 +91,8 @@ impl DebeziumKafkaSys {
         &self,
         pool: &SqliteConnectionPool,
     ) -> Result<Option<DebeziumKafkaMetadata>> {
+        type MetadataRow = (String, String, String, String);
+
         let dataset_name = self.dataset_name.clone();
         let schema_needs_ensure = self.schema_needs_ensure();
 
@@ -101,7 +103,6 @@ impl DebeziumKafkaSys {
             });
         };
 
-        type MetadataRow = (String, String, String, String);
         let result = conn
             .conn
             .call(move |conn| {

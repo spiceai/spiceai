@@ -109,10 +109,10 @@ impl KafkaSys {
         }
 
         // Diagnostic-only: surface a warn log when an offset regresses.
-        if let Ok(read_conn) = pool.connect_direct().await {
-            if let Ok(prior) = load_offsets(&read_conn, &self.dataset_name).await {
-                let _ = offsets::merge_offsets(&self.dataset_name, prior, offsets);
-            }
+        if let Ok(read_conn) = pool.connect_direct().await
+            && let Ok(prior) = load_offsets(&read_conn, &self.dataset_name).await
+        {
+            let _ = offsets::merge_offsets(&self.dataset_name, prior, offsets);
         }
 
         let mut conn = pool.connect_direct().await.map_err(Error::external)?;

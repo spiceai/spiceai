@@ -373,7 +373,7 @@ mod tests {
         );
     }
 
-    /// Regression for finding #2: upsert_offsets must succeed even when no
+    /// Regression for finding #2: `upsert_offsets` must succeed even when no
     /// metadata row exists.
     #[tokio::test]
     async fn test_duckdb_offsets_update_succeeds_without_metadata_row() {
