@@ -95,6 +95,10 @@ pub struct SetSnapshotArgs {
 
     /// The snapshot ID to set as current
     pub snapshot_id: u64,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 /// Snapshot information from the API.
@@ -130,7 +134,7 @@ struct SetCurrentSnapshotRequest {
 }
 
 /// Generic message response.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct MessageResponse {
     message: String,
 }
@@ -332,6 +336,10 @@ async fn execute_set_snapshot(ctx: &RuntimeContext, args: &SetSnapshotArgs) -> R
         }
         .build()
     })?;
+
+    if matches!(args.output, OutputFormat::Json) {
+        return write_json(&result);
+    }
 
     tracing::info!("{}", result.message);
 

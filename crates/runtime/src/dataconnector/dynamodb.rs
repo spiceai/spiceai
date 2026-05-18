@@ -469,9 +469,9 @@ impl DataConnector for DynamoDB {
                 let dynamodb_sys = Arc::new(if dataset.is_file_accelerated() {
                     initialize_dynamodb_sys(&dataset).await
                 } else {
-                    tracing::info!(
+                    tracing::warn!(
                         dataset = %dataset_name,
-                        "DynamoDB Streams dataset is not file-accelerated. Lag will not be persisted"
+                        "DynamoDB Streams dataset is not file-accelerated. Connector state is ephemeral and the stream will restart on every runtime restart"
                     );
                     None
                 });
@@ -513,13 +513,13 @@ impl DataConnector for DynamoDB {
 }
 
 async fn initialize_dynamodb_sys(dataset: &Dataset) -> Option<DynamoDBSys> {
-    match DynamoDBSys::try_new(dataset, OpenOption::OpenExisting).await {
+    match DynamoDBSys::try_new(dataset, OpenOption::CreateIfNotExists).await {
         Ok(sys) => Some(sys),
         Err(err) => {
             tracing::error!(
                 dataset = %dataset.name,
                 error = ?err,
-                "Failed to initialize local storage for lag persistence. Lag will not be persisted"
+                "Failed to initialize DynamoDB Streams sidecar checkpoint storage. Connector state is ephemeral and the stream will restart on every runtime restart"
             );
             None
         }

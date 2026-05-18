@@ -263,7 +263,7 @@ fn additional_columns_of_schema(schema: &SchemaRef, primary_key: &[Column]) -> V
         .iter()
         .filter_map(|f| {
             let name = f.name();
-            let col = Column::from_qualified_name(f.name());
+            let col = Column::from_name(f.name());
             if [SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME].contains(&name.as_str())
                 || primary_key.contains(&col)
             {
@@ -531,6 +531,34 @@ mod tests {
         assert_eq!(
             additional_columns_of_schema(&schema, primary_keys.as_slice()),
             vec![Column::from_name("additional")]
+        );
+    }
+
+    /// Regression test for #10631: mixed-case column names (e.g. `LocationID`) must
+    /// retain their original casing through `additional_columns_of_schema`. Using
+    /// `Column::from_qualified_name` here would lowercase the identifier and cause
+    /// downstream plan resolution to fail with `No field named locationid` against
+    /// a schema that registered the field as `"LocationID"`.
+    #[test]
+    fn test_additional_columns_of_schema_preserves_mixed_case() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Int8, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Int8, false),
+            Field::new("LocationID", DataType::Utf8, false),
+            Field::new("Borough", DataType::Utf8, false),
+            Field::new("service_zone", DataType::Utf8, false),
+        ]));
+        let primary_keys = vec![Column::from_name("LocationID")];
+        let additional = additional_columns_of_schema(&schema, primary_keys.as_slice());
+        let names: Vec<String> = additional.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["Borough".to_string(), "service_zone".to_string()]
+        );
+        // Make sure no column got lowercased on its way through.
+        assert!(
+            !names.iter().any(|n| n == "borough"),
+            "expected Borough to retain mixed case, got {names:?}"
         );
     }
 

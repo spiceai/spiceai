@@ -109,7 +109,7 @@ struct ApplyContext<'a> {
     write_session_state: &'a SessionState,
     commit_timeout: Duration,
     pending_finalize: &'a mut Option<PendingApplyFinalize>,
-    pending_commit: &'a mut Option<tokio::task::JoinHandle<()>>,
+    pending_commit: &'a mut Option<tokio::task::JoinHandle<Result<(), String>>>,
 }
 
 struct WriteChangeOutcome {
@@ -418,8 +418,10 @@ impl RefreshTask {
         // apply once the accelerator write has succeeded. Before publishing a
         // new commit task we drain the previous one with `commit_timeout`, so
         // commit(N) overlaps apply(N+1) without accumulating an unbounded chain
-        // of tasks if the source-side commit path stalls.
-        let mut pending_commit: Option<tokio::task::JoinHandle<()>> = None;
+        // of tasks if the source-side commit path stalls. Commit task errors
+        // are returned through `join_pending_commit` so source offsets cannot
+        // silently stop advancing.
+        let mut pending_commit: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
         let mut pending_finalize: Option<PendingApplyFinalize> = None;
         let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
         let write_ctx = SessionContext::new();
@@ -1337,7 +1339,7 @@ async fn join_pending_finalize(
 /// would leave the dataset healthy while source-side offsets stop advancing)
 /// but treats cancellation during shutdown as expected.
 async fn join_pending_commit(
-    mut handle: tokio::task::JoinHandle<()>,
+    mut handle: tokio::task::JoinHandle<Result<(), String>>,
     dataset_name: &TableReference,
     is_shutdown: bool,
     commit_timeout: Duration,
@@ -1361,7 +1363,8 @@ async fn join_pending_commit(
                     tracing::error!("{error_message}");
                     Some(error_message)
                 }
-                Ok(()) => None,
+                Ok(Ok(())) => None,
+                Ok(Err(error_message)) => Some(error_message),
             }
         }
         () = tokio::time::sleep(commit_timeout) => {
@@ -1388,7 +1391,7 @@ fn spawn_ordered_commit_task(
     committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
     runtime_status: Arc<status::RuntimeStatus>,
     commit_dataset: TableReference,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
         // Safe catch-up mode: this task is spawned only after the accelerator
         // write returns successfully. For Cayenne staged appends, that return
@@ -1401,9 +1404,13 @@ fn spawn_ordered_commit_task(
             if let Err(e) = committer.commit().await
                 && !runtime_status.is_shutdown()
             {
-                tracing::error!("Failed to commit CDC change envelope for {commit_dataset}: {e}");
+                let error_message =
+                    format!("Failed to commit CDC change envelope for {commit_dataset}: {e}");
+                tracing::error!("{error_message}");
+                return Err(error_message);
             }
         }
+        Ok(())
     })
 }
 
@@ -2976,7 +2983,7 @@ mod tests {
     #[tokio::test]
     async fn test_join_pending_commit_ignores_cancel_during_shutdown() {
         let dataset_name = TableReference::bare("test");
-        let handle = tokio::spawn(std::future::pending::<()>());
+        let handle = tokio::spawn(std::future::pending::<Result<(), String>>());
         handle.abort();
 
         let result = join_pending_commit(handle, &dataset_name, true, Duration::from_secs(5)).await;
