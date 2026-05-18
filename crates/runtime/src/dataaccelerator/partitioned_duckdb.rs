@@ -54,7 +54,10 @@ use tokio::{fs::create_dir_all, sync::Mutex};
 
 use super::{
     AccelerationSource, BootstrapStatus, DataAccelerator,
-    duckdb::{DuckDBAccelerator, create_table_provider, settings::OrderByNonIntegerLiteral},
+    duckdb::{
+        DuckDBAccelerator, create_table_provider,
+        settings::{OrderByNonIntegerLiteral, TimeZone},
+    },
 };
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
@@ -490,7 +493,9 @@ fn create_factory() -> DuckDBTableProviderFactory {
     DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
         .with_dialect(new_duckdb_dialect())
         .with_settings_registry(
-            DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
+            DuckDBSettingsRegistry::new()
+                .with_setting(Box::new(OrderByNonIntegerLiteral))
+                .with_setting(Box::new(TimeZone)),
         )
         .with_function_support(deny_spice_functions_for_duckdb().as_ref().clone())
 }
