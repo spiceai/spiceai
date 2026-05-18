@@ -1,17 +1,13 @@
-select
-    o_ol_cnt, count(*) as order_count
-from
+SELECT
+    o_ol_cnt,
+    count(*) as order_count
+FROM
     orders
-where
-    o_entry_d >= '2007-01-02 00:00:00.000000'
-    and o_entry_d < '2032-01-02 00:00:00.000000'
-    and exists (select *
-                from order_line
-                where o_id = ol_o_id
-                  and o_w_id = ol_w_id
-                  and o_d_id = ol_d_id
-                  and ol_delivery_d >= o_entry_d)
-group by
-    o_ol_cnt
-order by
-    o_ol_cnt;
+WHERE exists (SELECT *
+              FROM order_line
+              WHERE o_id = ol_o_id
+                AND o_w_id = ol_w_id
+                AND o_d_id = ol_d_id
+                AND ol_delivery_d >= o_entry_d)
+GROUP BY o_ol_cnt
+ORDER BY o_ol_cnt;

@@ -1,8 +1,8 @@
-select
-    sum(ol_amount) as revenue
-from
+SELECT
+    sum(ol_amount) AS revenue
+FROM
     order_line
-where
+WHERE
     ol_delivery_d >= '1997-01-01 00:00:00'
-    and ol_delivery_d < '2030-01-01 00:00:00'
-    and ol_quantity between 1 and 100000;
+    AND ol_delivery_d < '2030-01-01 00:00:00'
+    AND ol_quantity BETWEEN 1 AND 100000;

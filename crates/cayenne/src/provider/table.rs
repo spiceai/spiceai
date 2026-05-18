@@ -1819,13 +1819,7 @@ impl CayenneTableProvider {
         // fails with NotFound. Sleeping `OLD_SNAPSHOT_CLEANUP_GRACE` before
         // deleting lets every plan that began under the old listing table
         // finish opening its files.
-        const OLD_SNAPSHOT_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
-
-        // Collect protected snapshot IDs to preserve during cleanup
-        let protected_snapshot_ids: HashSet<String> = {
-            let guard = self.protected_snapshots.read();
-            guard.keys().cloned().collect()
-        };
+        const OLD_SNAPSHOT_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
 
         if self.table_metadata.path.starts_with("s3://") {
             // S3 cleanup uses `self.cleanup_old_snapshots_s3` which holds
@@ -1834,6 +1828,13 @@ impl CayenneTableProvider {
             // `OLD_SNAPSHOT_CLEANUP_GRACE` only delays the next compaction
             // cycle, not user writes or scans.
             tokio::time::sleep(OLD_SNAPSHOT_CLEANUP_GRACE).await;
+            // Read the LIVE protected set after the grace period. During the
+            // sleep, CDC writers may have created new protected snapshots that
+            // must not be deleted.
+            let protected_snapshot_ids: HashSet<String> = {
+                let guard = self.protected_snapshots.read();
+                guard.keys().cloned().collect()
+            };
             if let Err(err) = self
                 .cleanup_old_snapshots_s3(current_snapshot, &protected_snapshot_ids)
                 .await
@@ -1847,8 +1848,19 @@ impl CayenneTableProvider {
             let table_path = self.table_metadata.path.clone();
             let table_id = self.table_metadata.table_id.clone();
             let current_snapshot = current_snapshot.to_string();
+            let protected_snapshots = Arc::clone(&self.protected_snapshots);
             tokio::spawn(async move {
                 tokio::time::sleep(OLD_SNAPSHOT_CLEANUP_GRACE).await;
+                // Read the LIVE protected set after the grace period. During the
+                // sleep, CDC writers may have created new protected snapshots
+                // that must not be deleted. Capturing the set before the sleep
+                // caused a race: compaction clears `protected_snapshots` at
+                // commit time, new CDC writes re-populate it, then the stale
+                // (empty) captured set causes cleanup to delete them.
+                let protected_snapshot_ids: HashSet<String> = {
+                    let guard = protected_snapshots.read();
+                    guard.keys().cloned().collect()
+                };
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Err(e) = Self::cleanup_old_snapshots_blocking(
                         &table_path,
@@ -2599,6 +2611,21 @@ impl CayenneTableProvider {
             protected_snapshot_ids.len()
         );
 
+        // Parse the current snapshot UUID7 unix timestamp. Directories with a
+        // UUID7 timestamp >= this might be in-flight writes that started after compaction committed
+        // but haven't added themselves to `protected_snapshots` yet.
+        let current_snapshot_unix = uuid::Uuid::parse_str(current_snapshot_id)
+            .ok()
+            .and_then(|u| u.get_timestamp())
+            .map(|ts| ts.to_unix());
+
+        if current_snapshot_unix.is_none() {
+            tracing::warn!(
+                "Unable to extract UUID7 timestamp from current snapshot '{}'; in-flight write protection disabled",
+                current_snapshot_id
+            );
+        }
+
         // Read all entries in the table directory using blocking I/O
         let entries =
             std::fs::read_dir(&table_dir).map_err(|source| CatalogError::IoError { source })?;
@@ -2628,6 +2655,28 @@ impl CayenneTableProvider {
                     snapshot_id
                 );
                 continue;
+            }
+
+            // Skip directories whose UUID7 timestamp is >= the current snapshot.
+            // These might be in-flight writes. Deleting them would cause the writer's final rename to fail with ENOENT.
+            if let Some(current_unix) = current_snapshot_unix {
+                let dir_unix = uuid::Uuid::parse_str(snapshot_id)
+                    .ok()
+                    .and_then(|u| u.get_timestamp())
+                    .map(|ts| ts.to_unix());
+
+                match dir_unix {
+                    Some(ts) if ts >= current_unix => {
+                        tracing::debug!("Keeping snapshot: {snapshot_id} (newer than current)");
+                        continue;
+                    }
+                    None => {
+                        tracing::warn!(
+                            "Unable to extract UUID7 timestamp from snapshot '{snapshot_id}'",
+                        );
+                    }
+                    _ => {}
+                }
             }
 
             // Delete the old snapshot directory using blocking I/O
@@ -5464,6 +5513,22 @@ impl CayenneTableProvider {
         );
     }
 
+    /// Drop the in-memory inline-memtable view: zero the cached row count
+    /// and bump `inlined_generation` so the next scan rebuilds from the
+    /// (presumably now-empty) catalog.
+    ///
+    /// Call this after a catalog operation that wipes
+    /// `cayenne_inlined_data` / `cayenne_inlined_delete` rows for the
+    /// table outside the inline-mutation path — e.g. `commit_overwrite`,
+    /// which clears those tables atomically with the snapshot pointer
+    /// flip but does not flow through `commit_inlined_data_mutation`.
+    /// Without this bump, scans keep serving the pre-overwrite cache and
+    /// row counts read high (old inline rows + new snapshot rows).
+    pub(crate) fn invalidate_inlined_cache(&self) {
+        self.inlined_row_count.store(0, Ordering::Relaxed);
+        self.inlined_generation.fetch_add(1, Ordering::Release);
+    }
+
     /// Get the current snapshot ID.
     ///
     /// This returns the live snapshot ID which may differ from `table_metadata.current_snapshot_id`
@@ -6313,16 +6378,19 @@ impl CayenneTableProvider {
         // `clear_staging_dir`, `ensure_no_incomplete_write`, and the
         // compaction trigger.
         //
-        // Why the threshold is `inline_flush_max_bytes / inline_max_bytes`:
-        // every `commit_inlined_data_mutation` call from the inline-write
-        // path adds at most 1 inline entry, with at most `inline_max_bytes`
-        // of IPC payload and at most `inline_max_rows` rows.
+        // Why the threshold is `inline_flush_max_bytes / inline_max_bytes`
+        // (runtime values derived from `DEFAULT_INLINE_FLUSH_MAX_BYTES`,
+        // `DEFAULT_INLINE_FLUSH_MAX_SEGMENTS`, `DEFAULT_INLINE_FLUSH_MAX_ROWS`,
+        // and `DEFAULT_INLINE_MAX_BYTES`): every `commit_inlined_data_mutation`
+        // call from the inline-write path adds at most 1 inline entry, with
+        // at most `inline_max_bytes` of IPC payload and at most
+        // `inline_max_rows` rows.
         // Cached `inlined_row_count` ≥ number of commits (each commit
         // contributes ≥ 1 row). So:
         //   - commits ≤ cached_rows
-        //   - entries  ≤ commits          ≤ cached_rows < inline_flush_max_segments
-        //   - bytes    ≤ commits·max_ipc  ≤ cached_rows·max_ipc < inline_flush_max_bytes
-        // when `cached_rows < inline_flush_max_bytes / inline_max_bytes`.
+        //   - entries  ≤ commits          ≤ cached_rows < INLINE_FLUSH_MAX_SEGMENTS
+        //   - bytes    ≤ commits·max_ipc  ≤ cached_rows·max_ipc < INLINE_FLUSH_MAX_BYTES
+        // when `cached_rows < INLINE_FLUSH_MAX_BYTES / INLINE_MAX_BYTES`.
         // The bytes bound usually dominates the safe-skip region.
         //
         // For workloads with many small rows per commit (typical CDC: a
@@ -8129,6 +8197,7 @@ mod tests {
     use rstest::rstest;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use tempfile::TempDir;
     use test_framework::arrow_record_batch_gen::*;
 
     #[test]
@@ -9255,5 +9324,103 @@ mod tests {
             }
             Ok(completed) => panic!("read fence acquired despite held write fence: {completed:?}"),
         }
+    }
+
+    // =================================
+    // UUID7 snapshot timestamp parsing
+    // =================================
+
+    #[test]
+    fn uuid7_snapshot_timestamp_is_extractable_and_ordered() {
+        // Simulate two snapshot IDs created at different times via Uuid::now_v7().
+        let older = uuid::Uuid::now_v7();
+        // Advance the embedded timestamp by creating a second UUID slightly later.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let newer = uuid::Uuid::now_v7();
+
+        let ts_older = older
+            .get_timestamp()
+            .expect("UUID v7 should have an extractable timestamp")
+            .to_unix();
+        let ts_newer = newer
+            .get_timestamp()
+            .expect("UUID v7 should have an extractable timestamp")
+            .to_unix();
+
+        assert!(
+            ts_older <= ts_newer,
+            "older UUID7 timestamp must be <= newer UUID7 timestamp"
+        );
+
+        // Verify round-trip through string representation (as used by cleanup).
+        let older_str = older.to_string();
+        let newer_str = newer.to_string();
+
+        let parsed_older_ts = uuid::Uuid::parse_str(&older_str)
+            .expect("valid UUID string")
+            .get_timestamp()
+            .expect("parsed UUID v7 should yield a timestamp")
+            .to_unix();
+        let parsed_newer_ts = uuid::Uuid::parse_str(&newer_str)
+            .expect("valid UUID string")
+            .get_timestamp()
+            .expect("parsed UUID v7 should yield a timestamp")
+            .to_unix();
+
+        assert!(
+            parsed_older_ts <= parsed_newer_ts,
+            "timestamp ordering must survive string round-trip"
+        );
+    }
+
+    #[test]
+    fn cleanup_skips_snapshots_newer_than_current() {
+        let tmp = TempDir::new().expect("create temp dir");
+        let table_path = tmp.path().to_str().expect("valid UTF-8 path");
+        let table_id = uuid::Uuid::now_v7().to_string();
+
+        // Create the table directory.
+        let table_dir = tmp.path().join(&table_id);
+        std::fs::create_dir_all(&table_dir).expect("create table dir");
+
+        // Create 3 snapshot directories:
+        // - old_snapshot (older than current) → should be deleted
+        // - current_snapshot → should be kept
+        // - newer_snapshot (newer than current, simulating in-flight write) → should be kept
+        let old_snapshot = uuid::Uuid::now_v7().to_string();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let current_snapshot = uuid::Uuid::now_v7().to_string();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let newer_snapshot = uuid::Uuid::now_v7().to_string();
+
+        std::fs::create_dir(table_dir.join(&old_snapshot)).expect("create old snapshot dir");
+        std::fs::create_dir(table_dir.join(&current_snapshot)).expect("create current dir");
+        std::fs::create_dir(table_dir.join(&newer_snapshot)).expect("create newer dir");
+
+        let protected: HashSet<String> = HashSet::new();
+
+        CayenneTableProvider::cleanup_old_snapshots_blocking(
+            table_path,
+            &table_id,
+            &current_snapshot,
+            &protected,
+        )
+        .expect("cleanup should succeed");
+
+        // old_snapshot should be deleted
+        assert!(
+            !table_dir.join(&old_snapshot).exists(),
+            "old snapshot should be deleted"
+        );
+        // current_snapshot should be kept
+        assert!(
+            table_dir.join(&current_snapshot).exists(),
+            "current snapshot must be preserved"
+        );
+        // newer_snapshot should be kept (in-flight write protection)
+        assert!(
+            table_dir.join(&newer_snapshot).exists(),
+            "snapshot newer than current must be preserved (in-flight write)"
+        );
     }
 }

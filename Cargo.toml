@@ -127,7 +127,7 @@ aws-sdk-cognitoidentity = "1.99.0"
 aws-sdk-cognitoidentityprovider = "1.116.0"
 aws-sdk-dynamodb = "1.111.0"
 aws-sdk-dynamodbstreams = "1.99.0"
-aws-sdk-glue = "1.145.0"
+aws-sdk-glue = "1.145.1"
 aws-sdk-s3 = "1.132.0"
 aws-sdk-s3vectors = "1.24.0"
 aws-sdk-secretsmanager = "1.104.0"
@@ -347,12 +347,12 @@ flatbuffers = "25.2.10"
 # Vortex tagged releases publish version 0.1.0 in their Cargo.toml, not the actual release version,
 # so we specify git deps here directly. The [patch.crates-io] entries below exist to override
 # transitive vortex dependencies pulled in by other patched crates.
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-datafusion = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "c765c90de6e1adccb822d0bddfe67d6738cc0d39" } # spiceai-52.5
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "c765c90de6e1adccb822d0bddfe67d6738cc0d39" } # spiceai-52.5
+vortex-datafusion = { git = "https://github.com/spiceai/vortex.git", rev = "c765c90de6e1adccb822d0bddfe67d6738cc0d39" } # spiceai-52.5
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "c765c90de6e1adccb822d0bddfe67d6738cc0d39" } # spiceai-52.5
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "c765c90de6e1adccb822d0bddfe67d6738cc0d39" } # spiceai-52.5
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "c765c90de6e1adccb822d0bddfe67d6738cc0d39" } # spiceai-52.5
 
 x509-certificate = "0.25.0"
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "4c63970cf1d78c71eb69e2f4346d5d4795631b47" } # branch: trunk
@@ -426,9 +426,9 @@ datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev 
 
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "b798c391b6566c172d44361f8acc8472c958ca75" } # spiceai-52
 
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "383e165a080d648c313a2530a3a53eae6077fdba" }      # spiceai-52.5
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "383e165a080d648c313a2530a3a53eae6077fdba" } # spiceai-52.5
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "383e165a080d648c313a2530a3a53eae6077fdba" } # spiceai-52.5
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "c25e25b9e88c50404e230c698a35cbde2fdd30ae" }      # spiceai-52.5
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "c25e25b9e88c50404e230c698a35cbde2fdd30ae" } # spiceai-52.5
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "c25e25b9e88c50404e230c698a35cbde2fdd30ae" } # spiceai-52.5
 
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "47034733a0477f72e4f6abbbf6a27d0da069860a" } # spiceai-0.18.2
 
@@ -470,9 +470,9 @@ parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "96190c47f7a1
 
 object_store = { git = "https://github.com/apache/arrow-rs-object-store", rev = "f0a772cd49d2ebb1f19f487ccd93d705f48dc891" }
 
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-datafusion = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "c765c90de6e1adccb822d0bddfe67d6738cc0d39" } # spiceai-52.5
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "c765c90de6e1adccb822d0bddfe67d6738cc0d39" } # spiceai-52.5
+vortex-datafusion = { git = "https://github.com/spiceai/vortex.git", rev = "c765c90de6e1adccb822d0bddfe67d6738cc0d39" } # spiceai-52.5
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "c765c90de6e1adccb822d0bddfe67d6738cc0d39" } # spiceai-52.5
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "c765c90de6e1adccb822d0bddfe67d6738cc0d39" } # spiceai-52.5
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "c765c90de6e1adccb822d0bddfe67d6738cc0d39" } # spiceai-52.5

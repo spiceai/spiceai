@@ -2417,13 +2417,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_write_concurrency_is_resolved_per_dataset() {
+    #[tokio::test]
+    async fn test_write_concurrency_is_resolved_per_dataset() {
         let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
 
         let mut hot_dataset = DatasetBuilder::try_new("hot".to_string(), "hot")
             .expect("hot dataset builder")
             .with_app(Arc::clone(&app))
+            .with_runtime(Arc::clone(&rt))
             .build()
             .expect("hot dataset");
         hot_dataset.acceleration = Some(Acceleration {
@@ -2438,6 +2440,7 @@ mod tests {
         let mut quiet_dataset = DatasetBuilder::try_new("quiet".to_string(), "quiet")
             .expect("quiet dataset builder")
             .with_app(app)
+            .with_runtime(rt)
             .build()
             .expect("quiet dataset");
         quiet_dataset.acceleration = Some(Acceleration {
@@ -2456,13 +2459,15 @@ mod tests {
         assert_eq!(quiet.write_concurrency, Some(2));
     }
 
-    #[test]
-    fn test_inline_thresholds_are_resolved_from_acceleration_params() {
+    #[tokio::test]
+    async fn test_inline_thresholds_are_resolved_from_acceleration_params() {
         let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
 
         let mut dataset = DatasetBuilder::try_new("cdc_hot".to_string(), "cdc_hot")
             .expect("dataset builder")
             .with_app(app)
+            .with_runtime(rt)
             .build()
             .expect("dataset");
         dataset.acceleration = Some(Acceleration {
