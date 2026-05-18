@@ -791,15 +791,6 @@ mod tests {
         );
     }
 
-    fn dummy_flight_sql_client() -> FlightSqlClient {
-        let channel = tonic::transport::Channel::from_static("http://[::1]:50051").connect_lazy();
-        let cookie_channel = flight_client::cookie::CookieService::new(
-            channel,
-            Arc::new(flight_client::cookie::CookieStore::new()),
-        );
-        arrow_flight::sql::client::FlightSqlServiceClient::new(cookie_channel)
-    }
-
     /// Verify `ready_executors` includes executors present in both maps.
     #[tokio::test]
     async fn ready_executors_includes_fully_registered() {
