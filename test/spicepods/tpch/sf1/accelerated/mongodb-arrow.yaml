@@ -13,6 +13,7 @@ definitions:
     mongodb_user: root
     mongodb_pass: ${env:MONGODB_PASSWORD}
     mongodb_sslmode: disabled
+    mongodb_direct_connection: "true"
   - &acceleration
     enabled: true
     engine: arrow

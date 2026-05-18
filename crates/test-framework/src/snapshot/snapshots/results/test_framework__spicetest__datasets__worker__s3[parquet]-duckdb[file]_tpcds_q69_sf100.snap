@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q69"
+---
++-----------+-------------------+---------------------+------+----------------------+------+------------------+------+
+| cd_gender | cd_marital_status | cd_education_status | cnt1 | cd_purchase_estimate | cnt2 | cd_credit_rating | cnt3 |
++-----------+-------------------+---------------------+------+----------------------+------+------------------+------+
+| F         | D                 | 2 yr Degree         | 3    | 500                  | 3    | Good             | 3    |
+| F         | D                 | 2 yr Degree         | 10   | 500                  | 10   | High Risk        | 10   |
+| F         | D                 | 2 yr Degree         | 6    | 500                  | 6    | Low Risk         | 6    |
+| F         | D                 | 2 yr Degree         | 5    | 500                  | 5    | Unknown          | 5    |
+| F         | D                 | 2 yr Degree         | 6    | 1000                 | 6    | Good             | 6    |
+| F         | D                 | 2 yr Degree         | 5    | 1000                 | 5    | High Risk        | 5    |
+| F         | D                 | 2 yr Degree         | 6    | 1000                 | 6    | Low Risk         | 6    |
+| F         | D                 | 2 yr Degree         | 11   | 1000                 | 11   | Unknown          | 11   |
+| F         | D                 | 2 yr Degree         | 11   | 1500                 | 11   | Good             | 11   |
+| F         | D                 | 2 yr Degree         | 3    | 1500                 | 3    | High Risk        | 3    |
++-----------+-------------------+---------------------+------+----------------------+------+------------------+------+
