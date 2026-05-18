@@ -52,7 +52,7 @@
 //! Throughput is reported in "cycles" so the gap is a clean 2× at the
 //! ceiling.
 
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used)]
 
 use std::hint::black_box;
 use std::sync::Arc;

@@ -305,10 +305,6 @@ pub trait MetadataCatalog: Send + Sync {
     /// [`crate::provider::table::CayenneTableProvider::apply_on_conflict_deletions`]
     /// for the original sequence.
     ///
-    /// Returns the assigned delete-file IDs in the same order as
-    /// `delete_files`, so the caller can correlate them with the
-    /// physical files it just wrote.
-    ///
     /// # Errors
     ///
     /// Returns an error if the transaction cannot be opened, any insert
@@ -320,7 +316,7 @@ pub trait MetadataCatalog: Send + Sync {
         table_id: &str,
         insert_pk_bytes_list: Vec<Vec<u8>>,
         insert_sequence: i64,
-    ) -> CatalogResult<Vec<String>>;
+    ) -> CatalogResult<()>;
 
     /// Get all insert records for a table.
     ///

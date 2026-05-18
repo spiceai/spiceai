@@ -53,6 +53,7 @@ const MIN_BLOOM_CAPACITY: usize = 64;
 pub struct DeletionIndex {
     entries: HashMap<i64, i64>,
     bloom: BloomFilter,
+    max_sequence_number: Option<i64>,
     /// Item count the current `bloom` was sized for. When `entries.len()` exceeds
     /// `2 * bloom_capacity`, `extend_max` rebuilds the bloom from scratch to keep the
     /// false-positive rate bounded; otherwise it inserts incrementally.
@@ -73,6 +74,7 @@ impl DeletionIndex {
         Self {
             entries: HashMap::new(),
             bloom: BloomFilter::new(MIN_BLOOM_CAPACITY),
+            max_sequence_number: None,
             bloom_capacity: MIN_BLOOM_CAPACITY,
         }
     }
@@ -85,9 +87,11 @@ impl DeletionIndex {
         for &pk in entries.keys() {
             bloom.insert(hash_key(&pk));
         }
+        let max_sequence_number = entries.values().copied().max();
         Self {
             entries,
             bloom,
+            max_sequence_number,
             bloom_capacity: capacity,
         }
     }
@@ -108,6 +112,12 @@ impl DeletionIndex {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Highest delete sequence number in this index, if any.
+    #[must_use]
+    pub fn max_sequence_number(&self) -> Option<i64> {
+        self.max_sequence_number
     }
 
     /// Bloom-filter check. Returns `false` if the key is definitely not in the index;
@@ -158,20 +168,26 @@ impl DeletionIndex {
     #[must_use]
     pub fn extend_max(&self, additions: impl IntoIterator<Item = (i64, i64)>) -> Self {
         let mut entries = self.entries.clone();
+        let mut max_sequence_number = self.max_sequence_number;
         // Track newly-inserted keys so the bloom can be updated incrementally
         // without re-iterating the entire entry set.
         let mut new_keys: Vec<i64> = Vec::new();
         for (pk, seq) in additions {
-            match entries.entry(pk) {
+            let stored_sequence = match entries.entry(pk) {
                 std::collections::hash_map::Entry::Occupied(mut e) => {
                     let existing = *e.get();
-                    *e.get_mut() = existing.max(seq);
+                    let stored_sequence = existing.max(seq);
+                    *e.get_mut() = stored_sequence;
+                    stored_sequence
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
                     e.insert(seq);
                     new_keys.push(pk);
+                    seq
                 }
-            }
+            };
+            max_sequence_number =
+                Some(max_sequence_number.map_or(stored_sequence, |max| max.max(stored_sequence)));
         }
 
         let new_len = entries.len();
@@ -190,6 +206,7 @@ impl DeletionIndex {
             return Self {
                 entries,
                 bloom,
+                max_sequence_number,
                 bloom_capacity: new_capacity,
             };
         }
@@ -203,6 +220,7 @@ impl DeletionIndex {
         Self {
             entries,
             bloom,
+            max_sequence_number,
             bloom_capacity: self.bloom_capacity,
         }
     }
@@ -217,6 +235,7 @@ impl DeletionIndex {
 pub struct KeyDeletionIndex {
     entries: HashMap<Box<[u8]>, i64>,
     bloom: BloomFilter,
+    max_sequence_number: Option<i64>,
     /// Item count the current `bloom` was sized for. Mirrors
     /// [`DeletionIndex::bloom_capacity`] to amortize bloom rebuilds.
     bloom_capacity: usize,
@@ -235,6 +254,7 @@ impl KeyDeletionIndex {
         Self {
             entries: HashMap::new(),
             bloom: BloomFilter::new(MIN_BLOOM_CAPACITY),
+            max_sequence_number: None,
             bloom_capacity: MIN_BLOOM_CAPACITY,
         }
     }
@@ -247,9 +267,11 @@ impl KeyDeletionIndex {
         for key in entries.keys() {
             bloom.insert(hash_key(&key.as_ref()));
         }
+        let max_sequence_number = entries.values().copied().max();
         Self {
             entries,
             bloom,
+            max_sequence_number,
             bloom_capacity: capacity,
         }
     }
@@ -270,6 +292,12 @@ impl KeyDeletionIndex {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Highest delete sequence number in this index, if any.
+    #[must_use]
+    pub fn max_sequence_number(&self) -> Option<i64> {
+        self.max_sequence_number
     }
 
     /// Bloom-filter check; see [`DeletionIndex::might_contain`].
@@ -305,21 +333,27 @@ impl KeyDeletionIndex {
     #[must_use]
     pub fn extend_max(&self, additions: impl IntoIterator<Item = (Box<[u8]>, i64)>) -> Self {
         let mut entries = self.entries.clone();
+        let mut max_sequence_number = self.max_sequence_number;
         // Track newly-inserted keys so the bloom can be updated incrementally
         // without re-iterating the entire entry set.
         let mut new_keys: Vec<Box<[u8]>> = Vec::new();
         for (key, seq) in additions {
-            match entries.entry(key) {
+            let stored_sequence = match entries.entry(key) {
                 std::collections::hash_map::Entry::Occupied(mut e) => {
                     let existing = *e.get();
-                    *e.get_mut() = existing.max(seq);
+                    let stored_sequence = existing.max(seq);
+                    *e.get_mut() = stored_sequence;
+                    stored_sequence
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
                     let key_clone: Box<[u8]> = e.key().clone();
                     e.insert(seq);
                     new_keys.push(key_clone);
+                    seq
                 }
-            }
+            };
+            max_sequence_number =
+                Some(max_sequence_number.map_or(stored_sequence, |max| max.max(stored_sequence)));
         }
 
         let new_len = entries.len();
@@ -332,6 +366,7 @@ impl KeyDeletionIndex {
             return Self {
                 entries,
                 bloom,
+                max_sequence_number,
                 bloom_capacity: new_capacity,
             };
         }
@@ -343,6 +378,7 @@ impl KeyDeletionIndex {
         Self {
             entries,
             bloom,
+            max_sequence_number,
             bloom_capacity: self.bloom_capacity,
         }
     }
@@ -361,6 +397,7 @@ mod tests {
         let idx = DeletionIndex::from_map(map);
 
         assert_eq!(idx.len(), 3);
+        assert_eq!(idx.max_sequence_number(), Some(3));
         assert_eq!(idx.get(100), Some(1));
         assert_eq!(idx.get(200), Some(2));
         assert_eq!(idx.get(300), Some(3));
@@ -371,6 +408,7 @@ mod tests {
     fn empty_index_probes_to_none() {
         let idx = DeletionIndex::empty();
         assert!(idx.is_empty());
+        assert_eq!(idx.max_sequence_number(), None);
         assert_eq!(idx.get(42), None);
     }
 
@@ -381,10 +419,12 @@ mod tests {
         let idx = DeletionIndex::from_map(map);
 
         let next = idx.extend_max([(100, 3), (200, 7)]);
+        assert_eq!(next.max_sequence_number(), Some(7));
         assert_eq!(next.get(100), Some(5));
         assert_eq!(next.get(200), Some(7));
 
         let after = next.extend_max([(100, 10)]);
+        assert_eq!(after.max_sequence_number(), Some(10));
         assert_eq!(after.get(100), Some(10));
     }
 
@@ -418,6 +458,7 @@ mod tests {
         map.insert(key2.clone(), 2);
 
         let idx = KeyDeletionIndex::from_map(map);
+        assert_eq!(idx.max_sequence_number(), Some(2));
         assert_eq!(idx.get(&key1), Some(1));
         assert_eq!(idx.get(&key2), Some(2));
         assert_eq!(idx.get(&[7, 8, 9]), None);
@@ -431,9 +472,11 @@ mod tests {
         let idx = KeyDeletionIndex::from_map(map);
 
         let next = idx.extend_max([(key1.clone(), 3)]);
+        assert_eq!(next.max_sequence_number(), Some(5));
         assert_eq!(next.get(&key1), Some(5));
 
         let after = next.extend_max([(key1.clone(), 10)]);
+        assert_eq!(after.max_sequence_number(), Some(10));
         assert_eq!(after.get(&key1), Some(10));
     }
 

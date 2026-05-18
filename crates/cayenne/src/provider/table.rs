@@ -878,6 +878,12 @@ impl OnConflictExt for OnConflict {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct CachedTableStatistics {
+    optimizer: Option<Statistics>,
+    catalog_blob: Option<TableStatistics>,
+}
+
 /// Cayenne table provider that reads from Vortex virtual files.
 ///
 /// This provider manages a table composed of multiple "virtual files", where each file
@@ -921,17 +927,12 @@ pub struct CayenneTableProvider {
     /// table. Reusing the table keeps file-statistics caches warm across scans
     /// while preserving per-session target partition and statistics settings.
     scan_listing_tables: Arc<ParkingMutex<HashMap<ScanListingTableKey, Arc<ListingTable>>>>,
-    /// Table-level Vortex statistics loaded from the metastore and maintained
-    /// after writes. This gives `DataFusion` synchronous access to Cayenne stats
-    /// without querying the async catalog from `TableProvider::statistics`.
-    table_statistics: Arc<RwLock<Option<Statistics>>>,
-    /// Raw `TableStatistics` blob cached alongside the derived optimizer-facing
-    /// `table_statistics`. `persist_table_stats` reads this to skip the
-    /// `get_table_statistics` round trip on every post-write maintenance cycle:
-    /// after the in-process writer just upserted the blob on the prior cycle,
-    /// the catalog read returns exactly that value back. Cleared in lockstep
-    /// with the derived cache via [`Self::clear_cached_table_statistics`].
-    cached_table_statistics_blob: Arc<RwLock<Option<TableStatistics>>>,
+    /// Table-level Vortex statistics cache loaded from the metastore and maintained
+    /// after writes. The optimizer-facing `Statistics` and raw `TableStatistics`
+    /// blob live under the same lock so clears and updates publish both views
+    /// together. This gives `DataFusion` synchronous access to Cayenne stats while
+    /// allowing `persist_table_stats` to skip a steady-state catalog read.
+    table_statistics: Arc<RwLock<CachedTableStatistics>>,
     /// Optional retention filters that should be applied immediately after writes.
     retention_filters: Vec<Expr>,
     /// Optional builder to construct time-based retention filter.
@@ -2871,8 +2872,10 @@ impl CayenneTableProvider {
             listing_table: Arc::new(ArcSwap::new(listing_table)),
             listing_fence: Arc::new(tokio::sync::RwLock::new(())),
             scan_listing_tables: Arc::new(ParkingMutex::new(HashMap::new())),
-            table_statistics: Arc::new(RwLock::new(table_statistics)),
-            cached_table_statistics_blob: Arc::new(RwLock::new(None)),
+            table_statistics: Arc::new(RwLock::new(CachedTableStatistics {
+                optimizer: table_statistics,
+                catalog_blob: None,
+            })),
             retention_filters,
             time_retention_filter_builder,
             context,
@@ -3305,7 +3308,6 @@ impl CayenneTableProvider {
             listing_fence: Arc::clone(&self.listing_fence),
             scan_listing_tables: Arc::clone(&self.scan_listing_tables),
             table_statistics: Arc::clone(&self.table_statistics),
-            cached_table_statistics_blob: Arc::clone(&self.cached_table_statistics_blob),
             context: Arc::clone(&self.context),
             retention_filters: self.retention_filters.clone(),
             time_retention_filter_builder: self.time_retention_filter_builder.clone(),
@@ -3383,8 +3385,7 @@ impl CayenneTableProvider {
         let has_pending_visibility_changes =
             self.has_pending_deletions() || self.inlined_row_count.load(Ordering::Relaxed) > 0;
 
-        let guard = self.table_statistics.read();
-        let stats = guard.as_ref()?;
+        let stats = self.table_statistics.read().optimizer.clone()?;
 
         if stats.column_statistics.len() > TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT {
             tracing::trace!(
@@ -3394,12 +3395,10 @@ impl CayenneTableProvider {
                 "Returning top-level table statistics only for wide table"
             );
             return Some(Self::top_level_statistics_only(
-                stats,
+                &stats,
                 has_pending_visibility_changes,
             ));
         }
-
-        let stats = stats.clone();
 
         if has_pending_visibility_changes {
             Some(Self::statistics_to_inexact(stats))
@@ -3450,17 +3449,10 @@ impl CayenneTableProvider {
         }
     }
 
-    fn set_cached_table_statistics(&self, stats: Option<Statistics>) {
-        let mut guard = self.table_statistics.write();
-        *guard = stats;
-    }
-
     pub(crate) fn clear_cached_table_statistics(&self) {
-        self.set_cached_table_statistics(None);
-        // Drop the raw blob cache too so the next `persist_table_stats` cycle
-        // re-fetches authoritative state from the catalog (e.g. after an
-        // overwrite invalidated the in-memory view).
-        *self.cached_table_statistics_blob.write() = None;
+        let mut cache = self.table_statistics.write();
+        cache.optimizer = None;
+        cache.catalog_blob = None;
     }
 
     fn take_cached_pk_keyset(&self) -> Option<HashMap<OwnedRow, RowLocation>> {
@@ -5871,7 +5863,7 @@ impl CayenneTableProvider {
         // `clear_cached_table_statistics` (e.g. overwrite path), the cache is
         // `None` and we fall back to the catalog once to seed it.
         let existing_stats = {
-            let cached = self.cached_table_statistics_blob.read().clone();
+            let cached = self.table_statistics.read().catalog_blob.clone();
             if cached.is_some() {
                 cached
             } else {
@@ -5923,13 +5915,9 @@ impl CayenneTableProvider {
         }
 
         let df_stats = Self::table_statistics_to_df(&self.table_metadata.schema, &stats);
-        // Seed the blob cache with the just-upserted state so the next
-        // maintenance cycle can merge in memory instead of paying a
-        // `get_table_statistics` round trip. Done before publishing the
-        // derived `Statistics` to keep the two caches consistent on the
-        // optimizer-visible read path.
-        *self.cached_table_statistics_blob.write() = Some(stats);
-        self.set_cached_table_statistics(df_stats);
+        let mut cache = self.table_statistics.write();
+        cache.catalog_blob = Some(stats);
+        cache.optimizer = df_stats;
     }
 
     /// Write small batches directly to the metastore, optionally atomically
@@ -7186,7 +7174,10 @@ impl CayenneTableProvider {
             PkDeletionSnapshot::Int64Pk {
                 deleted_pk_values, ..
             } => {
-                if deleted_pk_values.is_empty() {
+                if deleted_pk_values
+                    .max_sequence_number()
+                    .is_none_or(|max_sequence| max_sequence <= min_delete_seq_to_apply)
+                {
                     return Ok(Arc::new(CayenneAccelerationExec::new(plan)));
                 }
 
@@ -7198,7 +7189,7 @@ impl CayenneTableProvider {
                     })?;
 
                 let empty_insert_records = Arc::new(DeletionIndex::empty());
-                Ok(Arc::new(Int64PkDeletionFilterExec::new_with_min_seq(
+                Ok(Arc::new(Int64PkDeletionFilterExec::new(
                     plan,
                     Arc::clone(deleted_pk_values),
                     empty_insert_records,
@@ -7210,12 +7201,15 @@ impl CayenneTableProvider {
                 deleted_row_keys, ..
             } => {
                 if let Some(ref row_converter) = self.pk_row_converter {
-                    if deleted_row_keys.is_empty() {
+                    if deleted_row_keys
+                        .max_sequence_number()
+                        .is_none_or(|max_sequence| max_sequence <= min_delete_seq_to_apply)
+                    {
                         return Ok(Arc::new(CayenneAccelerationExec::new(plan)));
                     }
 
                     let empty_insert_records = Arc::new(KeyDeletionIndex::empty());
-                    Ok(Arc::new(KeyBasedDeletionFilterExec::new_with_min_seq(
+                    Ok(Arc::new(KeyBasedDeletionFilterExec::new(
                         plan,
                         Arc::clone(deleted_row_keys),
                         empty_insert_records,
@@ -7263,6 +7257,7 @@ impl CayenneTableProvider {
                         Arc::clone(deleted_pk_values),
                         empty_insert_records,
                         pk_column_index,
+                        None,
                     )));
                 }
             }
@@ -7280,6 +7275,7 @@ impl CayenneTableProvider {
                             empty_insert_records,
                             pk_indices_in_projection.to_vec(),
                             Arc::clone(row_converter),
+                            None,
                         )));
                     }
                 }
@@ -7328,6 +7324,7 @@ impl CayenneTableProvider {
                         Arc::clone(deleted_pk_values),
                         Arc::clone(insert_records),
                         pk_column_index,
+                        None,
                     )));
                 }
             }
@@ -7351,6 +7348,7 @@ impl CayenneTableProvider {
                         Arc::clone(insert_records),
                         pk_indices_in_projection.to_vec(),
                         Arc::clone(row_converter),
+                        None,
                     )));
                 }
             }
@@ -8931,7 +8929,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_cached_table_statistics_drops_blob_cache() {
-        // Regression for the iter-6 `cached_table_statistics_blob` cache.
+        // Regression for the raw table-statistics blob cache.
         // `clear_cached_table_statistics` must drop BOTH the derived
         // `Statistics` cache and the raw `TableStatistics` blob cache, otherwise
         // a post-overwrite `persist_table_stats` would re-seed the catalog with
@@ -8949,32 +8947,35 @@ mod tests {
 
         // Seed both caches with placeholder state to model the steady-state
         // after a successful `persist_table_stats` upsert.
-        provider.set_cached_table_statistics(Some(datafusion_common::Statistics::new_unknown(
-            &provider.table_metadata.schema,
-        )));
-        *provider.cached_table_statistics_blob.write() = Some(crate::metadata::TableStatistics {
-            table_id: provider.table_metadata.table_id.clone(),
-            statistics_blob: vec![1, 2, 3, 4],
-            num_rows: 7,
-        });
+        {
+            let mut cache = provider.table_statistics.write();
+            cache.optimizer = Some(datafusion_common::Statistics::new_unknown(
+                &provider.table_metadata.schema,
+            ));
+            cache.catalog_blob = Some(crate::metadata::TableStatistics {
+                table_id: provider.table_metadata.table_id.clone(),
+                statistics_blob: vec![1, 2, 3, 4],
+                num_rows: 7,
+            });
+        }
 
         assert!(
-            provider.table_statistics.read().is_some(),
+            provider.table_statistics.read().optimizer.is_some(),
             "precondition: derived Statistics cache must be seeded"
         );
         assert!(
-            provider.cached_table_statistics_blob.read().is_some(),
+            provider.table_statistics.read().catalog_blob.is_some(),
             "precondition: blob cache must be seeded"
         );
 
         provider.clear_cached_table_statistics();
 
         assert!(
-            provider.table_statistics.read().is_none(),
+            provider.table_statistics.read().optimizer.is_none(),
             "clear must drop the derived Statistics cache"
         );
         assert!(
-            provider.cached_table_statistics_blob.read().is_none(),
+            provider.table_statistics.read().catalog_blob.is_none(),
             "clear must drop the blob cache in lockstep with the derived cache"
         );
     }

@@ -62,8 +62,8 @@
 //!
 //! `cargo bench --bench apply_partial_deletion_filter_per_scan -p cayenne`.
 
-#![allow(clippy::expect_used)]
-#![allow(clippy::cast_possible_wrap)]
+#![expect(clippy::expect_used)]
+#![expect(clippy::cast_possible_wrap)]
 
 use std::collections::HashMap;
 use std::hint::black_box;

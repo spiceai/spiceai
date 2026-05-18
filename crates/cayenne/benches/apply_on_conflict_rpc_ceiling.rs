@@ -68,7 +68,7 @@
 //!
 //! `cargo bench --bench apply_on_conflict_rpc_ceiling -p cayenne`.
 
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used)]
 
 use std::hint::black_box;
 use std::sync::Arc;

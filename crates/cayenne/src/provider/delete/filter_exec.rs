@@ -80,7 +80,7 @@ use std::sync::Arc;
 /// rejects most non-matching probes from reaching). `None` means apply every
 /// deletion in `deleted_pks` (main scan path).
 #[inline]
-pub(crate) fn is_pk_visible_i64_with_min_seq(
+pub(crate) fn is_pk_visible_i64(
     pk: i64,
     deleted_pks: &DeletionIndex,
     insert_records: &DeletionIndex,
@@ -107,9 +107,9 @@ pub(crate) fn is_pk_visible_i64_with_min_seq(
 /// Check if a row with the given byte key is visible (not deleted, or re-inserted after deletion).
 ///
 /// `min_delete_seq_to_apply` is the protected-snapshot cutoff. See
-/// [`is_pk_visible_i64_with_min_seq`] for the rationale.
+/// [`is_pk_visible_i64`] for the rationale.
 #[inline]
-pub(crate) fn is_pk_visible_row_key_with_min_seq(
+pub(crate) fn is_pk_visible_row_key(
     key: &[u8],
     deleted_keys: &KeyDeletionIndex,
     insert_records: &KeyDeletionIndex,
@@ -182,27 +182,8 @@ impl KeyBasedDeletionFilterExec {
     /// * `insert_records` - Bloom-prefiltered index of upserted PK byte keys
     /// * `pk_column_indices` - Indices of primary key columns in the schema
     /// * `row_converter` - `RowConverter` configured for the PK columns
+    /// * `min_delete_seq_to_apply` - Optional protected-snapshot cutoff
     pub fn new(
-        input: Arc<dyn ExecutionPlan>,
-        deleted_row_keys: Arc<KeyDeletionIndex>,
-        insert_records: Arc<KeyDeletionIndex>,
-        pk_column_indices: Vec<usize>,
-        row_converter: Arc<RowConverter>,
-    ) -> Self {
-        Self::new_with_min_seq(
-            input,
-            deleted_row_keys,
-            insert_records,
-            pk_column_indices,
-            row_converter,
-            None,
-        )
-    }
-
-    /// Variant that only honours deletions whose recorded sequence number
-    /// exceeds `min_delete_seq_to_apply`. See
-    /// [`Int64PkDeletionFilterExec::new_with_min_seq`].
-    pub fn new_with_min_seq(
         input: Arc<dyn ExecutionPlan>,
         deleted_row_keys: Arc<KeyDeletionIndex>,
         insert_records: Arc<KeyDeletionIndex>,
@@ -265,7 +246,7 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
                 "KeyBasedDeletionFilterExec requires exactly 1 child".to_string(),
             ));
         }
-        Ok(Arc::new(Self::new_with_min_seq(
+        Ok(Arc::new(Self::new(
             Arc::clone(&children[0]),
             Arc::clone(&self.deleted_row_keys),
             Arc::clone(&self.insert_records),
@@ -371,7 +352,7 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     let mut keep_count: usize = 0;
                     for row in &rows {
                         let key: &[u8] = row.as_ref();
-                        let visible = is_pk_visible_row_key_with_min_seq(
+                        let visible = is_pk_visible_row_key(
                             key,
                             &self.deleted_row_keys,
                             &self.insert_records,
@@ -468,28 +449,8 @@ impl Int64PkDeletionFilterExec {
     /// * `deleted_pk_values` - Bloom-prefiltered index of deleted PK values
     /// * `insert_records` - Bloom-prefiltered index of upserted PK values
     /// * `pk_column_index` - Index of the primary key column in the schema
+    /// * `min_delete_seq_to_apply` - Optional protected-snapshot cutoff
     pub fn new(
-        input: Arc<dyn ExecutionPlan>,
-        deleted_pk_values: Arc<DeletionIndex>,
-        insert_records: Arc<DeletionIndex>,
-        pk_column_index: usize,
-    ) -> Self {
-        Self::new_with_min_seq(
-            input,
-            deleted_pk_values,
-            insert_records,
-            pk_column_index,
-            None,
-        )
-    }
-
-    /// Create a new Int64 PK-based deletion filter that only honours
-    /// deletions whose recorded sequence number exceeds
-    /// `min_delete_seq_to_apply`. Lets the protected-snapshot scan path
-    /// share the full `deleted_pk_values` index across snapshots and apply
-    /// the per-snapshot cutoff at probe time, instead of rebuilding a
-    /// filtered `DeletionIndex` per snapshot.
-    pub fn new_with_min_seq(
         input: Arc<dyn ExecutionPlan>,
         deleted_pk_values: Arc<DeletionIndex>,
         insert_records: Arc<DeletionIndex>,
@@ -551,7 +512,7 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
                 "Int64PkDeletionFilterExec requires exactly 1 child".to_string(),
             ));
         }
-        Ok(Arc::new(Self::new_with_min_seq(
+        Ok(Arc::new(Self::new(
             Arc::clone(&children[0]),
             Arc::clone(&self.deleted_pk_values),
             Arc::clone(&self.insert_records),
@@ -648,7 +609,7 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                     let mut keep_mask: Vec<bool> = Vec::with_capacity(batch_size);
                     let mut keep_count: usize = 0;
                     for &pk_value in pk_slice {
-                        let visible = is_pk_visible_i64_with_min_seq(
+                        let visible = is_pk_visible_i64(
                             pk_value,
                             &self.deleted_pk_values,
                             &self.insert_records,
@@ -749,9 +710,8 @@ mod tests {
         // Probe every key, including some that aren't in either index.
         for pk in -2..12_i64 {
             let probe_time_filter =
-                is_pk_visible_i64_with_min_seq(pk, &full_index, &empty_inserts, Some(min_seq));
-            let rebuilt_filter =
-                is_pk_visible_i64_with_min_seq(pk, &filtered_index, &empty_inserts, None);
+                is_pk_visible_i64(pk, &full_index, &empty_inserts, Some(min_seq));
+            let rebuilt_filter = is_pk_visible_i64(pk, &filtered_index, &empty_inserts, None);
             assert_eq!(
                 probe_time_filter, rebuilt_filter,
                 "pk={pk}: probe-time min_seq filter must match a rebuilt index"
@@ -774,18 +734,10 @@ mod tests {
 
         for pk in -2..12_i64 {
             let key = pk.to_be_bytes();
-            let probe_time = is_pk_visible_row_key_with_min_seq(
-                &key,
-                &full_key_index,
-                &empty_key_inserts,
-                Some(min_seq),
-            );
-            let rebuilt = is_pk_visible_row_key_with_min_seq(
-                &key,
-                &filtered_key_index,
-                &empty_key_inserts,
-                None,
-            );
+            let probe_time =
+                is_pk_visible_row_key(&key, &full_key_index, &empty_key_inserts, Some(min_seq));
+            let rebuilt =
+                is_pk_visible_row_key(&key, &filtered_key_index, &empty_key_inserts, None);
             assert_eq!(
                 probe_time, rebuilt,
                 "byte-key pk={pk}: probe-time min_seq filter must match a rebuilt KeyDeletionIndex"
