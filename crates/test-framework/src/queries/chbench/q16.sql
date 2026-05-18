@@ -1,18 +1,18 @@
-select
+SELECT
     i_name,
-    substr(i_data, 1, 3) as brand,
+    substr(i_data, 1, 3) AS brand,
     i_price,
-    count(distinct (mod((s_w_id * s_i_id),10000))) as supplier_cnt
-from
+    count(DISTINCT (mod((s_w_id * s_i_id),10000))) AS supplier_cnt
+FROM
     stock, item
-where
+WHERE
     i_id = s_i_id
-    and i_data not like 'zz%'
-    and (mod((s_w_id * s_i_id),10000) not in
-         (select s_suppkey
-          from supplier
-          where s_comment like '%bad%'))
-group by
+    AND i_data NOT LIKE 'zz%'
+    AND (mod((s_w_id * s_i_id),10000) NOT IN
+         (SELECT su_suppkey
+          FROM supplier
+          WHERE su_comment LIKE '%bad%'))
+GROUP BY
     i_name, substr(i_data, 1, 3), i_price
-order by
-    supplier_cnt desc;
+ORDER BY
+    supplier_cnt DESC;
