@@ -72,15 +72,17 @@ const RTTS: &[(&str, Duration)] = &[
 
 /// Maintenance cycles per table per iteration. At 100 ms debounce a
 /// table emits ~10 cycles/s, so 16 cycles ≈ 1.6 s of sustained ingestion.
-/// Kept at 16 so the worst-case shape (`N=32`, `rtt_10ms`,
-/// `current_two_rpc` = `2·32·16·10 ms ≈ 10.2 s` per iteration) still fits
+/// Kept at 16 so the default worst-case shape (`N=14`, `rtt_10ms`,
+/// `current_two_rpc` = `2·14·16·10 ms ≈ 4.5 s` per iteration) still fits
 /// inside Criterion `--quick`'s shrunken budget without dropping below
 /// the 2-sample floor that triggers the `slice.len() > 1` stats panic.
 const CYCLES_PER_TABLE: usize = 16;
 
-/// Table counts. 4 is a small pipeline; 14 matches CH-benCH SF100; 32
-/// stresses the multi-table case where the metastore-pool is saturated.
-const TABLE_COUNTS: &[usize] = &[4, 14, 32];
+/// Table counts. 4 is a small pipeline; 14 matches CH-benCH SF100.
+/// Larger saturation shapes are intentionally left out of the default
+/// matrix so `cargo bench --bench stats_persistence_rpc_ceiling -- --quick`
+/// remains practical on laptops.
+const TABLE_COUNTS: &[usize] = &[4, 14];
 
 /// One simulated metastore RPC. Holds a slot in the (shared) connection
 /// pool for the round-trip duration. The bench models the pool as a
@@ -150,7 +152,7 @@ fn bench_stats_persistence_rpc_ceiling(c: &mut Criterion) {
         .expect("tokio runtime");
 
     let mut group = c.benchmark_group("stats_persistence_rpc_ceiling");
-    // Sample size kept small so the N=32/rtt_10ms case (≈25 s per iteration)
+    // Sample size kept small so the N=14/rtt_10ms case
     // still produces a multi-sample distribution under `--quick`.
     group.sample_size(10);
     for &(rtt_label, rtt) in RTTS {

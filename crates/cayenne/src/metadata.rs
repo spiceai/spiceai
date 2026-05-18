@@ -317,14 +317,19 @@ pub struct VortexConfig {
     /// as "small" when their size is below `target_vortex_file_size_mb / 4`. The
     /// compactor also requires that the eligible tier's total size meets the
     /// per-tier target before rewriting the current snapshot (see
-    /// [`crate::provider::compaction`]). The same threshold is used as a
-    /// protected-snapshot count trigger, folding many tiny post-delete/upsert
-    /// snapshots into one current snapshot even when their bytes are below the
-    /// small-file tier target.
+    /// [`crate::provider::compaction`]).
     ///
     /// Defaults to 8.
     #[serde(default = "default_compaction_trigger_files")]
     pub compaction_trigger_files: usize,
+    /// Number of protected snapshots that can accumulate before snapshot-maintenance
+    /// compaction is eligible to run. Kept separate from `compaction_trigger_files`
+    /// so small-file compaction tuning does not silently change scan amplification
+    /// behavior for protected snapshots.
+    ///
+    /// Defaults to 8.
+    #[serde(default = "default_compaction_trigger_protected_snapshots")]
+    pub compaction_trigger_protected_snapshots: usize,
     /// Maximum age in milliseconds of the oldest protected snapshot before
     /// snapshot-maintenance compaction is eligible to run. This bounds how long
     /// low-volume update/delete workloads can keep extra protected snapshots
@@ -405,6 +410,10 @@ fn default_compaction_trigger_files() -> usize {
     8
 }
 
+fn default_compaction_trigger_protected_snapshots() -> usize {
+    8
+}
+
 fn default_compaction_trigger_snapshot_age_ms() -> u64 {
     300_000
 }
@@ -459,6 +468,8 @@ impl Default for VortexConfig {
             upload_concurrency: default_upload_concurrency(),
             write_concurrency: None,
             compaction_trigger_files: default_compaction_trigger_files(),
+            compaction_trigger_protected_snapshots: default_compaction_trigger_protected_snapshots(
+            ),
             compaction_trigger_snapshot_age_ms: default_compaction_trigger_snapshot_age_ms(),
             compaction_max_levels: default_compaction_max_levels(),
             compaction_max_files_per_pick: default_compaction_max_files_per_pick(),

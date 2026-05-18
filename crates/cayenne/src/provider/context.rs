@@ -186,6 +186,12 @@ impl CayenneContext {
         )
     }
 
+    /// Protected snapshot count that should trigger maintenance compaction.
+    #[must_use]
+    pub(crate) fn compaction_trigger_protected_snapshots(&self) -> usize {
+        self.config.compaction_trigger_protected_snapshots.max(1)
+    }
+
     /// Maximum number of consecutive compaction passes per trigger.
     #[must_use]
     pub(crate) fn compaction_max_levels(&self) -> usize {

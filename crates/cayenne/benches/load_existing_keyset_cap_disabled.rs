@@ -109,9 +109,6 @@ limitations under the License.
 //!   M: 1024 bloom probes + ~10 HashMap lookups. Shows the achievable
 //!   floor for option (B).
 
-#![allow(clippy::expect_used)]
-#![allow(clippy::cast_possible_truncation)]
-
 use std::collections::HashMap;
 use std::hint::black_box;
 
@@ -142,9 +139,11 @@ const INCOMING_BATCH_KEYS: usize = 1024;
 /// (cold path), so the two lanes compare like-for-like.
 fn make_key(idx: usize) -> Box<[u8]> {
     let mut bytes = vec![0u8; KEY_BYTES];
-    bytes[..8].copy_from_slice(&(idx as u64).to_be_bytes());
+    let idx_u64 = u64::try_from(idx).unwrap_or(u64::MAX);
+    bytes[..8].copy_from_slice(&idx_u64.to_be_bytes());
     // Vary the tail so hash distribution isn't degenerate.
-    let tail = (idx.wrapping_mul(2_654_435_761) as u64).to_be_bytes();
+    let tail_idx = idx.wrapping_mul(2_654_435_761);
+    let tail = u64::try_from(tail_idx).unwrap_or(u64::MAX).to_be_bytes();
     bytes[8..16].copy_from_slice(&tail);
     bytes.into_boxed_slice()
 }
@@ -154,7 +153,7 @@ fn make_key(idx: usize) -> Box<[u8]> {
 /// file id + 8-byte row id). Kept inline for the bench so HashMap layout
 /// matches production.
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct RowLocation {
     source: u8,
     data_file_id: i64,
@@ -169,7 +168,7 @@ fn build_warm_keyset(total_rows: usize) -> HashMap<Box<[u8]>, RowLocation> {
             RowLocation {
                 source: 0,
                 data_file_id: 0,
-                row_id: i as i64,
+                row_id: i64::try_from(i).unwrap_or(i64::MAX),
             },
         );
     }
@@ -196,7 +195,7 @@ fn run_full_rebuild(rows_per_snapshot: usize, snapshot_count: usize) -> usize {
                 RowLocation {
                     source: 0,
                     data_file_id: 0,
-                    row_id: row_offset as i64,
+                    row_id: i64::try_from(row_offset).unwrap_or(i64::MAX),
                 },
             );
         }
@@ -261,7 +260,7 @@ impl BloomFilter {
     fn insert(&mut self, key: &[u8]) {
         let (h1, h2) = Self::hashes(key);
         for h in [h1, h2] {
-            let bit = h as usize & self.bit_mask;
+            let bit = usize::try_from(h).unwrap_or(usize::MAX) & self.bit_mask;
             self.bits[bit / 64] |= 1 << (bit % 64);
         }
     }
@@ -269,7 +268,7 @@ impl BloomFilter {
     fn maybe_contains(&self, key: &[u8]) -> bool {
         let (h1, h2) = Self::hashes(key);
         for h in [h1, h2] {
-            let bit = h as usize & self.bit_mask;
+            let bit = usize::try_from(h).unwrap_or(usize::MAX) & self.bit_mask;
             if self.bits[bit / 64] & (1 << (bit % 64)) == 0 {
                 return false;
             }
@@ -328,7 +327,9 @@ fn bench_keyset_cap(c: &mut Criterion) {
 
         for &snapshot_count in SNAPSHOT_COUNTS {
             let total_rows = rows_per_snapshot.saturating_mul(snapshot_count + 1);
-            group.throughput(Throughput::Elements(total_rows as u64));
+            group.throughput(Throughput::Elements(
+                u64::try_from(total_rows).unwrap_or(u64::MAX),
+            ));
 
             let id = format!("M={rows_per_snapshot}/N={snapshot_count}");
 

@@ -80,18 +80,46 @@ use std::sync::Arc;
 /// rejects most non-matching probes from reaching). `None` means apply every
 /// deletion in `deleted_pks` (main scan path).
 #[inline]
+#[cfg(test)]
 pub(crate) fn is_pk_visible_i64(
     pk: i64,
     deleted_pks: &DeletionIndex,
     insert_records: &DeletionIndex,
     min_delete_seq_to_apply: Option<i64>,
 ) -> bool {
+    match min_delete_seq_to_apply {
+        Some(min_delete_seq_to_apply) => {
+            is_pk_visible_i64_after_min(pk, deleted_pks, insert_records, min_delete_seq_to_apply)
+        }
+        None => is_pk_visible_i64_without_min(pk, deleted_pks, insert_records),
+    }
+}
+
+#[inline]
+fn is_pk_visible_i64_without_min(
+    pk: i64,
+    deleted_pks: &DeletionIndex,
+    insert_records: &DeletionIndex,
+) -> bool {
+    match deleted_pks.get(pk) {
+        None => true,
+        Some(delete_seq) => insert_records
+            .get(pk)
+            .is_some_and(|insert_seq| insert_seq > delete_seq),
+    }
+}
+
+#[inline]
+fn is_pk_visible_i64_after_min(
+    pk: i64,
+    deleted_pks: &DeletionIndex,
+    insert_records: &DeletionIndex,
+    min_delete_seq_to_apply: i64,
+) -> bool {
     match deleted_pks.get(pk) {
         None => true,
         Some(delete_seq) => {
-            if let Some(min) = min_delete_seq_to_apply
-                && delete_seq <= min
-            {
+            if delete_seq <= min_delete_seq_to_apply {
                 // Deletion pre-dates the protected snapshot's creation —
                 // skip it. The full deletion index is reused here instead
                 // of being rebuilt with these entries filtered out.
@@ -109,18 +137,49 @@ pub(crate) fn is_pk_visible_i64(
 /// `min_delete_seq_to_apply` is the protected-snapshot cutoff. See
 /// [`is_pk_visible_i64`] for the rationale.
 #[inline]
+#[cfg(test)]
 pub(crate) fn is_pk_visible_row_key(
     key: &[u8],
     deleted_keys: &KeyDeletionIndex,
     insert_records: &KeyDeletionIndex,
     min_delete_seq_to_apply: Option<i64>,
 ) -> bool {
+    match min_delete_seq_to_apply {
+        Some(min_delete_seq_to_apply) => is_pk_visible_row_key_after_min(
+            key,
+            deleted_keys,
+            insert_records,
+            min_delete_seq_to_apply,
+        ),
+        None => is_pk_visible_row_key_without_min(key, deleted_keys, insert_records),
+    }
+}
+
+#[inline]
+fn is_pk_visible_row_key_without_min(
+    key: &[u8],
+    deleted_keys: &KeyDeletionIndex,
+    insert_records: &KeyDeletionIndex,
+) -> bool {
+    match deleted_keys.get(key) {
+        None => true,
+        Some(delete_seq) => insert_records
+            .get(key)
+            .is_some_and(|insert_seq| insert_seq > delete_seq),
+    }
+}
+
+#[inline]
+fn is_pk_visible_row_key_after_min(
+    key: &[u8],
+    deleted_keys: &KeyDeletionIndex,
+    insert_records: &KeyDeletionIndex,
+    min_delete_seq_to_apply: i64,
+) -> bool {
     match deleted_keys.get(key) {
         None => true,
         Some(delete_seq) => {
-            if let Some(min) = min_delete_seq_to_apply
-                && delete_seq <= min
-            {
+            if delete_seq <= min_delete_seq_to_apply {
                 return true;
             }
             insert_records
@@ -350,16 +409,32 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     // Build keep mask: bloom-prefiltered probe per row + visibility check.
                     let mut keep_mask: Vec<bool> = Vec::with_capacity(batch_size);
                     let mut keep_count: usize = 0;
-                    for row in &rows {
-                        let key: &[u8] = row.as_ref();
-                        let visible = is_pk_visible_row_key(
-                            key,
-                            &self.deleted_row_keys,
-                            &self.insert_records,
-                            self.min_delete_seq_to_apply,
-                        );
-                        keep_mask.push(visible);
-                        keep_count += usize::from(visible);
+                    match self.min_delete_seq_to_apply {
+                        Some(min_delete_seq_to_apply) => {
+                            for row in &rows {
+                                let key: &[u8] = row.as_ref();
+                                let visible = is_pk_visible_row_key_after_min(
+                                    key,
+                                    &self.deleted_row_keys,
+                                    &self.insert_records,
+                                    min_delete_seq_to_apply,
+                                );
+                                keep_mask.push(visible);
+                                keep_count += usize::from(visible);
+                            }
+                        }
+                        None => {
+                            for row in &rows {
+                                let key: &[u8] = row.as_ref();
+                                let visible = is_pk_visible_row_key_without_min(
+                                    key,
+                                    &self.deleted_row_keys,
+                                    &self.insert_records,
+                                );
+                                keep_mask.push(visible);
+                                keep_count += usize::from(visible);
+                            }
+                        }
                     }
 
                     tracing::debug!(
@@ -608,15 +683,30 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                     let pk_slice = pk_array.values();
                     let mut keep_mask: Vec<bool> = Vec::with_capacity(batch_size);
                     let mut keep_count: usize = 0;
-                    for &pk_value in pk_slice {
-                        let visible = is_pk_visible_i64(
-                            pk_value,
-                            &self.deleted_pk_values,
-                            &self.insert_records,
-                            self.min_delete_seq_to_apply,
-                        );
-                        keep_mask.push(visible);
-                        keep_count += usize::from(visible);
+                    match self.min_delete_seq_to_apply {
+                        Some(min_delete_seq_to_apply) => {
+                            for &pk_value in pk_slice {
+                                let visible = is_pk_visible_i64_after_min(
+                                    pk_value,
+                                    &self.deleted_pk_values,
+                                    &self.insert_records,
+                                    min_delete_seq_to_apply,
+                                );
+                                keep_mask.push(visible);
+                                keep_count += usize::from(visible);
+                            }
+                        }
+                        None => {
+                            for &pk_value in pk_slice {
+                                let visible = is_pk_visible_i64_without_min(
+                                    pk_value,
+                                    &self.deleted_pk_values,
+                                    &self.insert_records,
+                                );
+                                keep_mask.push(visible);
+                                keep_count += usize::from(visible);
+                            }
+                        }
                     }
 
                     tracing::debug!(

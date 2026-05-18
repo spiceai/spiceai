@@ -1982,12 +1982,26 @@ impl MetadataCatalog for CayenneCatalog {
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
 
         'attempts: for attempt in 1..=max_attempts {
-            let tx = self.metastore.begin_transaction().await.map_err(|e| {
-                CatalogError::InvalidOperation {
-                    message: "Failed to begin on-conflict deletion transaction".to_string(),
-                    source: Box::new(e),
+            let tx = match self.metastore.begin_transaction().await {
+                Ok(tx) => tx,
+                Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
+                    let delay = retry_backoff_delay(attempt);
+                    tracing::debug!(
+                        attempt,
+                        max_attempts,
+                        ?delay,
+                        "Retrying on-conflict deletion transaction after begin conflict"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue 'attempts;
                 }
-            })?;
+                Err(e) => {
+                    return Err(CatalogError::InvalidOperation {
+                        message: "Failed to begin on-conflict deletion transaction".to_string(),
+                        source: Box::new(e),
+                    });
+                }
+            };
 
             // INSERT every delete_file row inside the txn. A duplicate
             // (table_id, path) is idempotent only when the existing row's
@@ -2115,7 +2129,7 @@ impl MetadataCatalog for CayenneCatalog {
 
         Err(CatalogError::InvalidOperationNoSource {
             message: format!(
-                "commit_on_conflict_deletions was not attempted because max attempts is {max_attempts}"
+                "commit_on_conflict_deletions exhausted {max_attempts} attempts without success or a terminal error"
             ),
         })
     }

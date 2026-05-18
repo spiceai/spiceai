@@ -205,6 +205,7 @@ pub struct VortexConfig {
 
     // Compaction
     pub compaction_trigger_files: usize,      // default caching/changes/short-append=4, otherwise=8
+    pub compaction_trigger_protected_snapshots: usize, // default caching/changes/short-append=4, otherwise=8
     pub compaction_trigger_snapshot_age_ms: u64,  // default caching/changes/short-append=60_000, otherwise=300_000; 0 disables age trigger
     pub compaction_max_levels: usize,         // default 3
     pub compaction_max_files_per_pick: usize, // default 32

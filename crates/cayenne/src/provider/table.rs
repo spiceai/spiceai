@@ -129,16 +129,37 @@ enum SnapshotMaintenanceTrigger {
 
 fn protected_snapshot_age(snapshot_id: &str, now: SystemTime) -> Option<Duration> {
     let Ok(snapshot_uuid) = uuid::Uuid::parse_str(snapshot_id) else {
+        tracing::warn!(
+            snapshot_id,
+            "Cayenne protected snapshot id is not a valid UUID; treating age as expired"
+        );
         return Some(Duration::MAX);
     };
     let Some(timestamp) = snapshot_uuid.get_timestamp() else {
+        tracing::warn!(
+            snapshot_id,
+            "Cayenne protected snapshot id does not contain a UUID timestamp; treating age as expired"
+        );
         return Some(Duration::MAX);
     };
     let (seconds, nanos) = timestamp.to_unix();
     let Some(snapshot_time) = UNIX_EPOCH.checked_add(Duration::new(seconds, nanos)) else {
+        tracing::warn!(
+            snapshot_id,
+            "Cayenne protected snapshot timestamp overflowed SystemTime; treating age as expired"
+        );
         return Some(Duration::MAX);
     };
-    now.duration_since(snapshot_time).ok()
+    match now.duration_since(snapshot_time) {
+        Ok(age) => Some(age),
+        Err(_) => {
+            tracing::warn!(
+                snapshot_id,
+                "Cayenne protected snapshot timestamp is in the future; treating age as expired"
+            );
+            Some(Duration::MAX)
+        }
+    }
 }
 
 fn oldest_protected_snapshot_age(
@@ -162,6 +183,7 @@ fn protected_snapshot_maintenance_trigger(
     now: SystemTime,
 ) -> Option<SnapshotMaintenanceTrigger> {
     let protected_snapshot_count = protected_snapshots.len();
+    let trigger_count = trigger_count.max(1);
     if protected_snapshot_count >= trigger_count {
         return Some(SnapshotMaintenanceTrigger::ProtectedSnapshotCount {
             protected_snapshot_count,
@@ -4911,7 +4933,7 @@ impl CayenneTableProvider {
 
     pub(crate) fn schedule_post_write_compaction(&self) {
         let cfg = self.context.compaction_picker_config();
-        let maintenance_trigger = self.protected_snapshot_maintenance_trigger(&cfg);
+        let maintenance_trigger = self.protected_snapshot_maintenance_trigger();
         if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files
             && maintenance_trigger.is_none()
         {
@@ -5076,7 +5098,7 @@ impl CayenneTableProvider {
         // listing (S3 LIST or local readdir of potentially thousands of files)
         // on every post-write trigger.
         let cfg = self.context.compaction_picker_config();
-        let maintenance_trigger = self.protected_snapshot_maintenance_trigger(&cfg);
+        let maintenance_trigger = self.protected_snapshot_maintenance_trigger();
         if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files
             && maintenance_trigger.is_none()
         {
@@ -5179,14 +5201,11 @@ impl CayenneTableProvider {
         Ok(files)
     }
 
-    fn protected_snapshot_maintenance_trigger(
-        &self,
-        cfg: &super::compaction::CompactionPickerConfig,
-    ) -> Option<SnapshotMaintenanceTrigger> {
+    fn protected_snapshot_maintenance_trigger(&self) -> Option<SnapshotMaintenanceTrigger> {
         let protected_snapshots = self.protected_snapshots.read();
         protected_snapshot_maintenance_trigger(
             &protected_snapshots,
-            cfg.trigger_files,
+            self.context.compaction_trigger_protected_snapshots(),
             self.context.compaction_trigger_snapshot_age(),
             SystemTime::now(),
         )
@@ -7206,8 +7225,8 @@ impl CayenneTableProvider {
             protected_snapshot_count = protected_snapshots.len(),
             "Cayenne scan includes protected snapshots"
         );
-        let protected_snapshot_warn_threshold =
-            self.context.compaction_picker_config().trigger_files.max(1);
+        let protected_snapshot_trigger = self.context.compaction_trigger_protected_snapshots();
+        let protected_snapshot_warn_threshold = (protected_snapshot_trigger / 2).max(1);
         if protected_snapshots.len() >= protected_snapshot_warn_threshold {
             tracing::warn!(
                 table = %self.table_metadata.table_name,
@@ -8424,6 +8443,26 @@ mod tests {
     fn protected_snapshot_maintenance_trigger_treats_invalid_uuid_as_old() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
         let protected_snapshots = HashMap::from([("not-a-uuid".to_string(), 1)]);
+
+        assert_eq!(
+            protected_snapshot_maintenance_trigger(
+                &protected_snapshots,
+                8,
+                Some(Duration::from_secs(60)),
+                now,
+            ),
+            Some(SnapshotMaintenanceTrigger::ProtectedSnapshotAge {
+                protected_snapshot_count: 1,
+                oldest_snapshot_age: Duration::MAX,
+                trigger_age: Duration::from_secs(60),
+            })
+        );
+    }
+
+    #[test]
+    fn protected_snapshot_maintenance_trigger_treats_future_uuid_as_old() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let protected_snapshots = HashMap::from([(protected_snapshot_id_at_unix_time(1_100), 1)]);
 
         assert_eq!(
             protected_snapshot_maintenance_trigger(

@@ -169,6 +169,17 @@ fn parse_usize(acceleration: &Acceleration, key: &str, default: usize) -> usize 
         })
 }
 
+fn parse_u64(acceleration: &Acceleration, key: &str, default: u64) -> u64 {
+    acceleration.params.get(key).map_or(default, |v| {
+        v.parse::<u64>().unwrap_or_else(|_| {
+            tracing::warn!(
+                "An invalid '{key}' value was provided: '{v}'. Expected a non-negative integer, defaulting to {default}. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+            );
+            default
+        })
+    })
+}
+
 fn parse_optional_usize<'a>(
     acceleration: &Acceleration,
     keys: &'a [&'a str],
@@ -196,6 +207,7 @@ fn parse_usize_aliases_as_i64(acceleration: &Acceleration, keys: &[&str], defaul
 }
 
 const SMALL_WRITE_COMPACTION_TRIGGER_FILES: usize = 4;
+const SMALL_WRITE_COMPACTION_TRIGGER_PROTECTED_SNAPSHOTS: usize = 4;
 const SMALL_WRITE_COMPACTION_TRIGGER_SNAPSHOT_AGE_MS: u64 = 60_000;
 const SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS: u64 = 10_000;
 const SMALL_WRITE_INLINE_FLUSH_MAX_ROWS: i64 = 2_048;
@@ -209,6 +221,8 @@ fn apply_refresh_mode_defaults(
 ) {
     if uses_small_write_refresh_profile(acceleration) {
         config.compaction_trigger_files = SMALL_WRITE_COMPACTION_TRIGGER_FILES;
+        config.compaction_trigger_protected_snapshots =
+            SMALL_WRITE_COMPACTION_TRIGGER_PROTECTED_SNAPSHOTS;
         config.compaction_trigger_snapshot_age_ms = SMALL_WRITE_COMPACTION_TRIGGER_SNAPSHOT_AGE_MS;
         config.compaction_background_interval_ms = SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS;
         config.inline_flush_max_rows = SMALL_WRITE_INLINE_FLUSH_MAX_ROWS;
@@ -545,22 +559,16 @@ impl CayenneAccelerator {
                 "cayenne_compaction_trigger_files",
                 config.compaction_trigger_files,
             );
-            if let Some(interval_str) = acceleration
-                .params
-                .get("cayenne_compaction_trigger_snapshot_age_ms")
-            {
-                match interval_str.parse::<u64>() {
-                    Ok(parsed) => {
-                        config.compaction_trigger_snapshot_age_ms = parsed;
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            "Invalid 'cayenne_compaction_trigger_snapshot_age_ms' value: '{interval_str}'. Expected a non-negative integer (milliseconds, 0 disables). Keeping default of {}.",
-                            config.compaction_trigger_snapshot_age_ms
-                        );
-                    }
-                }
-            }
+            config.compaction_trigger_protected_snapshots = parse_usize(
+                acceleration,
+                "cayenne_compaction_trigger_protected_snapshots",
+                config.compaction_trigger_protected_snapshots,
+            );
+            config.compaction_trigger_snapshot_age_ms = parse_u64(
+                acceleration,
+                "cayenne_compaction_trigger_snapshot_age_ms",
+                config.compaction_trigger_snapshot_age_ms,
+            );
             config.compaction_max_levels = parse_usize(
                 acceleration,
                 "cayenne_compaction_max_levels",
@@ -618,25 +626,14 @@ impl CayenneAccelerator {
                 config.inline_flush_max_bytes,
             );
 
-            if let Some(interval_str) = acceleration
-                .params
-                .get("cayenne_compaction_background_interval_ms")
-            {
-                match interval_str.parse::<u64>() {
-                    Ok(parsed) => {
-                        config.compaction_background_interval_ms = parsed;
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            "Invalid 'cayenne_compaction_background_interval_ms' value: '{interval_str}'. Expected a non-negative integer (milliseconds, 0 disables). Keeping default of {}.",
-                            config.compaction_background_interval_ms
-                        );
-                    }
-                }
-            }
+            config.compaction_background_interval_ms = parse_u64(
+                acceleration,
+                "cayenne_compaction_background_interval_ms",
+                config.compaction_background_interval_ms,
+            );
 
             tracing::debug!(
-                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, pk_conflict_detection={}, compaction_trigger_files={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}",
+                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, pk_conflict_detection={}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}",
                 config.footer_cache_mb,
                 config.segment_cache_mb,
                 config.target_vortex_file_size_mb,
@@ -646,6 +643,7 @@ impl CayenneAccelerator {
                 config.compression_strategy,
                 config.pk_conflict_detection.as_str(),
                 config.compaction_trigger_files,
+                config.compaction_trigger_protected_snapshots,
                 config.compaction_trigger_snapshot_age_ms,
                 config.compaction_max_levels,
                 config.compaction_max_files_per_pick,
@@ -988,7 +986,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("write_concurrency")
             .description("Optional writer partition override for unsorted Cayenne ingests. Defaults to runtime.query.target_partitions."),
         ParameterSpec::component("compaction_trigger_files")
-            .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs, and the protected-snapshot count that triggers snapshot-maintenance compaction. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise."),
+            .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise."),
+        ParameterSpec::component("compaction_trigger_protected_snapshots")
+            .description("Number of protected snapshots before snapshot-maintenance compaction runs. This is separate from compaction_trigger_files so small-file tuning does not silently change scan amplification behavior. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise."),
         ParameterSpec::component("compaction_trigger_snapshot_age_ms")
             .description("Maximum age in milliseconds of the oldest protected snapshot before snapshot-maintenance compaction runs. Set to 0 to disable the age trigger. Default: 60000 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 300000 otherwise."),
         ParameterSpec::component("compaction_max_levels")
@@ -2538,6 +2538,10 @@ mod tests {
                 SMALL_WRITE_COMPACTION_TRIGGER_FILES
             );
             assert_eq!(
+                config.compaction_trigger_protected_snapshots,
+                SMALL_WRITE_COMPACTION_TRIGGER_PROTECTED_SNAPSHOTS
+            );
+            assert_eq!(
                 config.compaction_trigger_snapshot_age_ms,
                 SMALL_WRITE_COMPACTION_TRIGGER_SNAPSHOT_AGE_MS
             );
@@ -2592,6 +2596,10 @@ mod tests {
             SMALL_WRITE_COMPACTION_TRIGGER_FILES
         );
         assert_eq!(
+            config.compaction_trigger_protected_snapshots,
+            SMALL_WRITE_COMPACTION_TRIGGER_PROTECTED_SNAPSHOTS
+        );
+        assert_eq!(
             config.inline_flush_max_rows,
             SMALL_WRITE_INLINE_FLUSH_MAX_ROWS
         );
@@ -2635,6 +2643,10 @@ mod tests {
                 config.compaction_trigger_files,
                 cayenne::metadata::VortexConfig::default().compaction_trigger_files
             );
+            assert_eq!(
+                config.compaction_trigger_protected_snapshots,
+                cayenne::metadata::VortexConfig::default().compaction_trigger_protected_snapshots
+            );
         }
 
         let mut dataset =
@@ -2666,6 +2678,10 @@ mod tests {
         assert_eq!(
             config.compaction_trigger_files,
             cayenne::metadata::VortexConfig::default().compaction_trigger_files
+        );
+        assert_eq!(
+            config.compaction_trigger_protected_snapshots,
+            cayenne::metadata::VortexConfig::default().compaction_trigger_protected_snapshots
         );
     }
 
@@ -2750,6 +2766,10 @@ mod tests {
                     "cayenne_compaction_trigger_snapshot_age_ms".to_string(),
                     "120000".to_string(),
                 ),
+                (
+                    "cayenne_compaction_trigger_protected_snapshots".to_string(),
+                    "9".to_string(),
+                ),
                 ("cayenne_compaction_max_levels".to_string(), "5".to_string()),
                 (
                     "cayenne_compaction_max_files_per_pick".to_string(),
@@ -2768,6 +2788,7 @@ mod tests {
         let config = CayenneAccelerator::get_vortex_config("compact", &dataset);
 
         assert_eq!(config.compaction_trigger_files, 12);
+        assert_eq!(config.compaction_trigger_protected_snapshots, 9);
         assert_eq!(config.compaction_trigger_snapshot_age_ms, 120_000);
         assert_eq!(config.compaction_max_levels, 5);
         assert_eq!(config.compaction_max_files_per_pick, 64);

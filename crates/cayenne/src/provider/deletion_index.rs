@@ -179,9 +179,12 @@ impl DeletionIndex {
             let stored_sequence = match entries.entry(pk) {
                 std::collections::hash_map::Entry::Occupied(mut e) => {
                     let existing = *e.get();
-                    let stored_sequence = existing.max(seq);
-                    *e.get_mut() = stored_sequence;
-                    stored_sequence
+                    if seq > existing {
+                        *e.get_mut() = seq;
+                        seq
+                    } else {
+                        existing
+                    }
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
                     e.insert(seq);
@@ -189,8 +192,9 @@ impl DeletionIndex {
                     seq
                 }
             };
-            max_sequence_number =
-                Some(max_sequence_number.map_or(stored_sequence, |max| max.max(stored_sequence)));
+            if max_sequence_number.is_none_or(|max| stored_sequence > max) {
+                max_sequence_number = Some(stored_sequence);
+            }
         }
 
         let new_len = entries.len();
@@ -352,9 +356,12 @@ impl KeyDeletionIndex {
             let stored_sequence = match entries.entry(key) {
                 std::collections::hash_map::Entry::Occupied(mut e) => {
                     let existing = *e.get();
-                    let stored_sequence = existing.max(seq);
-                    *e.get_mut() = stored_sequence;
-                    stored_sequence
+                    if seq > existing {
+                        *e.get_mut() = seq;
+                        seq
+                    } else {
+                        existing
+                    }
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
                     let key_clone: Box<[u8]> = e.key().clone();
@@ -363,8 +370,9 @@ impl KeyDeletionIndex {
                     seq
                 }
             };
-            max_sequence_number =
-                Some(max_sequence_number.map_or(stored_sequence, |max| max.max(stored_sequence)));
+            if max_sequence_number.is_none_or(|max| stored_sequence > max) {
+                max_sequence_number = Some(stored_sequence);
+            }
         }
 
         let new_len = entries.len();
