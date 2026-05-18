@@ -51,7 +51,7 @@ pub const DEFAULT_TASK_HISTORY_RETENTION_CHECK_INTERVAL_SECS: u64 = 15 * 60; // 
 
 /// [`TaskSpan`] records information about the execution of a given task. On [`finish`], it will write to the datafusion.
 #[derive(Clone)]
-pub(crate) struct TaskSpan {
+pub struct TaskSpan {
     pub(crate) trace_id: Arc<str>,
 
     /// A user-defined trace id that can be used to override the default trace id when exported.

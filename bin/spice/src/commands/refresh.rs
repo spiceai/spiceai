@@ -18,6 +18,7 @@ limitations under the License.
 
 use crate::context::RuntimeContext;
 use crate::error::{self, InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
+use crate::output::{OutputFormat, write_json};
 use clap::Args;
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +51,10 @@ pub struct RefreshArgs {
     /// Maximum jitter for the refresh operation (e.g. '1m')
     #[arg(long)]
     pub refresh_jitter_max: Option<String>,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 /// Request body for the refresh API.
@@ -120,6 +125,14 @@ pub async fn execute(ctx: &RuntimeContext, args: &RefreshArgs) -> Result<()> {
         }
         .build()
     })?;
+
+    if args.output == OutputFormat::Json {
+        return write_json(&serde_json::json!({
+            "dataset": args.dataset,
+            "message": result.message,
+            "status": "submitted",
+        }));
+    }
 
     if let Some(message) = result.message {
         tracing::info!("{message}");

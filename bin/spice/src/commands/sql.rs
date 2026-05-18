@@ -14,20 +14,30 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! SQL command implementation - starts an interactive SQL REPL.
+//! SQL command implementation - starts an interactive SQL REPL or runs one query.
 
 use crate::context::RuntimeContext;
 use crate::error::Result;
+use crate::output::OutputFormat;
 use clap::Args;
 use spice_cloud_client::endpoints::flight_endpoint as spice_cloud_flight_endpoint;
 
 /// Arguments for the sql command.
 #[derive(Args, Debug)]
 #[command(
-    about = "Start an interactive SQL query session against the Spice.ai runtime",
-    long_about = r#"Start an interactive SQL query session against the Spice.ai runtime
+    about = "Run SQL queries against the Spice.ai runtime",
+    long_about = r#"Run SQL queries against the Spice.ai runtime
+
+The `-sql` form is a root-level shortcut for a one-shot query. Quote multi-word
+queries so the shell passes them as one argument.
 
 Examples:
+  $ spice -sql "show tables"
+  # Runs a single SQL query and exits.
+
+  $ spice sql --query "select * from taxi_trips limit 10"
+  # Runs a single SQL query through the sql command and exits.
+
   $ spice sql
   Welcome to the Spice.ai SQL REPL! Type 'help' for help.
 
@@ -39,6 +49,10 @@ Examples:
 See more at: https://spiceai.org/docs/"#
 )]
 pub struct SqlArgs {
+    /// SQL query to run directly instead of opening the interactive REPL.
+    #[arg(long, value_name = "SQL")]
+    pub query: Option<String>,
+
     /// Specifies the remote Spice instance endpoint.
     /// Supports http://, https://, grpc://, or grpc+tls:// schemes.
     /// If not provided, uses local spiced runtime.
@@ -77,11 +91,32 @@ pub struct SqlArgs {
     /// per record. Useful for wide tables; can be toggled at runtime with `.expanded`.
     #[arg(long, short = 'x')]
     expanded: bool,
+
+    /// Output format for direct query mode
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 /// Execute the sql command.
 pub async fn execute(ctx: &RuntimeContext, args: &SqlArgs) -> Result<()> {
     let repl_config = build_repl_config(ctx, args);
+    if let Some(query) = &args.query {
+        if args.output == OutputFormat::Json {
+            repl::run_query_json(repl_config, query)
+                .await
+                .map_err(|e| crate::error::Error::Repl {
+                    message: e.to_string(),
+                })?;
+        } else {
+            repl::run_query(repl_config, query)
+                .await
+                .map_err(|e| crate::error::Error::Repl {
+                    message: e.to_string(),
+                })?;
+        }
+        return Ok(());
+    }
+
     repl::run(repl_config)
         .await
         .map_err(|e| crate::error::Error::Repl {

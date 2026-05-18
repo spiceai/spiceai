@@ -24,7 +24,7 @@ use vortex::VortexSessionDefault;
 use vortex_datafusion::{VortexFormat, VortexTableOptions};
 use vortex_session::VortexSession;
 
-use crate::metadata::VortexConfig;
+use crate::metadata::{PkConflictDetection, VortexConfig};
 
 /// Shared context for Cayenne table operations.
 ///
@@ -127,6 +127,81 @@ impl CayenneContext {
     #[must_use]
     pub fn write_concurrency(&self) -> Option<usize> {
         self.config.write_concurrency.map(|v| v.max(1))
+    }
+
+    /// Maximum rows in one write that may be inlined into the metastore.
+    #[must_use]
+    pub(crate) fn inline_max_rows(&self) -> usize {
+        self.config.inline_max_rows
+    }
+
+    /// Maximum serialized IPC bytes in one inlined metastore entry.
+    #[must_use]
+    pub(crate) fn inline_max_bytes(&self) -> usize {
+        self.config.inline_max_bytes
+    }
+
+    /// Maximum in-memory Arrow bytes buffered while deciding whether to inline.
+    #[must_use]
+    pub(crate) fn inline_max_buffer_bytes(&self) -> usize {
+        self.config.inline_max_buffer_bytes
+    }
+
+    /// Maximum inline rows before checkpointing to Vortex.
+    #[must_use]
+    pub(crate) fn inline_flush_max_rows(&self) -> i64 {
+        self.config.inline_flush_max_rows.max(0)
+    }
+
+    /// Maximum inline entries before checkpointing to Vortex.
+    #[must_use]
+    pub(crate) fn inline_flush_max_segments(&self) -> i64 {
+        self.config.inline_flush_max_segments.max(0)
+    }
+
+    /// Maximum inline IPC bytes before checkpointing to Vortex.
+    #[must_use]
+    pub(crate) fn inline_flush_max_bytes(&self) -> i64 {
+        self.config.inline_flush_max_bytes.max(0)
+    }
+
+    /// Primary-key conflict detection behavior for inserts.
+    #[must_use]
+    pub(crate) fn pk_conflict_detection(&self) -> PkConflictDetection {
+        self.config.pk_conflict_detection
+    }
+
+    /// Build the compaction picker config from the underlying `VortexConfig`.
+    #[must_use]
+    pub(crate) fn compaction_picker_config(&self) -> super::compaction::CompactionPickerConfig {
+        // `target_file_size_bytes` returns `usize`; widen via checked
+        // conversion so a future 128-bit `usize` couldn't silently truncate
+        // the tier thresholds. `u64::MAX` is a safe fallback because the
+        // picker only ever asks "is bucket size < threshold".
+        let target_bytes = u64::try_from(self.target_file_size_bytes()).unwrap_or(u64::MAX);
+        super::compaction::CompactionPickerConfig::new(
+            self.config.compaction_trigger_files,
+            self.config.compaction_max_files_per_pick,
+            target_bytes,
+        )
+    }
+
+    /// Maximum number of consecutive compaction passes per trigger.
+    #[must_use]
+    pub(crate) fn compaction_max_levels(&self) -> usize {
+        self.config.compaction_max_levels.max(1)
+    }
+
+    /// Background compaction interval. Returns `None` when disabled (interval = 0).
+    #[must_use]
+    pub(crate) fn compaction_background_interval(&self) -> Option<std::time::Duration> {
+        if self.config.compaction_background_interval_ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(
+                self.config.compaction_background_interval_ms,
+            ))
+        }
     }
 
     /// Get the shared semaphore for limiting concurrent file writes / uploads.

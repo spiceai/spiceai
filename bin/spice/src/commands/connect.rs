@@ -23,8 +23,22 @@ use clap::Args;
 
 /// Arguments for the connect command.
 #[derive(Args, Debug)]
+#[command(
+    about = "Add a Spicepod hosted on Spice.ai Cloud (with auth headers)",
+    long_about = r#"Add a Spicepod hosted on Spice.ai Cloud to the current project.
+
+This is equivalent to `spice add <pod>` but attaches the Spice.ai Cloud
+authentication headers (X-API-Key and Spice-Target-Source) so private Spicepods
+can be fetched. Run `spice login` first to obtain an API key.
+
+EXAMPLES
+  spice connect spiceai/quickstart
+  spice connect myorg/private-pod
+
+Docs: https://spiceai.org/docs"#
+)]
 pub struct ConnectArgs {
-    /// Spicepod path from Spice.ai Cloud (e.g., spiceai/quickstart)
+    /// Spicepod path on Spice.ai Cloud (e.g. `spiceai/quickstart`).
     pub pod_path: String,
 }
 

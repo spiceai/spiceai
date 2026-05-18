@@ -59,6 +59,7 @@ pub mod error_code;
 mod handle;
 mod metrics;
 pub mod registry;
+pub mod stage_history;
 mod tracker;
 
 pub use handle::{DistributedJobStatus, QueryHandle, QueryHandleError};
@@ -89,6 +90,7 @@ use crate::datafusion::{
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
+use runtime_datafusion::config::request_context_config::SpiceRequestContextConfig;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
 
@@ -299,18 +301,13 @@ impl Query {
     /// - Job submission fails
     pub async fn submit_distributed(self, job_id: &str) -> Result<QueryHandle> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
-        self.submit_distributed_internal(job_id, request_context)
-            .await
-    }
 
-    /// Internal implementation for submitting a distributed query.
-    async fn submit_distributed_internal(
-        self,
-        job_id: &str,
-        request_context: Arc<RequestContext>,
-    ) -> Result<QueryHandle> {
-        crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
-
+        // Create the `task_history` span here so it survives the early
+        // error paths inside `submit_distributed_internal`. On success the
+        // span moves into `QueryHandle` and closes when the job
+        // terminates; on failure (planning, validation, submission) we
+        // emit an error event on it here so the row's `error_message` is
+        // populated. Mirrors the sync `run_internal` shape.
         let span = tracing::span!(
             target: "task_history",
             tracing::Level::INFO,
@@ -318,19 +315,51 @@ impl Query {
             input = %self.sql,
             runtime_query = false,
             distributed = true,
-            job_id = %job_id
+            job_id = %job_id,
+            // Distributed-job summary labels — recorded at completion by
+            // `crate::datafusion::query::stage_history::record_stage_history`.
+            ballista_job_id = tracing::field::Empty,
+            stage_count = tracing::field::Empty,
+            executor_count = tracing::field::Empty,
+            total_tasks = tracing::field::Empty,
+            total_executor_ms = tracing::field::Empty,
         );
 
         if let Some(traceparent) = request_context.trace_parent() {
             crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
         }
 
+        let result = self
+            .submit_distributed_internal(job_id, request_context, span.clone())
+            .await;
+        if let Err(e) = &result {
+            tracing::error!(target: "task_history", parent: &span, "{e}");
+        }
+        result
+    }
+
+    /// Internal implementation for submitting a distributed query.
+    async fn submit_distributed_internal(
+        self,
+        job_id: &str,
+        request_context: Arc<RequestContext>,
+        span: Span,
+    ) -> Result<QueryHandle> {
+        crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
+
         // Get the scheduler server
         let scheduler = Self::get_scheduler_server(&self.df)?;
         let tracker = self.tracker;
 
-        // Create session for this job
-        let session_config = datafusion::prelude::SessionConfig::new_with_ballista();
+        // Create session for this job. The
+        // `SpiceRequestContextConfig` extension propagates the originating
+        // request's trace ids to executors through Ballista's
+        // `TaskDefinition` props; the scheduler-side session builder reads
+        // it back out and re-injects it on the built session config.
+        let session_config = datafusion::prelude::SessionConfig::new_with_ballista()
+            .with_option_extension(SpiceRequestContextConfig::from_request_context(
+                &request_context,
+            ));
         let session_ctx = scheduler
             .state
             .session_manager
@@ -506,6 +535,7 @@ impl Query {
             cache_key,
             tracker,
             request_context,
+            span,
         ))
     }
 

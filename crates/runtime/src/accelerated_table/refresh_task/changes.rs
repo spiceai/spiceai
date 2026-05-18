@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use super::RefreshTask;
+use crate::accelerated_table::metrics;
 use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::refresh_task::deletion::build_batch_delete_expr_from_change_batch;
 use crate::datafusion::error::{find_datafusion_root, format_datafusion_error};
@@ -21,9 +22,11 @@ use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{
     Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
 };
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow_tools::record_batch::try_cast_to;
 use cache::Caching;
+#[cfg(not(windows))]
+use cayenne::{CayenneCdcWrite, CayenneTableProvider};
 use data_components::arrow::{IndexedMemTable, write::MemTable};
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
 #[cfg(feature = "dynamodb")]
@@ -35,6 +38,7 @@ use data_components::kafka::{
     rdkafka::types::RDKafkaErrorCode,
 };
 use datafusion::datasource::TableProvider;
+use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
@@ -44,6 +48,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
+use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion_index::IndexedTableProvider;
 use runtime_table_partition::provider::PartitionTableProvider;
@@ -52,8 +57,47 @@ use std::collections::HashSet;
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, RwLock};
+
+type PendingApplyFinalize = tokio::task::JoinHandle<crate::accelerated_table::Result<()>>;
+
+pub(super) struct CdcInsertPlanCache {
+    target_schema: SchemaRef,
+    streaming_plan: Arc<StreamingDataUpdateExecutionPlan>,
+    insert_plan: Arc<dyn ExecutionPlan>,
+}
+
+impl CdcInsertPlanCache {
+    async fn try_new(
+        accelerator: &Arc<dyn TableProvider>,
+        session_state: &SessionState,
+        target_schema: SchemaRef,
+    ) -> Result<Self, DataFusionError> {
+        let streaming_plan = Arc::new(StreamingDataUpdateExecutionPlan::new_empty(Arc::clone(
+            &target_schema,
+        )));
+        let streaming_exec: Arc<dyn ExecutionPlan> =
+            Arc::<StreamingDataUpdateExecutionPlan>::clone(&streaming_plan);
+        let cast_plan: Arc<dyn ExecutionPlan> = Arc::new(SchemaCastScanExec::new(
+            streaming_exec,
+            Arc::clone(&target_schema),
+        ));
+        let insert_plan = accelerator
+            .insert_into(session_state, cast_plan, InsertOp::Append)
+            .await?;
+
+        Ok(Self {
+            target_schema,
+            streaming_plan,
+            insert_plan,
+        })
+    }
+
+    fn matches_schema(&self, schema: &SchemaRef) -> bool {
+        self.target_schema.as_ref() == schema.as_ref()
+    }
+}
 
 struct ApplyContext<'a> {
     refresh_sql: Option<&'a str>,
@@ -61,8 +105,25 @@ struct ApplyContext<'a> {
     caching: Option<&'a Weak<Caching>>,
     ready_sender: Option<&'a Arc<Notify>>,
     initial_load_completed: &'a Arc<AtomicBool>,
-    pending_commit: &'a mut Option<tokio::task::JoinHandle<()>>,
+    write_ctx: &'a SessionContext,
+    write_session_state: &'a SessionState,
     commit_timeout: Duration,
+    pending_finalize: &'a mut Option<PendingApplyFinalize>,
+    pending_commit: &'a mut Option<tokio::task::JoinHandle<Result<(), String>>>,
+}
+
+struct WriteChangeOutcome {
+    result: WriteChangeResult,
+    pending_finalize: Option<PendingApplyFinalize>,
+}
+
+impl WriteChangeOutcome {
+    fn new(result: WriteChangeResult, pending_finalize: Option<PendingApplyFinalize>) -> Self {
+        Self {
+            result,
+            pending_finalize,
+        }
+    }
 }
 
 /// Extracts the primary key value from the data, as a tuple of (String, Expr).
@@ -351,16 +412,20 @@ impl RefreshTask {
             }
         });
 
-        // The previous burst's commit task. Commits are network round-trips
-        // to the source (PG `Standby Status Update`, Kafka offset commit,
-        // DynamoDB shard checkpoint) that don't need to gate the next apply.
-        // We keep at most one commit task in flight: by waiting on the
-        // previous commit before *spawning* the next one, we preserve
-        // strict commit ordering across bursts (LSN/offsets advance
-        // monotonically), while letting commit(N) overlap with apply(N+1) —
-        // the actual idle window in the original serial loop.
-        let mut pending_commit: Option<tokio::task::JoinHandle<()>> = None;
+        // The previous burst's source-side commit task. Commits are network
+        // round-trips to the source (PG `Standby Status Update`, Kafka offset
+        // commit, DynamoDB shard checkpoint) that don't need to gate the next
+        // apply once the accelerator write has succeeded. Before publishing a
+        // new commit task we drain the previous one with `commit_timeout`, so
+        // commit(N) overlaps apply(N+1) without accumulating an unbounded chain
+        // of tasks if the source-side commit path stalls. Commit task errors
+        // are returned through `join_pending_commit` so source offsets cannot
+        // silently stop advancing.
+        let mut pending_commit: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
+        let mut pending_finalize: Option<PendingApplyFinalize> = None;
         let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
 
         while let Some(first) = match carried_item.take() {
             Some(item) => Some(item),
@@ -404,13 +469,37 @@ impl RefreshTask {
                 caching: caching.as_ref(),
                 ready_sender: ready_sender.as_ref(),
                 initial_load_completed: &initial_load_completed,
-                pending_commit: &mut pending_commit,
+                write_ctx: &write_ctx,
+                write_session_state: &write_session_state,
                 commit_timeout: cdc_cfg.commit_timeout,
+                pending_finalize: &mut pending_finalize,
+                pending_commit: &mut pending_commit,
             };
             if !self.apply_burst(&mut apply_context, burst).await {
                 rx.close();
                 reader_handle.abort();
                 break;
+            }
+        }
+
+        if let Some(finalize) = pending_finalize.take() {
+            if let Some(error_message) =
+                join_pending_finalize(finalize, &dataset_name, self.runtime_status.is_shutdown())
+                    .await
+            {
+                self.set_refresh_status(
+                    sql.as_deref(),
+                    status::ComponentStatus::error_with_message(error_message),
+                )
+                .await;
+            } else if let Some(cache_provider_ref) = caching.as_ref()
+                && let Some(cache_provider) = cache_provider_ref.upgrade()
+                && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone())
+                && !self.runtime_status.is_shutdown()
+            {
+                tracing::error!(
+                    "Failed to invalidate cached results for dataset {dataset_name}: {e}"
+                );
             }
         }
 
@@ -476,13 +565,25 @@ impl RefreshTask {
     /// underlying `RecordBatch`es into a single `ChangeBatch` and call
     /// `write_change` once — turning N small writes into one larger write
     /// and amortizing the per-envelope `SessionContext` + `insert_into`
-    /// planning cost. After a successful write we hand the run's committers
-    /// to a background commit task so that commit(N) overlaps with apply(N+1).
+    /// planning cost. After a successful write we append the run's committers
+    /// to the ordered background commit chain so source acknowledgements stay
+    /// monotonic without blocking catch-up apply work.
     async fn apply_burst(
         &self,
         context: &mut ApplyContext<'_>,
         burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
     ) -> bool {
+        let burst_start = Instant::now();
+        let burst_envelopes = u64::try_from(burst.len()).unwrap_or(u64::MAX);
+        let burst_bytes = burst
+            .iter()
+            .map(cdc_item_memory_size)
+            .fold(0_usize, usize::saturating_add);
+        let labels = [KeyValue::new("dataset", context.dataset_name.to_string())];
+        metrics::CDC_APPLY_BURST_ENVELOPES.record(burst_envelopes, &labels);
+        metrics::CDC_APPLY_BURST_BYTES
+            .record(u64::try_from(burst_bytes).unwrap_or(u64::MAX), &labels);
+
         // Walk the burst preserving arrival order, processing contiguous
         // runs of Ok envelopes together and Err items individually so error
         // handling and ordering semantics match the pre-coalesce behavior.
@@ -500,6 +601,8 @@ impl RefreshTask {
                     }
 
                     if !self.apply_envelope_run(context, envelopes).await {
+                        metrics::CDC_APPLY_BURST_DURATION_MS
+                            .record(elapsed_ms(burst_start), &labels);
                         return false;
                     }
                 }
@@ -521,12 +624,12 @@ impl RefreshTask {
                 }
             }
         }
+        metrics::CDC_APPLY_BURST_DURATION_MS.record(elapsed_ms(burst_start), &labels);
         true
     }
 
     /// Apply a contiguous run of successful envelopes as a single coalesced
-    /// write, then schedule their commits in a background task that overlaps
-    /// with the next burst's apply.
+    /// write, then append their commits to the ordered background commit chain.
     async fn apply_envelope_run(
         &self,
         context: &mut ApplyContext<'_>,
@@ -552,6 +655,7 @@ impl RefreshTask {
             batches.push(batch);
         }
 
+        let coalesce_start = Instant::now();
         // Fast path: a single envelope (low-load / serial behavior). Skips
         // concat allocation entirely so the no-coalesce path matches the
         // pre-pipelining cost exactly.
@@ -579,9 +683,20 @@ impl RefreshTask {
                 }
             }
         };
+        record_cdc_fixed_cost(context.dataset_name, "coalesce", coalesce_start);
 
-        match self.write_change(coalesced_batch).await {
-            Ok(write_result) => {
+        let write_start = Instant::now();
+        match self
+            .write_change_with_context(
+                coalesced_batch,
+                context.write_ctx,
+                context.write_session_state,
+            )
+            .await
+        {
+            Ok(write_outcome) => {
+                record_cdc_fixed_cost(context.dataset_name, "write", write_start);
+
                 if any_ready {
                     context
                         .initial_load_completed
@@ -593,7 +708,40 @@ impl RefreshTask {
                         .await;
                 }
 
-                if write_result == WriteChangeResult::DataWritten
+                if let Some(previous_finalize) = context.pending_finalize.take() {
+                    let finalize_start = Instant::now();
+                    if let Some(error_message) = join_pending_finalize(
+                        previous_finalize,
+                        context.dataset_name,
+                        self.runtime_status.is_shutdown(),
+                    )
+                    .await
+                    {
+                        self.set_refresh_status(
+                            context.refresh_sql,
+                            status::ComponentStatus::error_with_message(error_message),
+                        )
+                        .await;
+                        return false;
+                    }
+                    record_cdc_fixed_cost(context.dataset_name, "finalize_wait", finalize_start);
+
+                    if let Some(cache_provider_ref) = context.caching
+                        && let Some(cache_provider) = cache_provider_ref.upgrade()
+                        && let Err(e) =
+                            cache_provider.invalidate_for_table(context.dataset_name.clone())
+                        && !self.runtime_status.is_shutdown()
+                    {
+                        tracing::error!(
+                            "Failed to invalidate cached results for dataset {}: {e}",
+                            context.dataset_name
+                        );
+                    }
+                }
+
+                let current_finalize_pending = write_outcome.pending_finalize.is_some();
+                if write_outcome.result == WriteChangeResult::DataWritten
+                    && !current_finalize_pending
                     && let Some(cache_provider_ref) = context.caching
                     && let Some(cache_provider) = cache_provider_ref.upgrade()
                     && let Err(e) =
@@ -606,41 +754,35 @@ impl RefreshTask {
                     );
                 }
 
-                // Wait for the previous burst's commit to land before
-                // spawning this burst's commit. This preserves strict
-                // commit ordering across bursts (LSN/offsets must advance
-                // monotonically) while letting commit(N) overlap with the
-                // next apply(N+1).
-                if let Some(prev) = context.pending_commit.take()
-                    && let Some(error_message) = join_pending_commit(
-                        prev,
+                if let Some(finalize) = write_outcome.pending_finalize {
+                    *context.pending_finalize = Some(finalize);
+                }
+
+                if let Some(previous_commit) = context.pending_commit.take() {
+                    let commit_wait_start = Instant::now();
+                    if let Some(error_message) = join_pending_commit(
+                        previous_commit,
                         context.dataset_name,
                         self.runtime_status.is_shutdown(),
                         context.commit_timeout,
                     )
                     .await
-                {
-                    self.set_refresh_status(
-                        context.refresh_sql,
-                        status::ComponentStatus::error_with_message(error_message),
-                    )
-                    .await;
-                    return false;
+                    {
+                        self.set_refresh_status(
+                            context.refresh_sql,
+                            status::ComponentStatus::error_with_message(error_message),
+                        )
+                        .await;
+                        return false;
+                    }
+                    record_cdc_fixed_cost(context.dataset_name, "commit_wait", commit_wait_start);
                 }
 
-                let runtime_status = Arc::clone(&self.runtime_status);
-                let commit_dataset = context.dataset_name.clone();
-                *context.pending_commit = Some(tokio::spawn(async move {
-                    for committer in committers {
-                        if let Err(e) = committer.commit().await
-                            && !runtime_status.is_shutdown()
-                        {
-                            tracing::error!(
-                                "Failed to commit CDC change envelope for {commit_dataset}: {e}"
-                            );
-                        }
-                    }
-                }));
+                *context.pending_commit = Some(spawn_ordered_commit_task(
+                    committers,
+                    Arc::clone(&self.runtime_status),
+                    context.dataset_name.clone(),
+                ));
             }
             Err(e) => {
                 let error_message = format_datafusion_error(&e);
@@ -660,15 +802,27 @@ impl RefreshTask {
         true
     }
 
+    #[cfg(test)]
     async fn write_change(
         &self,
         change_batch: ChangeBatch,
     ) -> crate::accelerated_table::Result<WriteChangeResult> {
+        let ctx = SessionContext::new();
+        let session_state = ctx.state();
+        self.write_change_with_context(change_batch, &ctx, &session_state)
+            .await
+            .map(|outcome| outcome.result)
+    }
+
+    async fn write_change_with_context(
+        &self,
+        change_batch: ChangeBatch,
+        ctx: &SessionContext,
+        session_state: &SessionState,
+    ) -> crate::accelerated_table::Result<WriteChangeOutcome> {
         let dataset_name = self.dataset_name.clone();
 
         let sub_batches = group_into_sub_batches(&change_batch);
-        let ctx = SessionContext::new();
-        let session_state = ctx.state();
 
         tracing::trace!(
             "Processing append/change stream batch: dataset={}, rows={}, sub-batches={}",
@@ -678,20 +832,35 @@ impl RefreshTask {
         );
 
         let mut had_change = false;
+        let mut pending_finalize: Option<PendingApplyFinalize> = None;
         for (op_type, row_indices) in sub_batches {
+            if let Some(finalize) = pending_finalize.take()
+                && let Some(error_message) = join_pending_finalize(
+                    finalize,
+                    &self.dataset_name,
+                    self.runtime_status.is_shutdown(),
+                )
+                .await
+            {
+                return Err(crate::accelerated_table::Error::FailedToWriteData {
+                    source: DataFusionError::Execution(error_message),
+                });
+            }
+
             match op_type {
                 ChangeOperationType::Delete => {
-                    self.process_delete_batch(&change_batch, &row_indices, &ctx, &session_state)
+                    self.process_delete_batch(&change_batch, &row_indices, ctx, session_state)
                         .await?;
                     had_change = true;
                 }
                 ChangeOperationType::Upsert => {
-                    self.process_upsert_batch(&change_batch, &row_indices, &ctx, &session_state)
+                    pending_finalize = self
+                        .process_upsert_batch(&change_batch, &row_indices, ctx, session_state)
                         .await?;
                     had_change = true;
                 }
                 ChangeOperationType::Truncate => {
-                    self.process_truncate(&ctx, &session_state).await?;
+                    self.process_truncate(ctx, session_state).await?;
                     had_change = true;
                 }
                 ChangeOperationType::Unknown => {
@@ -707,9 +876,12 @@ impl RefreshTask {
         }
 
         if had_change {
-            Ok(WriteChangeResult::DataWritten)
+            Ok(WriteChangeOutcome::new(
+                WriteChangeResult::DataWritten,
+                pending_finalize,
+            ))
         } else {
-            Ok(WriteChangeResult::NoChange)
+            Ok(WriteChangeOutcome::new(WriteChangeResult::NoChange, None))
         }
     }
 
@@ -719,7 +891,7 @@ impl RefreshTask {
         row_indices: &[usize],
         ctx: &SessionContext,
         session_state: &SessionState,
-    ) -> crate::accelerated_table::Result<()> {
+    ) -> crate::accelerated_table::Result<Option<PendingApplyFinalize>> {
         let dataset_name = &self.dataset_name;
 
         let data_batch = change_batch.data_batch();
@@ -751,30 +923,91 @@ impl RefreshTask {
             Box::pin(stream::once(async move { Ok(selected_batch) })),
         ));
 
+        #[cfg(not(windows))]
+        if let Some(cayenne) = self.cayenne_accelerator() {
+            let task_ctx = ctx.task_ctx();
+            let cayenne_write = cayenne
+                .write_cdc_append_stream(record_batch_stream, &task_ctx)
+                .await
+                .map_err(DataFusionError::from)
+                .map_err(find_datafusion_root)
+                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+
+            self.update_last_updated_at();
+
+            if cayenne_write.has_pending_finalize() {
+                return Ok(Some(spawn_cayenne_finalize(cayenne_write)));
+            }
+
+            cayenne_write
+                .finish()
+                .await
+                .map_err(DataFusionError::from)
+                .map_err(find_datafusion_root)
+                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+
+            return Ok(None);
+        }
+
         let _lock_guard = self.accelerator_write_mutex.lock().await;
 
-        // Wrap with SchemaCastScanExec to ensure data types match the accelerator schema
-        // (e.g., timestamp precision conversion from Millisecond to Microsecond for Cayenne)
-        let streaming_plan: Arc<dyn ExecutionPlan> =
-            Arc::new(StreamingDataUpdateExecutionPlan::new(record_batch_stream));
-        let cast_plan: Arc<dyn ExecutionPlan> =
-            Arc::new(SchemaCastScanExec::new(streaming_plan, target_schema));
+        let (streaming_plan, insert_plan) = {
+            let mut cache_guard = self.cdc_insert_plan_cache.lock().await;
+            let rebuild_cache = cache_guard
+                .as_ref()
+                .is_none_or(|cache| !cache.matches_schema(&target_schema));
+            if rebuild_cache {
+                *cache_guard = Some(
+                    CdcInsertPlanCache::try_new(
+                        &self.accelerator,
+                        session_state,
+                        Arc::clone(&target_schema),
+                    )
+                    .await
+                    .map_err(find_datafusion_root)
+                    .context(crate::accelerated_table::FailedToWriteDataSnafu)?,
+                );
+            }
 
-        let insert_plan = self
-            .accelerator
-            .insert_into(session_state, cast_plan, InsertOp::Append)
+            let cache = cache_guard.as_ref().ok_or_else(|| {
+                crate::accelerated_table::Error::FailedToWriteData {
+                    source: DataFusionError::Execution(
+                        "CDC insert plan cache was not initialized".to_string(),
+                    ),
+                }
+            })?;
+            cache
+                .streaming_plan
+                .set_stream(record_batch_stream)
+                .map_err(find_datafusion_root)
+                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+            (
+                Arc::clone(&cache.streaming_plan),
+                Arc::clone(&cache.insert_plan),
+            )
+        };
+
+        let collect_result = collect(insert_plan, ctx.task_ctx())
             .await
             .map_err(find_datafusion_root)
-            .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
-        collect(insert_plan, ctx.task_ctx())
-            .await
+            .context(crate::accelerated_table::FailedToWriteDataSnafu);
+        streaming_plan
+            .clear_stream()
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+        collect_result?;
         perform_change_write_maintenance(&self.accelerator).await?;
 
         self.update_last_updated_at();
 
-        Ok(())
+        Ok(None)
+    }
+
+    #[cfg(not(windows))]
+    fn cayenne_accelerator(&self) -> Option<&CayenneTableProvider> {
+        self.accelerator
+            .as_any()
+            .downcast_ref::<CayenneTableProvider>()
     }
 
     async fn process_truncate(
@@ -902,6 +1135,18 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated_table::R
 fn cdc_item_memory_size(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
     item.as_ref()
         .map_or(0, |env| env.change_batch.record.get_array_memory_size())
+}
+
+fn elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
+fn record_cdc_fixed_cost(dataset_name: &TableReference, phase: &'static str, start: Instant) {
+    let labels = [
+        KeyValue::new("dataset", dataset_name.to_string()),
+        KeyValue::new("phase", phase),
+    ];
+    metrics::CDC_APPLY_FIXED_COST_MS.record(elapsed_ms(start), &labels);
 }
 
 fn select_rows(
@@ -1045,12 +1290,56 @@ fn contiguous_row_span(row_indices: &[usize]) -> Option<(usize, usize)> {
     }
 }
 
+#[cfg(not(windows))]
+fn spawn_cayenne_finalize(cayenne_write: CayenneCdcWrite) -> PendingApplyFinalize {
+    tokio::spawn(async move {
+        cayenne_write
+            .finish()
+            .await
+            .map(|_| ())
+            .map_err(DataFusionError::from)
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::FailedToWriteDataSnafu)
+    })
+}
+
+async fn join_pending_finalize(
+    handle: PendingApplyFinalize,
+    dataset_name: &TableReference,
+    is_shutdown: bool,
+) -> Option<String> {
+    match handle.await {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) if is_shutdown => {
+            tracing::debug!("CDC apply finalizer for {dataset_name} failed during shutdown: {e}");
+            None
+        }
+        Ok(Err(e)) => {
+            let error_message = format!("CDC apply finalizer for {dataset_name} failed: {e}");
+            tracing::error!("{error_message}");
+            Some(error_message)
+        }
+        Err(e) if e.is_cancelled() && is_shutdown => {
+            tracing::debug!(
+                "CDC apply finalizer for {dataset_name} was cancelled (likely shutdown)"
+            );
+            None
+        }
+        Err(e) => {
+            let error_message =
+                format!("CDC apply finalizer for {dataset_name} ended unexpectedly: {e}");
+            tracing::error!("{error_message}");
+            Some(error_message)
+        }
+    }
+}
+
 /// Await an in-flight commit task spawned by `apply_envelope_run`. Surfaces
 /// panics loudly (we must never silently swallow a commit-task panic — that
 /// would leave the dataset healthy while source-side offsets stop advancing)
 /// but treats cancellation during shutdown as expected.
 async fn join_pending_commit(
-    mut handle: tokio::task::JoinHandle<()>,
+    mut handle: tokio::task::JoinHandle<Result<(), String>>,
     dataset_name: &TableReference,
     is_shutdown: bool,
     commit_timeout: Duration,
@@ -1074,7 +1363,8 @@ async fn join_pending_commit(
                     tracing::error!("{error_message}");
                     Some(error_message)
                 }
-                Ok(()) => None,
+                Ok(Ok(())) => None,
+                Ok(Err(error_message)) => Some(error_message),
             }
         }
         () = tokio::time::sleep(commit_timeout) => {
@@ -1095,6 +1385,33 @@ async fn join_pending_commit(
             }
         }
     }
+}
+
+fn spawn_ordered_commit_task(
+    committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
+    runtime_status: Arc<status::RuntimeStatus>,
+    commit_dataset: TableReference,
+) -> tokio::task::JoinHandle<Result<(), String>> {
+    tokio::spawn(async move {
+        // Safe catch-up mode: this task is spawned only after the accelerator
+        // write returns successfully. For Cayenne staged appends, that return
+        // point is after the staging WAL is durable; file publication may still
+        // be finishing in the apply finalizer. `apply_envelope_run` has already
+        // drained the previous commit task with timeout/backpressure before
+        // spawning this one, so source progress is acknowledged in order
+        // without running ahead of a durable accelerator write.
+        for committer in committers {
+            if let Err(e) = committer.commit().await
+                && !runtime_status.is_shutdown()
+            {
+                let error_message =
+                    format!("Failed to commit CDC change envelope for {commit_dataset}: {e}");
+                tracing::error!("{error_message}");
+                return Err(error_message);
+            }
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -1832,6 +2149,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_write_change_reuses_cached_insert_plan_for_upserts() {
+        let insert_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingInsertProvider {
+            inner: make_mem_table() as Arc<dyn TableProvider>,
+            insert_calls: Arc::clone(&insert_calls),
+        });
+        let task = make_refresh_task(provider as Arc<dyn TableProvider>);
+        let ctx = SessionContext::new();
+        let session_state = ctx.state();
+
+        let first_batch =
+            create_test_change_batch(vec!["c"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
+        let second_batch =
+            create_test_change_batch(vec!["c"], &[vec!["id"]], vec![2], vec![Some("Bob")]);
+
+        assert_eq!(
+            task.write_change_with_context(first_batch, &ctx, &session_state)
+                .await
+                .expect("first write_change should succeed")
+                .result,
+            WriteChangeResult::DataWritten
+        );
+        assert_eq!(
+            task.write_change_with_context(second_batch, &ctx, &session_state)
+                .await
+                .expect("second write_change should succeed")
+                .result,
+            WriteChangeResult::DataWritten
+        );
+
+        assert_eq!(
+            insert_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "CDC upserts should reuse the cached insert_into plan"
+        );
+    }
+
+    #[tokio::test]
     async fn test_write_change_delete_returns_data_written() {
         let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         let change_batch =
@@ -2290,6 +2645,48 @@ mod tests {
 
     // -- Correctness: commit-after-write ordering -----------------------------
 
+    /// Wraps a `TableProvider` and counts each `insert_into` call.
+    #[derive(Debug)]
+    struct CountingInsertProvider {
+        inner: Arc<dyn TableProvider>,
+        insert_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TableProvider for CountingInsertProvider {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+
+        async fn insert_into(
+            &self,
+            state: &dyn Session,
+            input: Arc<dyn ExecutionPlan>,
+            insert_op: InsertOp,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.insert_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner.insert_into(state, input, insert_op).await
+        }
+    }
+
     /// Wraps a `TableProvider` and records each `insert_into` call.
     /// Together with `CommitLog`, this lets us assert that for every
     /// envelope `id`, the write event happens strictly before the commit.
@@ -2493,15 +2890,21 @@ mod tests {
         let log = CommitLog::new();
         let dataset_name = TableReference::bare("test");
         let initial_load_completed = Arc::new(AtomicBool::new(false));
+        let mut pending_finalize = None;
         let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
         let mut context = ApplyContext {
             refresh_sql: None,
             dataset_name: &dataset_name,
             caching: None,
             ready_sender: None,
             initial_load_completed: &initial_load_completed,
-            pending_commit: &mut pending_commit,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
             commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
+            pending_commit: &mut pending_commit,
         };
 
         assert!(
@@ -2580,7 +2983,7 @@ mod tests {
     #[tokio::test]
     async fn test_join_pending_commit_ignores_cancel_during_shutdown() {
         let dataset_name = TableReference::bare("test");
-        let handle = tokio::spawn(std::future::pending::<()>());
+        let handle = tokio::spawn(std::future::pending::<Result<(), String>>());
         handle.abort();
 
         let result = join_pending_commit(handle, &dataset_name, true, Duration::from_secs(5)).await;

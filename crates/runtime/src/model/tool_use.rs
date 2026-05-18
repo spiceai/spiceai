@@ -411,6 +411,7 @@ impl ToolUsingChat {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl Chat for ToolUsingChat {
     async fn run(&self, prompt: String) -> ChatResult<Option<String>> {

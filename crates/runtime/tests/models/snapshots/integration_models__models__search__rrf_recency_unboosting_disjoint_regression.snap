@@ -1,7 +1,7 @@
 ---
 source: crates/runtime/tests/models/search.rs
 description: "SELECT id, content, picked_at FROM rrf(vector_search(left_fruit, 'red crispy', content), vector_search(right_fruit, 'red crispy', content), join_key => 'id', k => 0, time_column => 'picked_at', decay_constant => 0.25) ORDER BY _fused_score DESC, id ASC LIMIT 3"
-expression: normalize_search_response(resp)
+expression: "normalize_search_response(resp, true)"
 snapshot_kind: text
 ---
 [

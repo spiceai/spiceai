@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `spice validate` — check that a spicepod.yaml file is syntactically valid and
+//! `spice validate` — check that a spicepod.yaml or spicepod.yml file is syntactically valid and
 //! resolves its component references, without starting the runtime.
 //!
 //! Mirrors the behaviour of `tools/spicepod-validator` so it can be used in CI and
@@ -28,8 +28,8 @@ use std::path::PathBuf;
 
 #[derive(Args, Debug)]
 #[command(
-    about = "Validate a spicepod.yaml without starting the runtime",
-    long_about = r#"Validate a spicepod.yaml without starting the runtime.
+    about = "Validate a spicepod.yaml or spicepod.yml without starting the runtime",
+    long_about = r#"Validate a spicepod.yaml or spicepod.yml without starting the runtime.
 
 Checks:
   - YAML syntax and schema
@@ -39,14 +39,15 @@ Checks:
   - Nested pod includes (`dependsOn`, referenced pods)
 
 Examples:
-  spice validate                          # validate ./spicepod.yaml
-  spice validate .                        # same as above
-  spice validate ./my-app                 # validate my-app/spicepod.yaml
-  spice validate path/to/spicepod.yaml    # validate a specific file
+    spice validate                          # validate ./spicepod.yaml
+    spice validate .                        # same as above
+    spice validate ./my-app                 # validate my-app/spicepod.yaml or spicepod.yml
+    spice validate path/to/spicepod.yaml    # validate a specific file
+    spice validate path/to/spicepod.yml     # validate a specific file
 "#
 )]
 pub struct ValidateArgs {
-    /// Path to a spicepod.yaml file, or a directory containing one. Defaults to ".".
+    /// Path to a spicepod.yaml/spicepod.yml file, or a directory containing one. Defaults to ".".
     #[arg(default_value = ".")]
     pub path: PathBuf,
 }
@@ -54,15 +55,37 @@ pub struct ValidateArgs {
 pub async fn execute(args: &ValidateArgs) -> Result<()> {
     match load_pod(&args.path).await {
         Ok(pod) => {
+            let runtime = if pod.runtime == spicepod::component::runtime::Runtime::default() {
+                "default"
+            } else {
+                "configured"
+            };
+            let management = if pod.management.is_some() {
+                "configured"
+            } else {
+                "none"
+            };
+            let snapshots = if pod.snapshots.is_some() {
+                "configured"
+            } else {
+                "none"
+            };
             println!(
-                "{} {} (datasets: {}, models: {}, views: {}, tools: {}, workers: {})",
+                "{} {}\n  components: catalogs={}, datasets={}, views={}, models={}, embeddings={}, rerankers={}, tools={}, workers={}, functions={}\n  resources: secrets={}, dependencies={}, extensions={}\n  configuration: runtime={runtime}, management={management}, snapshots={snapshots}",
                 Color::Green.paint("OK"),
                 pod.name,
+                pod.catalogs.len(),
                 pod.datasets.len(),
-                pod.models.len(),
                 pod.views.len(),
+                pod.models.len(),
+                pod.embeddings.len(),
+                pod.rerankers.len(),
                 pod.tools.len(),
                 pod.workers.len(),
+                pod.functions.len(),
+                pod.secrets.len(),
+                pod.dependencies.len(),
+                pod.extensions.len(),
             );
             Ok(())
         }
@@ -126,6 +149,16 @@ mod tests {
         let pod = load_pod(dir.path())
             .await
             .expect("should load spicepod.yaml from directory");
+        assert_eq!(pod.name, "test_app");
+    }
+
+    #[tokio::test]
+    async fn loads_directory_containing_spicepod_yml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _ = write_pod(&dir, "spicepod.yml", VALID_POD);
+        let pod = load_pod(dir.path())
+            .await
+            .expect("should load spicepod.yml from directory");
         assert_eq!(pod.name, "test_app");
     }
 
