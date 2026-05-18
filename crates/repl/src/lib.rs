@@ -288,89 +288,9 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     // Note: custom_headers are currently not applied to the gRPC Flight connection.
     // Adding gRPC metadata headers requires interceptor changes.
     // For now, this flag is accepted but not used.
-    if !repl_config.custom_headers.is_empty() {
-        tracing::warn!(
-            "Custom headers are not currently supported for the SQL REPL's Flight gRPC connection"
-        );
-    }
-
-    let mut repl_flight_endpoint = repl_config.repl_flight_endpoint;
-    let mut user_agent = get_user_agent();
-    if let Some(user_agent_override) = repl_config.user_agent {
-        // Prepend the user agent with the Spice.ai user agent
-        let mut new_agent = user_agent_override;
-        new_agent.push(' ');
-        new_agent.push_str(&user_agent);
-        user_agent = new_agent;
-    }
-    // Build mTLS client identity if both cert and key are provided.
-    // Clap `requires` on the CLI flags enforces that both are present or both absent.
-    let client_identity = if let (Some(cert_path), Some(key_path)) = (
-        &repl_config.client_tls_certificate_file,
-        &repl_config.client_tls_key_file,
-    ) {
-        let cert_pem = tokio::fs::read(cert_path).await.map_err(|e| {
-            format!("Failed to read TLS client certificate from '{cert_path}': {e}. Verify the file path and permissions.")
-        })?;
-        let key_pem = tokio::fs::read(key_path).await.map_err(|e| {
-            format!("Failed to read TLS client key from '{key_path}': {e}. Verify the file path and permissions.")
-        })?;
-        Some(tonic::transport::Identity::from_pem(cert_pem, key_pem))
-    } else {
-        None
-    };
-
-    let channel = if let Some(tls_root_certificate_file) = repl_config.tls_root_certificate_file {
-        let tls_root_certificate = tokio::fs::read(&tls_root_certificate_file)
-            .await
-            .map_err(|e| {
-                format!("Failed to read TLS root certificate from '{tls_root_certificate_file}': {e}. Verify the file path and permissions.")
-            })?;
-        let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);
-        let mut client_tls_config = ClientTlsConfig::new().ca_certificate(tls_root_certificate);
-        if let Some(identity) = client_identity {
-            client_tls_config = client_tls_config.identity(identity);
-        }
-        if repl_flight_endpoint.starts_with("http://") {
-            repl_flight_endpoint = repl_flight_endpoint.replacen("http://", "https://", 1);
-        }
-        Channel::from_shared(repl_flight_endpoint.clone())?
-            .user_agent(user_agent.clone())?
-            .tls_config(client_tls_config)?
-            .connect()
-            .await
-    } else if client_identity.is_some() || repl_flight_endpoint.starts_with("https://") {
-        // For HTTPS endpoints or mTLS client identity without an explicit CA, use system certificates
-        let mut client_tls_config = ClientTlsConfig::new().with_native_roots();
-        if let Some(identity) = client_identity {
-            client_tls_config = client_tls_config.identity(identity);
-        }
-        if repl_flight_endpoint.starts_with("http://") {
-            repl_flight_endpoint = repl_flight_endpoint.replacen("http://", "https://", 1);
-        }
-        Channel::from_shared(repl_flight_endpoint.clone())?
-            .user_agent(user_agent.clone())?
-            .tls_config(client_tls_config)?
-            .connect()
-            .await
-    } else {
-        Channel::from_shared(repl_flight_endpoint.clone())?
-            .user_agent(user_agent.clone())?
-            .connect()
-            .await
-    };
-
-    // Set up the Flight client
-    let channel = channel.map_err(|e| {
-        Box::<dyn Error>::from(format!(
-            "Connection failed to spiced at '{repl_flight_endpoint}': {e}. Check if the Spice runtime is running, endpoint including port is correct, and TLS config (if used) is valid."
-        ))
-    })?;
-
-    // The encoder/decoder size is limited to 500MB.
-    let client = FlightServiceClient::new(channel)
-        .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
-        .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
+    warn_if_custom_headers_are_unsupported(&repl_config);
+    let user_agent = build_user_agent(repl_config.user_agent.as_deref());
+    let client = connect_flight_client(&repl_config, &user_agent).await?;
 
     let config = Config::builder()
         .completion_type(CompletionType::List)
@@ -760,6 +680,188 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+/// Run one SQL query through the Flight SQL client and print the formatted result.
+///
+/// # Errors
+///
+/// Returns an error if the Flight connection or query execution fails.
+pub async fn run_query(
+    repl_config: ReplConfig,
+    sql: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    warn_if_custom_headers_are_unsupported(&repl_config);
+    let user_agent = build_user_agent(repl_config.user_agent.as_deref());
+    let client = connect_flight_client(&repl_config, &user_agent).await?;
+    let start_time = Instant::now();
+
+    match get_records(
+        client,
+        sql,
+        repl_config.api_key.as_ref(),
+        &user_agent,
+        repl_config.cache_control,
+    )
+    .await
+    {
+        Ok((records, total_rows, from_cache)) => {
+            display_records(
+                &records,
+                start_time,
+                total_rows,
+                from_cache,
+                repl_config.expanded,
+            )?;
+            Ok(())
+        }
+        Err(FlightError::Tonic(status)) => {
+            Err(Box::<dyn Error>::from(format_flight_sql_status(&status)))
+        }
+        Err(error) => Err(Box::<dyn Error>::from(format!(
+            "Unexpected Flight error: {error}. Check connection or query syntax."
+        ))),
+    }
+}
+
+/// Run one SQL query through the Flight SQL client and print the result as JSON.
+///
+/// # Errors
+///
+/// Returns an error if the Flight connection, query execution, or JSON serialization fails.
+pub async fn run_query_json(
+    repl_config: ReplConfig,
+    sql: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    warn_if_custom_headers_are_unsupported(&repl_config);
+    let user_agent = build_user_agent(repl_config.user_agent.as_deref());
+    let client = connect_flight_client(&repl_config, &user_agent).await?;
+
+    match get_records(
+        client,
+        sql,
+        repl_config.api_key.as_ref(),
+        &user_agent,
+        repl_config.cache_control,
+    )
+    .await
+    {
+        Ok((records, _total_rows, _from_cache)) => write_records_json(&records),
+        Err(FlightError::Tonic(status)) => {
+            Err(Box::<dyn Error>::from(format_flight_sql_status(&status)))
+        }
+        Err(error) => Err(Box::<dyn Error>::from(format!(
+            "Unexpected Flight error: {error}. Check connection or query syntax."
+        ))),
+    }
+}
+
+fn write_records_json(records: &[RecordBatch]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = arrow_json::ArrayWriter::new(&mut buf);
+        writer.write_batches(&records.iter().collect::<Vec<_>>())?;
+        writer.finish()?;
+    }
+    let json = String::from_utf8(buf)?;
+    println!("{json}");
+    Ok(())
+}
+
+fn warn_if_custom_headers_are_unsupported(repl_config: &ReplConfig) {
+    if !repl_config.custom_headers.is_empty() {
+        tracing::warn!(
+            "Custom headers are not currently supported for the SQL REPL's Flight gRPC connection"
+        );
+    }
+}
+
+fn build_user_agent(user_agent_override: Option<&str>) -> String {
+    let user_agent = get_user_agent();
+    match user_agent_override {
+        Some(override_value) => format!("{override_value} {user_agent}"),
+        None => user_agent,
+    }
+}
+
+fn format_flight_sql_status(status: &Status) -> String {
+    format!(
+        "Flight SQL query failed ({:?}): {}",
+        status.code(),
+        status.message()
+    )
+}
+
+async fn connect_flight_client(
+    repl_config: &ReplConfig,
+    user_agent: &str,
+) -> Result<FlightServiceClient<Channel>, Box<dyn std::error::Error>> {
+    let mut repl_flight_endpoint = repl_config.repl_flight_endpoint.clone();
+    let client_identity = if let (Some(cert_path), Some(key_path)) = (
+        &repl_config.client_tls_certificate_file,
+        &repl_config.client_tls_key_file,
+    ) {
+        let cert_pem = tokio::fs::read(cert_path).await.map_err(|e| {
+            format!("Failed to read TLS client certificate from '{cert_path}': {e}. Verify the file path and permissions.")
+        })?;
+        let key_pem = tokio::fs::read(key_path).await.map_err(|e| {
+            format!("Failed to read TLS client key from '{key_path}': {e}. Verify the file path and permissions.")
+        })?;
+        Some(tonic::transport::Identity::from_pem(cert_pem, key_pem))
+    } else {
+        None
+    };
+
+    let mut client_tls_config = if let Some(tls_root_certificate_file) =
+        &repl_config.tls_root_certificate_file
+    {
+        let tls_root_certificate = tokio::fs::read(tls_root_certificate_file)
+            .await
+            .map_err(|e| {
+                format!("Failed to read TLS root certificate from '{tls_root_certificate_file}': {e}. Verify the file path and permissions.")
+            })?;
+        let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);
+        Some(ClientTlsConfig::new().ca_certificate(tls_root_certificate))
+    } else if client_identity.is_some() || repl_flight_endpoint.starts_with("https://") {
+        Some(ClientTlsConfig::new().with_native_roots())
+    } else {
+        None
+    };
+
+    if let Some(identity) = client_identity {
+        let tls_config =
+            client_tls_config.unwrap_or_else(|| ClientTlsConfig::new().with_native_roots());
+        client_tls_config = Some(tls_config.identity(identity));
+    }
+
+    if client_tls_config.is_some() && repl_flight_endpoint.starts_with("http://") {
+        repl_flight_endpoint = repl_flight_endpoint.replacen("http://", "https://", 1);
+    }
+
+    let channel = connect_channel(repl_flight_endpoint.clone(), user_agent, client_tls_config)
+        .await
+        .map_err(|e| {
+        Box::<dyn Error>::from(format!(
+            "Connection failed to spiced at '{repl_flight_endpoint}': {e}. Check if the Spice runtime is running, endpoint including port is correct, and TLS config (if used) is valid."
+        ))
+    })?;
+
+    Ok(FlightServiceClient::new(channel)
+        .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
+        .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE))
+}
+
+async fn connect_channel(
+    endpoint: String,
+    user_agent: &str,
+    tls_config: Option<ClientTlsConfig>,
+) -> Result<Channel, Box<dyn std::error::Error>> {
+    let mut endpoint = Channel::from_shared(endpoint)?.user_agent(user_agent.to_string())?;
+    if let Some(tls_config) = tls_config {
+        endpoint = endpoint.tls_config(tls_config)?;
+    }
+
+    Ok(endpoint.connect().await?)
+}
+
 /// Send a SQL query to the Flight service and return the resulting record batches.
 ///
 /// # Errors
@@ -1107,6 +1209,14 @@ mod tests {
 
         RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(name_array)])
             .expect("Failed to create RecordBatch")
+    }
+
+    #[test]
+    fn flight_sql_status_error_includes_grpc_code() {
+        let message = format_flight_sql_status(&Status::permission_denied("missing token"));
+
+        assert!(message.contains("PermissionDenied"));
+        assert!(message.contains("missing token"));
     }
 
     #[test]
