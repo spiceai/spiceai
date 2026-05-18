@@ -26,10 +26,9 @@ use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
     AcceleratorInitializationFailedSnafu, Error, FullTextSearchRequiresAccelerationSnafu,
     LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu, Result, Runtime,
-    SchemaEvolutionNotSupportedSnafu, UnableToAttachDataConnectorSnafu,
-    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
-    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
-    UnknownDataConnectorSnafu,
+    SchemaEvolutionNotSupportedSnafu, UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
+    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
+    UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
     component::dataset::{
         Dataset,
