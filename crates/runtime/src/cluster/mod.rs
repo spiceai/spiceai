@@ -894,6 +894,16 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     scheduler_executor_registry: Arc<ExecutorRegistry>,
     scheduler_peers: Arc<RwLock<SchedulerPeers>>,
 ) -> crate::Result<Option<Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'static>>>> {
+    // Bootstrap `cluster.json` before binding the scheduler server so it exists
+    // before any executor can connect and call `GetAppDefinition`, and before
+    // partition metadata seeding runs.
+    if let Some(cluster_state) = rt.cluster_state() {
+        cluster_state.bootstrap().await.map_err(|e| {
+            crate::Error::FailedToStartClusterScheduler {
+                source: Box::new(e),
+            }
+        })?;
+    }
     initialize_cluster_scheduler(rt).await?;
     // Start internal cluster server for scheduler on separate port
     let internal_server_shutdown = CancellationToken::new();
