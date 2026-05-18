@@ -18,8 +18,14 @@ limitations under the License.
 //!
 //! Uses batched multi-row `INSERT ... VALUES (...), (...), ...` statements
 //! (1024 rows per batch) for faster inserts.
+//!
+//! For scale factors > `SEED_WAREHOUSES` (10), the first 10 warehouses are
+//! loaded with full independent random data. Remaining warehouses are cloned
+//! from the seed set using server-side `INSERT ... SELECT` (rotating across
+//! seed warehouses for slight variation).
 
 use std::fmt::Write as _;
+use std::time::Instant;
 
 use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
@@ -120,7 +126,62 @@ fn sql_opt_i32(v: Option<i32>) -> String {
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
+/// Number of warehouses loaded with full independent random data.
+/// Warehouses beyond this count are cloned from the seed set.
+/// Set to 10 to guarantee Q19 (which hard-codes `ol_w_id IN (1..5)`) gets
+/// genuinely diverse data, plus extra headroom for other per-warehouse queries.
+const SEED_WAREHOUSES: usize = 10;
+
+/// Tables that carry a `w_id`-like column and need per-warehouse cloning.
+/// Each entry: (table_name, w_id_column, column_list_for_select).
+const WAREHOUSE_TABLES: &[(&str, &str, &str)] = &[
+    (
+        "warehouse",
+        "w_id",
+        "w_name, w_street_1, w_street_2, w_city, w_state, w_zip, w_tax, w_ytd",
+    ),
+    (
+        "district",
+        "d_w_id",
+        "d_id, d_name, d_street_1, d_street_2, d_city, d_state, d_zip, d_tax, d_ytd, d_next_o_id",
+    ),
+    (
+        "stock",
+        "s_w_id",
+        "s_i_id, s_quantity, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10, s_ytd, s_order_cnt, s_remote_cnt, s_data",
+    ),
+    (
+        "customer",
+        "c_w_id",
+        "c_id, c_d_id, c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_since, c_credit, c_credit_lim, c_discount, c_balance, c_ytd_payment, c_payment_cnt, c_delivery_cnt, c_data",
+    ),
+    (
+        "history",
+        "h_c_w_id",
+        "h_c_id, h_c_d_id, h_d_id, h_w_id, h_date, h_amount, h_data",
+    ),
+    (
+        "orders",
+        "o_w_id",
+        "o_id, o_d_id, o_c_id, o_entry_d, o_carrier_id, o_ol_cnt, o_all_local",
+    ),
+    ("new_order", "no_w_id", "no_o_id, no_d_id"),
+    (
+        "order_line",
+        "ol_w_id",
+        "ol_o_id, ol_d_id, ol_number, ol_i_id, ol_supply_w_id, ol_delivery_d, ol_quantity, ol_amount, ol_dist_info",
+    ),
+];
+
 /// Load all seed data for the given number of warehouses.
+///
+/// Strategy:
+/// - Shared tables (item, nation, region, supplier) are loaded once on `client`.
+/// - The first `min(warehouses, SEED_WAREHOUSES)` warehouses are loaded **in
+///   parallel**, each on its own Postgres connection (spawned from `conn_str`).
+///   Each warehouse gets a deterministic per-warehouse RNG derived from `seed`.
+/// - Remaining warehouses are cloned from the seed set using server-side
+///   `INSERT ... SELECT` (rotating source across seed warehouses).
 ///
 /// When `seed` is `Some`, a deterministic RNG is used so that the same seed
 /// always produces the same dataset.
@@ -128,40 +189,162 @@ fn sql_opt_i32(v: Option<i32>) -> String {
 /// # Errors
 ///
 /// Returns an error if any database operation fails.
-pub async fn load_all(client: &Client, warehouses: usize, seed: Option<u64>) -> Result<()> {
+pub async fn load_all(
+    client: &Client,
+    conn_str: &str,
+    warehouses: usize,
+    seed: Option<u64>,
+) -> Result<()> {
     let mut rng: StdRng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
         None => StdRng::from_rng(&mut rand::rng()),
     };
-    let c_load: usize = rng.random_range(0..256);
 
     load_item(client, &mut rng).await?;
     load_nation(client).await?;
     load_region(client).await?;
     load_supplier(client, &mut rng).await?;
 
-    for w in 1..=warehouses {
-        let w_id = i32::try_from(w).unwrap_or(i32::MAX);
-        println!(
-            "  loading warehouse {w_id}: {DISTRICTS_PER_WAREHOUSE} districts, \
-             {}K customers, {}K orders, ~{}K order lines",
-            DISTRICTS_PER_WAREHOUSE * CUSTOMERS_PER_DISTRICT / 1000,
-            DISTRICTS_PER_WAREHOUSE * ORDERS_PER_DISTRICT / 1000,
-            DISTRICTS_PER_WAREHOUSE * ORDERS_PER_DISTRICT * 10 / 1000,
-        );
-        load_warehouse(client, &mut rng, w_id).await?;
-        load_district(client, &mut rng, w_id).await?;
-        load_stock(client, &mut rng, w_id).await?;
+    let seed_count = warehouses.min(SEED_WAREHOUSES);
 
-        for d in 1..=DISTRICTS_PER_WAREHOUSE {
-            load_customer(client, &mut rng, w_id, d, c_load).await?;
-            load_history(client, &mut rng, w_id, d).await?;
-            let ol_cnts = load_orders(client, &mut rng, w_id, d).await?;
-            load_new_order(client, w_id, d).await?;
-            load_order_line(client, &mut rng, w_id, d, &ol_cnts).await?;
+    // Phase 1: Load seed warehouses in parallel, each with its own connection.
+    let phase1_start = Instant::now();
+    println!(
+        "  loading {seed_count} seed warehouse(s) in parallel ({DISTRICTS_PER_WAREHOUSE} districts, \
+         {}K customers, {}K orders, ~{}K order lines each)...",
+        DISTRICTS_PER_WAREHOUSE * CUSTOMERS_PER_DISTRICT / 1000,
+        DISTRICTS_PER_WAREHOUSE * ORDERS_PER_DISTRICT / 1000,
+        DISTRICTS_PER_WAREHOUSE * ORDERS_PER_DISTRICT * 10 / 1000,
+    );
+
+    let mut handles = Vec::with_capacity(seed_count);
+    for w in 1..=seed_count {
+        let conn_str = conn_str.to_owned();
+        // Derive a deterministic per-warehouse seed: base_seed XOR warehouse index.
+        // This ensures each warehouse gets different random data while remaining
+        // reproducible across runs.
+        let warehouse_seed = seed.map(|s| s ^ (w as u64));
+
+        handles.push(tokio::spawn(async move {
+            let (wh_client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+                .await
+                .map_err(|source| crate::Error::Sql {
+                    action: format!("connect for warehouse {w} loader"),
+                    source,
+                })?;
+
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    eprintln!("warehouse {w} loader connection error: {e}");
+                }
+            });
+
+            let w_id = i32::try_from(w).unwrap_or(i32::MAX);
+
+            let mut wh_rng: StdRng = match warehouse_seed {
+                Some(s) => StdRng::seed_from_u64(s),
+                None => StdRng::from_rng(&mut rand::rng()),
+            };
+            let wh_c_load: usize = wh_rng.random_range(0..256);
+
+            load_warehouse(&wh_client, &mut wh_rng, w_id).await?;
+            load_district(&wh_client, &mut wh_rng, w_id).await?;
+            load_stock(&wh_client, &mut wh_rng, w_id).await?;
+
+            for d in 1..=DISTRICTS_PER_WAREHOUSE {
+                load_customer(&wh_client, &mut wh_rng, w_id, d, wh_c_load).await?;
+                load_history(&wh_client, &mut wh_rng, w_id, d).await?;
+                let ol_cnts = load_orders(&wh_client, &mut wh_rng, w_id, d).await?;
+                load_new_order(&wh_client, w_id, d).await?;
+                load_order_line(&wh_client, &mut wh_rng, w_id, d, &ol_cnts).await?;
+            }
+
+            Ok::<(), crate::Error>(())
+        }));
+    }
+
+    // Await all seed warehouse tasks.
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => {
+                return Err(crate::Error::Sql {
+                    action: format!("seed warehouse loader task panicked: {e}"),
+                    source: tokio_postgres::Error::__private_api_timeout(),
+                });
+            }
         }
     }
 
+    println!(
+        "  seed phase complete ({seed_count} warehouses in {:.1?})",
+        phase1_start.elapsed()
+    );
+
+    // Phase 2: Clone remaining warehouses from the seed set.
+    // Parallelism adds no benefit here since INSERT...SELECT is
+    // server-side I/O bound (shared WAL writer, buffer pool, disk).
+    if warehouses > seed_count {
+        let clone_start = Instant::now();
+        let to_clone = warehouses - seed_count;
+        println!(
+            "  cloning {to_clone} warehouse(s) from {seed_count} seed warehouse(s) \
+             using server-side INSERT...SELECT..."
+        );
+
+        for w in (seed_count + 1)..=warehouses {
+            let target_w_id = i32::try_from(w).unwrap_or(i32::MAX);
+            // Rotate source across seed warehouses (1-based).
+            let source_w_id = i32::try_from((w - 1) % seed_count + 1).unwrap_or(1);
+
+            clone_warehouse(client, source_w_id, target_w_id).await?;
+
+            // Progress reporting every 50 warehouses.
+            let done = w - seed_count;
+            if done % 50 == 0 || w == warehouses {
+                let elapsed = clone_start.elapsed();
+                println!("    cloned {done}/{to_clone} warehouses ({elapsed:.1?} elapsed)",);
+            }
+        }
+
+        println!(
+            "  clone phase complete ({to_clone} warehouses in {:.1?})",
+            clone_start.elapsed()
+        );
+    }
+
+    Ok(())
+}
+
+/// Clone all warehouse-scoped data from `source_w_id` to `target_w_id` using
+/// server-side `INSERT ... SELECT` with the `w_id` column substituted.
+async fn clone_warehouse(client: &Client, source_w_id: i32, target_w_id: i32) -> Result<()> {
+    for &(table, wid_col, cols) in WAREHOUSE_TABLES {
+        // For `history`, h_w_id is a separate column that also references the
+        // warehouse — substitute both h_c_w_id (filter) and h_w_id (value).
+        let select_cols = if table == "history" {
+            cols.replace("h_w_id", &target_w_id.to_string())
+        } else if table == "order_line" {
+            // ol_supply_w_id should point to the target warehouse too.
+            cols.replace("ol_supply_w_id", &target_w_id.to_string())
+        } else {
+            cols.to_owned()
+        };
+
+        let sql = format!(
+            "INSERT INTO {table} ({wid_col}, {cols}) \
+             SELECT {target_w_id}, {select_cols} FROM {table} WHERE {wid_col} = {source_w_id}"
+        );
+
+        client
+            .execute(sql.as_str(), &[])
+            .await
+            .map_err(|source| crate::Error::Sql {
+                action: format!("clone {table} from warehouse {source_w_id} to {target_w_id}"),
+                source,
+            })?;
+    }
     Ok(())
 }
 

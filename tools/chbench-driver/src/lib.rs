@@ -120,13 +120,20 @@ impl ChBenchDriver for PostgresChBenchDriver {
     /// Drop and recreate all 12 CH-benCH tables, then load seed data.
     async fn prepare(&self) -> Result<()> {
         println!(
-            "Preparing CH-benCH schema with {} warehouse(s)",
+            "Preparing schema with {} warehouse(s)",
             self.config.warehouses,
         );
 
         schema::drop_tables(&self.client).await?;
         schema::create_tables(&self.client).await?;
-        loader::load_all(&self.client, self.config.warehouses, self.config.seed).await?;
+        let conn_str = self.source.connection_string();
+        loader::load_all(
+            &self.client,
+            &conn_str,
+            self.config.warehouses,
+            self.config.seed,
+        )
+        .await?;
 
         println!("CH-benCH prepare complete");
         Ok(())

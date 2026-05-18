@@ -371,7 +371,7 @@ pub(crate) async fn prepare_chbench_source(
     };
 
     println!(
-        "Preparing chbench source (SF{scale_factor}: {warehouses} warehouse(s), {terminals} terminal(s))..."
+        "Preparing CH-benCHmark source, SF{scale_factor}: {warehouses} warehouse(s), {terminals} terminal(s)"
     );
 
     let source = chbench_source_from_env()?;
