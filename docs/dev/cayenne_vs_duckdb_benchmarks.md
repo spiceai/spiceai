@@ -104,17 +104,17 @@ accelerator-internal write/read paths directly, with no spiced and no
 Flight. They run identical work against `CayenneTableProvider` and a
 file-backed `duckdb::Connection`.
 
-| Bench                    | What it measures                                                        |
-| ------------------------ | ----------------------------------------------------------------------- |
-| `vs_duckdb_ingest`       | Bulk load from parquet and incremental append of N batches              |
-| `vs_duckdb_burst`        | Burst append patterns across Cayenne metastore lanes and DuckDB         |
-| `vs_duckdb_concurrent`   | Concurrent append and query workers against the same table              |
-| `vs_duckdb_scan`         | `COUNT(*)`, full-column `SUM`, range-filtered `SUM`                     |
-| `vs_duckdb_groupby`      | Grouped aggregate scans over identical data                             |
-| `vs_duckdb_join`         | Same-source join query shapes and optimizer behavior                    |
-| `vs_duckdb_pk_lookup`    | `WHERE id = ?`, `WHERE id IN (...)`, `WHERE id BETWEEN ? AND ?`         |
-| `vs_duckdb_delete`       | DELETE of ~10% of rows, then scan exercising the deletion-vector filter |
-| `vs_duckdb_upsert`       | Primary-key upsert conflict-resolution throughput                       |
+| Bench                  | What it measures                                                        |
+| ---------------------- | ----------------------------------------------------------------------- |
+| `vs_duckdb_ingest`     | Bulk load from parquet and incremental append of N batches              |
+| `vs_duckdb_burst`      | Burst append patterns across Cayenne metastore lanes and DuckDB         |
+| `vs_duckdb_concurrent` | Concurrent append and query workers against the same table              |
+| `vs_duckdb_scan`       | `COUNT(*)`, full-column `SUM`, range-filtered `SUM`                     |
+| `vs_duckdb_groupby`    | Grouped aggregate scans over identical data                             |
+| `vs_duckdb_join`       | Same-source join query shapes and optimizer behavior                    |
+| `vs_duckdb_pk_lookup`  | `WHERE id = ?`, `WHERE id IN (...)`, `WHERE id BETWEEN ? AND ?`         |
+| `vs_duckdb_delete`     | DELETE of ~10% of rows, then scan exercising the deletion-vector filter |
+| `vs_duckdb_upsert`     | Primary-key upsert conflict-resolution throughput                       |
 
 Each bench groups Cayenne and DuckDB measurements together so criterion's
 HTML report shows them on the same chart. To run the full suite:
