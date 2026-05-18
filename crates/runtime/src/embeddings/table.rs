@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::{any::Any, sync::Arc};
 
@@ -30,7 +31,7 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::{
     datasource::{TableProvider, TableType},
-    logical_expr::Expr,
+    logical_expr::{Expr, LogicalPlan},
 };
 use itertools::Itertools;
 use snafu::prelude::*;
@@ -798,6 +799,7 @@ impl EmbeddingTable {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for EmbeddingTable {
     fn as_any(&self) -> &dyn Any {
@@ -814,6 +816,14 @@ impl TableProvider for EmbeddingTable {
 
     fn get_column_default(&self, column: &str) -> Option<&Expr> {
         self.base_table.get_column_default(column)
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        self.base_table.get_table_definition()
+    }
+
+    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
+        self.base_table.get_logical_plan()
     }
 
     fn schema(&self) -> SchemaRef {
@@ -1008,6 +1018,26 @@ impl TableProvider for EmbeddingTable {
         filters: Vec<Expr>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.base_table.update(state, assignments, filters).await
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> DataFusionResult<datafusion::catalog::ScanResult> {
+        let plan = self
+            .scan(
+                state,
+                args.projection().map(<[usize]>::to_vec).as_ref(),
+                args.filters().unwrap_or(&[]),
+                args.limit(),
+            )
+            .await?;
+        Ok(plan.into())
+    }
+
+    async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.base_table.truncate(state).await
     }
 }
 

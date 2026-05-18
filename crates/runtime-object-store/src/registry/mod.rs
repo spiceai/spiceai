@@ -708,6 +708,7 @@ impl SpiceObjectStoreRegistry {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
     fn register_store(
         &self,
@@ -723,6 +724,10 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
             self.inner.register_store(url, Arc::clone(&store));
             Ok(store)
         })
+    }
+
+    fn deregister_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        self.inner.deregister_store(url)
     }
 }
 

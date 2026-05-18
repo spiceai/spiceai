@@ -279,6 +279,7 @@ impl ChatWrapper {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl Chat for ChatWrapper {
     /// Expect `captured_output` to be instrumented by the underlying chat model (to not reopen/parse streams). i.e.
