@@ -26,9 +26,10 @@ use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
     AcceleratorInitializationFailedSnafu, Error, FullTextSearchRequiresAccelerationSnafu,
     LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu, Result, Runtime,
-    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
-    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
-    UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
+    SchemaEvolutionNotSupportedSnafu, UnableToAttachDataConnectorSnafu,
+    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
+    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
+    UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
     component::dataset::{
         Dataset,
@@ -581,6 +582,27 @@ impl Runtime {
     ) -> Result<()> {
         let source = ds.source();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
+
+        // Validate the dataset's schema_evolution setting against the connector's declared support.
+        // Every connector explicitly opts into modes via `supported_schema_evolution_modes`; the
+        // default is `[Block]`, so non-default values must be opt-in per connector.
+        let supported = data_connector.supported_schema_evolution_modes();
+        if !supported.contains(&ds.schema_evolution) {
+            let err = SchemaEvolutionNotSupportedSnafu {
+                dataset_name: ds.name.to_string(),
+                connector: source.to_string(),
+                requested: ds.schema_evolution.to_string(),
+                supported: supported
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }
+            .build();
+            warn_spaced!(spaced_tracer, "{}{err}", "");
+            return Err(err);
+        }
+
         if let Some(acceleration) = &ds.acceleration
             && data_connector.resolve_refresh_mode(acceleration.refresh_mode)
                 == RefreshMode::Changes

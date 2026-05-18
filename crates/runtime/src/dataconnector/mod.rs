@@ -18,6 +18,7 @@ use crate::accelerated_table::{self, AcceleratedTable};
 use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
+use crate::component::dataset::SchemaEvolution;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::metrics::MetricsProvider;
 use crate::component::metrics::MetricsProviderComponent;
@@ -605,6 +606,22 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     /// Most data connectors should keep this as `RefreshMode::Full`.
     fn resolve_refresh_mode(&self, refresh_mode: Option<RefreshMode>) -> RefreshMode {
         refresh_mode.unwrap_or(RefreshMode::Full)
+    }
+
+    /// The set of `schema_evolution` modes this connector supports for the given dataset.
+    ///
+    /// The default is `&[SchemaEvolution::Block, SchemaEvolution::Detect]` — every connector
+    /// supports both the conservative `block` (no schema re-evaluation) and `detect` (surface
+    /// schema mismatches at refresh time via the existing `schema_evolution_mismatch_refresh_message`
+    /// path). Connectors that cannot even passively detect schema mismatches should override this
+    /// to `&[SchemaEvolution::Block]`. Connectors that implement automatic evolution should add
+    /// `SchemaEvolution::Evolve` (planned for Spice v2.1).
+    ///
+    /// The runtime validates the dataset's `schema_evolution` setting against this list at startup
+    /// and rejects unsupported values with a clear configuration error — silent ignores violate
+    /// the data-correctness rule.
+    fn supported_schema_evolution_modes(&self) -> &'static [SchemaEvolution] {
+        &[SchemaEvolution::Block, SchemaEvolution::Detect]
     }
 
     async fn read_provider(&self, dataset: &Dataset)

@@ -89,6 +89,12 @@ impl DataConnector for DeferredConnector {
         self.inner.resolve_refresh_mode(refresh_mode)
     }
 
+    fn supported_schema_evolution_modes(
+        &self,
+    ) -> &'static [crate::component::dataset::SchemaEvolution] {
+        self.inner.supported_schema_evolution_modes()
+    }
+
     fn supports_changes_stream(&self) -> bool {
         false
     }

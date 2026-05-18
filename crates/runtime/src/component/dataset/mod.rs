@@ -35,6 +35,13 @@ use spicepod::{
 };
 use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
 
+/// Re-exported from spicepod: see `spicepod::component::dataset::SchemaEvolution`.
+///
+/// Cross-connector setting that controls how the runtime reacts when the source's schema
+/// changes after the dataset is registered. Connector support varies; connectors that do
+/// not support a non-default value will surface a configuration error at startup.
+pub use spicepod_dataset::SchemaEvolution;
+
 pub mod acceleration;
 pub mod builder;
 pub mod declared_schema;
@@ -268,6 +275,7 @@ pub struct Dataset {
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Arc<App>,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
+    pub schema_evolution: SchemaEvolution,
     pub ready_state: ReadyState,
     pub metrics: Metrics,
     pub runtime: Arc<Runtime>,
@@ -295,6 +303,7 @@ impl std::fmt::Debug for Dataset {
             .field("embeddings", &self.embeddings)
             .field("app", &self.app)
             .field("unsupported_type_action", &self.unsupported_type_action)
+            .field("schema_evolution", &self.schema_evolution)
             .field("ready_state", &self.ready_state)
             .field("metrics", &self.metrics)
             .field("vectors", &self.vectors)
@@ -326,6 +335,7 @@ impl PartialEq for Dataset {
             && self.vectors == other.vectors
             && self.full_text_search == other.full_text_search
             && self.check_availability == other.check_availability
+            && self.schema_evolution == other.schema_evolution
     }
 }
 

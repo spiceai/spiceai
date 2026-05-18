@@ -63,6 +63,14 @@ cargo run -p testoperator -- run bench -p ./test/spicepods/tpch/sf1/federated/du
 
 ## Rust Coding Standards
 
+### Configuration & User-Facing Parameters
+
+- **Avoid boolean parameters in user-facing configuration** (Spicepod fields, connector `params`, CLI flags, public API options). Booleans paint you into a corner the moment a third state is needed and force readers to know which value means "on": `schema_evolution: detect` reads better than `schema_evolution: true`, and leaves room for `evolve`, `block`, `evolve_strict`, … without breaking changes.
+- **Prefer named enum variants** (`#[serde(rename_all = "snake_case")]`). Pick verbs/states that describe behavior, not capability — `block` / `detect` / `evolve`, not `disabled` / `enabled` / `auto`. Default to the conservative variant via `#[derive(Default)]` + `#[default]` so the safe behavior is what users get when they omit the field.
+- **Mirror precedent** already in the codebase: `on_zero_results: return_empty|use_source`, `unsupported_type_action: error|warn|ignore|string`, `ready_state: on_load|on_registration|on_schema_resolved`, `check_availability: auto|disabled`, `schema_evolution: block|detect|evolve`. Reach for an existing enum-shaped pattern before inventing a new boolean.
+- **Make each connector explicitly opt in** when a cross-connector setting depends on connector behavior. Add a trait method whose default returns the modes that work universally — for `schema_evolution` that's `&[SchemaEvolution::Block, SchemaEvolution::Detect]`, because every connector can passively surface schema mismatches at refresh time. Connectors that *cannot* even detect (or that implement `Evolve`) override the default. Validate the dataset setting against the returned list at registration — silent ignores violate the data-correctness rule. Audit every wrapper/decorator impl (`EmbeddingConnector`, `FullTextConnector`, `DeferredConnector`, …) to forward the new method to the inner connector; see "Trait Evolution & Wrapper Delegation" below.
+- **Booleans are still fine in internal, non-config code paths** (struct fields, function arguments, in-memory flags, test helpers). This rule is about *what users type into YAML / pass on the CLI*, not about Rust's primitive types.
+
 ### Rust Version Baseline
 
 - **Workspace Rust version is 1.94.1**: Treat Rust 1.94.1 as the minimum supported compiler version for workspace code unless a specific crate or integration explicitly documents a different constraint.

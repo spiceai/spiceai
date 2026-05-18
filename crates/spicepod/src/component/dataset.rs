@@ -89,6 +89,41 @@ pub enum UnsupportedTypeAction {
     String,
 }
 
+/// Controls how the runtime reacts when the source's schema changes after the dataset is registered.
+///
+/// `block` is the explicit, conservative default: every connector is required to opt in to
+/// `detect` or `evolve`. Connectors that have not declared support for the requested mode
+/// surface a configuration error at startup instead of silently ignoring the setting.
+/// Full automatic evolution (`evolve`) is planned for Spice v2.1.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaEvolution {
+    /// Schema evolution is blocked: the source schema is captured once at registration and
+    /// never re-evaluated. Detected mismatches at refresh time surface as errors. This is
+    /// the default for every connector.
+    #[default]
+    Block,
+    /// The connector probes the source on reload/refresh and surfaces detected schema changes
+    /// via dataset status, logs, and refresh errors. No automatic remediation is performed.
+    /// Connectors must opt in to support this mode.
+    Detect,
+    /// The runtime automatically evolves the dataset (and any acceleration) to match detected
+    /// schema changes. Planned for Spice v2.1 — connectors that have not implemented this yet
+    /// return a `NotImplemented` error at startup.
+    Evolve,
+}
+
+impl std::fmt::Display for SchemaEvolution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaEvolution::Block => write!(f, "block"),
+            SchemaEvolution::Detect => write!(f, "detect"),
+            SchemaEvolution::Evolve => write!(f, "evolve"),
+        }
+    }
+}
+
 /// Controls when the dataset is marked ready for queries.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -173,6 +208,11 @@ pub struct Dataset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
 
+    /// How the runtime reacts to source schema changes after the dataset is registered.
+    /// See `SchemaEvolution` for the available modes. Defaults to `disabled`.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub schema_evolution: SchemaEvolution,
+
     #[serde(default, skip_serializing_if = "is_default")]
     pub ready_state: ReadyState,
 
@@ -222,6 +262,7 @@ impl Dataset {
             embeddings: Vec::default(),
             depends_on: Vec::default(),
             unsupported_type_action: None,
+            schema_evolution: SchemaEvolution::default(),
             ready_state: ReadyState::default(),
             metrics: None,
             vectors: None,
@@ -311,6 +352,7 @@ impl WithDependsOn<Dataset> for Dataset {
             embeddings: self.embeddings.clone(),
             depends_on: depends_on.to_vec(),
             unsupported_type_action: self.unsupported_type_action,
+            schema_evolution: self.schema_evolution,
             ready_state: self.ready_state,
             metrics: self.metrics.clone(),
             vectors: self.vectors.clone(),
@@ -385,6 +427,8 @@ struct DatasetDeserializer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     unsupported_type_action: Option<UnsupportedTypeAction>,
     #[serde(default, skip_serializing_if = "is_default")]
+    schema_evolution: SchemaEvolution,
+    #[serde(default, skip_serializing_if = "is_default")]
     ready_state: ReadyState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     metrics: Option<Metrics>,
@@ -442,6 +486,7 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             embeddings: deserializer.embeddings,
             depends_on: deserializer.depends_on,
             unsupported_type_action,
+            schema_evolution: deserializer.schema_evolution,
             ready_state: deserializer.ready_state,
             metrics: deserializer.metrics,
             vectors: deserializer.vectors,
