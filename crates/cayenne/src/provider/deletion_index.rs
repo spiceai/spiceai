@@ -53,6 +53,9 @@ const MIN_BLOOM_CAPACITY: usize = 64;
 pub struct DeletionIndex {
     entries: HashMap<i64, i64>,
     bloom: BloomFilter,
+    /// Monotonic upper bound for the current immutable entries. This stays
+    /// exact because indexes are build-once / extend-only; any future removal
+    /// API must recompute it instead of carrying a stale high-water mark.
     max_sequence_number: Option<i64>,
     /// Item count the current `bloom` was sized for. When `entries.len()` exceeds
     /// `2 * bloom_capacity`, `extend_max` rebuilds the bloom from scratch to keep the
@@ -235,6 +238,9 @@ impl DeletionIndex {
 pub struct KeyDeletionIndex {
     entries: HashMap<Box<[u8]>, i64>,
     bloom: BloomFilter,
+    /// Monotonic upper bound for the current immutable entries. This stays
+    /// exact because indexes are build-once / extend-only; any future removal
+    /// API must recompute it instead of carrying a stale high-water mark.
     max_sequence_number: Option<i64>,
     /// Item count the current `bloom` was sized for. Mirrors
     /// [`DeletionIndex::bloom_capacity`] to amortize bloom rebuilds.

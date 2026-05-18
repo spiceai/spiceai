@@ -293,8 +293,12 @@ pub trait MetadataCatalog: Send + Sync {
     ) -> CatalogResult<()>;
 
     /// Atomically commit the catalog side of an on-conflict (upsert)
-    /// deletion: every delete-file row AND every insert-record row in
-    /// one transaction.
+    /// deletion.
+    ///
+    /// Implementations MUST commit every delete-file row and every
+    /// insert-record row in one durable transaction. A non-atomic
+    /// implementation reintroduces the crash window this method exists to
+    /// close.
     ///
     /// This replaces the legacy 3-call sequence on the on-conflict path
     /// (`add_delete_file` per file → `add_insert_records_batch`), which

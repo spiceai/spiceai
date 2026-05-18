@@ -933,6 +933,10 @@ pub struct CayenneTableProvider {
     /// together. This gives `DataFusion` synchronous access to Cayenne stats while
     /// allowing `persist_table_stats` to skip a steady-state catalog read.
     table_statistics: Arc<RwLock<CachedTableStatistics>>,
+    /// Serializes the read/merge/upsert/publish stats persistence cycle so
+    /// concurrent maintenance tasks cannot merge from the same cached base and
+    /// overwrite each other's row-count or column-stat deltas.
+    table_statistics_persistence_lock: Arc<tokio::sync::Mutex<()>>,
     /// Optional retention filters that should be applied immediately after writes.
     retention_filters: Vec<Expr>,
     /// Optional builder to construct time-based retention filter.
@@ -2876,6 +2880,7 @@ impl CayenneTableProvider {
                 optimizer: table_statistics,
                 catalog_blob: None,
             })),
+            table_statistics_persistence_lock: Arc::new(tokio::sync::Mutex::new(())),
             retention_filters,
             time_retention_filter_builder,
             context,
@@ -3308,6 +3313,7 @@ impl CayenneTableProvider {
             listing_fence: Arc::clone(&self.listing_fence),
             scan_listing_tables: Arc::clone(&self.scan_listing_tables),
             table_statistics: Arc::clone(&self.table_statistics),
+            table_statistics_persistence_lock: Arc::clone(&self.table_statistics_persistence_lock),
             context: Arc::clone(&self.context),
             retention_filters: self.retention_filters.clone(),
             time_retention_filter_builder: self.time_retention_filter_builder.clone(),
@@ -5856,6 +5862,8 @@ impl CayenneTableProvider {
         else {
             return;
         };
+
+        let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
 
         // In the steady state we just wrote this blob ourselves on the prior
         // maintenance cycle and the cache snapshot is exactly what the catalog

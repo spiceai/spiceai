@@ -231,6 +231,59 @@ impl CayenneCatalog {
         self.metastore.begin_transaction().await
     }
 
+    async fn existing_delete_file_record(
+        &self,
+        table_id: &str,
+        path: &str,
+    ) -> CatalogResult<Option<ExistingDeleteFileRecord>> {
+        let records = self
+            .metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT delete_file_id, path_is_relative, format, delete_count,
+                           file_size_bytes, source_data_file_path, sequence_number
+                    FROM cayenne_delete_file
+                    WHERE table_id = ?1 AND path = ?2
+                    ORDER BY delete_file_id DESC
+                    LIMIT 1
+                ",
+                    params: vec![
+                        MetastoreValue::Text(table_id.to_string()),
+                        MetastoreValue::Text(path.to_string()),
+                    ],
+                },
+                |row| {
+                    Ok(ExistingDeleteFileRecord {
+                        delete_file_id: row.get_string(0)?,
+                        path_is_relative: row.get_bool(1)?,
+                        format: row.get_string(2)?,
+                        delete_count: row.get_i64(3)?,
+                        file_size_bytes: row.get_i64(4)?,
+                        source_data_file_path: row.get_optional_string(5)?,
+                        sequence_number: row.get_optional_i64(6)?.unwrap_or(0),
+                    })
+                },
+            )
+            .await?;
+
+        Ok(records.into_iter().next())
+    }
+
+    async fn validate_existing_delete_file_if_present(
+        &self,
+        delete_file: &DeleteFile,
+    ) -> CatalogResult<()> {
+        if let Some(existing_record) = self
+            .existing_delete_file_record(&delete_file.table_id, &delete_file.path)
+            .await?
+        {
+            validate_existing_delete_file_record(delete_file, &existing_record)?;
+        }
+
+        Ok(())
+    }
+
     /// Apply a compaction commit's catalog mutations inside the caller's
     /// `MetastoreTransaction`, without opening a new transaction.
     ///
@@ -854,38 +907,17 @@ impl MetadataCatalog for CayenneCatalog {
             {
                 // Another concurrent operation inserted first — only treat this as idempotent
                 // when the existing row matches the incoming delete-file metadata.
-                let existing_record: ExistingDeleteFileRecord = self
-                    .metastore
-                    .query_row_helper(
-                        QueryRowParams {
-                            sql: r"
-                            SELECT delete_file_id, path_is_relative, format, delete_count,
-                                   file_size_bytes, source_data_file_path, sequence_number
-                            FROM cayenne_delete_file
-                            WHERE table_id = ?1 AND path = ?2
-                            ORDER BY delete_file_id DESC
-                            LIMIT 1
-                        ",
-                            params: vec![
-                                MetastoreValue::Text(delete_file.table_id.clone()),
-                                MetastoreValue::Text(delete_file.path.clone()),
-                            ],
-                        },
-                        |row| {
-                            Ok(ExistingDeleteFileRecord {
-                                delete_file_id: row.get_string(0)?,
-                                path_is_relative: row.get_bool(1)?,
-                                format: row.get_string(2)?,
-                                delete_count: row.get_i64(3)?,
-                                file_size_bytes: row.get_i64(4)?,
-                                source_data_file_path: row.get_optional_string(5)?,
-                                sequence_number: row.get_optional_i64(6)?.unwrap_or(0),
-                            })
-                        },
-                    )
+                let existing_record = self
+                    .existing_delete_file_record(&delete_file.table_id, &delete_file.path)
                     .await
                     .map_err(|e| CatalogError::FailedToAddDeleteFile {
                         source: Box::new(e),
+                    })?
+                    .ok_or_else(|| CatalogError::ConstraintViolation {
+                        message: format!(
+                            "Delete file path '{}' for table '{}' hit a unique constraint but the existing row could not be found",
+                            delete_file.path, delete_file.table_id
+                        ),
                     })?;
 
                 validate_existing_delete_file_record(&delete_file, &existing_record).map_err(
@@ -1942,14 +1974,17 @@ impl MetadataCatalog for CayenneCatalog {
                     ),
                 });
             }
+            self.validate_existing_delete_file_if_present(delete_file)
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message:
+                        "Failed to validate existing delete file before on-conflict transaction"
+                            .to_string(),
+                    source: Box::new(e),
+                })?;
         }
 
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
-        if max_attempts == 0 {
-            return Err(CatalogError::InvalidOperationNoSource {
-                message: "commit_on_conflict_deletions requires at least one attempt".to_string(),
-            });
-        }
 
         'attempts: for attempt in 1..=max_attempts {
             let tx = self.metastore.begin_transaction().await.map_err(|e| {
@@ -1962,7 +1997,9 @@ impl MetadataCatalog for CayenneCatalog {
             // INSERT every delete_file row inside the txn. A duplicate
             // (table_id, path) is idempotent only when the existing row's
             // metadata exactly matches the incoming delete file; conflicting
-            // metadata trips the NOT NULL guard and rolls back the txn.
+            // metadata trips the NOT NULL guard, then the error path below
+            // maps that SQL constraint failure back through the same
+            // descriptive validator used by add_delete_file.
             for delete_file in &delete_files {
                 let delete_file_id = uuid::Uuid::now_v7().to_string();
                 let res = tx
@@ -2012,6 +2049,18 @@ impl MetadataCatalog for CayenneCatalog {
                         );
                         tokio::time::sleep(delay).await;
                         continue 'attempts;
+                    }
+                    drop(tx);
+                    if let Err(validation_error) = self
+                        .validate_existing_delete_file_if_present(delete_file)
+                        .await
+                    {
+                        return Err(CatalogError::InvalidOperation {
+                            message:
+                                "Delete-file metadata conflicts with an existing row inside on-conflict transaction"
+                                    .to_string(),
+                            source: Box::new(validation_error),
+                        });
                     }
                     return Err(CatalogError::InvalidOperation {
                         message: "Failed to insert delete file inside on-conflict transaction"
