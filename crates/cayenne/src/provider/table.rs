@@ -1814,12 +1814,6 @@ impl CayenneTableProvider {
         // finish opening its files.
         const OLD_SNAPSHOT_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
-        // Collect protected snapshot IDs to preserve during cleanup
-        let protected_snapshot_ids: HashSet<String> = {
-            let guard = self.protected_snapshots.read();
-            guard.keys().cloned().collect()
-        };
-
         if self.table_metadata.path.starts_with("s3://") {
             // S3 cleanup uses `self.cleanup_old_snapshots_s3` which holds
             // `&self`; sleep + cleanup are awaited inline. The compaction
@@ -1827,6 +1821,13 @@ impl CayenneTableProvider {
             // `OLD_SNAPSHOT_CLEANUP_GRACE` only delays the next compaction
             // cycle, not user writes or scans.
             tokio::time::sleep(OLD_SNAPSHOT_CLEANUP_GRACE).await;
+            // Read the LIVE protected set after the grace period. During the
+            // sleep, CDC writers may have created new protected snapshots that
+            // must not be deleted.
+            let protected_snapshot_ids: HashSet<String> = {
+                let guard = self.protected_snapshots.read();
+                guard.keys().cloned().collect()
+            };
             if let Err(err) = self
                 .cleanup_old_snapshots_s3(current_snapshot, &protected_snapshot_ids)
                 .await
@@ -1840,8 +1841,19 @@ impl CayenneTableProvider {
             let table_path = self.table_metadata.path.clone();
             let table_id = self.table_metadata.table_id.clone();
             let current_snapshot = current_snapshot.to_string();
+            let protected_snapshots = Arc::clone(&self.protected_snapshots);
             tokio::spawn(async move {
                 tokio::time::sleep(OLD_SNAPSHOT_CLEANUP_GRACE).await;
+                // Read the LIVE protected set after the grace period. During the
+                // sleep, CDC writers may have created new protected snapshots
+                // that must not be deleted. Capturing the set before the sleep
+                // caused a race: compaction clears `protected_snapshots` at
+                // commit time, new CDC writes re-populate it, then the stale
+                // (empty) captured set causes cleanup to delete them.
+                let protected_snapshot_ids: HashSet<String> = {
+                    let guard = protected_snapshots.read();
+                    guard.keys().cloned().collect()
+                };
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Err(e) = Self::cleanup_old_snapshots_blocking(
                         &table_path,
