@@ -449,6 +449,61 @@ async fn compaction_collapses_tiny_protected_snapshots(
     Ok(())
 }
 
+test_with_backends!(current_snapshot_publish_preserves_protected_scan_listing_cache_entries);
+async fn current_snapshot_publish_preserves_protected_scan_listing_cache_entries(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = pk_schema();
+    let config = VortexConfig {
+        target_vortex_file_size_mb: 128,
+        compaction_trigger_files: 100,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    let (table, ctx, table_id) = build_table(
+        &fixture,
+        "scan_listing_cache",
+        Arc::clone(&schema),
+        Some("id"),
+        config,
+    )
+    .await;
+
+    let batch_rows = 1500_i64;
+    for batch_idx in 0..4_i64 {
+        let start = batch_idx * batch_rows;
+        common::insert_batch(&table, make_batch(&schema, start, batch_rows)).await?;
+    }
+
+    let protected_snapshot_count = count_protected_snapshots(&fixture, &table_id).await;
+    assert_eq!(protected_snapshot_count, 4);
+
+    let total = count_rows(&ctx, "scan_listing_cache").await;
+    assert_eq!(total, batch_rows * 4);
+    assert_eq!(
+        table.scan_listing_table_cache_entry_count(),
+        protected_snapshot_count + 1,
+        "the first scan should cache current plus protected snapshot listing tables"
+    );
+
+    table.publish_current_snapshot_files_changed().await;
+    assert_eq!(
+        table.scan_listing_table_cache_entry_count(),
+        protected_snapshot_count,
+        "publishing current snapshot changes should retain protected snapshot listing tables"
+    );
+
+    let total = count_rows(&ctx, "scan_listing_cache").await;
+    assert_eq!(total, batch_rows * 4);
+    assert_eq!(
+        table.scan_listing_table_cache_entry_count(),
+        protected_snapshot_count + 1,
+        "the next scan should rebuild only the current snapshot listing table"
+    );
+
+    Ok(())
+}
+
 test_with_backends!(compaction_idempotent_when_no_candidates);
 async fn compaction_idempotent_when_no_candidates(
     fixture: common::TestFixture,

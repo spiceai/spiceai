@@ -5651,18 +5651,44 @@ impl CayenneTableProvider {
         guard.clone()
     }
 
+    fn invalidate_scan_listing_table_cache_for_snapshot(&self, snapshot_id: &str) {
+        let mut cache = self.scan_listing_tables.lock();
+        cache.retain(|key, _| key.snapshot_id != snapshot_id);
+        let cache_entries = cache.len();
+        drop(cache);
+        self.record_scan_listing_table_cache_entries(cache_entries);
+    }
+
+    /// Returns the number of per-scan `ListingTable` entries currently cached.
+    ///
+    /// Exposed as `#[doc(hidden)] pub` so integration tests can assert cache
+    /// invalidation behavior without reaching into private fields.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn scan_listing_table_cache_entry_count(&self) -> usize {
+        self.scan_listing_tables.lock().len()
+    }
+
     /// Update the current snapshot ID after a compaction operation.
     ///
     /// This must be called after `commit_compaction` to keep the in-memory snapshot ID
     /// in sync with the catalog.
     ///
     pub(crate) fn update_current_snapshot_id(&self, new_snapshot_id: &str) {
-        let mut guard = self.current_snapshot_id.write();
-        if guard.as_str() != new_snapshot_id {
-            self.scan_listing_tables.lock().clear();
-            self.record_scan_listing_table_cache_entries(0);
+        let previous_snapshot_id = {
+            let mut guard = self.current_snapshot_id.write();
+            if guard.as_str() == new_snapshot_id {
+                None
+            } else {
+                let previous_snapshot_id = guard.clone();
+                *guard = new_snapshot_id.to_string();
+                Some(previous_snapshot_id)
+            }
+        };
+
+        if let Some(previous_snapshot_id) = previous_snapshot_id {
+            self.invalidate_scan_listing_table_cache_for_snapshot(&previous_snapshot_id);
         }
-        *guard = new_snapshot_id.to_string();
 
         // Any snapshot rewrite (compaction, sort, etc.) means the "new files
         // since last compaction" counter should be reset. The next accumulation
@@ -5887,8 +5913,7 @@ impl CayenneTableProvider {
         );
 
         Self::invalidate_list_files_cache(self.context.runtime_env(), &snapshot_dir_url);
-        self.scan_listing_tables.lock().clear();
-        self.record_scan_listing_table_cache_entries(0);
+        self.invalidate_scan_listing_table_cache_for_snapshot(&current_snapshot);
 
         tracing::trace!(
             table = self.table_metadata.table_name.as_str(),
@@ -5898,7 +5923,8 @@ impl CayenneTableProvider {
     }
 
     /// Acquire the listing fence and publish current-snapshot file changes.
-    pub(crate) async fn publish_current_snapshot_files_changed(&self) {
+    #[doc(hidden)]
+    pub async fn publish_current_snapshot_files_changed(&self) {
         let _fence = self.listing_fence.write().await;
         self.publish_current_snapshot_files_changed_under_held_fence();
     }
