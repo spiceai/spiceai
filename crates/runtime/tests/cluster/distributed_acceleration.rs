@@ -223,7 +223,9 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
                     scheduler: Some(
                         make_named_scheduler_config_with_max_partitions_per_executor(
                             "test_distributed_acceleration_multi_executor",
-                            2,
+                            // bucket(4, id) makes 5 partitions.
+                            // max_partitions = 3 will assign 3 & 2 partitons to executors.
+                            3,
                         ),
                     ),
                     ..SpicepodRuntime::default()
