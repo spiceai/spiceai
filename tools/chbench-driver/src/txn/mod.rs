@@ -94,7 +94,7 @@ pub fn pick_txn_type(rng: &mut impl Rng, mix: &[u32; 5]) -> TxnType {
 /// range, eliminating `d_next_o_id` lock collisions between terminals.
 ///
 /// Follows TPC-C spec clause 4.2.2 (each terminal is "home" to one warehouse)
-/// and BenchBase's `TPCCBenchmark.createTerminals()` district-partitioning strategy.
+/// and `BenchBase`'s `TPCCBenchmark.createTerminals()` district-partitioning strategy.
 #[derive(Debug, Clone, Copy)]
 pub struct TerminalAssignment {
     /// Home warehouse ID (1-based).
@@ -109,32 +109,33 @@ pub struct TerminalAssignment {
 
 impl TerminalAssignment {
     /// Compute assignments for all terminals, distributing evenly across
-    /// warehouses and districts (like BenchBase's `createTerminals`).
+    /// warehouses and districts (like `BenchBase`'s `createTerminals`).
+    #[must_use]
     pub fn compute(num_terminals: usize, num_warehouses: i32) -> Vec<Self> {
-        let nw = num_warehouses.max(1) as usize;
-        let terminals_per_wh = num_terminals as f64 / nw as f64;
+        let nw = usize::try_from(num_warehouses.max(1)).unwrap_or(1);
         let mut assignments = Vec::with_capacity(num_terminals);
 
         for w in 0..nw {
-            let w_id = (w as i32) + 1;
-            let lower = (w as f64 * terminals_per_wh) as usize;
+            let w_id = i32::try_from(w).unwrap_or(i32::MAX - 1) + 1;
+            // Terminals assigned to this warehouse: [lower, upper)
+            let lower = w * num_terminals / nw;
             let upper = if w + 1 == nw {
                 num_terminals
             } else {
-                ((w + 1) as f64 * terminals_per_wh) as usize
+                (w + 1) * num_terminals / nw
             };
             let wh_terminals = upper - lower;
             if wh_terminals == 0 {
                 continue;
             }
 
-            let districts_per_terminal = 10.0 / wh_terminals as f64;
             for t in 0..wh_terminals {
-                let d_lo = (t as f64 * districts_per_terminal) as i32 + 1;
+                // Districts assigned to this terminal: [d_lo, d_hi]
+                let d_lo = i32::try_from(t * 10 / wh_terminals).unwrap_or(0) + 1;
                 let d_hi = if t + 1 == wh_terminals {
                     10
                 } else {
-                    ((t + 1) as f64 * districts_per_terminal) as i32
+                    i32::try_from((t + 1) * 10 / wh_terminals).unwrap_or(10)
                 };
                 assignments.push(Self {
                     home_w_id: w_id,

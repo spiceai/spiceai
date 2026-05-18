@@ -24,15 +24,20 @@ use std::time::SystemTime;
 use ::rand::{Rng, RngExt};
 use tokio_postgres::Client;
 
-use crate::Result;
-use crate::rand as tpcc_rand;
 use super::TerminalAssignment;
 use super::prepared::NewOrderStmts;
+use crate::Result;
+use crate::rand as tpcc_rand;
 
 /// # Errors
 ///
 /// Returns an error if any database operation fails.
-pub async fn run(client: &mut Client, rng: &mut impl Rng, assignment: &TerminalAssignment, stmts: &NewOrderStmts) -> Result<()> {
+pub async fn run(
+    client: &mut Client,
+    rng: &mut impl Rng,
+    assignment: &TerminalAssignment,
+    stmts: &NewOrderStmts,
+) -> Result<()> {
     let w_id = assignment.home_w_id;
     let d_id = rng.random_range(assignment.district_lo..=assignment.district_hi);
     let c_id = tpcc_rand::rand_customer_id(rng);
@@ -52,16 +57,17 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, assignment: &TerminalA
             rng.random_range(1..=100_000)
         };
 
-        let (ol_supply_w_id, remote) = if assignment.num_warehouses == 1 || rng.random_range(1..=100) != 1 {
-            (w_id, 0)
-        } else {
-            let mut other = rng.random_range(1..=assignment.num_warehouses);
-            while other == w_id {
-                other = rng.random_range(1..=assignment.num_warehouses);
-            }
-            all_local = 0;
-            (other, 1)
-        };
+        let (ol_supply_w_id, remote) =
+            if assignment.num_warehouses == 1 || rng.random_range(1..=100) != 1 {
+                (w_id, 0)
+            } else {
+                let mut other = rng.random_range(1..=assignment.num_warehouses);
+                while other == w_id {
+                    other = rng.random_range(1..=assignment.num_warehouses);
+                }
+                all_local = 0;
+                (other, 1)
+            };
 
         let ol_quantity = rng.random_range(1..=10);
         items.push((ol_i_id, ol_supply_w_id, ol_quantity, remote));
@@ -111,12 +117,15 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, assignment: &TerminalA
     let now = SystemTime::now();
 
     // 4. INSERT orders
-    tx.execute(&stmts.insert_orders, &[&o_id, &d_id, &w_id, &c_id, &now, &ol_cnt, &all_local])
-        .await
-        .map_err(|source| crate::Error::Sql {
-            action: "new_order: insert orders".into(),
-            source,
-        })?;
+    tx.execute(
+        &stmts.insert_orders,
+        &[&o_id, &d_id, &w_id, &c_id, &now, &ol_cnt, &all_local],
+    )
+    .await
+    .map_err(|source| crate::Error::Sql {
+        action: "new_order: insert orders".into(),
+        source,
+    })?;
 
     // 5. INSERT new_order
     tx.execute(&stmts.insert_new_order, &[&o_id, &d_id, &w_id])
@@ -169,24 +178,46 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, assignment: &TerminalA
         }
 
         // Update stock
-        tx.execute(&stmts.update_stock, &[&s_quantity, &ol_quantity, &remote, &ol_i_id, &ol_supply_w_id])
-            .await
-            .map_err(|source| crate::Error::Sql {
-                action: "new_order: update stock".into(),
-                source,
-            })?;
+        tx.execute(
+            &stmts.update_stock,
+            &[
+                &s_quantity,
+                &ol_quantity,
+                &remote,
+                &ol_i_id,
+                &ol_supply_w_id,
+            ],
+        )
+        .await
+        .map_err(|source| crate::Error::Sql {
+            action: "new_order: update stock".into(),
+            source,
+        })?;
 
         // Calculate amount
         let ol_amount =
             f64::from(ol_quantity) * i_price * (1.0 + w_tax + d_tax) * (1.0 - c_discount);
 
         // Insert order_line
-        tx.execute(&stmts.insert_order_line, &[&o_id, &d_id, &w_id, &ol_number, &ol_i_id, &ol_supply_w_id, &ol_quantity, &ol_amount, &ol_dist_info])
-            .await
-            .map_err(|source| crate::Error::Sql {
-                action: "new_order: insert order_line".into(),
-                source,
-            })?;
+        tx.execute(
+            &stmts.insert_order_line,
+            &[
+                &o_id,
+                &d_id,
+                &w_id,
+                &ol_number,
+                &ol_i_id,
+                &ol_supply_w_id,
+                &ol_quantity,
+                &ol_amount,
+                &ol_dist_info,
+            ],
+        )
+        .await
+        .map_err(|source| crate::Error::Sql {
+            action: "new_order: insert order_line".into(),
+            source,
+        })?;
     }
 
     tx.commit().await.map_err(|source| crate::Error::Sql {

@@ -65,9 +65,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     // 1. Prepare the source (schema + seed data).
     let scale_factor = test_args.scale_factor.unwrap_or(1.0);
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let terminals = args
-        .terminals
-        .unwrap_or_else(|| (scale_factor * 10.0) as usize);
+    let terminals = args.terminals.unwrap_or((scale_factor * 10.0) as usize);
     let duration = Duration::from_secs(test_args.common.duration);
     let driver: Arc<dyn chbench_driver::ChBenchDriver> =
         Arc::new(prepare_chbench_source(scale_factor, terminals).await?);

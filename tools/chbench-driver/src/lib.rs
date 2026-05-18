@@ -156,10 +156,9 @@ impl ChBenchDriver for PostgresChBenchDriver {
         );
 
         let mut handles = Vec::with_capacity(terminals);
-        for terminal_id in 0..terminals {
+        for (terminal_id, &assignment) in assignments.iter().enumerate() {
             let conn_str = self.source.connection_string();
             let stop = stop.clone();
-            let assignment = assignments[terminal_id];
 
             handles.push(tokio::spawn(async move {
                 run_terminal(terminal_id, &conn_str, stop, assignment, mix, base_seed).await

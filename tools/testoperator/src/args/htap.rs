@@ -33,7 +33,7 @@ pub struct HtapArgs {
     #[command(flatten)]
     pub(crate) test_args: DatasetTestArgs,
 
-    /// Override the number of concurrent OLTP terminals (default: scale_factor * 10).
+    /// Override the number of concurrent OLTP terminals (default: `scale_factor` * 10).
     #[arg(long)]
     pub(crate) terminals: Option<usize>,
 }

@@ -133,7 +133,7 @@ fn sql_opt_i32(v: Option<i32>) -> String {
 const SEED_WAREHOUSES: usize = 10;
 
 /// Tables that carry a `w_id`-like column and need per-warehouse cloning.
-/// Each entry: (table_name, w_id_column, column_list_for_select).
+/// Each entry: (`table_name`, `w_id_column`, `column_list_for_select`).
 const WAREHOUSE_TABLES: &[(&str, &str, &str)] = &[
     (
         "warehouse",
@@ -302,7 +302,7 @@ pub async fn load_all(
 
             // Progress reporting every 50 warehouses.
             let done = w - seed_count;
-            if done % 50 == 0 || w == warehouses {
+            if done.is_multiple_of(50) || w == warehouses {
                 let elapsed = clone_start.elapsed();
                 println!("    cloned {done}/{to_clone} warehouses ({elapsed:.1?} elapsed)",);
             }

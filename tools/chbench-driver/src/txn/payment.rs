@@ -24,15 +24,20 @@ use std::time::SystemTime;
 use ::rand::{Rng, RngExt};
 use tokio_postgres::Client;
 
-use crate::Result;
-use crate::rand as tpcc_rand;
 use super::TerminalAssignment;
 use super::prepared::PaymentStmts;
+use crate::Result;
+use crate::rand as tpcc_rand;
 
 /// # Errors
 ///
 /// Returns an error if any database operation fails.
-pub async fn run(client: &mut Client, rng: &mut impl Rng, assignment: &TerminalAssignment, stmts: &PaymentStmts) -> Result<()> {
+pub async fn run(
+    client: &mut Client,
+    rng: &mut impl Rng,
+    assignment: &TerminalAssignment,
+    stmts: &PaymentStmts,
+) -> Result<()> {
     let w_id = assignment.home_w_id;
     let d_id = rng.random_range(assignment.district_lo..=assignment.district_hi);
     let h_amount: f64 = f64::from(rng.random_range(100..=500_000)) / 100.0;
@@ -52,15 +57,16 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, assignment: &TerminalA
     };
 
     // 85% local, 15% remote (spec 2.5.1.2)
-    let (customer_wh, customer_dist) = if assignment.num_warehouses == 1 || rng.random_range(0..100) < 85 {
-        (w_id, d_id)
-    } else {
-        let mut other = rng.random_range(1..=assignment.num_warehouses);
-        while other == w_id {
-            other = rng.random_range(1..=assignment.num_warehouses);
-        }
-        (other, rng.random_range(1..=10))
-    };
+    let (customer_wh, customer_dist) =
+        if assignment.num_warehouses == 1 || rng.random_range(0..100) < 85 {
+            (w_id, d_id)
+        } else {
+            let mut other = rng.random_range(1..=assignment.num_warehouses);
+            while other == w_id {
+                other = rng.random_range(1..=assignment.num_warehouses);
+            }
+            (other, rng.random_range(1..=10))
+        };
 
     let tx = client
         .transaction()
@@ -113,7 +119,11 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, assignment: &TerminalA
         let rows = tx
             .query(
                 &stmts.select_customer_by_last,
-                &[&customer_wh, &customer_dist, &c_last.as_deref().unwrap_or("")],
+                &[
+                    &customer_wh,
+                    &customer_dist,
+                    &c_last.as_deref().unwrap_or(""),
+                ],
             )
             .await
             .map_err(|source| crate::Error::Sql {
@@ -179,7 +189,14 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, assignment: &TerminalA
 
         tx.execute(
             &stmts.update_customer_with_data,
-            &[&h_amount, &h_amount, &new_data, &customer_wh, &customer_dist, &c_id],
+            &[
+                &h_amount,
+                &h_amount,
+                &new_data,
+                &customer_wh,
+                &customer_dist,
+                &c_id,
+            ],
         )
         .await
         .map_err(|source| crate::Error::Sql {
@@ -203,7 +220,16 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, assignment: &TerminalA
     let history_ts = SystemTime::now();
     tx.execute(
         &stmts.insert_history,
-        &[&customer_dist, &customer_wh, &c_id, &d_id, &w_id, &history_ts, &h_amount, &history_data],
+        &[
+            &customer_dist,
+            &customer_wh,
+            &c_id,
+            &d_id,
+            &w_id,
+            &history_ts,
+            &h_amount,
+            &history_data,
+        ],
     )
     .await
     .map_err(|source| crate::Error::Sql {
