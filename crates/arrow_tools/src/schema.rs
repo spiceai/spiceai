@@ -972,9 +972,9 @@ mod tests {
                 Arc::clone(&src),
                 vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
             )
-            .unwrap();
+            .expect("valid batch");
 
-            let result = cast_view_columns(batch.clone(), &src).unwrap();
+            let result = cast_view_columns(batch.clone(), &src).expect("cast should succeed");
             assert_eq!(result.schema(), batch.schema());
             assert_eq!(result.num_rows(), 3);
         }
@@ -985,9 +985,9 @@ mod tests {
             let tgt = schema(vec![("id", DataType::Int32), ("name", DataType::LargeUtf8)]);
             let batch =
                 RecordBatch::try_new(Arc::clone(&src), vec![Arc::new(Int32Array::from(vec![1]))])
-                    .unwrap();
+                    .expect("valid batch");
 
-            let result = cast_view_columns(batch.clone(), &tgt).unwrap();
+            let result = cast_view_columns(batch.clone(), &tgt).expect("cast should succeed");
             assert_eq!(result.schema(), batch.schema());
         }
 
@@ -1000,16 +1000,16 @@ mod tests {
                 Arc::clone(&src),
                 vec![Arc::new(StringViewArray::from(vec!["hello", "world"]))],
             )
-            .unwrap();
+            .expect("valid batch");
 
-            let result = cast_view_columns(batch, &tgt).unwrap();
+            let result = cast_view_columns(batch, &tgt).expect("cast should succeed");
             assert_eq!(result.schema().field(0).data_type(), &DataType::LargeUtf8);
 
             let col = result
                 .column(0)
                 .as_any()
                 .downcast_ref::<LargeStringArray>()
-                .unwrap();
+                .expect("LargeStringArray");
             assert_eq!(col.value(0), "hello");
             assert_eq!(col.value(1), "world");
         }
@@ -1026,16 +1026,16 @@ mod tests {
                     b"bar".as_ref(),
                 ]))],
             )
-            .unwrap();
+            .expect("valid batch");
 
-            let result = cast_view_columns(batch, &tgt).unwrap();
+            let result = cast_view_columns(batch, &tgt).expect("cast should succeed");
             assert_eq!(result.schema().field(0).data_type(), &DataType::LargeBinary);
 
             let col = result
                 .column(0)
                 .as_any()
                 .downcast_ref::<LargeBinaryArray>()
-                .unwrap();
+                .expect("LargeBinaryArray");
             assert_eq!(col.value(0), b"foo");
             assert_eq!(col.value(1), b"bar");
         }
@@ -1061,9 +1061,9 @@ mod tests {
                     Arc::new(BinaryViewArray::from(vec![b"bytes".as_ref()])),
                 ],
             )
-            .unwrap();
+            .expect("valid batch");
 
-            let result = cast_view_columns(batch, &tgt).unwrap();
+            let result = cast_view_columns(batch, &tgt).expect("cast should succeed");
             assert_eq!(result.schema().field(0).data_type(), &DataType::Int32);
             assert_eq!(result.schema().field(1).data_type(), &DataType::LargeUtf8);
             assert_eq!(result.schema().field(2).data_type(), &DataType::LargeBinary);
@@ -1072,14 +1072,14 @@ mod tests {
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int32Array>()
-                .unwrap();
+                .expect("Int32Array");
             assert_eq!(ids.value(0), 42);
 
             let names = result
                 .column(1)
                 .as_any()
                 .downcast_ref::<LargeStringArray>()
-                .unwrap();
+                .expect("LargeStringArray");
             assert_eq!(names.value(0), "alice");
         }
 
@@ -1090,16 +1090,16 @@ mod tests {
                 Arc::clone(&src),
                 vec![Arc::new(StringArray::from(vec!["x"]))],
             )
-            .unwrap();
+            .expect("valid batch");
 
-            let result = cast_view_columns(batch, &src).unwrap();
+            let result = cast_view_columns(batch, &src).expect("cast should succeed");
             assert_eq!(result.schema().field(0).data_type(), &DataType::Utf8);
             assert_eq!(
                 result
                     .column(0)
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .unwrap()
+                    .expect("StringArray")
                     .value(0),
                 "x"
             );
@@ -1113,14 +1113,15 @@ mod tests {
             let arr: StringViewArray = vec![Some("hello"), None, Some("world")]
                 .into_iter()
                 .collect();
-            let batch = RecordBatch::try_new(Arc::clone(&src), vec![Arc::new(arr)]).unwrap();
+            let batch =
+                RecordBatch::try_new(Arc::clone(&src), vec![Arc::new(arr)]).expect("valid batch");
 
-            let result = cast_view_columns(batch, &tgt).unwrap();
+            let result = cast_view_columns(batch, &tgt).expect("cast should succeed");
             let col = result
                 .column(0)
                 .as_any()
                 .downcast_ref::<LargeStringArray>()
-                .unwrap();
+                .expect("LargeStringArray");
             assert_eq!(col.value(0), "hello");
             assert!(col.is_null(1));
             assert_eq!(col.value(2), "world");
