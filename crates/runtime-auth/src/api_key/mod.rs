@@ -88,7 +88,7 @@ impl ApiKeyAuth {
 }
 
 impl HttpAuth for ApiKeyAuth {
-    /// Checks the `X-API-Key` header for a valid API key
+    /// Checks the `X-API-Key` header or `Authorization: Bearer` header for a valid API key
     fn http_verify(&self, request: &http::request::Parts) -> Result<AuthVerdict, Error> {
         let api_key = request
             .headers
@@ -96,11 +96,26 @@ impl HttpAuth for ApiKeyAuth {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
 
-        if api_key.is_empty() {
+        if !api_key.is_empty() {
+            return match self.lookup(api_key) {
+                Some(api_key) => Ok(AuthVerdict::Allow(Arc::new(api_key))),
+                None => Ok(AuthVerdict::Deny),
+            };
+        }
+
+        let bearer = request
+            .headers
+            .get("Authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split_once(' '))
+            .and_then(|(scheme, token)| scheme.eq_ignore_ascii_case("Bearer").then_some(token))
+            .unwrap_or_default();
+
+        if bearer.is_empty() {
             return Ok(AuthVerdict::Deny);
         }
 
-        match self.lookup(api_key) {
+        match self.lookup(bearer) {
             Some(api_key) => Ok(AuthVerdict::Allow(Arc::new(api_key))),
             None => Ok(AuthVerdict::Deny),
         }
@@ -238,6 +253,61 @@ mod tests {
             assert_eq!(comparison_count, 3);
             assert_eq!(matched.is_some(), presented != "missing");
         }
+    }
+
+    fn create_bearer_request_parts(authorization: &str) -> http::request::Parts {
+        let request = Builder::new()
+            .uri("https://example.com")
+            .header("Authorization", authorization)
+            .body(())
+            .expect("Failed to build request");
+        request.into_parts().0
+    }
+
+    #[test]
+    fn test_valid_bearer_token() {
+        let auth = ApiKeyAuth::new(vec![ApiKey::parse_str("valid-key")]);
+        let parts = create_bearer_request_parts("Bearer valid-key");
+        assert!(matches!(auth.http_verify(&parts), Ok(AuthVerdict::Allow(_))));
+    }
+
+    #[test]
+    fn test_invalid_bearer_token() {
+        let auth = ApiKeyAuth::new(vec![ApiKey::parse_str("valid-key")]);
+        let parts = create_bearer_request_parts("Bearer wrong-key");
+        assert!(matches!(auth.http_verify(&parts), Ok(AuthVerdict::Deny)));
+    }
+
+    #[test]
+    fn test_bearer_scheme_case_insensitive() {
+        let auth = ApiKeyAuth::new(vec![ApiKey::parse_str("valid-key")]);
+        for header in ["bearer valid-key", "BEARER valid-key", "BeArEr valid-key"] {
+            let parts = create_bearer_request_parts(header);
+            assert!(
+                matches!(auth.http_verify(&parts), Ok(AuthVerdict::Allow(_))),
+                "scheme casing '{header}' should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unknown_auth_scheme_denied() {
+        let auth = ApiKeyAuth::new(vec![ApiKey::parse_str("valid-key")]);
+        let parts = create_bearer_request_parts("Basic valid-key");
+        assert!(matches!(auth.http_verify(&parts), Ok(AuthVerdict::Deny)));
+    }
+
+    #[test]
+    fn test_x_api_key_takes_precedence_over_bearer() {
+        let auth = ApiKeyAuth::new(vec![ApiKey::parse_str("valid-key")]);
+        let request = Builder::new()
+            .uri("https://example.com")
+            .header("X-API-Key", "valid-key")
+            .header("Authorization", "Bearer wrong-key")
+            .body(())
+            .expect("Failed to build request");
+        let parts = request.into_parts().0;
+        assert!(matches!(auth.http_verify(&parts), Ok(AuthVerdict::Allow(_))));
     }
 
     #[test]
