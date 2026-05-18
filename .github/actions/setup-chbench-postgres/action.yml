@@ -15,7 +15,9 @@ runs:
           -c synchronous_commit=off \
           -c max_replication_slots=20 \
           -c max_wal_senders=20 \
-          -c shared_buffers=128MB
+          -c shared_buffers=128MB \
+          -c max_wal_size=4GB \
+          -c wal_buffers=64MB
 
     - name: Wait for CH-benCH PostgreSQL
       shell: bash

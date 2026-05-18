@@ -87,6 +87,68 @@ pub fn pick_txn_type(rng: &mut impl Rng, mix: &[u32; 5]) -> TxnType {
     TxnType::NewOrder
 }
 
+/// Per-terminal warehouse/district assignment to reduce contention.
+///
+/// Each terminal "owns" a home warehouse and a slice of districts within it.
+/// Transactions use the home warehouse and pick districts only from the assigned
+/// range, eliminating `d_next_o_id` lock collisions between terminals.
+///
+/// Follows TPC-C spec clause 4.2.2 (each terminal is "home" to one warehouse)
+/// and BenchBase's `TPCCBenchmark.createTerminals()` district-partitioning strategy.
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalAssignment {
+    /// Home warehouse ID (1-based).
+    pub home_w_id: i32,
+    /// Lower district ID (inclusive, 1-based).
+    pub district_lo: i32,
+    /// Upper district ID (inclusive, 1-based).
+    pub district_hi: i32,
+    /// Total number of warehouses (for remote warehouse selection).
+    pub num_warehouses: i32,
+}
+
+impl TerminalAssignment {
+    /// Compute assignments for all terminals, distributing evenly across
+    /// warehouses and districts (like BenchBase's `createTerminals`).
+    pub fn compute(num_terminals: usize, num_warehouses: i32) -> Vec<Self> {
+        let nw = num_warehouses.max(1) as usize;
+        let terminals_per_wh = num_terminals as f64 / nw as f64;
+        let mut assignments = Vec::with_capacity(num_terminals);
+
+        for w in 0..nw {
+            let w_id = (w as i32) + 1;
+            let lower = (w as f64 * terminals_per_wh) as usize;
+            let upper = if w + 1 == nw {
+                num_terminals
+            } else {
+                ((w + 1) as f64 * terminals_per_wh) as usize
+            };
+            let wh_terminals = upper - lower;
+            if wh_terminals == 0 {
+                continue;
+            }
+
+            let districts_per_terminal = 10.0 / wh_terminals as f64;
+            for t in 0..wh_terminals {
+                let d_lo = (t as f64 * districts_per_terminal) as i32 + 1;
+                let d_hi = if t + 1 == wh_terminals {
+                    10
+                } else {
+                    ((t + 1) as f64 * districts_per_terminal) as i32
+                };
+                assignments.push(Self {
+                    home_w_id: w_id,
+                    district_lo: d_lo,
+                    district_hi: d_hi.max(d_lo),
+                    num_warehouses: num_warehouses.max(1),
+                });
+            }
+        }
+
+        assignments
+    }
+}
+
 /// Execute one TPC-C transaction of the given type.
 ///
 /// # Errors
@@ -96,14 +158,14 @@ pub async fn execute(
     client: &mut Client,
     rng: &mut impl Rng,
     txn_type: TxnType,
-    warehouses: i32,
+    assignment: &TerminalAssignment,
     stmts: &PreparedStatements,
 ) -> Result<()> {
     match txn_type {
-        TxnType::NewOrder => new_order::run(client, rng, warehouses, &stmts.new_order).await,
-        TxnType::Payment => payment::run(client, rng, warehouses, &stmts.payment).await,
-        TxnType::Delivery => delivery::run(client, rng, warehouses).await,
-        TxnType::OrderStatus => order_status::run(client, rng, warehouses).await,
-        TxnType::StockLevel => stock_level::run(client, rng, warehouses).await,
+        TxnType::NewOrder => new_order::run(client, rng, assignment, &stmts.new_order).await,
+        TxnType::Payment => payment::run(client, rng, assignment, &stmts.payment).await,
+        TxnType::Delivery => delivery::run(client, rng, assignment.num_warehouses).await,
+        TxnType::OrderStatus => order_status::run(client, rng, assignment.num_warehouses).await,
+        TxnType::StockLevel => stock_level::run(client, rng, assignment.num_warehouses).await,
     }
 }

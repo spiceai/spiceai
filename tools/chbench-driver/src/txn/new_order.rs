@@ -26,14 +26,15 @@ use tokio_postgres::Client;
 
 use crate::Result;
 use crate::rand as tpcc_rand;
+use super::TerminalAssignment;
 use super::prepared::NewOrderStmts;
 
 /// # Errors
 ///
 /// Returns an error if any database operation fails.
-pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32, stmts: &NewOrderStmts) -> Result<()> {
-    let w_id = rng.random_range(1..=warehouses);
-    let d_id = rng.random_range(1..=10);
+pub async fn run(client: &mut Client, rng: &mut impl Rng, assignment: &TerminalAssignment, stmts: &NewOrderStmts) -> Result<()> {
+    let w_id = assignment.home_w_id;
+    let d_id = rng.random_range(assignment.district_lo..=assignment.district_hi);
     let c_id = tpcc_rand::rand_customer_id(rng);
     let ol_cnt = rng.random_range(5..=15);
     let rbk = rng.random_range(1..=100);
@@ -51,12 +52,12 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32, stmts
             rng.random_range(1..=100_000)
         };
 
-        let (ol_supply_w_id, remote) = if warehouses == 1 || rng.random_range(1..=100) != 1 {
+        let (ol_supply_w_id, remote) = if assignment.num_warehouses == 1 || rng.random_range(1..=100) != 1 {
             (w_id, 0)
         } else {
-            let mut other = rng.random_range(1..=warehouses);
+            let mut other = rng.random_range(1..=assignment.num_warehouses);
             while other == w_id {
-                other = rng.random_range(1..=warehouses);
+                other = rng.random_range(1..=assignment.num_warehouses);
             }
             all_local = 0;
             (other, 1)

@@ -149,6 +149,8 @@ impl ChBenchDriver for PostgresChBenchDriver {
         let warehouses = i32::try_from(self.config.warehouses).unwrap_or(1);
         let base_seed = self.config.seed.unwrap_or(42);
 
+        let assignments = txn::TerminalAssignment::compute(terminals, warehouses);
+
         println!(
             "Starting OLTP workload: {warehouses} warehouse(s), {terminals} terminals, mix={mix:?}",
         );
@@ -157,9 +159,10 @@ impl ChBenchDriver for PostgresChBenchDriver {
         for terminal_id in 0..terminals {
             let conn_str = self.source.connection_string();
             let stop = stop.clone();
+            let assignment = assignments[terminal_id];
 
             handles.push(tokio::spawn(async move {
-                run_terminal(terminal_id, &conn_str, stop, warehouses, mix, base_seed).await
+                run_terminal(terminal_id, &conn_str, stop, assignment, mix, base_seed).await
             }));
         }
 
@@ -221,7 +224,7 @@ async fn run_terminal(
     terminal_id: usize,
     conn_str: &str,
     stop: CancellationToken,
-    warehouses: i32,
+    assignment: txn::TerminalAssignment,
     mix: [u32; 5],
     base_seed: u64,
 ) -> Result<metrics::OltpMetrics> {
@@ -256,7 +259,7 @@ async fn run_terminal(
 
         let txn_type = txn::pick_txn_type(&mut rng, &mix);
 
-        match txn::execute(&mut client, &mut rng, txn_type, warehouses, &stmts).await {
+        match txn::execute(&mut client, &mut rng, txn_type, &assignment, &stmts).await {
             Ok(()) => {
                 metrics.record_success(txn_type);
             }
