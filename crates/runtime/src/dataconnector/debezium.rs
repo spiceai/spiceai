@@ -16,7 +16,6 @@ limitations under the License.
 
 use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 use crate::component::dataset::Dataset;
-use crate::component::dataset::SchemaEvolution;
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::metrics::MetricsProvider;
 use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::DebeziumKafkaSys};
@@ -59,11 +58,6 @@ pub enum Error {
     ))]
     MissingKafkaBootstrapServers,
 
-    #[snafu(display(
-        "Invalid value for the deprecated `schema_evolution` connector parameter: '{value}'. Expected 'true' or 'false'. Migrate to the dataset-level `schema_evolution: block|detect|evolve` field. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium#parameters"
-    ))]
-    InvalidSchemaEvolutionParam { value: String },
-
     #[snafu(display("Failed to generate Debezium refresh SQL: {source}"))]
     RefreshSql { source: refresh_sql::Error },
 }
@@ -74,10 +68,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Debezium {
     kafka_config: KafkaConfig,
     batching: (usize, Duration),
-    /// Legacy fallback for the deprecated `schema_evolution: true|false` connector param.
-    /// Only consulted when `dataset.schema_evolution` is at its default (`Block`).
-    /// Remove when the deprecated param is removed.
-    legacy_schema_evolution: Option<SchemaEvolution>,
+    schema_evolution: bool,
 }
 
 impl Debezium {
@@ -175,43 +166,20 @@ impl Debezium {
             .and_then(|v| fundu::parse_duration(v).ok())
             .unwrap_or(Duration::from_secs(1));
 
-        let legacy_schema_evolution = match params.get("schema_evolution").expose().ok() {
-            Some(raw) => {
-                tracing::warn!(
-                    "The `schema_evolution` connector parameter is deprecated. Set `schema_evolution: detect` (or `block`/`evolve`) on the dataset instead. See: https://spiceai.org/docs/reference/spicepod/datasets#schema-evolution"
-                );
-                match raw.parse::<bool>() {
-                    Ok(true) => Some(SchemaEvolution::Detect),
-                    Ok(false) => Some(SchemaEvolution::Block),
-                    Err(_) => {
-                        return InvalidSchemaEvolutionParamSnafu {
-                            value: raw.to_string(),
-                        }
-                        .fail();
-                    }
-                }
-            }
-            None => None,
-        };
+        let schema_evolution = params
+            .get("schema_evolution")
+            .expose()
+            .ok()
+            .unwrap_or("false")
+            .to_string()
+            .parse()
+            .unwrap_or(false);
 
         Ok(Self {
             kafka_config,
             batching: (batch_max_size, batch_max_duration),
-            legacy_schema_evolution,
+            schema_evolution,
         })
-    }
-
-    /// Resolve the effective schema evolution mode for a dataset.
-    ///
-    /// The dataset-level `schema_evolution` field is authoritative. The deprecated
-    /// `schema_evolution` connector parameter is only honored when the dataset is left
-    /// at the default (`Block`); remove this fallback when the deprecated parameter
-    /// is removed.
-    fn resolved_schema_evolution(&self, dataset: &Dataset) -> SchemaEvolution {
-        match (dataset.schema_evolution, self.legacy_schema_evolution) {
-            (SchemaEvolution::Block, Some(legacy)) => legacy,
-            (mode, _) => mode,
-        }
     }
 }
 
@@ -274,7 +242,8 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("Maximum time to wait for a batch to fill before processing")
         .default("1s"),
     ParameterSpec::runtime("schema_evolution")
-        .description("Deprecated. Set `schema_evolution: block|detect|evolve` on the dataset instead. When set here as `true`, the connector treats the dataset as `detect`; `false` maps to `block`."),
+        .default("false")
+        .description("Enable automatic schema evolution detection on reload. When true, the connector peeks at the latest Kafka message to detect schema changes. Default: false."),
 ];
 
 impl DataConnectorFactory for DebeziumFactory {
@@ -312,11 +281,6 @@ impl DataConnector for Debezium {
     fn resolve_refresh_mode(&self, refresh_mode: Option<RefreshMode>) -> RefreshMode {
         refresh_mode.unwrap_or(RefreshMode::Changes)
     }
-
-    // `supported_schema_evolution_modes` is left at the trait default (`&[Block, Detect]`).
-    // Debezium's `Detect` is *active* (it peeks at the latest Kafka message in `read_provider`),
-    // whereas the default `Detect` for other connectors is passive (refresh-time mismatch errors).
-    // `Evolve` is planned for Spice v2.1; it returns a configuration error at startup until then.
 
     async fn read_provider(
         &self,
@@ -391,31 +355,19 @@ impl DataConnector for Debezium {
                     }
                 );
 
-                let mode = self.resolved_schema_evolution(dataset);
-                let (metadata, schema) = match mode {
-                    SchemaEvolution::Detect => {
-                        // Check for schema evolution by peeking at the latest Kafka message
-                        refresh_schema_if_evolved(metadata, dataset, topic, &self.kafka_config)
-                            .await?
-                    }
-                    SchemaEvolution::Evolve => {
-                        return Err(super::DataConnectorError::InvalidConfigurationNoSource {
-                            dataconnector: "debezium".into(),
-                            message: "`schema_evolution: evolve` is not yet implemented for the Debezium connector. Planned for Spice v2.1. Use `block` or `detect` for now. See: https://spiceai.org/docs/components/data-connectors/debezium".into(),
-                            connector_component: ConnectorComponent::from(dataset),
-                        });
-                    }
-                    SchemaEvolution::Block => {
-                        let schema = debezium::arrow::convert_fields_to_arrow_schema(
-                            metadata.schema_fields.iter().collect(),
-                        )
-                        .boxed()
-                        .context(super::UnableToGetReadProviderSnafu {
-                            dataconnector: "debezium",
-                            connector_component: ConnectorComponent::from(dataset),
-                        })?;
-                        (metadata, Arc::new(schema))
-                    }
+                let (metadata, schema) = if self.schema_evolution {
+                    // Check for schema evolution by peeking at the latest Kafka message
+                    refresh_schema_if_evolved(metadata, dataset, topic, &self.kafka_config).await?
+                } else {
+                    let schema = debezium::arrow::convert_fields_to_arrow_schema(
+                        metadata.schema_fields.iter().collect(),
+                    )
+                    .boxed()
+                    .context(super::UnableToGetReadProviderSnafu {
+                        dataconnector: "debezium",
+                        connector_component: ConnectorComponent::from(dataset),
+                    })?;
+                    (metadata, Arc::new(schema))
                 };
 
                 kafka_consumer.subscribe(topic).boxed().context(

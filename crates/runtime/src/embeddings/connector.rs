@@ -471,12 +471,6 @@ impl DataConnector for EmbeddingConnector {
         self.inner_connector.resolve_refresh_mode(refresh_mode)
     }
 
-    fn supported_schema_evolution_modes(
-        &self,
-    ) -> &'static [crate::component::dataset::SchemaEvolution] {
-        self.inner_connector.supported_schema_evolution_modes()
-    }
-
     fn initialization_for_dataset(
         &self,
         dataset: &crate::component::dataset::Dataset,

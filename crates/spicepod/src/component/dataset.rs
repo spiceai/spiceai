@@ -89,38 +89,30 @@ pub enum UnsupportedTypeAction {
     String,
 }
 
-/// Controls how the runtime reacts when the source's schema changes after the dataset is registered.
-///
-/// `block` is the explicit, conservative default: every connector is required to opt in to
-/// `detect` or `evolve`. Connectors that have not declared support for the requested mode
-/// surface a configuration error at startup instead of silently ignoring the setting.
-/// Full automatic evolution (`evolve`) is planned for Spice v2.1.
+/// Policy for handling source schema changes after the dataset is registered.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
-pub enum SchemaEvolution {
-    /// Schema evolution is blocked: the source schema is captured once at registration and
-    /// never re-evaluated. Detected mismatches at refresh time surface as errors. This is
-    /// the default for every connector.
+pub enum OnSchemaChange {
+    /// Block schema changes from being applied automatically. The dataset stays healthy and
+    /// continues serving queries using the registered schema.
     #[default]
     Block,
-    /// The connector probes the source on reload/refresh and surfaces detected schema changes
-    /// via dataset status, logs, and refresh errors. No automatic remediation is performed.
-    /// Connectors must opt in to support this mode.
-    Detect,
-    /// The runtime automatically evolves the dataset (and any acceleration) to match detected
-    /// schema changes. Planned for Spice v2.1 — until a connector declares support, requesting
-    /// `evolve` is rejected at registration with a `SchemaEvolutionNotSupported` configuration
-    /// error.
-    Evolve,
+    /// Fail when the projected source schema diverges from the registered dataset schema.
+    Fail,
+    /// Add new source columns to the registered schema; reject removals and incompatible changes.
+    AppendNewColumns,
+    /// Keep the registered dataset schema synchronized with the projected source schema.
+    SyncAllColumns,
 }
 
-impl std::fmt::Display for SchemaEvolution {
+impl std::fmt::Display for OnSchemaChange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SchemaEvolution::Block => write!(f, "block"),
-            SchemaEvolution::Detect => write!(f, "detect"),
-            SchemaEvolution::Evolve => write!(f, "evolve"),
+            OnSchemaChange::Block => write!(f, "block"),
+            OnSchemaChange::Fail => write!(f, "fail"),
+            OnSchemaChange::AppendNewColumns => write!(f, "append_new_columns"),
+            OnSchemaChange::SyncAllColumns => write!(f, "sync_all_columns"),
         }
     }
 }
@@ -209,10 +201,13 @@ pub struct Dataset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
 
-    /// How the runtime reacts to source schema changes after the dataset is registered.
-    /// See `SchemaEvolution` for the available modes. Defaults to `block`.
+    /// Controls how the runtime handles source schema changes after the dataset is registered.
+    ///
+    /// Options: `block` / `fail` / `append_new_columns` / `sync_all_columns`.
+    ///
+    /// `block` (default) keeps the dataset healthy and queryable using the registered schema.
     #[serde(default, skip_serializing_if = "is_default")]
-    pub schema_evolution: SchemaEvolution,
+    pub on_schema_change: OnSchemaChange,
 
     #[serde(default, skip_serializing_if = "is_default")]
     pub ready_state: ReadyState,
@@ -263,7 +258,7 @@ impl Dataset {
             embeddings: Vec::default(),
             depends_on: Vec::default(),
             unsupported_type_action: None,
-            schema_evolution: SchemaEvolution::default(),
+            on_schema_change: OnSchemaChange::default(),
             ready_state: ReadyState::default(),
             metrics: None,
             vectors: None,
@@ -353,7 +348,7 @@ impl WithDependsOn<Dataset> for Dataset {
             embeddings: self.embeddings.clone(),
             depends_on: depends_on.to_vec(),
             unsupported_type_action: self.unsupported_type_action,
-            schema_evolution: self.schema_evolution,
+            on_schema_change: self.on_schema_change,
             ready_state: self.ready_state,
             metrics: self.metrics.clone(),
             vectors: self.vectors.clone(),
@@ -428,7 +423,7 @@ struct DatasetDeserializer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     unsupported_type_action: Option<UnsupportedTypeAction>,
     #[serde(default, skip_serializing_if = "is_default")]
-    schema_evolution: SchemaEvolution,
+    on_schema_change: OnSchemaChange,
     #[serde(default, skip_serializing_if = "is_default")]
     ready_state: ReadyState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -487,7 +482,7 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             embeddings: deserializer.embeddings,
             depends_on: deserializer.depends_on,
             unsupported_type_action,
-            schema_evolution: deserializer.schema_evolution,
+            on_schema_change: deserializer.on_schema_change,
             ready_state: deserializer.ready_state,
             metrics: deserializer.metrics,
             vectors: deserializer.vectors,
@@ -616,6 +611,40 @@ mod tests {
         ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.time_format, Some(TimeFormat::ISO8601));
+    }
+
+    #[test]
+    fn test_deserialize_default_on_schema_change() {
+        let yaml = r"
+            name: test
+            from: test
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.on_schema_change, OnSchemaChange::Block);
+    }
+
+    #[test]
+    fn test_deserialize_all_on_schema_change_modes() {
+        for (yaml_value, expected) in [
+            ("block", OnSchemaChange::Block),
+            ("fail", OnSchemaChange::Fail),
+            ("append_new_columns", OnSchemaChange::AppendNewColumns),
+            ("sync_all_columns", OnSchemaChange::SyncAllColumns),
+        ] {
+            let yaml = format!(
+                r"
+                    name: test
+                    from: test
+                    on_schema_change: {yaml_value}
+                "
+            );
+            let dataset: Dataset = yaml::from_str(&yaml)
+                .unwrap_or_else(|_| panic!("should parse on_schema_change '{yaml_value}'"));
+            assert_eq!(
+                dataset.on_schema_change, expected,
+                "unexpected parse for '{yaml_value}'"
+            );
+        }
     }
 
     #[test]

@@ -291,16 +291,6 @@ pub enum Error {
     AcceleratedTableInvalidChanges { dataset_name: String },
 
     #[snafu(display(
-        "Dataset {dataset_name} requested `schema_evolution: {requested}`, but the `{connector}` connector does not support this mode (supported: {supported}). Set `schema_evolution` to a supported value or migrate to a connector that supports it. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#schema-evolution"
-    ))]
-    SchemaEvolutionNotSupported {
-        dataset_name: String,
-        connector: String,
-        requested: String,
-        supported: String,
-    },
-
-    #[snafu(display(
         "An accelerated table has invalid configuration: {source}. Update the configuration and retry. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
     InvalidAccelerationConfiguration {

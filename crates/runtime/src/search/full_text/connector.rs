@@ -24,7 +24,7 @@ use crate::accelerated_table::{self, AcceleratedTable};
 use crate::changes::{Indexes, index_change_envelope};
 use crate::component::{
     ComponentInitialization,
-    dataset::{Dataset, SchemaEvolution, acceleration::RefreshMode},
+    dataset::{Dataset, acceleration::RefreshMode},
     metrics::MetricsProvider,
 };
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
@@ -164,10 +164,6 @@ impl DataConnector for FullTextConnector {
 
     fn resolve_refresh_mode(&self, refresh_mode: Option<RefreshMode>) -> RefreshMode {
         self.inner_connector.resolve_refresh_mode(refresh_mode)
-    }
-
-    fn supported_schema_evolution_modes(&self) -> &'static [SchemaEvolution] {
-        self.inner_connector.supported_schema_evolution_modes()
     }
 
     fn supports_changes_stream(&self) -> bool {

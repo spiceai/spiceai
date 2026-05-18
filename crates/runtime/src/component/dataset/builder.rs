@@ -17,9 +17,8 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use super::{
-    CheckAvailability, Dataset, Error, InvalidConfigurationSnafu, ReadyState, Result,
-    SchemaEvolution, TimeFormat, UnsupportedTypeAction, acceleration, replication,
-    validate_identifier,
+    CheckAvailability, Dataset, Error, InvalidConfigurationSnafu, OnSchemaChange, ReadyState,
+    Result, TimeFormat, UnsupportedTypeAction, acceleration, replication, validate_identifier,
 };
 use crate::Runtime;
 use crate::component::access::AccessMode;
@@ -60,7 +59,7 @@ pub struct DatasetBuilder {
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Option<Arc<App>>,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
-    pub schema_evolution: SchemaEvolution,
+    pub on_schema_change: OnSchemaChange,
     pub ready_state: ReadyState,
     pub metrics: Metrics,
     pub runtime: Option<Arc<Runtime>>,
@@ -150,7 +149,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             unsupported_type_action: dataset
                 .unsupported_type_action
                 .map(UnsupportedTypeAction::from),
-            schema_evolution: dataset.schema_evolution,
+            on_schema_change: OnSchemaChange::from(dataset.on_schema_change),
             ready_state,
             metrics: dataset.metrics.unwrap_or_default(),
             runtime: None,
@@ -183,7 +182,7 @@ impl DatasetBuilder {
             embeddings: Vec::default(),
             app: None,
             unsupported_type_action: None,
-            schema_evolution: SchemaEvolution::default(),
+            on_schema_change: OnSchemaChange::default(),
             ready_state: ReadyState::default(),
             metrics: Metrics::default(),
             runtime: None,
@@ -286,7 +285,7 @@ impl DatasetBuilder {
             embeddings: self.embeddings,
             app,
             unsupported_type_action: self.unsupported_type_action,
-            schema_evolution: self.schema_evolution,
+            on_schema_change: self.on_schema_change,
             ready_state: self.ready_state,
             metrics: self.metrics,
             runtime,

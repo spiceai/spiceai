@@ -26,7 +26,7 @@ use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
     AcceleratorInitializationFailedSnafu, Error, FullTextSearchRequiresAccelerationSnafu,
     LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu, Result, Runtime,
-    SchemaEvolutionNotSupportedSnafu, UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
+    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
     UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
     UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
@@ -581,29 +581,6 @@ impl Runtime {
     ) -> Result<()> {
         let source = ds.source();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
-
-        // Validate the dataset's schema_evolution setting against the connector's declared support.
-        // The trait default supports `[Block, Detect]` (every connector can passively surface
-        // mismatches at refresh time); connectors opt out of `Detect` or opt in to `Evolve` by
-        // overriding `supported_schema_evolution_modes`. Unsupported modes are rejected here
-        // rather than being silently ignored.
-        let supported = data_connector.supported_schema_evolution_modes();
-        if !supported.contains(&ds.schema_evolution) {
-            let err = SchemaEvolutionNotSupportedSnafu {
-                dataset_name: ds.name.to_string(),
-                connector: source.to_string(),
-                requested: ds.schema_evolution.to_string(),
-                supported: supported
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            }
-            .build();
-            warn_spaced!(spaced_tracer, "{}{err}", "");
-            return Err(err);
-        }
-
         if let Some(acceleration) = &ds.acceleration
             && data_connector.resolve_refresh_mode(acceleration.refresh_mode)
                 == RefreshMode::Changes
