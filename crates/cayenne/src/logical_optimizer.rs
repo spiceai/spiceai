@@ -657,8 +657,9 @@ fn key_domain_upper_bound_rows_for_expr(input: &LogicalPlan, expr: &Expr) -> Opt
 
 /// `true` when propagation should be skipped based on cardinality.
 ///
-/// Skips when either side has missing stats, the fact side is too small, or the
-/// fact side is not much larger than the propagated join-key domain.
+/// Skips only when stats prove the fact side is too small, or not much larger
+/// than the propagated join-key domain. Missing stats fall back to the
+/// structural safety checks instead of disabling propagation.
 fn skip_propagation_by_cardinality(
     dim_side: &LogicalPlan,
     fact_side: &LogicalPlan,
@@ -671,10 +672,6 @@ fn skip_propagation_by_cardinality(
         "CayennePropagateFilterAcrossEquiJoinKeys: dim-side key-domain cardinality"
     );
 
-    let Some(dim_key_domain_rows) = dim_key_domain_rows else {
-        return true;
-    };
-
     let fact_rows = subtree_upper_bound_rows(fact_side);
 
     tracing::debug!(
@@ -683,11 +680,15 @@ fn skip_propagation_by_cardinality(
     );
 
     let Some(fact_rows) = fact_rows else {
-        return true;
+        return false;
     };
     if fact_rows < MIN_FACT_ROWS_FOR_PROPAGATION {
         return true;
     }
+
+    let Some(dim_key_domain_rows) = dim_key_domain_rows else {
+        return false;
+    };
 
     if dim_key_domain_rows == 0 {
         return false;
@@ -1825,9 +1826,9 @@ mod tests {
     }
 
     #[test]
-    fn skip_propagation_by_cardinality_skips_when_dim_stats_absent() -> Result<()> {
+    fn skip_propagation_by_cardinality_allows_when_stats_absent() -> Result<()> {
         // MemTable doesn't expose row counts via `TableProvider::statistics()`,
-        // so the gate must skip propagation
+        // so the gate must allow the structural safety checks to decide.
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
         let provider = Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]])?);
         let source = Arc::new(DefaultTableSource::new(provider));
@@ -1836,8 +1837,8 @@ mod tests {
 
         assert_eq!(subtree_upper_bound_rows(&scan), None);
         assert!(
-            skip_propagation_by_cardinality(&scan, &scan, &key),
-            "absent dim-side stats must trigger skip"
+            !skip_propagation_by_cardinality(&scan, &scan, &key),
+            "absent stats must not trigger the cardinality gate"
         );
         Ok(())
     }

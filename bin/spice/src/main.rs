@@ -39,6 +39,23 @@ const GLOBAL_VALUE_FLAGS: &[&str] = &[
     "--http-endpoint",
     "--tls-root-certificate-file",
 ];
+const DIRECT_SHORTCUT_VALUE_FLAGS: &[&str] = &[
+    "--api-key",
+    "--cloud-region",
+    "--http-endpoint",
+    "--tls-root-certificate-file",
+    "--endpoint",
+    "--flight-endpoint",
+    "--cache-control",
+    "--client-tls-certificate-file",
+    "--client-tls-key-file",
+    "--headers",
+    "--model",
+    "-m",
+    "--temperature",
+    "--output",
+    "-o",
+];
 static TOP_LEVEL_COMMANDS: LazyLock<Vec<String>> = LazyLock::new(|| {
     let mut commands = Vec::new();
     for command in Cli::command().get_subcommands() {
@@ -307,16 +324,16 @@ fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Ve
 
     while let Some(arg) = args.next() {
         if arg == OsStr::new("-sql") {
-            normalized.push(OsString::from("sql"));
-            normalized.push(OsString::from("--query"));
-            normalized.extend(normalize_cloud_region_flags(args));
+            normalized.extend(normalize_direct_shortcut_args(args, "sql", "--query"));
             break;
         }
 
         if arg == OsStr::new("-p") || arg == OsStr::new("-chat") {
-            normalized.push(OsString::from("chat"));
-            normalized.push(OsString::from("--direct-prompt"));
-            normalized.extend(normalize_cloud_region_flags(args));
+            normalized.extend(normalize_direct_shortcut_args(
+                args,
+                "chat",
+                "--direct-prompt",
+            ));
             break;
         }
 
@@ -365,6 +382,72 @@ fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Ve
         }
     }
 
+    normalized
+}
+
+fn normalize_direct_shortcut_args(
+    args: impl IntoIterator<Item = OsString>,
+    command: &str,
+    value_flag: &str,
+) -> Vec<OsString> {
+    let mut passthrough = Vec::new();
+    let mut direct_value = None;
+    let mut args = args.into_iter().peekable();
+
+    while let Some(arg) = args.next() {
+        if arg == OsStr::new("--") {
+            if direct_value.is_none() {
+                direct_value = args.next();
+            } else {
+                passthrough.push(arg);
+            }
+            passthrough.extend(args);
+            break;
+        }
+
+        if let Some(region) = cloud_region_from_equals(&arg) {
+            passthrough.push(OsString::from("--cloud"));
+            passthrough.push(OsString::from("--cloud-region"));
+            passthrough.push(OsString::from(region));
+            continue;
+        }
+
+        if arg == OsStr::new("--cloud") {
+            passthrough.push(arg);
+            if args
+                .peek()
+                .is_some_and(|value| should_treat_as_cloud_region(value.as_os_str()))
+            {
+                passthrough.push(OsString::from("--cloud-region"));
+                if let Some(region) = args.next() {
+                    passthrough.push(region);
+                }
+            }
+            continue;
+        }
+
+        let arg_text = arg.to_string_lossy();
+        if direct_value.is_none() && !arg_text.starts_with('-') {
+            direct_value = Some(arg);
+            continue;
+        }
+
+        let consumes_value = direct_shortcut_flag_consumes_value(&arg_text);
+        passthrough.push(arg);
+
+        if consumes_value
+            && let Some(value) = args.next()
+        {
+            passthrough.push(value);
+        }
+    }
+
+    let mut normalized = vec![OsString::from(command)];
+    normalized.extend(passthrough);
+    normalized.push(OsString::from(value_flag));
+    if let Some(value) = direct_value {
+        normalized.push(value);
+    }
     normalized
 }
 
@@ -419,7 +502,20 @@ fn parse_cloud_region(value: &str) -> std::result::Result<String, String> {
 fn should_treat_as_cloud_region(value: &OsStr) -> bool {
     value
         .to_str()
-        .is_some_and(|value| !value.starts_with('-') && !is_top_level_command(value))
+        .is_some_and(|value| looks_like_legacy_cloud_region(value) && !is_top_level_command(value))
+}
+
+fn looks_like_legacy_cloud_region(value: &str) -> bool {
+    is_valid_cloud_region(value)
+        && value.contains('-')
+        && value
+            .chars()
+            .last()
+            .is_some_and(|last| last.is_ascii_digit())
+}
+
+fn direct_shortcut_flag_consumes_value(value: &str) -> bool {
+    !value.contains('=') && DIRECT_SHORTCUT_VALUE_FLAGS.contains(&value)
 }
 
 fn cloud_region_from_equals(value: &OsStr) -> Option<&str> {
@@ -1016,6 +1112,18 @@ mod tests {
     }
 
     #[test]
+    fn machine_flag_before_direct_sql_text_is_not_consumed_as_query() {
+        let mut cli = parse_normalized(&["spice", "-sql", "--machine", "select 1"]);
+        assert!(cli.machine);
+        apply_machine_mode(&mut cli.command);
+        let Commands::Sql(args) = cli.command else {
+            panic!("expected sql command");
+        };
+        assert_eq!(args.query.as_deref(), Some("select 1"));
+        assert_eq!(args.output, OutputFormat::Json);
+    }
+
+    #[test]
     fn machine_error_codes_are_stable() {
         let error = spice::error::Error::InvalidArgument {
             message: "bad input".to_string(),
@@ -1118,6 +1226,15 @@ mod tests {
         let Commands::Status(_) = cli.command else {
             panic!("expected status command");
         };
+    }
+
+    #[test]
+    fn cloud_flag_does_not_consume_arbitrary_value_as_region() {
+        let Err(error) = try_parse_normalized(&["spice", "--cloud", "foo", "status"]) else {
+            panic!("arbitrary value after --cloud should not be consumed as a region");
+        };
+
+        assert!(error.to_string().contains("unrecognized subcommand 'foo'"));
     }
 
     #[test]

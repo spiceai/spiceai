@@ -19,6 +19,7 @@ limitations under the License.
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use snafu::Snafu;
 
 // ============================================================================
 // Common enums
@@ -34,6 +35,16 @@ pub enum UpdateChannel {
     Internal,
 }
 
+#[derive(Debug, Snafu, PartialEq, Eq)]
+pub enum ParseCloudEnumError {
+    #[snafu(display(
+        "invalid channel '{input}'. Expected one of: stable, preview, nightly, internal"
+    ))]
+    InvalidUpdateChannel { input: String },
+    #[snafu(display("invalid kind '{input}'. Expected one of: set, cluster"))]
+    InvalidAppKind { input: String },
+}
+
 impl std::fmt::Display for UpdateChannel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -46,7 +57,7 @@ impl std::fmt::Display for UpdateChannel {
 }
 
 impl std::str::FromStr for UpdateChannel {
-    type Err = String;
+    type Err = ParseCloudEnumError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
@@ -54,9 +65,9 @@ impl std::str::FromStr for UpdateChannel {
             "preview" => Ok(Self::Preview),
             "nightly" => Ok(Self::Nightly),
             "internal" => Ok(Self::Internal),
-            _ => Err(format!(
-                "invalid channel '{s}'. Expected one of: stable, preview, nightly, internal"
-            )),
+            _ => Err(ParseCloudEnumError::InvalidUpdateChannel {
+                input: s.to_string(),
+            }),
         }
     }
 }
@@ -81,13 +92,15 @@ impl std::fmt::Display for AppKind {
 }
 
 impl std::str::FromStr for AppKind {
-    type Err = String;
+    type Err = ParseCloudEnumError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "set" | "spicepodset" => Ok(Self::Set),
             "cluster" | "spicepodcluster" => Ok(Self::Cluster),
-            _ => Err(format!("invalid kind '{s}'. Expected one of: set, cluster")),
+            _ => Err(ParseCloudEnumError::InvalidAppKind {
+                input: s.to_string(),
+            }),
         }
     }
 }
@@ -161,6 +174,8 @@ pub struct AppResources {
 pub struct AppResourceLimits {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<String>,
+    /// Omitted when the caller leaves memory unspecified; Cloud API treats the missing field as
+    /// unset/default rather than as a request for a synthetic client-side default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<String>,
     #[serde(rename = "ephemeral-storage", skip_serializing_if = "Option::is_none")]
@@ -443,7 +458,7 @@ pub struct OAuthTokenResponse {
     pub token_type: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct AuthContext {
     pub username: String,
     pub email: String,
@@ -455,7 +470,7 @@ pub struct AuthContext {
 /// Wire format for the Spice Cloud auth context endpoint, which returns
 /// `org` and `app` as nested objects. Flattened into [`AuthContext`] for the
 /// rest of the CLI.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct AuthContextRaw {
     #[serde(default)]
     pub username: String,
@@ -467,15 +482,53 @@ pub struct AuthContextRaw {
     pub app: Option<AuthContextApp>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct AuthContextOrg {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct AuthContextApp {
     pub name: Option<String>,
     pub api_key: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_channel_parse_error_is_typed() {
+        let error = "beta"
+            .parse::<UpdateChannel>()
+            .expect_err("invalid channel should fail");
+
+        assert!(matches!(
+            error,
+            ParseCloudEnumError::InvalidUpdateChannel { .. }
+        ));
+    }
+
+    #[test]
+    fn app_kind_parse_error_is_typed() {
+        let error = "worker"
+            .parse::<AppKind>()
+            .expect_err("invalid app kind should fail");
+
+        assert!(matches!(error, ParseCloudEnumError::InvalidAppKind { .. }));
+    }
+
+    #[test]
+    fn resource_limits_omit_unspecified_memory() {
+        let limits = AppResourceLimits {
+            cpu: Some("2".to_string()),
+            memory: None,
+            ephemeral_storage: None,
+        };
+
+        let value = serde_json::to_value(limits).expect("limits should serialize");
+        assert_eq!(value, serde_json::json!({ "cpu": "2" }));
+    }
 }
 
 impl From<AuthContextRaw> for AuthContext {

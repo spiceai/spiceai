@@ -1358,9 +1358,17 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
                 {
                     Ok(updated_app) => updated_app,
                     Err(error) => {
+                        let update_error = error.to_string();
+                        let cleanup_result = client.delete_app(&org_app).await;
+                        let cleanup_message = match cleanup_result {
+                            Ok(()) => "The app was deleted to roll back the failed create.".to_string(),
+                            Err(cleanup_error) => format!(
+                                "The app still exists, and an automatic delete attempt failed: {cleanup_error}."
+                            ),
+                        };
                         return Err(crate::error::Error::InvalidResponse {
                             message: format!(
-                                "Created app {org_app}, but failed to update spicepod/channel: {error}. The app still exists; run `spice cloud update app --app {org_app}` to apply those settings or delete the app manually."
+                                "Created app {org_app}, but failed to update spicepod/channel: {update_error}. {cleanup_message}"
                             ),
                         });
                     }
@@ -1399,10 +1407,32 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
 }
 
 fn validate_create_app_args(args: &CreateAppArgs) -> Result<()> {
-    if args.kind == AppKind::Cluster && args.replicas != Some(1) {
-        return Err(crate::error::Error::InvalidArgument {
-            message: "SpicepodCluster requires --replicas 1".to_string(),
-        });
+    if args.kind == AppKind::Cluster {
+        if args.replicas != Some(1) {
+            return Err(crate::error::Error::InvalidArgument {
+                message: "SpicepodCluster requires --replicas 1".to_string(),
+            });
+        }
+
+        let mut missing = Vec::new();
+        if args.executor_replicas.is_none() {
+            missing.push("--executor-replicas");
+        }
+        if args.executor_cpu.is_none() {
+            missing.push("--executor-cpu");
+        }
+        if args.executor_memory.is_none() {
+            missing.push("--executor-memory");
+        }
+
+        if !missing.is_empty() {
+            return Err(crate::error::Error::InvalidArgument {
+                message: format!(
+                    "SpicepodCluster requires explicit executor configuration: {}",
+                    missing.join(", ")
+                ),
+            });
+        }
     }
 
     Ok(())
@@ -1924,6 +1954,14 @@ mod tests {
         }
     }
 
+    fn cluster_app_args(replicas: Option<i32>) -> CreateAppArgs {
+        let mut args = create_app_args(AppKind::Cluster, replicas);
+        args.executor_replicas = Some(1);
+        args.executor_cpu = Some(1.0);
+        args.executor_memory = Some(bytes::NumBytes::from_bytes(1024));
+        args
+    }
+
     #[test]
     fn create_cluster_requires_explicit_single_replica() {
         let err = validate_create_app_args(&create_app_args(AppKind::Cluster, None))
@@ -1936,8 +1974,19 @@ mod tests {
     }
 
     #[test]
+    fn create_cluster_requires_executor_configuration() {
+        let err = validate_create_app_args(&create_app_args(AppKind::Cluster, Some(1)))
+            .expect_err("cluster without executor configuration should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "Invalid argument: SpicepodCluster requires explicit executor configuration: --executor-replicas, --executor-cpu, --executor-memory"
+        );
+    }
+
+    #[test]
     fn create_cluster_accepts_one_replica() {
-        validate_create_app_args(&create_app_args(AppKind::Cluster, Some(1)))
+        validate_create_app_args(&cluster_app_args(Some(1)))
             .expect("cluster with one scheduler replica should pass");
     }
 

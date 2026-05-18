@@ -123,7 +123,7 @@ impl CloudClient {
             .context(HttpRequestSnafu)?;
 
         let status = response.status();
-        if status == reqwest::StatusCode::ACCEPTED {
+        if auth_exchange_status_is_pending(status) {
             return Ok(None);
         }
 
@@ -620,6 +620,10 @@ fn auth_exchange_result(body: AuthExchangeResponse) -> Result<Option<AuthExchang
     Ok(Some(body))
 }
 
+fn auth_exchange_status_is_pending(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::ACCEPTED
+}
+
 fn body_or<'a>(fallback: &'a str, body: &'a str) -> &'a str {
     if body.trim().is_empty() {
         fallback
@@ -649,7 +653,7 @@ fn oauth_host(host: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CloudClient, auth_exchange_result};
+    use super::{CloudClient, auth_exchange_result, auth_exchange_status_is_pending};
     use crate::types::{AuthContext, AuthContextApp, AuthContextOrg, AuthContextRaw};
     use crate::{error, types::AuthExchangeResponse};
 
@@ -706,6 +710,14 @@ mod tests {
         .expect("pending auth exchange should not fail");
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn auth_exchange_accepted_status_is_pending() {
+        assert!(auth_exchange_status_is_pending(
+            reqwest::StatusCode::ACCEPTED
+        ));
+        assert!(!auth_exchange_status_is_pending(reqwest::StatusCode::OK));
     }
 
     #[test]

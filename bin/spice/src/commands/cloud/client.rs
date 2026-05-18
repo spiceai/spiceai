@@ -193,7 +193,7 @@ impl CloudClient {
         executor_memory: Option<NumBytes>,
     ) -> Result<App> {
         let resources = build_resources(cpu, memory);
-        let executor = build_executor(executor_replicas, executor_cpu, executor_memory, None);
+        let executor = build_executor(executor_replicas, executor_cpu, executor_memory);
 
         let (tags, replicas) = match kind {
             AppKind::Cluster => {
@@ -223,12 +223,12 @@ impl CloudClient {
     pub async fn update_app(&self, org_app: &str, params: UpdateAppParams<'_>) -> Result<App> {
         let app = self.get_app(org_app).await?;
         let resources = build_resources(params.cpu, params.memory);
-        // The update endpoint accepts storage size at the app level; create app nests it under executor.
+        // Create and update both send storage size at the app level. The executor field remains
+        // in the wire type for API compatibility, but the CLI does not set it.
         let executor = build_executor(
             params.executor_replicas,
             params.executor_cpu,
             params.executor_memory,
-            None,
         );
 
         let request = UpdateAppRequest {
@@ -481,15 +481,14 @@ fn build_executor(
     replicas: Option<i32>,
     cpu: Option<i32>,
     memory: Option<NumBytes>,
-    storage_size_gb: Option<f64>,
 ) -> Option<AppExecutor> {
-    if replicas.is_none() && cpu.is_none() && memory.is_none() && storage_size_gb.is_none() {
+    if replicas.is_none() && cpu.is_none() && memory.is_none() {
         return None;
     }
     Some(AppExecutor {
         replicas,
         resources: build_resources(cpu, memory),
-        storage_size_gb,
+        storage_size_gb: None,
     })
 }
 
@@ -543,8 +542,7 @@ mod tests {
 
     #[test]
     fn build_executor_does_not_default_executor_memory() {
-        let executor =
-            build_executor(None, Some(2), None, None).expect("executor cpu should create executor");
+        let executor = build_executor(None, Some(2), None).expect("executor cpu should create executor");
 
         let resources = executor.resources.expect("executor resources should exist");
         assert_eq!(resources.limits.cpu.as_deref(), Some("2"));
