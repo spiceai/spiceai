@@ -79,6 +79,22 @@ use std::{
 
 pub(crate) mod settings;
 
+/// Creates a [`DuckDBTableProviderFactory`] with standard Spice settings (dialect, timezone,
+/// index scan tuning, function deny-list). All DuckDB accelerator consumers should use this
+/// to avoid divergent configurations.
+pub(crate) fn create_duckdb_factory() -> DuckDBTableProviderFactory {
+    DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
+        .with_dialect(new_duckdb_dialect())
+        .with_settings_registry(
+            DuckDBSettingsRegistry::new()
+                .with_setting(Box::new(OrderByNonIntegerLiteral))
+                .with_setting(Box::new(settings::IndexScanPercentage))
+                .with_setting(Box::new(settings::IndexScanMaxCount))
+                .with_setting(Box::new(settings::TimeZone)),
+        )
+        .with_function_support(deny_spice_functions_for_duckdb().as_ref().clone())
+}
+
 pub(crate) const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
 pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
 pub(crate) const SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY: &str =
@@ -129,17 +145,7 @@ impl DuckDBAccelerator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            // DuckDB accelerator uses params.duckdb_file for file connection
-            duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
-                .with_dialect(new_duckdb_dialect())
-                .with_settings_registry(
-                    DuckDBSettingsRegistry::new()
-                        .with_setting(Box::new(OrderByNonIntegerLiteral))
-                        .with_setting(Box::new(settings::IndexScanPercentage))
-                        .with_setting(Box::new(settings::IndexScanMaxCount))
-                        .with_setting(Box::new(settings::TimeZone)),
-                )
-                .with_function_support(deny_spice_functions_for_duckdb().as_ref().clone()),
+            duckdb_factory: create_duckdb_factory(),
         }
     }
 

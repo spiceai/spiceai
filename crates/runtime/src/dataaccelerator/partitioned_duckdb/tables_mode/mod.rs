@@ -37,13 +37,12 @@ use datafusion::{
 };
 use datafusion_table_providers::{
     duckdb::{
-        DuckDB, DuckDBSettingsRegistry, DuckDBTableFactory, DuckDBTableProviderFactory,
-        TableDefinition, write::DuckDBTableWriter,
+        DuckDB, DuckDBTableFactory, DuckDBTableProviderFactory, TableDefinition,
+        write::DuckDBTableWriter,
     },
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
     util::{constraints::UpsertOptions, on_conflict::OnConflict},
 };
-use duckdb::AccessMode;
 use runtime_table_partition::{
     Partition,
     creator::{self, PartitionCreator, filename::parse_partition_value},
@@ -58,14 +57,13 @@ use crate::{
     dataaccelerator::{
         AccelerationSource, DataAccelerator, FilePathError,
         duckdb::{
-            DuckDBAccelerator, create_table_provider, duckdb_file_path,
-            settings::{OrderByNonIntegerLiteral, TimeZone},
+            DuckDBAccelerator, create_duckdb_factory, create_table_provider, duckdb_file_path,
         },
         partitioned_duckdb::{
             ExpectedAccelerationSourceSnafu, FailedToCreateConnectionPoolSnafu, FileModeOnlySnafu,
         },
     },
-    datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_functions_for_duckdb},
+    datafusion::dialect::new_duckdb_dialect,
     make_spice_data_directory,
     parameters::ParameterSpec,
     register_data_accelerator,
@@ -372,7 +370,6 @@ impl PartitionCreator for DuckDBPartitionCreator {
 
         let duckdb_table_factory = DuckDBTableFactory::new(Arc::clone(&self.pool))
             .with_dialect(new_duckdb_dialect())
-            .with_schema(Arc::clone(&self.schema))
             .with_indexes(self.table_definition.indexes().to_vec());
 
         let mut partitions = Vec::with_capacity(partitioned_tables.len());
@@ -449,14 +446,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
 }
 
 fn create_factory() -> DuckDBTableProviderFactory {
-    DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
-        .with_dialect(new_duckdb_dialect())
-        .with_settings_registry(
-            DuckDBSettingsRegistry::new()
-                .with_setting(Box::new(OrderByNonIntegerLiteral))
-                .with_setting(Box::new(TimeZone)),
-        )
-        .with_function_support(deny_spice_functions_for_duckdb().as_ref().clone())
+    create_duckdb_factory()
 }
 
 async fn get_pool(

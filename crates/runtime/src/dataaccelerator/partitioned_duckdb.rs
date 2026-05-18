@@ -36,10 +36,9 @@ use datafusion::{
     sql::unparser::expr_to_sql,
 };
 use datafusion_table_providers::{
-    duckdb::{DuckDBSettingsRegistry, DuckDBTableProviderFactory},
+    duckdb::DuckDBTableProviderFactory,
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
 };
-use duckdb::AccessMode;
 use runtime_table_partition::{
     Partition,
     creator::{
@@ -54,15 +53,11 @@ use tokio::{fs::create_dir_all, sync::Mutex};
 
 use super::{
     AccelerationSource, BootstrapStatus, DataAccelerator,
-    duckdb::{
-        DuckDBAccelerator, create_table_provider,
-        settings::{OrderByNonIntegerLiteral, TimeZone},
-    },
+    duckdb::{DuckDBAccelerator, create_duckdb_factory, create_table_provider},
 };
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::FilePathError,
-    datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_functions_for_duckdb},
     parameters::ParameterSpec,
     register_data_accelerator, spice_data_base_path,
 };
@@ -490,14 +485,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
 }
 
 fn create_factory() -> DuckDBTableProviderFactory {
-    DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
-        .with_dialect(new_duckdb_dialect())
-        .with_settings_registry(
-            DuckDBSettingsRegistry::new()
-                .with_setting(Box::new(OrderByNonIntegerLiteral))
-                .with_setting(Box::new(TimeZone)),
-        )
-        .with_function_support(deny_spice_functions_for_duckdb().as_ref().clone())
+    create_duckdb_factory()
 }
 
 async fn get_pool(
