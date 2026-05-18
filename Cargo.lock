@@ -5392,6 +5392,7 @@ dependencies = [
  "regex",
  "reqwest 0.12.24",
  "runtime-rate-control",
+ "runtime-request-context",
  "rusqlite",
  "s3_vectors",
  "s3_vectors_metadata_filter",

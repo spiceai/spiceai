@@ -46,8 +46,9 @@ use datafusion::{
     },
 };
 use futures::{Stream, StreamExt};
+use crate::extension::request_context::resolve_request_context;
 use opentelemetry::KeyValue;
-use runtime_request_context::{Protocol, RequestContext, RequestContextBuilder};
+use runtime_request_context::RequestContext;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::{any::Any, sync::Arc};
@@ -299,13 +300,9 @@ impl ExecutionPlan for BytesProcessedExec {
         let stream = self.input_exec.execute(partition, Arc::clone(&context))?;
         let schema = stream.schema();
 
-        let request_context = if let Some(request_context) =
-            context.session_config().get_extension::<RequestContext>()
-        {
-            request_context
-        } else if self.fallback_to_new_context {
-            Arc::new(RequestContextBuilder::new(Protocol::Internal).build())
-        } else {
+        let Some(request_context) =
+            resolve_request_context(&context, self.fallback_to_new_context)
+        else {
             // This should never happen if all queries are run through the query builder, so if it does its a bug we need to catch in development.
             panic!(
                 "The request context was not provided to BytesProcessedExec, report a bug at https://github.com/spiceai/spiceai/issues"
@@ -420,7 +417,10 @@ mod tests {
     use datafusion::prelude::{SessionConfig, SessionContext};
     use std::sync::{Arc, Mutex};
 
+    use crate::config::request_context_config::SpiceRequestContextConfig;
     use crate::extension::bytes_processed::{BytesEmittedCallback, BytesProcessedExec};
+    use opentelemetry::trace::{SpanId, TraceId};
+    use runtime_request_context::{Protocol, RequestContextBuilder, TraceParent};
 
     fn make_test_table() -> Result<Arc<dyn TableProvider>> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -608,6 +608,66 @@ mod tests {
             after_total > 0,
             "Expected non-zero bytes tracked after repartitioning"
         );
+
+        Ok(())
+    }
+
+    /// Verifies the executor-side propagation path that this issue
+    /// enables: when no typed `Arc<RequestContext>` is present on the
+    /// session config (the case after Ballista round-trips the config to
+    /// an executor), `BytesProcessedExec` reconstructs the request
+    /// context from the `SpiceRequestContextConfig` option extension and
+    /// emits metric dimensions tagged with the originating protocol.
+    #[tokio::test]
+    async fn test_uses_config_extension_when_typed_request_context_missing() -> Result<()> {
+        let trace_id = TraceId::from_hex("0123456789abcdef0123456789abcdef").expect("trace id");
+        let span_id = SpanId::from_hex("0123456789abcdef").expect("span id");
+
+        let cfg_ext = SpiceRequestContextConfig::from_request_context(&Arc::new(
+            RequestContextBuilder::new(Protocol::FlightSQL)
+                .with_trace_parent(Some(TraceParent { trace_id, span_id }))
+                .build(),
+        ));
+
+        let session_config = SessionConfig::new()
+            .with_target_partitions(1)
+            .with_option_extension(cfg_ext);
+        let ctx = SessionContext::new_with_config(session_config);
+        let test_table = make_test_table()?;
+
+        let data_source_exec = test_table.scan(&ctx.state(), None, &[], None).await?;
+
+        // `fallback_to_new_context` is intentionally left off here: the
+        // exec must resolve via the config extension, not the fallback.
+        let exec = Arc::new(BytesProcessedExec::new(
+            data_source_exec,
+            Arc::new(Box::new(|_, _| {})),
+        )) as Arc<dyn ExecutionPlan>;
+
+        let observed_protocol = Arc::new(Mutex::new(None::<String>));
+        let observed_clone = Arc::clone(&observed_protocol);
+        let capture_protocol: Arc<BytesEmittedCallback> = Arc::new(Box::new(move |_, dims| {
+            let protocol = dims
+                .iter()
+                .find(|kv| kv.key.as_str() == "protocol")
+                .map(|kv| kv.value.as_str().to_string());
+            *observed_clone
+                .lock()
+                .expect("observed protocol mutex should not be poisoned") = protocol;
+        }));
+
+        let capturing_exec = Arc::new(BytesProcessedExec::new(
+            exec,
+            Arc::clone(&capture_protocol),
+        )) as Arc<dyn ExecutionPlan>;
+
+        let _ = collect(capturing_exec, ctx.task_ctx()).await?;
+
+        let observed = observed_protocol
+            .lock()
+            .expect("observed protocol mutex should not be poisoned")
+            .clone();
+        assert_eq!(observed.as_deref(), Some("flightsql"));
 
         Ok(())
     }

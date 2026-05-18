@@ -90,6 +90,7 @@ use crate::datafusion::{
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
+use runtime_datafusion::config::request_context_config::SpiceRequestContextConfig;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
 
@@ -350,8 +351,15 @@ impl Query {
         let scheduler = Self::get_scheduler_server(&self.df)?;
         let tracker = self.tracker;
 
-        // Create session for this job
-        let session_config = datafusion::prelude::SessionConfig::new_with_ballista();
+        // Create session for this job. The
+        // `SpiceRequestContextConfig` extension propagates the originating
+        // request's trace ids to executors through Ballista's
+        // `TaskDefinition` props; the scheduler-side session builder reads
+        // it back out and re-injects it on the built session config.
+        let session_config = datafusion::prelude::SessionConfig::new_with_ballista()
+            .with_option_extension(SpiceRequestContextConfig::from_request_context(
+                &request_context,
+            ));
         let session_ctx = scheduler
             .state
             .session_manager
