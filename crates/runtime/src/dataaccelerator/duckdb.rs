@@ -145,7 +145,7 @@ impl DuckDBAccelerator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            duckdb_factory: create_duckdb_factory(),
+            duckdb_factory: create_factory(),
         }
     }
 
