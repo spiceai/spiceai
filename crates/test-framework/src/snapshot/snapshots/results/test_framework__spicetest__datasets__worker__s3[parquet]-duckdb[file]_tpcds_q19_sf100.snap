@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q19"
+---
++----------+--------------------+---------------+-----------------+-----------+
+| brand_id | brand              | i_manufact_id | i_manufact      | ext_price |
++----------+--------------------+---------------+-----------------+-----------+
+| 1001001  | amalgamalg #1      | 644           | eseesecally     | 349369.14 |
+| 3003001  | exportiexporti #1  | 209           | n stbarable     | 341786.71 |
+| 1002001  | importoamalg #1    | 126           | callyableought  | 336514.96 |
+| 2004001  | edu packimporto #1 | 331           | oughtpripri     | 334975.81 |
+| 3001001  | amalgexporti #1    | 6             | cally           | 318431.83 |
+| 3003001  | exportiexporti #1  | 264           | esecallyable    | 306578.29 |
+| 2002001  | importoimporto #1  | 179           | n stationought  | 305872.54 |
+| 1004001  | edu packamalg #1   | 222           | ableableable    | 295094.27 |
+| 3003002  | exportiexporti #2  | 161           | oughtcallyought | 292261.29 |
+| 5002002  | importoscholar #2  | 503           | pribaranti      | 288187.20 |
++----------+--------------------+---------------+-----------------+-----------+
