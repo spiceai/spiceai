@@ -268,7 +268,10 @@ mod tests {
     fn test_valid_bearer_token() {
         let auth = ApiKeyAuth::new(vec![ApiKey::parse_str("valid-key")]);
         let parts = create_bearer_request_parts("Bearer valid-key");
-        assert!(matches!(auth.http_verify(&parts), Ok(AuthVerdict::Allow(_))));
+        assert!(matches!(
+            auth.http_verify(&parts),
+            Ok(AuthVerdict::Allow(_))
+        ));
     }
 
     #[test]
@@ -307,7 +310,10 @@ mod tests {
             .body(())
             .expect("Failed to build request");
         let parts = request.into_parts().0;
-        assert!(matches!(auth.http_verify(&parts), Ok(AuthVerdict::Allow(_))));
+        assert!(matches!(
+            auth.http_verify(&parts),
+            Ok(AuthVerdict::Allow(_))
+        ));
     }
 
     #[test]
