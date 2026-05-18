@@ -1361,7 +1361,9 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
                         let update_error = error.to_string();
                         let cleanup_result = client.delete_app(&org_app).await;
                         let cleanup_message = match cleanup_result {
-                            Ok(()) => "The app was deleted to roll back the failed create.".to_string(),
+                            Ok(()) => {
+                                "The app was deleted to roll back the failed create.".to_string()
+                            }
                             Err(cleanup_error) => format!(
                                 "The app still exists, and an automatic delete attempt failed: {cleanup_error}."
                             ),

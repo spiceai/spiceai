@@ -435,9 +435,7 @@ fn normalize_direct_shortcut_args(
         let consumes_value = direct_shortcut_flag_consumes_value(&arg_text);
         passthrough.push(arg);
 
-        if consumes_value
-            && let Some(value) = args.next()
-        {
+        if consumes_value && let Some(value) = args.next() {
             passthrough.push(value);
         }
     }
