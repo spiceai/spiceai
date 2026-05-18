@@ -243,6 +243,8 @@ where
         Some(format!("{host}:{port}").into())
     });
 
+    let (ballista_transform, ballista_retention) =
+        runtime::datafusion::query::stage_history::BallistaStageMiddleware::pair();
     let task_history_exporter = task_history::otel_exporter::TaskHistoryExporter::new(
         df,
         captured_output,
@@ -251,7 +253,9 @@ where
         captured_plan,
         min_plan_duration_ms,
         node_id,
-    );
+    )
+    .with_transform(ballista_transform)
+    .with_retention(ballista_retention);
 
     let zipkin_exporter = zipkin_task_history_otel_exporter(config).await?;
 

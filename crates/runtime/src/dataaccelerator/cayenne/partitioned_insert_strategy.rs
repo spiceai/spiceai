@@ -510,6 +510,25 @@ impl CayennePartitionedOverwriteSink {
             DataFusionError::Execution(format!("Failed to encode partition key: {e}"))
         })?;
 
+        // Fast path: take a read lock first. Existing partitions hit this
+        // path on every subsequent insert, and we MUST NOT serialize those
+        // through a write lock. The previous revision unconditionally
+        // acquired `partitions.write().await`, which made every per-row
+        // partition lookup contend on the same exclusive lock and produced
+        // a global write barrier across the whole partitioned table — the
+        // difference between ~1-row-per-RTT (write-locked) and parallel
+        // processing across all partitions (read-locked) on sustained
+        // partitioned ingestion.
+        {
+            let read_guard = self.partitions.read().await;
+            if let Some(partition) = read_guard.get(&partition_key) {
+                return Ok(Arc::clone(&partition.table_provider));
+            }
+        }
+
+        // Slow path: the partition is new. Acquire the write lock, but
+        // double-check the map first — another writer may have created
+        // the same partition while we waited for the lock.
         let mut partitions_lock = self.partitions.write().await;
         if let Some(partition) = partitions_lock.get(&partition_key) {
             return Ok(Arc::clone(&partition.table_provider));
@@ -873,6 +892,25 @@ impl CayennePartitionedAppendSink {
             DataFusionError::Execution(format!("Failed to encode partition key: {e}"))
         })?;
 
+        // Fast path: take a read lock first. Existing partitions hit this
+        // path on every subsequent insert, and we MUST NOT serialize those
+        // through a write lock. The previous revision unconditionally
+        // acquired `partitions.write().await`, which made every per-row
+        // partition lookup contend on the same exclusive lock and produced
+        // a global write barrier across the whole partitioned table — the
+        // difference between ~1-row-per-RTT (write-locked) and parallel
+        // processing across all partitions (read-locked) on sustained
+        // partitioned ingestion.
+        {
+            let read_guard = self.partitions.read().await;
+            if let Some(partition) = read_guard.get(&partition_key) {
+                return Ok(Arc::clone(&partition.table_provider));
+            }
+        }
+
+        // Slow path: the partition is new. Acquire the write lock, but
+        // double-check the map first — another writer may have created
+        // the same partition while we waited for the lock.
         let mut partitions_lock = self.partitions.write().await;
         if let Some(partition) = partitions_lock.get(&partition_key) {
             return Ok(Arc::clone(&partition.table_provider));

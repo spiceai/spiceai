@@ -207,4 +207,95 @@ impl TableProvider for DatasetTableProvider {
             self.name
         )))
     }
+
+    fn constraints(&self) -> Option<&datafusion::common::Constraints> {
+        None
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        None
+    }
+
+    fn get_logical_plan(
+        &self,
+    ) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
+        None
+    }
+
+    fn get_column_default(&self, _column: &str) -> Option<&Expr> {
+        None
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> Result<datafusion::catalog::ScanResult, DataFusionError> {
+        let filters = args.filters().unwrap_or(&[]);
+        let projection = args.projection().map(<[usize]>::to_vec);
+        let limit = args.limit();
+        let plan = self
+            .scan(state, projection.as_ref(), filters, limit)
+            .await?;
+        Ok(datafusion::catalog::ScanResult::new(plan))
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>, DataFusionError> {
+        Ok(vec![
+            datafusion::logical_expr::TableProviderFilterPushDown::Unsupported;
+            filters.len()
+        ])
+    }
+
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        None
+    }
+
+    async fn insert_into(
+        &self,
+        _state: &dyn Session,
+        _input: Arc<dyn ExecutionPlan>,
+        _insert_op: datafusion::logical_expr::dml::InsertOp,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        Err(DataFusionError::Internal(format!(
+            "DatasetTableProvider for `{}` does not support inserts before initialization.",
+            self.name
+        )))
+    }
+
+    async fn delete_from(
+        &self,
+        _state: &dyn Session,
+        _filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        Err(DataFusionError::Internal(format!(
+            "DatasetTableProvider for `{}` does not support deletes before initialization.",
+            self.name
+        )))
+    }
+
+    async fn update(
+        &self,
+        _state: &dyn Session,
+        _assignments: Vec<(String, Expr)>,
+        _filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        Err(DataFusionError::Internal(format!(
+            "DatasetTableProvider for `{}` does not support updates before initialization.",
+            self.name
+        )))
+    }
+
+    async fn truncate(
+        &self,
+        _state: &dyn Session,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        Err(DataFusionError::Internal(format!(
+            "DatasetTableProvider for `{}` does not support truncate before initialization.",
+            self.name
+        )))
+    }
 }

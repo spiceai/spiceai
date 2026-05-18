@@ -342,6 +342,24 @@ pub trait MetadataCatalog: Send + Sync {
     /// Atomically update snapshot and clear delete files in a single transaction.
     async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
 
+    /// Atomically commit an overwrite: update the snapshot pointer, clear all
+    /// per-snapshot delete tracking, AND drop inlined data, inlined deletes,
+    /// and table statistics — everything that belonged to the old snapshot
+    /// and no longer applies once the user has replaced the table's contents.
+    ///
+    /// Differs from [`commit_compaction`] in that compaction PRESERVES inlined
+    /// data (the inlined memtable is still valid for the new snapshot — the
+    /// rewrite only consolidates Vortex files). Overwrite REPLACES everything,
+    /// so anything keyed on the old snapshot must be dropped atomically with
+    /// the pointer flip; otherwise a crash between the pointer flip and the
+    /// (separate) inlined-data clear would leave stale inlined rows that scan
+    /// would union into the new snapshot's results.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be committed.
+    async fn commit_overwrite(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
+
     /// Add a partition to a table.
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<String>;
 
@@ -385,6 +403,16 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Remove all inlined data for a table (called after checkpoint flushes to Vortex).
     async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()>;
+
+    /// Remove all inlined data and inlined deletes for a table atomically.
+    ///
+    /// Implementations may override this to use a single backend transaction or
+    /// batch call. The default preserves the existing behavior for implementors
+    /// that do not have a combined primitive.
+    async fn clear_inlined_data_and_deletes(&self, table_id: &str) -> CatalogResult<()> {
+        self.clear_inlined_data(table_id).await?;
+        self.clear_inlined_deletes(table_id).await
+    }
 
     /// Add a small batch of delete identifiers inlined in the metastore.
     async fn add_inlined_delete(&self, delete: InlinedDelete) -> CatalogResult<String>;

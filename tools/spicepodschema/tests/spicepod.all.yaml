@@ -597,6 +597,13 @@ datasets:
         cayenne_cayenne_target_file_size_mb: '128'
         cayenne_sort_columns: id,timestamp
         cayenne_compression_strategy: zstd
+        cayenne_inline_max_rows: '1024'
+        cayenne_inline_max_bytes: '1048576'
+        cayenne_inline_max_buffer_bytes: '4194304'
+        cayenne_inline_flush_max_rows: '10000'
+        cayenne_inline_flush_max_segments: '64'
+        cayenne_inline_flush_max_bytes: '8388608'
+        cayenne_pk_conflict_detection: none
 
   # ---------------------------------------------------------------------------
   # S3 connector (full params)
