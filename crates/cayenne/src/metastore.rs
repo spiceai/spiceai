@@ -468,6 +468,19 @@ pub trait MetastoreBackend: Send + Sync {
     /// Returns an error if any statement in the batch fails.
     async fn execute_batch(&self, sql: &str) -> CatalogResult<()>;
 
+    /// Execute a batch of SQL statements inside one backend transaction.
+    ///
+    /// The backend must keep exclusive access to the connection until the
+    /// transaction commits or rolls back, so no other catalog operation can
+    /// observe or inherit a partially-applied transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot begin, any statement in the
+    /// batch fails, or the transaction cannot commit. Backends should make a
+    /// best-effort rollback before returning an error.
+    async fn execute_transaction_batch(&self, sql: &str) -> CatalogResult<()>;
+
     /// Query a single row from the database.
     ///
     /// # Errors

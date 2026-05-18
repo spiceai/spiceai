@@ -1,0 +1,364 @@
+# Cayenne vs DuckDB performance comparison matrix.
+#
+# Each entry pairs a Cayenne spicepod with a DuckDB spicepod that differ ONLY in
+# the acceleration engine (and accelerator-specific tuning). All other inputs —
+# source data, refresh mode, primary key, partition column, retention policy —
+# must be identical so any performance delta can be attributed to the
+# accelerator alone.
+#
+# Metastore variants: Cayenne supports both SQLite (default) and Turso as the
+# metadata backend. Each Cayenne entry exists in two forms: a default form
+# (implicit SQLite — no `cayenne_metastore` param) and a `*-turso` form that
+# points at a sibling pod with `cayenne_metastore: turso` set. The Turso pod
+# is otherwise identical to its SQLite sibling, so comparing the two entries
+# isolates the metastore's contribution to overall accelerator performance.
+#
+# Schema:
+#   pairs:
+#     - id:              unique identifier for the pair
+#       workload:        bench | throughput | load | ingest | mutation | point-lookup | append | mixed
+#       query_set:       tpch | tpcds | clickbench | chbench (omit for non-query workloads)
+#       scale_factor:    1 | 5 | 10 | 100 | 1000
+#       cayenne:         spicepod path relative to test/spicepods/
+#       duckdb:          spicepod path relative to test/spicepods/
+#       must_beat:       true if Cayenne is expected to beat DuckDB on this workload
+#                        (used by `testoperator compare` to set non-zero exit code on regression)
+#       runner_type:     spiceai-dev-runners | spiceai-dev-large-runners
+#       duration_secs:   load/throughput test duration (omit for bench)
+#       query_concurrency: analytical query workers for mixed append+query runs
+#       load_interval_secs: seconds between append loads for mixed/append runs
+#       load_steps:      number of append loads for mixed/append runs
+#       notes:           free-text explanation of trade-offs or known asymmetries
+#
+# Adding a new pair:
+#   1. Confirm both yamls already exist under test/spicepods/.
+#   2. Read both files and confirm only the engine and accelerator-specific
+#      fields differ. Document any unavoidable asymmetry in `notes`.
+#   3. Append the entry below. Keep pairs grouped by workload, then by
+#      query_set, then by scale_factor. When adding a Cayenne entry, add the
+#      matching `*-turso` variant immediately after it.
+
+version: v1
+spicepod_root: ../../../../test/spicepods
+
+pairs:
+  # ===========================================================================
+  # Query benchmarks (read-only, single query stream)
+  # ===========================================================================
+  - id: bench-tpch-sf1-file
+    workload: bench
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/file[parquet]-cayenne[file].yaml
+    duckdb: tpch/sf1/accelerated/file[parquet]-duckdb[file].yaml
+    must_beat: true
+    runner_type: spiceai-dev-runners
+
+  - id: bench-tpch-sf1-file-turso
+    workload: bench
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/file[parquet]-cayenne[file]turso.yaml
+    duckdb: tpch/sf1/accelerated/file[parquet]-duckdb[file].yaml
+    must_beat: true
+    runner_type: spiceai-dev-runners
+    notes: Turso metastore variant. Compare against bench-tpch-sf1-file to isolate the metastore.
+
+  # sf10 file: no DuckDB sf10 file-mode pod exists today (only s3 at sf10);
+  # add a `file[parquet]-duckdb[file].yaml` under test/spicepods/tpch/sf10/
+  # mirroring the SF1 layout to enable this pair.
+
+  - id: bench-tpch-sf1-s3-partitioned
+    workload: bench
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/s3[parquet]-cayenne[file]-partitioned.yaml
+    duckdb: tpch/sf1/accelerated/s3[parquet]-duckdb[file]-partitioned.yaml
+    must_beat: true
+    runner_type: spiceai-dev-runners
+    notes: Both pods use the same partition column; differences should be accelerator-only.
+
+  - id: bench-tpch-sf1-s3-partitioned-turso
+    workload: bench
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/s3[parquet]-cayenne[file]turso-partitioned.yaml
+    duckdb: tpch/sf1/accelerated/s3[parquet]-duckdb[file]-partitioned.yaml
+    must_beat: true
+    runner_type: spiceai-dev-runners
+    notes: Turso metastore variant. Compare against bench-tpch-sf1-s3-partitioned to isolate the metastore.
+
+  - id: bench-tpch-sf10-s3
+    workload: bench
+    query_set: tpch
+    scale_factor: 10
+    cayenne: tpch/sf10/accelerated/s3[parquet]-cayenne[file].yaml
+    duckdb: tpch/sf10/accelerated/s3[parquet]-duckdb[file].yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+
+  - id: bench-tpch-sf10-s3-turso
+    workload: bench
+    query_set: tpch
+    scale_factor: 10
+    cayenne: tpch/sf10/accelerated/s3[parquet]-cayenne[file]turso.yaml
+    duckdb: tpch/sf10/accelerated/s3[parquet]-duckdb[file].yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+    notes: Turso metastore variant. Compare against bench-tpch-sf10-s3 to isolate the metastore.
+
+  - id: bench-tpch-sf100-s3
+    workload: bench
+    query_set: tpch
+    scale_factor: 100
+    cayenne: tpch/sf100/accelerated/s3[parquet]-cayenne[file].yaml
+    duckdb: tpch/sf100/accelerated/s3[parquet]-duckdb[file].yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+
+  - id: bench-tpch-sf100-s3-turso
+    workload: bench
+    query_set: tpch
+    scale_factor: 100
+    cayenne: tpch/sf100/accelerated/s3[parquet]-cayenne[file]turso.yaml
+    duckdb: tpch/sf100/accelerated/s3[parquet]-duckdb[file].yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+    notes: Turso metastore variant. Compare against bench-tpch-sf100-s3 to isolate the metastore.
+
+  - id: bench-tpcds-sf1-file
+    workload: bench
+    query_set: tpcds
+    scale_factor: 1
+    cayenne: tpcds/sf1/accelerated/file[parquet]-cayenne[file].yaml
+    duckdb: tpcds/sf1/accelerated/file[parquet]-duckdb[file].yaml
+    must_beat: true
+    runner_type: spiceai-dev-runners
+
+  - id: bench-tpcds-sf1-file-turso
+    workload: bench
+    query_set: tpcds
+    scale_factor: 1
+    cayenne: tpcds/sf1/accelerated/file[parquet]-cayenne[file]turso.yaml
+    duckdb: tpcds/sf1/accelerated/file[parquet]-duckdb[file].yaml
+    must_beat: true
+    runner_type: spiceai-dev-runners
+    notes: Turso metastore variant. Compare against bench-tpcds-sf1-file to isolate the metastore.
+
+  - id: bench-tpcds-sf1-s3
+    workload: bench
+    query_set: tpcds
+    scale_factor: 1
+    cayenne: tpcds/sf1/accelerated/s3[parquet]-cayenne[file].yaml
+    duckdb: tpcds/sf1/accelerated/s3[parquet]-duckdb[file].yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+
+  - id: bench-tpcds-sf1-s3-turso
+    workload: bench
+    query_set: tpcds
+    scale_factor: 1
+    cayenne: tpcds/sf1/accelerated/s3[parquet]-cayenne[file]turso.yaml
+    duckdb: tpcds/sf1/accelerated/s3[parquet]-duckdb[file].yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+    notes: Turso metastore variant. Compare against bench-tpcds-sf1-s3 to isolate the metastore.
+
+  - id: bench-clickbench-sf1-s3
+    workload: bench
+    query_set: clickbench
+    scale_factor: 1
+    cayenne: clickbench/sf1/accelerated/s3[parquet]-cayenne[file].yaml
+    duckdb: clickbench/sf1/accelerated/s3[parquet]-duckdb[file].yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+
+  - id: bench-clickbench-sf1-s3-turso
+    workload: bench
+    query_set: clickbench
+    scale_factor: 1
+    cayenne: clickbench/sf1/accelerated/s3[parquet]-cayenne[file]turso.yaml
+    duckdb: clickbench/sf1/accelerated/s3[parquet]-duckdb[file].yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+    notes: Turso metastore variant. Compare against bench-clickbench-sf1-s3 to isolate the metastore.
+
+  # ===========================================================================
+  # Throughput benchmarks (read-only, many concurrent query streams)
+  # ===========================================================================
+  - id: throughput-tpch-sf1-file
+    workload: throughput
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/file[parquet]-cayenne[file].yaml
+    duckdb: tpch/sf1/accelerated/file[parquet]-duckdb[file].yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+
+  - id: throughput-tpch-sf1-file-turso
+    workload: throughput
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/file[parquet]-cayenne[file]turso.yaml
+    duckdb: tpch/sf1/accelerated/file[parquet]-duckdb[file].yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+    notes: Turso metastore variant. Compare against throughput-tpch-sf1-file to isolate the metastore.
+
+  - id: throughput-tpch-sf10-s3
+    workload: throughput
+    query_set: tpch
+    scale_factor: 10
+    cayenne: tpch/sf10/accelerated/s3[parquet]-cayenne[file].yaml
+    duckdb: tpch/sf10/accelerated/s3[parquet]-duckdb[file].yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+    notes: SF10 file-mode pair is omitted because no DuckDB file-mode SF10 pod exists today.
+
+  - id: throughput-tpch-sf10-s3-turso
+    workload: throughput
+    query_set: tpch
+    scale_factor: 10
+    cayenne: tpch/sf10/accelerated/s3[parquet]-cayenne[file]turso.yaml
+    duckdb: tpch/sf10/accelerated/s3[parquet]-duckdb[file].yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+    notes: Turso metastore variant. Compare against throughput-tpch-sf10-s3 to isolate the metastore.
+
+  # ===========================================================================
+  # Mixed workloads (append while querying, CH-benCH-style interference)
+  # ===========================================================================
+  - id: mixed-append-query-tpch-sf1-file
+    workload: mixed
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/append/file[parquet]-cayenne[file]-append.yaml
+    duckdb: tpch/sf1/accelerated/append/file[parquet]-duckdb[file]-append.yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+    duration_secs: 720
+    query_concurrency: 4
+    load_interval_secs: 30
+    load_steps: 20
+    notes: Runs analytical TPC-H query workers while append loads mutate the source, measuring query latency and correctness under ingest pressure.
+
+  - id: mixed-append-query-tpch-sf1-file-turso
+    workload: mixed
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/append/file[parquet]-cayenne[file]turso-append.yaml
+    duckdb: tpch/sf1/accelerated/append/file[parquet]-duckdb[file]-append.yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+    duration_secs: 720
+    query_concurrency: 4
+    load_interval_secs: 30
+    load_steps: 20
+    notes: Turso metastore variant of mixed-append-query-tpch-sf1-file. Tests metastore contention under concurrent read+write — where the SQLite single-writer mutex is most likely to bite.
+
+  # ===========================================================================
+  # Load tests (long-running, read-only, observe drift over time)
+  # ===========================================================================
+  - id: load-tpch-sf1-file
+    workload: load
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/file[parquet]-cayenne[file].yaml
+    duckdb: tpch/sf1/accelerated/file[parquet]-duckdb[file].yaml
+    must_beat: false
+    runner_type: spiceai-dev-large-runners
+    duration_secs: 28800
+    notes: 8-hour load. Measures drift, leak resistance, and long-tail latency.
+
+  - id: load-tpch-sf1-file-turso
+    workload: load
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/file[parquet]-cayenne[file]turso.yaml
+    duckdb: tpch/sf1/accelerated/file[parquet]-duckdb[file].yaml
+    must_beat: false
+    runner_type: spiceai-dev-large-runners
+    duration_secs: 28800
+    notes: Turso metastore variant. 8-hour load. Compare against load-tpch-sf1-file for long-tail behavior under each metastore.
+
+  # ===========================================================================
+  # Append + upsert workloads (write-heavy with concurrent reads)
+  # ===========================================================================
+  - id: append-tpch-sf1
+    workload: append
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/append/file[parquet]-cayenne[file]-append.yaml
+    duckdb: tpch/sf1/accelerated/append/file[parquet]-duckdb[file]-append.yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+
+  - id: append-tpch-sf1-turso
+    workload: append
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/append/file[parquet]-cayenne[file]turso-append.yaml
+    duckdb: tpch/sf1/accelerated/append/file[parquet]-duckdb[file]-append.yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+    notes: Turso metastore variant of append-tpch-sf1. Write-heavy workload — isolates metastore commit cost.
+
+  - id: append-tpch-sf1-upsert
+    workload: append
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/append/file[parquet]-cayenne[file]-append_upsert.yaml
+    duckdb: tpch/sf1/accelerated/append/file[parquet]-duckdb[file]-append_upsert.yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+    notes: Stresses primary-key conflict resolution (deletion-vector vs row-rewrite paths).
+
+  - id: append-tpch-sf1-upsert-turso
+    workload: append
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/append/file[parquet]-cayenne[file]turso-append_upsert.yaml
+    duckdb: tpch/sf1/accelerated/append/file[parquet]-duckdb[file]-append_upsert.yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+    notes: Turso metastore variant of append-tpch-sf1-upsert. Upserts touch the deletion index in the metastore on every conflict, so this pair stresses the metastore commit path hardest.
+
+  - id: append-tpch-sf1-retention-period
+    workload: append
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/append/file[parquet]-cayenne[file]-append_retention_period.yaml
+    duckdb: tpch/sf1/accelerated/append/file[parquet]-duckdb[file]-append_retention_period.yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+    notes: Time-based retention. Exercises Cayenne's retention-filter pushdown.
+
+  - id: append-tpch-sf1-retention-period-turso
+    workload: append
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/append/file[parquet]-cayenne[file]turso-append_retention_period.yaml
+    duckdb: tpch/sf1/accelerated/append/file[parquet]-duckdb[file]-append_retention_period.yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+    notes: Turso metastore variant of append-tpch-sf1-retention-period. Retention sweeps issue metastore writes alongside append writes — sensitive to metastore concurrency.
+
+  - id: append-tpch-sf1-retention-sql
+    workload: append
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/append/file[parquet]-cayenne[file]-append_retention_sql.yaml
+    duckdb: tpch/sf1/accelerated/append/file[parquet]-duckdb[file]-append_retention_sql.yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+    notes: SQL-based retention.
+
+  - id: append-tpch-sf1-retention-sql-turso
+    workload: append
+    query_set: tpch
+    scale_factor: 1
+    cayenne: tpch/sf1/accelerated/append/file[parquet]-cayenne[file]turso-append_retention_sql.yaml
+    duckdb: tpch/sf1/accelerated/append/file[parquet]-duckdb[file]-append_retention_sql.yaml
+    must_beat: true
+    runner_type: spiceai-dev-large-runners
+    notes: Turso metastore variant of append-tpch-sf1-retention-sql.

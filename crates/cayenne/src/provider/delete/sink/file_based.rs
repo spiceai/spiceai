@@ -46,8 +46,9 @@ use datafusion_catalog::TableProvider;
 use datafusion_common::ScalarValue;
 use datafusion_expr::Expr;
 use object_store::{ObjectMeta, ObjectStore};
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
 /// Result from file-based deletion, including metadata for post-delete cleanup.
@@ -109,6 +110,13 @@ pub struct FileBasedDeletionSink {
     runtime_env: Arc<RuntimeEnv>,
     /// Shared write lock to prevent concurrent writes/refreshes from racing with deletions.
     write_lock: Arc<TokioMutex<()>>,
+    /// Shared listing fence. Acquired in write mode during physical file
+    /// deletion so concurrent scans cannot begin plan-build against a
+    /// listing that includes a file we are about to unlink. Without this,
+    /// a scan can capture file paths during plan-build, release its read
+    /// fence, and then fail with `NotFound` when its plan executes against
+    /// a file retention just removed.
+    listing_fence: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl FileBasedDeletionSink {
@@ -138,6 +146,7 @@ impl FileBasedDeletionSink {
         table_path: String,
         runtime_env: Arc<RuntimeEnv>,
         write_lock: Arc<TokioMutex<()>>,
+        listing_fence: Arc<tokio::sync::RwLock<()>>,
     ) -> Self {
         Self {
             listing_table,
@@ -150,6 +159,7 @@ impl FileBasedDeletionSink {
             table_path,
             runtime_env,
             write_lock,
+            listing_fence,
         }
     }
 
@@ -403,6 +413,13 @@ impl DeletionSink for FileBasedDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         // Acquire write lock to prevent racing with concurrent inserts or catalog refreshes.
         let _write_guard = self.write_lock.lock().await;
+        // Acquire the listing fence in write mode so new scan plan-builds
+        // cannot resolve a file listing while we are physically unlinking
+        // files. In-flight scans that already released their read fence
+        // remain at small risk (their plan-execute may race), but Unix
+        // unlink semantics keep already-opened handles valid; the residual
+        // window is between plan-build return and file open.
+        let _listing_guard = self.listing_fence.write().await;
 
         let result = self.delete_from_internal().await?;
 
@@ -448,15 +465,7 @@ impl FileBasedDeletionSink {
             }
 
             // 2. Remove from in-memory map
-            if let Ok(mut guard) = self.protected_snapshots.write() {
-                guard.remove(snapshot_id);
-            } else {
-                tracing::warn!(
-                    "Protected snapshots lock poisoned while cleaning up snapshot {snapshot_id} in table {}",
-                    self.table_name
-                );
-                continue;
-            }
+            self.protected_snapshots.write().remove(snapshot_id);
 
             // 3. Delete the empty snapshot directory
             let snapshot_dir = std::path::PathBuf::from(&self.table_path)

@@ -57,9 +57,10 @@ use datafusion::{
 pub const DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES: usize = 128 * 1024 * 1024; // 128Mb - can store approximately 32 million i32 keys.
 const DEFAULT_MAXIMUM_BLOOM_FILTER_MEMORY_BYTES: usize = 8 * 1024 * 1024;
 const MAXIMUM_RANGE_INTERVALS: usize = 64;
+const UNCONFIGURED_SHARED_INLIST_MEMORY_BYTES: usize = usize::MAX;
 
 static MAXIMUM_SHARED_INLIST_MEMORY_BYTES: AtomicUsize =
-    AtomicUsize::new(DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES);
+    AtomicUsize::new(UNCONFIGURED_SHARED_INLIST_MEMORY_BYTES);
 static CURRENT_INLIST_MEMORY_BYTES: AtomicUsize = AtomicUsize::new(0);
 // The exact in-list path reserves against one process-wide budget shared across
 // all accumulator instances. This keeps dynamic join filters bounded under query
@@ -67,7 +68,10 @@ static CURRENT_INLIST_MEMORY_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 #[must_use]
 pub fn maximum_shared_inlist_memory_bytes() -> usize {
-    MAXIMUM_SHARED_INLIST_MEMORY_BYTES.load(AtomicOrdering::Relaxed)
+    match MAXIMUM_SHARED_INLIST_MEMORY_BYTES.load(AtomicOrdering::Relaxed) {
+        UNCONFIGURED_SHARED_INLIST_MEMORY_BYTES => DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES,
+        limit => limit,
+    }
 }
 
 /// Conservatively clamps the process-wide exact in-list reservation budget.
@@ -78,7 +82,18 @@ pub fn maximum_shared_inlist_memory_bytes() -> usize {
 /// in one process, use the strictest configured limit instead of letting the
 /// most recent builder raise the shared budget for existing instances.
 pub fn clamp_maximum_shared_inlist_memory_bytes(limit: usize) {
-    MAXIMUM_SHARED_INLIST_MEMORY_BYTES.fetch_min(limit, AtomicOrdering::Relaxed);
+    let configured_limit = limit.min(UNCONFIGURED_SHARED_INLIST_MEMORY_BYTES.saturating_sub(1));
+    let _ = MAXIMUM_SHARED_INLIST_MEMORY_BYTES.fetch_update(
+        AtomicOrdering::Relaxed,
+        AtomicOrdering::Relaxed,
+        |current| {
+            Some(if current == UNCONFIGURED_SHARED_INLIST_MEMORY_BYTES {
+                configured_limit
+            } else {
+                current.min(configured_limit)
+            })
+        },
+    );
 }
 
 #[derive(Debug)]
@@ -183,23 +198,27 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
             batch.num_rows()
         );
 
-        // eagerly evaluate the expression and store the resulting array
-        // this avoids storing the entire record batch in memory, only storing the evaluated column
-        let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
-
         if self.exact_values_exceeded_memory_limit {
+            let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
+            self.total_memory_size = self
+                .total_memory_size
+                .saturating_add(array.get_array_memory_size());
             self.range_bounds.update(array.as_ref())?;
             return Ok(());
         }
+
+        // eagerly evaluate the expression and store the resulting array
+        // this avoids storing the entire record batch in memory, only storing the evaluated column
+        let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
 
         let array_memory_size = array.get_array_memory_size();
         let total_memory_size = self.total_memory_size.saturating_add(array_memory_size);
 
         if total_memory_size > self.max_inlist_memory_size {
-            tracing::debug!(
+            tracing::warn!(
                 total_memory_size,
                 max_inlist_memory_size = self.max_inlist_memory_size,
-                "ExactLeftAccumulator exceeded its local in-list memory limit; using range fallback."
+                "ExactLeftAccumulator exceeded its local in-list memory limit and switched to range dynamic filtering for this join. Consider increasing memory limits or reducing cardinality of the build side."
             );
             self.inlist_memory_reservation = None;
             self.range_bounds = self.range_bounds_from_collected_arrays(array.as_ref())?;
@@ -210,12 +229,12 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
         }
 
         if !self.try_reserve_inlist_memory(array_memory_size) {
-            tracing::debug!(
+            tracing::warn!(
                 requested_bytes = array_memory_size,
                 current_shared_inlist_memory_bytes =
                     CURRENT_INLIST_MEMORY_BYTES.load(AtomicOrdering::Relaxed),
                 maximum_shared_inlist_memory_bytes = maximum_shared_inlist_memory_bytes(),
-                "ExactLeftAccumulator shared in-list memory budget is exhausted; using range fallback."
+                "ExactLeftAccumulator shared in-list memory budget is exhausted and switched to range dynamic filtering for this join. Consider increasing memory limits or reducing cardinality of the build side."
             );
             self.inlist_memory_reservation = None;
             self.range_bounds = self.range_bounds_from_collected_arrays(array.as_ref())?;
@@ -244,7 +263,7 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
             arrays,
             total_memory_size,
             range_bounds,
-            use_range_fallback: exact_values_exceeded_memory_limit,
+            exact_values_exceeded_memory_limit,
             _inlist_memory_reservation: inlist_memory_reservation,
         }))
     }
@@ -300,18 +319,40 @@ pub struct ExactColumnBounds {
     arrays: Vec<Arc<dyn Array>>,
     total_memory_size: usize,
     range_bounds: RangeBounds,
-    use_range_fallback: bool,
+    exact_values_exceeded_memory_limit: bool,
     _inlist_memory_reservation: Option<InListMemoryReservation>,
 }
 
 impl ColumnBounds for ExactColumnBounds {
     /// Converts the collected arrays into an `InListExpr` for use in dynamic filtering.
     /// This builds an IN expression with all collected values.
+    ///
+    /// If the exact in-list exceeds its memory budget, return the accumulated
+    /// range/bloom fallback. The Cayenne optimizer only installs this exact
+    /// accumulator for inner joins with null-equals-nothing semantics, which
+    /// keeps the fallback in the same safety envelope as `DataFusion`'s native
+    /// min/max dynamic filter while bounding the exact in-list allocation.
+    ///
+    /// The `CoalescePartitionsExec` + iterative flatten wrapper detection added
+    /// in the optimizer ensures more plans (including those with partition
+    /// coalescing between join and Cayenne scan) now correctly route through
+    /// `ExactLeftAccumulator`, increasing the importance of these edge cases
+    /// being well understood and tested.
+    ///
+    /// NULL handling: In the exact path, NULLs from the build side are collected
+    /// as `ScalarValue::Null`. The generated expression is a non-negated `IN`
+    /// predicate, so probe rows only match concrete collected values. If either
+    /// side is NULL, SQL three-valued logic yields NULL rather than true, and the
+    /// dynamic filter does not keep that row on the basis of the NULL alone.
     fn physical_expr(
         &self,
         left_expr: Arc<dyn PhysicalExpr>,
     ) -> DataFusionResult<Arc<dyn PhysicalExpr>> {
-        if self.use_range_fallback {
+        if self.exact_values_exceeded_memory_limit {
+            tracing::warn!(
+                range_interval_count = self.range_bounds.intervals.len(),
+                "ExactLeftAccumulator exact values exceeded memory limit; returning range dynamic filter."
+            );
             return Ok(self.range_bounds.physical_expr(left_expr));
         }
 
@@ -324,9 +365,10 @@ impl ColumnBounds for ExactColumnBounds {
             .collect::<DataFusionResult<HashSet<ScalarValue>>>()?;
 
         if unique_values.is_empty() {
-            // No values collected - return a no-op filter (always true)
-            tracing::debug!("ExactLeftAccumulator collected no values, returning no-op filter.");
-            return Ok(literal_true());
+            tracing::debug!(
+                "ExactLeftAccumulator collected no build-side values, returning always-false filter."
+            );
+            return Ok(literal_false());
         }
 
         let expr_values = unique_values
@@ -478,19 +520,19 @@ impl RangeBounds {
     }
 
     fn physical_expr(&self, left_expr: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
-        if self.intervals.is_empty() {
-            tracing::debug!(
-                "ExactLeftAccumulator range fallback has no non-null values, returning no-op filter."
-            );
-            return literal_true();
-        }
-
         if !self.supports_range_filter {
             tracing::debug!(
                 supports_range_filter = self.supports_range_filter,
                 "ExactLeftAccumulator could not create range fallback, returning no-op filter."
             );
             return literal_true();
+        }
+
+        if self.intervals.is_empty() {
+            tracing::debug!(
+                "ExactLeftAccumulator range fallback has no non-null values, returning always-false filter."
+            );
+            return literal_false();
         }
 
         let mut range_expr = self
@@ -1103,6 +1145,10 @@ fn literal_true() -> Arc<dyn PhysicalExpr> {
     Arc::new(Literal::new(ScalarValue::Boolean(Some(true))))
 }
 
+fn literal_false() -> Arc<dyn PhysicalExpr> {
+    Arc::new(Literal::new(ScalarValue::Boolean(Some(false))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1139,6 +1185,15 @@ mod tests {
             .downcast_ref::<Literal>()
             .expect("Should downcast to Literal");
         let expected_value = ScalarValue::Boolean(Some(true));
+        assert_eq!(literal_expr.value(), &expected_value);
+    }
+
+    fn assert_literal_false(physical_expr: &Arc<dyn PhysicalExpr>) {
+        let literal_expr = physical_expr
+            .as_any()
+            .downcast_ref::<Literal>()
+            .expect("Should downcast to Literal");
+        let expected_value = ScalarValue::Boolean(Some(false));
         assert_eq!(literal_expr.value(), &expected_value);
     }
 
@@ -1247,7 +1302,7 @@ mod tests {
 
     #[test]
     fn test_exact_left_accumulator_empty_batch() {
-        // Test that updating with an empty batch does not cause errors and results in an always-true filter
+        // Test that updating with an empty batch does not cause errors and produces an always-false filter.
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
         let empty_batch = RecordBatch::try_new(
             Arc::new(schema),
@@ -1270,7 +1325,7 @@ mod tests {
             .physical_expr(left_expr)
             .expect("Should create physical expr");
 
-        assert_literal_true(&physical_expr);
+        assert_literal_false(&physical_expr);
     }
 
     #[test]
@@ -1302,7 +1357,6 @@ mod tests {
 
     #[test]
     fn test_exact_left_accumulator_exceeds_memory() {
-        // Test that when accumulated arrays exceed the in-list memory limit, we fallback to a range filter.
         let batch = create_uint64_batch(vec![1, 3, 5]);
 
         let left_expr = col("a", &batch.schema()).expect("Should create column expr");
@@ -1321,18 +1375,45 @@ mod tests {
             .physical_expr(left_expr)
             .expect("Should create physical expr");
 
-        // Validate the expression is a range filter from 1 through 5, not a no-op filter.
-        assert!(physical_expr.as_any().downcast_ref::<Literal>().is_none());
-
-        let probe_schema = Schema::new(vec![Field::new("a", DataType::UInt64, false)]);
-        let probe_array: ArrayRef = Arc::new(UInt64Array::from(vec![0, 1, 3, 5, 6]));
-        let probe_batch = RecordBatch::try_new(Arc::new(probe_schema), vec![probe_array])
-            .expect("Should create probe record batch");
-        let actual_values = evaluate_boolean_expression(&physical_expr, &probe_batch);
-
+        let result =
+            evaluate_boolean_expression(&physical_expr, &create_uint64_batch(vec![0, 1, 3, 5, 6]));
         assert_eq!(
             vec![Some(false), Some(true), Some(true), Some(true), Some(false)],
-            actual_values
+            result
+        );
+    }
+
+    #[test]
+    fn test_exact_left_accumulator_memory_fallback_with_nulls_and_mixed_values() {
+        // Edge case: memory limit exceeded while accumulating a column that contains NULLs.
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let values: Vec<Option<i32>> = vec![Some(5), None, Some(10), Some(15), None, Some(20)];
+        let array: ArrayRef = Arc::new(Int32Array::from(values));
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![array])
+            .expect("Should create batch with NULLs");
+
+        let left_expr = col("a", &batch.schema()).expect("Should create column expr");
+
+        // Extremely small memory limit to force immediate fallback.
+        let mut accumulator =
+            ExactLeftAccumulator::new_with_memory_limit(Arc::clone(&left_expr), 1);
+
+        accumulator
+            .update_batch(&batch)
+            .expect("Should update batch with NULLs and values");
+
+        assert!(accumulator.exact_values_exceeded_memory_limit);
+        assert!(accumulator.arrays.is_empty());
+
+        let column_bounds = accumulator.evaluate().expect("Should evaluate bounds");
+        let physical_expr = column_bounds
+            .physical_expr(Arc::clone(&left_expr))
+            .expect("Should create physical expr");
+
+        let result = evaluate_boolean_expression(&physical_expr, &batch);
+        assert_eq!(
+            vec![Some(true), None, Some(true), Some(true), None, Some(true)],
+            result
         );
     }
 
@@ -1364,17 +1445,18 @@ mod tests {
             .physical_expr(left_expr)
             .expect("Should create physical expr");
 
-        let probe_batch = create_uint64_batch(vec![0, 1, 15, 30, 31]);
-        let actual_values = evaluate_boolean_expression(&physical_expr, &probe_batch);
-
+        let result = evaluate_boolean_expression(
+            &physical_expr,
+            &create_uint64_batch(vec![0, 1, 15, 30, 31]),
+        );
         assert_eq!(
             vec![Some(false), Some(true), Some(true), Some(true), Some(false)],
-            actual_values
+            result
         );
     }
 
     #[test]
-    fn test_exact_left_accumulator_range_fallback_updates_after_limit_exceeded() {
+    fn test_exact_left_accumulator_updates_range_after_limit_exceeded() {
         let first_batch = create_uint64_batch(vec![10, 20]);
         let second_batch = create_uint64_batch(vec![1, 30]);
 
@@ -1396,17 +1478,18 @@ mod tests {
             .physical_expr(left_expr)
             .expect("Should create physical expr");
 
-        let probe_batch = create_uint64_batch(vec![0, 1, 15, 30, 31]);
-        let actual_values = evaluate_boolean_expression(&physical_expr, &probe_batch);
-
+        let result = evaluate_boolean_expression(
+            &physical_expr,
+            &create_uint64_batch(vec![0, 1, 15, 30, 31]),
+        );
         assert_eq!(
             vec![Some(false), Some(true), Some(true), Some(true), Some(false)],
-            actual_values
+            result
         );
     }
 
     #[test]
-    fn test_exact_left_accumulator_range_fallback_keeps_disjoint_intervals() {
+    fn test_exact_left_accumulator_tracks_disjoint_ranges_after_limit_exceeded() {
         let first_batch = create_uint64_batch(vec![10, 20]);
         let second_batch = create_uint64_batch(vec![100, 110]);
         let max_memory_size = first_batch.column(0).get_array_memory_size();
@@ -1422,6 +1505,7 @@ mod tests {
             .update_batch(&second_batch)
             .expect("Should update second batch");
 
+        assert!(accumulator.exact_values_exceeded_memory_limit);
         assert_eq!(2, accumulator.range_bounds.intervals.len());
 
         let column_bounds = accumulator.evaluate().expect("Should evaluate bounds");
@@ -1429,10 +1513,20 @@ mod tests {
             .physical_expr(left_expr)
             .expect("Should create physical expr");
 
-        let probe_batch = create_uint64_batch(vec![15, 50, 105]);
-        let actual_values = evaluate_boolean_expression(&physical_expr, &probe_batch);
-
-        assert_eq!(vec![Some(true), Some(false), Some(true)], actual_values);
+        let result = evaluate_boolean_expression(
+            &physical_expr,
+            &create_uint64_batch(vec![5, 10, 50, 100, 120]),
+        );
+        assert_eq!(
+            vec![
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(false)
+            ],
+            result
+        );
     }
 
     #[test]
@@ -1559,7 +1653,7 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_left_accumulator_range_fallback_ignores_nulls() {
+    fn test_exact_left_accumulator_memory_range_with_nulls() {
         let batch = create_nullable_uint64_batch(vec![Some(1), None, Some(3)]);
 
         let left_expr = col("a", &batch.schema()).expect("Should create column expr");
@@ -1576,17 +1670,12 @@ mod tests {
             .physical_expr(Arc::clone(&left_expr))
             .expect("Should create physical expr");
 
-        let probe_batch = create_uint64_batch(vec![0, 1, 2, 3, 4]);
-        let actual_values = evaluate_boolean_expression(&physical_expr, &probe_batch);
-
-        assert_eq!(
-            vec![Some(false), Some(true), Some(true), Some(true), Some(false)],
-            actual_values
-        );
+        let result = evaluate_boolean_expression(&physical_expr, &batch);
+        assert_eq!(vec![Some(true), None, Some(true)], result);
     }
 
     #[test]
-    fn test_exact_left_accumulator_range_fallback_with_only_nulls_returns_noop() {
+    fn test_exact_left_accumulator_memory_false_with_only_nulls() {
         let batch = create_nullable_uint64_batch(vec![None, None]);
 
         let left_expr = col("a", &batch.schema()).expect("Should create column expr");
@@ -1602,11 +1691,11 @@ mod tests {
             .physical_expr(left_expr)
             .expect("Should create physical expr");
 
-        assert_literal_true(&physical_expr);
+        assert_literal_false(&physical_expr);
     }
 
     #[test]
-    fn test_exact_left_accumulator_range_fallback_with_unsupported_type_returns_noop() {
+    fn test_exact_left_accumulator_memory_noop_with_unsupported_type() {
         let schema = Schema::new(vec![Field::new("a", DataType::Boolean, false)]);
         let a: ArrayRef = Arc::new(BooleanArray::from(vec![true, false]));
         let batch =
@@ -1629,7 +1718,7 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_left_accumulator_range_fallback_with_nan_returns_noop() {
+    fn test_exact_left_accumulator_memory_noop_with_nan() {
         let schema = Schema::new(vec![Field::new("a", DataType::Float64, false)]);
         let a: ArrayRef = Arc::new(Float64Array::from(vec![1.0, f64::NAN, 3.0]));
         let batch =
@@ -1652,7 +1741,7 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_left_accumulator_range_fallback_with_strings() {
+    fn test_exact_left_accumulator_memory_range_with_strings() {
         let schema = Schema::new(vec![Field::new("a", DataType::Utf8, false)]);
         let a: ArrayRef = Arc::new(StringArray::from(vec!["delta", "bravo", "charlie"]));
         let batch =
@@ -1671,17 +1760,18 @@ mod tests {
             .physical_expr(left_expr)
             .expect("Should create physical expr");
 
-        let probe_schema = Schema::new(vec![Field::new("a", DataType::Utf8, false)]);
-        let probe_array: ArrayRef = Arc::new(StringArray::from(vec![
-            "alpha", "bravo", "charlie", "delta", "zulu",
-        ]));
-        let probe_batch = RecordBatch::try_new(Arc::new(probe_schema), vec![probe_array])
-            .expect("Should create probe record batch");
-        let actual_values = evaluate_boolean_expression(&physical_expr, &probe_batch);
-
+        let eval_schema = Schema::new(vec![Field::new("a", DataType::Utf8, false)]);
+        let eval_batch = RecordBatch::try_new(
+            Arc::new(eval_schema),
+            vec![Arc::new(StringArray::from(vec![
+                "alpha", "bravo", "charlie", "delta", "echo",
+            ]))],
+        )
+        .expect("Should create evaluation batch");
+        let result = evaluate_boolean_expression(&physical_expr, &eval_batch);
         assert_eq!(
             vec![Some(false), Some(true), Some(true), Some(true), Some(false)],
-            actual_values
+            result
         );
     }
 

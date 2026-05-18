@@ -54,6 +54,7 @@ test_with_backends!(test_pk_auto_checkpoint_preserves_rows);
 test_with_backends!(test_inline_memtable_segment_pressure_checkpoints);
 test_with_backends!(test_inline_memtable_pressure_flushes_after_legacy_deletes);
 test_with_backends!(test_inline_writer_fallback_preserves_buffered_and_remaining_batches);
+test_with_backends!(test_compaction_runs_after_inline_memtable_checkpoint);
 
 #[tokio::test]
 #[ignore = "performance regression coverage; run explicitly with --ignored"]
@@ -1359,6 +1360,284 @@ async fn test_roundtrip_exceeds_byte_threshold(
     assert_eq!(c.value(0), i64::try_from(row_count).expect("fits"));
     assert_eq!(mn.value(0), 0);
     assert_eq!(mx.value(0), i64::try_from(row_count - 1).expect("fits"));
+
+    Ok(())
+}
+
+/// Direct Vortex appends should be eligible for the tiered compaction trigger.
+/// Drive several large writes (each above `INLINE_MAX_ROWS`, bypassing the
+/// inline path) with an aggressive trigger so compaction runs during ingestion.
+/// End-to-end row count is the correctness check; the final visible-file count
+/// is emitted as diagnostic context for compaction behavior.
+async fn test_compaction_runs_after_inline_memtable_checkpoint(
+    fixture: common::TestFixture,
+) -> TestResult {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+
+    // Build a table with aggressive compaction settings so the test runs fast.
+    let vortex_config = cayenne::metadata::VortexConfig {
+        target_vortex_file_size_mb: 1,
+        compaction_trigger_files: 4,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            CreateTableOptions {
+                table_name: "inline_then_compaction".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: fixture.data_path.to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config,
+            },
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    ctx.register_table(
+        "inline_then_compaction",
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    )?;
+
+    let table_id = fixture
+        .catalog
+        .get_table("inline_then_compaction")
+        .await?
+        .table_id;
+
+    // Step 1: 8 batches above INLINE_MAX_ROWS so each writes a Vortex file
+    // directly (bypassing the inline memtable). Compaction should fire inline.
+    // Use larger batches here so the resulting Vortex files are still "small"
+    // relative to the 1 MiB target but have enough aggregate bytes that 8 of
+    // them reliably trigger the Small tier (with trigger_files=4). This makes
+    // the "ingestion created N direct Vortex files → Small tier compaction
+    // consolidated them" regression path deterministic and fast under the
+    // aggressive config used in this test.
+    let large_batch_rows: i64 = 8000;
+    let mut expected_total: i64 = 0;
+    for batch_idx in 0..8_i64 {
+        let start = batch_idx * large_batch_rows;
+        let ids: Vec<i64> = (start..start + large_batch_rows).collect();
+        let names: Vec<String> = ids.iter().map(|i| format!("n_{i}")).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )?;
+        common::insert_batch(&table, batch).await?;
+        expected_total += large_batch_rows;
+    }
+
+    // Capture the current snapshot's Vortex file count as diagnostic context
+    // for this ingestion + compaction path. File-count reduction depends on
+    // exact compression ratios and Vortex chunking, so a stable assertion on
+    // the absolute count would be brittle. The row-count assertion below is
+    // the correctness contract; file-count is logged for post-failure triage.
+    let snapshot_id = fixture
+        .catalog
+        .get_table("inline_then_compaction")
+        .await?
+        .current_snapshot_id;
+    let files = table
+        .list_snapshot_files_with_sizes(&snapshot_id)
+        .await
+        .expect("list_snapshot_files_with_sizes should succeed");
+    eprintln!(
+        "inline_then_compaction table_id={table_id} snapshot_id={snapshot_id} visible_vortex_files={}",
+        files.len()
+    );
+
+    // Row count must match end-to-end after compaction.
+    let df = ctx
+        .sql("SELECT COUNT(*) AS c FROM inline_then_compaction")
+        .await?;
+    let results = df.collect().await?;
+    let batch = arrow::compute::concat_batches(&results[0].schema(), &results)?;
+    let total = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count")
+        .value(0);
+    assert_eq!(total, expected_total);
+
+    Ok(())
+}
+
+// ─── inline-memtable cache invalidation ────────────────────────────────────
+
+test_with_backends!(test_inlined_cache_generation_invariants);
+
+/// Verify that the inline-memtable cache generation counter is bumped correctly.
+///
+/// The generation is the key signal read by `read_inlined_batches` to decide
+/// whether it can return the in-process cached `Vec<RecordBatch>` instead of
+/// re-reading and re-decoding from the metastore. This test checks that:
+///
+/// 1. The counter starts at 0.
+/// 2. Each successful inline write bumps it.
+/// 3. Scans after successive writes return correct row counts (exercises the
+///    cache-hit path because the second scan sees the same generation as the
+///    previous `read_inlined_batches` call).
+async fn test_inlined_cache_generation_invariants(fixture: common::TestFixture) -> TestResult {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            cayenne::metadata::CreateTableOptions {
+                table_name: "inlined_cache_gen".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: fixture.data_path.to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            },
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    ctx.register_table(
+        "inlined_cache_gen",
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    )?;
+
+    // Generation starts at 0 (no writes yet).
+    assert_eq!(
+        table.inlined_generation(),
+        0,
+        "initial generation must be 0"
+    );
+
+    // First inline write — generation should increase.
+    let batch1 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )?;
+    common::insert_batch(&table, batch1).await?;
+    let gen_after_first = table.inlined_generation();
+    assert!(
+        gen_after_first > 0,
+        "generation must be bumped after first inline write, got {gen_after_first}"
+    );
+
+    // Second inline write — generation must increase again.
+    let batch2 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![4_i64, 5])),
+            Arc::new(StringArray::from(vec!["d", "e"])),
+        ],
+    )?;
+    common::insert_batch(&table, batch2).await?;
+    let gen_after_second = table.inlined_generation();
+    assert!(
+        gen_after_second > gen_after_first,
+        "generation must be bumped after second inline write: before={gen_after_first} after={gen_after_second}"
+    );
+
+    // A scan exercises the cache-hit path on the second call. Both scans must
+    // return the same correct row count.
+    let df = ctx
+        .sql("SELECT COUNT(*) AS c FROM inlined_cache_gen")
+        .await?;
+    let results = df.collect().await?;
+    let batch = arrow::compute::concat_batches(&results[0].schema(), &results)?;
+    let count = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count col")
+        .value(0);
+    assert_eq!(count, 5, "scan must see all 5 inlined rows");
+
+    // Second scan — should hit the cache (same generation) and return identical count.
+    let df2 = ctx
+        .sql("SELECT COUNT(*) AS c FROM inlined_cache_gen")
+        .await?;
+    let results2 = df2.collect().await?;
+    let batch2 = arrow::compute::concat_batches(&results2[0].schema(), &results2)?;
+    let count2 = batch2
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count col")
+        .value(0);
+    assert_eq!(
+        count2, 5,
+        "cache-hit scan must also return 5 rows (same generation)"
+    );
+
+    // Generation must not have changed between the two scans (no writes occurred).
+    assert_eq!(
+        table.inlined_generation(),
+        gen_after_second,
+        "generation must not change between scans with no writes"
+    );
+
+    // Checkpoint flushes inline data to Vortex and clears the metastore rows;
+    // this must bump the generation so the next read_inlined_batches misses
+    // the stale cache entry and sees an empty inline set.
+    table
+        .checkpoint_inlined_data()
+        .await
+        .expect("checkpoint_inlined_data should succeed");
+    let gen_after_checkpoint = table.inlined_generation();
+    assert!(
+        gen_after_checkpoint > gen_after_second,
+        "generation must be bumped after checkpoint: before={gen_after_second} after={gen_after_checkpoint}"
+    );
+    let table_id = fixture
+        .catalog
+        .get_table("inlined_cache_gen")
+        .await?
+        .table_id;
+    assert_eq!(
+        fixture.catalog.get_inlined_data_count(&table_id).await?,
+        0,
+        "checkpoint clear must remove inlined rows from the metastore"
+    );
+
+    // Post-checkpoint scan: inline data was flushed to Vortex, so the
+    // table must still return all 5 rows (now from the file layer).
+    let df3 = ctx
+        .sql("SELECT COUNT(*) AS c FROM inlined_cache_gen")
+        .await?;
+    let results3 = df3.collect().await?;
+    let batch3 = arrow::compute::concat_batches(&results3[0].schema(), &results3)?;
+    let count3 = batch3
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count col")
+        .value(0);
+    assert_eq!(
+        count3, 5,
+        "post-checkpoint scan must still return 5 rows (now from Vortex files)"
+    );
+    assert_eq!(
+        table.inlined_generation(),
+        gen_after_checkpoint,
+        "post-checkpoint scans must not bump the inline generation"
+    );
 
     Ok(())
 }
