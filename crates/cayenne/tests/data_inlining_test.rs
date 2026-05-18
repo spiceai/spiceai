@@ -1506,7 +1506,7 @@ async fn test_inlined_cache_generation_invariants(fixture: common::TestFixture) 
                 on_conflict: None,
                 base_path: fixture.data_path.to_string_lossy().to_string(),
                 partition_column: None,
-                vortex_config: Default::default(),
+                vortex_config: cayenne::metadata::VortexConfig::default(),
             },
             ctx.runtime_env(),
         )

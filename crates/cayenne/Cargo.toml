@@ -163,6 +163,10 @@ name = "deletion_vector_bitmap_to_treemap"
 
 [[bench]]
 harness = false
+name = "wide_table_key_probe_scan"
+
+[[bench]]
+harness = false
 name = "vs_duckdb_in_list_delete"
 required-features = ["duckdb-bench"]
 
