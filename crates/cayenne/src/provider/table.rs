@@ -5450,6 +5450,22 @@ impl CayenneTableProvider {
         );
     }
 
+    /// Drop the in-memory inline-memtable view: zero the cached row count
+    /// and bump `inlined_generation` so the next scan rebuilds from the
+    /// (presumably now-empty) catalog.
+    ///
+    /// Call this after a catalog operation that wipes
+    /// `cayenne_inlined_data` / `cayenne_inlined_delete` rows for the
+    /// table outside the inline-mutation path — e.g. `commit_overwrite`,
+    /// which clears those tables atomically with the snapshot pointer
+    /// flip but does not flow through `commit_inlined_data_mutation`.
+    /// Without this bump, scans keep serving the pre-overwrite cache and
+    /// row counts read high (old inline rows + new snapshot rows).
+    pub(crate) fn invalidate_inlined_cache(&self) {
+        self.inlined_row_count.store(0, Ordering::Relaxed);
+        self.inlined_generation.fetch_add(1, Ordering::Release);
+    }
+
     /// Get the current snapshot ID.
     ///
     /// This returns the live snapshot ID which may differ from `table_metadata.current_snapshot_id`
@@ -6283,16 +6299,19 @@ impl CayenneTableProvider {
         // `clear_staging_dir`, `ensure_no_incomplete_write`, and the
         // compaction trigger.
         //
-        // Why the threshold is `inline_flush_max_bytes / inline_max_bytes`:
-        // every `commit_inlined_data_mutation` call from the inline-write
-        // path adds at most 1 inline entry, with at most `inline_max_bytes`
-        // of IPC payload and at most `inline_max_rows` rows.
+        // Why the threshold is `inline_flush_max_bytes / inline_max_bytes`
+        // (runtime values derived from `DEFAULT_INLINE_FLUSH_MAX_BYTES`,
+        // `DEFAULT_INLINE_FLUSH_MAX_SEGMENTS`, `DEFAULT_INLINE_FLUSH_MAX_ROWS`,
+        // and `DEFAULT_INLINE_MAX_BYTES`): every `commit_inlined_data_mutation`
+        // call from the inline-write path adds at most 1 inline entry, with
+        // at most `inline_max_bytes` of IPC payload and at most
+        // `inline_max_rows` rows.
         // Cached `inlined_row_count` ≥ number of commits (each commit
         // contributes ≥ 1 row). So:
         //   - commits ≤ cached_rows
-        //   - entries  ≤ commits          ≤ cached_rows < inline_flush_max_segments
-        //   - bytes    ≤ commits·max_ipc  ≤ cached_rows·max_ipc < inline_flush_max_bytes
-        // when `cached_rows < inline_flush_max_bytes / inline_max_bytes`.
+        //   - entries  ≤ commits          ≤ cached_rows < INLINE_FLUSH_MAX_SEGMENTS
+        //   - bytes    ≤ commits·max_ipc  ≤ cached_rows·max_ipc < INLINE_FLUSH_MAX_BYTES
+        // when `cached_rows < INLINE_FLUSH_MAX_BYTES / INLINE_MAX_BYTES`.
         // The bytes bound usually dominates the safe-skip region.
         //
         // For workloads with many small rows per commit (typical CDC: a
