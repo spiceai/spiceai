@@ -428,7 +428,7 @@ impl ExecutorRegistry {
     /// `AcceleratedTable` downcast in the runtime crate).
     ///
     /// This function is called from a synchronous `TablePartitionProvider::get_partitions`
-    /// implementation during DataFusion query planning, which runs on Tokio runtime threads.
+    /// implementation during `DataFusion` query planning, which runs on Tokio runtime threads.
     /// `block_in_place` moves the current thread out of the Tokio worker pool for the
     /// duration of the lock acquisitions, preventing async task starvation.
     #[must_use]
