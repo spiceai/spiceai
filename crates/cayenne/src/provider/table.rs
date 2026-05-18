@@ -145,6 +145,10 @@ fn oldest_protected_snapshot_age(
         .max()
 }
 
+fn duration_millis_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn protected_snapshot_maintenance_trigger(
     protected_snapshots: &HashMap<String, i64>,
     trigger_count: usize,
@@ -5182,8 +5186,8 @@ impl CayenneTableProvider {
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 protected_snapshot_count,
-                oldest_snapshot_age_ms = oldest_snapshot_age.as_millis(),
-                trigger_age_ms = trigger_age.as_millis(),
+                oldest_snapshot_age_ms = duration_millis_saturating(oldest_snapshot_age),
+                trigger_age_ms = duration_millis_saturating(trigger_age),
                 "Running protected snapshot maintenance compaction because the age trigger fired"
             ),
         }

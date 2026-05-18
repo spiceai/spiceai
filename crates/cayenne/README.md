@@ -205,6 +205,7 @@ pub struct VortexConfig {
 
     // Compaction
     pub compaction_trigger_files: usize,      // default 8
+    pub compaction_trigger_snapshot_age_ms: u64,  // default 300_000, 0 disables age trigger
     pub compaction_max_levels: usize,         // default 3
     pub compaction_max_files_per_pick: usize, // default 32
     pub compaction_background_interval_ms: u64,  // default 30_000, 0 disables background loop

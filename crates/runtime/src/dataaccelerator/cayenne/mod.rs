@@ -506,6 +506,22 @@ impl CayenneAccelerator {
                 "cayenne_compaction_trigger_files",
                 config.compaction_trigger_files,
             );
+            if let Some(interval_str) = acceleration
+                .params
+                .get("cayenne_compaction_trigger_snapshot_age_ms")
+            {
+                match interval_str.parse::<u64>() {
+                    Ok(parsed) => {
+                        config.compaction_trigger_snapshot_age_ms = parsed;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "Invalid 'cayenne_compaction_trigger_snapshot_age_ms' value: '{interval_str}'. Expected a non-negative integer (milliseconds, 0 disables). Keeping default of {}.",
+                            config.compaction_trigger_snapshot_age_ms
+                        );
+                    }
+                }
+            }
             config.compaction_max_levels = parse_usize(
                 acceleration,
                 "cayenne_compaction_max_levels",
@@ -581,7 +597,7 @@ impl CayenneAccelerator {
             }
 
             tracing::debug!(
-                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, pk_conflict_detection={}, compaction_trigger_files={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}",
+                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, pk_conflict_detection={}, compaction_trigger_files={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}",
                 config.footer_cache_mb,
                 config.segment_cache_mb,
                 config.target_vortex_file_size_mb,
@@ -591,6 +607,7 @@ impl CayenneAccelerator {
                 config.compression_strategy,
                 config.pk_conflict_detection.as_str(),
                 config.compaction_trigger_files,
+                config.compaction_trigger_snapshot_age_ms,
                 config.compaction_max_levels,
                 config.compaction_max_files_per_pick,
                 config.compaction_background_interval_ms,
@@ -934,6 +951,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("compaction_trigger_files")
             .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 8.")
             .default("8"),
+        ParameterSpec::component("compaction_trigger_snapshot_age_ms")
+            .description("Maximum age in milliseconds of the oldest protected snapshot before snapshot-maintenance compaction runs. Set to 0 to disable the age trigger. Default: 300000.")
+            .default("300000"),
         ParameterSpec::component("compaction_max_levels")
             .description("Maximum number of consecutive compaction passes per trigger. Bounds write amplification when promotion keeps producing new candidates. Default: 3.")
             .default("3"),
