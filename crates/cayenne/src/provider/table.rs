@@ -1812,7 +1812,7 @@ impl CayenneTableProvider {
         // fails with NotFound. Sleeping `OLD_SNAPSHOT_CLEANUP_GRACE` before
         // deleting lets every plan that began under the old listing table
         // finish opening its files.
-        const OLD_SNAPSHOT_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+        const OLD_SNAPSHOT_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
 
         if self.table_metadata.path.starts_with("s3://") {
             // S3 cleanup uses `self.cleanup_old_snapshots_s3` which holds

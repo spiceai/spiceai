@@ -491,6 +491,7 @@ impl SpiceTestQueryWorker {
         results_snapshot: bool,
         validate: bool,
     ) -> Result<QueryRunResult> {
+        let query_start = std::time::Instant::now();
         match self
             .execute_query(
                 query,
@@ -506,6 +507,8 @@ impl SpiceTestQueryWorker {
                 query_failure: None,
             }),
             Err(e) => {
+                let failed_duration = query_start.elapsed();
+
                 // Check if this is a connection error using typed error checking
                 // This is more reliable than string matching
                 let is_connection_error =
@@ -529,10 +532,11 @@ impl SpiceTestQueryWorker {
                     })
                 } else {
                     eprintln!(
-                        "{} FAIL - Worker {} - Query '{}' failed: {}",
+                        "{} FAIL - Worker {} - Query '{}' failed (duration: {:.3}s): {}",
                         chrono::Utc::now(),
                         self.id,
                         query.name,
+                        failed_duration.as_secs_f64(),
                         e
                     );
 
