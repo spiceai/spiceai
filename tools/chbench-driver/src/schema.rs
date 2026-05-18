@@ -360,7 +360,9 @@ const MUTATED_TABLES: &[&str] = &[
 ];
 
 /// Tables probed for staleness gap measurement (alphabetical).
-/// All non-static mutated TPC-C tables (excludes `item`, `nation`, `region`, `supplier`).
+/// All mutated TPC-C tables that are accelerated/replicated by Spice.
+/// Excludes static reference tables (`item`, `nation`, `region`, `supplier`)
+/// and `history` (no primary key, not supported for CDC replication).
 pub const STALENESS_PROBE_TABLES: &[&str] = &[
     "customer",
     "district",
