@@ -493,6 +493,23 @@ pub struct AuthContextApp {
     pub api_key: Option<String>,
 }
 
+impl From<AuthContextRaw> for AuthContext {
+    fn from(raw: AuthContextRaw) -> Self {
+        let org_name = raw.org.and_then(|o| o.name).unwrap_or_default();
+        let (app_name, app_api_key) = match raw.app {
+            Some(app) => (app.name, app.api_key),
+            None => (None, None),
+        };
+        Self {
+            username: raw.username,
+            email: raw.email,
+            org_name,
+            app_name,
+            app_api_key,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,22 +545,5 @@ mod tests {
 
         let value = serde_json::to_value(limits).expect("limits should serialize");
         assert_eq!(value, serde_json::json!({ "cpu": "2" }));
-    }
-}
-
-impl From<AuthContextRaw> for AuthContext {
-    fn from(raw: AuthContextRaw) -> Self {
-        let org_name = raw.org.and_then(|o| o.name).unwrap_or_default();
-        let (app_name, app_api_key) = match raw.app {
-            Some(app) => (app.name, app.api_key),
-            None => (None, None),
-        };
-        Self {
-            username: raw.username,
-            email: raw.email,
-            org_name,
-            app_name,
-            app_api_key,
-        }
     }
 }

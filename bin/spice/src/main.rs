@@ -504,12 +504,32 @@ fn should_treat_as_cloud_region(value: &OsStr) -> bool {
 }
 
 fn looks_like_legacy_cloud_region(value: &str) -> bool {
-    is_valid_cloud_region(value)
-        && value.contains('-')
-        && value
-            .chars()
-            .last()
-            .is_some_and(|last| last.is_ascii_digit())
+    if !is_valid_cloud_region(value) {
+        return false;
+    }
+
+    let mut parts = value.split('-');
+    let (Some(first), Some(second), Some(third)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+
+    match parts.next() {
+        None => legacy_region_parts_match(first, second, third),
+        Some(fourth) if first == "us" && second == "gov" && parts.next().is_none() => {
+            legacy_region_parts_match(first, third, fourth)
+        }
+        _ => false,
+    }
+}
+
+fn legacy_region_parts_match(prefix: &str, area: &str, zone: &str) -> bool {
+    prefix.len() == 2
+        && prefix.chars().all(|c| c.is_ascii_lowercase())
+        && !area.is_empty()
+        && area.chars().all(|c| c.is_ascii_lowercase())
+        && !zone.is_empty()
+        && zone.chars().all(|c| c.is_ascii_digit())
 }
 
 fn direct_shortcut_flag_consumes_value(value: &str) -> bool {
@@ -518,7 +538,9 @@ fn direct_shortcut_flag_consumes_value(value: &str) -> bool {
 
 fn cloud_region_from_equals(value: &OsStr) -> Option<&str> {
     let value = value.to_str()?;
-    value.strip_prefix("--cloud=")
+    value
+        .strip_prefix("--cloud=")
+        .filter(|region| looks_like_legacy_cloud_region(region))
 }
 
 fn is_top_level_command(value: &str) -> bool {
@@ -1236,6 +1258,30 @@ mod tests {
     }
 
     #[test]
+    fn cloud_flag_does_not_consume_arbitrary_region_shaped_value() {
+        let Err(error) = try_parse_normalized(&["spice", "--cloud", "foo-1", "status"]) else {
+            panic!("arbitrary region-like value after --cloud should not be consumed");
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("unrecognized subcommand 'foo-1'")
+        );
+    }
+
+    #[test]
+    fn cloud_equals_rejects_arbitrary_region_value() {
+        let Err(error) = try_parse_normalized(&["spice", "--cloud=foo", "status"]) else {
+            panic!("arbitrary value in --cloud= should not be normalized as a region");
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("--cloud"));
+        assert!(message.contains("foo"));
+    }
+
+    #[test]
     fn cloud_flag_accepts_equals_region_value() {
         let cli = parse_normalized(&["spice", "--cloud=us-west-2", "status"]);
         assert!(cli.cloud);
@@ -1269,12 +1315,14 @@ mod tests {
     }
 
     #[test]
-    fn cloud_region_rejects_invalid_values_after_normalization() {
+    fn cloud_equals_rejects_invalid_region_syntax() {
         let Err(error) = try_parse_normalized(&["spice", "--cloud=bad_region", "status"]) else {
             panic!("invalid cloud region should fail parsing");
         };
 
-        assert!(error.to_string().contains("invalid cloud region"));
+        let message = error.to_string();
+        assert!(message.contains("--cloud"));
+        assert!(message.contains("bad_region"));
     }
 
     #[test]
