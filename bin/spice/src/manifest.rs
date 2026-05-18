@@ -153,6 +153,9 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
 }
 
 /// Writes a file and restricts permissions to the owner on Unix platforms.
+///
+/// On non-Unix platforms this falls back to the standard library write path;
+/// callers must not assume owner-only ACL hardening there.
 pub fn write_secure_file(path: &Path, contents: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {

@@ -774,6 +774,7 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::RuntimeVersion { .. } => "runtime_version",
         spice::error::Error::Environment { .. } => "environment",
         spice::error::Error::InvalidArgument { .. } => "invalid_argument",
+        spice::error::Error::DeviceAuthorizationDenied => "device_authorization_denied",
         spice::error::Error::HomeDirectoryNotFound => "home_directory_not_found",
         spice::error::Error::Repl { .. } => "repl",
         spice::error::Error::ChildProcessId => "child_process_id",

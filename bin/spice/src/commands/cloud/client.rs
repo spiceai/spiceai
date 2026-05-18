@@ -34,7 +34,6 @@ use spice_cloud_client::types::{
 
 const DEV_CLOUD_API_BASE_URL: &str = "https://dev-api.spice.ai";
 const CLOUD_API_BASE_URL: &str = "https://api.spice.ai";
-pub const DEVICE_AUTHORIZATION_DENIED_MESSAGE: &str = "Device authorization was denied";
 
 /// CLI wrapper around [`spice_cloud_client::CloudClient`].
 ///
@@ -534,9 +533,8 @@ fn into_cli(e: spice_cloud_client::error::Error) -> crate::error::Error {
         CloudError::Forbidden { message } => crate::error::Error::InvalidArgument {
             message: format!("Forbidden: {message}"),
         },
-        CloudError::AuthorizationDenied => crate::error::Error::InvalidArgument {
-            message: DEVICE_AUTHORIZATION_DENIED_MESSAGE.to_string(),
-        },
+        CloudError::AuthorizationDenied => crate::error::Error::DeviceAuthorizationDenied,
+        CloudError::InvalidResponse { message } => crate::error::Error::InvalidResponse { message },
         CloudError::NotFound { message } => crate::error::Error::InvalidResponse {
             message: format!("Not found: {message}"),
         },
@@ -554,11 +552,7 @@ fn into_cli(e: spice_cloud_client::error::Error) -> crate::error::Error {
 }
 
 pub fn is_device_authorization_denied_error(error: &crate::error::Error) -> bool {
-    matches!(
-        error,
-        crate::error::Error::InvalidArgument { message }
-            if message == DEVICE_AUTHORIZATION_DENIED_MESSAGE
-    )
+    matches!(error, crate::error::Error::DeviceAuthorizationDenied)
 }
 
 #[cfg(test)]

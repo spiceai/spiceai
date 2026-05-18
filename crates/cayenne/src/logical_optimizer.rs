@@ -105,7 +105,10 @@ limitations under the License.
 //! When statistics are present, the cardinality gates suppress propagation only
 //! when they prove the receiving side is too small or insufficiently larger
 //! than the filtered key domain. Missing statistics fall back to the same
-//! structural safety checks as known-cardinality plans.
+//! structural safety checks as known-cardinality plans: the receiving subtree
+//! must still contain a Cayenne-backed scan, the filtered side must be
+//! dim-like, the join key must be preserved through summaries, and propagation
+//! markers must not already target the key.
 
 use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};

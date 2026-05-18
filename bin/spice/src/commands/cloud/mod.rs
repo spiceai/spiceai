@@ -470,7 +470,7 @@ pub struct CreateAppArgs {
     pub name: String,
 
     /// Deployment region (e.g. us-east-1-prod-aws-data)
-    #[arg(long)]
+    #[arg(long, value_parser = parse_create_app_region)]
     pub region: String,
 
     /// App kind (set or cluster)
@@ -1765,6 +1765,13 @@ fn normalize_create_app_region(region: &str) -> Result<String> {
 
     data_region_name(&endpoint_region).ok_or_else(|| crate::error::Error::InvalidArgument {
         message: format!("Invalid region '{region}': expected a Spice Cloud data region"),
+    })
+}
+
+fn parse_create_app_region(region: &str) -> std::result::Result<String, String> {
+    normalize_create_app_region(region).map_err(|error| match error {
+        crate::error::Error::InvalidArgument { message } => message,
+        error => error.to_string(),
     })
 }
 

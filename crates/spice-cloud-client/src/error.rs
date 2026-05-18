@@ -41,6 +41,11 @@ pub enum Error {
     #[snafu(display("Device authorization was denied"))]
     AuthorizationDenied,
 
+    /// The server returned a successful response whose body was invalid for the
+    /// requested operation.
+    #[snafu(display("Invalid response: {message}"))]
+    InvalidResponse { message: String },
+
     /// The server returned 404 Not Found.
     #[snafu(display("Not found: {message}"))]
     NotFound { message: String },

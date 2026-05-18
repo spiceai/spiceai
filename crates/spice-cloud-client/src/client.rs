@@ -612,8 +612,15 @@ fn auth_exchange_result(body: AuthExchangeResponse) -> Result<Option<AuthExchang
         return error::AuthorizationDeniedSnafu.fail();
     }
 
-    if body.access_token.as_deref().is_none_or(str::is_empty) {
+    if body.access_token.is_none() {
         return Ok(None);
+    }
+
+    if body.access_token.as_deref().is_some_and(str::is_empty) {
+        return error::InvalidResponseSnafu {
+            message: "Auth token exchange completed without an access token".to_string(),
+        }
+        .fail();
     }
 
     Ok(Some(body))
@@ -707,6 +714,19 @@ mod tests {
         .expect("pending auth exchange should not fail");
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn auth_exchange_empty_token_is_error() {
+        let result = auth_exchange_result(AuthExchangeResponse {
+            access_token: Some(String::new()),
+            access_denied: false,
+        });
+
+        let Err(error::Error::InvalidResponse { message }) = result else {
+            panic!("empty auth token should return an invalid-response error");
+        };
+        assert!(message.contains("without an access token"));
     }
 
     #[test]
