@@ -29,7 +29,7 @@ use std::time::Duration;
 use arrow::array::{Array, TimestampMicrosecondArray};
 use arrow::datatypes::DataType;
 use chbench_driver::ChBenchDriver;
-use futures::{TryStreamExt, future::join_all};
+use futures::TryStreamExt;
 use test_framework::anyhow;
 use test_framework::opentelemetry::KeyValue;
 use tokio_util::sync::CancellationToken;
