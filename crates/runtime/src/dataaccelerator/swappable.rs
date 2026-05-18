@@ -150,6 +150,7 @@ impl SwappableTableProvider {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for SwappableTableProvider {
     fn as_any(&self) -> &dyn Any {
@@ -213,6 +214,38 @@ impl TableProvider for SwappableTableProvider {
         filters: Vec<Expr>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         self.current().update(state, assignments, filters).await
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        // Cannot delegate to current() as it returns a temporary Arc whose
+        // lifetime does not extend to the returned &str borrow.
+        None
+    }
+
+    fn get_logical_plan(
+        &self,
+    ) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
+        // Cannot delegate to current() as it returns a temporary Arc whose
+        // lifetime does not extend to the returned borrow.
+        None
+    }
+
+    fn get_column_default(&self, _column: &str) -> Option<&Expr> {
+        // Cannot delegate to current() as it returns a temporary Arc whose
+        // lifetime does not extend to the returned borrow.
+        None
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> DFResult<datafusion::catalog::ScanResult> {
+        self.current().scan_with_args(state, args).await
+    }
+
+    async fn truncate(&self, state: &dyn Session) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.current().truncate(state).await
     }
 }
 
