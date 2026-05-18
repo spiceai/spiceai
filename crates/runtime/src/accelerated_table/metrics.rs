@@ -145,3 +145,37 @@ pub(crate) static REFRESH_BYTES_WRITTEN: LazyLock<Counter<u64>> = LazyLock::new(
         .with_unit("By")
         .build()
 });
+
+pub(crate) static CDC_APPLY_BURST_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("dataset_acceleration_cdc_apply_burst_duration_ms")
+        .with_description("Duration in milliseconds to apply one coalesced CDC burst.")
+        .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});
+
+pub(crate) static CDC_APPLY_BURST_BYTES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("dataset_acceleration_cdc_apply_burst_bytes")
+        .with_description("Arrow in-memory bytes in one coalesced CDC apply burst.")
+        .with_unit("By")
+        .build()
+});
+
+pub(crate) static CDC_APPLY_BURST_ENVELOPES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("dataset_acceleration_cdc_apply_burst_envelopes")
+        .with_description("Number of source envelopes in one coalesced CDC apply burst.")
+        .with_unit("envelopes")
+        .build()
+});
+
+pub(crate) static CDC_APPLY_FIXED_COST_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("dataset_acceleration_cdc_apply_fixed_cost_ms")
+        .with_description("Duration in milliseconds for fixed-cost phases of CDC apply.")
+        .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});

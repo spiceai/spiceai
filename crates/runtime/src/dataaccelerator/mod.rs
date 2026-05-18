@@ -307,6 +307,7 @@ impl AcceleratorEngineRegistry {
         .mode(acceleration_settings.mode)
         .options(params)
         .indexes(acceleration_settings.indexes.clone());
+        let suppress_auto_on_conflict = cayenne_pk_conflict_detection_none(acceleration_settings);
 
         // If there are constraints from the federated table, then add them to the accelerated table
         // For Arrow/MemTable accelerator, on_conflict will be automatically derived from primary key constraints
@@ -314,9 +315,12 @@ impl AcceleratorEngineRegistry {
             && !constraints.is_empty()
         {
             external_table_builder = external_table_builder.constraints(constraints.clone());
-            let primary_keys: Vec<String> = get_primary_keys_from_constraints(constraints, &schema);
-            external_table_builder = external_table_builder
-                .on_conflict(OnConflict::Upsert(ColumnReference::new(primary_keys)));
+            if !suppress_auto_on_conflict {
+                let primary_keys: Vec<String> =
+                    get_primary_keys_from_constraints(constraints, &schema);
+                external_table_builder = external_table_builder
+                    .on_conflict(OnConflict::Upsert(ColumnReference::new(primary_keys)));
+            }
         }
 
         if let Some(on_conflict) =
@@ -340,7 +344,7 @@ impl AcceleratorEngineRegistry {
                         external_table_builder.constraints(constraints.clone());
                     // Update on_conflict to match the new constraints' primary key
                     // if user hasn't explicitly configured on_conflict
-                    if acceleration_settings.on_conflict.is_empty() {
+                    if acceleration_settings.on_conflict.is_empty() && !suppress_auto_on_conflict {
                         let primary_keys: Vec<String> =
                             get_primary_keys_from_constraints(&constraints, &schema);
                         if !primary_keys.is_empty() {
@@ -828,6 +832,14 @@ pub(crate) fn get_primary_keys_from_constraints(
         .collect()
 }
 
+fn cayenne_pk_conflict_detection_none(acceleration_settings: &Acceleration) -> bool {
+    matches!(acceleration_settings.engine, Engine::Cayenne)
+        && ["cayenne_pk_conflict_detection", "pk_conflict_detection"]
+            .iter()
+            .filter_map(|key| acceleration_settings.params.get(*key))
+            .any(|value| value.eq_ignore_ascii_case("none"))
+}
+
 async fn get_registered_accelerator(
     source: &dyn AccelerationSource,
     engine: Engine,
@@ -887,6 +899,34 @@ mod test {
     use ::arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
+
+    #[test]
+    fn test_cayenne_pk_conflict_detection_none_suppresses_auto_on_conflict() {
+        let acceleration_settings = Acceleration {
+            engine: Engine::Cayenne,
+            params: HashMap::from([(
+                "cayenne_pk_conflict_detection".to_string(),
+                "none".to_string(),
+            )]),
+            ..Acceleration::default()
+        };
+
+        assert!(cayenne_pk_conflict_detection_none(&acceleration_settings));
+    }
+
+    #[test]
+    fn test_cayenne_pk_conflict_detection_auto_keeps_auto_on_conflict() {
+        let acceleration_settings = Acceleration {
+            engine: Engine::Cayenne,
+            params: HashMap::from([(
+                "cayenne_pk_conflict_detection".to_string(),
+                "auto".to_string(),
+            )]),
+            ..Acceleration::default()
+        };
+
+        assert!(!cayenne_pk_conflict_detection_none(&acceleration_settings));
+    }
 
     #[tokio::test]
     #[cfg(feature = "duckdb")]

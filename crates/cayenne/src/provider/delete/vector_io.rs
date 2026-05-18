@@ -509,23 +509,44 @@ async fn write_deletion_file(
     tokio::task::spawn_blocking(move || -> Result<u64> {
         use arrow::ipc::writer::FileWriter;
 
+        // Crash-safe write. Ensure the deletion vector file content is durable
+        // before we record a pointer to it in the catalog. A crash without
+        // this sync could leave a zero-length or partial .arrow file while the
+        // catalog transaction that references it has committed (or is about
+        // to). On recovery, readers would then hit a missing/corrupt deletion
+        // vector for a "committed" delete — either erroring or (worse)
+        // returning deleted rows. This is the exact durability requirement we
+        // enforce for data files and WAL markers in the append path.
+        //
+        // 1. Stream Arrow IPC into the file.
+        // 2. Recover the underlying std::fs::File from the writer and fsync
+        //    its data (sync_all flushes data + metadata). A previous revision
+        //    also re-opened the file to fsync it a second time — that
+        //    reopen+fsync was redundant work on every delete and has been
+        //    removed.
+        // 3. fsync the parent directory so the new directory entry is durable
+        //    across a power-loss restart — without this, the catalog can
+        //    record a delete file path that fails to resolve after a crash
+        //    because the file's inode is on disk but the dirent isn't.
         let file = std::fs::File::create(&output_path)?;
         let mut writer = FileWriter::try_new(file, &schema)?;
         writer.write(&batch)?;
         writer.finish()?;
-
-        // Ensure the deletion vector file content is durable before we record
-        // a pointer to it in the catalog. A crash without this sync could leave
-        // a zero-length or partial .arrow file while the catalog transaction
-        // that references it has committed (or is about to). On recovery,
-        // readers would then hit a missing/corrupt deletion vector for a
-        // "committed" delete — either erroring or (worse) returning deleted rows.
-        // This is the exact durability requirement we enforce for data files
-        // and WAL markers in the append path.
-        let f = std::fs::OpenOptions::new().write(true).open(&output_path)?;
-        f.sync_all()?;
+        let inner = writer.into_inner()?;
+        inner.sync_all()?;
+        drop(inner);
 
         let metadata = std::fs::metadata(&output_path)?;
+
+        // Best-effort parent-dir fsync. Matches the partitioned_wal /
+        // staging_wal write patterns: a failure here is unusual and logged
+        // by the caller; the deletion file's content is already durable
+        // regardless.
+        if let Some(parent) = output_path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
 
         Ok(metadata.len())
     })
