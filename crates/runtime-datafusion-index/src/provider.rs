@@ -19,7 +19,7 @@ use std::{any::Any, borrow::Cow, sync::Arc};
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::SchemaRef,
-    catalog::{Session, TableProvider},
+    catalog::{ScanArgs, ScanResult, Session, TableProvider},
     common::{Constraints, Statistics},
     datasource::TableType,
     error::Result as DataFusionResult,
@@ -95,6 +95,7 @@ impl IndexedTableProvider {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for IndexedTableProvider {
     fn as_any(&self) -> &dyn Any {
@@ -174,5 +175,17 @@ impl TableProvider for IndexedTableProvider {
         filters: Vec<Expr>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.underlying.update(state, assignments, filters).await
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: ScanArgs<'a>,
+    ) -> DataFusionResult<ScanResult> {
+        self.underlying.scan_with_args(state, args).await
+    }
+
+    async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.underlying.truncate(state).await
     }
 }

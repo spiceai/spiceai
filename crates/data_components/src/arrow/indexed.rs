@@ -571,6 +571,7 @@ impl PrimaryKeyValue {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for IndexedMemTable {
     fn as_any(&self) -> &dyn Any {
@@ -805,6 +806,47 @@ impl TableProvider for IndexedMemTable {
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         self.inner.delete_from(state, filters).await
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        self.inner.get_table_definition()
+    }
+
+    fn get_logical_plan(
+        &self,
+    ) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
+        self.inner.get_logical_plan()
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> Result<datafusion::catalog::ScanResult> {
+        let filters = args.filters().unwrap_or(&[]);
+        let projection = args.projection().map(<[usize]>::to_vec);
+        let limit = args.limit();
+        let plan = self
+            .scan(state, projection.as_ref(), filters, limit)
+            .await?;
+        Ok(datafusion::catalog::ScanResult::new(plan))
+    }
+
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        self.inner.statistics()
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.inner.update(state, assignments, filters).await
+    }
+
+    async fn truncate(&self, state: &dyn Session) -> Result<Arc<dyn ExecutionPlan>> {
+        self.inner.truncate(state).await
     }
 }
 

@@ -647,6 +647,7 @@ impl RerankUDTFProvider {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for RerankUDTFProvider {
     fn as_any(&self) -> &dyn Any {
@@ -780,6 +781,83 @@ impl TableProvider for RerankUDTFProvider {
         }
 
         Ok(rerank_exec)
+    }
+
+    fn constraints(&self) -> Option<&datafusion::common::Constraints> {
+        None
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        None
+    }
+
+    fn get_logical_plan(
+        &self,
+    ) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
+        None
+    }
+
+    fn get_column_default(&self, _column: &str) -> Option<&Expr> {
+        None
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> DataFusionResult<datafusion::catalog::ScanResult> {
+        let filters = args.filters().unwrap_or(&[]);
+        let projection = args.projection().map(<[usize]>::to_vec);
+        let limit = args.limit();
+        let plan = self
+            .scan(state, projection.as_ref(), filters, limit)
+            .await?;
+        Ok(datafusion::catalog::ScanResult::new(plan))
+    }
+
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        None
+    }
+
+    async fn insert_into(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+        _input: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        _insert_op: datafusion::logical_expr::dml::InsertOp,
+    ) -> DataFusionResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        Err(DataFusionError::NotImplemented(
+            "RerankUDTFProvider does not support insert_into".to_string(),
+        ))
+    }
+
+    async fn delete_from(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+        _filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        Err(DataFusionError::NotImplemented(
+            "RerankUDTFProvider does not support delete_from".to_string(),
+        ))
+    }
+
+    async fn update(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+        _assignments: Vec<(String, Expr)>,
+        _filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        Err(DataFusionError::NotImplemented(
+            "RerankUDTFProvider does not support update".to_string(),
+        ))
+    }
+
+    async fn truncate(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+    ) -> DataFusionResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        Err(DataFusionError::NotImplemented(
+            "RerankUDTFProvider does not support truncate".to_string(),
+        ))
     }
 }
 

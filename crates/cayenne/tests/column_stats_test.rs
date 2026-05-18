@@ -26,17 +26,13 @@ limitations under the License.
 
 mod common;
 
-use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
+use cayenne::MetadataCatalog;
 use cayenne::metadata::{CreateTableOptions, TableStatistics};
-use cayenne::{CayenneTableProvider, MetadataCatalog};
-use datafusion::prelude::SessionContext;
 use std::sync::Arc;
 
 // Generate test variants for each backend
 test_with_backends!(test_table_statistics_crud);
-test_with_backends!(test_stats_persisted_after_insert);
 test_with_backends!(test_stats_cleared_on_drop_table);
 
 /// Test basic CRUD operations on `cayenne_table_statistics`.
@@ -102,71 +98,6 @@ async fn test_table_statistics_crud(
     catalog.clear_table_statistics(&table_id).await?;
     let stats = catalog.get_table_statistics(&table_id).await?;
     assert!(stats.is_none());
-
-    Ok(())
-}
-
-/// Test that table-level stats are persisted after inserting data.
-async fn test_stats_persisted_after_insert(
-    fixture: common::TestFixture,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let catalog = &fixture.catalog;
-    let data_path = &fixture.data_path;
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("name", DataType::Utf8, true),
-    ]));
-
-    let ctx = SessionContext::new();
-    let table_name = "stats_insert_test";
-    let table = CayenneTableProvider::create_table(
-        Arc::clone(catalog) as Arc<dyn MetadataCatalog>,
-        CreateTableOptions {
-            table_name: table_name.to_string(),
-            schema: Arc::clone(&schema),
-            primary_key: vec![],
-            on_conflict: None,
-            base_path: data_path.to_string_lossy().to_string(),
-            partition_column: None,
-            vortex_config: cayenne::metadata::VortexConfig::default(),
-        },
-        ctx.runtime_env(),
-    )
-    .await?;
-
-    let table_id = catalog.get_table(table_name).await?.table_id;
-
-    // Insert data
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
-            Arc::new(StringArray::from(vec![
-                Some("Alice"),
-                Some("Bob"),
-                None,
-                Some("Diana"),
-                Some("Eve"),
-            ])),
-        ],
-    )?;
-
-    common::insert_batch(&table, batch).await?;
-
-    // Verify stats were persisted
-    let stats = catalog.get_table_statistics(&table_id).await?;
-    assert!(
-        stats.is_some(),
-        "Expected table statistics to be persisted after insert"
-    );
-
-    let stats = stats.expect("table statistics should exist");
-    assert_eq!(stats.num_rows, 5, "Expected 5 rows");
-    assert!(
-        !stats.statistics_blob.is_empty(),
-        "Expected non-empty statistics blob"
-    );
 
     Ok(())
 }

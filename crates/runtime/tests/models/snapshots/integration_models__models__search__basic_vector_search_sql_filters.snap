@@ -7,21 +7,21 @@ snapshot_kind: text
   {
     "id": 863,
     "answer": "Choices create costs and benefits.",
-    "_score": "[score]"
+    "_score": "0.87"
   },
   {
     "id": 6,
     "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)",
-    "_score": "[score]"
+    "_score": "0.82"
   },
   {
     "id": 438,
     "answer": "The Cat does not need to drink, as it obtains sufficient water from its prey.",
-    "_score": "[score]"
+    "_score": "0.80"
   },
   {
     "id": 1041,
     "answer": "A common thermometer operates on the principle that matter usually expands when it absorbs heat energy.",
-    "_score": "[score]"
+    "_score": "0.77"
   }
 ]
