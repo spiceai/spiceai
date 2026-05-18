@@ -25,10 +25,15 @@ use super::DatasetTestArgs;
 /// measuring analytical query freshness under write load.
 ///
 /// CH-benCH convention: `--scale-factor` maps to warehouses (SF1 = 1 warehouse
-/// ≈ 100 MB seed data). The TPC-C terminal count is `warehouses * 10`, matching
-/// the spec's requirement of 10 terminals per warehouse.
+/// ≈ 100 MB seed data). The TPC-C terminal count defaults to `warehouses * 10`,
+/// matching the spec's requirement of 10 terminals per warehouse.
+/// Use `--terminals` to override.
 #[derive(Parser, Debug, Clone)]
 pub struct HtapArgs {
     #[command(flatten)]
     pub(crate) test_args: DatasetTestArgs,
+
+    /// Override the number of concurrent OLTP terminals (default: scale_factor * 10).
+    #[arg(long)]
+    pub(crate) terminals: Option<usize>,
 }

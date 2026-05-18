@@ -85,7 +85,9 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         let query_set = args.load_query_set()?;
         if query_set == test_framework::queries::QuerySet::ChBench {
             let scale_factor = args.scale_factor.unwrap_or(1.0);
-            prepare_chbench_source(scale_factor).await?;
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let terminals = (scale_factor * 10.0) as usize;
+            prepare_chbench_source(scale_factor, terminals).await?;
         }
 
         let instance = SpicedInstance::start(start_request).await?;
@@ -347,8 +349,10 @@ fn chbench_source_from_env() -> anyhow::Result<chbench_driver::PostgresSourceCon
 /// Postgres, create the schema and load seed data.
 ///
 /// `scale_factor` maps to TPC-C warehouses (must be a positive integer >= 1).
+/// `terminals` specifies the target number of terminals.
 pub(crate) async fn prepare_chbench_source(
     scale_factor: f64,
+    terminals: usize,
 ) -> anyhow::Result<chbench_driver::PostgresChBenchDriver> {
     if scale_factor < 1.0 || scale_factor.fract() != 0.0 {
         anyhow::bail!(
@@ -360,7 +364,6 @@ pub(crate) async fn prepare_chbench_source(
     // Scale factor is validated >= 1.0 and integer above, so the cast is safe.
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let warehouses = scale_factor as usize;
-    let terminals = warehouses * 10;
     let config = chbench_driver::ChBenchConfig {
         warehouses,
         terminals,

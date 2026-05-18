@@ -10,11 +10,12 @@ runs:
         docker run -d --name chbench-pg \
           -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=chbench \
           -p 5432:5432 postgres:16 \
-          -c max_connections=150 \
+          -c max_connections=200 \
           -c wal_level=logical \
           -c synchronous_commit=off \
           -c max_replication_slots=20 \
-          -c max_wal_senders=20
+          -c max_wal_senders=20 \
+          -c shared_buffers=128MB
 
     - name: Wait for CH-benCH PostgreSQL
       shell: bash
