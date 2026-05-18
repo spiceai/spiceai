@@ -69,6 +69,7 @@ event_stream = { path = "../event_stream" }
 flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
 futures.workspace = true
+geodatafusion = { workspace = true, optional = true }
 globset.workspace = true
 governor.workspace = true
 graphql-parser.workspace = true
@@ -312,6 +313,7 @@ dynamodb = [
 extended_tests = []
 flightsql = ["data_components/flightsql"]
 ftp = ["runtime-object-store/ftp"]
+geo = ["dep:geodatafusion"]
 http-functions = ["runtime-datafusion-udfs/http-functions"]
 rate-control = []
 wasm-functions = ["runtime-datafusion-udfs/wasm-functions"]
