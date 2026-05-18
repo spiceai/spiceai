@@ -109,8 +109,9 @@ pub enum SchemaEvolution {
     /// Connectors must opt in to support this mode.
     Detect,
     /// The runtime automatically evolves the dataset (and any acceleration) to match detected
-    /// schema changes. Planned for Spice v2.1 — connectors that have not implemented this yet
-    /// return a `NotImplemented` error at startup.
+    /// schema changes. Planned for Spice v2.1 — until a connector declares support, requesting
+    /// `evolve` is rejected at registration with a `SchemaEvolutionNotSupported` configuration
+    /// error.
     Evolve,
 }
 
@@ -209,7 +210,7 @@ pub struct Dataset {
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
 
     /// How the runtime reacts to source schema changes after the dataset is registered.
-    /// See `SchemaEvolution` for the available modes. Defaults to `disabled`.
+    /// See `SchemaEvolution` for the available modes. Defaults to `block`.
     #[serde(default, skip_serializing_if = "is_default")]
     pub schema_evolution: SchemaEvolution,
 

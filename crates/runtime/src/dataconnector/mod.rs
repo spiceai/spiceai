@@ -608,7 +608,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         refresh_mode.unwrap_or(RefreshMode::Full)
     }
 
-    /// The set of `schema_evolution` modes this connector supports for the given dataset.
+    /// The set of `schema_evolution` modes this connector supports.
     ///
     /// The default is `&[SchemaEvolution::Block, SchemaEvolution::Detect]` — every connector
     /// supports both the conservative `block` (no schema re-evaluation) and `detect` (surface

@@ -75,7 +75,7 @@ pub struct Debezium {
     kafka_config: KafkaConfig,
     batching: (usize, Duration),
     /// Legacy fallback for the deprecated `schema_evolution: true|false` connector param.
-    /// Only consulted when `dataset.schema_evolution` is at its default (`Disabled`).
+    /// Only consulted when `dataset.schema_evolution` is at its default (`Block`).
     /// Remove when the deprecated param is removed.
     legacy_schema_evolution: Option<SchemaEvolution>,
 }

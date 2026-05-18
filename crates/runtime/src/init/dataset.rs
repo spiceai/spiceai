@@ -584,8 +584,10 @@ impl Runtime {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         // Validate the dataset's schema_evolution setting against the connector's declared support.
-        // Every connector explicitly opts into modes via `supported_schema_evolution_modes`; the
-        // default is `[Block]`, so non-default values must be opt-in per connector.
+        // The trait default supports `[Block, Detect]` (every connector can passively surface
+        // mismatches at refresh time); connectors opt out of `Detect` or opt in to `Evolve` by
+        // overriding `supported_schema_evolution_modes`. Unsupported modes are rejected here
+        // rather than being silently ignored.
         let supported = data_connector.supported_schema_evolution_modes();
         if !supported.contains(&ds.schema_evolution) {
             let err = SchemaEvolutionNotSupportedSnafu {
