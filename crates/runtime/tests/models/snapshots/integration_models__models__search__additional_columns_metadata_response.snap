@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp)
+expression: normalize_search_response(resp, round_scores)
 snapshot_kind: text
 ---
 {
@@ -20,7 +20,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 863
       },
-      "_score": "[score]"
+      "_score": "0.94"
     },
     {
       "data": {
@@ -36,7 +36,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 1316
       },
-      "_score": "[score]"
+      "_score": "0.92"
     },
     {
       "data": {
@@ -52,7 +52,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 590
       },
-      "_score": "[score]"
+      "_score": "0.91"
     },
     {
       "data": {
@@ -68,7 +68,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 6
       },
-      "_score": "[score]"
+      "_score": "0.91"
     }
   ]
 }

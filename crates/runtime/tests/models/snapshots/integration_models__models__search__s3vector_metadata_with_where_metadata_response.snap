@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp)
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "[score]",
+      "_score": "0.29",
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -18,7 +18,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "[score]",
+      "_score": "0.25",
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -30,7 +30,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "[score]",
+      "_score": "0.23",
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -42,7 +42,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "[score]",
+      "_score": "0.20",
       "dataset": "qs",
       "matches": {
         "answer": [
