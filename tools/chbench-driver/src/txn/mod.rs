@@ -27,6 +27,7 @@ pub mod delivery;
 pub mod new_order;
 pub mod order_status;
 pub mod payment;
+pub mod prepared;
 pub mod stock_level;
 
 use std::fmt;
@@ -35,6 +36,7 @@ use ::rand::{Rng, RngExt};
 use tokio_postgres::Client;
 
 use crate::Result;
+pub use prepared::PreparedStatements;
 
 /// The five TPC-C transaction types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -95,10 +97,11 @@ pub async fn execute(
     rng: &mut impl Rng,
     txn_type: TxnType,
     warehouses: i32,
+    stmts: &PreparedStatements,
 ) -> Result<()> {
     match txn_type {
-        TxnType::NewOrder => new_order::run(client, rng, warehouses).await,
-        TxnType::Payment => payment::run(client, rng, warehouses).await,
+        TxnType::NewOrder => new_order::run(client, rng, warehouses, &stmts.new_order).await,
+        TxnType::Payment => payment::run(client, rng, warehouses, &stmts.payment).await,
         TxnType::Delivery => delivery::run(client, rng, warehouses).await,
         TxnType::OrderStatus => order_status::run(client, rng, warehouses).await,
         TxnType::StockLevel => stock_level::run(client, rng, warehouses).await,

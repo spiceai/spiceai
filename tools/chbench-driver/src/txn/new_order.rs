@@ -26,11 +26,12 @@ use tokio_postgres::Client;
 
 use crate::Result;
 use crate::rand as tpcc_rand;
+use super::prepared::NewOrderStmts;
 
 /// # Errors
 ///
 /// Returns an error if any database operation fails.
-pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Result<()> {
+pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32, stmts: &NewOrderStmts) -> Result<()> {
     let w_id = rng.random_range(1..=warehouses);
     let d_id = rng.random_range(1..=10);
     let c_id = tpcc_rand::rand_customer_id(rng);
@@ -75,10 +76,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
 
     // 1. SELECT customer + warehouse info
     let customer_row = tx
-        .query_one(
-            "SELECT c_discount, c_last, c_credit, w_tax FROM customer, warehouse WHERE w_id = $1 AND c_w_id = w_id AND c_d_id = $2 AND c_id = $3",
-            &[&w_id, &d_id, &c_id],
-        )
+        .query_one(&stmts.select_customer_warehouse, &[&w_id, &d_id, &c_id])
         .await
         .map_err(|source| crate::Error::Sql {
             action: "new_order: select customer".into(),
@@ -90,10 +88,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
 
     // 2. SELECT district FOR UPDATE
     let district_row = tx
-        .query_one(
-            "SELECT d_next_o_id, d_tax FROM district WHERE d_id = $1 AND d_w_id = $2 FOR UPDATE",
-            &[&d_id, &w_id],
-        )
+        .query_one(&stmts.select_district, &[&d_id, &w_id])
         .await
         .map_err(|source| crate::Error::Sql {
             action: "new_order: select district".into(),
@@ -104,40 +99,31 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
     let d_tax: f64 = district_row.get(1);
 
     // 3. UPDATE district d_next_o_id
-    tx.execute(
-        "UPDATE district SET d_next_o_id = $1 + 1 WHERE d_id = $2 AND d_w_id = $3",
-        &[&d_next_o_id, &d_id, &w_id],
-    )
-    .await
-    .map_err(|source| crate::Error::Sql {
-        action: "new_order: update district".into(),
-        source,
-    })?;
+    tx.execute(&stmts.update_district, &[&d_next_o_id, &d_id, &w_id])
+        .await
+        .map_err(|source| crate::Error::Sql {
+            action: "new_order: update district".into(),
+            source,
+        })?;
 
     let o_id = d_next_o_id;
     let now = SystemTime::now();
 
     // 4. INSERT orders
-    tx.execute(
-        "INSERT INTO orders (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_ol_cnt, o_all_local) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        &[&o_id, &d_id, &w_id, &c_id, &now, &ol_cnt, &all_local],
-    )
-    .await
-    .map_err(|source| crate::Error::Sql {
-        action: "new_order: insert orders".into(),
-        source,
-    })?;
+    tx.execute(&stmts.insert_orders, &[&o_id, &d_id, &w_id, &c_id, &now, &ol_cnt, &all_local])
+        .await
+        .map_err(|source| crate::Error::Sql {
+            action: "new_order: insert orders".into(),
+            source,
+        })?;
 
     // 5. INSERT new_order
-    tx.execute(
-        "INSERT INTO new_order (no_o_id, no_d_id, no_w_id) VALUES ($1, $2, $3)",
-        &[&o_id, &d_id, &w_id],
-    )
-    .await
-    .map_err(|source| crate::Error::Sql {
-        action: "new_order: insert new_order".into(),
-        source,
-    })?;
+    tx.execute(&stmts.insert_new_order, &[&o_id, &d_id, &w_id])
+        .await
+        .map_err(|source| crate::Error::Sql {
+            action: "new_order: insert new_order".into(),
+            source,
+        })?;
 
     // 6-9. Process each order line: select item, select/update stock, insert order_line
     for (ol_number_0, &(ol_i_id, ol_supply_w_id, ol_quantity, remote)) in items.iter().enumerate() {
@@ -154,10 +140,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
 
         // Select item
         let item_row = tx
-            .query_one(
-                "SELECT i_price, i_name, i_data FROM item WHERE i_id = $1",
-                &[&ol_i_id],
-            )
+            .query_one(&stmts.select_item, &[&ol_i_id])
             .await
             .map_err(|source| crate::Error::Sql {
                 action: "new_order: select item".into(),
@@ -166,13 +149,10 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
 
         let i_price: f64 = item_row.get(0);
 
-        // Select stock FOR UPDATE
-        let dist_col = format!("s_dist_{d_id:02}");
-        let stock_sql = format!(
-            "SELECT s_quantity, s_data, {dist_col} FROM stock WHERE s_i_id = $1 AND s_w_id = $2 FOR UPDATE"
-        );
+        // Select stock FOR UPDATE (pre-prepared per district)
+        let stock_stmt = &stmts.select_stock[usize::try_from(d_id - 1).unwrap_or(0)];
         let stock_row = tx
-            .query_one(&stock_sql, &[&ol_i_id, &ol_supply_w_id])
+            .query_one(stock_stmt, &[&ol_i_id, &ol_supply_w_id])
             .await
             .map_err(|source| crate::Error::Sql {
                 action: "new_order: select stock".into(),
@@ -188,30 +168,24 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
         }
 
         // Update stock
-        tx.execute(
-            "UPDATE stock SET s_quantity = $1, s_ytd = s_ytd + $2, s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + $3 WHERE s_i_id = $4 AND s_w_id = $5",
-            &[&s_quantity, &ol_quantity, &remote, &ol_i_id, &ol_supply_w_id],
-        )
-        .await
-        .map_err(|source| crate::Error::Sql {
-            action: "new_order: update stock".into(),
-            source,
-        })?;
+        tx.execute(&stmts.update_stock, &[&s_quantity, &ol_quantity, &remote, &ol_i_id, &ol_supply_w_id])
+            .await
+            .map_err(|source| crate::Error::Sql {
+                action: "new_order: update stock".into(),
+                source,
+            })?;
 
         // Calculate amount
         let ol_amount =
             f64::from(ol_quantity) * i_price * (1.0 + w_tax + d_tax) * (1.0 - c_discount);
 
         // Insert order_line
-        tx.execute(
-            "INSERT INTO order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_dist_info) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-            &[&o_id, &d_id, &w_id, &ol_number, &ol_i_id, &ol_supply_w_id, &ol_quantity, &ol_amount, &ol_dist_info],
-        )
-        .await
-        .map_err(|source| crate::Error::Sql {
-            action: "new_order: insert order_line".into(),
-            source,
-        })?;
+        tx.execute(&stmts.insert_order_line, &[&o_id, &d_id, &w_id, &ol_number, &ol_i_id, &ol_supply_w_id, &ol_quantity, &ol_amount, &ol_dist_info])
+            .await
+            .map_err(|source| crate::Error::Sql {
+                action: "new_order: insert order_line".into(),
+                source,
+            })?;
     }
 
     tx.commit().await.map_err(|source| crate::Error::Sql {

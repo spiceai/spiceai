@@ -378,6 +378,6 @@ pub(crate) async fn prepare_chbench_source(
     let driver = chbench_driver::PostgresChBenchDriver::connect(config, source).await?;
     driver.prepare().await?;
 
-    println!("chbench source is ready");
+    println!("CH-benCHmark source is ready");
     Ok(driver)
 }

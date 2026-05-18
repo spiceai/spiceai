@@ -120,7 +120,7 @@ impl ChBenchDriver for PostgresChBenchDriver {
     /// Drop and recreate all 12 CH-benCH tables, then load seed data.
     async fn prepare(&self) -> Result<()> {
         println!(
-            "Preparing schema with {} warehouse(s)",
+            "Preparing CH-benCHmark schema with {} warehouse(s)",
             self.config.warehouses,
         );
 
@@ -135,7 +135,6 @@ impl ChBenchDriver for PostgresChBenchDriver {
         )
         .await?;
 
-        println!("CH-benCH prepare complete");
         Ok(())
     }
 
@@ -245,6 +244,8 @@ async fn run_terminal(
         }
     });
 
+    let stmts = txn::PreparedStatements::prepare(&client).await?;
+
     let mut rng = StdRng::seed_from_u64(base_seed.wrapping_add(terminal_id as u64));
     let mut metrics = metrics::OltpMetrics::new();
 
@@ -255,7 +256,7 @@ async fn run_terminal(
 
         let txn_type = txn::pick_txn_type(&mut rng, &mix);
 
-        match txn::execute(&mut client, &mut rng, txn_type, warehouses).await {
+        match txn::execute(&mut client, &mut rng, txn_type, warehouses, &stmts).await {
             Ok(()) => {
                 metrics.record_success(txn_type);
             }

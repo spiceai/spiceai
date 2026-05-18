@@ -26,11 +26,12 @@ use tokio_postgres::Client;
 
 use crate::Result;
 use crate::rand as tpcc_rand;
+use super::prepared::PaymentStmts;
 
 /// # Errors
 ///
 /// Returns an error if any database operation fails.
-pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Result<()> {
+pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32, stmts: &PaymentStmts) -> Result<()> {
     let w_id = rng.random_range(1..=warehouses);
     let d_id = rng.random_range(1..=10);
     let h_amount: f64 = f64::from(rng.random_range(100..=500_000)) / 100.0;
@@ -69,22 +70,16 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
         })?;
 
     // 1. UPDATE warehouse
-    tx.execute(
-        "UPDATE warehouse SET w_ytd = w_ytd + $1 WHERE w_id = $2",
-        &[&h_amount, &w_id],
-    )
-    .await
-    .map_err(|source| crate::Error::Sql {
-        action: "payment: update warehouse".into(),
-        source,
-    })?;
+    tx.execute(&stmts.update_warehouse, &[&h_amount, &w_id])
+        .await
+        .map_err(|source| crate::Error::Sql {
+            action: "payment: update warehouse".into(),
+            source,
+        })?;
 
     // 2. SELECT warehouse
     let w_row = tx
-        .query_one(
-            "SELECT w_street_1, w_street_2, w_city, w_state, w_zip, w_name FROM warehouse WHERE w_id = $1",
-            &[&w_id],
-        )
+        .query_one(&stmts.select_warehouse, &[&w_id])
         .await
         .map_err(|source| crate::Error::Sql {
             action: "payment: select warehouse".into(),
@@ -94,22 +89,16 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
     let w_name: String = w_row.get(5);
 
     // 3. UPDATE district
-    tx.execute(
-        "UPDATE district SET d_ytd = d_ytd + $1 WHERE d_w_id = $2 AND d_id = $3",
-        &[&h_amount, &w_id, &d_id],
-    )
-    .await
-    .map_err(|source| crate::Error::Sql {
-        action: "payment: update district".into(),
-        source,
-    })?;
+    tx.execute(&stmts.update_district, &[&h_amount, &w_id, &d_id])
+        .await
+        .map_err(|source| crate::Error::Sql {
+            action: "payment: update district".into(),
+            source,
+        })?;
 
     // 4. SELECT district
     let d_row = tx
-        .query_one(
-            "SELECT d_street_1, d_street_2, d_city, d_state, d_zip, d_name FROM district WHERE d_w_id = $1 AND d_id = $2",
-            &[&w_id, &d_id],
-        )
+        .query_one(&stmts.select_district, &[&w_id, &d_id])
         .await
         .map_err(|source| crate::Error::Sql {
             action: "payment: select district".into(),
@@ -122,7 +111,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
     if by_name {
         let rows = tx
             .query(
-                "SELECT c_id FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_last = $3 ORDER BY c_first",
+                &stmts.select_customer_by_last,
                 &[&customer_wh, &customer_dist, &c_last.as_deref().unwrap_or("")],
             )
             .await
@@ -148,7 +137,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
     // 6. SELECT customer FOR UPDATE
     let c_row = tx
         .query_one(
-            "SELECT c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_credit, c_credit_lim, c_discount, c_balance, c_since FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3 FOR UPDATE",
+            &stmts.select_customer_for_update,
             &[&customer_wh, &customer_dist, &c_id],
         )
         .await
@@ -163,7 +152,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
     if c_credit.trim() == "BC" {
         let c_data_row = tx
             .query_one(
-                "SELECT c_data FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3",
+                &stmts.select_customer_data,
                 &[&customer_wh, &customer_dist, &c_id],
             )
             .await
@@ -188,7 +177,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
         }
 
         tx.execute(
-            "UPDATE customer SET c_balance = c_balance - $1, c_ytd_payment = c_ytd_payment + $2, c_payment_cnt = c_payment_cnt + 1, c_data = $3 WHERE c_w_id = $4 AND c_d_id = $5 AND c_id = $6",
+            &stmts.update_customer_with_data,
             &[&h_amount, &h_amount, &new_data, &customer_wh, &customer_dist, &c_id],
         )
         .await
@@ -198,7 +187,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
         })?;
     } else {
         tx.execute(
-            "UPDATE customer SET c_balance = c_balance - $1, c_ytd_payment = c_ytd_payment + $2, c_payment_cnt = c_payment_cnt + 1 WHERE c_w_id = $3 AND c_d_id = $4 AND c_id = $5",
+            &stmts.update_customer,
             &[&h_amount, &h_amount, &customer_wh, &customer_dist, &c_id],
         )
         .await
@@ -212,7 +201,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
     let history_data = format!("{w_name:>10}    {d_name:>10}");
     let history_ts = SystemTime::now();
     tx.execute(
-        "INSERT INTO history (h_c_d_id, h_c_w_id, h_c_id, h_d_id, h_w_id, h_date, h_amount, h_data) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        &stmts.insert_history,
         &[&customer_dist, &customer_wh, &c_id, &d_id, &w_id, &history_ts, &h_amount, &history_data],
     )
     .await
