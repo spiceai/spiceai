@@ -230,3 +230,7 @@ required-features = ["duckdb-bench"]
 [[bench]]
 harness = false
 name = "compaction_picker"
+
+[[bench]]
+harness = false
+name = "scan_listing_cache_invalidation"

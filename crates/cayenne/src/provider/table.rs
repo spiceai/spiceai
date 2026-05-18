@@ -94,7 +94,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task;
 use vortex::dtype::arrow::FromArrowType;
 use vortex_datafusion::VortexFormat;
@@ -110,9 +110,67 @@ use super::vortex_format::DeletionFilteringVortexFormat;
 use arc_swap::ArcSwap;
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
+const PROTECTED_SNAPSHOT_WARN_THRESHOLD: usize = 4;
 const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
 const PK_KEYSET_CACHE_MAX_ENTRIES: usize = 1_000_000;
 const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotMaintenanceTrigger {
+    ProtectedSnapshotCount {
+        protected_snapshot_count: usize,
+        trigger_count: usize,
+    },
+    ProtectedSnapshotAge {
+        protected_snapshot_count: usize,
+        oldest_snapshot_age: Duration,
+        trigger_age: Duration,
+    },
+}
+
+fn protected_snapshot_age(snapshot_id: &str, now: SystemTime) -> Option<Duration> {
+    let timestamp = uuid::Uuid::parse_str(snapshot_id).ok()?.get_timestamp()?;
+    let (seconds, nanos) = timestamp.to_unix();
+    let snapshot_time = UNIX_EPOCH.checked_add(Duration::new(seconds, nanos))?;
+    now.duration_since(snapshot_time).ok()
+}
+
+fn oldest_protected_snapshot_age(
+    protected_snapshots: &HashMap<String, i64>,
+    now: SystemTime,
+) -> Option<Duration> {
+    protected_snapshots
+        .keys()
+        .filter_map(|snapshot_id| protected_snapshot_age(snapshot_id, now))
+        .max()
+}
+
+fn protected_snapshot_maintenance_trigger(
+    protected_snapshots: &HashMap<String, i64>,
+    trigger_count: usize,
+    trigger_age: Option<Duration>,
+    now: SystemTime,
+) -> Option<SnapshotMaintenanceTrigger> {
+    let protected_snapshot_count = protected_snapshots.len();
+    if protected_snapshot_count >= trigger_count {
+        return Some(SnapshotMaintenanceTrigger::ProtectedSnapshotCount {
+            protected_snapshot_count,
+            trigger_count,
+        });
+    }
+
+    let trigger_age = trigger_age?;
+    let oldest_snapshot_age = oldest_protected_snapshot_age(protected_snapshots, now)?;
+    if oldest_snapshot_age >= trigger_age {
+        Some(SnapshotMaintenanceTrigger::ProtectedSnapshotAge {
+            protected_snapshot_count,
+            oldest_snapshot_age,
+            trigger_age,
+        })
+    } else {
+        None
+    }
+}
 
 #[derive(Default)]
 struct PostWriteMaintenanceState {
@@ -4823,7 +4881,10 @@ impl CayenneTableProvider {
 
     pub(crate) fn schedule_post_write_compaction(&self) {
         let cfg = self.context.compaction_picker_config();
-        if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files {
+        let maintenance_trigger = self.protected_snapshot_maintenance_trigger(&cfg);
+        if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files
+            && maintenance_trigger.is_none()
+        {
             return;
         }
 
@@ -4978,15 +5039,24 @@ impl CayenneTableProvider {
     async fn run_one_compaction_pass(&self) -> Result<bool> {
         use super::compaction::{FileEntry, pick_candidates};
 
-        // Cheap early-out using in-memory counter. During the common
+        // Cheap early-out using in-memory counters. During the common
         // "accumulation phase" of many small appends we have not yet created
-        // enough new files in the current snapshot to possibly cross the
-        // trigger threshold. This avoids the expensive full snapshot listing
-        // (S3 LIST or local readdir of potentially thousands of files) on
-        // every post-write trigger.
+        // enough new files or protected snapshots to possibly cross a
+        // compaction threshold. This avoids the expensive full snapshot
+        // listing (S3 LIST or local readdir of potentially thousands of files)
+        // on every post-write trigger.
         let cfg = self.context.compaction_picker_config();
-        if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files {
+        let maintenance_trigger = self.protected_snapshot_maintenance_trigger(&cfg);
+        if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files
+            && maintenance_trigger.is_none()
+        {
             return Ok(false);
+        }
+
+        if let Some(trigger) = maintenance_trigger {
+            self.log_snapshot_maintenance_trigger(trigger);
+            self.rewrite_current_snapshot_for_compaction().await?;
+            return Ok(true);
         }
 
         let snapshot_id = self.get_current_snapshot_id();
@@ -5077,6 +5147,46 @@ impl CayenneTableProvider {
         }
 
         Ok(files)
+    }
+
+    fn protected_snapshot_maintenance_trigger(
+        &self,
+        cfg: &super::compaction::CompactionPickerConfig,
+    ) -> Option<SnapshotMaintenanceTrigger> {
+        let protected_snapshots = self.protected_snapshots.read();
+        protected_snapshot_maintenance_trigger(
+            &protected_snapshots,
+            cfg.trigger_files,
+            self.context.compaction_trigger_snapshot_age(),
+            SystemTime::now(),
+        )
+    }
+
+    fn log_snapshot_maintenance_trigger(&self, trigger: SnapshotMaintenanceTrigger) {
+        match trigger {
+            SnapshotMaintenanceTrigger::ProtectedSnapshotCount {
+                protected_snapshot_count,
+                trigger_count,
+            } => tracing::info!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                protected_snapshot_count,
+                trigger_count,
+                "Running protected snapshot maintenance compaction because the count trigger fired"
+            ),
+            SnapshotMaintenanceTrigger::ProtectedSnapshotAge {
+                protected_snapshot_count,
+                oldest_snapshot_age,
+                trigger_age,
+            } => tracing::info!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                protected_snapshot_count,
+                oldest_snapshot_age_ms = oldest_snapshot_age.as_millis(),
+                trigger_age_ms = trigger_age.as_millis(),
+                "Running protected snapshot maintenance compaction because the age trigger fired"
+            ),
+        }
     }
 
     async fn list_snapshot_files_with_sizes_local(
@@ -7042,7 +7152,7 @@ impl CayenneTableProvider {
             protected_snapshot_count = protected_snapshots.len(),
             "Cayenne scan includes protected snapshots"
         );
-        if protected_snapshots.len() >= 4 {
+        if protected_snapshots.len() >= PROTECTED_SNAPSHOT_WARN_THRESHOLD {
             tracing::warn!(
                 table = %self.table_metadata.table_name,
                 protected_snapshot_count = protected_snapshots.len(),
@@ -8205,6 +8315,69 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
     use test_framework::arrow_record_batch_gen::*;
+
+    fn protected_snapshot_id_at_unix_time(seconds: u64) -> String {
+        uuid::Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, seconds, 0)).to_string()
+    }
+
+    #[test]
+    fn protected_snapshot_maintenance_trigger_uses_compaction_count_threshold() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let protected_snapshots =
+            HashMap::from([("snapshot-1".to_string(), 1), ("snapshot-2".to_string(), 2)]);
+
+        assert_eq!(
+            protected_snapshot_maintenance_trigger(
+                &protected_snapshots,
+                2,
+                Some(Duration::from_secs(300)),
+                now,
+            ),
+            Some(SnapshotMaintenanceTrigger::ProtectedSnapshotCount {
+                protected_snapshot_count: 2,
+                trigger_count: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn protected_snapshot_maintenance_trigger_uses_oldest_snapshot_age() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let protected_snapshots = HashMap::from([
+            (protected_snapshot_id_at_unix_time(900), 1),
+            (protected_snapshot_id_at_unix_time(990), 2),
+        ]);
+
+        assert_eq!(
+            protected_snapshot_maintenance_trigger(
+                &protected_snapshots,
+                8,
+                Some(Duration::from_secs(60)),
+                now,
+            ),
+            Some(SnapshotMaintenanceTrigger::ProtectedSnapshotAge {
+                protected_snapshot_count: 2,
+                oldest_snapshot_age: Duration::from_secs(100),
+                trigger_age: Duration::from_secs(60),
+            })
+        );
+    }
+
+    #[test]
+    fn protected_snapshot_maintenance_trigger_ignores_invalid_uuid_age() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let protected_snapshots = HashMap::from([("not-a-uuid".to_string(), 1)]);
+
+        assert_eq!(
+            protected_snapshot_maintenance_trigger(
+                &protected_snapshots,
+                8,
+                Some(Duration::from_secs(60)),
+                now,
+            ),
+            None
+        );
+    }
 
     #[test]
     fn pk_deletion_snapshot_is_stable_after_cache_publish() {
