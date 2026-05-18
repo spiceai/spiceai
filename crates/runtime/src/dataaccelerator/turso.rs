@@ -314,20 +314,28 @@ impl TursoAccelerator {
         }
     }
 
+    fn turso_pool_key_and_path(&self, source: &dyn AccelerationSource) -> Result<(String, String)> {
+        let db_path = self.turso_file_path(source)?;
+        if !source.is_file_accelerated() {
+            return Ok((format!("memory:{}", source.name()), db_path));
+        }
+        Ok((db_path.clone(), db_path))
+    }
+
     /// Returns the shared connection pool for a `Turso` database
     pub async fn get_shared_pool(
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<Arc<TursoConnectionPool>> {
-        let turso_file = self.turso_file_path(source)?;
+        let (pool_key, db_path) = self.turso_pool_key_and_path(source)?;
         let timestamp_format = Self::parse_timestamp_format(source)?;
 
         let mut pools = self.pools.lock().await;
-        if let Some(pool) = pools.get(&turso_file) {
+        if let Some(pool) = pools.get(&pool_key) {
             Ok(Arc::clone(pool))
         } else {
             let pool = Arc::new(
-                TursoConnectionPool::new_with_timestamp_format(&turso_file, timestamp_format)
+                TursoConnectionPool::new_with_timestamp_format(&db_path, timestamp_format)
                     .await
                     .map_err(|e| match e {
                         data_components::turso::Error::TursoDatabaseError { source } => {
@@ -338,7 +346,7 @@ impl TursoAccelerator {
                         },
                     })?,
             );
-            pools.insert(turso_file, Arc::clone(&pool));
+            pools.insert(pool_key, Arc::clone(&pool));
             Ok(pool)
         }
     }
@@ -522,22 +530,22 @@ impl DataAccelerator for TursoAccelerator {
         //   - ":memory:" for memory mode (!is_file_accelerated())
         //   - A file path for file mode (is_file_accelerated())
         // When called without a source (standalone external table), use provided file or memory mode
-        let db_path = if let Some(source) = source {
-            self.turso_file_path(source)?
+        let (pool_key, db_path) = if let Some(source) = source {
+            self.turso_pool_key_and_path(source)?
         } else if let Some(file) = cmd.options.get("file") {
-            file.clone()
+            (file.clone(), file.clone())
         } else {
-            ":memory:".to_string()
+            (":memory:".to_string(), ":memory:".to_string())
         };
 
         // Get or create connection pool
         let pool = {
             let mut pools = self.pools.lock().await;
-            if let Some(pool) = pools.get(&db_path) {
+            if let Some(pool) = pools.get(&pool_key) {
                 Arc::clone(pool)
             } else {
                 let new_pool = Arc::new(TursoConnectionPool::new(&db_path).await?);
-                pools.insert(db_path.clone(), Arc::clone(&new_pool));
+                pools.insert(pool_key, Arc::clone(&new_pool));
                 new_pool
             }
         };
@@ -828,6 +836,53 @@ mod tests {
 
         // cleanup
         cleanup_turso_test_files(&path);
+    }
+
+    #[tokio::test]
+    async fn test_turso_memory_mode_uses_dataset_scoped_pools() {
+        let app = Arc::new(app::AppBuilder::new("test").build());
+        let rt = Arc::new(Runtime::builder().build().await);
+
+        let mut customer = DatasetBuilder::try_new("customer".to_string(), "customer")
+            .expect("Failed to create customer builder")
+            .with_app(Arc::clone(&app))
+            .with_runtime(Arc::clone(&rt))
+            .build()
+            .expect("Failed to build customer dataset");
+        customer.acceleration = Some(Acceleration {
+            engine: Engine::Turso,
+            mode: Mode::Memory,
+            ..Default::default()
+        });
+
+        let mut lineitem = DatasetBuilder::try_new("lineitem".to_string(), "lineitem")
+            .expect("Failed to create lineitem builder")
+            .with_app(app)
+            .with_runtime(rt)
+            .build()
+            .expect("Failed to build lineitem dataset");
+        lineitem.acceleration = Some(Acceleration {
+            engine: Engine::Turso,
+            mode: Mode::Memory,
+            ..Default::default()
+        });
+
+        let accelerator = TursoAccelerator::new();
+        let customer_pool = accelerator
+            .get_shared_pool(&customer)
+            .await
+            .expect("customer pool should be created");
+        let customer_pool_again = accelerator
+            .get_shared_pool(&customer)
+            .await
+            .expect("customer pool should be reused");
+        let lineitem_pool = accelerator
+            .get_shared_pool(&lineitem)
+            .await
+            .expect("lineitem pool should be created");
+
+        assert!(Arc::ptr_eq(&customer_pool, &customer_pool_again));
+        assert!(!Arc::ptr_eq(&customer_pool, &lineitem_pool));
     }
 
     #[tokio::test]
