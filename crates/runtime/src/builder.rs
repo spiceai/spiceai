@@ -242,6 +242,11 @@ impl RuntimeBuilder {
             &spicepod_rt.params,
             "cayenne_sort_merge_memory_pool_fraction",
         );
+        let cayenne_filter_propagation_enabled = parse_bool_runtime_param(
+            &spicepod_rt.params,
+            "cayenne_propagate_filter_across_equi_join_keys",
+            false,
+        );
 
         let caching = Runtime::init_caching(Some(&spicepod_rt.caching));
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
@@ -389,7 +394,8 @@ impl RuntimeBuilder {
         .with_resource_monitor(resource_monitor.clone())
         .with_url_tables(url_tables_enabled)
         .cayenne_sort_merge_min_rows(cayenne_sort_merge_min_rows)
-        .cayenne_sort_merge_memory_pool_fraction(cayenne_sort_merge_memory_pool_fraction);
+        .cayenne_sort_merge_memory_pool_fraction(cayenne_sort_merge_memory_pool_fraction)
+        .cayenne_filter_propagation_enabled(cayenne_filter_propagation_enabled);
 
         if let Some(DistributedNode::Scheduler {
             executor_registry,
@@ -672,6 +678,23 @@ fn parse_f64_runtime_param(params: &HashMap<String, String>, key: &str) -> Optio
     }
 }
 
+fn parse_bool_runtime_param(params: &HashMap<String, String>, key: &str, default: bool) -> bool {
+    let Some(raw) = params.get(key) else {
+        return default;
+    };
+
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "enabled" | "enable" | "yes" | "on" => true,
+        "0" | "false" | "disabled" | "disable" | "no" | "off" => false,
+        _ => {
+            tracing::warn!(
+                "runtime.params.{key}={raw:?} is not a valid boolean; using default {default}"
+            );
+            default
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -759,5 +782,30 @@ mod test {
         assert_eq!(parse_f64_runtime_param(&params, "nan"), None);
         assert_eq!(parse_f64_runtime_param(&params, "bad"), None);
         assert_eq!(parse_f64_runtime_param(&params, "missing"), None);
+    }
+
+    #[test]
+    fn test_parse_bool_runtime_param() {
+        let params = HashMap::from([
+            (
+                "cayenne_propagate_filter_across_equi_join_keys".to_string(),
+                "enabled".to_string(),
+            ),
+            ("disabled".to_string(), "false".to_string()),
+            ("one".to_string(), "1".to_string()),
+            ("zero".to_string(), "0".to_string()),
+            ("bad".to_string(), "maybe".to_string()),
+        ]);
+
+        assert!(parse_bool_runtime_param(
+            &params,
+            "cayenne_propagate_filter_across_equi_join_keys",
+            false
+        ));
+        assert!(!parse_bool_runtime_param(&params, "disabled", true));
+        assert!(parse_bool_runtime_param(&params, "one", false));
+        assert!(!parse_bool_runtime_param(&params, "zero", true));
+        assert!(parse_bool_runtime_param(&params, "missing", true));
+        assert!(!parse_bool_runtime_param(&params, "bad", false));
     }
 }

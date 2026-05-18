@@ -159,6 +159,7 @@ pub struct DataFusionBuilder {
     url_tables_enabled: bool,
     cayenne_sort_merge_min_rows: Option<usize>,
     cayenne_sort_merge_memory_pool_fraction: Option<f64>,
+    cayenne_filter_propagation_enabled: bool,
     /// Arbitrary additional analyzer rules.
     additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
     executor_registry: Option<Arc<ExecutorRegistry>>,
@@ -209,6 +210,7 @@ impl DataFusionBuilder {
             url_tables_enabled: false,
             cayenne_sort_merge_min_rows: None,
             cayenne_sort_merge_memory_pool_fraction: None,
+            cayenne_filter_propagation_enabled: false,
             additional_analyzer_rules: vec![],
             executor_registry: None,
             partition_service: None,
@@ -313,6 +315,12 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn cayenne_sort_merge_memory_pool_fraction(mut self, fraction: Option<f64>) -> Self {
         self.cayenne_sort_merge_memory_pool_fraction = fraction;
+        self
+    }
+
+    #[must_use]
+    pub fn cayenne_filter_propagation_enabled(mut self, enabled: bool) -> Self {
+        self.cayenne_filter_propagation_enabled = enabled;
         self
     }
 
@@ -424,7 +432,9 @@ impl DataFusionBuilder {
             // and accumulator budget are only configured for supported targets.
             // Windows keeps DataFusion's standard hash-join dynamic filters.
             clamp_maximum_shared_inlist_memory_bytes(exact_join_filter_memory_limit);
-            state = with_cayenne_logical_optimizer(state);
+            if self.cayenne_filter_propagation_enabled {
+                state = with_cayenne_logical_optimizer(state);
+            }
             state = state
                 .with_physical_optimizer_rule(Arc::new(CayenneDynamicFilterSharing::new()))
                 .with_physical_optimizer_rule(Arc::new(CayenneAntiJoinSortMergeRewriter::new()));
@@ -1107,7 +1117,7 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
-    fn test_built_datafusion_registers_cayenne_logical_rule_before_subquery_decorrelation() {
+    fn test_built_datafusion_does_not_register_cayenne_logical_rule_by_default() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1119,6 +1129,34 @@ mod tests {
             Arc::new(AcceleratorEngineRegistry::default()),
             handle,
         )
+        .build();
+
+        let state = df.ctx.state();
+        let rule_names: Vec<&str> = state.optimizers().iter().map(|r| r.name()).collect();
+
+        assert!(
+            !rule_names
+                .iter()
+                .any(|name| *name == "cayenne_propagate_filter_across_equi_join_keys"),
+            "Cayenne logical filter propagation should be disabled by default"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_registers_cayenne_logical_rule_when_enabled() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .cayenne_filter_propagation_enabled(true)
         .build();
 
         let state = df.ctx.state();
@@ -1168,6 +1206,7 @@ mod tests {
             Arc::new(AcceleratorEngineRegistry::default()),
             handle,
         )
+        .cayenne_filter_propagation_enabled(true)
         .build();
 
         rt.block_on(async {
@@ -1248,6 +1287,7 @@ mod tests {
             Arc::new(AcceleratorEngineRegistry::default()),
             handle,
         )
+        .cayenne_filter_propagation_enabled(true)
         .build();
 
         rt.block_on(async {

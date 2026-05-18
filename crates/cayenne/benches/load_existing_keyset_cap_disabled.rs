@@ -183,8 +183,7 @@ fn build_warm_keyset(total_rows: usize) -> HashMap<Box<[u8]>, RowLocation> {
 /// disabled (table size > `PK_KEYSET_CACHE_MAX_ENTRIES`).
 fn run_full_rebuild(rows_per_snapshot: usize, snapshot_count: usize) -> usize {
     let total_snapshots = snapshot_count + 1;
-    let mut keyset: HashMap<Box<[u8]>, RowLocation> =
-        HashMap::with_capacity(rows_per_snapshot);
+    let mut keyset: HashMap<Box<[u8]>, RowLocation> = HashMap::with_capacity(rows_per_snapshot);
     for snapshot_idx in 0..total_snapshots {
         let row_id_base = snapshot_idx * rows_per_snapshot;
         for row_offset in 0..rows_per_snapshot {

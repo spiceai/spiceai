@@ -295,8 +295,10 @@ impl CayenneCdcWrite {
     /// Returns an error if the staged append cannot be published.
     pub async fn finish(self) -> Result<u64> {
         if let Some(prepared_append) = self.prepared_append {
+            let publish_start = Instant::now();
             prepared_append.apply_under_barrier().await?;
             let rows = prepared_append.finish().await?;
+            record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
             self.table.record_file_pk_keys(&self.validated_file_keys);
             self.table
                 .schedule_post_write_maintenance(self.stats, false);
@@ -1580,6 +1582,14 @@ impl OnConflictValidationStream {
             incoming_keys: &self.incoming_keys,
         };
 
+        let validation_start = Instant::now();
+        let validation_result = self.table.apply_on_conflict_to_batch(batch, &mut ctx);
+        record_cayenne_write_phase(
+            self.table.table_name(),
+            "apply_on_conflict_validation",
+            validation_start,
+        );
+
         let BatchValidationResult {
             filtered_batch,
             delete_specs: batch_delete_specs,
@@ -1588,10 +1598,7 @@ impl OnConflictValidationStream {
             deleted_row_keys,
             deleted_inlined_pk_i64,
             deleted_inlined_row_keys,
-        } = self
-            .table
-            .apply_on_conflict_to_batch(batch, &mut ctx)
-            .map_err(datafusion_common::DataFusionError::from)?;
+        } = validation_result.map_err(datafusion_common::DataFusionError::from)?;
 
         for (data_file_id, rows) in batch_delete_specs {
             self.delete_specs
@@ -1646,6 +1653,16 @@ impl OnConflictValidationStream {
         self.store_existing_keyset();
         self.finalized = true;
     }
+}
+
+pub(crate) fn record_cayenne_write_phase(table_name: &str, phase: &'static str, start: Instant) {
+    telemetry::track_cayenne_write_phase_duration(
+        start.elapsed(),
+        &[
+            telemetry::KeyValue::new("table", table_name.to_string()),
+            telemetry::KeyValue::new("phase", phase),
+        ],
+    );
 }
 
 impl Unpin for OnConflictValidationStream {}
@@ -4014,12 +4031,17 @@ impl CayenneTableProvider {
                 None
             };
 
+        let deduplicate_batch = !ctx.upsert_options.is_default();
         let mut keep_mask = Vec::with_capacity(batch.num_rows());
-        let mut kept_keys: HashSet<OwnedRow> = HashSet::with_capacity(batch.num_rows());
-        let mut row_keys: Vec<OwnedRow> = if ctx.upsert_options.is_default() {
-            Vec::new()
+        let mut kept_keys: HashSet<OwnedRow> = if deduplicate_batch {
+            HashSet::new()
         } else {
+            HashSet::with_capacity(batch.num_rows())
+        };
+        let mut row_keys: Vec<OwnedRow> = if deduplicate_batch {
             Vec::with_capacity(batch.num_rows())
+        } else {
+            Vec::new()
         };
         let mut delete_specs: HashMap<i64, Vec<i64>> = HashMap::new();
         let mut deleted_pk_i64: Vec<i64> = Vec::new();
@@ -4086,44 +4108,46 @@ impl CayenneTableProvider {
                 true
             };
 
-            if keep_row {
-                kept_keys.insert(key.clone());
+            if deduplicate_batch {
+                row_keys.push(key);
+            } else if keep_row {
+                kept_keys.insert(key);
             }
             keep_mask.push(keep_row);
-            if !ctx.upsert_options.is_default() {
-                row_keys.push(key);
-            }
         }
 
-        if !ctx.upsert_options.is_default() {
-            let mut seen: HashMap<OwnedRow, usize> = HashMap::new();
-            for (row_idx, key) in row_keys.iter().enumerate() {
-                if !keep_mask[row_idx] {
-                    continue;
-                }
-
-                if let Some(existing_idx) = seen.get(key) {
-                    if ctx.upsert_options.last_write_wins {
-                        keep_mask[*existing_idx] = false;
-                        seen.insert(key.clone(), row_idx);
-                    } else if ctx.upsert_options.remove_duplicates {
-                        keep_mask[row_idx] = false;
-                    } else {
-                        return Err(Error::DataValidation {
-                            table: self.table_metadata.table_name.clone(),
-                            message: "Duplicate primary key found in batch".to_string(),
-                        });
+        if deduplicate_batch {
+            {
+                let mut seen: HashMap<&[u8], usize> = HashMap::new();
+                for (row_idx, key) in row_keys.iter().enumerate() {
+                    if !keep_mask[row_idx] {
+                        continue;
                     }
-                } else {
-                    seen.insert(key.clone(), row_idx);
+
+                    let key_bytes = key.as_ref();
+                    if let Some(existing_idx) = seen.get(key_bytes) {
+                        if ctx.upsert_options.last_write_wins {
+                            keep_mask[*existing_idx] = false;
+                            seen.insert(key_bytes, row_idx);
+                        } else if ctx.upsert_options.remove_duplicates {
+                            keep_mask[row_idx] = false;
+                        } else {
+                            return Err(Error::DataValidation {
+                                table: self.table_metadata.table_name.clone(),
+                                message: "Duplicate primary key found in batch".to_string(),
+                            });
+                        }
+                    } else {
+                        seen.insert(key_bytes, row_idx);
+                    }
                 }
             }
 
             kept_keys = row_keys
-                .iter()
+                .into_iter()
                 .zip(&keep_mask)
                 .filter(|(_, keep)| **keep)
-                .map(|(key, _)| key.clone())
+                .map(|(key, _)| key)
                 .collect();
         }
 
