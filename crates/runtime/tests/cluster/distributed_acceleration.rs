@@ -587,13 +587,13 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                 .with_dataset(make_memory_accelerated_dataset(
                     format!("file://{}", data_path.display()),
                     "test_data",
-                    4,
+                    3,
                     "id",
                 ))
                 .with_dataset(make_memory_accelerated_dataset(
                     format!("file://{}", cat_path.display()),
                     "categories",
-                    4,
+                    3,
                     "id",
                 ))
                 .with_runtime(SpicepodRuntime {
