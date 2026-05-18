@@ -57,7 +57,7 @@ use crate::{
     dataaccelerator::{
         AccelerationSource, DataAccelerator, FilePathError,
         duckdb::{
-            DuckDBAccelerator, create_duckdb_factory, create_table_provider, duckdb_file_path,
+            DuckDBAccelerator, create_factory, create_table_provider, duckdb_file_path,
         },
         partitioned_duckdb::{
             ExpectedAccelerationSourceSnafu, FailedToCreateConnectionPoolSnafu, FileModeOnlySnafu,
@@ -443,10 +443,6 @@ impl PartitionCreator for DuckDBPartitionCreator {
             Some(&self.cmd.constraints)
         }
     }
-}
-
-fn create_factory() -> DuckDBTableProviderFactory {
-    create_duckdb_factory()
 }
 
 async fn get_pool(

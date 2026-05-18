@@ -53,7 +53,7 @@ use tokio::{fs::create_dir_all, sync::Mutex};
 
 use super::{
     AccelerationSource, BootstrapStatus, DataAccelerator,
-    duckdb::{DuckDBAccelerator, create_duckdb_factory, create_table_provider},
+    duckdb::{DuckDBAccelerator, create_factory, create_table_provider},
 };
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
@@ -484,9 +484,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
     }
 }
 
-fn create_factory() -> DuckDBTableProviderFactory {
-    create_duckdb_factory()
-}
+
 
 async fn get_pool(
     duckdb_factory: &DuckDBTableProviderFactory,
