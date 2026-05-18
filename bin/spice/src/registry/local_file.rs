@@ -93,9 +93,8 @@ impl LocalFileRegistry {
             operation: "canonicalize",
             path: pods_dir.display().to_string(),
         })?;
-        // The destination directory may not exist yet, so canonicalize the parent and join
-        // the normalized pod directory name for stable source/destination comparisons.
-        let comparable_destination_dir = canonical_pods_dir.join(&pod_name);
+        let comparable_destination_dir =
+            comparable_destination_dir(&destination_dir, &canonical_pods_dir, &pod_name)?;
 
         if source_path != comparable_destination_dir
             && (comparable_destination_dir.starts_with(&source_path)
@@ -168,6 +167,21 @@ fn push_unique_candidate(candidate_names: &mut Vec<String>, candidate_name: Stri
     if !candidate_names.contains(&candidate_name) {
         candidate_names.push(candidate_name);
     }
+}
+
+fn comparable_destination_dir(
+    destination_dir: &Path,
+    canonical_pods_dir: &Path,
+    pod_name: &str,
+) -> Result<PathBuf> {
+    if destination_dir.exists() {
+        return std::fs::canonicalize(destination_dir).context(IoSnafu {
+            operation: "canonicalize",
+            path: destination_dir.display().to_string(),
+        });
+    }
+
+    Ok(canonical_pods_dir.join(pod_name))
 }
 
 fn manifest_aliases(pod_name: &str) -> Vec<String> {
@@ -413,6 +427,37 @@ mod tests {
         assert_eq!(installed_path, installed_dir);
         assert!(installed_dir.join("spicepod.yaml").exists());
         assert!(!installed_dir.join("spicepod.yml").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readding_pod_with_symlinked_destination_skips_self_copy() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let source_dir = temp_dir.path().join("localpod");
+        let pods_dir = temp_dir.path().join("spicepods");
+        std::fs::create_dir_all(&source_dir).expect("source directory should be created");
+        std::fs::create_dir_all(&pods_dir).expect("pods directory should be created");
+        std::fs::write(
+            source_dir.join("spicepod.yml"),
+            "version: v2\nkind: Spicepod\nname: localpod\n",
+        )
+        .expect("spicepod.yml should be written");
+        std::os::unix::fs::symlink(&source_dir, pods_dir.join("localpod"))
+            .expect("destination symlink should be created");
+
+        let installed_path = LocalFileRegistry
+            .get_pod(
+                source_dir.to_str().expect("source path should be utf-8"),
+                &pods_dir,
+                &HashMap::new(),
+                &reqwest::Client::new(),
+            )
+            .await
+            .expect("symlinked installed local pod should be accepted");
+
+        assert_eq!(installed_path, pods_dir.join("localpod"));
+        assert!(source_dir.join("spicepod.yaml").exists());
+        assert!(!source_dir.join("spicepod.yml").exists());
     }
 
     #[tokio::test]

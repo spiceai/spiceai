@@ -143,6 +143,7 @@ struct Delta {
 
 /// Token usage statistics.
 #[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(rename_all = "snake_case")]
 #[expect(clippy::struct_field_names)]
 struct Usage {
     prompt_tokens: u32,

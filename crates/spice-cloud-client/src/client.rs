@@ -607,10 +607,10 @@ impl CloudClient {
 
 fn auth_exchange_result(body: AuthExchangeResponse) -> Result<Option<AuthExchangeResponse>> {
     if body.access_denied {
-        return Err(error::Error::Api {
-            status: reqwest::StatusCode::FORBIDDEN.as_u16(),
+        return error::ForbiddenSnafu {
             message: "Device authorization was denied".to_string(),
-        });
+        }
+        .fail();
     }
 
     if body.access_token.as_deref().is_none_or(str::is_empty) {
@@ -694,10 +694,9 @@ mod tests {
             access_denied: true,
         });
 
-        let Err(error::Error::Api { status, message }) = result else {
-            panic!("denied auth exchange should return an API error");
+        let Err(error::Error::Forbidden { message }) = result else {
+            panic!("denied auth exchange should return a forbidden error");
         };
-        assert_eq!(status, reqwest::StatusCode::FORBIDDEN.as_u16());
         assert!(message.contains("denied"));
     }
 

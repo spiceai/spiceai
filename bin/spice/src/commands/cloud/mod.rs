@@ -30,7 +30,10 @@ use std::{fmt, io::IsTerminal};
 
 pub use client::CloudClient;
 pub use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
-use spice_cloud_client::types::{AppKind, IngestionMetrics, PodMetrics, UpdateChannel};
+use spice_cloud_client::{
+    endpoints::is_valid_region as is_valid_cloud_region,
+    types::{AppKind, IngestionMetrics, PodMetrics, UpdateChannel},
+};
 
 /// Arguments for the cloud command.
 #[derive(Args, Debug)]
@@ -964,7 +967,7 @@ async fn execute_login_device_flow(open_browser: bool) -> Result<()> {
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        if let Ok(Some(response)) = client.exchange_code(&auth_code).await {
+        if let Some(response) = client.exchange_code(&auth_code).await? {
             if response.access_denied {
                 return InvalidArgumentSnafu {
                     message: "Access denied",
@@ -1365,7 +1368,7 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
                                 "The app was deleted to roll back the failed create.".to_string()
                             }
                             Err(cleanup_error) => format!(
-                                "The app still exists, and an automatic delete attempt failed: {cleanup_error}."
+                                "The app still exists, and an automatic delete attempt failed: {cleanup_error}. Run 'spice cloud api-keys {org_app}' if you need to inspect its provisioned API keys, or delete the app manually."
                             ),
                         };
                         return Err(crate::error::Error::InvalidResponse {
@@ -1409,6 +1412,15 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
 }
 
 fn validate_create_app_args(args: &CreateAppArgs) -> Result<()> {
+    if !is_valid_cloud_region(&args.region) {
+        return Err(crate::error::Error::InvalidArgument {
+            message: format!(
+                "Invalid region '{}': expected lowercase letters, digits, and hyphens, starting and ending with a letter or digit",
+                args.region
+            ),
+        });
+    }
+
     if args.kind == AppKind::Cluster {
         if args.replicas != Some(1) {
             return Err(crate::error::Error::InvalidArgument {
@@ -1990,6 +2002,16 @@ mod tests {
     fn create_cluster_accepts_one_replica() {
         validate_create_app_args(&cluster_app_args(Some(1)))
             .expect("cluster with one scheduler replica should pass");
+    }
+
+    #[test]
+    fn create_app_rejects_invalid_region_syntax() {
+        let mut args = create_app_args(AppKind::Set, None);
+        args.region = "bad_region".to_string();
+
+        let err = validate_create_app_args(&args).expect_err("invalid region should fail");
+
+        assert!(err.to_string().contains("Invalid region 'bad_region'"));
     }
 
     fn test_app(org: &str, name: &str) -> spice_cloud_client::types::App {

@@ -26,7 +26,9 @@ use spice::commands::{
 };
 use spice::output::OutputFormat;
 use spice::{Result, RuntimeContext};
-use spice_cloud_client::endpoints::is_valid_region as is_valid_cloud_region;
+use spice_cloud_client::endpoints::{
+    is_valid_region as is_valid_cloud_region, normalize_data_region,
+};
 use std::ffi::{OsStr, OsString};
 use std::sync::LazyLock;
 use tracing_subscriber::EnvFilter;
@@ -488,8 +490,8 @@ fn normalize_cloud_region_flags(args: impl IntoIterator<Item = OsString>) -> Vec
 }
 
 fn parse_cloud_region(value: &str) -> std::result::Result<String, String> {
-    if is_valid_cloud_region(value) {
-        return Ok(value.to_string());
+    if let Some(region) = normalize_data_region(value) {
+        return Ok(region);
     }
 
     Err(format!(
@@ -497,10 +499,20 @@ fn parse_cloud_region(value: &str) -> std::result::Result<String, String> {
     ))
 }
 
+// Legacy `--cloud <region>` syntax has no value marker, so only consume values
+// that look like supported region shortcuts and never current command names.
 fn should_treat_as_cloud_region(value: &OsStr) -> bool {
-    value
-        .to_str()
-        .is_some_and(|value| looks_like_legacy_cloud_region(value) && !is_top_level_command(value))
+    value.to_str().is_some_and(|value| {
+        looks_like_cloud_region_shortcut_value(value) && !is_top_level_command(value)
+    })
+}
+
+fn looks_like_cloud_region_shortcut_value(value: &str) -> bool {
+    looks_like_legacy_cloud_region(value) || looks_like_data_region_name(value)
+}
+
+fn looks_like_data_region_name(value: &str) -> bool {
+    normalize_data_region(value).is_some_and(|region| region != value)
 }
 
 fn looks_like_legacy_cloud_region(value: &str) -> bool {
@@ -540,7 +552,7 @@ fn cloud_region_from_equals(value: &OsStr) -> Option<&str> {
     let value = value.to_str()?;
     value
         .strip_prefix("--cloud=")
-        .filter(|region| looks_like_legacy_cloud_region(region))
+        .filter(|region| looks_like_cloud_region_shortcut_value(region))
 }
 
 fn is_top_level_command(value: &str) -> bool {
@@ -1249,6 +1261,17 @@ mod tests {
     }
 
     #[test]
+    fn cloud_flag_accepts_full_data_region_value() {
+        let cli = parse_normalized(&["spice", "--cloud", "us-west-2-prod-aws-data", "status"]);
+        assert!(cli.cloud);
+        assert_eq!(cli.cloud_region, "us-west-2");
+
+        let Commands::Status(_) = cli.command else {
+            panic!("expected status command");
+        };
+    }
+
+    #[test]
     fn cloud_flag_does_not_consume_arbitrary_value_as_region() {
         let Err(error) = try_parse_normalized(&["spice", "--cloud", "foo", "status"]) else {
             panic!("arbitrary value after --cloud should not be consumed as a region");
@@ -1304,6 +1327,17 @@ mod tests {
     }
 
     #[test]
+    fn cloud_flag_accepts_equals_full_data_region_value() {
+        let cli = parse_normalized(&["spice", "--cloud=us-west-2-prod-aws-data", "status"]);
+        assert!(cli.cloud);
+        assert_eq!(cli.cloud_region, "us-west-2");
+
+        let Commands::Status(_) = cli.command else {
+            panic!("expected status command");
+        };
+    }
+
+    #[test]
     fn cloud_flag_does_not_consume_top_level_command_as_region() {
         let cli = parse_normalized(&["spice", "--cloud", "models"]);
         assert!(cli.cloud);
@@ -1312,6 +1346,16 @@ mod tests {
         let Commands::Models(_) = cli.command else {
             panic!("expected models command");
         };
+    }
+
+    #[test]
+    fn top_level_commands_do_not_match_cloud_region_shortcut_shape() {
+        for command in TOP_LEVEL_COMMANDS.iter() {
+            assert!(
+                !looks_like_cloud_region_shortcut_value(command),
+                "top-level command '{command}' would be ambiguous after --cloud"
+            );
+        }
     }
 
     #[test]

@@ -152,7 +152,7 @@ pub struct AppConfig {
     pub registry: Option<String>,
     pub image: Option<String>,
     pub image_tag: Option<String>,
-    pub update_channel: Option<UpdateChannel>,
+    pub update_channel: Option<String>,
     pub replicas: Option<i32>,
     pub resources: Option<AppResources>,
     pub executor: Option<AppExecutor>,
@@ -545,5 +545,15 @@ mod tests {
 
         let value = serde_json::to_value(limits).expect("limits should serialize");
         assert_eq!(value, serde_json::json!({ "cpu": "2" }));
+    }
+
+    #[test]
+    fn app_config_preserves_unknown_update_channel() {
+        let config = serde_json::from_value::<AppConfig>(serde_json::json!({
+            "update_channel": "next"
+        }))
+        .expect("unknown update channels should deserialize");
+
+        assert_eq!(config.update_channel.as_deref(), Some("next"));
     }
 }

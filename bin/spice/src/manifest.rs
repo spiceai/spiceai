@@ -19,6 +19,8 @@ limitations under the License.
 use crate::error::{ConfigIoSnafu, Result};
 use snafu::ResultExt;
 use spicepod::spec::{SpicepodKind, SpicepodVersion};
+#[cfg(unix)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use yaml::{Mapping, Value};
 
@@ -129,6 +131,10 @@ fn leading_manifest_comments(path: &Path) -> Result<Vec<String>> {
         break;
     }
 
+    while comments.last().is_some_and(|line| line.trim().is_empty()) {
+        comments.pop();
+    }
+
     Ok(comments)
 }
 
@@ -148,17 +154,39 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
 
 /// Writes a file and restricts permissions to the owner on Unix platforms.
 pub fn write_secure_file(path: &Path, contents: &[u8]) -> Result<()> {
-    std::fs::write(path, contents).context(ConfigIoSnafu {
-        operation: "write",
-        path: path.to_path_buf(),
-    })?;
-
     #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::fs::PermissionsExt;
+
         let permissions = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(path, permissions).context(ConfigIoSnafu {
-            operation: "set permissions on",
+        if path.exists() {
+            std::fs::set_permissions(path, permissions).context(ConfigIoSnafu {
+                operation: "set permissions on",
+                path: path.to_path_buf(),
+            })?;
+        }
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .context(ConfigIoSnafu {
+                operation: "open",
+                path: path.to_path_buf(),
+            })?;
+        file.write_all(contents).context(ConfigIoSnafu {
+            operation: "write",
+            path: path.to_path_buf(),
+        })?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents).context(ConfigIoSnafu {
+            operation: "write",
             path: path.to_path_buf(),
         })?;
     }
@@ -371,6 +399,25 @@ future_primitive:
     }
 
     #[test]
+    fn write_spicepod_value_trims_extra_blank_after_leading_comments() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let path = temp_dir.path().join(SPICEPOD_YAML);
+        std::fs::write(
+            &path,
+            "# managed by tests\n\nversion: v2\nkind: Spicepod\nname: comments\n",
+        )
+        .expect("spicepod should be written");
+        let mut value = read_spicepod_value(&path).expect("spicepod should parse");
+        ensure_string_sequence_item(&mut value, "dependencies", "spicepods/localpod")
+            .expect("dependency should be added");
+
+        write_spicepod_value(&path, &value).expect("spicepod should be written");
+
+        let content = std::fs::read_to_string(path).expect("spicepod should be readable");
+        assert!(content.starts_with("# managed by tests\nversion: v2\n"));
+    }
+
+    #[test]
     fn edits_existing_yml_and_preserves_all_top_level_primitives() {
         let temp_dir = tempfile::tempdir().expect("tempdir should be created");
         let spicepod_path = temp_dir.path().join(SPICEPOD_YML);
@@ -491,5 +538,23 @@ future_primitive:
             .mode()
             & 0o777;
         assert_eq!(mode, 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secure_file_creates_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let path = temp_dir.path().join("secret.env");
+
+        write_secure_file(&path, b"API_KEY=secret\n").expect("secure file should be written");
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata should be readable")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

@@ -32,7 +32,7 @@ const GB: u64 = MB * 1000;
 /// A validated byte quantity.
 ///
 /// Stores the raw byte count and provides parsing from human-readable strings
-/// (e.g. `"16Gi"`, `"32GiB"`) and formatting back to the most appropriate unit.
+/// (e.g. `"16Gi"`, `"32GiB"`) and formatting back to the most appropriate binary unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NumBytes(u64);
 
@@ -99,7 +99,8 @@ impl NumBytes {
 
     /// Format as a Kubernetes-style resource string without losing precision.
     ///
-    /// This is the format expected by the Spice Cloud API for memory/storage fields.
+    /// This is the format expected by the Spice Cloud API for memory/storage fields. Decimal
+    /// inputs such as `16GB` are normalized to the equivalent binary `Ki`/`Mi`/`Gi` form.
     pub fn to_resource_string(self) -> String {
         self.to_parse_string()
     }
