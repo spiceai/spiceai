@@ -110,7 +110,9 @@ impl CloudClient {
     /// Exchange a device auth code for an access token.
     ///
     /// Returns `Ok(None)` while the user has not yet completed the browser flow.
-    /// Returns an error if the user denies the browser authorization request.
+    /// Returns [`error::Error::AuthorizationDenied`] when the user denies the
+    /// browser authorization request. Other errors represent HTTP transport
+    /// failures, non-success API responses, or response parsing failures.
     pub async fn exchange_code(&self, auth_code: &str) -> Result<Option<AuthExchangeResponse>> {
         let url = format!("{}/auth/token/exchange", self.oauth_base_url());
         let request = AuthExchangeRequest { code: auth_code };
@@ -607,10 +609,7 @@ impl CloudClient {
 
 fn auth_exchange_result(body: AuthExchangeResponse) -> Result<Option<AuthExchangeResponse>> {
     if body.access_denied {
-        return error::ForbiddenSnafu {
-            message: "Device authorization was denied".to_string(),
-        }
-        .fail();
+        return error::AuthorizationDeniedSnafu.fail();
     }
 
     if body.access_token.as_deref().is_none_or(str::is_empty) {
@@ -694,10 +693,9 @@ mod tests {
             access_denied: true,
         });
 
-        let Err(error::Error::Forbidden { message }) = result else {
-            panic!("denied auth exchange should return a forbidden error");
+        let Err(error::Error::AuthorizationDenied) = result else {
+            panic!("denied auth exchange should return an authorization-denied error");
         };
-        assert!(message.contains("denied"));
     }
 
     #[test]

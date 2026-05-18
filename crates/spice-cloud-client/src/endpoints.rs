@@ -49,6 +49,12 @@ pub fn normalize_data_region(region: &str) -> Option<String> {
 }
 
 #[must_use]
+pub fn data_region_name(region: &str) -> Option<String> {
+    normalize_data_region(region)
+        .map(|endpoint_region| format!("{endpoint_region}{DATA_REGION_SUFFIX}"))
+}
+
+#[must_use]
 pub fn is_valid_region(region: &str) -> bool {
     region
         .chars()
@@ -115,6 +121,19 @@ mod tests {
             Some("us-east-1".to_string())
         );
         assert_eq!(normalize_data_region("bad_region"), None);
+    }
+
+    #[test]
+    fn builds_data_region_names() {
+        assert_eq!(
+            data_region_name("us-east-1"),
+            Some("us-east-1-prod-aws-data".to_string())
+        );
+        assert_eq!(
+            data_region_name("us-east-1-prod-aws-data"),
+            Some("us-east-1-prod-aws-data".to_string())
+        );
+        assert_eq!(data_region_name("bad_region"), None);
     }
 
     #[test]

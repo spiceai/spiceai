@@ -533,6 +533,9 @@ fn into_cli(e: spice_cloud_client::error::Error) -> crate::error::Error {
         CloudError::Forbidden { message } => crate::error::Error::InvalidArgument {
             message: format!("Forbidden: {message}"),
         },
+        CloudError::AuthorizationDenied => crate::error::Error::InvalidArgument {
+            message: "Device authorization was denied".to_string(),
+        },
         CloudError::NotFound { message } => crate::error::Error::InvalidResponse {
             message: format!("Not found: {message}"),
         },

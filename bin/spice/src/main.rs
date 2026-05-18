@@ -35,17 +35,7 @@ use tracing_subscriber::EnvFilter;
 
 const DEFAULT_CLOUD_REGION: &str = "us-east-1";
 const MACHINE_ERROR_SERIALIZATION_FAILED: &str = r#"{"status":"error","error":{"code":"error_serialization_failed","message":"Failed to serialize CLI error"}}"#;
-const GLOBAL_VALUE_FLAGS: &[&str] = &[
-    "--api-key",
-    "--cloud-region",
-    "--http-endpoint",
-    "--tls-root-certificate-file",
-];
 const SQL_DIRECT_SHORTCUT_VALUE_FLAGS: &[&str] = &[
-    "--api-key",
-    "--cloud-region",
-    "--http-endpoint",
-    "--tls-root-certificate-file",
     "--endpoint",
     "--flight-endpoint",
     "--cache-control",
@@ -56,10 +46,6 @@ const SQL_DIRECT_SHORTCUT_VALUE_FLAGS: &[&str] = &[
     "-o",
 ];
 const CHAT_DIRECT_SHORTCUT_VALUE_FLAGS: &[&str] = &[
-    "--api-key",
-    "--cloud-region",
-    "--http-endpoint",
-    "--tls-root-certificate-file",
     "--endpoint",
     "--headers",
     "--model",
@@ -68,6 +54,7 @@ const CHAT_DIRECT_SHORTCUT_VALUE_FLAGS: &[&str] = &[
     "--output",
     "-o",
 ];
+static GLOBAL_VALUE_FLAGS: LazyLock<Vec<String>> = LazyLock::new(collect_global_value_flags);
 static TOP_LEVEL_COMMANDS: LazyLock<Vec<String>> = LazyLock::new(|| {
     let mut commands = Vec::new();
     for command in Cli::command().get_subcommands() {
@@ -76,6 +63,20 @@ static TOP_LEVEL_COMMANDS: LazyLock<Vec<String>> = LazyLock::new(|| {
     }
     commands
 });
+
+fn collect_global_value_flags() -> Vec<String> {
+    Cli::command()
+        .get_arguments()
+        .filter(|arg| arg.is_global_set())
+        .filter(|arg| {
+            matches!(
+                arg.get_action(),
+                clap::ArgAction::Set | clap::ArgAction::Append
+            )
+        })
+        .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
+        .collect()
+}
 
 /// Spice.ai CLI - Interact with the Spice.ai runtime, edit Spicepod manifests, and manage Spice Cloud.
 #[derive(Parser)]
@@ -383,7 +384,7 @@ fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Ve
         }
 
         let arg_text = arg.to_string_lossy();
-        let consumes_value = GLOBAL_VALUE_FLAGS.contains(&arg_text.as_ref());
+        let consumes_value = global_value_flag_consumes_value(&arg_text);
         let is_subcommand = !arg_text.starts_with('-');
         normalized.push(arg);
 
@@ -451,7 +452,8 @@ fn normalize_direct_shortcut_args(
             continue;
         }
 
-        let consumes_value = direct_shortcut_flag_consumes_value(&arg_text, value_flags);
+        let consumes_value = global_value_flag_consumes_value(&arg_text)
+            || direct_shortcut_flag_consumes_value(&arg_text, value_flags);
         passthrough.push(arg);
 
         if consumes_value && let Some(value) = args.next() {
@@ -563,6 +565,10 @@ fn legacy_region_parts_match(prefix: &str, area: &str, zone: &str) -> bool {
 
 fn direct_shortcut_flag_consumes_value(value: &str, value_flags: &[&str]) -> bool {
     !value.contains('=') && value_flags.contains(&value)
+}
+
+fn global_value_flag_consumes_value(value: &str) -> bool {
+    !value.contains('=') && GLOBAL_VALUE_FLAGS.iter().any(|flag| flag == value)
 }
 
 fn cloud_region_from_equals(value: &OsStr) -> Option<&str> {
@@ -1200,23 +1206,17 @@ mod tests {
 
     #[test]
     fn global_value_flags_match_cli_definition() {
-        let actual = Cli::command()
-            .get_arguments()
-            .filter(|arg| arg.is_global_set())
-            .filter(|arg| {
-                matches!(
-                    arg.get_action(),
-                    clap::ArgAction::Set | clap::ArgAction::Append
-                )
-            })
-            .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
-            .collect::<Vec<_>>();
-        let expected = GLOBAL_VALUE_FLAGS
-            .iter()
-            .map(|flag| (*flag).to_string())
-            .collect::<Vec<_>>();
+        let actual = GLOBAL_VALUE_FLAGS.as_slice();
+        let expected = [
+            "--api-key",
+            "--cloud-region",
+            "--http-endpoint",
+            "--tls-root-certificate-file",
+        ]
+        .map(ToString::to_string)
+        .to_vec();
 
-        assert_eq!(actual, expected);
+        assert_eq!(actual, expected.as_slice());
     }
 
     #[test]

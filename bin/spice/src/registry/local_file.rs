@@ -96,9 +96,9 @@ impl LocalFileRegistry {
         let comparable_destination_dir =
             comparable_destination_dir(&destination_dir, &canonical_pods_dir, &pod_name)?;
 
-        if source_path != comparable_destination_dir
-            && (comparable_destination_dir.starts_with(&source_path)
-                || source_path.starts_with(&canonical_pods_dir))
+        if !local_paths_equal(&source_path, &comparable_destination_dir)
+            && (local_path_starts_with(&comparable_destination_dir, &source_path)
+                || local_path_starts_with(&source_path, &canonical_pods_dir))
         {
             return Err(Error::NestedLocalInstall {
                 source_path: source_path.display().to_string(),
@@ -116,7 +116,7 @@ impl LocalFileRegistry {
         // When the source path is identical to the destination (e.g. `spice add ./spicepods/<pod>`
         // run from the app root, or re-adding an already-installed local pod), skip the copy but
         // still ensure the installed dependency directory has the canonical manifest name.
-        if source_path == comparable_destination_dir {
+        if local_paths_equal(&source_path, &comparable_destination_dir) {
             normalize_manifest(&source_manifest, &destination_dir, &source_pod_name)?;
             return Ok(destination_dir);
         }
@@ -182,6 +182,53 @@ fn comparable_destination_dir(
     }
 
     Ok(canonical_pods_dir.join(pod_name))
+}
+
+fn local_paths_equal(left: &Path, right: &Path) -> bool {
+    left == right || (case_insensitive_local_paths() && path_components_equal(left, right))
+}
+
+fn local_path_starts_with(path: &Path, base: &Path) -> bool {
+    path.starts_with(base)
+        || (case_insensitive_local_paths() && path_components_start_with(path, base))
+}
+
+fn case_insensitive_local_paths() -> bool {
+    cfg!(any(target_os = "macos", target_family = "windows"))
+}
+
+fn path_components_equal(left: &Path, right: &Path) -> bool {
+    let mut left_components = left.components();
+    let mut right_components = right.components();
+
+    loop {
+        match (left_components.next(), right_components.next()) {
+            (Some(left), Some(right)) if path_component_equal(left, right) => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+fn path_components_start_with(path: &Path, base: &Path) -> bool {
+    let mut path_components = path.components();
+
+    for base_component in base.components() {
+        let Some(path_component) = path_components.next() else {
+            return false;
+        };
+
+        if !path_component_equal(path_component, base_component) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn path_component_equal(left: std::path::Component<'_>, right: std::path::Component<'_>) -> bool {
+    left.as_os_str().to_string_lossy().to_lowercase()
+        == right.as_os_str().to_string_lossy().to_lowercase()
 }
 
 fn manifest_aliases(pod_name: &str) -> Vec<String> {
@@ -264,6 +311,28 @@ mod tests {
         let path = "file:///path/to/pod";
         let stripped = path.strip_prefix("file://").unwrap_or(path);
         assert_eq!(stripped, "/path/to/pod");
+    }
+
+    #[test]
+    fn local_paths_compare_case_insensitively_on_macos_and_windows() {
+        let source = Path::new("/tmp/LocalPod");
+        let destination = Path::new("/tmp/localpod");
+
+        assert_eq!(
+            local_paths_equal(source, destination),
+            cfg!(any(target_os = "macos", target_family = "windows"))
+        );
+    }
+
+    #[test]
+    fn local_path_prefix_compare_is_case_insensitive_on_macos_and_windows() {
+        let path = Path::new("/tmp/SpicePods/LocalPod/nested");
+        let base = Path::new("/tmp/spicepods/localpod");
+
+        assert_eq!(
+            local_path_starts_with(path, base),
+            cfg!(any(target_os = "macos", target_family = "windows"))
+        );
     }
 
     #[tokio::test]

@@ -31,7 +31,7 @@ use std::{fmt, io::IsTerminal};
 pub use client::CloudClient;
 pub use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
 use spice_cloud_client::{
-    endpoints::is_valid_region as is_valid_cloud_region,
+    endpoints::{data_region_name, normalize_data_region},
     types::{AppKind, IngestionMetrics, PodMetrics, UpdateChannel},
 };
 
@@ -1328,10 +1328,11 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
                 None
             };
 
+            let create_region = normalize_create_app_region(&args.region)?;
             let app = client
                 .create_app(
                     &args.name,
-                    &args.region,
+                    &create_region,
                     args.kind,
                     args.description.as_deref(),
                     &args.visibility,
@@ -1412,14 +1413,7 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
 }
 
 fn validate_create_app_args(args: &CreateAppArgs) -> Result<()> {
-    if !is_valid_cloud_region(&args.region) {
-        return Err(crate::error::Error::InvalidArgument {
-            message: format!(
-                "Invalid region '{}': expected lowercase letters, digits, and hyphens, starting and ending with a letter or digit",
-                args.region
-            ),
-        });
-    }
+    let _ = normalize_create_app_region(&args.region)?;
 
     if args.kind == AppKind::Cluster {
         if args.replicas != Some(1) {
@@ -1679,11 +1673,9 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
         println!("No metrics available for {app_name}");
         return Ok(());
     }
-    let has_window = args.window.is_some();
-
     let mut table = TableOutput::new(metrics_table_headers());
     for (pod, m) in &response.metrics {
-        table.add_row(metrics_table_row(pod, m, has_window));
+        table.add_row(metrics_table_row(pod, m));
     }
     table.print();
 
@@ -1732,7 +1724,7 @@ fn metrics_table_headers() -> Vec<&'static str> {
     ]
 }
 
-fn metrics_table_row(pod: &str, m: &PodMetrics, _has_window: bool) -> Vec<String> {
+fn metrics_table_row(pod: &str, m: &PodMetrics) -> Vec<String> {
     vec![
         pod.to_string(),
         m.cpu_usage_percent
@@ -1752,6 +1744,20 @@ fn metrics_table_row(pod: &str, m: &PodMetrics, _has_window: bool) -> Vec<String
 
 fn format_bytes(bytes: u64) -> String {
     bytes::NumBytes::from_bytes(bytes).to_string()
+}
+
+fn normalize_create_app_region(region: &str) -> Result<String> {
+    let Some(endpoint_region) = normalize_data_region(region) else {
+        return Err(crate::error::Error::InvalidArgument {
+            message: format!(
+                "Invalid region '{region}': expected lowercase letters, digits, and hyphens, starting and ending with a letter or digit"
+            ),
+        });
+    };
+
+    data_region_name(&endpoint_region).ok_or_else(|| crate::error::Error::InvalidArgument {
+        message: format!("Invalid region '{region}': expected a Spice Cloud data region"),
+    })
 }
 
 // ============================================================================
@@ -1802,7 +1808,7 @@ mod tests {
         let headers = metrics_table_headers();
 
         let none_metrics = PodMetrics::default();
-        let none_row = metrics_table_row("pod-none", &none_metrics, false);
+        let none_row = metrics_table_row("pod-none", &none_metrics);
         assert_eq!(
             none_row.len(),
             headers.len(),
@@ -1817,7 +1823,7 @@ mod tests {
             disk_write_bytes: Some(4096.0),
             disk_write_operations: Some(22.0),
         };
-        let full_row = metrics_table_row("pod-full", &full_metrics, true);
+        let full_row = metrics_table_row("pod-full", &full_metrics);
         assert_eq!(
             full_row.len(),
             headers.len(),
@@ -1848,7 +1854,7 @@ mod tests {
     #[test]
     fn metrics_table_row_renders_dash_for_missing_values() {
         let m = PodMetrics::default();
-        let row = metrics_table_row("p", &m, false);
+        let row = metrics_table_row("p", &m);
         // Pod name is always present; the six metric cells should be "-".
         assert_eq!(row[0], "p");
         assert!(
@@ -2012,6 +2018,19 @@ mod tests {
         let err = validate_create_app_args(&args).expect_err("invalid region should fail");
 
         assert!(err.to_string().contains("Invalid region 'bad_region'"));
+    }
+
+    #[test]
+    fn create_app_region_accepts_short_and_data_region_names() {
+        assert_eq!(
+            normalize_create_app_region("us-east-1").expect("short region should normalize"),
+            "us-east-1-prod-aws-data"
+        );
+        assert_eq!(
+            normalize_create_app_region("us-east-1-prod-aws-data")
+                .expect("data region should normalize"),
+            "us-east-1-prod-aws-data"
+        );
     }
 
     fn test_app(org: &str, name: &str) -> spice_cloud_client::types::App {

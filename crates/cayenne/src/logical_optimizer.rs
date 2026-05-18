@@ -102,12 +102,10 @@ limitations under the License.
 //!   style small-domain pruning, while avoiding broad propagation across
 //!   similarly sized HTAP joins.
 //!
-//! The cardinality gates require stats to be present: if either side has no
-//! statistics, the rule skips propagation entirely. Acceleration engines
-//! (`DuckDB`, Arrow, Cayenne, etc.) expose row counts via
-//! `TableProvider::statistics`, so this gate is transparent for accelerated
-//! tables. Data sources without statistics (e.g. HTTP virtual tables) are
-//! excluded.
+//! When statistics are present, the cardinality gates suppress propagation only
+//! when they prove the receiving side is too small or insufficiently larger
+//! than the filtered key domain. Missing statistics fall back to the same
+//! structural safety checks as known-cardinality plans.
 
 use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -884,7 +882,10 @@ fn wrap_with_in_subquery_filter_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::arrow::util::pretty::pretty_format_batches;
     use datafusion::catalog::MemTable;
     use datafusion::common::stats::Precision;
     use datafusion::datasource::{DefaultTableSource, TableProvider};
@@ -1197,6 +1198,86 @@ mod tests {
         assert!(
             !changed2,
             "second pass must not re-propagate (cycle guard); plan was:\n{second_plan}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_stats_propagation_matches_unoptimized_results() -> Result<()> {
+        let ctx = SessionContext::new();
+        let nation_schema = Arc::new(Schema::new(vec![
+            Field::new("n_nationkey", DataType::Int64, false),
+            Field::new("n_name", DataType::Utf8, true),
+        ]));
+        let supplier_schema = Arc::new(Schema::new(vec![
+            Field::new("s_suppkey", DataType::Int64, false),
+            Field::new("s_nationkey", DataType::Int64, false),
+        ]));
+
+        let nation_batch = RecordBatch::try_new(
+            Arc::clone(&nation_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("CHINA"), Some("FRANCE"), None])) as ArrayRef,
+            ],
+        )?;
+        let supplier_batch = RecordBatch::try_new(
+            Arc::clone(&supplier_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![10, 11, 12, 13])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 2, 1, 4])) as ArrayRef,
+            ],
+        )?;
+
+        ctx.register_table(
+            "nation",
+            Arc::new(MemTable::try_new(nation_schema, vec![vec![nation_batch]])?),
+        )?;
+        ctx.register_table(
+            "supplier",
+            Arc::new(MemTable::try_new(
+                supplier_schema,
+                vec![vec![supplier_batch]],
+            )?),
+        )?;
+
+        let plan = ctx
+            .sql(
+                "SELECT s_suppkey FROM supplier JOIN nation \
+                 ON s_nationkey = n_nationkey \
+                 WHERE n_name = 'CHINA' ORDER BY s_suppkey",
+            )
+            .await?
+            .into_optimized_plan()?;
+
+        let r = rule();
+        let cfg = datafusion::optimizer::OptimizerContext::new();
+        let (transformed_plan, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
+        assert!(
+            changed,
+            "rule should propagate when MemTable statistics are absent; plan was:\n{plan}"
+        );
+        assert_eq!(count_propagated_filter_exprs(&transformed_plan), 1);
+
+        let baseline_batches = ctx.execute_logical_plan(plan).await?.collect().await?;
+        let transformed_batches = ctx
+            .execute_logical_plan(transformed_plan)
+            .await?
+            .collect()
+            .await?;
+
+        let baseline = pretty_format_batches(&baseline_batches)?.to_string();
+        let transformed = pretty_format_batches(&transformed_batches)?.to_string();
+        assert_eq!(transformed, baseline);
+        assert_eq!(
+            baseline,
+            "+-----------+\n\
+             | s_suppkey |\n\
+             +-----------+\n\
+             | 10        |\n\
+             | 12        |\n\
+             +-----------+"
         );
 
         Ok(())
