@@ -69,9 +69,9 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, 
 use tokio::runtime::Runtime;
 
 use common::{
-    CAYENNE_LANES, CayenneFixture, DuckDbFixture, Metastore, cayenne_insert,
-    duckdb_insert_parquet, duckdb_upsert_parquet, make_batch, schema, setup_cayenne_pk_for,
-    setup_duckdb_pk, write_parquet,
+    CAYENNE_LANES, CayenneFixture, DuckDbFixture, Metastore, cayenne_insert, duckdb_insert_parquet,
+    duckdb_upsert_parquet, make_batch, schema, setup_cayenne_pk_for, setup_duckdb_pk,
+    write_parquet,
 };
 
 /// Preloaded table sizes. The middle and top values straddle
@@ -142,10 +142,7 @@ fn bench_upsert_scaling(c: &mut Criterion) {
         let base_parquet_path = parquet_dir
             .path()
             .join(format!("base_{table_rows}.parquet"));
-        write_parquet(
-            &make_batch(schema(), 0, table_rows),
-            &base_parquet_path,
-        );
+        write_parquet(&make_batch(schema(), 0, table_rows), &base_parquet_path);
 
         let upsert_batch = Arc::new(make_upsert_batch(table_rows, INCOMING_ROWS));
         let upsert_parquet_path = parquet_dir

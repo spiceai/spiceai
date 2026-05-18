@@ -2129,7 +2129,7 @@ impl MetadataCatalog for CayenneCatalog {
 
         Err(CatalogError::InvalidOperationNoSource {
             message: format!(
-                "commit_on_conflict_deletions exhausted {max_attempts} attempts without success or a terminal error"
+                "commit_on_conflict_deletions exhausted {max_attempts} retry attempts after retryable write conflicts"
             ),
         })
     }

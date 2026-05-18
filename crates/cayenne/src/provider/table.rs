@@ -91,8 +91,8 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task;
@@ -111,8 +111,16 @@ use arc_swap::ArcSwap;
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
 const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
-const PK_KEYSET_CACHE_MAX_ENTRIES: usize = 1_000_000;
+/// Byte budget for the in-memory PK keyset cache (Option A from iter 5/6).
+/// Using a byte budget instead of a hard entry count allows small-PK tables
+/// (e.g. single Int64) to cache far more rows before eviction, while still
+/// protecting memory on wide composite-PK tables. At ~40-64 bytes per entry
+/// (key bytes + RowLocation + HashMap overhead) this is ~2-4M rows for int64 PKs.
+const PK_KEYSET_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
+
+static PROTECTED_SNAPSHOT_AGE_WARNING_KEYS: LazyLock<ParkingMutex<HashSet<String>>> =
+    LazyLock::new(|| ParkingMutex::new(HashSet::new()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotMaintenanceTrigger {
@@ -127,36 +135,50 @@ enum SnapshotMaintenanceTrigger {
     },
 }
 
+fn should_warn_protected_snapshot_age(snapshot_id: &str, warning_kind: &'static str) -> bool {
+    PROTECTED_SNAPSHOT_AGE_WARNING_KEYS
+        .lock()
+        .insert(format!("{warning_kind}:{snapshot_id}"))
+}
+
 fn protected_snapshot_age(snapshot_id: &str, now: SystemTime) -> Option<Duration> {
     let Ok(snapshot_uuid) = uuid::Uuid::parse_str(snapshot_id) else {
-        tracing::warn!(
-            snapshot_id,
-            "Cayenne protected snapshot id is not a valid UUID; treating age as expired"
-        );
+        if should_warn_protected_snapshot_age(snapshot_id, "invalid_uuid") {
+            tracing::warn!(
+                snapshot_id,
+                "Cayenne protected snapshot id is not a valid UUID; treating age as expired"
+            );
+        }
         return Some(Duration::MAX);
     };
     let Some(timestamp) = snapshot_uuid.get_timestamp() else {
-        tracing::warn!(
-            snapshot_id,
-            "Cayenne protected snapshot id does not contain a UUID timestamp; treating age as expired"
-        );
+        if should_warn_protected_snapshot_age(snapshot_id, "missing_uuid_timestamp") {
+            tracing::warn!(
+                snapshot_id,
+                "Cayenne protected snapshot id does not contain a UUID timestamp; treating age as expired"
+            );
+        }
         return Some(Duration::MAX);
     };
     let (seconds, nanos) = timestamp.to_unix();
     let Some(snapshot_time) = UNIX_EPOCH.checked_add(Duration::new(seconds, nanos)) else {
-        tracing::warn!(
-            snapshot_id,
-            "Cayenne protected snapshot timestamp overflowed SystemTime; treating age as expired"
-        );
+        if should_warn_protected_snapshot_age(snapshot_id, "timestamp_overflow") {
+            tracing::warn!(
+                snapshot_id,
+                "Cayenne protected snapshot timestamp overflowed SystemTime; treating age as expired"
+            );
+        }
         return Some(Duration::MAX);
     };
     match now.duration_since(snapshot_time) {
         Ok(age) => Some(age),
         Err(_) => {
-            tracing::warn!(
-                snapshot_id,
-                "Cayenne protected snapshot timestamp is in the future; treating age as expired"
-            );
+            if should_warn_protected_snapshot_age(snapshot_id, "future_timestamp") {
+                tracing::warn!(
+                    snapshot_id,
+                    "Cayenne protected snapshot timestamp is in the future; treating age as expired"
+                );
+            }
             Some(Duration::MAX)
         }
     }
@@ -3570,12 +3592,17 @@ impl CayenneTableProvider {
     }
 
     fn store_cached_pk_keyset(&self, keyset: HashMap<OwnedRow, RowLocation>) {
-        if keyset.len() > PK_KEYSET_CACHE_MAX_ENTRIES {
+        let approx_bytes = keyset
+            .keys()
+            .map(|k| k.as_ref().len() + std::mem::size_of::<RowLocation>() + 16)
+            .sum::<usize>();
+        if approx_bytes > PK_KEYSET_CACHE_MAX_BYTES {
             tracing::debug!(
                 table = self.table_metadata.table_name.as_str(),
                 key_count = keyset.len(),
-                max_key_count = PK_KEYSET_CACHE_MAX_ENTRIES,
-                "Skipping primary-key keyset cache because it exceeds the configured in-memory cap"
+                approx_bytes,
+                max_bytes = PK_KEYSET_CACHE_MAX_BYTES,
+                "Skipping primary-key keyset cache because it exceeds the configured byte budget"
             );
             *self.pk_keyset_cache.lock() = None;
             return;
@@ -3598,13 +3625,23 @@ impl CayenneTableProvider {
             return;
         };
 
-        if keyset.len().saturating_add(keys.len()) > PK_KEYSET_CACHE_MAX_ENTRIES {
+        let current_bytes: usize = keyset
+            .keys()
+            .map(|k| k.as_ref().len() + std::mem::size_of::<RowLocation>() + 16)
+            .sum();
+        let incoming_bytes: usize = keys
+            .iter()
+            .map(|k| k.as_ref().len() + std::mem::size_of::<RowLocation>() + 16)
+            .sum();
+        if current_bytes.saturating_add(incoming_bytes) > PK_KEYSET_CACHE_MAX_BYTES {
             tracing::debug!(
                 table = self.table_metadata.table_name.as_str(),
                 key_count = keyset.len(),
                 incoming_key_count = keys.len(),
-                max_key_count = PK_KEYSET_CACHE_MAX_ENTRIES,
-                "Clearing primary-key keyset cache because the write would exceed the in-memory cap"
+                current_bytes,
+                incoming_bytes,
+                max_bytes = PK_KEYSET_CACHE_MAX_BYTES,
+                "Clearing primary-key keyset cache because the write would exceed the byte budget"
             );
             *guard = None;
             return;
@@ -4105,6 +4142,12 @@ impl CayenneTableProvider {
                                 }
                             }
                             PkDeletionStrategyWithCache::RowConverterBased { .. } => {
+                                // Convert the OwnedRow's byte view into a `Box<[u8]>` for the
+                                // delete-list — `deleted_row_keys` and `deleted_inlined_row_keys`
+                                // are typed `Vec<Box<[u8]>>` so they can be forwarded to the
+                                // `commit_on_conflict_deletions` catalog call without a second
+                                // re-encoding. This is one allocation per conflict row; the
+                                // arena-indexed key design discussed in iter 3 would amortize it.
                                 let row_key = key.as_ref().to_vec().into_boxed_slice();
                                 if is_inlined_conflict {
                                     deleted_inlined_row_keys.push(row_key);

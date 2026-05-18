@@ -154,9 +154,9 @@ impl DeletionIndex {
     ///
     /// # Performance
     ///
-    /// The `HashMap` clone is O(N) per call — unavoidable for the `ArcSwap`-published-
-    /// snapshot pattern without persistent data structures, which we deliberately
-    /// avoid as a dependency. The bloom filter is updated incrementally (O(K) inserts
+    /// With `Arc<HashMap>` + `Arc::make_mut`, the map clone is O(1) (refcount bump)
+    /// on the common single-writer path; only when readers hold the latest generation
+    /// do we pay O(N). The bloom filter is updated incrementally (O(K) inserts
     /// for K new keys) instead of being rebuilt from scratch every call. A full
     /// O(N) rebuild only happens when the entry count crosses `2 * bloom_capacity`,
     /// giving amortized O(K) bloom cost per call.
