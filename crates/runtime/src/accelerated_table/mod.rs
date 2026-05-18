@@ -1769,6 +1769,40 @@ impl TableProvider for AcceleratedTable {
             }
         }
     }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        self.accelerator.get_table_definition()
+    }
+
+    fn get_logical_plan(
+        &self,
+    ) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
+        self.accelerator.get_logical_plan()
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.accelerator.get_column_default(column)
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> DataFusionResult<datafusion::catalog::ScanResult> {
+        let plan = self
+            .scan(
+                state,
+                args.projection().map(<[usize]>::to_vec).as_ref(),
+                args.filters().unwrap_or(&[]),
+                args.limit(),
+            )
+            .await?;
+        Ok(plan.into())
+    }
+
+    async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.accelerator.truncate(state).await
+    }
 }
 
 /// Extends projection to include columns required by the caching pipeline

@@ -57,10 +57,22 @@ use datafusion::{
     },
     sql::TableReference,
 };
+use runtime_request_context::RequestContext;
 use tonic::codegen::Bytes;
 use tonic::transport::{Channel, channel};
 
 use crate::Read;
+
+/// Build a W3C `traceparent` header value (`00-{trace_id}-{span_id}-01`)
+/// from the typed `Arc<RequestContext>` extension on the
+/// [`TaskContext`]'s session config, if one is present. The fixed `01`
+/// trace flag marks the trace as sampled.
+#[must_use]
+pub fn trace_parent_from_task_context(context: &TaskContext) -> Option<String> {
+    let request_context = context.session_config().get_extension::<RequestContext>()?;
+    let tp = request_context.trace_parent().as_ref()?;
+    Some(format!("00-{}-{}-01", tp.trace_id, tp.span_id))
+}
 
 pub mod federation;
 
@@ -432,6 +444,12 @@ pub struct FlightSqlExec {
     properties: PlanProperties,
     cookie_store: Arc<CookieStore>,
     metrics: ExecutionPlanMetricsSet,
+    /// Optional W3C `traceparent` value (e.g. `00-{trace_id}-{span_id}-01`)
+    /// to attach as a gRPC metadata header on outgoing `execute()` and
+    /// `do_get()` calls. When `None`, `execute()` falls back to reading
+    /// the typed `Arc<RequestContext>` extension from the `TaskContext`
+    /// session config and constructs a header from its `trace_parent()`.
+    trace_parent: Option<String>,
 }
 
 impl FlightSqlExec {
@@ -460,7 +478,25 @@ impl FlightSqlExec {
             ),
             cookie_store,
             metrics: ExecutionPlanMetricsSet::new(),
+            trace_parent: None,
         })
+    }
+
+    /// Set an explicit W3C `traceparent` header value to forward on each
+    /// outgoing `FlightSQL` call. Useful when the plan-creation path has
+    /// access to an `Arc<RequestContext>` but the executor-side
+    /// `TaskContext` will not (e.g. when this `ExecutionPlan` is shipped
+    /// to a remote executor via Ballista codecs).
+    #[must_use]
+    pub fn with_trace_parent(mut self, trace_parent: Option<String>) -> Self {
+        self.trace_parent = trace_parent;
+        self
+    }
+
+    /// Returns the currently configured W3C `traceparent` value, if any.
+    #[must_use]
+    pub fn trace_parent(&self) -> Option<&str> {
+        self.trace_parent.as_deref()
     }
 
     /// Returns a reference to the underlying `FlightSqlClient`.
@@ -655,6 +691,7 @@ impl ExecutionPlan for FlightSqlExec {
             ),
             cookie_store: Arc::clone(&self.cookie_store),
             metrics: ExecutionPlanMetricsSet::new(),
+            trace_parent: self.trace_parent.clone(),
         };
 
         Ok(SortOrderPushdownResult::Exact {
@@ -665,7 +702,7 @@ impl ExecutionPlan for FlightSqlExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let sql = self.sql().map_err(to_execution_error)?;
         let target_schema = self.schema();
@@ -676,9 +713,19 @@ impl ExecutionPlan for FlightSqlExec {
 
         let baseline = datafusion::common::instant::Instant::now();
 
-        let inner = query_to_stream(self.client.clone(), sql, Arc::clone(&self.cookie_store)).map(
-            move |result| result.and_then(|batch| coerce_batch_to_schema(&batch, &target_schema)),
-        );
+        let mut client = self.client.clone();
+        let trace_parent = self
+            .trace_parent
+            .clone()
+            .or_else(|| trace_parent_from_task_context(&context));
+        if let Some(value) = trace_parent {
+            client.set_header("traceparent", value);
+        }
+
+        let inner =
+            query_to_stream(client, sql, Arc::clone(&self.cookie_store)).map(move |result| {
+                result.and_then(|batch| coerce_batch_to_schema(&batch, &target_schema))
+            });
 
         let timed_stream = stream! {
             futures::pin_mut!(inner);
@@ -727,6 +774,7 @@ impl ExecutionPlan for FlightSqlExec {
             properties: self.properties.clone(),
             cookie_store: Arc::clone(&self.cookie_store),
             metrics: ExecutionPlanMetricsSet::new(),
+            trace_parent: self.trace_parent.clone(),
         };
 
         Some(Arc::new(new_plan))

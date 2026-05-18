@@ -1,42 +1,27 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp)
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "[score]",
+      "_score": "0.03",
       "dataset": "qs",
       "matches": {
         "answer": [
-          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+          "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
         ],
         "question": [
-          "Which base number, when raised to the fifth power, equals thirty-two?"
+          "What is the fifth root of 32?"
         ]
       },
       "primary_key": {
-        "id": 1277
+        "id": 948
       }
     },
     {
-      "_score": "[score]",
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
-        ],
-        "question": [
-          "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
-        ]
-      },
-      "primary_key": {
-        "id": 189
-      }
-    },
-    {
-      "_score": "[score]",
+      "_score": "0.03",
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -51,18 +36,33 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "[score]",
+      "_score": "0.03",
       "dataset": "qs",
       "matches": {
         "answer": [
-          "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+          "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
         ],
         "question": [
-          "What is the fifth root of 32?"
+          "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
         ]
       },
       "primary_key": {
-        "id": 948
+        "id": 189
+      }
+    },
+    {
+      "_score": "0.03",
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+        ],
+        "question": [
+          "Which base number, when raised to the fifth power, equals thirty-two?"
+        ]
+      },
+      "primary_key": {
+        "id": 1277
       }
     }
   ]

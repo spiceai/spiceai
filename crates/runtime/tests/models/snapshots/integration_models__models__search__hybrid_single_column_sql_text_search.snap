@@ -1,11 +1,11 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: resp
+expression: resp?
 ---
 [
   {
     "id": 361,
     "answer": "The number of ways is \\( 18 \\times 17 \\times 16 = \\boxed{4896} \\).",
-    "trunc(text_search(qs, Utf8(\"second\"))._score,Int64(3))": "[score]"
+    "trunc(text_search(qs, Utf8(\"second\"))._score,Int64(3))": 5.065
   }
 ]
