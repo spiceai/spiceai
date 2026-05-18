@@ -23,6 +23,9 @@ use data_components::kafka::KafkaOffset;
 
 #[derive(Default)]
 pub(crate) struct OffsetSchemaState {
+    // This is intentionally scoped to a single sidecar instance. The DDL is
+    // idempotent, so separate KafkaSys/DebeziumKafkaSys instances may each
+    // ensure their table once without sharing process-wide state.
     ensured: AtomicBool,
 }
 
