@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 pub mod bytes_processed;
 pub mod data_source_tree_display;
+pub mod request_context;
 
 /// [`ExtensionPlanQueryPlanner`] implements [`QueryPlanner`] with a set of [`ExtensionPlanner`].
 ///

@@ -1,19 +1,19 @@
-select
-    s_i_id, sum(s_order_cnt) as ordercount
-from
+SELECT
+    s_i_id, sum(s_order_cnt) AS ordercount
+FROM
     stock, supplier, nation
-where
-    mod((s_w_id * s_i_id),10000) = s_suppkey
-    and s_nationkey = n_nationkey
-    and n_name = 'CHINA'
-group by
+WHERE
+    mod((s_w_id * s_i_id),10000) = su_suppkey
+    AND su_nationkey = n_nationkey
+    AND n_name = 'CHINA'
+GROUP BY
     s_i_id
-having
+HAVING
     sum(s_order_cnt) >
-    (select sum(s_order_cnt) * .005
-     from stock, supplier, nation
-     where mod((s_w_id * s_i_id),10000) = s_suppkey
-       and s_nationkey = n_nationkey
-       and n_name = 'CHINA')
-order by
-    ordercount desc;
+    (SELECT sum(s_order_cnt) * .005
+     FROM stock, supplier, nation
+     WHERE mod((s_w_id * s_i_id),10000) = su_suppkey
+       AND su_nationkey = n_nationkey
+       AND n_name = 'CHINA')
+ORDER BY
+    ordercount DESC;

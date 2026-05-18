@@ -286,14 +286,14 @@ pub async fn create_tables(client: &Client) -> Result<()> {
         (
             "supplier",
             "CREATE TABLE IF NOT EXISTS supplier (
-                s_suppkey BIGINT NOT NULL,
-                s_name CHAR(25) NOT NULL,
-                s_address VARCHAR(40) NOT NULL,
-                s_nationkey BIGINT NOT NULL,
-                s_phone CHAR(15) NOT NULL,
-                s_acctbal DOUBLE PRECISION NOT NULL,
-                s_comment VARCHAR(101) NOT NULL,
-                PRIMARY KEY (s_suppkey)
+                su_suppkey BIGINT NOT NULL,
+                su_name CHAR(25) NOT NULL,
+                su_address VARCHAR(40) NOT NULL,
+                su_nationkey BIGINT NOT NULL,
+                su_phone CHAR(15) NOT NULL,
+                su_acctbal DOUBLE PRECISION NOT NULL,
+                su_comment VARCHAR(101) NOT NULL,
+                PRIMARY KEY (su_suppkey)
             )",
         ),
     ];
@@ -359,10 +359,19 @@ const MUTATED_TABLES: &[&str] = &[
     "stock",
 ];
 
-/// Tables probed for staleness gap measurement.
-/// Selected for diversity: district (small, baseline), `order_line` (high volume),
-/// `new_order` (DELETE path).
-pub const STALENESS_PROBE_TABLES: &[&str] = &["district", "order_line", "new_order"];
+/// Tables probed for staleness gap measurement (alphabetical).
+/// All mutated TPC-C tables that are accelerated/replicated by Spice.
+/// Excludes static reference tables (`item`, `nation`, `region`, `supplier`)
+/// and `history` (no primary key, not supported for CDC replication).
+pub const STALENESS_PROBE_TABLES: &[&str] = &[
+    "customer",
+    "district",
+    "new_order",
+    "order_line",
+    "orders",
+    "stock",
+    "warehouse",
+];
 
 /// Add `_bench_ts TIMESTAMPTZ` column with `clock_timestamp()` default and
 /// a `BEFORE INSERT OR UPDATE` trigger to all mutated TPC-C tables.

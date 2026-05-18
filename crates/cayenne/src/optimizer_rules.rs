@@ -48,12 +48,13 @@ limitations under the License.
 //!    excluded — their semantics require the *absence* of a match, so sharing
 //!    the filter would drop rows the anti-join is supposed to preserve).
 //!
-//! 3. **Same-source anti / semi-join sort-merge rewrite.** `DataFusion` does not
-//!    create dynamic filters for anti joins, and q21's `NOT EXISTS` self-join
-//!    can leave large `HashJoinInput[N]` reservations behind.
+//! 3. **Same-source large-join sort-merge rewrite.** `DataFusion` does not
+//!    create dynamic filters for anti joins, and q21's multi-way same-source
+//!    joins can leave large `HashJoinInput[N]` reservations behind when the
+//!    exact dynamic-filter budget is exhausted.
 //!    [`CayenneAntiJoinSortMergeRewriter`] rewrites same-source Cayenne
-//!    `LeftAnti` / `RightAnti` / `LeftSemi` / `RightSemi` `HashJoinExec` nodes
-//!    to `SortMergeJoinExec` with explicit spillable `SortExec` inputs above a
+//!    `Inner` / outer / semi / anti `HashJoinExec` nodes to
+//!    `SortMergeJoinExec` with explicit spillable `SortExec` inputs above a
 //!    10M-row build-side threshold. Sort-merge preserves the join semantics for
 //!    each of these types without materializing a full non-spillable hash table
 //!    on the LEFT input (`HashJoinExec`'s build side, regardless of join type).
@@ -95,10 +96,10 @@ limitations under the License.
 //! `test_framework::queries::get_chbench_test_queries`.
 
 use arrow::compute::SortOptions;
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, IntervalUnit, SchemaRef};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion::common::{JoinType, NullEquality};
-use datafusion::config::ConfigOptions;
+use datafusion::common::{JoinType, NullEquality, extensions_options};
+use datafusion::config::{ConfigExtension, ConfigOptions};
 use datafusion::error::DataFusionError;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
@@ -113,7 +114,9 @@ use datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
-use runtime_datafusion::join_accumulator::ExactLeftAccumulator;
+use runtime_datafusion::join_accumulator::{
+    DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES, ExactLeftAccumulator,
+};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -152,23 +155,45 @@ impl std::fmt::Debug for CayenneDynamicFilterSharing {
     }
 }
 
-/// Rewrites same-source Cayenne anti and semi joins from hash join to
+/// Rewrites same-source large Cayenne joins from hash join to
 /// sort-merge join when the build side is large enough to risk OOM.
 ///
 /// `DataFusion`'s `HashJoinExec` always materializes its left input as the
-/// non-spillable build side regardless of join type. For q21's correlated
-/// `NOT EXISTS` self-join (a `LeftAnti`) that build side can be a large
-/// multi-way `order_line` result; the same shape arises in `EXISTS` /
-/// `IN (subquery)` constructs that decorrelate into `LeftSemi`. Sort-merge
-/// preserves the join semantics for each of these types while keeping the
+/// non-spillable build side regardless of join type. For q21, that build side
+/// can be a large multi-way `order_line` result not only for `NOT EXISTS` /
+/// `EXISTS` decorrelations, but also for ordinary same-source equi-joins when
+/// exact dynamic filtering is disabled by its shared memory cap. Sort-merge
+/// preserves the join semantics for supported equi-join types while keeping the
 /// build side spillable.
 #[derive(Default)]
 pub struct CayenneAntiJoinSortMergeRewriter;
 
-/// Only rewrite same-source anti or semi joins whose LEFT (build) input has
-/// `Precision::Exact` row count exceeding this threshold. Below it the
-/// in-memory hash table is faster than two explicit sort buffers.
+/// Only rewrite same-source joins whose LEFT (build) input has
+/// `Precision::Exact` row count exceeding this threshold. Below it, the
+/// in-memory hash table is usually faster than two explicit sort buffers.
 const ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS: usize = 10_000_000;
+const ANTI_JOIN_SORT_MERGE_MEMORY_POOL_FRACTION: f64 = 0.125;
+
+extensions_options! {
+    /// Cayenne optimizer configuration.
+    pub struct CayenneOptimizerConfig {
+        /// Minimum exact LEFT/build-side row count before considering the same-source hash-join to sort-merge rewrite.
+        pub sort_merge_min_rows: usize, default = ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS
+
+        /// Fraction of the query memory pool that the estimated hash-join build side must exceed before rewriting to sort-merge. Set to 0 to disable the memory gate.
+        pub sort_merge_memory_pool_fraction: f64, default = ANTI_JOIN_SORT_MERGE_MEMORY_POOL_FRACTION
+
+        /// Effective query memory pool size in bytes. Runtime wiring sets this from `runtime.query.memory_limit`; direct DataFusion users can leave it unset to use the row-count gate only.
+        pub sort_merge_memory_pool_bytes: Option<usize>, default = None
+
+        /// Maximum estimated LEFT/build-side join-key bytes before preserving DataFusion's default hash-join accumulator instead of using Cayenne's exact in-list accumulator.
+        pub exact_join_filter_max_bytes: usize, default = DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES
+    }
+}
+
+impl ConfigExtension for CayenneOptimizerConfig {
+    const PREFIX: &'static str = "cayenne";
+}
 
 impl CayenneAntiJoinSortMergeRewriter {
     /// Create a new `CayenneAntiJoinSortMergeRewriter` optimizer rule.
@@ -196,14 +221,15 @@ impl PhysicalOptimizerRule for CayenneAntiJoinSortMergeRewriter {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         plan.transform_down(|node| {
             let Some(hash_join) = node.as_any().downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));
             };
 
-            let Some(sort_merge_join) = try_rewrite_same_source_anti_join(hash_join)? else {
+            let Some(sort_merge_join) = try_rewrite_large_same_source_join(hash_join, config)?
+            else {
                 return Ok(Transformed::no(node));
             };
 
@@ -356,16 +382,24 @@ fn filter_additions_for_join(
     (left_additions, right_additions)
 }
 
-fn try_rewrite_same_source_anti_join(
+fn try_rewrite_large_same_source_join(
     hash_join: &HashJoinExec,
+    config: &ConfigOptions,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
-    // Same-source `LeftAnti`/`RightAnti`/`LeftSemi`/`RightSemi` joins all
-    // share the relevant property: `HashJoinExec` builds the LEFT input into
-    // a non-spillable hash table, so a large build side risks OOM. Sort-merge
-    // is spillable and preserves the join semantics for each of these types.
+    // These same-source joins all share the relevant property: `HashJoinExec`
+    // builds the LEFT input into a non-spillable hash table, so a large build
+    // side risks OOM. Sort-merge is spillable and preserves the join semantics
+    // for each of these types.
     if !matches!(
         hash_join.join_type(),
-        JoinType::LeftAnti | JoinType::RightAnti | JoinType::LeftSemi | JoinType::RightSemi,
+        JoinType::Inner
+            | JoinType::Left
+            | JoinType::Right
+            | JoinType::Full
+            | JoinType::LeftAnti
+            | JoinType::RightAnti
+            | JoinType::LeftSemi
+            | JoinType::RightSemi,
     ) {
         return Ok(None);
     }
@@ -381,8 +415,32 @@ fn try_rewrite_same_source_anti_join(
     let Some(build_row_count) = spillable_rewrite_build_input_exact_rows(hash_join) else {
         return Ok(None);
     };
-    if build_row_count <= ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS {
+    let optimizer_config = cayenne_optimizer_config(config);
+    let row_count_threshold = optimizer_config.sort_merge_min_rows;
+    if build_row_count <= row_count_threshold {
         return Ok(None);
+    }
+
+    let memory_gate_bytes = sort_merge_memory_gate_bytes(&optimizer_config);
+    let mut estimated_build_bytes = None;
+    if let Some(gate_bytes) = memory_gate_bytes {
+        let Some(estimated_bytes) =
+            build_side_memory_estimate(hash_join.left().as_ref(), build_row_count)
+        else {
+            return Ok(None);
+        };
+        if estimated_bytes <= gate_bytes {
+            tracing::debug!(
+                join_type = ?hash_join.join_type(),
+                build_row_count,
+                row_count_threshold,
+                estimated_build_bytes = estimated_bytes,
+                memory_gate_bytes = gate_bytes,
+                "Keeping same-source Cayenne HashJoinExec because estimated build side fits within memory gate"
+            );
+            return Ok(None);
+        }
+        estimated_build_bytes = Some(estimated_bytes);
     }
 
     let sort_options = vec![SortOptions::default(); hash_join.on().len()];
@@ -423,27 +481,204 @@ fn try_rewrite_same_source_anti_join(
     tracing::debug!(
         join_type = ?hash_join.join_type(),
         build_row_count,
-        threshold = ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS,
-        "Replacing same-source Cayenne anti/semi HashJoinExec with SortMergeJoinExec"
+        row_count_threshold,
+        estimated_build_bytes,
+        memory_gate_bytes,
+        "Replacing large same-source Cayenne HashJoinExec with SortMergeJoinExec"
     );
 
     Ok(Some(Arc::new(join)))
 }
 
+fn cayenne_optimizer_config(config: &ConfigOptions) -> CayenneOptimizerConfig {
+    config
+        .extensions
+        .get::<CayenneOptimizerConfig>()
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn sort_merge_memory_gate_bytes(config: &CayenneOptimizerConfig) -> Option<usize> {
+    let fraction = config.sort_merge_memory_pool_fraction;
+    if !fraction.is_finite() || fraction <= 0.0 {
+        return None;
+    }
+
+    config
+        .sort_merge_memory_pool_bytes
+        .map(|pool_bytes| fractional_bytes(pool_bytes, fraction))
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "DataFusion config exposes this memory gate as a fraction; saturating conversion is used for byte thresholds"
+)]
+fn fractional_bytes(bytes: usize, fraction: f64) -> usize {
+    let scaled = bytes as f64 * fraction;
+    if !scaled.is_finite() || scaled >= usize::MAX as f64 {
+        usize::MAX
+    } else if scaled <= 0.0 {
+        0
+    } else {
+        scaled as usize
+    }
+}
+
+fn build_side_memory_estimate(plan: &dyn ExecutionPlan, build_rows: usize) -> Option<usize> {
+    let row_width = plan
+        .schema()
+        .fields()
+        .iter()
+        .try_fold(0_usize, |acc, field| {
+            Some(acc.saturating_add(estimated_arrow_width(field.data_type())?))
+        })?;
+
+    Some(row_width.saturating_mul(build_rows))
+}
+
+fn estimated_arrow_width(data_type: &DataType) -> Option<usize> {
+    match data_type {
+        DataType::Null => Some(0),
+        DataType::Boolean | DataType::Int8 | DataType::UInt8 => Some(1),
+        DataType::Int16 | DataType::UInt16 | DataType::Float16 => Some(2),
+        DataType::Int32
+        | DataType::UInt32
+        | DataType::Float32
+        | DataType::Date32
+        | DataType::Time32(_)
+        | DataType::Interval(IntervalUnit::YearMonth)
+        | DataType::Decimal32(_, _) => Some(4),
+        DataType::Int64
+        | DataType::UInt64
+        | DataType::Float64
+        | DataType::Timestamp(_, _)
+        | DataType::Date64
+        | DataType::Time64(_)
+        | DataType::Duration(_)
+        | DataType::Decimal64(_, _)
+        | DataType::Interval(IntervalUnit::DayTime) => Some(8),
+        DataType::Interval(IntervalUnit::MonthDayNano) | DataType::Decimal128(_, _) => Some(16),
+        DataType::Decimal256(_, _) => Some(32),
+        DataType::FixedSizeBinary(size) => usize::try_from(*size).ok(),
+        DataType::Dictionary(_, value_type) => estimated_arrow_width(value_type)
+            .map(|width| width.saturating_add(std::mem::size_of::<u64>())),
+        DataType::FixedSizeList(field, length) => {
+            let length = usize::try_from(*length).ok()?;
+            estimated_arrow_width(field.data_type()).map(|width| width.saturating_mul(length))
+        }
+        DataType::Struct(fields) => fields.iter().try_fold(0_usize, |acc, field| {
+            Some(acc.saturating_add(estimated_arrow_width(field.data_type())?))
+        }),
+        DataType::RunEndEncoded(_, value_field) => estimated_arrow_width(value_field.data_type())
+            .map(|width| width.saturating_add(std::mem::size_of::<u64>())),
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::List(_)
+        | DataType::ListView(_)
+        | DataType::LargeList(_)
+        | DataType::LargeListView(_)
+        | DataType::Map(_, _)
+        | DataType::Union(_, _) => Some(64),
+    }
+}
+
 fn spillable_rewrite_build_input_exact_rows(hash_join: &HashJoinExec) -> Option<usize> {
     // `HashJoinExec` materializes the LEFT input as the (non-spillable) build
-    // hash table regardless of join type — including `*Anti` and `*Semi`.
-    let build_input = match hash_join.join_type() {
-        JoinType::LeftAnti | JoinType::RightAnti | JoinType::LeftSemi | JoinType::RightSemi => {
-            hash_join.left()
-        }
-        _ => return None,
-    };
+    // hash table regardless of join type.
+    let build_input = hash_join.left();
 
     match build_input.partition_statistics(None).ok()?.num_rows {
         Precision::Exact(row_count) => Some(row_count),
         Precision::Inexact(_) | Precision::Absent => None,
     }
+}
+
+fn exact_join_filter_build_estimate(hash_join: &HashJoinExec) -> Option<(usize, usize)> {
+    let build_row_count = spillable_rewrite_build_input_exact_rows(hash_join)?;
+    let build_schema = hash_join.left().schema();
+    let join_key_width = hash_join
+        .on()
+        .iter()
+        .try_fold(0_usize, |width, (left_key, _)| {
+            let data_type = left_key.data_type(build_schema.as_ref()).ok()?;
+            if !supports_exact_join_filter_fallback(&data_type) {
+                return None;
+            }
+            Some(width.saturating_add(estimated_arrow_width(&data_type)?))
+        })?;
+
+    Some((
+        build_row_count,
+        build_row_count.saturating_mul(join_key_width),
+    ))
+}
+
+fn supports_exact_join_filter_fallback(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+    )
+}
+
+fn should_rewrite_with_exact_accumulator(hash_join: &HashJoinExec, config: &ConfigOptions) -> bool {
+    if *hash_join.join_type() != JoinType::Inner {
+        tracing::debug!(
+            join_type = ?hash_join.join_type(),
+            "Keeping HashJoinExec default accumulator because DataFusion only pushes join dynamic filters through inner joins"
+        );
+        return false;
+    }
+
+    let optimizer_config = cayenne_optimizer_config(config);
+    let max_build_bytes = optimizer_config.exact_join_filter_max_bytes;
+    let Some((build_row_count, estimated_build_bytes)) =
+        exact_join_filter_build_estimate(hash_join)
+    else {
+        tracing::debug!(
+            "Keeping HashJoinExec default accumulator because exact build-side join-key statistics or fallback-compatible key types are unavailable"
+        );
+        return false;
+    };
+
+    if estimated_build_bytes > max_build_bytes {
+        tracing::debug!(
+            build_row_count,
+            estimated_build_bytes,
+            max_build_bytes,
+            "Keeping HashJoinExec default accumulator because estimated exact join-filter memory exceeds the configured budget"
+        );
+        return false;
+    }
+
+    true
 }
 
 fn join_key_ordering(
@@ -759,7 +994,7 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
     fn optimize(
         &self,
         plan: std::sync::Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         // For each `HashJoinExec`, determine if probe side is a `CayenneAccelerationExec` with a Cayenne accelerator
         // If so, that `HashJoinExec` can be replaced with one which uses a `ExactLeftAccumulator` so we can push down exact dynamic filter bounds into Cayenne
@@ -791,6 +1026,10 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
                 return Ok(Transformed::no(node));
             }
 
+            if !should_rewrite_with_exact_accumulator(hash_join, config) {
+                return Ok(Transformed::no(node));
+            }
+
             tracing::debug!(
                 "Replacing HashJoinExec with ExactLeftAccumulator for Cayenne acceleration"
             );
@@ -807,8 +1046,8 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
 mod tests {
     use super::{
         ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS, CayenneAntiJoinSortMergeRewriter,
-        CayenneDynamicFilterSharing, CayenneJoinRewriter, FilterAddition, apply_filter_additions,
-        plan_schema_fields,
+        CayenneDynamicFilterSharing, CayenneJoinRewriter, CayenneOptimizerConfig, FilterAddition,
+        apply_filter_additions, plan_schema_fields,
     };
     use crate::provider::CayenneAccelerationExec;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -935,11 +1174,11 @@ mod tests {
     }
 
     fn memory_exec(column_name: &str) -> Arc<dyn ExecutionPlan> {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            column_name,
-            DataType::Int32,
-            false,
-        )]));
+        memory_exec_with_type(column_name, DataType::Int32)
+    }
+
+    fn memory_exec_with_type(column_name: &str, data_type: DataType) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new(column_name, data_type, false)]));
         MemorySourceConfig::try_new_exec(&[vec![]], schema, None)
             .expect("memory exec should be valid")
     }
@@ -1141,8 +1380,15 @@ mod tests {
     }
 
     fn optimize(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        optimize_with_config(plan, &ConfigOptions::default())
+    }
+
+    fn optimize_with_config(
+        plan: Arc<dyn ExecutionPlan>,
+        config: &ConfigOptions,
+    ) -> Arc<dyn ExecutionPlan> {
         CayenneJoinRewriter::new()
-            .optimize(plan, &ConfigOptions::default())
+            .optimize(plan, config)
             .expect("optimizer should succeed")
     }
 
@@ -1153,9 +1399,44 @@ mod tests {
     }
 
     fn optimize_anti_join_sort_merge(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        optimize_anti_join_sort_merge_with_config(plan, &ConfigOptions::default())
+    }
+
+    fn optimize_anti_join_sort_merge_with_config(
+        plan: Arc<dyn ExecutionPlan>,
+        config: &ConfigOptions,
+    ) -> Arc<dyn ExecutionPlan> {
         CayenneAntiJoinSortMergeRewriter::new()
-            .optimize(plan, &ConfigOptions::default())
+            .optimize(plan, config)
             .expect("anti join sort-merge optimizer should succeed")
+    }
+
+    fn config_with_cayenne_optimizer(
+        sort_merge_min_rows: Option<usize>,
+        sort_merge_memory_pool_fraction: Option<f64>,
+        sort_merge_memory_pool_bytes: Option<usize>,
+    ) -> ConfigOptions {
+        let mut config = ConfigOptions::default();
+        let mut cayenne_config = CayenneOptimizerConfig::default();
+        if let Some(sort_merge_min_rows) = sort_merge_min_rows {
+            cayenne_config.sort_merge_min_rows = sort_merge_min_rows;
+        }
+        if let Some(sort_merge_memory_pool_fraction) = sort_merge_memory_pool_fraction {
+            cayenne_config.sort_merge_memory_pool_fraction = sort_merge_memory_pool_fraction;
+        }
+        cayenne_config.sort_merge_memory_pool_bytes = sort_merge_memory_pool_bytes;
+        config.extensions.insert(cayenne_config);
+        config
+    }
+
+    fn config_with_exact_join_filter_max_bytes(max_bytes: usize) -> ConfigOptions {
+        let mut config = ConfigOptions::default();
+        let cayenne_config = CayenneOptimizerConfig {
+            exact_join_filter_max_bytes: max_bytes,
+            ..CayenneOptimizerConfig::default()
+        };
+        config.extensions.insert(cayenne_config);
+        config
     }
 
     fn plan_snapshot(plan: &Arc<dyn ExecutionPlan>) -> String {
@@ -1208,6 +1489,80 @@ mod tests {
         assert!(
             optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
             "Null-equal joins should keep the default accumulator to preserve probe NULL matches"
+        );
+    }
+
+    #[test]
+    fn leaves_non_inner_hash_join_unchanged() {
+        let left = memory_exec("left_id");
+        let right = Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "left_id",
+            "right_id",
+            JoinType::LeftSemi,
+            NullEquality::NullEqualsNothing,
+        ));
+
+        let optimized = optimize(join);
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "Non-inner joins should keep DataFusion's default accumulator"
+        );
+    }
+
+    #[test]
+    fn leaves_hash_join_with_unknown_build_stats_unchanged() {
+        let schema = order_line_schema();
+        let left = file_exec(&schema, "left.vortex", None);
+        let right = cayenne_file_exec(&schema, "right.vortex", None);
+        let join = Arc::new(hash_join(left, right, "order_id", "order_id"));
+
+        let optimized = optimize(join);
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "Joins without exact build-side row statistics should keep DataFusion's default accumulator"
+        );
+    }
+
+    #[test]
+    fn leaves_large_exact_build_side_unchanged() {
+        let schema = order_line_schema();
+        let left = file_exec_with_statistics(
+            &schema,
+            "left.vortex",
+            None,
+            Statistics::new_unknown(&schema).with_num_rows(Precision::Exact(2)),
+        );
+        let right = cayenne_file_exec(&schema, "right.vortex", None);
+        let join = Arc::new(hash_join(left, right, "order_id", "order_id"));
+        let config = config_with_exact_join_filter_max_bytes(8);
+
+        let optimized = optimize_with_config(join, &config);
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "Estimated exact join-filter bytes above the budget should keep DataFusion's default accumulator"
+        );
+    }
+
+    #[test]
+    fn leaves_hash_join_with_unsupported_exact_fallback_type_unchanged() {
+        let left = memory_exec_with_type("left_id", DataType::Boolean);
+        let right = Arc::new(CayenneAccelerationExec::new(memory_exec_with_type(
+            "right_id",
+            DataType::Boolean,
+        )));
+        let join = Arc::new(hash_join(left, right, "left_id", "right_id"));
+
+        let optimized = optimize(join);
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "Join-key types without a real exhausted-memory fallback should keep DataFusion's default accumulator"
         );
     }
 
@@ -1581,6 +1936,52 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_same_source_inner_hash_join_to_sort_merge_when_build_side_is_large() {
+        let schema = order_line_schema();
+        let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let right = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+
+        let optimized = optimize_anti_join_sort_merge(join);
+        let sort_merge = optimized
+            .as_any()
+            .downcast_ref::<SortMergeJoinExec>()
+            .expect("large same-source Cayenne inner join should use sort-merge join");
+
+        assert_eq!(JoinType::Inner, sort_merge.join_type());
+    }
+
+    #[test]
+    fn rewrites_same_source_left_hash_join_to_sort_merge_when_build_side_is_large() {
+        let schema = order_line_schema();
+        let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let right = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::Left,
+            NullEquality::NullEqualsNothing,
+        ));
+
+        let optimized = optimize_anti_join_sort_merge(join);
+        let sort_merge = optimized
+            .as_any()
+            .downcast_ref::<SortMergeJoinExec>()
+            .expect("large same-source Cayenne left join should use sort-merge join");
+
+        assert_eq!(JoinType::Left, sort_merge.join_type());
+    }
+
+    #[test]
     fn rewrites_same_source_multi_key_left_anti_hash_join_to_sort_merge() {
         let schema = order_line_schema();
         let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
@@ -1627,6 +2028,28 @@ mod tests {
     }
 
     #[test]
+    fn leaves_unrelated_inner_hash_join_unchanged() {
+        let schema = order_line_schema();
+        let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let right = large_exact_cayenne_file_exec(&schema, "other_order_line.vortex");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+
+        let optimized = optimize_anti_join_sort_merge(join);
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "inner joins over unrelated sources should stay as hash joins"
+        );
+    }
+
+    #[test]
     fn leaves_exact_small_same_source_left_anti_hash_join_unchanged() {
         let schema = order_line_schema();
         let left = cayenne_file_exec_with_num_rows(
@@ -1649,6 +2072,82 @@ mod tests {
         assert!(
             optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
             "same-source anti joins at or below the large-input threshold should stay as hash joins"
+        );
+    }
+
+    #[test]
+    fn leaves_same_source_left_anti_hash_join_when_configured_min_rows_is_higher() {
+        let schema = order_line_schema();
+        let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let right = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::LeftAnti,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config = config_with_cayenne_optimizer(
+            Some(ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS + 2),
+            None,
+            None,
+        );
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "configured min-row threshold should keep smaller build sides as hash joins"
+        );
+    }
+
+    #[test]
+    fn leaves_same_source_left_anti_hash_join_when_build_estimate_fits_memory_gate() {
+        let schema = order_line_schema();
+        let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let right = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::LeftAnti,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(4 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "estimated build side within the configured memory fraction should stay a hash join"
+        );
+    }
+
+    #[test]
+    fn rewrites_same_source_left_anti_hash_join_when_build_estimate_exceeds_memory_gate() {
+        let schema = order_line_schema();
+        let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let right = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::LeftAnti,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(64 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized
+                .as_any()
+                .downcast_ref::<SortMergeJoinExec>()
+                .is_some(),
+            "estimated build side above the configured memory fraction should use sort-merge"
         );
     }
 
