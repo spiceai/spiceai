@@ -41,7 +41,7 @@ const GLOBAL_VALUE_FLAGS: &[&str] = &[
     "--http-endpoint",
     "--tls-root-certificate-file",
 ];
-const DIRECT_SHORTCUT_VALUE_FLAGS: &[&str] = &[
+const SQL_DIRECT_SHORTCUT_VALUE_FLAGS: &[&str] = &[
     "--api-key",
     "--cloud-region",
     "--http-endpoint",
@@ -51,6 +51,16 @@ const DIRECT_SHORTCUT_VALUE_FLAGS: &[&str] = &[
     "--cache-control",
     "--client-tls-certificate-file",
     "--client-tls-key-file",
+    "--headers",
+    "--output",
+    "-o",
+];
+const CHAT_DIRECT_SHORTCUT_VALUE_FLAGS: &[&str] = &[
+    "--api-key",
+    "--cloud-region",
+    "--http-endpoint",
+    "--tls-root-certificate-file",
+    "--endpoint",
     "--headers",
     "--model",
     "-m",
@@ -326,7 +336,12 @@ fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Ve
 
     while let Some(arg) = args.next() {
         if arg == OsStr::new("-sql") {
-            normalized.extend(normalize_direct_shortcut_args(args, "sql", "--query"));
+            normalized.extend(normalize_direct_shortcut_args(
+                args,
+                "sql",
+                "--query",
+                SQL_DIRECT_SHORTCUT_VALUE_FLAGS,
+            ));
             break;
         }
 
@@ -335,6 +350,7 @@ fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Ve
                 args,
                 "chat",
                 "--direct-prompt",
+                CHAT_DIRECT_SHORTCUT_VALUE_FLAGS,
             ));
             break;
         }
@@ -391,6 +407,7 @@ fn normalize_direct_shortcut_args(
     args: impl IntoIterator<Item = OsString>,
     command: &str,
     value_flag: &str,
+    value_flags: &[&str],
 ) -> Vec<OsString> {
     let mut passthrough = Vec::new();
     let mut direct_value = None;
@@ -434,7 +451,7 @@ fn normalize_direct_shortcut_args(
             continue;
         }
 
-        let consumes_value = direct_shortcut_flag_consumes_value(&arg_text);
+        let consumes_value = direct_shortcut_flag_consumes_value(&arg_text, value_flags);
         passthrough.push(arg);
 
         if consumes_value && let Some(value) = args.next() {
@@ -544,8 +561,8 @@ fn legacy_region_parts_match(prefix: &str, area: &str, zone: &str) -> bool {
         && zone.chars().all(|c| c.is_ascii_digit())
 }
 
-fn direct_shortcut_flag_consumes_value(value: &str) -> bool {
-    !value.contains('=') && DIRECT_SHORTCUT_VALUE_FLAGS.contains(&value)
+fn direct_shortcut_flag_consumes_value(value: &str, value_flags: &[&str]) -> bool {
+    !value.contains('=') && value_flags.contains(&value)
 }
 
 fn cloud_region_from_equals(value: &OsStr) -> Option<&str> {
@@ -1239,6 +1256,18 @@ mod tests {
     }
 
     #[test]
+    fn cloud_region_without_cloud_is_rejected() {
+        let Err(error) = try_parse_normalized(&["spice", "--cloud-region", "us-west-2", "status"])
+        else {
+            panic!("cloud-region without cloud should fail parsing");
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("--cloud"));
+        assert!(message.contains("--cloud-region"));
+    }
+
+    #[test]
     fn cloud_flag_accepts_legacy_region_value() {
         let cli = parse_normalized(&["spice", "--cloud", "us-west-2", "status"]);
         assert!(cli.cloud);
@@ -1395,6 +1424,26 @@ mod tests {
             panic!("expected sql command");
         };
         assert_eq!(args.query.as_deref(), Some("show tables"));
+    }
+
+    #[test]
+    fn direct_shortcut_value_flags_are_scoped_to_target_command() {
+        assert!(direct_shortcut_flag_consumes_value(
+            "--cache-control",
+            SQL_DIRECT_SHORTCUT_VALUE_FLAGS
+        ));
+        assert!(!direct_shortcut_flag_consumes_value(
+            "--cache-control",
+            CHAT_DIRECT_SHORTCUT_VALUE_FLAGS
+        ));
+        assert!(direct_shortcut_flag_consumes_value(
+            "--temperature",
+            CHAT_DIRECT_SHORTCUT_VALUE_FLAGS
+        ));
+        assert!(!direct_shortcut_flag_consumes_value(
+            "--temperature",
+            SQL_DIRECT_SHORTCUT_VALUE_FLAGS
+        ));
     }
 
     #[test]

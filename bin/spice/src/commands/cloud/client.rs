@@ -192,31 +192,20 @@ impl CloudClient {
         executor_cpu: Option<i32>,
         executor_memory: Option<NumBytes>,
     ) -> Result<App> {
-        let resources = build_resources(cpu, memory);
-        let executor = build_executor(executor_replicas, executor_cpu, executor_memory);
-
-        let (tags, replicas) = match kind {
-            AppKind::Cluster => {
-                let mut t = BTreeMap::new();
-                t.insert("kind".to_string(), "cluster".to_string());
-                (Some(t), Some(1))
-            }
-            AppKind::Set => (None, replicas),
-        };
-
-        let request = CreateAppRequest {
-            name: name.to_string(),
-            description: description.map(String::from),
-            visibility: visibility.to_string(),
-            // The Cloud create-app endpoint currently accepts the target deployment region
-            // in the legacy `cname` request field; update-app uses the newer `region` field.
-            cname: Some(region.to_string()),
-            tags,
+        let request = build_create_app_request(
+            name,
+            region,
+            kind,
+            description,
+            visibility,
             replicas,
-            resources,
-            executor,
+            cpu,
+            memory,
             storage_size_gb,
-        };
+            executor_replicas,
+            executor_cpu,
+            executor_memory,
+        );
         self.inner.create_app(&request).await.map_err(into_cli)
     }
 
@@ -457,6 +446,48 @@ pub fn parse_org_app(org_app: &str) -> (String, String) {
 
 use super::bytes::NumBytes;
 
+#[expect(clippy::too_many_arguments)]
+fn build_create_app_request(
+    name: &str,
+    region: &str,
+    kind: AppKind,
+    description: Option<&str>,
+    visibility: &str,
+    replicas: Option<i32>,
+    cpu: Option<i32>,
+    memory: Option<NumBytes>,
+    storage_size_gb: Option<f64>,
+    executor_replicas: Option<i32>,
+    executor_cpu: Option<i32>,
+    executor_memory: Option<NumBytes>,
+) -> CreateAppRequest {
+    let resources = build_resources(cpu, memory);
+    let executor = build_executor(executor_replicas, executor_cpu, executor_memory);
+
+    let (tags, replicas) = match kind {
+        AppKind::Cluster => {
+            let mut tags = BTreeMap::new();
+            tags.insert("kind".to_string(), "cluster".to_string());
+            (Some(tags), Some(1))
+        }
+        AppKind::Set => (None, replicas),
+    };
+
+    CreateAppRequest {
+        name: name.to_string(),
+        description: description.map(String::from),
+        visibility: visibility.to_string(),
+        // The Cloud create-app endpoint currently accepts the target deployment region
+        // in the legacy `cname` request field; update-app uses the newer `region` field.
+        cname: Some(region.to_string()),
+        tags,
+        replicas,
+        resources,
+        executor,
+        storage_size_gb,
+    }
+}
+
 /// Build an [`AppResources`] from optional CPU (vCPUs) and a parsed [`NumBytes`] memory value.
 ///
 /// Returns `None` if neither is provided.
@@ -548,5 +579,34 @@ mod tests {
         let resources = executor.resources.expect("executor resources should exist");
         assert_eq!(resources.limits.cpu.as_deref(), Some("2"));
         assert!(resources.limits.memory.is_none());
+    }
+
+    #[test]
+    fn create_app_request_sends_region_as_cname() {
+        let request = build_create_app_request(
+            "app",
+            "us-east-1-prod-aws-data",
+            AppKind::Set,
+            None,
+            "private",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let value = serde_json::to_value(request).expect("create app request should serialize");
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "name": "app",
+                "visibility": "private",
+                "cname": "us-east-1-prod-aws-data"
+            })
+        );
     }
 }

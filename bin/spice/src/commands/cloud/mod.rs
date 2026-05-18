@@ -1424,7 +1424,7 @@ fn validate_create_app_args(args: &CreateAppArgs) -> Result<()> {
     if args.kind == AppKind::Cluster {
         if args.replicas != Some(1) {
             return Err(crate::error::Error::InvalidArgument {
-                message: "SpicepodCluster requires --replicas 1".to_string(),
+                message: "Cluster apps require --replicas 1".to_string(),
             });
         }
 
@@ -1442,7 +1442,7 @@ fn validate_create_app_args(args: &CreateAppArgs) -> Result<()> {
         if !missing.is_empty() {
             return Err(crate::error::Error::InvalidArgument {
                 message: format!(
-                    "SpicepodCluster requires explicit executor configuration: {}",
+                    "Cluster apps require explicit executor configuration: {}",
                     missing.join(", ")
                 ),
             });
@@ -1983,7 +1983,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "Invalid argument: SpicepodCluster requires --replicas 1"
+            "Invalid argument: Cluster apps require --replicas 1"
         );
     }
 
@@ -1994,7 +1994,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "Invalid argument: SpicepodCluster requires explicit executor configuration: --executor-replicas, --executor-cpu, --executor-memory"
+            "Invalid argument: Cluster apps require explicit executor configuration: --executor-replicas, --executor-cpu, --executor-memory"
         );
     }
 
