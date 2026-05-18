@@ -6,7 +6,7 @@ expression: "normalize_search_response(resp, round_scores)"
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "[score]",
+      "_score": "0.01",
       "data": {
         "question": "Perform the division \\(4 \\div 10\\) and express the resulting decimal in words."
       },
@@ -21,7 +21,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "[score]",
+      "_score": "0.01",
       "data": {
         "question": "In which of the following compounds, cations are present in tetrahedral voids?  \na. ZnS  \nb. SrF₂  \nc. NaBr  \nd. Na₂O"
       },
@@ -36,7 +36,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "[score]",
+      "_score": "0.01",
       "data": {
         "question": "How many chirality centers does cholesterol have?"
       },
@@ -51,7 +51,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "[score]",
+      "_score": "0.01",
       "data": {
         "question": "Find the missing factor in the equation: \\( 42 = 21 \\times \\,? \\)."
       },
