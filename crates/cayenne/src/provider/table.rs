@@ -925,6 +925,13 @@ pub struct CayenneTableProvider {
     /// after writes. This gives `DataFusion` synchronous access to Cayenne stats
     /// without querying the async catalog from `TableProvider::statistics`.
     table_statistics: Arc<RwLock<Option<Statistics>>>,
+    /// Raw `TableStatistics` blob cached alongside the derived optimizer-facing
+    /// `table_statistics`. `persist_table_stats` reads this to skip the
+    /// `get_table_statistics` round trip on every post-write maintenance cycle:
+    /// after the in-process writer just upserted the blob on the prior cycle,
+    /// the catalog read returns exactly that value back. Cleared in lockstep
+    /// with the derived cache via [`Self::clear_cached_table_statistics`].
+    cached_table_statistics_blob: Arc<RwLock<Option<TableStatistics>>>,
     /// Optional retention filters that should be applied immediately after writes.
     retention_filters: Vec<Expr>,
     /// Optional builder to construct time-based retention filter.
@@ -2816,6 +2823,7 @@ impl CayenneTableProvider {
             listing_fence: Arc::new(tokio::sync::RwLock::new(())),
             scan_listing_tables: Arc::new(ParkingMutex::new(HashMap::new())),
             table_statistics: Arc::new(RwLock::new(table_statistics)),
+            cached_table_statistics_blob: Arc::new(RwLock::new(None)),
             retention_filters,
             time_retention_filter_builder,
             context,
@@ -3248,6 +3256,7 @@ impl CayenneTableProvider {
             listing_fence: Arc::clone(&self.listing_fence),
             scan_listing_tables: Arc::clone(&self.scan_listing_tables),
             table_statistics: Arc::clone(&self.table_statistics),
+            cached_table_statistics_blob: Arc::clone(&self.cached_table_statistics_blob),
             context: Arc::clone(&self.context),
             retention_filters: self.retention_filters.clone(),
             time_retention_filter_builder: self.time_retention_filter_builder.clone(),
@@ -3399,6 +3408,10 @@ impl CayenneTableProvider {
 
     pub(crate) fn clear_cached_table_statistics(&self) {
         self.set_cached_table_statistics(None);
+        // Drop the raw blob cache too so the next `persist_table_stats` cycle
+        // re-fetches authoritative state from the catalog (e.g. after an
+        // overwrite invalidated the in-memory view).
+        *self.cached_table_statistics_blob.write() = None;
     }
 
     fn take_cached_pk_keyset(&self) -> Option<HashMap<OwnedRow, RowLocation>> {
@@ -4367,16 +4380,11 @@ impl CayenneTableProvider {
             return Ok(());
         }
 
+        // Track new position-based deletions for the in-memory cache update
+        // below. This walks the same `results` list we'd otherwise enumerate
+        // during per-file `add_delete_file` calls.
         let mut new_deleted_rows = RoaringBitmap::new();
-        // Register new delete files
         for result in &results {
-            self.catalog
-                .add_delete_file(result.delete_file.clone())
-                .await
-                .map_err(|err| CatalogError::InvalidOperationNoSource {
-                    message: format!("Failed to register delete file: {err}"),
-                })?;
-
             if let DeletionIdentifier::PositionBased { row_ids, .. } = &result.identifiers {
                 for &row_id in row_ids {
                     if let Ok(row_id_u32) = u32::try_from(row_id) {
@@ -4386,21 +4394,27 @@ impl CayenneTableProvider {
             }
         }
 
-        // Persist insert records for reinserted PKs so sequence-based visibility survives restart.
-        // Without this, caches may allow reinserted rows in-process, but after restart the
-        // catalog reload would miss insert sequences and incorrectly hide rows as deleted.
-        if !pk_bytes_list_for_insert_records.is_empty() {
-            self.catalog
-                .add_insert_records_batch(
-                    &self.table_metadata.table_id,
-                    pk_bytes_list_for_insert_records,
-                    insert_sequence,
-                )
-                .await
-                .map_err(|err| CatalogError::InvalidOperationNoSource {
-                    message: format!("Failed to persist insert records for upserted PKs: {err}"),
-                })?;
-        }
+        // Atomically commit every delete-file row AND every insert-record row
+        // in one catalog transaction. Replaces the legacy
+        // `add_delete_file × N` + `add_insert_records_batch` sequence which
+        // left a crash window where deletion records could persist without
+        // their corresponding insert sequences — see
+        // `crates/cayenne/benches/apply_on_conflict_rpc_ceiling.rs` for the
+        // before-numbers (collapses `N+2` RPCs to 2 plus the existing
+        // `increment_sequence_number`).
+        let delete_files: Vec<crate::metadata::DeleteFile> =
+            results.iter().map(|r| r.delete_file.clone()).collect();
+        self.catalog
+            .commit_on_conflict_deletions(
+                delete_files,
+                &self.table_metadata.table_id,
+                pk_bytes_list_for_insert_records,
+                insert_sequence,
+            )
+            .await
+            .map_err(|err| CatalogError::InvalidOperationNoSource {
+                message: format!("Failed to commit on-conflict deletions: {err}"),
+            })?;
 
         // For PK-based strategies, keep old delete files to preserve deletion history.
         // Each upsert round may affect a different subset of PKs, so removing old files
@@ -5786,18 +5800,30 @@ impl CayenneTableProvider {
             return;
         };
 
-        let existing_stats = match self
-            .catalog
-            .get_table_statistics(&self.table_metadata.table_id)
-            .await
-        {
-            Ok(stats) => stats,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to load existing table stats for {} before merge: {e}",
-                    self.table_metadata.table_name
-                );
-                None
+        // In the steady state we just wrote this blob ourselves on the prior
+        // maintenance cycle and the cache snapshot is exactly what the catalog
+        // would return, so skip the round trip. On a cold start, or after
+        // `clear_cached_table_statistics` (e.g. overwrite path), the cache is
+        // `None` and we fall back to the catalog once to seed it.
+        let existing_stats = {
+            let cached = self.cached_table_statistics_blob.read().clone();
+            if cached.is_some() {
+                cached
+            } else {
+                match self
+                    .catalog
+                    .get_table_statistics(&self.table_metadata.table_id)
+                    .await
+                {
+                    Ok(stats) => stats,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to load existing table stats for {} before merge: {e}",
+                            self.table_metadata.table_name
+                        );
+                        None
+                    }
+                }
             }
         };
 
@@ -5831,10 +5857,14 @@ impl CayenneTableProvider {
             return;
         }
 
-        self.set_cached_table_statistics(Self::table_statistics_to_df(
-            &self.table_metadata.schema,
-            &stats,
-        ));
+        let df_stats = Self::table_statistics_to_df(&self.table_metadata.schema, &stats);
+        // Seed the blob cache with the just-upserted state so the next
+        // maintenance cycle can merge in memory instead of paying a
+        // `get_table_statistics` round trip. Done before publishing the
+        // derived `Statistics` to keep the two caches consistent on the
+        // optimizer-visible read path.
+        *self.cached_table_statistics_blob.write() = Some(stats);
+        self.set_cached_table_statistics(df_stats);
     }
 
     /// Write small batches directly to the metastore, optionally atomically
@@ -7075,20 +7105,20 @@ impl CayenneTableProvider {
         min_delete_seq_to_apply: i64,
         deletion_snapshot: &PkDeletionSnapshot,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        // Previously this rebuilt a per-snapshot `DeletionIndex` via
+        // `HashMap::collect` + bloom-filter rebuild — O(N · M) per scan
+        // where N = #protected_snapshots and M = total deletion entries.
+        // The fix shares the existing index across snapshots and pushes
+        // the per-snapshot `min_seq` filter into the probe loop, which
+        // already pays a bloom prefilter; one integer comparison per
+        // confirmed match is amortized to ~zero per row. See
+        // `crates/cayenne/benches/apply_partial_deletion_filter_per_scan.rs`
+        // for the before-numbers.
         match deletion_snapshot {
             PkDeletionSnapshot::Int64Pk {
                 deleted_pk_values, ..
             } => {
-                // Filter to only include deletions with seq > min_delete_seq_to_apply.
-                let filtered_deletions: HashMap<i64, i64> = deleted_pk_values
-                    .entries()
-                    .iter()
-                    .filter(|(_, seq)| **seq > min_delete_seq_to_apply)
-                    .map(|(&pk, &seq)| (pk, seq))
-                    .collect();
-
-                if filtered_deletions.is_empty() {
-                    // No deletions to apply, return plan as-is
+                if deleted_pk_values.is_empty() {
                     return Ok(Arc::new(CayenneAccelerationExec::new(plan)));
                 }
 
@@ -7100,37 +7130,30 @@ impl CayenneTableProvider {
                     })?;
 
                 let empty_insert_records = Arc::new(DeletionIndex::empty());
-                Ok(Arc::new(Int64PkDeletionFilterExec::new(
+                Ok(Arc::new(Int64PkDeletionFilterExec::new_with_min_seq(
                     plan,
-                    Arc::new(DeletionIndex::from_map(filtered_deletions)),
+                    Arc::clone(deleted_pk_values),
                     empty_insert_records,
                     pk_column_index,
+                    Some(min_delete_seq_to_apply),
                 )))
             }
             PkDeletionSnapshot::RowConverterBased {
                 deleted_row_keys, ..
             } => {
-                // Similar logic for RowConverter-based strategy
                 if let Some(ref row_converter) = self.pk_row_converter {
-                    // Filter to only include deletions with seq > min_delete_seq_to_apply.
-                    let filtered_deletions: HashMap<Box<[u8]>, i64> = deleted_row_keys
-                        .entries()
-                        .iter()
-                        .filter(|(_, seq)| **seq > min_delete_seq_to_apply)
-                        .map(|(key, &seq)| (key.clone(), seq))
-                        .collect();
-
-                    if filtered_deletions.is_empty() {
+                    if deleted_row_keys.is_empty() {
                         return Ok(Arc::new(CayenneAccelerationExec::new(plan)));
                     }
 
                     let empty_insert_records = Arc::new(KeyDeletionIndex::empty());
-                    Ok(Arc::new(KeyBasedDeletionFilterExec::new(
+                    Ok(Arc::new(KeyBasedDeletionFilterExec::new_with_min_seq(
                         plan,
-                        Arc::new(KeyDeletionIndex::from_map(filtered_deletions)),
+                        Arc::clone(deleted_row_keys),
                         empty_insert_records,
                         pk_indices_in_projection.to_vec(),
                         Arc::clone(row_converter),
+                        Some(min_delete_seq_to_apply),
                     )))
                 } else {
                     Ok(Arc::new(CayenneAccelerationExec::new(plan)))
@@ -8834,6 +8857,56 @@ mod tests {
                 .output_partitioning()
                 .partition_count(),
             4
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_cached_table_statistics_drops_blob_cache() {
+        // Regression for the iter-6 `cached_table_statistics_blob` cache.
+        // `clear_cached_table_statistics` must drop BOTH the derived
+        // `Statistics` cache and the raw `TableStatistics` blob cache, otherwise
+        // a post-overwrite `persist_table_stats` would re-seed the catalog with
+        // stale pre-overwrite stats merged into the new accumulator. See the
+        // iter-8 race analysis in this PR's loop history.
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_sorted_cayenne_table(
+            "clear_cached_stats_blob_test",
+            schema,
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        // Seed both caches with placeholder state to model the steady-state
+        // after a successful `persist_table_stats` upsert.
+        provider.set_cached_table_statistics(Some(datafusion_common::Statistics::new_unknown(
+            &provider.table_metadata.schema,
+        )));
+        *provider.cached_table_statistics_blob.write() = Some(crate::metadata::TableStatistics {
+            table_id: provider.table_metadata.table_id.clone(),
+            statistics_blob: vec![1, 2, 3, 4],
+            num_rows: 7,
+        });
+
+        assert!(
+            provider.table_statistics.read().is_some(),
+            "precondition: derived Statistics cache must be seeded"
+        );
+        assert!(
+            provider.cached_table_statistics_blob.read().is_some(),
+            "precondition: blob cache must be seeded"
+        );
+
+        provider.clear_cached_table_statistics();
+
+        assert!(
+            provider.table_statistics.read().is_none(),
+            "clear must drop the derived Statistics cache"
+        );
+        assert!(
+            provider.cached_table_statistics_blob.read().is_none(),
+            "clear must drop the blob cache in lockstep with the derived cache"
         );
     }
 

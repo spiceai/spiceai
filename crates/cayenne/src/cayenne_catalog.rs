@@ -1909,6 +1909,152 @@ impl MetadataCatalog for CayenneCatalog {
         })
     }
 
+    async fn commit_on_conflict_deletions(
+        &self,
+        delete_files: Vec<DeleteFile>,
+        table_id: &str,
+        insert_pk_bytes_list: Vec<Vec<u8>>,
+        insert_sequence: i64,
+    ) -> CatalogResult<Vec<String>> {
+        // Atomic replacement for the legacy `add_delete_file × N` +
+        // `add_insert_records_batch` sequence in `apply_on_conflict_deletions`.
+        // See `crates/cayenne/benches/apply_on_conflict_rpc_ceiling.rs` for the
+        // before-numbers — collapses `N+2` RPCs to 2 (the caller still pays
+        // `increment_sequence_number` itself) and, more importantly, makes
+        // the catalog state all-or-nothing.
+        if delete_files.is_empty() && insert_pk_bytes_list.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Validate every delete_file belongs to this table_id up front so a
+        // mismatch can't half-apply via the txn.
+        for delete_file in &delete_files {
+            if delete_file.table_id != table_id {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Delete-file table_id '{}' does not match commit table_id '{table_id}'",
+                        delete_file.table_id
+                    ),
+                });
+            }
+        }
+
+        // Pre-allocate UUIDs outside the retry loop so retries replay the same
+        // delete_file_ids — keeps the caller's mapping stable across attempts.
+        let delete_file_ids: Vec<String> = (0..delete_files.len())
+            .map(|_| uuid::Uuid::now_v7().to_string())
+            .collect();
+
+        // SQLite param limit chunking (mirrors add_insert_records_batch).
+        const PARAMS_PER_ROW: usize = 4;
+        const MAX_PARAMS: usize = 32_000;
+        const MAX_ROWS_PER_CHUNK: usize = MAX_PARAMS / PARAMS_PER_ROW;
+
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+        if max_attempts == 0 {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "commit_on_conflict_deletions requires at least one attempt".to_string(),
+            });
+        }
+
+        for attempt in 1..=max_attempts {
+            let tx = self.metastore.begin_transaction().await.map_err(|e| {
+                CatalogError::InvalidOperation {
+                    message: "Failed to begin on-conflict deletion transaction".to_string(),
+                    source: Box::new(e),
+                }
+            })?;
+
+            // INSERT every delete_file row inside the txn. Use the
+            // pre-generated UUID for each so retries are stable.
+            let mut delete_file_err: Option<CatalogError> = None;
+            for (delete_file, delete_file_id) in delete_files.iter().zip(delete_file_ids.iter()) {
+                let res = tx
+                    .execute(ExecuteParams {
+                        sql: r"
+                        INSERT INTO cayenne_delete_file (
+                            delete_file_id, table_id, path, path_is_relative,
+                            format, delete_count, file_size_bytes, source_data_file_path, sequence_number
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    ",
+                        params: vec![
+                            MetastoreValue::Text(delete_file_id.clone()),
+                            MetastoreValue::Text(delete_file.table_id.clone()),
+                            MetastoreValue::Text(delete_file.path.clone()),
+                            MetastoreValue::Bool(delete_file.path_is_relative),
+                            MetastoreValue::Text(delete_file.format.clone()),
+                            MetastoreValue::Integer(delete_file.delete_count),
+                            MetastoreValue::Integer(delete_file.file_size_bytes),
+                            delete_file
+                                .source_data_file_path
+                                .clone()
+                                .map_or(MetastoreValue::Null, MetastoreValue::Text),
+                            MetastoreValue::Integer(delete_file.sequence_number),
+                        ],
+                    })
+                    .await;
+                if let Err(e) = res {
+                    delete_file_err = Some(CatalogError::InvalidOperation {
+                        message: "Failed to insert delete file inside on-conflict transaction"
+                            .to_string(),
+                        source: Box::new(e),
+                    });
+                    break;
+                }
+            }
+            if let Some(e) = delete_file_err {
+                drop(tx);
+                return Err(e);
+            }
+
+            // Chunked INSERTs for the insert_record rows.
+            let mut insert_record_err: Option<CatalogError> = None;
+            for chunk in insert_pk_bytes_list.chunks(MAX_ROWS_PER_CHUNK) {
+                let (sql, params) =
+                    Self::build_insert_records_chunk_sql(table_id, chunk.to_vec(), insert_sequence);
+                if let Err(e) = tx.execute(ExecuteParams { sql: &sql, params }).await {
+                    insert_record_err = Some(CatalogError::InvalidOperation {
+                        message:
+                            "Failed to insert insert-record chunk inside on-conflict transaction"
+                                .to_string(),
+                        source: Box::new(e),
+                    });
+                    break;
+                }
+            }
+            if let Some(e) = insert_record_err {
+                drop(tx);
+                return Err(e);
+            }
+
+            match tx.commit().await {
+                Ok(()) => return Ok(delete_file_ids),
+                Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
+                    let delay = retry_backoff_delay(attempt);
+                    tracing::debug!(
+                        attempt,
+                        max_attempts,
+                        ?delay,
+                        "Retrying on-conflict deletion transaction after commit conflict"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => {
+                    return Err(CatalogError::InvalidOperation {
+                        message: "Failed to commit on-conflict deletion transaction".to_string(),
+                        source: Box::new(e),
+                    });
+                }
+            }
+        }
+
+        Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "commit_on_conflict_deletions exhausted {max_attempts} attempts without success or a terminal error"
+            ),
+        })
+    }
+
     async fn get_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>> {
         self.metastore
             .query_helper(

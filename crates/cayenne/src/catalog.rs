@@ -292,6 +292,36 @@ pub trait MetadataCatalog: Send + Sync {
         sequence_number: i64,
     ) -> CatalogResult<()>;
 
+    /// Atomically commit the catalog side of an on-conflict (upsert)
+    /// deletion: every delete-file row AND every insert-record row in
+    /// one transaction.
+    ///
+    /// This replaces the legacy 3-call sequence on the on-conflict path
+    /// (`add_delete_file` per file → `add_insert_records_batch`), which
+    /// left a crash window where the catalog could persist deletion
+    /// records without their corresponding insert sequences. After
+    /// restart, the new row (already in the data files) would then be
+    /// permanently hidden by the deletion filter — see
+    /// [`crate::provider::table::CayenneTableProvider::apply_on_conflict_deletions`]
+    /// for the original sequence.
+    ///
+    /// Returns the assigned delete-file IDs in the same order as
+    /// `delete_files`, so the caller can correlate them with the
+    /// physical files it just wrote.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be opened, any insert
+    /// fails, or the commit fails. Failures roll back the entire txn —
+    /// the catalog is unchanged.
+    async fn commit_on_conflict_deletions(
+        &self,
+        delete_files: Vec<DeleteFile>,
+        table_id: &str,
+        insert_pk_bytes_list: Vec<Vec<u8>>,
+        insert_sequence: i64,
+    ) -> CatalogResult<Vec<String>>;
+
     /// Get all insert records for a table.
     ///
     /// Returns a map of PK bytes to their sequence numbers.
