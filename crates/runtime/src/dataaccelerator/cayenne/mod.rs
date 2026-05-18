@@ -52,7 +52,7 @@ use super::{
     AccelerationSource, BootstrapStatus, DataAccelerator, get_primary_keys_from_constraints,
     upsert_dedup,
 };
-use crate::component::dataset::acceleration::{Acceleration, Engine, Mode};
+use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
@@ -192,6 +192,39 @@ fn parse_usize_aliases_as_i64(acceleration: &Acceleration, keys: &[&str], defaul
     let default_usize = usize::try_from(default).unwrap_or(usize::MAX);
     let parsed = parse_usize_aliases(acceleration, keys, default_usize);
     i64::try_from(parsed).unwrap_or(i64::MAX)
+}
+
+const SMALL_WRITE_COMPACTION_TRIGGER_FILES: usize = 4;
+const SMALL_WRITE_COMPACTION_TRIGGER_SNAPSHOT_AGE_MS: u64 = 60_000;
+const SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS: u64 = 10_000;
+const SMALL_WRITE_INLINE_FLUSH_MAX_ROWS: i64 = 2_048;
+const SMALL_WRITE_INLINE_FLUSH_MAX_SEGMENTS: i64 = 16;
+const SMALL_WRITE_INLINE_FLUSH_MAX_BYTES: i64 = 2 * 1_048_576;
+
+fn apply_refresh_mode_defaults(
+    config: &mut cayenne::metadata::VortexConfig,
+    refresh_mode: Option<RefreshMode>,
+) {
+    match refresh_mode.unwrap_or(RefreshMode::Full) {
+        RefreshMode::Append | RefreshMode::Changes => {
+            config.compaction_trigger_files = SMALL_WRITE_COMPACTION_TRIGGER_FILES;
+            config.compaction_trigger_snapshot_age_ms =
+                SMALL_WRITE_COMPACTION_TRIGGER_SNAPSHOT_AGE_MS;
+            config.compaction_background_interval_ms =
+                SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS;
+            config.inline_flush_max_rows = SMALL_WRITE_INLINE_FLUSH_MAX_ROWS;
+            config.inline_flush_max_segments = SMALL_WRITE_INLINE_FLUSH_MAX_SEGMENTS;
+            config.inline_flush_max_bytes = SMALL_WRITE_INLINE_FLUSH_MAX_BYTES;
+        }
+        RefreshMode::Disabled
+        | RefreshMode::Full
+        | RefreshMode::Caching
+        | RefreshMode::Snapshot => {
+            config.inline_max_rows = 0;
+            config.inline_max_bytes = 0;
+            config.inline_max_buffer_bytes = 0;
+        }
+    }
 }
 
 /// Returns true if the path is a local filesystem path (not a remote object store).
@@ -410,6 +443,8 @@ impl CayenneAccelerator {
         let mut config = cayenne::metadata::VortexConfig::default();
 
         if let Some(acceleration) = source.acceleration() {
+            apply_refresh_mode_defaults(&mut config, acceleration.refresh_mode);
+
             // Parse cache options - use VortexConfig defaults if not specified
             config.footer_cache_mb = parse_usize(
                 acceleration,
@@ -949,11 +984,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("write_concurrency")
             .description("Optional writer partition override for unsorted Cayenne ingests. Defaults to runtime.query.target_partitions."),
         ParameterSpec::component("compaction_trigger_files")
-            .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs, and the protected-snapshot count that triggers snapshot-maintenance compaction. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 8.")
-            .default("8"),
+            .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs, and the protected-snapshot count that triggers snapshot-maintenance compaction. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 4 for refresh_mode: append or changes; 8 otherwise."),
         ParameterSpec::component("compaction_trigger_snapshot_age_ms")
-            .description("Maximum age in milliseconds of the oldest protected snapshot before snapshot-maintenance compaction runs. Set to 0 to disable the age trigger. Default: 300000.")
-            .default("300000"),
+            .description("Maximum age in milliseconds of the oldest protected snapshot before snapshot-maintenance compaction runs. Set to 0 to disable the age trigger. Default: 60000 for refresh_mode: append or changes; 300000 otherwise."),
         ParameterSpec::component("compaction_max_levels")
             .description("Maximum number of consecutive compaction passes per trigger. Bounds write amplification when promotion keeps producing new candidates. Default: 3.")
             .default("3"),
@@ -961,26 +994,19 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Maximum number of eligible file paths retained in one compaction candidate for trigger selection and observability. The current compactor rewrites the whole current snapshot once triggered, so this does not bound rewrite IO or memory. Default: 32.")
             .default("32"),
         ParameterSpec::component("compaction_background_interval_ms")
-            .description("Background compaction interval in milliseconds. The accelerator runs a per-table background task at this interval. Set to 0 to disable the background task — inline compaction on writes still runs. Default: 30000.")
-            .default("30000"),
+            .description("Background compaction interval in milliseconds. The accelerator runs a per-table background task at this interval. Set to 0 to disable the background task — inline compaction on writes still runs. Default: 10000 for refresh_mode: append or changes; 30000 otherwise."),
         ParameterSpec::component("inline_max_rows")
-            .description("Maximum rows in a single write that can be inlined into the Cayenne metastore instead of writing a Vortex file. Set to 0 to disable write-entry inlining. Default: 1024.")
-            .default("1024"),
+            .description("Maximum rows in a single write that can be inlined into the Cayenne metastore instead of writing a Vortex file. Set to 0 to disable write-entry inlining. Default: 1024 for refresh_mode: append or changes; 0 otherwise."),
         ParameterSpec::component("inline_max_bytes")
-            .description("Maximum serialized Arrow IPC bytes in a single inlined Cayenne metastore entry. Set to 0 to disable write-entry inlining. Default: 1048576.")
-            .default("1048576"),
+            .description("Maximum serialized Arrow IPC bytes in a single inlined Cayenne metastore entry. Set to 0 to disable write-entry inlining. Default: 1048576 for refresh_mode: append or changes; 0 otherwise."),
         ParameterSpec::component("inline_max_buffer_bytes")
-            .description("Maximum Arrow in-memory bytes buffered while deciding whether to inline a write. Set to 0 to force the Vortex write path after the first buffered batch. Default: 4194304.")
-            .default("4194304"),
+            .description("Maximum Arrow in-memory bytes buffered while deciding whether to inline a write. Set to 0 to force the Vortex write path after the first buffered batch. Default: 4194304 for refresh_mode: append or changes; 0 otherwise."),
         ParameterSpec::component("inline_flush_max_rows")
-            .description("Maximum inline rows before checkpointing inline data to Vortex. Default: 10000.")
-            .default("10000"),
+            .description("Maximum inline rows before checkpointing inline data to Vortex. Default: 2048 for refresh_mode: append or changes; 10000 otherwise."),
         ParameterSpec::component("inline_flush_max_segments")
-            .description("Maximum inline entries before checkpointing inline data to Vortex. Default: 64.")
-            .default("64"),
+            .description("Maximum inline entries before checkpointing inline data to Vortex. Default: 16 for refresh_mode: append or changes; 64 otherwise."),
         ParameterSpec::component("inline_flush_max_bytes")
-            .description("Maximum inline IPC bytes before checkpointing inline data to Vortex. Default: 8388608.")
-            .default("8388608"),
+            .description("Maximum inline IPC bytes before checkpointing inline data to Vortex. Default: 2097152 for refresh_mode: append or changes; 8388608 otherwise."),
     ],
 );
 
@@ -2079,7 +2105,7 @@ register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::dataset::acceleration::{Acceleration, Mode};
+    use crate::component::dataset::acceleration::{Acceleration, Mode, RefreshMode};
     use crate::component::dataset::builder::DatasetBuilder;
     use app::AppBuilder;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -2480,6 +2506,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_vortex_config_defaults_use_small_write_refresh_profile() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        for (table_name, refresh_mode) in [
+            ("append_hot", RefreshMode::Append),
+            ("cdc_hot", RefreshMode::Changes),
+        ] {
+            let mut dataset = DatasetBuilder::try_new(table_name.to_string(), table_name)
+                .expect("dataset builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("dataset");
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                refresh_mode: Some(refresh_mode),
+                ..Default::default()
+            });
+
+            let config = CayenneAccelerator::get_vortex_config(table_name, &dataset);
+
+            assert_eq!(
+                config.compaction_trigger_files,
+                SMALL_WRITE_COMPACTION_TRIGGER_FILES
+            );
+            assert_eq!(
+                config.compaction_trigger_snapshot_age_ms,
+                SMALL_WRITE_COMPACTION_TRIGGER_SNAPSHOT_AGE_MS
+            );
+            assert_eq!(
+                config.compaction_background_interval_ms,
+                SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS
+            );
+            assert_eq!(
+                config.inline_max_rows,
+                cayenne::metadata::DEFAULT_INLINE_MAX_ROWS
+            );
+            assert_eq!(
+                config.inline_max_bytes,
+                cayenne::metadata::DEFAULT_INLINE_MAX_BYTES
+            );
+            assert_eq!(
+                config.inline_max_buffer_bytes,
+                cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES
+            );
+            assert_eq!(
+                config.inline_flush_max_rows,
+                SMALL_WRITE_INLINE_FLUSH_MAX_ROWS
+            );
+            assert_eq!(
+                config.inline_flush_max_segments,
+                SMALL_WRITE_INLINE_FLUSH_MAX_SEGMENTS
+            );
+            assert_eq!(
+                config.inline_flush_max_bytes,
+                SMALL_WRITE_INLINE_FLUSH_MAX_BYTES
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_vortex_config_defaults_use_large_write_refresh_profile() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        for (table_name, refresh_mode) in [
+            ("default_load", None),
+            ("full_load", Some(RefreshMode::Full)),
+            ("cached_load", Some(RefreshMode::Caching)),
+            ("snapshot_load", Some(RefreshMode::Snapshot)),
+            ("disabled_load", Some(RefreshMode::Disabled)),
+        ] {
+            let mut dataset = DatasetBuilder::try_new(table_name.to_string(), table_name)
+                .expect("dataset builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("dataset");
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                refresh_mode,
+                ..Default::default()
+            });
+
+            let config = CayenneAccelerator::get_vortex_config(table_name, &dataset);
+
+            assert_eq!(config.inline_max_rows, 0);
+            assert_eq!(config.inline_max_bytes, 0);
+            assert_eq!(config.inline_max_buffer_bytes, 0);
+            assert_eq!(
+                config.inline_flush_max_rows,
+                cayenne::metadata::DEFAULT_INLINE_FLUSH_MAX_ROWS
+            );
+            assert_eq!(
+                config.compaction_trigger_files,
+                cayenne::metadata::VortexConfig::default().compaction_trigger_files
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_inline_thresholds_are_resolved_from_acceleration_params() {
         let app = Arc::new(AppBuilder::new("test").build());
         let rt = Arc::new(crate::Runtime::builder().build().await);
@@ -2493,8 +2623,9 @@ mod tests {
         dataset.acceleration = Some(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Changes),
             params: [
-                ("cayenne_inline_max_rows".to_string(), "0".to_string()),
+                ("cayenne_inline_max_rows".to_string(), "123".to_string()),
                 ("cayenne_inline_max_bytes".to_string(), "262144".to_string()),
                 (
                     "cayenne_inline_max_buffer_bytes".to_string(),
@@ -2502,15 +2633,15 @@ mod tests {
                 ),
                 (
                     "cayenne_inline_flush_max_rows".to_string(),
-                    "2048".to_string(),
+                    "4096".to_string(),
                 ),
                 (
                     "cayenne_inline_flush_max_segments".to_string(),
-                    "16".to_string(),
+                    "32".to_string(),
                 ),
                 (
                     "cayenne_inline_flush_max_bytes".to_string(),
-                    "2097152".to_string(),
+                    "3145728".to_string(),
                 ),
                 (
                     "cayenne_pk_conflict_detection".to_string(),
@@ -2524,12 +2655,12 @@ mod tests {
 
         let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset);
 
-        assert_eq!(config.inline_max_rows, 0);
+        assert_eq!(config.inline_max_rows, 123);
         assert_eq!(config.inline_max_bytes, 262_144);
         assert_eq!(config.inline_max_buffer_bytes, 524_288);
-        assert_eq!(config.inline_flush_max_rows, 2_048);
-        assert_eq!(config.inline_flush_max_segments, 16);
-        assert_eq!(config.inline_flush_max_bytes, 2_097_152);
+        assert_eq!(config.inline_flush_max_rows, 4_096);
+        assert_eq!(config.inline_flush_max_segments, 32);
+        assert_eq!(config.inline_flush_max_bytes, 3_145_728);
         assert_eq!(
             config.pk_conflict_detection,
             cayenne::metadata::PkConflictDetection::None

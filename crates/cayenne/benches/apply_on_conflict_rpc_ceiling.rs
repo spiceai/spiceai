@@ -7,12 +7,10 @@
 //     https://www.apache.org/licenses/LICENSE-2.0
 
 //! Regression bench: per-upsert metastore call count in
-//! [`crate::provider::table::CayenneTableProvider::apply_on_conflict_deletions`]
-//! (`crates/cayenne/src/provider/table.rs:4262-4479`).
+//! [`crate::provider::table::CayenneTableProvider::apply_on_conflict_deletions`].
 //!
-//! The on-conflict path runs a 3+ metastore-call sequence on every upsert that
-//! produces deletion vectors, with **no transaction** wrapping any of
-//! them:
+//! Older versions of the on-conflict path ran a non-atomic 3+ metastore-call
+//! sequence on every upsert that produces deletion vectors:
 //!
 //! 1. `catalog.increment_sequence_number(table_id)` — 1 call
 //! 2. `DeletionVectorWriter::write(specs)` — writes deletion-vector
@@ -21,51 +19,43 @@
 //!    `catalog.add_delete_file(result.delete_file)` — 1 call per file
 //! 4. `catalog.add_insert_records_batch(...)` — 1 call per insert-record chunk
 //!
-//! For a typical PK-mode upsert that produces 1-2 delete files the
-//! cumulative cost is 3-4 metastore calls per upsert. The bigger issue is
-//! that **none of these are wrapped in a transaction**, so a crash
-//! between step 3 and step 4 leaves the catalog with delete-file records
-//! at `delete_sequence` but no insert-record at `insert_sequence`. On
-//! restart the new row is then permanently hidden by the deletion filter
-//! (the comment at `provider/table.rs:4389-4391` explicitly acknowledges
-//! this durability requirement).
+//! For a typical PK-mode upsert that produces 1-2 delete files the cumulative
+//! cost was 3-4 metastore calls per upsert. None of those calls were wrapped
+//! in a transaction, so a crash between step 3 and step 4 could leave the
+//! catalog with delete-file records at `delete_sequence` but no insert-record
+//! at `insert_sequence`, permanently hiding the new row on restart.
 //!
-//! The fix mirrors the established pattern for atomic multi-row catalog
-//! work — see `commit_inlined_mutation` (`cayenne_catalog.rs`) and the
-//! `commit_compaction_in_txn` / `commit_overwrite_in_txn` family. A new
-//! `commit_on_conflict_deletions` trait method opens one transaction,
-//! INSERTs every `cayenne_delete_file` row, INSERTs every insert-record
-//! row (chunked under SQLite's 32 K-param cap, as
-//! `add_insert_records_batch_in_chunks` already does internally), and
-//! commits. Crash anywhere before commit → catalog state unchanged → the
-//! upsert is fully re-driveable from the calling write path.
+//! The production path now calls `commit_on_conflict_deletions`
+//! ([`crate::catalog::MetadataCatalog::commit_on_conflict_deletions`], wired in
+//! at `provider/table.rs:4506-4526`) which opens one transaction, INSERTs every
+//! `cayenne_delete_file` row, INSERTs every insert-record row (chunked under
+//! SQLite's 32 K-param cap, as `add_insert_records_batch_in_chunks` already
+//! does internally), and commits. Crash anywhere before commit → catalog state
+//! unchanged → the upsert is fully re-driveable from the calling write path.
 //!
 //! Counted metastore-call totals for the one-insert-record-chunk case:
 //!
-//! | path                                       | calls per upsert | atomic? |
-//! |--------------------------------------------|------------------|---------|
-//! | today (`apply_on_conflict_deletions`)      | `2 + delete_files` | no   |
-//! | proposed (`commit_on_conflict_deletions`)  | `4 + delete_files` | yes  |
+//! | path                                            | calls per upsert     | atomic? |
+//! |-------------------------------------------------|----------------------|---------|
+//! | older (`apply_on_conflict_deletions`, no txn)   | `2 + delete_files`   | no      |
+//! | current (`commit_on_conflict_deletions` in txn) | `4 + delete_files`   | yes     |
 //!
 //! ## What this bench measures
 //!
 //! Pure shape — same `tokio::sync::Mutex<()>` + `tokio::time::sleep(call_latency)`
-//! pattern as `stats_persistence_rpc_ceiling.rs` and
-//! `metastore_connection_contention.rs`. No real SQLite, no Cayenne
+//! pattern as `stats_persistence_rpc_ceiling.rs`. No real SQLite, no Cayenne
 //! setup. Two lanes per `(delete_files_per_upsert, upsert_count, call_latency)`:
 //!
-//! - `current_n_plus_two_calls` — each upsert: 1 call (increment) + N calls
+//! - `no_txn_baseline` — each upsert: 1 call (increment) + N calls
 //!   (add_delete_file × N) + 1 call (add_insert_records_batch). Total =
-//!   `(N + 2)` calls per upsert. Mirrors today's body.
-//! - `proposed_atomic_txn_calls` — each upsert: 1 call (increment) + 1 call
-//!   (begin transaction) + N calls (delete-file INSERTs) + 1 call
+//!   `(N + 2)` calls per upsert. Mirrors the older non-atomic path.
+//! - `atomic_txn_calls` — current behavior. Each upsert: 1 call (increment) +
+//!   1 call (begin transaction) + N calls (delete-file INSERTs) + 1 call
 //!   (insert-record chunk INSERT) + 1 call (commit). Total = `(N + 4)` calls
 //!   per upsert for this bench's single-chunk setup.
 //!
-//! The synthetic models the metastore call-latency envelope and makes the
-//! atomicity tax explicit. The production change is still valuable because it
-//! closes the catalog crash window; this bench keeps the call-count tradeoff
-//! visible as that implementation evolves.
+//! The bench keeps the call-count tradeoff visible — atomicity costs a
+//! constant 2 extra calls per upsert in exchange for closing the crash window.
 //!
 //! `cargo bench --bench apply_on_conflict_rpc_ceiling -p cayenne`.
 
@@ -101,8 +91,8 @@ async fn one_metastore_call(pool: &Mutex<()>, rtt: Duration) {
     tokio::time::sleep(rtt).await;
 }
 
-/// Lane A: mirrors today's `apply_on_conflict_deletions`. Each upsert
-/// pays `2 + delete_files` separate metastore calls.
+/// Lane A: mirrors the older non-atomic `apply_on_conflict_deletions`. Each
+/// upsert pays `2 + delete_files` separate metastore calls.
 async fn run_current(pool: &Arc<Mutex<()>>, upserts: usize, delete_files: usize, rtt: Duration) {
     for _ in 0..upserts {
         // 1. increment_sequence_number
@@ -116,7 +106,7 @@ async fn run_current(pool: &Arc<Mutex<()>>, upserts: usize, delete_files: usize,
     }
 }
 
-/// Lane B: models `commit_on_conflict_deletions` as implemented:
+/// Lane B: current behavior — `commit_on_conflict_deletions` as implemented:
 /// `increment_sequence_number`, `BEGIN`, per-delete-file `INSERT`, one
 /// insert-record chunk `INSERT`, then `COMMIT`.
 async fn run_proposed(pool: &Arc<Mutex<()>>, upserts: usize, delete_files: usize, rtt: Duration) {
@@ -154,7 +144,7 @@ fn bench_apply_on_conflict_rpc_ceiling(c: &mut Criterion) {
             let id = format!("delete_files={delete_files}/{rtt_label}");
             let pool_a = Arc::new(Mutex::new(()));
             group.bench_with_input(
-                BenchmarkId::new("current_n_plus_two_calls", &id),
+                BenchmarkId::new("no_txn_baseline", &id),
                 &delete_files,
                 |b, &delete_files| {
                     b.to_async(&rt).iter(|| {
@@ -168,7 +158,7 @@ fn bench_apply_on_conflict_rpc_ceiling(c: &mut Criterion) {
             );
             let pool_b = Arc::new(Mutex::new(()));
             group.bench_with_input(
-                BenchmarkId::new("proposed_atomic_txn_calls", &id),
+                BenchmarkId::new("atomic_txn_calls", &id),
                 &delete_files,
                 |b, &delete_files| {
                     b.to_async(&rt).iter(|| {

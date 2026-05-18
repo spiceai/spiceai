@@ -16,11 +16,9 @@ limitations under the License.
 
 //! Regression bench: per-scan cost of the inline-memtable read path.
 //!
-//! `CayenneTableProvider::read_inlined_batches`
-//! (`crates/cayenne/src/provider/table.rs:5592-5619`) is invoked from
-//! every `scan()` whose table has a non-empty inline memtable (the fast
-//! skip at `table.rs:7059` checks the cached row count). On a cache
-//! miss it performs:
+//! Older versions of `CayenneTableProvider::read_inlined_batches` re-decoded
+//! the inline data on every `scan()` against a table with a non-empty inline
+//! memtable:
 //!
 //! ```ignore
 //! let inlined = self.catalog.get_inlined_data(&id).await?;             // 1 metastore RTT
@@ -35,47 +33,34 @@ limitations under the License.
 //! }
 //! ```
 //!
-//! There is no in-memory cache of the deserialized `Vec<RecordBatch>` —
-//! every scan repeats the IPC decode and deletion-mask construction
-//! even though the inlined state is **static** between writes and
-//! checkpoints (writes set the cached row count via
-//! `inlined_row_count`, checkpoints clear it; nothing else changes the
-//! inlined data).
+//! There was no in-memory cache of the deserialized `Vec<RecordBatch>`, even
+//! though the inlined state is static between writes and checkpoints. A CDC
+//! table with 1 MiB of inlined data paid ~100 µs–1 ms of IPC decode per scan
+//! plus 2 metastore RTTs.
 //!
-//! Two consequences:
-//!
-//! 1. **Per-scan fixed cost**: a CDC table with 1 MiB of inlined data
-//!    pays ~100 µs–1 ms of IPC decode per scan plus 2 metastore RTTs
-//!    (now parallel via the pool, but still ~0.5–2 ms latency).
-//! 2. **Freshness-probe tail spikes**: the May 15 2026 SF100 retest
-//!    reported the probe table's p99 freshness regressed from 931 ms
-//!    to 1607 ms (+73%). One mechanism that fits: the probe's reads
-//!    re-decode inlined data on every poll, and CPU contention from
-//!    high-WAL-table flushes lengthens the decode tail.
-//!
-//! The TigerStyle remedy is an in-memory cache keyed by inline
-//! generation (an `AtomicU64` bumped by every `commit_inlined_mutation`
-//! / `clear_inlined_data_and_deletes`). On scan, atomic-load the
-//! generation; if it matches the cached generation, return the cached
-//! `Arc<Vec<RecordBatch>>`. Otherwise rebuild + cache. Wait-free in
-//! steady state.
+//! The production path now caches the decoded batches by inline generation —
+//! `inlined_generation: Arc<AtomicU64>` ([`provider/table.rs:1079`]) is bumped
+//! by every `commit_inlined_mutation` and `clear_inlined_data_and_deletes`,
+//! and `inlined_cache: Arc<ArcSwap<InlinedCache>>` stores the
+//! `(generation, Arc<Vec<RecordBatch>>)` pair. `read_inlined_batches`
+//! atomic-loads the generation; on a match it returns the cached `Arc`
+//! (wait-free); on a miss it rebuilds and stores. The two metastore RTTs
+//! and the IPC decode happen only when the generation actually changed.
 //!
 //! ## What this bench measures
 //!
-//! Pure shape — no metastore, no Cayenne setup. Models the **CPU-side**
-//! cost of the read path: Arrow IPC deserialize + per-row deletion-mask
-//! probe.
+//! Pure shape — no metastore, no Cayenne setup. Models the CPU-side cost of
+//! the read path: Arrow IPC deserialize + per-row deletion-mask probe.
 //!
 //! Two lanes per inline data size:
 //!
-//! - `current_decode_per_scan/<rows>` — mirrors today's `read_inlined_batches`:
+//! - `decode_per_scan_baseline/<rows>` — mirrors the older `read_inlined_batches`:
 //!   re-deserialize the IPC payload on every iteration and rebuild the
-//!   filtered batch. The "metastore round trip" is not modeled because
-//!   the pool already parallelizes it; what remains is the CPU-bound
-//!   IPC decode that no fix to the metastore can address.
-//! - `cached_arc_clone/<rows>` — models the proposed cache: a single
-//!   pre-decoded `Arc<Vec<RecordBatch>>` cloned per scan. Wall time is
-//!   one `Arc::clone` plus the downstream usage (the `black_box`).
+//!   filtered batch. The "metastore round trip" is not modeled because the
+//!   pool parallelizes it; what remains is the CPU-bound IPC decode.
+//! - `cached_arc_clone/<rows>` — current behavior: a single pre-decoded
+//!   `Arc<Vec<RecordBatch>>` cloned per scan. Wall time is one `Arc::clone`
+//!   plus the downstream usage (the `black_box`).
 //!
 //! Inline sizes:
 //!
@@ -87,11 +72,10 @@ limitations under the License.
 //!
 //! `cargo bench --bench inline_memtable_read_overhead -p cayenne`.
 //!
-//! - `current_decode_per_scan/1MiB` is the per-scan fixed cost a
-//!   freshness-probe table pays today between checkpoints. At 1000
-//!   QPS this is the latency floor below which p99 cannot go.
-//! - `cached_arc_clone/1MiB` is the achievable floor. The ratio is
-//!   the QPS headroom from adding the cache.
+//! - `decode_per_scan_baseline/1MiB` is the per-scan fixed cost a
+//!   freshness-probe table would pay between checkpoints without the cache.
+//! - `cached_arc_clone/1MiB` is the current floor. The ratio is the
+//!   QPS headroom the cache delivered.
 
 #![allow(clippy::expect_used)]
 
