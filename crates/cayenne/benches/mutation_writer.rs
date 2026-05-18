@@ -261,5 +261,151 @@ fn bench_inline_mutation_paths(c: &mut Criterion) {
     pressure.finish();
 }
 
-criterion_group!(benches, bench_append_roundtrip, bench_inline_mutation_paths);
+/// Benchmarks the directory durability primitives added for ACID correctness
+/// on local FS (parent-directory `sync_all` after `create_dir_all` for
+/// snapshot directories, _partitioned_wal/, and deletions/ subdirs).
+///
+/// These one-time-per-snapshot or per-table costs are the direct result of
+/// the durability hardening. The benchmark quantifies the "tax" for Q21
+/// workloads that trigger frequent compactions or cross-partition operations.
+fn bench_directory_durability_primitives(c: &mut Criterion) {
+    let rt = Runtime::new().expect("runtime");
+
+    let mut group = c.benchmark_group("directory_durability_sync_all");
+    // These are one-time operations; a smaller sample size is sufficient
+    // to get stable numbers without making the bench too slow.
+    group.sample_size(30);
+
+    group.bench_function("create_dir_all_plus_parent_sync", |b| {
+        b.iter_batched(
+            || {
+                let temp = tempfile::tempdir().expect("tempdir for bench");
+                let parent = temp.path().to_path_buf();
+                let child = parent.join("new_snapshot_or_wal_or_deletions_dir");
+                (temp, parent, child)
+            },
+            |(_keep_alive, parent, child)| {
+                rt.block_on(async {
+                    // Replicate the exact hardened pattern used in
+                    // ensure_snapshot_dir_exists, ensure_partitioned_wal_dir_and_sync_parent,
+                    // and the deletions/ subdir creation in DeletionVectorWriter.
+                    if !child.exists() {
+                        tokio::fs::create_dir_all(&child)
+                            .await
+                            .expect("create_dir_all");
+                        let p = parent.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            std::fs::File::open(&p).and_then(|f| f.sync_all())
+                        })
+                        .await;
+                    }
+                    black_box(child);
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    // For comparison: the cost of create_dir_all *without* the parent sync.
+    // This shows the incremental cost of the durability guarantee.
+    group.bench_function("create_dir_all_without_sync", |b| {
+        b.iter_batched(
+            || {
+                let temp = tempfile::tempdir().expect("tempdir for bench");
+                let parent = temp.path().to_path_buf();
+                let child = parent.join("new_snapshot_without_sync");
+                (temp, parent, child)
+            },
+            |(_keep_alive, _parent, child)| {
+                rt.block_on(async {
+                    if !child.exists() {
+                        tokio::fs::create_dir_all(&child)
+                            .await
+                            .expect("create_dir_all");
+                    }
+                    black_box(child);
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    // Quantifies the cost a "duplicate directory fsync" regression imposes on
+    // the staged-append commit path. The two benchmarks below replicate the
+    // exact post-rename pattern used in `move_staging_files_local` (open the
+    // directory + `sync_all` on the inode). The duplicate variant calls it
+    // back-to-back without any filesystem mutation in between — semantically
+    // identical to a single fsync on the same on-disk state, but pays the
+    // syscall and journal cost twice.
+    //
+    // Concretely: a previous revision of `move_staging_files_local`
+    // accidentally fsynced `target_dir` twice in a row. This is the cost it
+    // added per staged-append commit on local FS. If anyone reintroduces a
+    // duplicate fsync on this hot path, the `duplicate_dir_fsync` line of
+    // this group will be ~2× the `single_dir_fsync` line in the criterion
+    // report, making the regression obvious.
+    group.bench_function("single_dir_fsync", |b| {
+        b.iter_batched(
+            || {
+                let temp = tempfile::tempdir().expect("tempdir for bench");
+                let dir = temp.path().join("target_snapshot");
+                std::fs::create_dir_all(&dir).expect("create snapshot dir");
+                (temp, dir)
+            },
+            |(_keep_alive, dir)| {
+                rt.block_on(async {
+                    let path = dir.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let f = std::fs::File::open(&path).expect("open dir");
+                        f.sync_all().expect("fsync dir");
+                    })
+                    .await
+                    .expect("join");
+                    black_box(dir);
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("duplicate_dir_fsync", |b| {
+        b.iter_batched(
+            || {
+                let temp = tempfile::tempdir().expect("tempdir for bench");
+                let dir = temp.path().join("target_snapshot");
+                std::fs::create_dir_all(&dir).expect("create snapshot dir");
+                (temp, dir)
+            },
+            |(_keep_alive, dir)| {
+                rt.block_on(async {
+                    let path1 = dir.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let f = std::fs::File::open(&path1).expect("open dir");
+                        f.sync_all().expect("fsync dir");
+                    })
+                    .await
+                    .expect("join1");
+                    let path2 = dir.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let f = std::fs::File::open(&path2).expect("open dir");
+                        f.sync_all().expect("fsync dir");
+                    })
+                    .await
+                    .expect("join2");
+                    black_box(dir);
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_append_roundtrip,
+    bench_inline_mutation_paths,
+    bench_directory_durability_primitives
+);
 criterion_main!(benches);

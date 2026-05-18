@@ -1,16 +1,16 @@
-select
+SELECT
     o_ol_cnt,
-    sum(case when o_carrier_id = 1 or o_carrier_id = 2 then 1 else 0 end) as high_line_count,
-    sum(case when o_carrier_id <> 1 and o_carrier_id <> 2 then 1 else 0 end) as low_line_count
-from
+    sum(CASE WHEN o_carrier_id = 1 OR o_carrier_id = 2 THEN 1 ELSE 0 END) AS high_line_count,
+    sum(CASE WHEN o_carrier_id <> 1 AND o_carrier_id <> 2 THEN 1 ELSE 0 END) AS low_line_count
+FROM
     orders, order_line
-where
+WHERE
     ol_w_id = o_w_id
-    and ol_d_id = o_d_id
-    and ol_o_id = o_id
-    and o_entry_d <= ol_delivery_d
-    and ol_delivery_d < '2030-01-01 00:00:00.000000'
-group by
+    AND ol_d_id = o_d_id
+    AND ol_o_id = o_id
+    AND o_entry_d <= ol_delivery_d
+    AND ol_delivery_d < '2030-01-01 00:00:00.000000'
+GROUP BY
     o_ol_cnt
-order by
+ORDER BY
     o_ol_cnt;

@@ -168,6 +168,29 @@ pub async fn insert_batches(
     Ok(extract_row_count(&results))
 }
 
+/// Poll `catalog.get_inlined_data_count(table_id)` until it returns `0` or
+/// the timeout elapses. The auto-checkpoint that drains the inline memtable
+/// runs in a background `tokio::spawn` task scheduled from the write path,
+/// so tests that assert "inline data was flushed" after an insert race
+/// against that task. This helper gives the background task a bounded
+/// window to complete before failing the test.
+pub async fn poll_inlined_data_count_zero(
+    catalog: &Arc<CayenneCatalog>,
+    table_id: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    use cayenne::MetadataCatalog;
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    let started = std::time::Instant::now();
+    loop {
+        let count = catalog.get_inlined_data_count(table_id).await?;
+        if count == 0 || started.elapsed() >= TIMEOUT {
+            return Ok(count);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Extract the row count from insert result batches.
 fn extract_row_count(results: &[RecordBatch]) -> u64 {
     use arrow::datatypes::DataType;

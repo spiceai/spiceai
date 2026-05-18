@@ -172,6 +172,8 @@ pub(crate) fn init_tracing_with_task_history_captured_context(
 
     let fmt_layer = fmt::layer().with_ansi(true).with_filter(filter);
 
+    let (ballista_transform, ballista_retention) =
+        runtime::datafusion::query::stage_history::BallistaStageMiddleware::pair();
     let task_history_exporter = TaskHistoryExporter::new(
         rt.datafusion(),
         TaskHistoryCapturedOutput::Truncated,
@@ -180,7 +182,9 @@ pub(crate) fn init_tracing_with_task_history_captured_context(
         spicepod::component::runtime::TaskHistoryCapturedPlan::None,
         None, // min_plan_duration_ms
         None, // scheduler_id - not in cluster mode for tests
-    );
+    )
+    .with_transform(ballista_transform)
+    .with_retention(ballista_retention);
 
     // Tests hang if we don't use TokioCurrentThread here (similar to https://github.com/open-telemetry/opentelemetry-rust/issues/868)
     let processor = BatchSpanProcessor::builder(task_history_exporter, TokioCurrentThread).build();

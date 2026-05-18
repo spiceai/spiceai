@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod partitioned_insert_strategy;
 pub mod s3;
 pub mod snapshot_engine;
 
@@ -140,6 +141,11 @@ pub(crate) fn transform_schema_for_vortex(
 
 pub struct CayenneAccelerator {
     catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
+    /// Shared semaphore that bounds the number of concurrent per-table
+    /// background compactions across all Cayenne tables registered with this
+    /// accelerator. Sized at `available_parallelism()` so a fleet of tables
+    /// can't oversubscribe the writer pool.
+    compaction_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl Default for CayenneAccelerator {
@@ -178,6 +184,16 @@ fn parse_optional_usize<'a>(
     })
 }
 
+fn parse_usize_aliases(acceleration: &Acceleration, keys: &[&str], default: usize) -> usize {
+    parse_optional_usize(acceleration, keys).map_or(default, |(_, value)| value)
+}
+
+fn parse_usize_aliases_as_i64(acceleration: &Acceleration, keys: &[&str], default: i64) -> i64 {
+    let default_usize = usize::try_from(default).unwrap_or(usize::MAX);
+    let parsed = parse_usize_aliases(acceleration, keys, default_usize);
+    i64::try_from(parsed).unwrap_or(i64::MAX)
+}
+
 /// Returns true if the path is a local filesystem path (not a remote object store).
 ///
 /// Local paths include:
@@ -193,8 +209,13 @@ fn is_local_path(path: &str) -> bool {
 impl CayenneAccelerator {
     #[must_use]
     pub fn new() -> Self {
+        let permits = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .max(1);
         Self {
             catalog: Arc::new(OnceCell::new()),
+            compaction_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
         }
     }
 
@@ -426,6 +447,19 @@ impl CayenneAccelerator {
                 }
             }
 
+            if let Some((key, value)) = ["cayenne_pk_conflict_detection", "pk_conflict_detection"]
+                .iter()
+                .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
+            {
+                if let Some(mode) = cayenne::metadata::PkConflictDetection::parse(value) {
+                    config.pk_conflict_detection = mode;
+                } else {
+                    tracing::warn!(
+                        "Dataset '{table_name}' contains an invalid `{key}` value: '{value}'. Expected one of: auto, none. Defaulting to auto."
+                    );
+                }
+            }
+
             // Parse sort columns
             if let Some(sort_cols_str) = acceleration
                 .params
@@ -467,15 +501,105 @@ impl CayenneAccelerator {
                 }
             }
 
+            config.compaction_trigger_files = parse_usize(
+                acceleration,
+                "cayenne_compaction_trigger_files",
+                config.compaction_trigger_files,
+            );
+            config.compaction_max_levels = parse_usize(
+                acceleration,
+                "cayenne_compaction_max_levels",
+                config.compaction_max_levels,
+            );
+            config.compaction_max_files_per_pick = parse_usize(
+                acceleration,
+                "cayenne_compaction_max_files_per_pick",
+                config.compaction_max_files_per_pick,
+            );
+
+            config.inline_max_rows = parse_usize_aliases(
+                acceleration,
+                &["cayenne_inline_max_rows", "inline_max_rows"],
+                config.inline_max_rows,
+            );
+            config.inline_max_bytes = parse_usize_aliases(
+                acceleration,
+                &["cayenne_inline_max_bytes", "inline_max_bytes"],
+                config.inline_max_bytes,
+            );
+            config.inline_max_buffer_bytes = parse_usize_aliases(
+                acceleration,
+                &["cayenne_inline_max_buffer_bytes", "inline_max_buffer_bytes"],
+                config.inline_max_buffer_bytes,
+            );
+            config.inline_flush_max_rows = parse_usize_aliases_as_i64(
+                acceleration,
+                &[
+                    "cayenne_inline_flush_max_rows",
+                    "inline_flush_max_rows",
+                    "cayenne_inline_memtable_max_rows",
+                    "inline_memtable_max_rows",
+                ],
+                config.inline_flush_max_rows,
+            );
+            config.inline_flush_max_segments = parse_usize_aliases_as_i64(
+                acceleration,
+                &[
+                    "cayenne_inline_flush_max_segments",
+                    "inline_flush_max_segments",
+                    "cayenne_inline_memtable_max_segments",
+                    "inline_memtable_max_segments",
+                ],
+                config.inline_flush_max_segments,
+            );
+            config.inline_flush_max_bytes = parse_usize_aliases_as_i64(
+                acceleration,
+                &[
+                    "cayenne_inline_flush_max_bytes",
+                    "inline_flush_max_bytes",
+                    "cayenne_inline_memtable_max_bytes",
+                    "inline_memtable_max_bytes",
+                ],
+                config.inline_flush_max_bytes,
+            );
+
+            if let Some(interval_str) = acceleration
+                .params
+                .get("cayenne_compaction_background_interval_ms")
+            {
+                match interval_str.parse::<u64>() {
+                    Ok(parsed) => {
+                        config.compaction_background_interval_ms = parsed;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "Invalid 'cayenne_compaction_background_interval_ms' value: '{interval_str}'. Expected a non-negative integer (milliseconds, 0 disables). Keeping default of {}.",
+                            config.compaction_background_interval_ms
+                        );
+                    }
+                }
+            }
+
             tracing::debug!(
-                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}",
+                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, pk_conflict_detection={}, compaction_trigger_files={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}",
                 config.footer_cache_mb,
                 config.segment_cache_mb,
                 config.target_vortex_file_size_mb,
                 config.upload_concurrency,
                 config.write_concurrency,
                 config.sort_columns,
-                config.compression_strategy
+                config.compression_strategy,
+                config.pk_conflict_detection.as_str(),
+                config.compaction_trigger_files,
+                config.compaction_max_levels,
+                config.compaction_max_files_per_pick,
+                config.compaction_background_interval_ms,
+                config.inline_max_rows,
+                config.inline_max_bytes,
+                config.inline_max_buffer_bytes,
+                config.inline_flush_max_rows,
+                config.inline_flush_max_segments,
+                config.inline_flush_max_bytes,
             );
         }
 
@@ -682,7 +806,12 @@ impl CayenneAccelerator {
             .context(AccelerationCreationFailedSnafu)?;
 
         tracing::debug!("create_cayenne_table_provider: table {table_name} created successfully");
-        Ok(Arc::new(cayenne_table))
+        let provider = Arc::new(cayenne_table);
+        let spawned = provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
+        if spawned {
+            tracing::debug!("Background compaction task spawned for Cayenne table {table_name}",);
+        }
+        Ok(provider)
     }
 }
 
@@ -761,8 +890,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    12,
-    { S3_PARAMS_LEN + 12 },
+    23,
+    { S3_PARAMS_LEN + 23 },
 >(
     S3_PARAMETERS,
     [
@@ -794,10 +923,44 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Compression strategy to use for Vortex files. Options: 'btrblocks' (default), 'zstd'")
             .one_of(&["btrblocks", "zstd"])
             .default("btrblocks"),
+        ParameterSpec::component("pk_conflict_detection")
+            .description("Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts and applies on_conflict behavior. 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness and the ingestion path cannot replay existing rows, such as steady-state append-only CDC after bootstrap.")
+            .one_of(&["auto", "none"])
+            .default("auto"),
         ParameterSpec::component("upload_concurrency")
             .description("Maximum number of concurrent file uploads when writing multiple Vortex files. Defaults to available CPU parallelism."),
         ParameterSpec::component("write_concurrency")
             .description("Optional writer partition override for unsorted Cayenne ingests. Defaults to runtime.query.target_partitions."),
+        ParameterSpec::component("compaction_trigger_files")
+            .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 8.")
+            .default("8"),
+        ParameterSpec::component("compaction_max_levels")
+            .description("Maximum number of consecutive compaction passes per trigger. Bounds write amplification when promotion keeps producing new candidates. Default: 3.")
+            .default("3"),
+        ParameterSpec::component("compaction_max_files_per_pick")
+            .description("Maximum number of eligible file paths retained in one compaction candidate for trigger selection and observability. The current compactor rewrites the whole current snapshot once triggered, so this does not bound rewrite IO or memory. Default: 32.")
+            .default("32"),
+        ParameterSpec::component("compaction_background_interval_ms")
+            .description("Background compaction interval in milliseconds. The accelerator runs a per-table background task at this interval. Set to 0 to disable the background task — inline compaction on writes still runs. Default: 30000.")
+            .default("30000"),
+        ParameterSpec::component("inline_max_rows")
+            .description("Maximum rows in a single write that can be inlined into the Cayenne metastore instead of writing a Vortex file. Set to 0 to disable write-entry inlining. Default: 1024.")
+            .default("1024"),
+        ParameterSpec::component("inline_max_bytes")
+            .description("Maximum serialized Arrow IPC bytes in a single inlined Cayenne metastore entry. Set to 0 to disable write-entry inlining. Default: 1048576.")
+            .default("1048576"),
+        ParameterSpec::component("inline_max_buffer_bytes")
+            .description("Maximum Arrow in-memory bytes buffered while deciding whether to inline a write. Set to 0 to force the Vortex write path after the first buffered batch. Default: 4194304.")
+            .default("4194304"),
+        ParameterSpec::component("inline_flush_max_rows")
+            .description("Maximum inline rows before checkpointing inline data to Vortex. Default: 10000.")
+            .default("10000"),
+        ParameterSpec::component("inline_flush_max_segments")
+            .description("Maximum inline entries before checkpointing inline data to Vortex. Default: 64.")
+            .default("64"),
+        ParameterSpec::component("inline_flush_max_bytes")
+            .description("Maximum inline IPC bytes before checkpointing inline data to Vortex. Default: 8388608.")
+            .default("8388608"),
     ],
 );
 
@@ -1279,12 +1442,22 @@ impl DataAccelerator for CayenneAccelerator {
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?;
 
-            // Create a new catalog - it will use WAL mode and busy timeout internally
-            let catalog = Arc::new(
+            // Create a new catalog - it will use WAL mode and busy timeout internally.
+            // We keep both a concrete and a trait-object handle: the trait
+            // object goes to the per-partition CayenneTableProviders (which use
+            // the MetadataCatalog API), while the concrete handle is needed by
+            // `CayennePartitionedInsertStrategy` to open a shared
+            // MetastoreTransaction across all partitions (issue #10125).
+            let catalog_concrete: Arc<cayenne::CayenneCatalog> = Arc::new(
                 cayenne::CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
                     .boxed()
                     .context(AccelerationInitializationFailedSnafu)?,
-            ) as Arc<dyn cayenne::MetadataCatalog>;
+            );
+            // Promote to a trait object for the existing per-partition callers.
+            // The coercion from Arc<CayenneCatalog> to Arc<dyn MetadataCatalog>
+            // happens via the unsizing rule on the let-binding's declared type.
+            let catalog: Arc<dyn cayenne::MetadataCatalog> =
+                Arc::<cayenne::CayenneCatalog>::clone(&catalog_concrete);
 
             // Initialize the catalog (creates tables if needed)
             catalog
@@ -1336,14 +1509,25 @@ impl DataAccelerator for CayenneAccelerator {
                 primary_keys.clone(),
                 on_conflict,
                 runtime_env,
+                Arc::clone(&self.compaction_semaphore),
             ));
 
-            // Wrap the base table provider with partitioning logic
+            // Wrap the base table provider with partitioning logic, installing
+            // the Cayenne-specific cross-partition insert strategy so that
+            // overwrite-mode writes batch every partition's catalog mutation
+            // into a single MetastoreTransaction (#10125).
+            let insert_strategy = Arc::new(
+                partitioned_insert_strategy::CayennePartitionedInsertStrategy::new(
+                    Arc::clone(&catalog_concrete),
+                    PathBuf::from(&dir_path),
+                ),
+            );
             let partition_provider = Arc::new(
                 PartitionTableProvider::new(creator, partition_by, Arc::clone(&arrow_schema))
                     .await
                     .boxed()
-                    .context(AccelerationCreationFailedSnafu)?,
+                    .context(AccelerationCreationFailedSnafu)?
+                    .with_insert_strategy(insert_strategy),
             );
 
             // Wrap with upsert deduplication if needed based on on_conflict settings
@@ -1528,6 +1712,11 @@ pub(crate) struct CayennePartitionCreator {
     on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
     /// Shared Cayenne context with cache, created once and shared across all partitions.
     context: Arc<cayenne::CayenneContext>,
+    /// Shared compaction semaphore inherited from the parent
+    /// [`CayenneAccelerator`]. Per-partition providers spawn their own
+    /// background compaction tasks through this semaphore so the whole accelerator
+    /// shares one concurrency budget.
+    compaction_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for CayennePartitionCreator {
@@ -1550,7 +1739,7 @@ impl std::fmt::Debug for CayennePartitionCreator {
             .field("primary_key", &self.primary_key)
             .field("on_conflict", &self.on_conflict.is_some())
             .field("context", &"<CayenneContext>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1571,6 +1760,7 @@ impl CayennePartitionCreator {
         primary_key: Vec<String>,
         on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
         runtime_env: Arc<RuntimeEnv>,
+        compaction_semaphore: Arc<tokio::sync::Semaphore>,
     ) -> Self {
         // Create shared Cayenne context with cache once, to be shared across all partitions.
         // This ensures all partitions share the same footer/segment caches instead of
@@ -1592,6 +1782,7 @@ impl CayennePartitionCreator {
             primary_key,
             on_conflict,
             context,
+            compaction_semaphore,
         }
     }
 
@@ -1740,9 +1931,11 @@ impl PartitionCreator for CayennePartitionCreator {
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
 
+        let partition_provider = Arc::new(cayenne_table);
+        partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
         Ok(Partition {
             partition_values,
-            table_provider: Arc::new(cayenne_table),
+            table_provider: partition_provider,
         })
     }
 
@@ -1809,9 +2002,11 @@ impl PartitionCreator for CayennePartitionCreator {
                 .boxed()
                 .context(creator::InferringPartitionsSnafu)?;
 
+            let partition_provider = Arc::new(cayenne_table);
+            partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
             result.push(Partition {
                 partition_values,
-                table_provider: Arc::new(cayenne_table),
+                table_provider: partition_provider,
             });
         }
 
@@ -2219,6 +2414,105 @@ mod tests {
         assert!(
             result.ends_with(".spice/data/metadata"),
             "Expected path to end with '.spice/data/metadata', got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_concurrency_is_resolved_per_dataset() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let mut hot_dataset = DatasetBuilder::try_new("hot".to_string(), "hot")
+            .expect("hot dataset builder")
+            .with_app(Arc::clone(&app))
+            .with_runtime(Arc::clone(&rt))
+            .build()
+            .expect("hot dataset");
+        hot_dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            params: [("cayenne_write_concurrency".to_string(), "16".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+
+        let mut quiet_dataset = DatasetBuilder::try_new("quiet".to_string(), "quiet")
+            .expect("quiet dataset builder")
+            .with_app(app)
+            .with_runtime(rt)
+            .build()
+            .expect("quiet dataset");
+        quiet_dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            params: [("cayenne_write_concurrency".to_string(), "2".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+
+        let hot = CayenneAccelerator::get_vortex_config("hot", &hot_dataset);
+        let quiet = CayenneAccelerator::get_vortex_config("quiet", &quiet_dataset);
+
+        assert_eq!(hot.write_concurrency, Some(16));
+        assert_eq!(quiet.write_concurrency, Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_inline_thresholds_are_resolved_from_acceleration_params() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let mut dataset = DatasetBuilder::try_new("cdc_hot".to_string(), "cdc_hot")
+            .expect("dataset builder")
+            .with_app(app)
+            .with_runtime(rt)
+            .build()
+            .expect("dataset");
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            params: [
+                ("cayenne_inline_max_rows".to_string(), "0".to_string()),
+                ("cayenne_inline_max_bytes".to_string(), "262144".to_string()),
+                (
+                    "cayenne_inline_max_buffer_bytes".to_string(),
+                    "524288".to_string(),
+                ),
+                (
+                    "cayenne_inline_flush_max_rows".to_string(),
+                    "2048".to_string(),
+                ),
+                (
+                    "cayenne_inline_flush_max_segments".to_string(),
+                    "16".to_string(),
+                ),
+                (
+                    "cayenne_inline_flush_max_bytes".to_string(),
+                    "2097152".to_string(),
+                ),
+                (
+                    "cayenne_pk_conflict_detection".to_string(),
+                    "none".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset);
+
+        assert_eq!(config.inline_max_rows, 0);
+        assert_eq!(config.inline_max_bytes, 262_144);
+        assert_eq!(config.inline_max_buffer_bytes, 524_288);
+        assert_eq!(config.inline_flush_max_rows, 2_048);
+        assert_eq!(config.inline_flush_max_segments, 16);
+        assert_eq!(config.inline_flush_max_bytes, 2_097_152);
+        assert_eq!(
+            config.pk_conflict_detection,
+            cayenne::metadata::PkConflictDetection::None
         );
     }
 

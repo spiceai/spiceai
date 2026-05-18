@@ -298,6 +298,7 @@ impl ExecutionPlan for IcebergCreateSchemaExec {
                     &df_schema_name,
                     if_not_exists,
                 );
+                registry.append_ddl(forward_sql.clone()).await;
                 forward_ddl_to_executors(registry, &forward_sql).await?;
             }
 
@@ -983,6 +984,7 @@ async fn synchronize_distributed_write_through_registration(
             dataset_options,
             partition_expr_sql,
         )?;
+        registry.append_ddl(forward_sql.clone()).await;
         forward_ddl_to_executors(registry, &forward_sql).await?;
     }
 

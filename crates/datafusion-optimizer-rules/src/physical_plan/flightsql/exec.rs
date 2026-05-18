@@ -40,7 +40,9 @@ use datafusion::physical_plan::{
 };
 use datafusion::sql::TableReference;
 
-use data_components::flightsql::{FlightSqlClient, FlightSqlExec, query_to_stream};
+use data_components::flightsql::{
+    FlightSqlClient, FlightSqlExec, query_to_stream, trace_parent_from_task_context,
+};
 use data_components::sql_expr::to_sql_preserving_precedence;
 use flight_client::cookie::CookieStore;
 use futures::StreamExt;
@@ -153,6 +155,11 @@ pub struct PartialAggregationFlightSqlExec {
     cookie_store: Arc<CookieStore>,
     /// Cached plan properties.
     properties: PlanProperties,
+    /// Optional W3C `traceparent` value inherited from the source
+    /// `FlightSqlExec`. Forwarded as a gRPC metadata header on each
+    /// outgoing call so executor-side spans chain back to the originating
+    /// request.
+    trace_parent: Option<String>,
 }
 
 impl PartialAggregationFlightSqlExec {
@@ -181,6 +188,7 @@ impl PartialAggregationFlightSqlExec {
             client: source.client().clone(),
             cookie_store: Arc::clone(source.cookie_store()),
             properties,
+            trace_parent: source.trace_parent().map(str::to_string),
         }
     }
 
@@ -250,7 +258,7 @@ impl ExecutionPlan for PartialAggregationFlightSqlExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         if partition != 0 {
             return Err(DataFusionError::Execution(format!(
@@ -261,14 +269,20 @@ impl ExecutionPlan for PartialAggregationFlightSqlExec {
         let target_schema = self.schema();
         let column_mapping = query.column_mapping;
 
-        let stream = query_to_stream(
-            self.client.clone(),
-            query.sql,
-            Arc::clone(&self.cookie_store),
-        )
-        .map(move |result: std::result::Result<_, DataFusionError>| {
-            result.and_then(|batch| remap_batch(&batch, &column_mapping, &target_schema))
-        });
+        let mut client = self.client.clone();
+        let trace_parent = self
+            .trace_parent
+            .clone()
+            .or_else(|| trace_parent_from_task_context(&context));
+        if let Some(value) = trace_parent {
+            client.set_header("traceparent", value);
+        }
+
+        let stream = query_to_stream(client, query.sql, Arc::clone(&self.cookie_store)).map(
+            move |result: std::result::Result<_, DataFusionError>| {
+                result.and_then(|batch| remap_batch(&batch, &column_mapping, &target_schema))
+            },
+        );
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),

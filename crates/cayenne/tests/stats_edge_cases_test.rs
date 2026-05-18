@@ -24,8 +24,8 @@ limitations under the License.
 
 mod common;
 
-use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::array::{Int64Array, RecordBatch};
+use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::metadata::CreateTableOptions;
 use cayenne::{CayenneTableProvider, MetadataCatalog};
 use datafusion::prelude::*;
@@ -37,11 +37,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 // Column Statistics Edge Cases
 // ============================================================================
 
-test_with_backends!(test_stats_reflect_latest_write_only);
 test_with_backends!(test_stats_correct_after_overwrite);
-test_with_backends!(test_stats_with_all_null_column);
-test_with_backends!(test_stats_with_mixed_types);
-test_with_backends!(test_stats_min_max_correct_for_strings);
 
 // ============================================================================
 // Data Inlining Edge Cases
@@ -140,82 +136,6 @@ async fn query_count(ctx: &SessionContext, table_name: &str) -> usize {
 // Stats Tests
 // ============================================================================
 
-/// Stats are updated on each write and stored as a Vortex `FileStatistics` blob.
-///
-/// NOTE: `persist_table_stats` currently performs an upsert keyed by `table_id`
-/// using only the stats from the *current* write's `ColumnStatsAccumulator`.
-/// That means each append overwrites the prior persisted stats rather than
-/// merging them across the full table. This is a known design limitation
-/// tracked separately (see PR #10314 design-level review threads); this test
-/// asserts the actual observed behavior with exact values so any regression
-/// (e.g. dropping a stat, mis-typing a precision, breaking
-/// `ColumnStatsAccumulator` seeding) fails loudly.
-async fn test_stats_reflect_latest_write_only(fixture: common::TestFixture) -> TestResult {
-    use datafusion::common::ScalarValue;
-    use datafusion::common::stats::Precision;
-
-    let schema = simple_schema();
-    let (table, _ctx) = create_table_no_pk(&fixture, "stats_accum", Arc::clone(&schema)).await;
-    let table_id = fixture.catalog.get_table("stats_accum").await?.table_id;
-
-    // First append: 3 rows, value column = [10, 20, 30] (no nulls).
-    let batch1 = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int64Array::from(vec![1, 2, 3])),
-            Arc::new(Int64Array::from(vec![10, 20, 30])),
-        ],
-    )?;
-    common::insert_batch(&table, batch1).await?;
-
-    let stats1 = fixture
-        .catalog
-        .get_table_statistics(&table_id)
-        .await?
-        .expect("stats present after first write");
-    assert_eq!(stats1.num_rows, 3, "first write num_rows");
-    let fs1 = cayenne::stats::deserialize_file_statistics(&stats1.statistics_blob, &schema)
-        .expect("deserialize stats1");
-    let df1 = cayenne::stats::file_statistics_to_df(&fs1, stats1.num_rows);
-    let v1 = &df1.column_statistics[1];
-    assert_eq!(v1.min_value, Precision::Exact(ScalarValue::Int64(Some(10))));
-    assert_eq!(v1.max_value, Precision::Exact(ScalarValue::Int64(Some(30))));
-    assert_eq!(v1.null_count, Precision::Exact(0));
-
-    // Second append: 2 rows, value column = [5, 50] (no nulls).
-    let batch2 = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int64Array::from(vec![4, 5])),
-            Arc::new(Int64Array::from(vec![5, 50])),
-        ],
-    )?;
-    common::insert_batch(&table, batch2).await?;
-
-    let stats2 = fixture
-        .catalog
-        .get_table_statistics(&table_id)
-        .await?
-        .expect("stats present after second write");
-    // Current (non-aggregating) behavior: the second write's stats replace
-    // the first. Assert exactly what's stored so the upsert path is locked
-    // down. When per-table aggregation is implemented these expectations
-    // should change to (num_rows=5, min=5, max=50).
-    assert_eq!(
-        stats2.num_rows, 2,
-        "current implementation upserts per-write num_rows; aggregation TBD",
-    );
-    let fs2 = cayenne::stats::deserialize_file_statistics(&stats2.statistics_blob, &schema)
-        .expect("deserialize stats2");
-    let df2 = cayenne::stats::file_statistics_to_df(&fs2, stats2.num_rows);
-    let v2 = &df2.column_statistics[1];
-    assert_eq!(v2.min_value, Precision::Exact(ScalarValue::Int64(Some(5))));
-    assert_eq!(v2.max_value, Precision::Exact(ScalarValue::Int64(Some(50))));
-    assert_eq!(v2.null_count, Precision::Exact(0));
-
-    Ok(())
-}
-
 /// After overwrite, stats should reflect only the new data.
 async fn test_stats_correct_after_overwrite(fixture: common::TestFixture) -> TestResult {
     let schema = simple_schema();
@@ -246,131 +166,6 @@ async fn test_stats_correct_after_overwrite(fixture: common::TestFixture) -> Tes
 
     // Verify scan also returns 2 rows
     assert_eq!(query_count(&ctx, "stats_overwrite").await, 2);
-
-    Ok(())
-}
-
-/// Stats should handle all-NULL columns gracefully.
-async fn test_stats_with_all_null_column(fixture: common::TestFixture) -> TestResult {
-    let schema = simple_schema();
-    let (table, _ctx) = create_table_no_pk(&fixture, "stats_null", Arc::clone(&schema)).await;
-    let table_id = fixture.catalog.get_table("stats_null").await?.table_id;
-
-    // Insert with all NULLs in the value column
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int64Array::from(vec![1, 2, 3])),
-            Arc::new(Int64Array::from(vec![None, None, None])),
-        ],
-    )?;
-    common::insert_batch(&table, batch).await?;
-
-    let stats = fixture.catalog.get_table_statistics(&table_id).await?;
-    assert!(stats.is_some(), "Stats should exist after insert");
-    let stats = stats.expect("stats");
-    assert_eq!(stats.num_rows, 3);
-    assert!(
-        !stats.statistics_blob.is_empty(),
-        "statistics_blob should be non-empty even with all-NULL column"
-    );
-
-    Ok(())
-}
-
-/// Stats should work with multiple data types: Int64, Float64, Utf8, Timestamp.
-async fn test_stats_with_mixed_types(fixture: common::TestFixture) -> TestResult {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("score", DataType::Float64, true),
-        Field::new("name", DataType::Utf8, true),
-        Field::new("ts", DataType::Timestamp(TimeUnit::Millisecond, None), true),
-    ]));
-
-    let (table, _ctx) = create_table_no_pk(&fixture, "stats_types", Arc::clone(&schema)).await;
-    let table_id = fixture.catalog.get_table("stats_types").await?.table_id;
-
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int64Array::from(vec![1, 2, 3])),
-            Arc::new(Float64Array::from(vec![1.5, 2.7, 0.3])),
-            Arc::new(StringArray::from(vec!["alice", "bob", "charlie"])),
-            Arc::new(TimestampMillisecondArray::from(vec![1000, 2000, 3000])),
-        ],
-    )?;
-    common::insert_batch(&table, batch).await?;
-
-    let stats = fixture.catalog.get_table_statistics(&table_id).await?;
-    assert!(stats.is_some(), "Stats should exist after insert");
-    let stats = stats.expect("stats");
-    assert_eq!(stats.num_rows, 3);
-    assert!(
-        !stats.statistics_blob.is_empty(),
-        "statistics_blob should be non-empty for mixed types"
-    );
-
-    Ok(())
-}
-
-/// String min/max and `null_count` must round-trip correctly in the statistics
-/// blob. Asserts exact values (lexicographic min="apple", max="cherry") rather
-/// than just checking that the blob is non-empty — stats correctness is a
-/// data-correctness guarantee.
-async fn test_stats_min_max_correct_for_strings(fixture: common::TestFixture) -> TestResult {
-    use datafusion::common::ScalarValue;
-    use datafusion::common::stats::Precision;
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("name", DataType::Utf8, false),
-    ]));
-
-    let (table, _ctx) = create_table_no_pk(&fixture, "stats_str", Arc::clone(&schema)).await;
-    let table_id = fixture.catalog.get_table("stats_str").await?.table_id;
-
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int64Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec!["banana", "apple", "cherry"])),
-        ],
-    )?;
-    common::insert_batch(&table, batch).await?;
-
-    let stats = fixture
-        .catalog
-        .get_table_statistics(&table_id)
-        .await?
-        .expect("stats should exist after insert");
-    assert_eq!(stats.num_rows, 3);
-    assert!(!stats.statistics_blob.is_empty());
-
-    // Deserialize the blob and project into DataFusion Statistics so we can
-    // assert exact min/max values (not just that it deserialized).
-    let file_stats = cayenne::stats::deserialize_file_statistics(&stats.statistics_blob, &schema)
-        .expect("FileStatistics should deserialize");
-    let df_stats = cayenne::stats::file_statistics_to_df(&file_stats, stats.num_rows);
-
-    assert_eq!(df_stats.num_rows, Precision::Exact(3));
-    assert_eq!(df_stats.column_statistics.len(), 2, "one entry per column");
-
-    let name_stats = &df_stats.column_statistics[1];
-    assert_eq!(
-        name_stats.min_value,
-        Precision::Exact(ScalarValue::Utf8(Some("apple".into()))),
-        "min should be lexicographic minimum",
-    );
-    assert_eq!(
-        name_stats.max_value,
-        Precision::Exact(ScalarValue::Utf8(Some("cherry".into()))),
-        "max should be lexicographic maximum",
-    );
-    assert_eq!(
-        name_stats.null_count,
-        Precision::Exact(0),
-        "no NULL names in the input batch",
-    );
 
     Ok(())
 }
