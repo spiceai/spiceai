@@ -56,9 +56,7 @@ use crate::{
     component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{
         AccelerationSource, DataAccelerator, FilePathError,
-        duckdb::{
-            DuckDBAccelerator, create_factory, create_table_provider, duckdb_file_path,
-        },
+        duckdb::{DuckDBAccelerator, create_factory, create_table_provider, duckdb_file_path},
         partitioned_duckdb::{
             ExpectedAccelerationSourceSnafu, FailedToCreateConnectionPoolSnafu, FileModeOnlySnafu,
         },

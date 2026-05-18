@@ -484,8 +484,6 @@ impl PartitionCreator for DuckDBPartitionCreator {
     }
 }
 
-
-
 async fn get_pool(
     duckdb_factory: &DuckDBTableProviderFactory,
     duckdb_path: &str,
