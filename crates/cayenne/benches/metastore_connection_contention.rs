@@ -183,15 +183,11 @@ fn bench_metastore_connection_contention(c: &mut Criterion) {
                 },
             );
 
-            group.bench_with_input(
-                BenchmarkId::new("per_table_pool", &id),
-                &n,
-                |b, &n| {
-                    b.to_async(&rt).iter(|| async move {
-                        run_per_table_pool(n, rtt).await;
-                    });
-                },
-            );
+            group.bench_with_input(BenchmarkId::new("per_table_pool", &id), &n, |b, &n| {
+                b.to_async(&rt).iter(|| async move {
+                    run_per_table_pool(n, rtt).await;
+                });
+            });
         }
     }
     group.finish();

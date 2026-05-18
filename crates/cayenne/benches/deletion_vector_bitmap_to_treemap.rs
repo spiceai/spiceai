@@ -115,7 +115,8 @@ fn convert_to_treemap(bitmap: &RoaringBitmap) -> RoaringTreemap {
 }
 
 fn bench_convert_per_scan(c: &mut Criterion) {
-    let mut group = c.benchmark_group("deletion_vector_bitmap_to_treemap_convert_per_scan_baseline");
+    let mut group =
+        c.benchmark_group("deletion_vector_bitmap_to_treemap_convert_per_scan_baseline");
     for &n in DELETION_COUNTS {
         let bitmap = build_bitmap(n);
         group.throughput(Throughput::Elements(n as u64));
