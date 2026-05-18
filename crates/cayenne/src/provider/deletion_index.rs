@@ -51,7 +51,7 @@ const MIN_BLOOM_CAPACITY: usize = 64;
 /// [`extend_max`](Self::extend_max) for the full argument.
 #[derive(Debug, Clone)]
 pub struct DeletionIndex {
-    entries: HashMap<i64, i64>,
+    entries: Arc<HashMap<i64, i64>>,
     bloom: BloomFilter,
     /// Monotonic upper bound for the current immutable entries. This stays
     /// exact because indexes are build-once / extend-only; any future removal
@@ -75,7 +75,7 @@ impl DeletionIndex {
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: Arc::new(HashMap::new()),
             bloom: BloomFilter::new(MIN_BLOOM_CAPACITY),
             max_sequence_number: None,
             bloom_capacity: MIN_BLOOM_CAPACITY,
@@ -92,7 +92,7 @@ impl DeletionIndex {
         }
         let max_sequence_number = entries.values().copied().max();
         Self {
-            entries,
+            entries: Arc::new(entries),
             bloom,
             max_sequence_number,
             bloom_capacity: capacity,
@@ -146,7 +146,7 @@ impl DeletionIndex {
     /// rebuild a filtered index, e.g. partial-deletion filters).
     #[must_use]
     pub fn entries(&self) -> &HashMap<i64, i64> {
-        &self.entries
+        &*self.entries
     }
 
     /// Build a new index from `self`'s entries plus `additions`, taking the max sequence
@@ -170,7 +170,11 @@ impl DeletionIndex {
     /// regression that prompted this fix.
     #[must_use]
     pub fn extend_max(&self, additions: impl IntoIterator<Item = (i64, i64)>) -> Self {
-        let mut entries = self.entries.clone();
+        // Arc::make_mut gives O(1) "clone" (just bump rc) on the common single-writer
+        // path where the latest DeletionIndex Arc is not held by any concurrent reader.
+        // Only when readers pin the current generation do we pay the O(N) map clone.
+        let mut entries_arc = Arc::clone(&self.entries);
+        let entries = Arc::make_mut(&mut entries_arc);
         let mut max_sequence_number = self.max_sequence_number;
         // Track newly-inserted keys so the bloom can be updated incrementally
         // without re-iterating the entire entry set.
@@ -217,7 +221,7 @@ impl DeletionIndex {
                 bloom.insert(hash_key(&pk));
             }
             return Self {
-                entries,
+                entries: entries_arc,
                 bloom,
                 max_sequence_number,
                 bloom_capacity: new_capacity,
@@ -231,7 +235,7 @@ impl DeletionIndex {
             bloom.insert(hash_key(pk));
         }
         Self {
-            entries,
+            entries: entries_arc,
             bloom,
             max_sequence_number,
             bloom_capacity: self.bloom_capacity,
@@ -246,7 +250,7 @@ impl DeletionIndex {
 /// `KeyDeletionIndex` applies the same strategy to byte-keyed entries.
 #[derive(Debug, Clone)]
 pub struct KeyDeletionIndex {
-    entries: HashMap<Box<[u8]>, i64>,
+    entries: Arc<HashMap<Box<[u8]>, i64>>,
     bloom: BloomFilter,
     /// Monotonic upper bound for the current immutable entries. This stays
     /// exact because indexes are build-once / extend-only; any future removal
@@ -268,7 +272,7 @@ impl KeyDeletionIndex {
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: Arc::new(HashMap::new()),
             bloom: BloomFilter::new(MIN_BLOOM_CAPACITY),
             max_sequence_number: None,
             bloom_capacity: MIN_BLOOM_CAPACITY,
@@ -285,7 +289,7 @@ impl KeyDeletionIndex {
         }
         let max_sequence_number = entries.values().copied().max();
         Self {
-            entries,
+            entries: Arc::new(entries),
             bloom,
             max_sequence_number,
             bloom_capacity: capacity,
@@ -337,7 +341,7 @@ impl KeyDeletionIndex {
     /// Direct read-only access to the underlying entries.
     #[must_use]
     pub fn entries(&self) -> &HashMap<Box<[u8]>, i64> {
-        &self.entries
+        &*self.entries
     }
 
     /// Build a new index from `self`'s entries plus `additions`, taking the max sequence
@@ -348,7 +352,12 @@ impl KeyDeletionIndex {
     /// the new keys are inserted into a clone of the existing bloom.
     #[must_use]
     pub fn extend_max(&self, additions: impl IntoIterator<Item = (Box<[u8]>, i64)>) -> Self {
-        let mut entries = self.entries.clone();
+        // Arc::make_mut gives O(1) "clone" (just bump rc) on the common single-writer
+        // path where the latest KeyDeletionIndex Arc is not held by any concurrent reader.
+        // Only when readers pin the current generation (or for composite PKs with heavier
+        // Box<[u8]> keys) do we pay the O(N) map + key clone.
+        let mut entries_arc = Arc::clone(&self.entries);
+        let entries = Arc::make_mut(&mut entries_arc);
         let mut max_sequence_number = self.max_sequence_number;
         // Track newly-inserted keys so the bloom can be updated incrementally
         // without re-iterating the entire entry set.
@@ -386,7 +395,7 @@ impl KeyDeletionIndex {
                 bloom.insert(hash_key(&key.as_ref()));
             }
             return Self {
-                entries,
+                entries: entries_arc,
                 bloom,
                 max_sequence_number,
                 bloom_capacity: new_capacity,
@@ -398,7 +407,7 @@ impl KeyDeletionIndex {
             bloom.insert(hash_key(&key.as_ref()));
         }
         Self {
-            entries,
+            entries: entries_arc,
             bloom,
             max_sequence_number,
             bloom_capacity: self.bloom_capacity,

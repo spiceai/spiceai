@@ -218,6 +218,11 @@ required-features = ["duckdb-bench"]
 
 [[bench]]
 harness = false
+name = "vs_duckdb_upsert_scaling"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
 name = "vs_duckdb_groupby"
 required-features = ["duckdb-bench"]
 

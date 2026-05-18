@@ -944,8 +944,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    24,
-    { S3_PARAMS_LEN + 24 },
+    25,
+    { S3_PARAMS_LEN + 25 },
 >(
     S3_PARAMETERS,
     [
