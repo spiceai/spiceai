@@ -35,8 +35,7 @@ use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SC
 use cache::Caching;
 #[cfg(not(windows))]
 use cayenne::optimizer_rules::{
-    CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneJoinRewriter,
-    CayenneOptimizerConfig,
+    CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneOptimizerConfig,
 };
 #[cfg(not(windows))]
 use cayenne::{CayenneTableProvider, logical_optimizer::CayennePropagateFilterAcrossEquiJoinKeys};
@@ -428,8 +427,7 @@ impl DataFusionBuilder {
             state = with_cayenne_logical_optimizer(state);
             state = state
                 .with_physical_optimizer_rule(Arc::new(CayenneDynamicFilterSharing::new()))
-                .with_physical_optimizer_rule(Arc::new(CayenneAntiJoinSortMergeRewriter::new()))
-                .with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
+                .with_physical_optimizer_rule(Arc::new(CayenneAntiJoinSortMergeRewriter::new()));
         }
         #[cfg(windows)]
         {
@@ -917,25 +915,12 @@ pub(crate) fn default_extension_planners(
 #[cfg(test)]
 mod tests {
     #[cfg(not(windows))]
-    use arrow::{
-        array::{ArrayRef, Int32Array},
-        datatypes::{DataType, Field, Schema},
-        record_batch::RecordBatch,
-    };
+    use arrow::datatypes::{DataType, Field, Schema};
     #[cfg(not(windows))]
     use cayenne::optimizer_rules::CayenneOptimizerConfig;
     #[cfg(not(windows))]
-    use cayenne::provider::CayenneAccelerationExec;
-    #[cfg(not(windows))]
     use datafusion::catalog::{MemTable, TableProvider};
     use datafusion::optimizer::Analyzer;
-    #[cfg(not(windows))]
-    use datafusion::{
-        common::{JoinType, NullEquality},
-        datasource::memory::MemorySourceConfig,
-        physical_expr::expressions::col,
-        physical_plan::{ExecutionPlan, displayable, joins::HashJoinExec, joins::PartitionMode},
-    };
 
     use super::{
         DataFusionBuilder, configure_hash_join_memory_limits, exact_join_filter_memory_limit,
@@ -1320,12 +1305,11 @@ mod tests {
         });
     }
 
-    /// Cayenne rewrites `HashJoinExec` to use a custom accumulator type, so it
-    /// must run after `DataFusion`'s built-in physical optimizer rules that
-    /// downcast to the default `HashJoinExec` type.
+    /// Cayenne physical optimizer rules must run after `DataFusion`'s built-in
+    /// physical optimizer rules.
     #[test]
     #[cfg(not(windows))]
-    fn test_built_datafusion_registers_cayenne_join_rewriter_after_datafusion_rules() {
+    fn test_built_datafusion_registers_cayenne_rules_after_datafusion_rules() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1349,10 +1333,6 @@ mod tests {
             .iter()
             .position(|name| *name == "SanityCheckPlan")
             .expect("DataFusion sanity check rule should be registered");
-        let cayenne_rewriter_position = rule_names
-            .iter()
-            .position(|name| *name == "CayenneJoinRewriter")
-            .expect("Cayenne join rewriter should be registered");
         let cayenne_filter_sharing_position = rule_names
             .iter()
             .position(|name| *name == "CayenneDynamicFilterSharing")
@@ -1363,94 +1343,12 @@ mod tests {
             .expect("Cayenne anti join sort-merge rewriter should be registered");
 
         assert!(
-            sanity_check_position < cayenne_rewriter_position,
-            "CayenneJoinRewriter must run after DataFusion's built-in physical optimizer rules"
-        );
-        assert!(
             sanity_check_position < cayenne_filter_sharing_position,
             "CayenneDynamicFilterSharing must run after DataFusion's built-in physical optimizer rules"
         );
         assert!(
-            cayenne_filter_sharing_position < cayenne_rewriter_position,
-            "CayenneDynamicFilterSharing must run before CayenneJoinRewriter so it can inspect DataFusion's default HashJoinExec nodes"
-        );
-        assert!(
             cayenne_filter_sharing_position < cayenne_anti_sort_merge_position,
             "CayenneDynamicFilterSharing must run before CayenneAntiJoinSortMergeRewriter so same-source joins can receive shared scan filters before any sort-merge rewrite"
-        );
-        assert!(
-            cayenne_anti_sort_merge_position < cayenne_rewriter_position,
-            "CayenneAntiJoinSortMergeRewriter must run before CayenneJoinRewriter so large same-source joins are not recreated with the hash-join accumulator"
-        );
-    }
-
-    #[cfg(not(windows))]
-    fn memory_exec(column_name: &str) -> Arc<dyn ExecutionPlan> {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            column_name,
-            DataType::Int32,
-            false,
-        )]));
-        let values: ArrayRef = Arc::new(Int32Array::from(vec![1]));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![values])
-            .expect("memory exec batch should be valid");
-        MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)
-            .expect("memory exec should be valid")
-    }
-
-    #[cfg(not(windows))]
-    fn cayenne_backed_join() -> Arc<dyn ExecutionPlan> {
-        let left = memory_exec("left_id");
-        let right: Arc<dyn ExecutionPlan> =
-            Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
-
-        Arc::new(
-            HashJoinExec::try_new(
-                Arc::clone(&left),
-                Arc::clone(&right),
-                vec![(
-                    col("left_id", &left.schema()).expect("left join key should exist"),
-                    col("right_id", &right.schema()).expect("right join key should exist"),
-                )],
-                None,
-                &JoinType::Inner,
-                None,
-                PartitionMode::Partitioned,
-                NullEquality::NullEqualsNothing,
-            )
-            .expect("hash join should be valid"),
-        )
-    }
-
-    #[test]
-    #[cfg(not(windows))]
-    fn test_built_datafusion_applies_cayenne_join_rewriter_to_physical_plan() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        let handle = rt.handle().clone();
-
-        let df = DataFusionBuilder::new(
-            status::RuntimeStatus::new(),
-            Arc::new(AcceleratorEngineRegistry::default()),
-            handle,
-        )
-        .build();
-
-        let state = df.ctx.state();
-        let mut plan = cayenne_backed_join();
-        for optimizer in state.physical_optimizers() {
-            plan = optimizer
-                .optimize(plan, state.config_options())
-                .expect("physical optimizer should succeed");
-        }
-
-        let plan = displayable(plan.as_ref()).indent(true).to_string();
-
-        assert!(
-            plan.contains("accumulator=ExactLeftAccumulator"),
-            "Runtime physical optimizer stack should rewrite Cayenne-backed joins: {plan}"
         );
     }
 }
