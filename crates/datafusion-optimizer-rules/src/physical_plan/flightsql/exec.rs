@@ -40,7 +40,9 @@ use datafusion::physical_plan::{
 };
 use datafusion::sql::TableReference;
 
-use data_components::flightsql::{FlightSqlClient, FlightSqlExec, query_to_stream};
+use data_components::flightsql::{
+    FlightSqlClient, FlightSqlExec, query_to_stream, trace_parent_from_task_context,
+};
 use data_components::sql_expr::to_sql_preserving_precedence;
 use flight_client::cookie::CookieStore;
 use futures::StreamExt;
@@ -256,7 +258,7 @@ impl ExecutionPlan for PartialAggregationFlightSqlExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         if partition != 0 {
             return Err(DataFusionError::Execution(format!(
@@ -268,7 +270,11 @@ impl ExecutionPlan for PartialAggregationFlightSqlExec {
         let column_mapping = query.column_mapping;
 
         let mut client = self.client.clone();
-        if let Some(value) = self.trace_parent.clone() {
+        let trace_parent = self
+            .trace_parent
+            .clone()
+            .or_else(|| trace_parent_from_task_context(&context));
+        if let Some(value) = trace_parent {
             client.set_header("traceparent", value);
         }
 

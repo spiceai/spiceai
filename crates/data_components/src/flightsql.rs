@@ -67,7 +67,7 @@ use crate::Read;
 /// from the typed `Arc<RequestContext>` extension on the
 /// [`TaskContext`]'s session config, if one is present. The fixed `01`
 /// trace flag marks the trace as sampled.
-fn trace_parent_from_task_context(context: &TaskContext) -> Option<String> {
+pub fn trace_parent_from_task_context(context: &TaskContext) -> Option<String> {
     let request_context = context.session_config().get_extension::<RequestContext>()?;
     let tp = request_context.trace_parent().as_ref()?;
     Some(format!("00-{}-{}-01", tp.trace_id, tp.span_id))
