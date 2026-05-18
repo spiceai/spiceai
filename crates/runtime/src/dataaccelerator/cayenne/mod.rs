@@ -2536,6 +2536,53 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_compaction_thresholds_are_resolved_from_acceleration_params() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let mut dataset = DatasetBuilder::try_new("compact".to_string(), "compact")
+            .expect("dataset builder")
+            .with_app(app)
+            .with_runtime(rt)
+            .build()
+            .expect("dataset");
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            params: [
+                (
+                    "cayenne_compaction_trigger_files".to_string(),
+                    "12".to_string(),
+                ),
+                (
+                    "cayenne_compaction_trigger_snapshot_age_ms".to_string(),
+                    "120000".to_string(),
+                ),
+                ("cayenne_compaction_max_levels".to_string(), "5".to_string()),
+                (
+                    "cayenne_compaction_max_files_per_pick".to_string(),
+                    "64".to_string(),
+                ),
+                (
+                    "cayenne_compaction_background_interval_ms".to_string(),
+                    "45000".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let config = CayenneAccelerator::get_vortex_config("compact", &dataset);
+
+        assert_eq!(config.compaction_trigger_files, 12);
+        assert_eq!(config.compaction_trigger_snapshot_age_ms, 120_000);
+        assert_eq!(config.compaction_max_levels, 5);
+        assert_eq!(config.compaction_max_files_per_pick, 64);
+        assert_eq!(config.compaction_background_interval_ms, 45_000);
+    }
+
     #[test]
     fn test_resolve_metadata_dir_trims_trailing_slash() {
         let acceleration = Acceleration {
