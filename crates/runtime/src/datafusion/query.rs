@@ -59,7 +59,7 @@ pub mod error_code;
 mod handle;
 mod metrics;
 pub mod registry;
-mod stage_history;
+pub mod stage_history;
 mod tracker;
 
 pub use handle::{DistributedJobStatus, QueryHandle, QueryHandleError};

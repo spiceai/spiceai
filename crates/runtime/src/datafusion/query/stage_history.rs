@@ -25,19 +25,40 @@ limitations under the License.
 //! `crate::task_history::otel_exporter` writes them with the correct
 //! `parent_span_id`.
 //!
-//! Tracing spans use wall-clock time, so a child span's
-//! `execution_duration_ms` reflects the brief window between creation and
-//! drop in this module, not the stage's actual run. The historical times
-//! are emitted as `stage_started_at` / `stage_ended_at` /
-//! `stage_duration_ms` labels — queries against stage rows should use
-//! those.
+//! Tracing spans use wall-clock time, so without intervention the span
+//! window would just be the brief moment in which this module emitted
+//! the span at job completion. To make stage rows appear on the timeline
+//! view with their real execution window, the spans carry
+//! `stage_started_at` / `stage_ended_at` attributes (millis since UNIX
+//! epoch, derived from `TaskInfo::launch_time` / `finish_time`), and the
+//! `OTel` exporter overrides the row's `start_time` / `end_time` with
+//! those values. `stage_duration_ms` is also kept as a separate label
+//! for backwards-compatible label queries.
 
 use std::collections::HashMap;
+use std::time::{Duration, UNIX_EPOCH};
 
 use ballista_scheduler::state::execution_graph::ExecutionGraph;
 use ballista_scheduler::state::execution_stage::{ExecutionStage, TaskInfo};
 use datafusion::common::format::ExplainFormat;
+use opentelemetry_sdk::trace::SpanData;
 use tracing::Span;
+
+use crate::task_history::TaskSpan;
+use crate::task_history::otel_exporter::{SpanRetention, SpanTransform};
+use std::sync::Arc;
+
+/// Name of the tracing span this module emits per stage. Also the value
+/// of the `task` column in the resulting `task_history` row.
+const BALLISTA_STAGE_SPAN_NAME: &str = "ballista_stage";
+
+/// Attribute key carrying the stage's actual start time, in milliseconds
+/// since the UNIX epoch.
+const STAGE_STARTED_AT_ATTR: &str = "stage_started_at";
+
+/// Attribute key carrying the stage's actual end time, in milliseconds
+/// since the UNIX epoch.
+const STAGE_ENDED_AT_ATTR: &str = "stage_ended_at";
 
 /// Summary metrics extracted from a single stage's `TaskInfo`s.
 struct StageSummary {
@@ -115,6 +136,11 @@ fn emit_stage_span(
     let plan_str = stage.format_with(&ExplainFormat::Tree);
 
     parent_span.in_scope(|| {
+        // Span name must match `BALLISTA_STAGE_SPAN_NAME` so
+        // `BallistaStageMiddleware` can recognize the span at export
+        // time. `info_span!` interprets a string-literal positional
+        // argument as the span name, so the constant has to be inlined
+        // here (verified by `stage_span_name_matches_constant`).
         let stage_span = tracing::info_span!(
             target: "task_history",
             "ballista_stage",
@@ -242,6 +268,84 @@ fn u128_to_u64_sat(v: u128) -> u64 {
     u64::try_from(v).unwrap_or(u64::MAX)
 }
 
+/// Task-history middleware for `ballista_stage` spans. Bundles two
+/// hooks on a single type:
+///
+/// - [`SpanTransform`]: rewrites `start_time` / `end_time` to the
+///   stage's actual execution window (read from the `stage_started_at`
+///   / `stage_ended_at` attributes), so timeline visualizations show
+///   the real per-stage runtime rather than the brief span-emission
+///   window inside `record_stage_history`.
+/// - [`SpanRetention`]: declares that a `ballista_stage` row depends
+///   on its parent `sql_query` row — the stage row is written only
+///   when the parent row is also being written, avoiding orphans.
+///
+/// Register on the exporter (both hooks):
+/// ```ignore
+/// let m: Arc<BallistaStageMiddleware> = Arc::new(BallistaStageMiddleware);
+/// TaskHistoryExporter::new(...)
+///     .with_transform(Arc::clone(&m) as _)
+///     .with_retention(m as _)
+/// ```
+#[derive(Debug, Default)]
+pub struct BallistaStageMiddleware;
+
+impl BallistaStageMiddleware {
+    /// Helper that constructs an `Arc<Self>` and returns it twice — once
+    /// as each trait object — so a single instance can be registered for
+    /// both hooks in a single chained builder call.
+    #[must_use]
+    pub fn pair() -> (Arc<dyn SpanTransform>, Arc<dyn SpanRetention>) {
+        let m = Arc::new(Self);
+        (
+            Arc::clone(&m) as Arc<dyn SpanTransform>,
+            m as Arc<dyn SpanRetention>,
+        )
+    }
+}
+
+impl SpanTransform for BallistaStageMiddleware {
+    fn transform(&self, span: &mut SpanData) {
+        if &*span.name != BALLISTA_STAGE_SPAN_NAME {
+            return;
+        }
+        let Some(start_ms) = unix_ms_attr(span, STAGE_STARTED_AT_ATTR) else {
+            return;
+        };
+        let Some(end_ms) = unix_ms_attr(span, STAGE_ENDED_AT_ATTR) else {
+            return;
+        };
+        if start_ms == 0 || end_ms < start_ms {
+            return;
+        }
+        span.start_time = UNIX_EPOCH + Duration::from_millis(start_ms);
+        span.end_time = UNIX_EPOCH + Duration::from_millis(end_ms);
+    }
+}
+
+impl SpanRetention for BallistaStageMiddleware {
+    fn parent_dependency(&self, span: &TaskSpan) -> Option<Arc<str>> {
+        if span.task.as_ref() != BALLISTA_STAGE_SPAN_NAME {
+            return None;
+        }
+        span.parent_span_id.as_ref().map(Arc::clone)
+    }
+}
+
+/// Read a non-negative `i64` attribute as `u64` milliseconds. Returns
+/// `None` if the attribute is missing or not a non-negative integer.
+fn unix_ms_attr(span: &SpanData, key: &str) -> Option<u64> {
+    span.attributes.iter().find_map(|kv| {
+        if kv.key.as_str() != key {
+            return None;
+        }
+        match &kv.value {
+            opentelemetry::Value::I64(v) if *v >= 0 => Some((*v).cast_unsigned()),
+            _ => None,
+        }
+    })
+}
+
 /// Format `{executor_id -> count}` as `"executor-a:120,executor-b:80"`
 /// sorted by executor id so the same shape always produces the same
 /// string (stable for snapshot tests).
@@ -258,4 +362,152 @@ fn format_executor_histogram(by_executor: &HashMap<String, u64>) -> String {
         s.push_str(&count.to_string());
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry::trace::{
+        SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId, TraceState,
+    };
+    use opentelemetry::{InstrumentationScope, KeyValue};
+    use opentelemetry_sdk::trace::{SpanData, SpanEvents, SpanLinks};
+    use std::borrow::Cow;
+    use std::time::SystemTime;
+
+    fn stage_span(start_at: SystemTime, end_at: SystemTime, attrs: Vec<KeyValue>) -> SpanData {
+        SpanData {
+            span_context: SpanContext::new(
+                TraceId::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+                SpanId::from_bytes([0, 0, 0, 0, 0, 0, 0, 1]),
+                TraceFlags::default(),
+                false,
+                TraceState::default(),
+            ),
+            parent_span_id: SpanId::INVALID,
+            parent_span_is_remote: false,
+            span_kind: SpanKind::Internal,
+            name: Cow::Borrowed(BALLISTA_STAGE_SPAN_NAME),
+            start_time: start_at,
+            end_time: end_at,
+            attributes: attrs,
+            dropped_attributes_count: 0,
+            events: SpanEvents::default(),
+            links: SpanLinks::default(),
+            status: Status::Unset,
+            instrumentation_scope: InstrumentationScope::default(),
+        }
+    }
+
+    #[test]
+    fn override_replaces_timestamps_with_stage_window() {
+        let emit_at = UNIX_EPOCH + Duration::from_millis(10_000_000);
+        let mut span = stage_span(
+            emit_at,
+            emit_at + Duration::from_millis(2),
+            vec![
+                KeyValue::new(STAGE_STARTED_AT_ATTR, 1_000_000_i64),
+                KeyValue::new(STAGE_ENDED_AT_ATTR, 1_005_000_i64),
+            ],
+        );
+        BallistaStageMiddleware.transform(&mut span);
+        assert_eq!(
+            span.start_time,
+            UNIX_EPOCH + Duration::from_millis(1_000_000)
+        );
+        assert_eq!(span.end_time, UNIX_EPOCH + Duration::from_millis(1_005_000));
+    }
+
+    #[test]
+    fn override_leaves_span_unchanged_for_other_span_names() {
+        let emit_at = UNIX_EPOCH + Duration::from_millis(10_000_000);
+        let mut span = stage_span(
+            emit_at,
+            emit_at + Duration::from_millis(2),
+            vec![
+                KeyValue::new(STAGE_STARTED_AT_ATTR, 1_000_000_i64),
+                KeyValue::new(STAGE_ENDED_AT_ATTR, 1_005_000_i64),
+            ],
+        );
+        span.name = Cow::Borrowed("sql_query");
+        BallistaStageMiddleware.transform(&mut span);
+        assert_eq!(span.start_time, emit_at);
+        assert_eq!(span.end_time, emit_at + Duration::from_millis(2));
+    }
+
+    #[test]
+    fn override_skipped_when_attributes_missing() {
+        let emit_at = UNIX_EPOCH + Duration::from_millis(10_000_000);
+        let mut span = stage_span(emit_at, emit_at + Duration::from_millis(2), vec![]);
+        BallistaStageMiddleware.transform(&mut span);
+        assert_eq!(span.start_time, emit_at);
+        assert_eq!(span.end_time, emit_at + Duration::from_millis(2));
+    }
+
+    #[test]
+    fn override_skipped_when_window_is_inverted_or_zero() {
+        let emit_at = UNIX_EPOCH + Duration::from_millis(10_000_000);
+        // start > end is nonsense from a partly-recorded stage.
+        let mut span = stage_span(
+            emit_at,
+            emit_at + Duration::from_millis(2),
+            vec![
+                KeyValue::new(STAGE_STARTED_AT_ATTR, 1_005_000_i64),
+                KeyValue::new(STAGE_ENDED_AT_ATTR, 1_000_000_i64),
+            ],
+        );
+        BallistaStageMiddleware.transform(&mut span);
+        assert_eq!(span.start_time, emit_at);
+        // start == 0 means no tasks recorded a launch time; leave alone.
+        let mut span0 = stage_span(
+            emit_at,
+            emit_at + Duration::from_millis(2),
+            vec![
+                KeyValue::new(STAGE_STARTED_AT_ATTR, 0_i64),
+                KeyValue::new(STAGE_ENDED_AT_ATTR, 1_000_000_i64),
+            ],
+        );
+        BallistaStageMiddleware.transform(&mut span0);
+        assert_eq!(span0.start_time, emit_at);
+    }
+
+    fn task_span(task: &str, parent: Option<&str>) -> TaskSpan {
+        TaskSpan {
+            trace_id: Arc::from("trace"),
+            trace_id_override: None,
+            span_id: Arc::from("span"),
+            parent_span_id: parent.map(Arc::from),
+            distributed_parent_id: None,
+            task: Arc::from(task),
+            input: Arc::from(""),
+            captured_output: None,
+            start_time: UNIX_EPOCH,
+            end_time: UNIX_EPOCH,
+            execution_duration_ms: 0.0,
+            error_message: None,
+            labels: HashMap::new(),
+            node_id: None,
+        }
+    }
+
+    #[test]
+    fn retention_declares_parent_dependency_for_stage_spans() {
+        let span = task_span(BALLISTA_STAGE_SPAN_NAME, Some("parent-id"));
+        let dep = BallistaStageMiddleware.parent_dependency(&span);
+        assert_eq!(dep.as_deref(), Some("parent-id"));
+    }
+
+    #[test]
+    fn retention_returns_none_for_non_stage_spans() {
+        let span = task_span("sql_query", Some("ignored"));
+        assert!(BallistaStageMiddleware.parent_dependency(&span).is_none());
+    }
+
+    #[test]
+    fn retention_returns_none_for_orphan_stage() {
+        let span = task_span(BALLISTA_STAGE_SPAN_NAME, None);
+        // An orphan stage has no parent to depend on; falling through
+        // to base retention is the correct behavior.
+        assert!(BallistaStageMiddleware.parent_dependency(&span).is_none());
+    }
 }

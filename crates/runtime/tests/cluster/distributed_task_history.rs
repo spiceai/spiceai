@@ -130,6 +130,8 @@ impl opentelemetry_sdk::trace::SpanExporter for SwappableExporter {
             // The scheduler runtime registers task_history in cluster
             // mode, which requires every row to carry a non-null
             // `node_id` — synthesize one for the test.
+            let (ballista_transform, ballista_retention) =
+                runtime::datafusion::query::stage_history::BallistaStageMiddleware::pair();
             let exporter = TaskHistoryExporter::new(
                 df,
                 TaskHistoryCapturedOutput::Truncated,
@@ -138,7 +140,9 @@ impl opentelemetry_sdk::trace::SpanExporter for SwappableExporter {
                 TaskHistoryCapturedPlan::None,
                 None,
                 Some(Arc::<str>::from("test-scheduler")),
-            );
+            )
+            .with_transform(ballista_transform)
+            .with_retention(ballista_retention);
             opentelemetry_sdk::trace::SpanExporter::export(&exporter, batch).await
         }
     }
