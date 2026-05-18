@@ -120,6 +120,35 @@ impl SqliteMetastore {
 
                 if !db_dir.exists() {
                     tokio::fs::create_dir_all(db_dir).await?;
+
+                    // Best-effort parent directory sync (defense-in-depth with
+                    // the sync already performed in CayenneCatalog::init).
+                    // Ensures the db_dir entry is durable before opening the
+                    // SQLite connection and initializing the schema.
+                    //
+                    // We keep this best-effort (with warning on failure) for
+                    // the same reasons as in CayenneCatalog::init: one-time
+                    // initialization, followed by DB file + schema creation,
+                    // and the parent is often a stable operator-managed
+                    // volume root.
+                    if let Some(parent) = db_dir.parent() {
+                        let parent_for_sync = parent.to_path_buf();
+                        let parent_display = parent_for_sync.display().to_string();
+                        let db_dir_display = db_dir.display().to_string();
+                        match tokio::task::spawn_blocking(move || {
+                            std::fs::File::open(&parent_for_sync).and_then(|f| f.sync_all())
+                        })
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => tracing::warn!(
+                                "Failed to sync parent directory {parent_display} after creating SQLite catalog DB directory {db_dir_display} (subsequent DB writes will still be durable): {error}"
+                            ),
+                            Err(error) => tracing::warn!(
+                                "Failed to join SQLite catalog DB parent directory sync task for {parent_display}: {error}"
+                            ),
+                        }
+                    }
                 }
 
                 // Open connection with tokio-rusqlite

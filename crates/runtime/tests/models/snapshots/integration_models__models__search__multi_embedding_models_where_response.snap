@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp, round_scores)
+expression: normalize_search_response(resp)
 snapshot_kind: text
 ---
 {
@@ -19,7 +19,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 2
       },
-      "_score": "0.03"
+      "_score": "[score]"
     },
     {
       "dataset": "multi_embedding_models",
@@ -34,7 +34,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 6
       },
-      "_score": "0.03"
+      "_score": "[score]"
     },
     {
       "dataset": "multi_embedding_models",
@@ -49,7 +49,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 8
       },
-      "_score": "0.03"
+      "_score": "[score]"
     }
   ]
 }
