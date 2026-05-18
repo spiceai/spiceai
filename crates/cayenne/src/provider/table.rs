@@ -1810,34 +1810,59 @@ impl CayenneTableProvider {
             guard.keys().cloned().collect()
         };
 
-        if self.table_metadata.path.starts_with("s3://") {
-            if let Err(err) = self
-                .cleanup_old_snapshots_s3(current_snapshot, &protected_snapshot_ids)
-                .await
-            {
-                tracing::warn!(
-                    "Failed to cleanup old S3 snapshots for table {}: {err}",
-                    &self.table_metadata.table_id
-                );
-            }
-        } else {
-            let table_path = self.table_metadata.path.clone();
-            let table_id = self.table_metadata.table_id.clone();
-            let current_snapshot = current_snapshot.to_string();
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) = Self::cleanup_old_snapshots_blocking(
+        // Grace period before physically removing the old snapshot
+        // directories. Scans hold `listing_fence.read()` during plan-build
+        // (file paths are resolved against the old snapshot) but execute
+        // the plan AFTER the fence is released. If cleanup races ahead of
+        // plan execution the scan opens files that have been unlinked and
+        // fails with NotFound. Spawning the cleanup with a grace sleep lets
+        // every plan that began under the old listing table finish opening
+        // its files.
+        const OLD_SNAPSHOT_CLEANUP_GRACE: std::time::Duration =
+            std::time::Duration::from_secs(30);
+
+        let table_path = self.table_metadata.path.clone();
+        let table_id = self.table_metadata.table_id.clone();
+        let current_snapshot = current_snapshot.to_string();
+        let is_s3 = table_path.starts_with("s3://");
+        let object_store_config = self.table_metadata.object_store_config.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(OLD_SNAPSHOT_CLEANUP_GRACE).await;
+            if is_s3 {
+                if let Err(err) = Self::cleanup_old_snapshots_s3_static(
                     &table_path,
                     &table_id,
                     &current_snapshot,
                     &protected_snapshot_ids,
-                ) {
+                    object_store_config.as_ref(),
+                )
+                .await
+                {
                     tracing::warn!(
-                        "Failed to cleanup old snapshots for table {}: {e}",
-                        table_id
+                        "Failed to cleanup old S3 snapshots for table {}: {err}"
                     );
                 }
-            });
-        }
+            } else {
+                let table_path_inner = table_path.clone();
+                let table_id_inner = table_id.clone();
+                let snapshot_inner = current_snapshot.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = Self::cleanup_old_snapshots_blocking(
+                        &table_path_inner,
+                        &table_id_inner,
+                        &snapshot_inner,
+                        &protected_snapshot_ids,
+                    ) {
+                        tracing::warn!(
+                            "Failed to cleanup old snapshots for table {}: {e}",
+                            table_id_inner
+                        );
+                    }
+                })
+                .await;
+            }
+        });
     }
 
     /// Construct the path to a snapshot directory.
@@ -5167,18 +5192,28 @@ impl CayenneTableProvider {
             return Err(Error::Catalog { source: e });
         }
 
+        // Hold the listing fence across the listing-table swap and the
+        // current-snapshot-id update so new plan-build calls observe the
+        // swap atomically. Deletion caches and stats are touched under the
+        // fence too — readers that already hold a snapshot of these (loaded
+        // during plan-build under read fence) won't observe a torn state.
         {
             let _fence = self.listing_fence.write().await;
             self.listing_table.store(new_listing_table);
+            self.update_current_snapshot_id(&new_snapshot_id);
+            self.clear_all_deletion_caches();
+
+            // Persist accumulated stats from the rewrite — keeps DataFusion's
+            // synchronous statistics path consistent with the new snapshot.
+            self.persist_table_stats(&stats_acc).await;
         }
 
-        self.update_current_snapshot_id(&new_snapshot_id);
-        self.clear_all_deletion_caches();
-
-        // Persist accumulated stats from the rewrite — keeps DataFusion's
-        // synchronous statistics path consistent with the new snapshot.
-        self.persist_table_stats(&stats_acc).await;
-
+        // Cleanup must wait for in-flight scans whose plan-build already
+        // captured file paths from the OLD snapshot to finish executing.
+        // The fence guarantees no NEW plan-build sees the old listing
+        // table, but plan-execute holds no fence. `trigger_old_snapshot_cleanup_with_grace`
+        // delays the actual `remove_dir_all` by a configurable grace period
+        // so the at-risk window (plan-build → plan-execute) closes naturally.
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
 
         tracing::info!(

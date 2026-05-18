@@ -681,6 +681,14 @@ impl MetastoreBackend for TursoMetastore {
     async fn begin_transaction(&self) -> CatalogResult<Box<dyn MetastoreTransaction>> {
         let guard = self.pool().await?.acquire().await;
 
+        // Defensively clear any leftover transaction state before BEGIN. A
+        // prior `TursoTransaction` whose `Drop` fired-and-forgot a ROLLBACK
+        // via `tokio::spawn` can lose the rollback under runtime shutdown,
+        // returning the connection to the pool inside `BEGIN CONCURRENT`.
+        // Issuing ROLLBACK is idempotent on a clean connection (it errors
+        // with "no transaction active"); we ignore that case.
+        let _ = guard.execute("ROLLBACK", ()).await;
+
         guard
             .execute("BEGIN CONCURRENT", ())
             .await

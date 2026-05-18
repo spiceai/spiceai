@@ -713,8 +713,18 @@ impl MetastoreBackend for SqliteMetastore {
     async fn begin_transaction(&self) -> CatalogResult<Box<dyn MetastoreTransaction>> {
         let guard = self.pool().await?.acquire().await;
 
+        // Defensively clear any leftover transaction state before BEGIN. A
+        // prior `SqliteTransaction` whose `Drop` fired-and-forgot a ROLLBACK
+        // via `tokio::spawn` can lose the rollback under runtime shutdown,
+        // returning the connection to the pool inside an open transaction.
+        // SQLite's `autocommit` flag tells us if a txn is pending; rolling
+        // back only when needed avoids the noisy "no transaction is active"
+        // error on clean connections.
         guard
             .call(|conn| {
+                if !conn.is_autocommit() {
+                    let _ = conn.execute_batch("ROLLBACK");
+                }
                 conn.execute_batch("BEGIN TRANSACTION")?;
                 Ok::<_, rusqlite::Error>(())
             })
