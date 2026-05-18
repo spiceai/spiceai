@@ -179,6 +179,10 @@ name = "wide_table_key_probe_scan"
 
 [[bench]]
 harness = false
+name = "load_existing_keyset_cap_disabled"
+
+[[bench]]
+harness = false
 name = "vs_duckdb_in_list_delete"
 required-features = ["duckdb-bench"]
 
