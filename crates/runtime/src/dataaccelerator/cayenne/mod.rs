@@ -173,7 +173,7 @@ fn parse_u64(acceleration: &Acceleration, key: &str, default: u64) -> u64 {
     acceleration.params.get(key).map_or(default, |v| {
         v.parse::<u64>().unwrap_or_else(|_| {
             tracing::warn!(
-                "An invalid '{key}' value was provided: '{v}'. Expected a non-negative integer, defaulting to {default}. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+                "An invalid '{key}' value was provided: '{v}'. Expected an unsigned integer, defaulting to {default}. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
             );
             default
         })

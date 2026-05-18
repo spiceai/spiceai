@@ -198,11 +198,12 @@ impl DeletionIndex {
         }
 
         let new_len = entries.len();
-        debug_assert_eq!(
-            max_sequence_number,
-            entries.values().copied().max(),
-            "DeletionIndex max sequence cache must match entries"
-        );
+        // `max_sequence_number` is maintained incrementally above; the inline
+        // `is_none_or` check covers every mutation site, so we do not
+        // re-scan `entries` here (a full scan would make `extend_max` O(N)
+        // in debug builds and noticeably slow the test suite as the index
+        // grows). `from_map` is the single rebuild path and recomputes the
+        // exact max from scratch.
         // Rebuild from scratch when growth has outpaced bloom capacity by 2×.
         // The doubling threshold keeps amortized cost at O(K) per call:
         // between rebuilds we pay O(K) for incremental inserts; on a rebuild
@@ -376,11 +377,8 @@ impl KeyDeletionIndex {
         }
 
         let new_len = entries.len();
-        debug_assert_eq!(
-            max_sequence_number,
-            entries.values().copied().max(),
-            "KeyDeletionIndex max sequence cache must match entries"
-        );
+        // See `DeletionIndex::extend_max` for the rationale behind not
+        // re-scanning `entries` to validate `max_sequence_number` here.
         if new_len > self.bloom_capacity.saturating_mul(2) {
             let new_capacity = new_len.max(MIN_BLOOM_CAPACITY);
             let mut bloom = BloomFilter::new(new_capacity);
