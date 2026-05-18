@@ -28,11 +28,12 @@ use futures::Stream;
 use rdkafka::{
     ClientConfig, Message, Offset,
     config::RDKafkaLogLevel,
-    consumer::{Consumer, StreamConsumer},
+    consumer::{CommitMode, Consumer, StreamConsumer},
     message::BorrowedMessage,
+    topic_partition_list::TopicPartitionList,
     util::get_rdkafka_version,
 };
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use snafu::prelude::*;
 use std::collections::HashMap;
@@ -67,8 +68,17 @@ pub enum Error {
     #[snafu(display("Unable to mark Kafka message as being processed: {source}"))]
     UnableToCommitMessage { source: rdkafka::error::KafkaError },
 
+    #[snafu(display("Unable to commit Kafka consumer state: {source}"))]
+    UnableToCommitConsumerState { source: rdkafka::error::KafkaError },
+
     #[snafu(display("Unable to restart Kafka offsets {message}: {source}"))]
     UnableToRestartTopic {
+        source: rdkafka::error::KafkaError,
+        message: String,
+    },
+
+    #[snafu(display("Unable to restore Kafka offsets {message}: {source}"))]
+    UnableToRestoreOffsets {
         source: rdkafka::error::KafkaError,
         message: String,
     },
@@ -90,6 +100,29 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct KafkaOffset {
+    pub topic: String,
+    pub partition: i32,
+    pub offset: i64,
+}
+
+impl KafkaOffset {
+    #[must_use]
+    pub fn next_read_offset(&self) -> i64 {
+        self.offset.saturating_add(1)
+    }
+}
+
+#[async_trait]
+pub trait KafkaOffsetCommitHook: Send + Sync {
+    /// Runs after the refresh task has written a batch but before Kafka offsets are committed.
+    /// If this hook fails, Kafka is left uncommitted; plain append accelerations may replay the
+    /// batch after restart and should be treated as at-least-once.
+    async fn commit_offsets(&self, offsets: &[KafkaOffset])
+    -> std::result::Result<(), CommitError>;
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SslIdentification {
@@ -369,6 +402,37 @@ impl KafkaConsumer {
             .context(UnableToCommitMessageSnafu)
     }
 
+    pub fn commit_stored_offsets(&self) -> Result<()> {
+        self.consumer
+            .commit_consumer_state(CommitMode::Async)
+            .context(UnableToCommitConsumerStateSnafu)
+    }
+
+    pub fn restore_offsets(&self, offsets: &[KafkaOffset]) -> Result<()> {
+        if offsets.is_empty() {
+            return Ok(());
+        }
+
+        let mut topic_partition_list = TopicPartitionList::new();
+        for offset in offsets {
+            topic_partition_list
+                .add_partition_offset(
+                    &offset.topic,
+                    offset.partition,
+                    Offset::Offset(offset.next_read_offset()),
+                )
+                .context(UnableToRestoreOffsetsSnafu {
+                    message: "Failed to build topic partition list".to_string(),
+                })?;
+        }
+
+        self.consumer
+            .commit(&topic_partition_list, CommitMode::Sync)
+            .context(UnableToRestoreOffsetsSnafu {
+                message: "Failed to commit sidecar offsets to Kafka".to_string(),
+            })
+    }
+
     pub fn restart_topic(&self, topic: &str) -> Result<()> {
         let mut assignment = self
             .consumer
@@ -445,10 +509,8 @@ impl KafkaConsumer {
             .set("debug", "broker,cgrp,fetch")
             // For new consumer groups, start reading at the beginning of the topic
             .set("auto.offset.reset", "smallest")
-            // Commit offsets automatically
-            .set("enable.auto.commit", "true")
-            // Commit offsets every 5 seconds
-            .set("auto.commit.interval.ms", "5000")
+            // Commit offsets only after Spice has written the batch and persisted the sidecar cursor.
+            .set("enable.auto.commit", "false")
             // Don't automatically store offsets the library provides to us - we will store them after processing explicitly
             // This is what gives us the "at least once" semantics
             .set("enable.auto.offset.store", "false")
@@ -633,19 +695,10 @@ impl<'a, K, V> KafkaMessage<'a, K, V> {
     }
 }
 
-#[async_trait]
-impl<K: Sync, V: Sync> CommitChange for KafkaMessage<'_, K, V> {
-    async fn commit(&self) -> Result<(), CommitError> {
-        self.mark_processed()
-            .boxed()
-            .map_err(|e| cdc::CommitError::UnableToCommitChange { source: e })?;
-        Ok(())
-    }
-}
-
 pub struct MessageBatchCommitter {
     consumer: &'static KafkaConsumer,
-    offsets: Vec<(String, i32, i64)>,
+    offsets: Vec<KafkaOffset>,
+    offset_commit_hook: Option<Arc<dyn KafkaOffsetCommitHook>>,
 }
 
 impl MessageBatchCommitter {
@@ -669,10 +722,18 @@ impl MessageBatchCommitter {
 
         let offsets = max_offsets
             .into_iter()
-            .map(|((topic, partition), offset)| (topic, partition, offset))
+            .map(|((topic, partition), offset)| KafkaOffset {
+                topic,
+                partition,
+                offset,
+            })
             .collect();
 
-        Self { consumer, offsets }
+        Self {
+            consumer,
+            offsets,
+            offset_commit_hook: None,
+        }
     }
 
     #[must_use]
@@ -696,22 +757,49 @@ impl MessageBatchCommitter {
 
         let offsets = max_offsets
             .into_iter()
-            .map(|((topic, partition), offset)| (topic, partition, offset))
+            .map(|((topic, partition), offset)| KafkaOffset {
+                topic,
+                partition,
+                offset,
+            })
             .collect();
 
-        Self { consumer, offsets }
+        Self {
+            consumer,
+            offsets,
+            offset_commit_hook: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_offset_commit_hook(
+        mut self,
+        offset_commit_hook: Option<Arc<dyn KafkaOffsetCommitHook>>,
+    ) -> Self {
+        self.offset_commit_hook = offset_commit_hook;
+        self
     }
 }
 
 #[async_trait]
 impl CommitChange for MessageBatchCommitter {
     async fn commit(&self) -> Result<(), CommitError> {
-        for (topic, partition, offset) in &self.offsets {
+        if let Some(offset_commit_hook) = &self.offset_commit_hook {
+            offset_commit_hook.commit_offsets(&self.offsets).await?;
+        }
+
+        for offset in &self.offsets {
             self.consumer
-                .store_offset(topic, *partition, *offset)
+                .store_offset(&offset.topic, offset.partition, offset.offset)
                 .boxed()
                 .map_err(|e| CommitError::UnableToCommitChange { source: e })?;
         }
+
+        self.consumer
+            .commit_stored_offsets()
+            .boxed()
+            .map_err(|e| CommitError::UnableToCommitChange { source: e })?;
+
         Ok(())
     }
 }
@@ -721,6 +809,7 @@ pub struct Kafka {
     consumer: &'static KafkaConsumer,
     flatten_json: Option<String>,
     batching: (usize, Duration),
+    offset_commit_hook: Option<Arc<dyn KafkaOffsetCommitHook>>,
 }
 
 impl std::fmt::Debug for Kafka {
@@ -741,6 +830,7 @@ impl Kafka {
             consumer: Box::leak(Box::new(consumer)),
             flatten_json: None,
             batching: (10000, Duration::from_secs(1)),
+            offset_commit_hook: None,
         }
     }
 
@@ -757,11 +847,21 @@ impl Kafka {
     }
 
     #[must_use]
+    pub fn with_offset_commit_hook(
+        mut self,
+        offset_commit_hook: Arc<dyn KafkaOffsetCommitHook>,
+    ) -> Self {
+        self.offset_commit_hook = Some(offset_commit_hook);
+        self
+    }
+
+    #[must_use]
     pub fn stream_changes(&self) -> ChangesStream {
         let schema = Arc::clone(&self.schema);
         let flatten_json = self.flatten_json.clone();
         let consumer = self.consumer;
         let metrics = Arc::clone(self.consumer.metrics());
+        let offset_commit_hook = self.offset_commit_hook.clone();
         let inner = self
             .consumer
             .consumer
@@ -784,7 +884,8 @@ impl Kafka {
                 let change_batch =
                     messages_to_change_batch(&messages, flatten_json.as_ref(), &schema)?;
 
-                let committer = MessageBatchCommitter::from_borrowed_messages(consumer, &messages);
+                let committer = MessageBatchCommitter::from_borrowed_messages(consumer, &messages)
+                    .with_offset_commit_hook(offset_commit_hook.clone());
 
                 Ok(ChangeEnvelope::new(Box::new(committer), change_batch, true))
             });
