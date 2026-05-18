@@ -789,85 +789,6 @@ fn test_cloud_deployment_logs() {
     cleanup_app(&org_app);
 }
 
-#[test]
-fn test_cloud_rollback() {
-    let _ = require_cmd!();
-    let name = test_app_name();
-    let org_app = create_test_app(&name);
-
-    // Create two deployments
-    for _ in 0..2 {
-        let mut cmd = spice_cloud_cmd().expect("credentials required");
-        cmd.args([
-            "cloud",
-            "create",
-            "deployment",
-            "--app",
-            &org_app,
-            "--replicas",
-            "1",
-            "-o",
-            "json",
-        ])
-        .assert()
-        .success();
-    }
-
-    // Get the first deployment ID
-    let mut cmd = spice_cloud_cmd().expect("credentials required");
-    let list_assert = cmd
-        .args([
-            "cloud",
-            "deployments",
-            "--app",
-            &org_app,
-            "--limit",
-            "10",
-            "-o",
-            "json",
-        ])
-        .assert()
-        .success();
-    let list_output: serde_json::Value = serde_json::from_slice(&list_assert.get_output().stdout)
-        .expect("list deployments should produce valid JSON");
-    let deps = list_output
-        .as_array()
-        .expect("deployments should be an array");
-    assert!(
-        deps.len() >= 2,
-        "should have at least 2 deployments for rollback test"
-    );
-    // Rollback to the second-to-last (older) deployment
-    let target_id = deps
-        .last()
-        .and_then(|d| d.get("id").and_then(serde_json::Value::as_i64))
-        .expect("should get target deployment id");
-
-    let mut cmd = spice_cloud_cmd().expect("credentials required");
-    let rollback_assert = cmd
-        .args([
-            "cloud",
-            "rollback",
-            "--app",
-            &org_app,
-            "--target",
-            &target_id.to_string(),
-            "-o",
-            "json",
-        ])
-        .assert()
-        .success();
-
-    let rollback_output: serde_json::Value =
-        serde_json::from_slice(&rollback_assert.get_output().stdout)
-            .expect("rollback should produce valid JSON");
-    insta_settings().bind(|| {
-        insta::assert_json_snapshot!(&rollback_output, @"");
-    });
-
-    cleanup_app(&org_app);
-}
-
 // ============================================================================
 // Regions & Container Images
 // ============================================================================
@@ -1034,7 +955,6 @@ fn test_cloud_help_lists_all_subcommands() {
         .stdout(predicate::str::contains("delete"))
         .stdout(predicate::str::contains("deploy"))
         .stdout(predicate::str::contains("inspect"))
-        .stdout(predicate::str::contains("rollback"))
         .stdout(predicate::str::contains("api-keys"))
         .stdout(predicate::str::contains("metrics"));
 }
