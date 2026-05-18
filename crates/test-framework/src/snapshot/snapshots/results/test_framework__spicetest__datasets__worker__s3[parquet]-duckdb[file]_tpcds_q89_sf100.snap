@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q89"
+---
++------------+-----------+--------------------+--------------+----------------+-------+-----------+-------------------+
+| i_category | i_class   | i_brand            | s_store_name | s_company_name | d_moy | sum_sales | avg_monthly_sales |
++------------+-----------+--------------------+--------------+----------------+-------+-----------+-------------------+
+| Children   | infants   | importoexporti #2  | bar          | Unknown        | 2     | 304982.40 | 577571.5975       |
+| Children   | infants   | importoexporti #2  | able         | Unknown        | 2     | 308386.70 | 579059.7166666667 |
+| Children   | infants   | importoexporti #2  | ese          | Unknown        | 2     | 311498.28 | 579701.7116666667 |
+| Children   | infants   | importoexporti #2  | eing         | Unknown        | 2     | 311242.03 | 578493.7466666667 |
+| Music      | classical | edu packscholar #2 | ese          | Unknown        | 2     | 299141.90 | 560549.4375       |
+| Music      | classical | edu packscholar #2 | able         | Unknown        | 2     | 305679.04 | 562919.0808333333 |
+| Children   | infants   | importoexporti #2  | ese          | Unknown        | 4     | 322593.22 | 579701.7116666667 |
+| Music      | classical | edu packscholar #2 | bar          | Unknown        | 2     | 305535.38 | 560256.05         |
+| Children   | infants   | importoexporti #2  | eing         | Unknown        | 6     | 325385.45 | 578493.7466666667 |
+| Children   | infants   | importoexporti #2  | ese          | Unknown        | 3     | 327079.75 | 579701.7116666667 |
++------------+-----------+--------------------+--------------+----------------+-------+-----------+-------------------+
