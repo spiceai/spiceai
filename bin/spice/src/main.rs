@@ -21,8 +21,8 @@ use spice::commands::acceleration::{AccelerationArgs, SnapshotArgs, SnapshotsArg
 use spice::commands::component::{ComponentSection, SingletonSection};
 use spice::commands::{
     acceleration, add, catalogs, chat, cloud, cluster, completions, component, connect, dataset,
-    feedback, init, install, login, models, nsql, pods, query, refresh, run, search, sql, status,
-    trace, upgrade, validate, version, workers,
+    datasets, feedback, init, install, login, models, nsql, pods, query, refresh, run, search, sql,
+    status, trace, upgrade, validate, version, workers,
 };
 use spice::output::OutputFormat;
 use spice::{Result, RuntimeContext};

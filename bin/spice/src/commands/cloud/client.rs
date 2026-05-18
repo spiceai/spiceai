@@ -542,7 +542,8 @@ mod tests {
 
     #[test]
     fn build_executor_does_not_default_executor_memory() {
-        let executor = build_executor(None, Some(2), None).expect("executor cpu should create executor");
+        let executor =
+            build_executor(None, Some(2), None).expect("executor cpu should create executor");
 
         let resources = executor.resources.expect("executor resources should exist");
         assert_eq!(resources.limits.cpu.as_deref(), Some("2"));

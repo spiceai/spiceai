@@ -1959,7 +1959,7 @@ mod tests {
     fn cluster_app_args(replicas: Option<i32>) -> CreateAppArgs {
         let mut args = create_app_args(AppKind::Cluster, replicas);
         args.executor_replicas = Some(1);
-        args.executor_cpu = Some(1.0);
+        args.executor_cpu = Some(1);
         args.executor_memory = Some(bytes::NumBytes::from_bytes(1024));
         args
     }
