@@ -17,9 +17,9 @@ limitations under the License.
 //! Regression bench: amplification cost of clearing the full
 //! [`scan_listing_tables`] cache on every CDC commit.
 //!
+//! Older versions of
 //! [`CayenneTableProvider::publish_current_snapshot_files_changed_under_held_fence`]
-//! (`crates/cayenne/src/provider/table.rs:5811-5824`) calls
-//! `self.scan_listing_tables.lock().clear()` on every staged-append commit.
+//! cleared the entire scan-listing-table cache on every staged-append commit.
 //! The cache holds one [`Arc<ListingTable>`] per
 //! (`snapshot_id`, `target_partitions`, `collect_statistics`) tuple, populated
 //! lazily on the scan path via
@@ -30,13 +30,13 @@ limitations under the License.
 //! `protected_snapshots` (`publish_written_snapshot_with_sequence`,
 //! `provider/table.rs:3058-3080`), so a table that absorbs upserts between
 //! compactions has N protected snapshots whose listing-table entries are
-//! still valid (their on-disk file set has not changed). Today's
-//! `clear()` evicts those entries too — so the next scan rebuilds
-//! `N + 1` `ListingTable`s (current snapshot + every protected snapshot).
+//! still valid (their on-disk file set has not changed). A full cache clear
+//! evicts those entries too, so the next scan rebuilds `N + 1`
+//! `ListingTable`s (current snapshot + every protected snapshot).
 //!
-//! The TigerStyle remedy is `retain(|key, _| key.snapshot_id !=
-//! current_snapshot)` — invalidate only the entries that became stale,
-//! preserve the rest. This is the same pattern Cayenne already uses for
+//! The production path now retains entries whose snapshot IDs did not change:
+//! invalidate only the entries that became stale, preserve the rest. This is
+//! the same pattern Cayenne already uses for
 //! the runtime's per-URL `list_files_cache` (which `invalidate_list_files_cache`
 //! also targets at the current snapshot only).
 //!
@@ -45,23 +45,23 @@ limitations under the License.
 //! Pure shape — no Cayenne setup, no metastore. Two lanes per protected
 //! snapshot count:
 //!
-//! - `current_full_clear/<snapshots>` — mirrors today's behavior: clear
+//! - `full_clear_baseline/<snapshots>` — mirrors the old behavior: clear
 //!   the cache, then rebuild `N + 1` `ListingTable` instances (one per
 //!   snapshot) using the same `ListingTable::try_new` path the production
 //!   `scan_listing_table_for_config` exercises. Models the next scan after
 //!   one CDC commit when `N` protected snapshots exist.
-//! - `proposed_retain_protected/<snapshots>` — models the fix: clone the
+//! - `targeted_retain_protected/<snapshots>` — models current behavior: clone the
 //!   `Arc<ListingTable>` for each non-current snapshot (cache hit), and
 //!   rebuild only the current snapshot's entry. Wall time is `N`
 //!   `Arc::clone` plus one `ListingTable::try_new`.
 //!
-//! The gap visualizes the per-scan-after-write overhead the fix would
-//! eliminate. Per-scan, not per-write: writes are paced by their own
-//! cost, but every scan after a write pays the rebuild fee.
+//! The gap visualizes the per-scan-after-write overhead avoided by targeted
+//! invalidation. Per-scan, not per-write: writes are paced by their own cost,
+//! but every scan after a full clear pays the rebuild fee.
 //!
 //! `cargo bench --bench scan_listing_cache_invalidation -p cayenne`.
 
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used)]
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -77,8 +77,8 @@ use datafusion::datasource::listing::{
 /// Protected-snapshot counts that bracket realistic upsert workloads.
 ///
 /// - `0`: baseline — only the current snapshot is rebuilt per scan.
-/// - `4`: typical operational state, matches the warn-at-4 threshold in
-///   `scan_protected_snapshots` (`provider/table.rs:7082-7088`).
+/// - `4`: below the default protected-snapshot maintenance threshold but
+///   already enough to show cache rebuild amplification.
 /// - `16`: long-running upsert workload between compactions.
 /// - `64`: pathological — large backlog of protected snapshots.
 const SNAPSHOT_COUNTS: &[usize] = &[0, 4, 16, 64];
@@ -111,10 +111,8 @@ fn build_listing_table(url: &ListingTableUrl, schema: SchemaRef) -> Arc<ListingT
 fn make_snapshot_url(table_dir: &std::path::Path, snapshot_id: &str) -> ListingTableUrl {
     let dir = table_dir.join(snapshot_id);
     std::fs::create_dir_all(&dir).expect("snapshot dir should be creatable");
-    let url = format!(
-        "file://{}/",
-        dir.to_string_lossy().trim_end_matches('/').to_string()
-    );
+    let dir_path = dir.to_string_lossy();
+    let url = format!("file://{}/", dir_path.trim_end_matches('/'));
     ListingTableUrl::parse(&url).expect("listing url should parse")
 }
 
@@ -136,15 +134,15 @@ fn bench_scan_listing_cache_invalidation(c: &mut Criterion) {
             .collect();
 
         // Warm cache: pre-built protected snapshot entries that the
-        // proposed-retain lane reuses via Arc::clone.
+        // targeted-retain lane reuses via Arc::clone.
         let cached_protected: Vec<Arc<ListingTable>> = protected_urls
             .iter()
             .map(|url| build_listing_table(url, Arc::clone(&schema)))
             .collect();
 
-        // Lane A — current behavior: cache cleared, every entry rebuilt.
+        // Lane A — historical full-clear behavior: every entry rebuilt.
         group.bench_with_input(
-            BenchmarkId::new("current_full_clear", count),
+            BenchmarkId::new("full_clear_baseline", count),
             &count,
             |b, _| {
                 b.iter(|| {
@@ -160,10 +158,10 @@ fn bench_scan_listing_cache_invalidation(c: &mut Criterion) {
             },
         );
 
-        // Lane B — proposed behavior: protected entries survive, only the
-        // current snapshot rebuilds. Models post-fix per-scan cost.
+        // Lane B — current behavior: protected entries survive, only the
+        // current snapshot rebuilds.
         group.bench_with_input(
-            BenchmarkId::new("proposed_retain_protected", count),
+            BenchmarkId::new("targeted_retain_protected", count),
             &count,
             |b, _| {
                 b.iter(|| {

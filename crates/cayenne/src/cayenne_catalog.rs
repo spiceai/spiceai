@@ -446,7 +446,7 @@ impl CayenneCatalog {
         sequence_number: i64,
     ) -> CatalogResult<()> {
         let (sql, params) =
-            Self::build_insert_records_chunk_sql(table_id, pk_bytes_list, sequence_number);
+            Self::build_insert_records_chunk_sql(table_id, &pk_bytes_list, sequence_number);
 
         self.metastore
             .execute_helper(ExecuteParams { sql: &sql, params })
@@ -461,14 +461,14 @@ impl CayenneCatalog {
     /// Build the SQL and parameters for a single chunk of insert records.
     fn build_insert_records_chunk_sql(
         table_id: &str,
-        pk_bytes_list: Vec<Vec<u8>>,
+        pk_bytes_list: &[Vec<u8>],
         sequence_number: i64,
     ) -> (String, Vec<MetastoreValue>) {
         let mut values_parts = Vec::with_capacity(pk_bytes_list.len());
         let mut params = Vec::with_capacity(pk_bytes_list.len() * 4);
         let table_id = table_id.to_string();
 
-        for (i, pk_bytes) in pk_bytes_list.into_iter().enumerate() {
+        for (i, pk_bytes) in pk_bytes_list.iter().enumerate() {
             let base = i * 4 + 1; // SQLite params are 1-indexed
             values_parts.push(format!(
                 "(?{}, ?{}, ?{}, ?{})",
@@ -479,7 +479,7 @@ impl CayenneCatalog {
             ));
             params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
             params.push(MetastoreValue::Text(table_id.clone()));
-            params.push(MetastoreValue::Blob(pk_bytes));
+            params.push(MetastoreValue::Blob(pk_bytes.clone()));
             params.push(MetastoreValue::Integer(sequence_number));
         }
 
@@ -1111,7 +1111,7 @@ impl MetadataCatalog for CayenneCatalog {
 
         for chunk in pk_bytes_list.chunks(MAX_ROWS_PER_CHUNK) {
             let (sql, params) =
-                Self::build_insert_records_chunk_sql(table_id, chunk.to_vec(), sequence_number);
+                Self::build_insert_records_chunk_sql(table_id, chunk, sequence_number);
             if let Err(e) = tx.execute(ExecuteParams { sql: &sql, params }).await {
                 // Transaction auto-rolls-back on drop.
                 return Err(CatalogError::InvalidOperation {
@@ -1956,15 +1956,18 @@ impl MetadataCatalog for CayenneCatalog {
         // Atomic replacement for the legacy `add_delete_file × N` +
         // `add_insert_records_batch` sequence in `apply_on_conflict_deletions`.
         // See `crates/cayenne/benches/apply_on_conflict_rpc_ceiling.rs` for the
-        // before-numbers — collapses `N+2` RPCs to 2 (the caller still pays
-        // `increment_sequence_number` itself) and, more importantly, makes
-        // the catalog state all-or-nothing.
+        // before-numbers and the atomicity tradeoff. The caller still pays
+        // `increment_sequence_number` itself; this transaction wraps the
+        // delete-file and insert-record catalog writes so they commit all-or-
+        // nothing.
         if delete_files.is_empty() && insert_pk_bytes_list.is_empty() {
             return Ok(());
         }
 
         // Validate every delete_file belongs to this table_id up front so a
-        // mismatch can't half-apply via the txn.
+        // mismatch can't half-apply via the txn. Duplicate path metadata is
+        // checked by the INSERT/ON CONFLICT guard inside the transaction and
+        // re-read only on error to produce the descriptive validation message.
         for delete_file in &delete_files {
             if delete_file.table_id != table_id {
                 return Err(CatalogError::InvalidOperationNoSource {
@@ -1974,14 +1977,6 @@ impl MetadataCatalog for CayenneCatalog {
                     ),
                 });
             }
-            self.validate_existing_delete_file_if_present(delete_file)
-                .await
-                .map_err(|e| CatalogError::InvalidOperation {
-                    message:
-                        "Failed to validate existing delete file before on-conflict transaction"
-                            .to_string(),
-                    source: Box::new(e),
-                })?;
         }
 
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
@@ -2073,7 +2068,7 @@ impl MetadataCatalog for CayenneCatalog {
             // Chunked INSERTs for the insert_record rows.
             for chunk in insert_pk_bytes_list.chunks(MAX_ROWS_PER_CHUNK) {
                 let (sql, params) =
-                    Self::build_insert_records_chunk_sql(table_id, chunk.to_vec(), insert_sequence);
+                    Self::build_insert_records_chunk_sql(table_id, chunk, insert_sequence);
                 if let Err(e) = tx.execute(ExecuteParams { sql: &sql, params }).await {
                     if attempt < max_attempts && is_retryable_write_conflict(&e) {
                         drop(tx);
@@ -2087,6 +2082,7 @@ impl MetadataCatalog for CayenneCatalog {
                         tokio::time::sleep(delay).await;
                         continue 'attempts;
                     }
+                    drop(tx);
                     return Err(CatalogError::InvalidOperation {
                         message:
                             "Failed to insert insert-record chunk inside on-conflict transaction"
@@ -2119,7 +2115,7 @@ impl MetadataCatalog for CayenneCatalog {
 
         Err(CatalogError::InvalidOperationNoSource {
             message: format!(
-                "commit_on_conflict_deletions exhausted {max_attempts} attempts without success or a terminal error"
+                "commit_on_conflict_deletions was not attempted because max attempts is {max_attempts}"
             ),
         })
     }

@@ -110,7 +110,6 @@ use super::vortex_format::DeletionFilteringVortexFormat;
 use arc_swap::ArcSwap;
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
-const PROTECTED_SNAPSHOT_WARN_THRESHOLD: usize = 4;
 const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
 const PK_KEYSET_CACHE_MAX_ENTRIES: usize = 1_000_000;
 const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
@@ -129,9 +128,16 @@ enum SnapshotMaintenanceTrigger {
 }
 
 fn protected_snapshot_age(snapshot_id: &str, now: SystemTime) -> Option<Duration> {
-    let timestamp = uuid::Uuid::parse_str(snapshot_id).ok()?.get_timestamp()?;
+    let Ok(snapshot_uuid) = uuid::Uuid::parse_str(snapshot_id) else {
+        return Some(Duration::MAX);
+    };
+    let Some(timestamp) = snapshot_uuid.get_timestamp() else {
+        return Some(Duration::MAX);
+    };
     let (seconds, nanos) = timestamp.to_unix();
-    let snapshot_time = UNIX_EPOCH.checked_add(Duration::new(seconds, nanos))?;
+    let Some(snapshot_time) = UNIX_EPOCH.checked_add(Duration::new(seconds, nanos)) else {
+        return Some(Duration::MAX);
+    };
     now.duration_since(snapshot_time).ok()
 }
 
@@ -943,7 +949,6 @@ impl OnConflictExt for OnConflict {
 #[derive(Debug, Clone, Default)]
 struct CachedTableStatistics {
     optimizer: Option<Statistics>,
-    catalog_blob: Option<TableStatistics>,
 }
 
 /// Cayenne table provider that reads from Vortex virtual files.
@@ -2940,7 +2945,6 @@ impl CayenneTableProvider {
             scan_listing_tables: Arc::new(ParkingMutex::new(HashMap::new())),
             table_statistics: Arc::new(RwLock::new(CachedTableStatistics {
                 optimizer: table_statistics,
-                catalog_blob: None,
             })),
             table_statistics_persistence_lock: Arc::new(tokio::sync::Mutex::new(())),
             retention_filters,
@@ -3517,10 +3521,9 @@ impl CayenneTableProvider {
         }
     }
 
-    pub(crate) fn clear_cached_table_statistics(&self) {
+    fn clear_cached_table_statistics_unlocked(&self) {
         let mut cache = self.table_statistics.write();
         cache.optimizer = None;
-        cache.catalog_blob = None;
     }
 
     fn take_cached_pk_keyset(&self) -> Option<HashMap<OwnedRow, RowLocation>> {
@@ -4509,8 +4512,7 @@ impl CayenneTableProvider {
         // left a crash window where deletion records could persist without
         // their corresponding insert sequences — see
         // `crates/cayenne/benches/apply_on_conflict_rpc_ceiling.rs` for the
-        // before-numbers (collapses `N+2` RPCs to 2 plus the existing
-        // `increment_sequence_number`).
+        // metastore call-count shape and atomicity tradeoff.
         let delete_files: Vec<crate::metadata::DeleteFile> =
             results.iter().map(|r| r.delete_file.clone()).collect();
         self.catalog
@@ -5998,37 +6000,36 @@ impl CayenneTableProvider {
     /// Best-effort: logs a warning and continues if stats persistence fails,
     /// since stats are an optimization and not critical for correctness.
     pub(crate) async fn persist_table_stats(&self, accumulator: &ColumnStatsAccumulator) {
+        let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
+        self.persist_table_stats_locked(accumulator).await;
+    }
+
+    pub(crate) async fn reset_table_stats_after_overwrite(
+        &self,
+        accumulator: &ColumnStatsAccumulator,
+    ) {
+        let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
+        self.clear_cached_table_statistics_unlocked();
+        self.persist_table_stats_locked(accumulator).await;
+    }
+
+    async fn persist_table_stats_locked(&self, accumulator: &ColumnStatsAccumulator) {
         let Some((new_blob, new_rows)) = accumulator.to_file_statistics_blob_with_row_count()
         else {
             return;
         };
-
-        let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
-
-        // In the steady state we just wrote this blob ourselves on the prior
-        // maintenance cycle and the cache snapshot is exactly what the catalog
-        // would return, so skip the round trip. On a cold start, or after
-        // `clear_cached_table_statistics` (e.g. overwrite path), the cache is
-        // `None` and we fall back to the catalog once to seed it.
-        let existing_stats = {
-            let cached = self.table_statistics.read().catalog_blob.clone();
-            if cached.is_some() {
-                cached
-            } else {
-                match self
-                    .catalog
-                    .get_table_statistics(&self.table_metadata.table_id)
-                    .await
-                {
-                    Ok(stats) => stats,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to load existing table stats for {} before merge: {e}",
-                            self.table_metadata.table_name
-                        );
-                        None
-                    }
-                }
+        let existing_stats = match self
+            .catalog
+            .get_table_statistics(&self.table_metadata.table_id)
+            .await
+        {
+            Ok(stats) => stats,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load existing table stats for {} before merge: {e}",
+                    self.table_metadata.table_name
+                );
+                None
             }
         };
 
@@ -6064,7 +6065,6 @@ impl CayenneTableProvider {
 
         let df_stats = Self::table_statistics_to_df(&self.table_metadata.schema, &stats);
         let mut cache = self.table_statistics.write();
-        cache.catalog_blob = Some(stats);
         cache.optimizer = df_stats;
     }
 
@@ -7182,10 +7182,13 @@ impl CayenneTableProvider {
             protected_snapshot_count = protected_snapshots.len(),
             "Cayenne scan includes protected snapshots"
         );
-        if protected_snapshots.len() >= PROTECTED_SNAPSHOT_WARN_THRESHOLD {
+        let protected_snapshot_warn_threshold =
+            self.context.compaction_picker_config().trigger_files.max(1);
+        if protected_snapshots.len() >= protected_snapshot_warn_threshold {
             tracing::warn!(
                 table = %self.table_metadata.table_name,
                 protected_snapshot_count = protected_snapshots.len(),
+                protected_snapshot_warn_threshold,
                 "Cayenne scan has high protected snapshot amplification"
             );
         }
@@ -8394,7 +8397,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_snapshot_maintenance_trigger_ignores_invalid_uuid_age() {
+    fn protected_snapshot_maintenance_trigger_treats_invalid_uuid_as_old() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
         let protected_snapshots = HashMap::from([("not-a-uuid".to_string(), 1)]);
 
@@ -8405,7 +8408,11 @@ mod tests {
                 Some(Duration::from_secs(60)),
                 now,
             ),
-            None
+            Some(SnapshotMaintenanceTrigger::ProtectedSnapshotAge {
+                protected_snapshot_count: 1,
+                oldest_snapshot_age: Duration::MAX,
+                trigger_age: Duration::from_secs(60),
+            })
         );
     }
 
@@ -9139,55 +9146,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_cached_table_statistics_drops_blob_cache() {
-        // Regression for the raw table-statistics blob cache.
-        // `clear_cached_table_statistics` must drop BOTH the derived
-        // `Statistics` cache and the raw `TableStatistics` blob cache, otherwise
-        // a post-overwrite `persist_table_stats` would re-seed the catalog with
-        // stale pre-overwrite stats merged into the new accumulator. See the
-        // iter-8 race analysis in this PR's loop history.
+    async fn clear_cached_table_statistics_drops_optimizer_cache() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ctx = SessionContext::new();
         let (provider, _temp_dir) = create_sorted_cayenne_table(
-            "clear_cached_stats_blob_test",
+            "clear_cached_stats_optimizer_test",
             schema,
             vec![],
             ctx.runtime_env(),
         )
         .await;
 
-        // Seed both caches with placeholder state to model the steady-state
-        // after a successful `persist_table_stats` upsert.
         {
             let mut cache = provider.table_statistics.write();
             cache.optimizer = Some(datafusion_common::Statistics::new_unknown(
                 &provider.table_metadata.schema,
             ));
-            cache.catalog_blob = Some(crate::metadata::TableStatistics {
-                table_id: provider.table_metadata.table_id.clone(),
-                statistics_blob: vec![1, 2, 3, 4],
-                num_rows: 7,
-            });
         }
 
         assert!(
             provider.table_statistics.read().optimizer.is_some(),
             "precondition: derived Statistics cache must be seeded"
         );
-        assert!(
-            provider.table_statistics.read().catalog_blob.is_some(),
-            "precondition: blob cache must be seeded"
-        );
 
-        provider.clear_cached_table_statistics();
+        provider.clear_cached_table_statistics_unlocked();
 
         assert!(
             provider.table_statistics.read().optimizer.is_none(),
             "clear must drop the derived Statistics cache"
-        );
-        assert!(
-            provider.table_statistics.read().catalog_blob.is_none(),
-            "clear must drop the blob cache in lockstep with the derived cache"
         );
     }
 

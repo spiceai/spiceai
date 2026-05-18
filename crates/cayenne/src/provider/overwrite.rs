@@ -205,8 +205,9 @@ impl PreparedOverwrite {
         // leaves the cache empty rather than stale; `persist_table_stats`
         // repopulates it when the accumulator has rows. The catalog row was
         // already cleared atomically with the snapshot pointer flip.
-        self.table.clear_cached_table_statistics();
-        self.table.persist_table_stats(&self.write_stats_acc).await;
+        self.table
+            .reset_table_stats_after_overwrite(&self.write_stats_acc)
+            .await;
 
         // Drop the write guard last so all visibility-related updates happen
         // under exclusive table access.

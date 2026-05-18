@@ -10,8 +10,9 @@
 //! [`crate::provider::table::CayenneTableProvider::apply_partial_deletion_filter`]
 //! (`crates/cayenne/src/provider/table.rs:7100-7173`).
 //!
-//! Every call to `scan_protected_snapshots` walks every protected snapshot
-//! and, for each, hits `apply_partial_deletion_filter` which today does:
+//! Every call to `scan_protected_snapshots` walks every protected snapshot.
+//! Older `apply_partial_deletion_filter` code rebuilt a filtered deletion
+//! index for each protected snapshot:
 //!
 //! ```ignore
 //! let filtered_deletions: HashMap<i64, i64> = deleted_pk_values
@@ -26,44 +27,36 @@
 //!
 //! For N protected snapshots and a deletion cache of M total entries each
 //! scan pays `O(N · (M_total + M_filtered))` allocator + hashing work
-//! before any data is read. With the existing warn-at-N≥4 threshold
-//! (`provider/table.rs:6980-6986`) this is bounded but real: 4 snapshots
-//! at 100 K entries each ≈ 1.6 MB of HashMap allocator traffic + 4 fresh
-//! bloom filter rebuilds per scan.
+//! before any data is read. Four snapshots at 100 K entries each mean about
+//! 1.6 MB of `HashMap` allocator traffic plus four fresh bloom filter rebuilds
+//! per scan.
 //!
-//! The TigerStyle remedy is to apply the `min_seq` filter at probe time
-//! (one `seq > min_seq` comparison per matched PK in
-//! `Int64PkDeletionFilterStream::poll_next`) and reuse the existing
-//! `DeletionIndex` instance across protected snapshots. The probe path is
-//! already cheap because of the bloom prefilter — adding an integer
-//! comparison after a confirmed map hit is a constant per match, not per
-//! cached entry.
+//! The production path now applies the `min_seq` filter at probe time (one
+//! `seq > min_seq` comparison per matched PK in
+//! `Int64PkDeletionFilterStream::poll_next`) and reuses the existing
+//! `DeletionIndex` instance across protected snapshots.
 //!
 //! ## What this bench measures
 //!
 //! Pure shape — no Cayenne setup, no metastore. Two lanes per
 //! `(deletion_cache_size, protected_snapshot_count)`:
 //!
-//! - `current_rebuild_per_snapshot` — for each protected snapshot,
+//! - `rebuild_per_snapshot_baseline` — for each protected snapshot,
 //!   filter+collect+from_map. Mirrors the body of
-//!   `apply_partial_deletion_filter`. Cost scales as O(N · M).
-//! - `probe_time_filter` — model: share one `Arc<DeletionIndex>` across
+//!   the old `apply_partial_deletion_filter`. Cost scales as O(N · M).
+//! - `probe_time_filter` — current behavior: share one `Arc<DeletionIndex>` across
 //!   all snapshots, do nothing extra at scan-plan time. Cost is O(N) just
 //!   to count the snapshots; the per-snapshot work is amortized into the
 //!   probe loop which is not measured here (that cost is a constant per
 //!   probe, regardless of how many snapshots exist).
 //!
-//! The gap visualizes the per-plan-build overhead the proposed fix would
-//! eliminate. The probe-time work added by the fix is *not* captured by
-//! this bench — but `deletion_index_probe.rs` already measures the per-row
-//! probe cost, and adding one `seq > min_seq` comparison per matched
-//! probe is well below the bloom check cost, so the swap is a net win
-//! whenever `N · M_plan_build_cost > M_extra_probe_cost`.
+//! The gap visualizes the per-plan-build overhead avoided by probe-time
+//! filtering. The probe-time work is not captured by this bench, but
+//! `deletion_index_probe.rs` measures the per-row probe cost.
 //!
 //! `cargo bench --bench apply_partial_deletion_filter_per_scan -p cayenne`.
 
 #![expect(clippy::expect_used)]
-#![expect(clippy::cast_possible_wrap)]
 
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -78,8 +71,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 /// - 100 K     — long-lived table absorbing many deletes.
 const CACHE_SIZES: &[usize] = &[1_000, 10_000, 100_000];
 
-/// Protected snapshot counts. The warn-at-4 threshold in
-/// `scan_protected_snapshots` triggers above this; 8 stresses past it.
+/// Protected snapshot counts. The default snapshot-maintenance count trigger is 8,
+/// so this brackets the normal operating range and the trigger boundary.
 const SNAPSHOT_COUNTS: &[usize] = &[1, 4, 8];
 
 /// Build a deletion cache with `size` entries. Sequence numbers are spread
@@ -89,7 +82,8 @@ const SNAPSHOT_COUNTS: &[usize] = &[1, 4, 8];
 fn build_deletion_cache(size: usize) -> Arc<DeletionIndex> {
     let mut entries = HashMap::with_capacity(size);
     for i in 0..size {
-        entries.insert(i as i64, i as i64 + 1);
+        let seq = i64::try_from(i).expect("cache size should fit in i64");
+        entries.insert(seq, seq + 1);
     }
     Arc::new(DeletionIndex::from_map(entries))
 }
@@ -109,9 +103,9 @@ fn run_full_rebuild(cache: &Arc<DeletionIndex>, snapshot_count: usize, min_seq: 
     }
 }
 
-/// Lane B: models the proposed fix — share the existing `Arc<DeletionIndex>`
-/// across protected snapshots and defer the `min_seq` filter to probe time.
-/// Plan-build cost collapses to N Arc clones.
+/// Lane B: current behavior — share the existing `Arc<DeletionIndex>` across
+/// protected snapshots and defer the `min_seq` filter to probe time. Plan-build
+/// cost collapses to N Arc clones.
 fn run_probe_time_filter(cache: &Arc<DeletionIndex>, snapshot_count: usize, _min_seq: i64) {
     for _ in 0..snapshot_count {
         let shared = Arc::clone(cache);
@@ -127,7 +121,7 @@ fn bench_apply_partial_deletion_filter_per_scan(c: &mut Criterion) {
         let cache = build_deletion_cache(cache_size);
         // Cutoff that retains ~half the entries — typical shape from
         // protected-snapshot-creation-time max-delete-sequence captures.
-        let min_seq = (cache_size as i64) / 2;
+        let min_seq = i64::try_from(cache_size).expect("cache size should fit in i64") / 2;
 
         for &snapshot_count in SNAPSHOT_COUNTS {
             // Throughput = total entries touched across all snapshots, so
@@ -138,7 +132,7 @@ fn bench_apply_partial_deletion_filter_per_scan(c: &mut Criterion) {
             let id = format!("M={cache_size}/N={snapshot_count}");
             let cache_a = Arc::clone(&cache);
             group.bench_with_input(
-                BenchmarkId::new("current_rebuild_per_snapshot", &id),
+                BenchmarkId::new("rebuild_per_snapshot_baseline", &id),
                 &snapshot_count,
                 |b, &snapshot_count| {
                     b.iter(|| {

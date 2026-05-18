@@ -949,7 +949,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("write_concurrency")
             .description("Optional writer partition override for unsorted Cayenne ingests. Defaults to runtime.query.target_partitions."),
         ParameterSpec::component("compaction_trigger_files")
-            .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 8.")
+            .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs, and the protected-snapshot count that triggers snapshot-maintenance compaction. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 8.")
             .default("8"),
         ParameterSpec::component("compaction_trigger_snapshot_age_ms")
             .description("Maximum age in milliseconds of the oldest protected snapshot before snapshot-maintenance compaction runs. Set to 0 to disable the age trigger. Default: 300000.")
