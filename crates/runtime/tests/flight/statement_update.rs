@@ -195,6 +195,7 @@ async fn flightsql_query(
 /// Full lifecycle: setup table via runtime, then test INSERT, DELETE, UPDATE
 /// through `FlightSQL` `execute_update` (`CommandStatementUpdate` / `DoPut` path).
 #[tokio::test]
+#[ignore = "Requires non-distributed Cayenne catalog support: https://github.com/spiceai/spiceai/issues/9942"]
 async fn test_flightsql_execute_update_delete_and_update() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -356,6 +357,7 @@ async fn test_flightsql_execute_update_delete_and_update() -> Result<(), anyhow:
 
 /// Verify that `execute_update` requires write-level authentication.
 #[tokio::test]
+#[ignore = "Requires non-distributed Cayenne catalog support: https://github.com/spiceai/spiceai/issues/9942"]
 async fn test_flightsql_execute_update_requires_auth() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 

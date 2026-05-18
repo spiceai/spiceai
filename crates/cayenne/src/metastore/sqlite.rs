@@ -27,26 +27,59 @@ use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
 
 const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_delete_file_table_path ON cayenne_delete_file(table_id, path)";
 
-/// `SQLite`-based metastore backend with a persistent connection.
+/// Round-robin connection pool for the [`SqliteMetastore`].
 ///
-/// Uses `tokio-rusqlite` to maintain a long-lived connection to the database,
-/// eliminating the overhead of opening/closing connections for each operation.
+/// `SQLite` WAL mode allows concurrent readers and serializes writers at the
+/// engine level. Having K independent connections means N concurrent callers
+/// spread across K slots: for N ≤ K every caller finds a free slot immediately;
+/// for N > K callers share proportionally, reducing the per-table wait from
+/// O(N·RTT) to O(⌈N/K⌉·RTT).
+///
+/// Pool size is `min(available_parallelism, 8)` (minimum 2). Beyond 8,
+/// `SQLite`'s WAL write serialization is typically the limiting factor anyway.
+struct SqliteConnectionPool {
+    conns: Vec<Arc<Mutex<tokio_rusqlite::Connection>>>,
+    next: AtomicUsize,
+}
+
+impl SqliteConnectionPool {
+    /// Acquire a connection using round-robin with try-first heuristic.
+    ///
+    /// Tries each slot starting from the round-robin index; returns the first
+    /// slot that is immediately free (`try_lock_owned` succeeds). Falls back to
+    /// `lock_owned().await` on the starting slot if all slots appear busy.
+    async fn acquire(&self) -> OwnedMutexGuard<tokio_rusqlite::Connection> {
+        let n = self.conns.len();
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % n;
+        for i in 0..n {
+            let idx = (start + i) % n;
+            if let Ok(guard) = Arc::clone(&self.conns[idx]).try_lock_owned() {
+                return guard;
+            }
+        }
+        Arc::clone(&self.conns[start]).lock_owned().await
+    }
+}
+
+/// `SQLite`-based metastore backend with a persistent connection pool.
+///
+/// Maintains K independent `tokio-rusqlite` connections to eliminate the
+/// single-mutex serialization bottleneck that capped cross-table CDC
+/// throughput at one commit per RTT regardless of table count.
 pub struct SqliteMetastore {
     connection_string: String,
-    /// Cached connection behind a mutex.
+    /// Round-robin pool of K independent connections shared across all
+    /// operations (reads, writes, and transactions).
     ///
-    /// The [`Mutex`] ensures exclusive access to the underlying
-    /// `tokio_rusqlite::Connection`. Every operation acquires the mutex,
-    /// which prevents interleaving of multi-statement transactions
-    /// (e.g. `BEGIN ... INSERT ... COMMIT`) when multiple tasks share the
-    /// same metastore.
-    ///
-    /// Lazily initialized on first use via [`OnceCell`].
-    conn: OnceCell<Arc<Mutex<tokio_rusqlite::Connection>>>,
+    /// K = `min(available_parallelism, 8)` (minimum 2). Lazily initialised on
+    /// first use. `begin_transaction` holds an [`OwnedMutexGuard`] on one pool
+    /// slot for the full transaction lifetime.
+    pool: OnceCell<Arc<SqliteConnectionPool>>,
 }
 
 /// Convert a `tokio_rusqlite::Error` to a `CatalogError`, distinguishing constraint violations.
@@ -83,7 +116,7 @@ impl SqliteMetastore {
     pub fn new(connection_string: impl Into<String>) -> Self {
         Self {
             connection_string: connection_string.into(),
-            conn: OnceCell::new(),
+            pool: OnceCell::new(),
         }
     }
 
@@ -94,7 +127,7 @@ impl SqliteMetastore {
             .unwrap_or(&self.connection_string)
     }
 
-    /// Get or create the persistent connection (mutex-guarded).
+    /// Open a configured `SQLite` connection.
     ///
     /// The connection is configured with performance optimizations:
     /// - WAL mode for non-blocking reads/writes
@@ -103,94 +136,88 @@ impl SqliteMetastore {
     /// - Memory cache and temp storage for performance
     /// - Foreign keys enabled
     ///
-    /// Uses `OnceCell` to ensure the connection is created exactly once,
-    /// even when multiple tasks call this method concurrently.
-    /// Returns an `Arc<Mutex<..>>` so callers acquire the mutex before
-    /// using the connection.
-    async fn get_conn(&self) -> CatalogResult<Arc<Mutex<tokio_rusqlite::Connection>>> {
-        self.conn
-            .get_or_try_init(|| async {
-                // Create parent directory if it doesn't exist
-                let db_path = self.db_path();
-                let db_dir = Path::new(db_path).parent().ok_or_else(|| {
-                    CatalogError::InvalidDatabasePath {
-                        path: db_path.to_string(),
-                    }
+    async fn open_connection(&self) -> CatalogResult<tokio_rusqlite::Connection> {
+        let db_path = self.db_path();
+        let db_dir =
+            Path::new(db_path)
+                .parent()
+                .ok_or_else(|| CatalogError::InvalidDatabasePath {
+                    path: db_path.to_string(),
                 })?;
 
-                if !db_dir.exists() {
-                    tokio::fs::create_dir_all(db_dir).await?;
+        if !db_dir.exists() {
+            tokio::fs::create_dir_all(db_dir).await?;
 
-                    // Best-effort parent directory sync (defense-in-depth with
-                    // the sync already performed in CayenneCatalog::init).
-                    // Ensures the db_dir entry is durable before opening the
-                    // SQLite connection and initializing the schema.
-                    //
-                    // We keep this best-effort (with warning on failure) for
-                    // the same reasons as in CayenneCatalog::init: one-time
-                    // initialization, followed by DB file + schema creation,
-                    // and the parent is often a stable operator-managed
-                    // volume root.
-                    if let Some(parent) = db_dir.parent() {
-                        let parent_for_sync = parent.to_path_buf();
-                        let parent_display = parent_for_sync.display().to_string();
-                        let db_dir_display = db_dir.display().to_string();
-                        match tokio::task::spawn_blocking(move || {
-                            std::fs::File::open(&parent_for_sync).and_then(|f| f.sync_all())
-                        })
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => tracing::warn!(
-                                "Failed to sync parent directory {parent_display} after creating SQLite catalog DB directory {db_dir_display} (subsequent DB writes will still be durable): {error}"
-                            ),
-                            Err(error) => tracing::warn!(
-                                "Failed to join SQLite catalog DB parent directory sync task for {parent_display}: {error}"
-                            ),
-                        }
-                    }
-                }
-
-                // Open connection with tokio-rusqlite
-                let conn = tokio_rusqlite::Connection::open(db_path)
-                    .await
-                    .map_err(|e| CatalogError::Database {
-                        message: format!("Failed to open SQLite database: {e}"),
-                    })?;
-
-                // Configure pragmas for performance
-                conn.call(|conn| {
-                    // Enable WAL mode for better concurrent access
-                    conn.pragma_update(None, "journal_mode", "WAL")?;
-
-                    // SQLite will wait 5 seconds to obtain a lock before returning SQLITE_BUSY errors
-                    conn.busy_timeout(std::time::Duration::from_secs(5))?;
-
-                    // NORMAL synchronous mode is safe with WAL and more performant than FULL
-                    conn.pragma_update(None, "synchronous", "NORMAL")?;
-
-                    // 32MB cache size (negative number means kilobytes)
-                    conn.pragma_update(None, "cache_size", -32000)?;
-
-                    // Enable foreign keys (disabled by default for historical reasons)
-                    conn.pragma_update(None, "foreign_keys", true)?;
-
-                    // Store temporary tables in memory for better performance
-                    conn.pragma_update(None, "temp_store", "memory")?;
-
-                    Ok::<_, rusqlite::Error>(())
+            // Best-effort parent directory sync (defense-in-depth with the sync
+            // already performed in CayenneCatalog::init).
+            if let Some(parent) = db_dir.parent() {
+                let parent_for_sync = parent.to_path_buf();
+                let parent_display = parent_for_sync.display().to_string();
+                let db_dir_display = db_dir.display().to_string();
+                match tokio::task::spawn_blocking(move || {
+                    std::fs::File::open(&parent_for_sync).and_then(|f| f.sync_all())
                 })
                 .await
-                .map_err(
-                    |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                        message: format!("Failed to configure SQLite pragmas: {e}"),
-                    },
-                )?;
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing::warn!(
+                        "Failed to sync parent directory {parent_display} after creating SQLite catalog DB directory {db_dir_display} (subsequent DB writes will still be durable): {error}"
+                    ),
+                    Err(error) => tracing::warn!(
+                        "Failed to join SQLite catalog DB parent directory sync task for {parent_display}: {error}"
+                    ),
+                }
+            }
+        }
 
-                Ok(Arc::new(Mutex::new(conn)))
+        let conn = tokio_rusqlite::Connection::open(db_path)
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to open SQLite database: {e}"),
+            })?;
+
+        conn.call(|conn| {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+            conn.pragma_update(None, "cache_size", -32000)?;
+            conn.pragma_update(None, "foreign_keys", true)?;
+            conn.pragma_update(None, "temp_store", "memory")?;
+
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .map_err(
+            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                message: format!("Failed to configure SQLite pragmas: {e}"),
+            },
+        )?;
+
+        Ok(conn)
+    }
+
+    /// Return the connection pool, initialising it lazily on first call.
+    ///
+    /// Opens K = `min(available_parallelism, 8)` (minimum 2) connections once
+    /// and reuses them for the lifetime of the metastore. All operations draw
+    /// from the same pool; `begin_transaction` holds an [`OwnedMutexGuard`]
+    /// on the acquired slot for the full transaction lifetime.
+    async fn pool(&self) -> CatalogResult<&Arc<SqliteConnectionPool>> {
+        self.pool
+            .get_or_try_init(|| async {
+                let k = std::thread::available_parallelism()
+                    .map_or(4, |n| n.get().min(8))
+                    .max(2);
+                let mut conns = Vec::with_capacity(k);
+                for _ in 0..k {
+                    conns.push(Arc::new(Mutex::new(self.open_connection().await?)));
+                }
+                Ok(Arc::new(SqliteConnectionPool {
+                    conns,
+                    next: AtomicUsize::new(0),
+                }))
             })
             .await
-            .map(Arc::clone)
     }
 
     /// Schema for the `cayenne_table` table.
@@ -447,8 +474,7 @@ fn to_sqlite_value(value: &MetastoreValue) -> rusqlite::types::Value {
 #[async_trait]
 impl MetastoreBackend for SqliteMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
-        let conn = self.get_conn().await?;
-        let guard = conn.lock().await;
+        let guard = self.pool().await?.acquire().await;
 
         guard
             .call(|conn| {
@@ -500,11 +526,11 @@ impl MetastoreBackend for SqliteMetastore {
         // This catches incompatible metadata databases from previous versions.
         // Drop the guard before validation — the callback acquires it per-table.
         drop(guard);
-        let validate_conn = self.get_conn().await?;
+        let pool_ref = Arc::clone(self.pool().await?);
         super::validate_existing_schema(|table_name| {
-            let conn = Arc::clone(&validate_conn);
+            let pool = Arc::clone(&pool_ref);
             async move {
-                let g = conn.lock().await;
+                let g = pool.acquire().await;
                 g.call(move |conn| {
                     let mut stmt = conn.prepare(&format!("PRAGMA table_info('{table_name}')"))?;
                     let columns: Vec<String> = stmt
@@ -526,8 +552,7 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
-        let conn = self.get_conn().await?;
-        let guard = conn.lock().await;
+        let guard = self.pool().await?.acquire().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.iter().map(to_sqlite_value).collect();
@@ -548,8 +573,7 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn execute_batch(&self, sql: &str) -> CatalogResult<()> {
-        let conn = self.get_conn().await?;
-        let guard = conn.lock().await;
+        let guard = self.pool().await?.acquire().await;
         let sql_owned = sql.to_string();
 
         guard
@@ -567,13 +591,33 @@ impl MetastoreBackend for SqliteMetastore {
         Ok(())
     }
 
+    async fn execute_transaction_batch(&self, sql: &str) -> CatalogResult<()> {
+        let guard = self.pool().await?.acquire().await;
+        let batch_sql = format!("BEGIN TRANSACTION; {sql}; COMMIT;");
+
+        guard
+            .call(move |conn| {
+                conn.execute_batch(&batch_sql).inspect_err(|_| {
+                    let _ = conn.execute_batch("ROLLBACK");
+                })?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to execute transaction batch: {e}"),
+                },
+            )?;
+
+        Ok(())
+    }
+
     async fn query_row<F, T>(&self, params: QueryRowParams<'_>, f: F) -> CatalogResult<T>
     where
         F: FnOnce(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        let conn = self.get_conn().await?;
-        let guard = conn.lock().await;
+        let guard = self.pool().await?.acquire().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.iter().map(to_sqlite_value).collect();
@@ -616,8 +660,7 @@ impl MetastoreBackend for SqliteMetastore {
         F: Fn(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        let conn = self.get_conn().await?;
-        let guard = conn.lock().await;
+        let guard = self.pool().await?.acquire().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.iter().map(to_sqlite_value).collect();
@@ -668,11 +711,20 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn begin_transaction(&self) -> CatalogResult<Box<dyn MetastoreTransaction>> {
-        let conn = self.get_conn().await?;
-        let guard = conn.lock_owned().await;
+        let guard = self.pool().await?.acquire().await;
 
+        // Defensively clear any leftover transaction state before BEGIN. A
+        // prior `SqliteTransaction` whose `Drop` fired-and-forgot a ROLLBACK
+        // via `tokio::spawn` can lose the rollback under runtime shutdown,
+        // returning the connection to the pool inside an open transaction.
+        // SQLite's `autocommit` flag tells us if a txn is pending; rolling
+        // back only when needed avoids the noisy "no transaction is active"
+        // error on clean connections.
         guard
             .call(|conn| {
+                if !conn.is_autocommit() {
+                    let _ = conn.execute_batch("ROLLBACK");
+                }
                 conn.execute_batch("BEGIN TRANSACTION")?;
                 Ok::<_, rusqlite::Error>(())
             })
@@ -687,8 +739,12 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn shutdown(&self) -> CatalogResult<()> {
-        // Get the existing connection if it was initialized
-        if let Some(conn) = self.conn.get() {
+        // WAL checkpoint and optimize on the first connection only.
+        // Multiple concurrent checkpoints on the same WAL would conflict;
+        // a single checkpoint covers the shared file.
+        if let Some(pool) = self.pool.get()
+            && let Some(conn) = pool.conns.first()
+        {
             let guard = conn.lock().await;
             guard
                 .call(|conn| {
@@ -721,12 +777,10 @@ impl MetastoreBackend for SqliteMetastore {
                         message: format!("Failed to shutdown catalog: {e}"),
                     },
                 )?;
-
-            // Note: We intentionally do not explicitly close the connection here.
-            // Closing a cloned handle would leave a closed connection stored in the
-            // OnceCell, and any subsequent use of the metastore would see a closed
-            // connection and fail. Instead, we rely on normal drop semantics to
-            // clean up the background connection when the metastore is dropped.
+            // Note: We intentionally do not explicitly close the connections here.
+            // Closing pool connections while other pool slots remain open would be
+            // inconsistent; instead we rely on normal drop semantics to clean up
+            // the background connections when the metastore is dropped.
         }
 
         Ok(())

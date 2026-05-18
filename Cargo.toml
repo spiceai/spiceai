@@ -127,7 +127,7 @@ aws-sdk-cognitoidentity = "1.99.0"
 aws-sdk-cognitoidentityprovider = "1.116.0"
 aws-sdk-dynamodb = "1.111.0"
 aws-sdk-dynamodbstreams = "1.99.0"
-aws-sdk-glue = "1.145.0"
+aws-sdk-glue = "1.145.1"
 aws-sdk-s3 = "1.132.0"
 aws-sdk-s3vectors = "1.24.0"
 aws-sdk-secretsmanager = "1.104.0"
@@ -191,6 +191,7 @@ duckdb = "1.10502" # 1.10502.x corresponds to DuckDB v1.5.2
 dyn-hash = "1.0.0"
 fundu = "2.0.1"
 futures = "0.3.32"
+geodatafusion = { version = "0.3", default-features = false }
 gethostname = "1.1.0"
 git2 = { version = "0.20", default-features = false, features = [
     "https",
@@ -332,7 +333,7 @@ tracing = "0.1.43"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-turso = { version = "0.5.3", default-features = false }
+turso = { version = "0.6.0", default-features = false }
 turso-shared = { path = "crates/turso-shared" }
 twox-hash = "2.1.2"
 url = { version = "2.5", features = ["serde"] }
