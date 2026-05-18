@@ -153,8 +153,7 @@ fn ensure_kafka_tables(conn: &mut duckdb::Connection) -> Result<()> {
             PRIMARY KEY (dataset_name, topic, partition_id)
         )"
     );
-    conn.execute(&create_offsets, [])
-        .map_err(Error::external)?;
+    conn.execute(&create_offsets, []).map_err(Error::external)?;
     Ok(())
 }
 
@@ -378,8 +377,7 @@ mod tests {
     /// metadata row exists.
     #[tokio::test]
     async fn test_duckdb_offsets_update_succeeds_without_metadata_row() {
-        let (ds, _temp_dir) =
-            create_test_dataset("test_duckdb_offsets_no_metadata").await;
+        let (ds, _temp_dir) = create_test_dataset("test_duckdb_offsets_no_metadata").await;
         let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
             .await
             .expect("to create KafkaSys");
@@ -399,8 +397,7 @@ mod tests {
     /// partition.
     #[tokio::test]
     async fn test_duckdb_concurrent_same_partition_keeps_max() {
-        let (ds, _temp_dir) =
-            create_test_dataset("test_duckdb_concurrent_same_partition").await;
+        let (ds, _temp_dir) = create_test_dataset("test_duckdb_concurrent_same_partition").await;
         let kafka_sys = Arc::new(
             KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
                 .await
@@ -429,11 +426,7 @@ mod tests {
             h.await.expect("join");
         }
 
-        let retrieved = kafka_sys
-            .get()
-            .await
-            .expect("retrieve")
-            .expect("exist");
+        let retrieved = kafka_sys.get().await.expect("retrieve").expect("exist");
         let p0 = retrieved
             .offsets
             .iter()

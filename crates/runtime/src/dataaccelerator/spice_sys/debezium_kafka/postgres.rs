@@ -22,8 +22,7 @@ use super::{
 use data_components::debezium::change_event;
 use data_components::kafka::KafkaOffset;
 use datafusion_table_providers::sql::db_connection_pool::{
-    dbconnection::postgresconn::PostgresConnection,
-    postgrespool::PostgresConnectionPool,
+    dbconnection::postgresconn::PostgresConnection, postgrespool::PostgresConnectionPool,
 };
 use tokio_postgres::{Transaction, types::ToSql};
 
@@ -192,7 +191,10 @@ async fn upsert_offsets_tx(
             partition_offset = GREATEST(EXCLUDED.partition_offset, {DEBEZIUM_KAFKA_OFFSETS_TABLE_NAME}.partition_offset),
             updated_at = CURRENT_TIMESTAMP"
     );
-    let stmt = tx.prepare(stmt_sql.as_str()).await.map_err(Error::external)?;
+    let stmt = tx
+        .prepare(stmt_sql.as_str())
+        .await
+        .map_err(Error::external)?;
     for offset in offsets {
         let params: [&(dyn ToSql + Sync); 4] = [
             &dataset_name,
@@ -200,9 +202,7 @@ async fn upsert_offsets_tx(
             &offset.partition,
             &offset.offset,
         ];
-        tx.execute(&stmt, &params)
-            .await
-            .map_err(Error::external)?;
+        tx.execute(&stmt, &params).await.map_err(Error::external)?;
     }
     Ok(())
 }

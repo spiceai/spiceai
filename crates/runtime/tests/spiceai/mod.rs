@@ -32,7 +32,7 @@ fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
         vec![
             (
                 "spiceai_api_key".to_string(),
-                "${ secrets:spiceai_api_key }".to_string(),
+                "${ env:SPICEAI_API_KEY }".to_string(),
             ),
             (
                 "spiceai_endpoint".to_string(),

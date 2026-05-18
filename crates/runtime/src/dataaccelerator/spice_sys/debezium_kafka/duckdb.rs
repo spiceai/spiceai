@@ -170,8 +170,7 @@ fn ensure_debezium_kafka_tables(conn: &mut duckdb::Connection) -> Result<()> {
             PRIMARY KEY (dataset_name, topic, partition_id)
         )"
     );
-    conn.execute(&create_offsets, [])
-        .map_err(Error::external)?;
+    conn.execute(&create_offsets, []).map_err(Error::external)?;
     Ok(())
 }
 

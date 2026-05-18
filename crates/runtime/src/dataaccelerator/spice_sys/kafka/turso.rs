@@ -183,10 +183,7 @@ async fn upsert_offsets_each(
     Ok(())
 }
 
-async fn load_offsets(
-    conn: &turso::Connection,
-    dataset_name: &str,
-) -> Result<Vec<KafkaOffset>> {
+async fn load_offsets(conn: &turso::Connection, dataset_name: &str) -> Result<Vec<KafkaOffset>> {
     let query = format!(
         "SELECT topic, partition_id, partition_offset FROM {KAFKA_OFFSETS_TABLE_NAME} WHERE dataset_name = ?1"
     );

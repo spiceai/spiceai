@@ -454,19 +454,18 @@ mod tests {
                 .expect("to create KafkaSys"),
         );
 
-        let num_tasks = 8_usize;
+        let num_tasks = 8_i32;
         let partitions_per_task = 8_i32;
 
-        let mut handles = Vec::with_capacity(num_tasks);
+        let mut handles = Vec::new();
         for task_idx in 0..num_tasks {
             let kafka_sys = Arc::clone(&kafka_sys);
             handles.push(tokio::spawn(async move {
                 let offsets: Vec<KafkaOffset> = (0..partitions_per_task)
-                    .map(|p| KafkaOffset {
+                    .map(|partition_index| KafkaOffset {
                         topic: "concurrent-topic".to_string(),
-                        #[allow(clippy::cast_possible_wrap)]
-                        partition: task_idx as i32 * partitions_per_task + p,
-                        offset: 100 + i64::from(p),
+                        partition: task_idx * partitions_per_task + partition_index,
+                        offset: 100 + i64::from(partition_index),
                     })
                     .collect();
                 kafka_sys
@@ -490,8 +489,8 @@ mod tests {
             .expect("to retrieve metadata")
             .expect("metadata to exist");
 
-        #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
-        let expected_count = (num_tasks as i32 * partitions_per_task) as usize;
+        let expected_count = usize::try_from(num_tasks * partitions_per_task)
+            .expect("test offset count should fit in usize");
         let concurrent_count = retrieved
             .offsets
             .iter()
