@@ -359,10 +359,17 @@ const MUTATED_TABLES: &[&str] = &[
     "stock",
 ];
 
-/// Tables probed for staleness gap measurement.
-/// Selected for diversity: district (small, baseline), `order_line` (high volume),
-/// `new_order` (DELETE path).
-pub const STALENESS_PROBE_TABLES: &[&str] = &["district", "order_line", "new_order"];
+/// Tables probed for staleness gap measurement (alphabetical).
+/// All non-static mutated TPC-C tables (excludes `item`, `nation`, `region`, `supplier`).
+pub const STALENESS_PROBE_TABLES: &[&str] = &[
+    "customer",
+    "district",
+    "new_order",
+    "order_line",
+    "orders",
+    "stock",
+    "warehouse",
+];
 
 /// Add `_bench_ts TIMESTAMPTZ` column with `clock_timestamp()` default and
 /// a `BEFORE INSERT OR UPDATE` trigger to all mutated TPC-C tables.
