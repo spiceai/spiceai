@@ -206,7 +206,7 @@ fn apply_refresh_mode_defaults(
     refresh_mode: Option<RefreshMode>,
 ) {
     match refresh_mode.unwrap_or(RefreshMode::Full) {
-        RefreshMode::Append | RefreshMode::Changes => {
+        RefreshMode::Append | RefreshMode::Caching | RefreshMode::Changes => {
             config.compaction_trigger_files = SMALL_WRITE_COMPACTION_TRIGGER_FILES;
             config.compaction_trigger_snapshot_age_ms =
                 SMALL_WRITE_COMPACTION_TRIGGER_SNAPSHOT_AGE_MS;
@@ -216,10 +216,7 @@ fn apply_refresh_mode_defaults(
             config.inline_flush_max_segments = SMALL_WRITE_INLINE_FLUSH_MAX_SEGMENTS;
             config.inline_flush_max_bytes = SMALL_WRITE_INLINE_FLUSH_MAX_BYTES;
         }
-        RefreshMode::Disabled
-        | RefreshMode::Full
-        | RefreshMode::Caching
-        | RefreshMode::Snapshot => {
+        RefreshMode::Disabled | RefreshMode::Full | RefreshMode::Snapshot => {
             config.inline_max_rows = 0;
             config.inline_max_bytes = 0;
             config.inline_max_buffer_bytes = 0;
@@ -984,9 +981,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("write_concurrency")
             .description("Optional writer partition override for unsorted Cayenne ingests. Defaults to runtime.query.target_partitions."),
         ParameterSpec::component("compaction_trigger_files")
-            .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs, and the protected-snapshot count that triggers snapshot-maintenance compaction. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 4 for refresh_mode: append or changes; 8 otherwise."),
+            .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs, and the protected-snapshot count that triggers snapshot-maintenance compaction. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 4 for refresh_mode: append, caching, or changes; 8 otherwise."),
         ParameterSpec::component("compaction_trigger_snapshot_age_ms")
-            .description("Maximum age in milliseconds of the oldest protected snapshot before snapshot-maintenance compaction runs. Set to 0 to disable the age trigger. Default: 60000 for refresh_mode: append or changes; 300000 otherwise."),
+            .description("Maximum age in milliseconds of the oldest protected snapshot before snapshot-maintenance compaction runs. Set to 0 to disable the age trigger. Default: 60000 for refresh_mode: append, caching, or changes; 300000 otherwise."),
         ParameterSpec::component("compaction_max_levels")
             .description("Maximum number of consecutive compaction passes per trigger. Bounds write amplification when promotion keeps producing new candidates. Default: 3.")
             .default("3"),
@@ -994,19 +991,19 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Maximum number of eligible file paths retained in one compaction candidate for trigger selection and observability. The current compactor rewrites the whole current snapshot once triggered, so this does not bound rewrite IO or memory. Default: 32.")
             .default("32"),
         ParameterSpec::component("compaction_background_interval_ms")
-            .description("Background compaction interval in milliseconds. The accelerator runs a per-table background task at this interval. Set to 0 to disable the background task — inline compaction on writes still runs. Default: 10000 for refresh_mode: append or changes; 30000 otherwise."),
+            .description("Background compaction interval in milliseconds. The accelerator runs a per-table background task at this interval. Set to 0 to disable the background task — inline compaction on writes still runs. Default: 10000 for refresh_mode: append, caching, or changes; 30000 otherwise."),
         ParameterSpec::component("inline_max_rows")
-            .description("Maximum rows in a single write that can be inlined into the Cayenne metastore instead of writing a Vortex file. Set to 0 to disable write-entry inlining. Default: 1024 for refresh_mode: append or changes; 0 otherwise."),
+            .description("Maximum rows in a single write that can be inlined into the Cayenne metastore instead of writing a Vortex file. Set to 0 to disable write-entry inlining. Default: 1024 for refresh_mode: append, caching, or changes; 0 otherwise."),
         ParameterSpec::component("inline_max_bytes")
-            .description("Maximum serialized Arrow IPC bytes in a single inlined Cayenne metastore entry. Set to 0 to disable write-entry inlining. Default: 1048576 for refresh_mode: append or changes; 0 otherwise."),
+            .description("Maximum serialized Arrow IPC bytes in a single inlined Cayenne metastore entry. Set to 0 to disable write-entry inlining. Default: 1048576 for refresh_mode: append, caching, or changes; 0 otherwise."),
         ParameterSpec::component("inline_max_buffer_bytes")
-            .description("Maximum Arrow in-memory bytes buffered while deciding whether to inline a write. Set to 0 to force the Vortex write path after the first buffered batch. Default: 4194304 for refresh_mode: append or changes; 0 otherwise."),
+            .description("Maximum Arrow in-memory bytes buffered while deciding whether to inline a write. Set to 0 to force the Vortex write path after the first buffered batch. Default: 4194304 for refresh_mode: append, caching, or changes; 0 otherwise."),
         ParameterSpec::component("inline_flush_max_rows")
-            .description("Maximum inline rows before checkpointing inline data to Vortex. Default: 2048 for refresh_mode: append or changes; 10000 otherwise."),
+            .description("Maximum inline rows before checkpointing inline data to Vortex. Default: 2048 for refresh_mode: append, caching, or changes; 10000 otherwise."),
         ParameterSpec::component("inline_flush_max_segments")
-            .description("Maximum inline entries before checkpointing inline data to Vortex. Default: 16 for refresh_mode: append or changes; 64 otherwise."),
+            .description("Maximum inline entries before checkpointing inline data to Vortex. Default: 16 for refresh_mode: append, caching, or changes; 64 otherwise."),
         ParameterSpec::component("inline_flush_max_bytes")
-            .description("Maximum inline IPC bytes before checkpointing inline data to Vortex. Default: 2097152 for refresh_mode: append or changes; 8388608 otherwise."),
+            .description("Maximum inline IPC bytes before checkpointing inline data to Vortex. Default: 2097152 for refresh_mode: append, caching, or changes; 8388608 otherwise."),
     ],
 );
 
@@ -2512,6 +2509,7 @@ mod tests {
 
         for (table_name, refresh_mode) in [
             ("append_hot", RefreshMode::Append),
+            ("cached_hot", RefreshMode::Caching),
             ("cdc_hot", RefreshMode::Changes),
         ] {
             let mut dataset = DatasetBuilder::try_new(table_name.to_string(), table_name)
@@ -2576,7 +2574,6 @@ mod tests {
         for (table_name, refresh_mode) in [
             ("default_load", None),
             ("full_load", Some(RefreshMode::Full)),
-            ("cached_load", Some(RefreshMode::Caching)),
             ("snapshot_load", Some(RefreshMode::Snapshot)),
             ("disabled_load", Some(RefreshMode::Disabled)),
         ] {

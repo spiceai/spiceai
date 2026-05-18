@@ -139,7 +139,7 @@ fn deserialize_ipc(blob: &[u8]) -> Vec<RecordBatch> {
 /// Lane A: today's per-scan pattern — re-deserialize the IPC blob on
 /// every scan and pretend to hand the batches to the downstream
 /// MemorySourceConfig.
-fn current_decode_per_scan(blob: &[u8]) -> usize {
+fn decode_per_scan_baseline(blob: &[u8]) -> usize {
     let batches = deserialize_ipc(blob);
     let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
     black_box(&batches);
@@ -166,10 +166,10 @@ fn bench_inline_memtable_read(c: &mut Criterion) {
         ));
 
         group.bench_with_input(
-            BenchmarkId::new("current_decode_per_scan", rows),
+            BenchmarkId::new("decode_per_scan_baseline", rows),
             &blob,
             |b, blob| {
-                b.iter(|| current_decode_per_scan(black_box(blob.as_slice())));
+                b.iter(|| decode_per_scan_baseline(black_box(blob.as_slice())));
             },
         );
 

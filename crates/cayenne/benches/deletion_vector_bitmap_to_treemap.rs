@@ -15,66 +15,55 @@ limitations under the License.
 */
 
 //! Regression bench: per-scan cost of converting per-file deletion vectors from
-//! `RoaringBitmap` to `RoaringTreemap` in
-//! `crates/cayenne/src/provider/vortex_format.rs:151-182`.
+//! `RoaringBitmap` to `RoaringTreemap`.
 //!
-//! Every `DeletionFilteringVortexFormat::create_physical_plan` call walks the
-//! `FileScanConfig`'s file groups, looks up each file's deletion bitmap in the
-//! `deletion_cache` (a `ArcSwap<HashMap<String, Arc<RoaringBitmap>>>`), and —
-//! for every file that has deletions — rebuilds a fresh `RoaringTreemap`:
+//! Older versions of `DeletionFilteringVortexFormat::create_physical_plan` walked
+//! the `FileScanConfig`'s file groups and, for every file with deletions, rebuilt
+//! a fresh `RoaringTreemap` from the cached `RoaringBitmap`:
 //!
 //! ```ignore
-//! // attach_access_plan_to_file, vortex_format.rs:164
+//! // attach_access_plan_to_file
 //! let exclude: RoaringTreemap = bitmap.iter().map(u64::from).collect();
 //! let access_plan = VortexAccessPlan::default()
 //!     .with_selection(Selection::ExcludeRoaring(exclude));
 //! ```
 //!
-//! The cache stores `Arc<RoaringBitmap>` (u32-keyed, compact form) because the
-//! pre-cached deletion vectors were loaded as `RoaringBitmap`. The Vortex
-//! `Selection::ExcludeRoaring` API consumes a `RoaringTreemap` (u64-keyed) for
-//! billion-row tables. The conversion `bitmap.iter().map(u64::from).collect()`
-//! materializes every deleted row id from the source bitmap, builds a fresh
-//! `RoaringTreemap` containing the same elements, and discards both at the end
-//! of the scan setup.
+//! The cache stored `Arc<RoaringBitmap>` (u32-keyed, compact form) but Vortex's
+//! `Selection::ExcludeRoaring` API consumes a `RoaringTreemap` (u64-keyed). The
+//! conversion `bitmap.iter().map(u64::from).collect()` materialized every
+//! deleted row id, built a fresh `RoaringTreemap`, and discarded both at the
+//! end of scan setup — paid per file per scan, even when deletions had not
+//! changed.
 //!
-//! Two consequences:
+//! The production path now stores the prebuilt access plan directly. See
+//! `PositionDeletionVector::new` ([`crate::provider::deletion_strategy::PositionDeletionVector::new`],
+//! at `provider/deletion_strategy.rs:48-60`):
 //!
-//! 1. **Per-scan, per-file fixed cost**: a table with 1000 files where every
-//!    file carries 1000 deletions pays 1000 * (per-file conversion cost) on
-//!    every scan, *even when the underlying deletions are unchanged across
-//!    scans*. The deletion cache invalidates only on writes, but the converted
-//!    form is rebuilt per scan.
-//! 2. **Quadratic-ish in deletion density**: as deletion rate per file rises
-//!    (e.g. after a large delete-by-predicate or a slow checkpoint absorption),
-//!    each per-file conversion grows linearly with the deletion count.
+//! ```ignore
+//! let exclude: RoaringTreemap = row_ids.iter().map(u64::from).collect();
+//! let access_plan = Arc::new(
+//!     VortexAccessPlan::default().with_selection(Selection::ExcludeRoaring(exclude)),
+//! );
+//! ```
 //!
-//! The TigerStyle remedy is to store the converted form directly in the cache.
-//! Two options:
-//! - cache `Arc<RoaringTreemap>` instead of `Arc<RoaringBitmap>`, paying the
-//!   conversion once at deletion-cache publish time. The cache is published
-//!   under the write fence; readers only ever see the converted form.
-//! - cache both shapes as `(Arc<RoaringBitmap>, OnceCell<Arc<RoaringTreemap>>)`
-//!   and lazily fill the treemap on first scan. Same amortization, slightly
-//!   more memory.
-//!
-//! Either fix drops the per-scan cost to `Arc::clone()` on the converted bitmap
-//! — a single atomic refcount bump, independent of deletion count.
+//! Subsequent scans call `.access_plan()` ([`provider/deletion_strategy.rs:87`])
+//! which returns an `Arc::clone(&self.access_plan)`. The treemap conversion is
+//! paid once at deletion-snapshot publish time, never again per scan.
 //!
 //! ## What this bench measures
 //!
 //! Pure shape — no metastore, no Cayenne setup, no Vortex scan. Models the
-//! conversion that every scan-time `attach_access_plan_to_file` invocation
-//! performs on a single file's deletion bitmap.
+//! conversion that scan-time `attach_access_plan_to_file` invocations would
+//! have performed under the older code.
 //!
 //! Two lanes per deletion count:
 //!
-//! - `convert_per_scan/<deletions>` — mirrors today's
+//! - `convert_per_scan_baseline/<deletions>` — mirrors the older
 //!   `bitmap.iter().map(u64::from).collect::<RoaringTreemap>()` on every scan.
 //!   Wall time is the iterator walk plus the new treemap allocation.
-//! - `cached_arc_clone/<deletions>` — models the proposed cache: a single
-//!   pre-built `Arc<RoaringTreemap>` cloned per scan. Wall time is one
-//!   `Arc::clone` — a single atomic refcount bump.
+//! - `cached_arc_clone/<deletions>` — current behavior: a single pre-built
+//!   `Arc<RoaringTreemap>` cloned per scan. Wall time is one `Arc::clone` —
+//!   a single atomic refcount bump.
 //!
 //! Deletion counts mirror realistic file-level deletion densities:
 //!
@@ -85,19 +74,14 @@ limitations under the License.
 //! - 1 M      deletions: extreme — a near-empty file kept alive by zone-map
 //!   relevance for some other column.
 //!
-//! Per-file densities multiply: at 1000 files * 10 K deletions/file the
-//! per-scan tax is 1000 * `convert_per_scan/10000`.
-//!
 //! ## How to read
 //!
 //! `cargo bench --bench deletion_vector_bitmap_to_treemap -p cayenne`.
 //!
-//! - `convert_per_scan/100000` — per-file fixed cost on a delete-heavy file.
-//!   Multiply by your `num_files_with_deletions` to get the per-scan floor.
-//! - The ratio `convert_per_scan/N` ÷ `cached_arc_clone/N` is the headroom
-//!   from the fix. At N=1 K the ratio is dominated by the
-//!   `RoaringTreemap::new()` allocation; at N≥10 K it is dominated by the
-//!   `bitmap.iter()` walk plus `RoaringTreemap::insert` per element.
+//! - `convert_per_scan_baseline/100000` — per-file fixed cost on a
+//!   delete-heavy file under the older code.
+//! - The ratio `convert_per_scan_baseline/N` ÷ `cached_arc_clone/N` is the
+//!   headroom the prebuilt-access-plan fix delivered.
 
 #![allow(clippy::expect_used)]
 
@@ -131,7 +115,7 @@ fn convert_to_treemap(bitmap: &RoaringBitmap) -> RoaringTreemap {
 }
 
 fn bench_convert_per_scan(c: &mut Criterion) {
-    let mut group = c.benchmark_group("deletion_vector_bitmap_to_treemap_convert_per_scan");
+    let mut group = c.benchmark_group("deletion_vector_bitmap_to_treemap_convert_per_scan_baseline");
     for &n in DELETION_COUNTS {
         let bitmap = build_bitmap(n);
         group.throughput(Throughput::Elements(n as u64));
@@ -153,13 +137,14 @@ fn bench_cached_arc_clone(c: &mut Criterion) {
     let mut group = c.benchmark_group("deletion_vector_bitmap_to_treemap_cached_arc_clone");
     for &n in DELETION_COUNTS {
         let bitmap = build_bitmap(n);
-        // Pre-build the treemap once, share via Arc — models the fix where
-        // the deletion cache stores `Arc<RoaringTreemap>` directly.
+        // Pre-build the treemap once, share via Arc — mirrors the current
+        // production shape where `PositionDeletionVector` stores an
+        // `Arc<VortexAccessPlan>` containing the converted treemap.
         let treemap: Arc<RoaringTreemap> = Arc::new(convert_to_treemap(&bitmap));
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
-                // Per-scan cost in the proposed cache shape: one `Arc::clone`
+                // Per-scan cost in the current production shape: one `Arc::clone`
                 // (a single atomic refcount bump) regardless of deletion count.
                 let cloned = Arc::clone(&treemap);
                 black_box(cloned);

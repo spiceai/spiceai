@@ -186,7 +186,7 @@ pub trait MetadataCatalog: Send + Sync {
 - **`InlinedDataStats`** — `{ total_rows, segment_count, total_bytes }` aggregated from `cayenne_inlined_data` for memtable-pressure decisions.
 - **`PartitionMetadata`** — composite partition key, partition path, record/byte counts.
 - **`TableStatistics`** — serialized `FileStatistics` blob plus `num_rows`; populated from Vortex file footers and read by the DataFusion planner.
-- **`VortexConfig`** — Vortex-side tuning. All fields configurable per dataset via `cayenne_*` runtime parameters. The runtime applies refresh-mode defaults before parsing explicit params: `refresh_mode: append` and `refresh_mode: changes` favor small incremental writes, while `refresh_mode: full`, `caching`, `snapshot`, `disabled`, and unspecified refresh modes favor large Vortex writes.
+- **`VortexConfig`** — Vortex-side tuning. All fields configurable per dataset via `cayenne_*` runtime parameters. The runtime applies refresh-mode defaults before parsing explicit params: `refresh_mode: append`, `caching`, and `changes` favor small incremental writes, while `refresh_mode: full`, `snapshot`, `disabled`, and unspecified refresh modes favor large Vortex writes.
 
 ```rust
 pub struct VortexConfig {
@@ -204,21 +204,21 @@ pub struct VortexConfig {
     pub write_concurrency: Option<usize>,     // None = session target_partitions; forced to 1 if sort_columns set
 
     // Compaction
-    pub compaction_trigger_files: usize,      // default append/changes=4, otherwise=8
-    pub compaction_trigger_snapshot_age_ms: u64,  // default append/changes=60_000, otherwise=300_000; 0 disables age trigger
+    pub compaction_trigger_files: usize,      // default append/caching/changes=4, otherwise=8
+    pub compaction_trigger_snapshot_age_ms: u64,  // default append/caching/changes=60_000, otherwise=300_000; 0 disables age trigger
     pub compaction_max_levels: usize,         // default 3
     pub compaction_max_files_per_pick: usize, // default 32
-    pub compaction_background_interval_ms: u64,  // default append/changes=10_000, otherwise=30_000; 0 disables background loop
+    pub compaction_background_interval_ms: u64,  // default append/caching/changes=10_000, otherwise=30_000; 0 disables background loop
 
     // Inline-write admission (per-call gate)
-    pub inline_max_rows: usize,               // default append/changes=1_024, otherwise=0
-    pub inline_max_bytes: usize,              // default append/changes=1_048_576, otherwise=0
-    pub inline_max_buffer_bytes: usize,       // default append/changes=4_194_304, otherwise=0
+    pub inline_max_rows: usize,               // default append/caching/changes=1_024, otherwise=0
+    pub inline_max_bytes: usize,              // default append/caching/changes=1_048_576, otherwise=0
+    pub inline_max_buffer_bytes: usize,       // default append/caching/changes=4_194_304, otherwise=0
 
     // Inline-memtable flush triggers (cumulative gate)
-    pub inline_flush_max_rows: i64,           // default append/changes=2_048, otherwise=10_000
-    pub inline_flush_max_segments: i64,       // default append/changes=16, otherwise=64
-    pub inline_flush_max_bytes: i64,          // default append/changes=2_097_152, otherwise=8_388_608
+    pub inline_flush_max_rows: i64,           // default append/caching/changes=2_048, otherwise=10_000
+    pub inline_flush_max_segments: i64,       // default append/caching/changes=16, otherwise=64
+    pub inline_flush_max_bytes: i64,          // default append/caching/changes=2_097_152, otherwise=8_388_608
 
     // PK conflict detection
     pub pk_conflict_detection: PkConflictDetection,  // default Auto; None opts into blind append for CDC
