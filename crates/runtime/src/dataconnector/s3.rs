@@ -363,6 +363,20 @@ impl ListingTableConnector for S3 {
                         connector_component: ConnectorComponent::from(dataset),
                         source: err.into(),
                     }
+                } else if source.to_string().contains("error decoding response body") {
+                    let timeout = self
+                        .params
+                        .get("client_timeout")
+                        .expose()
+                        .ok()
+                        .unwrap_or("default");
+                    DataConnectorError::UnableToConnectInternal {
+                        dataconnector: format!("{self}"),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: format!(
+                            "S3 request failed while decoding the response body. This may be caused by a network timeout or IO starvation when loading many datasets concurrently. Consider increasing the `client_timeout` parameter (current: {timeout}) or reducing concurrent dataset loads. {source} For details, visit: {S3_DOCS}#params"
+                        ).into(),
+                    }
                 } else {
                     DataConnectorError::UnableToConnectInternal {
                         dataconnector: format!("{self}"),
@@ -420,6 +434,54 @@ mod tests {
             .with_runtime(Arc::new(RuntimeBuilder::new().build().await))
             .build()
             .expect("dataset should be built")
+    }
+
+    #[tokio::test]
+    async fn test_handle_object_store_error_decoding_response_body() {
+        let params = create_test_parameters(vec![]).await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+
+        let error = object_store::Error::Generic {
+            store: "S3",
+            source: "error decoding response body".into(),
+        };
+
+        let result = connector.handle_object_store_error(&dataset, error);
+        let error_str = result.to_string();
+
+        assert!(
+            error_str.contains("client_timeout"),
+            "Error message should mention client_timeout, got: {error_str}"
+        );
+        assert!(
+            error_str.contains("IO starvation"),
+            "Error message should mention IO starvation, got: {error_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_object_store_error_decoding_response_body_with_timeout() {
+        let params = create_test_parameters(vec![(
+            "client_timeout".to_string(),
+            "120s".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+
+        let error = object_store::Error::Generic {
+            store: "S3",
+            source: "error decoding response body".into(),
+        };
+
+        let result = connector.handle_object_store_error(&dataset, error);
+        let error_str = result.to_string();
+
+        assert!(
+            error_str.contains("120s"),
+            "Error message should show current timeout value, got: {error_str}"
+        );
     }
 
     #[tokio::test]
