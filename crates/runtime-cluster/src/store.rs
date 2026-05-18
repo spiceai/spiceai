@@ -959,7 +959,7 @@ mod tests {
             .await
             .expect("should initialize");
 
-        let pv = HashMap::from([("org_id".to_string(), "test_org_name".to_string())]);
+        let pv = HashMap::from([("org_id".to_string(), Some("test_org_name".to_string()))]);
         pm.set_unassigned_partitions(&bare, vec![pv], vec![])
             .await
             .expect("should set partitions");
@@ -973,7 +973,7 @@ mod tests {
         assert_eq!(meta_via_full.partitions.len(), 1);
 
         let partition_value: PartitionValue =
-            HashMap::from([("org_id".to_string(), "test_org_name".to_string())]);
+            HashMap::from([("org_id".to_string(), Some("test_org_name".to_string()))]);
         pm.assign_partition(&full, &partition_value, "executor-1")
             .await
             .expect("should assign via fully qualified ref");
@@ -999,7 +999,7 @@ mod tests {
         acc.initialize_metadata(&table, vec!["region".to_string()])
             .await
             .expect("init");
-        let pv = HashMap::from([("region".to_string(), "us-east-1".to_string())]);
+        let pv = HashMap::from([("region".to_string(), Some("us-east-1".to_string()))]);
         acc.set_unassigned_partitions(&table, vec![pv.clone()], vec![])
             .await
             .expect("set");
