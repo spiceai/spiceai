@@ -57,6 +57,7 @@ use datafusion_expr::Expr;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use futures::future::try_join_all;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
+use runtime_datafusion::config::request_context_config::SpiceRequestContextConfig;
 use runtime_object_store::registry::default_runtime_env;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
 use runtime_proto::{
@@ -1281,6 +1282,7 @@ pub async fn initialize_cluster_executor(
     let config_producer: ConfigProducer = Arc::new(move || {
         let mut config = SessionConfig::new_with_ballista()
             .with_option_extension(SpiceClusterConfig::default())
+            .with_option_extension(SpiceRequestContextConfig::default())
             .with_ballista_use_tls(tls_enabled)
             // Use 100MB max message size to match other gRPC configurations in the codebase.
             // The default Ballista config is 16MB which is too small for shuffle operations
@@ -1744,7 +1746,7 @@ async fn create_scheduler_server(
     // Uses the dynamic total_executor_slots to set target_partitions
     let slots_for_session = Arc::clone(&total_executor_slots);
     let session_builder: ballista_scheduler::scheduler_server::SessionBuilder =
-        Arc::new(move |_cfg| {
+        Arc::new(move |incoming_cfg| {
             // Get dynamic target_partitions based on cluster capacity
             let total_slots = slots_for_session.load(Ordering::Relaxed);
             let target_partitions = if total_slots > 0 { total_slots } else { 16 };
@@ -1755,10 +1757,24 @@ async fn create_scheduler_server(
                 "Cluster session_builder: setting target_partitions based on cluster capacity"
             );
 
+            // Inherit any `SpiceRequestContextConfig` set on the incoming
+            // per-job session config (populated by
+            // `Query::submit_distributed_internal`). The session builder
+            // otherwise rebuilds the session config from
+            // `current_context.copied_config()`, which is a shared
+            // background context with no request-specific trace ids.
+            let incoming_request_context = incoming_cfg
+                .options()
+                .extensions
+                .get::<SpiceRequestContextConfig>()
+                .cloned()
+                .unwrap_or_default();
+
             let mut cfg = current_context
                 .copied_config()
                 .with_target_partitions(target_partitions)
                 .with_option_extension(SpiceClusterConfig::default())
+                .with_option_extension(incoming_request_context)
                 .with_ballista_shuffle_format(ballista_shuffle_format)
                 .with_ballista_shuffle_memory_mode(shuffle_memory_mode);
 
@@ -1809,6 +1825,7 @@ async fn create_scheduler_server(
         SessionConfig::new_with_ballista()
             .with_target_partitions(target_partitions)
             .with_option_extension(SpiceClusterConfig::default())
+            .with_option_extension(SpiceRequestContextConfig::default())
             .with_ballista_shuffle_format(ballista_shuffle_format)
             .with_ballista_shuffle_memory_mode(shuffle_memory_mode)
     });
