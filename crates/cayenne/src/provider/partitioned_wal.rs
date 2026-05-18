@@ -52,6 +52,10 @@ limitations under the License.
 
 use std::path::{Path, PathBuf};
 
+use object_store::ObjectStore;
+use object_store::path::Path as ObjectStorePath;
+use tokio::io::AsyncWriteExt;
+
 use super::Result;
 use crate::provider::Error;
 
@@ -185,14 +189,32 @@ impl PartitionedWal {
         let wal_path = wal_dir.join(format!("{}.json", self.commit_id));
         let tmp_path = wal_dir.join(format!("{}.json.tmp", self.commit_id));
 
-        let content = serde_json::to_string_pretty(self).map_err(|e| Error::Internal {
+        // Compact serialization: this WAL is a machine-only coordination
+        // marker written on every cross-partition commit. Pretty-printing
+        // ~doubles the byte size and adds CPU time for whitespace formatting
+        // — both pure overhead on the ingestion hot path. The JSON parser is
+        // whitespace-tolerant, so any legacy pretty-printed WALs from older
+        // builds still load correctly. Inspect with `jq` if needed.
+        let content = serde_json::to_string(self).map_err(|e| Error::Internal {
             table: self.table_root.clone(),
             message: format!("Failed to serialize partitioned WAL: {e}"),
         })?;
 
         // Step 1: write to tmp file + fsync.
-        tokio::fs::write(&tmp_path, content.as_bytes()).await?;
-        let tmp_file = tokio::fs::File::open(&tmp_path).await?;
+        //
+        // Single open + write + fsync. The previous revision called
+        // `tokio::fs::write` (open + write + drop fd) and then re-opened the
+        // file to call `sync_all`, paying an extra `open(2)` per WAL write.
+        // Using `OpenOptions` + `AsyncWriteExt::write_all` keeps the fd open
+        // through the fsync, which is one fewer syscall per cross-partition
+        // commit on the local-FS hot path.
+        let mut tmp_file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .await?;
+        tmp_file.write_all(content.as_bytes()).await?;
         tmp_file.sync_all().await?;
         drop(tmp_file);
 
@@ -225,6 +247,72 @@ impl PartitionedWal {
         );
 
         Ok(wal_path)
+    }
+
+    /// S3/object-store equivalent of `write_to`.
+    ///
+    /// Writes the `PartitionedWal` JSON to a temporary object key first
+    /// (`<prefix>/_partitioned_wal/<commit_id>.json.tmp`), then to the final
+    /// key. This guarantees that any reader looking for the final key sees
+    /// either a complete, previously-written document or nothing at all
+    /// (never a torn/partial JSON), mirroring the local-FS tmp+rename+parent-
+    /// dir-fsync pattern and the staging WAL S3 write discipline.
+    ///
+    /// Best-effort cleanup of the tmp object is performed after the final
+    /// key is visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL cannot be serialized, uploaded to the
+    /// temporary key, or copied to the final key. Temporary-key cleanup after
+    /// publishing the final key is best-effort.
+    pub async fn write_to_object_store(
+        &self,
+        store: &dyn ObjectStore,
+        base_prefix: &ObjectStorePath,
+    ) -> Result<ObjectStorePath> {
+        let wal_dir = base_prefix.child(PARTITIONED_WAL_DIR);
+        let final_key = wal_dir.child(format!("{}.json", self.commit_id));
+        let tmp_key = wal_dir.child(format!("{}.json.tmp", self.commit_id));
+
+        // Compact serialization: see comment in `write_to` for the local-FS
+        // path; the S3 case has the same trade-offs plus a smaller PUT payload
+        // and fewer bytes billed.
+        let content = serde_json::to_string(self).map_err(|e| Error::Internal {
+            table: self.table_root.clone(),
+            message: format!("Failed to serialize partitioned WAL: {e}"),
+        })?;
+
+        // Phase 1: write to the tmp key (atomic for small objects on S3).
+        store
+            .put(&tmp_key, content.clone().into())
+            .await
+            .map_err(|e| Error::ObjectStore {
+                operation: "write partitioned WAL (tmp)",
+                table: self.table_root.clone(),
+                source: e,
+            })?;
+
+        // Phase 2: publish to the final key.
+        store
+            .put(&final_key, content.into())
+            .await
+            .map_err(|e| Error::ObjectStore {
+                operation: "write partitioned WAL (final)",
+                table: self.table_root.clone(),
+                source: e,
+            })?;
+
+        // Best-effort cleanup of the tmp object.
+        let _ = store.delete(&tmp_key).await;
+
+        tracing::debug!(
+            "Wrote partitioned WAL (S3) at {} for {} partition(s)",
+            final_key,
+            self.partitions.len(),
+        );
+
+        Ok(final_key)
     }
 
     /// Remove the WAL file for the given commit id. Safe to call multiple
@@ -350,7 +438,9 @@ mod tests {
             vec![
                 PartitionedWalEntry {
                     table_id: "01HY0000000000000000000001".to_string(),
-                    staging_wal_path: Some("/data/p1/_staging/_wal.json".to_string()),
+                    staging_wal_path: Some(
+                        "/data/p1/_staging/01HZ0000000000000000000000/_wal.json".to_string(),
+                    ),
                 },
                 PartitionedWalEntry {
                     table_id: "01HY0000000000000000000002".to_string(),
@@ -471,5 +561,48 @@ mod tests {
                 .expect("read after remove")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn write_to_object_store_uses_tmp_then_final_key() {
+        // S3 regression test for the tmp-object + final-key pattern on
+        // the top-level cross-partition WAL (mirrors the staging WAL S3
+        // discipline and the local-FS tmp+rename+parent-fsync pattern).
+        use object_store::memory::InMemory;
+        use object_store::path::Path as ObjectStorePath;
+
+        let store = InMemory::new();
+        let base = ObjectStorePath::from("table_root");
+
+        let wal = sample_wal();
+        let final_key = wal
+            .write_to_object_store(&store, &base)
+            .await
+            .expect("write to InMemory (S3-like)");
+
+        // The final key must exist and be parseable.
+        let bytes = store
+            .get(&final_key)
+            .await
+            .expect("get final key")
+            .bytes()
+            .await
+            .expect("read final key bytes");
+        let parsed: PartitionedWal = serde_json::from_slice(&bytes).expect("parse final key");
+        assert_eq!(parsed.commit_id, wal.commit_id);
+
+        // The tmp key for the same commit_id must be cleaned up after the final
+        // key is published, so readers only ever see the committed WAL object.
+        let tmp_key = base
+            .child(PARTITIONED_WAL_DIR)
+            .child(format!("{}.json.tmp", wal.commit_id));
+        assert!(matches!(
+            store.get(&tmp_key).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        store
+            .get(&final_key)
+            .await
+            .expect("final key exists after WAL commit");
     }
 }

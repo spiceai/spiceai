@@ -596,6 +596,7 @@ impl QuerySet {
                     "chbench_q12",
                     "chbench_q13",
                     "chbench_q14",
+                    "chbench_q15",
                     "chbench_q16",
                     "chbench_q17",
                     "chbench_q18",
@@ -1215,9 +1216,8 @@ pub fn get_clickbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Que
 #[must_use]
 pub fn get_chbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
     let queries = generate_chbench_queries!(
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 22
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22
     );
-    // q15 excluded: requires a `revenue1` view
 
     match overrides {
         // No engine-specific overrides yet
