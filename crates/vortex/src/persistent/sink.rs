@@ -444,26 +444,31 @@ fn remove_partition_columns(
     batch: &RecordBatch,
     partition_column_names: &[String],
 ) -> DFResult<RecordBatch> {
-    let partition_names: Vec<_> = partition_column_names.iter().map(String::as_str).collect();
-    let (columns, fields): (Vec<_>, Vec<_>) = batch
-        .columns()
+    let partition_name_set = partition_column_names
         .iter()
-        .zip(batch.schema().fields())
-        .filter(|(_, field)| !partition_names.contains(&field.name().as_str()))
-        .map(|(array, field)| (Arc::clone(array), (**field).clone()))
-        .unzip();
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let projection = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| {
+            (!partition_name_set.contains(field.name().as_str())).then_some(index)
+        })
+        .collect::<Vec<_>>();
 
-    let schema = Schema::new(fields);
-    if columns.is_empty() {
+    if projection.is_empty() {
+        let schema = Schema::empty();
         let options = RecordBatchOptions::default().with_row_count(Some(batch.num_rows()));
         return Ok(RecordBatch::try_new_with_options(
             Arc::new(schema),
-            columns,
+            vec![],
             &options,
         )?);
     }
 
-    Ok(RecordBatch::try_new(Arc::new(schema), columns)?)
+    Ok(batch.project(&projection)?)
 }
 
 /// Build the output path for a rolling write.
@@ -911,25 +916,26 @@ mod tests {
 
     #[test]
     fn test_remove_partition_columns() -> anyhow::Result<()> {
+        use datafusion::arrow::array::ArrayRef;
         use datafusion::arrow::array::StringArray;
 
         use super::remove_partition_columns;
 
+        let part_col = Arc::new(StringArray::from(vec!["x", "y"])) as ArrayRef;
+        let val_col = Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef;
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("part", DataType::Utf8, false),
                 Field::new("val", DataType::Int64, false),
             ])),
-            vec![
-                Arc::new(StringArray::from(vec!["x", "y"])),
-                Arc::new(Int64Array::from(vec![1, 2])),
-            ],
+            vec![Arc::clone(&part_col), Arc::clone(&val_col)],
         )?;
 
         let out = remove_partition_columns(&batch, &["part".to_string()])?;
         assert_eq!(out.num_columns(), 1);
         assert_eq!(out.schema().field(0).name(), "val");
         assert_eq!(out.num_rows(), 2);
+        assert!(Arc::ptr_eq(out.column(0), &val_col));
 
         Ok(())
     }
