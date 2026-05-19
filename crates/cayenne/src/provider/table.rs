@@ -7732,6 +7732,124 @@ impl CayenneTableProvider {
 
         Ok(plan)
     }
+
+    /// Returns `true` iff `filters` contain a `pk_column = literal` equality on
+    /// every primary-key column. For such point lookups, `ListingTable`'s
+    /// default byte-range fan-out (`target_partitions = num_cpus`) pays per
+    /// file-group footer-open cost the lookup never needs. Caller uses this to
+    /// build the scan-side `ListingTable` with `target_partitions = 1`. See
+    /// `pk_lookup_file_group_fanout` bench (1.6 ms → 898 µs at 1 M rows).
+    fn is_pk_point_lookup(&self, filters: &[Expr]) -> bool {
+        if self.pk_column_indices.is_empty() {
+            return false;
+        }
+        let pk_names: Vec<&str> = self
+            .pk_column_indices
+            .iter()
+            .map(|&idx| self.table_metadata.schema.field(idx).name().as_str())
+            .collect();
+
+        pk_names.iter().all(|pk_name| {
+            filters
+                .iter()
+                .any(|expr| pk_column_equals_literal(expr, pk_name))
+        })
+    }
+}
+
+/// Walks `expr` looking for `Column(name) = Literal` (or the flipped form).
+/// Conjunctions (`AND`) are descended into so `DataFusion`'s split-conjunction
+/// or coalesced `BinaryExpr(And, _, _)` predicates are both matched.
+/// `Cast`/`TryCast` wrappers around either side are unwrapped because
+/// type-coercion routinely wraps the literal in a `Cast` to match the
+/// column's data type.
+fn pk_column_equals_literal(expr: &Expr, pk_name: &str) -> bool {
+    match expr {
+        Expr::BinaryExpr(bin) if bin.op == Operator::Eq => {
+            (matches_column(&bin.left, pk_name) && is_literal_like(&bin.right))
+                || (matches_column(&bin.right, pk_name) && is_literal_like(&bin.left))
+        }
+        Expr::BinaryExpr(bin) if bin.op == Operator::And => {
+            pk_column_equals_literal(&bin.left, pk_name)
+                || pk_column_equals_literal(&bin.right, pk_name)
+        }
+        _ => false,
+    }
+}
+
+fn matches_column(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Column(col) => col.name == name,
+        Expr::Cast(c) => matches_column(&c.expr, name),
+        Expr::TryCast(c) => matches_column(&c.expr, name),
+        _ => false,
+    }
+}
+
+fn is_literal_like(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_, _) => true,
+        Expr::Cast(c) => is_literal_like(&c.expr),
+        Expr::TryCast(c) => is_literal_like(&c.expr),
+        _ => false,
+    }
+}
+
+/// If `expr` is an `InList` of integer literals over consecutive values, rewrite
+/// to `col >= min AND col <= max`. BETWEEN is ~50 % faster than IN-list at the
+/// per-row predicate evaluation level (two `i64` comparisons vs an N-element
+/// `HashSet` membership probe) and is semantically equivalent. See
+/// `pk_in_list_vs_range_rewrite` bench. Non-rewritable inputs (negated list,
+/// non-integer literals, sparse values, single element) are returned unchanged.
+fn rewrite_consecutive_inlist_to_range(expr: Expr) -> Expr {
+    let Expr::InList(in_list) = &expr else {
+        return expr;
+    };
+    if in_list.negated || in_list.list.len() < 2 {
+        return expr;
+    }
+    let mut values: Vec<i64> = Vec::with_capacity(in_list.list.len());
+    for item in &in_list.list {
+        let raw = match item {
+            Expr::Literal(s, _) => s,
+            Expr::Cast(c) | Expr::TryCast(c) => {
+                if let Expr::Literal(s, _) = &*c.expr {
+                    s
+                } else {
+                    return expr;
+                }
+            }
+            _ => return expr,
+        };
+        match raw {
+            ScalarValue::Int64(Some(v)) => values.push(*v),
+            ScalarValue::Int32(Some(v)) => values.push(i64::from(*v)),
+            ScalarValue::Int16(Some(v)) => values.push(i64::from(*v)),
+            ScalarValue::Int8(Some(v)) => values.push(i64::from(*v)),
+            _ => return expr,
+        }
+    }
+    values.sort_unstable();
+    values.dedup();
+    if values.len() != in_list.list.len() {
+        return expr;
+    }
+    let Some(&min) = values.first() else {
+        return expr;
+    };
+    let Some(&max) = values.last() else {
+        return expr;
+    };
+    let Some(span) = max.checked_sub(min).and_then(|d| d.checked_add(1)) else {
+        return expr;
+    };
+    if usize::try_from(span).ok() != Some(values.len()) {
+        return expr;
+    }
+    let col_expr = (*in_list.expr).clone();
+    let lit_min = Expr::Literal(ScalarValue::Int64(Some(min)), None);
+    let lit_max = Expr::Literal(ScalarValue::Int64(Some(max)), None);
+    col_expr.clone().gt_eq(lit_min).and(col_expr.lt_eq(lit_max))
 }
 
 #[async_trait]
@@ -7845,24 +7963,47 @@ impl TableProvider for CayenneTableProvider {
             };
 
         // Build effective scan filters: user filters + optional retention filter.
-        let effective_filters: Vec<Expr>;
-        let scan_filters = if let Some(ref keep_filter) = retention_keep_filter {
-            effective_filters = filters
+        // Also rewrite IN-lists of consecutive integers to BETWEEN ranges — both
+        // are semantically equivalent but the range path is ~50 % cheaper per
+        // row (two `i64` comparisons vs an N-element set probe). See
+        // `pk_in_list_vs_range_rewrite` bench.
+        let effective_filters: Vec<Expr> = match &retention_keep_filter {
+            Some(keep_filter) => filters
                 .iter()
                 .cloned()
+                .map(rewrite_consecutive_inlist_to_range)
                 .chain(std::iter::once(keep_filter.clone()))
-                .collect();
+                .collect(),
+            None => filters
+                .iter()
+                .cloned()
+                .map(rewrite_consecutive_inlist_to_range)
+                .collect(),
+        };
+        if retention_keep_filter.is_some() {
             tracing::trace!(
                 table = %self.table_metadata.table_name,
                 total_filters = effective_filters.len(),
                 "Injected time_retention keep-filter into scan filters"
             );
-            &effective_filters
-        } else {
-            filters
-        };
+        }
+        let scan_filters: &[Expr] = &effective_filters;
 
         let target_partitions = state.config().target_partitions();
+
+        // For PK point lookups (e.g. `WHERE pk_col = K`), force the inner
+        // `ListingTable` to use `target_partitions = 1` so DataFusion does NOT
+        // byte-range-split the matching file across N file_groups. The fan-out
+        // pays per-group Vortex footer-open cost (~50 µs each) without speeding
+        // up the lookup because only one chunk in one file_group actually
+        // contains K. See `pk_lookup_file_group_fanout` bench.
+        let scan_listing_config_override;
+        let scan_listing_config = if self.is_pk_point_lookup(scan_filters) {
+            scan_listing_config_override = state.config().clone().with_target_partitions(1);
+            &scan_listing_config_override
+        } else {
+            state.config()
+        };
 
         // Hold listing_fence.read() across the inner ListingTable::scan() call
         // so concurrent writer barriers (#10125 §6.4) cannot interleave file
@@ -7886,7 +8027,7 @@ impl TableProvider for CayenneTableProvider {
         let listing_table = self.scan_listing_table_for_config(
             &snapshot_dir_url,
             &current_snapshot_id,
-            state.config(),
+            scan_listing_config,
         )?;
         let listing_scan_start = Instant::now();
         let main_plan_result = listing_table
@@ -9862,5 +10003,156 @@ mod tests {
             table_dir.join(&newer_snapshot).exists(),
             "snapshot newer than current must be preserved (in-flight write)"
         );
+    }
+
+    fn col(name: &str) -> Expr {
+        Expr::Column(datafusion_common::Column::new_unqualified(name))
+    }
+
+    fn lit_i64(v: i64) -> Expr {
+        Expr::Literal(ScalarValue::Int64(Some(v)), None)
+    }
+
+    #[test]
+    fn pk_eq_literal_simple() {
+        let expr = col("id").eq(lit_i64(42));
+        assert!(pk_column_equals_literal(&expr, "id"));
+    }
+
+    #[test]
+    fn pk_eq_literal_flipped() {
+        let expr = lit_i64(42).eq(col("id"));
+        assert!(pk_column_equals_literal(&expr, "id"));
+    }
+
+    #[test]
+    fn pk_eq_with_type_coerced_literal() {
+        let casted = Expr::Cast(datafusion_expr::Cast::new(
+            Box::new(lit_i64(42)),
+            datafusion::arrow::datatypes::DataType::Int64,
+        ));
+        let expr = col("id").eq(casted);
+        assert!(pk_column_equals_literal(&expr, "id"));
+    }
+
+    #[test]
+    fn pk_eq_with_casted_column() {
+        let casted = Expr::Cast(datafusion_expr::Cast::new(
+            Box::new(col("id")),
+            datafusion::arrow::datatypes::DataType::Int64,
+        ));
+        let expr = casted.eq(lit_i64(42));
+        assert!(pk_column_equals_literal(&expr, "id"));
+    }
+
+    #[test]
+    fn pk_eq_inside_conjunction() {
+        let expr = col("id").eq(lit_i64(42)).and(col("name").eq(lit_i64(5)));
+        assert!(pk_column_equals_literal(&expr, "id"));
+    }
+
+    #[test]
+    fn non_pk_eq_rejected() {
+        let expr = col("name").eq(lit_i64(42));
+        assert!(!pk_column_equals_literal(&expr, "id"));
+    }
+
+    #[test]
+    fn pk_range_rejected() {
+        let expr = col("id").gt(lit_i64(42));
+        assert!(!pk_column_equals_literal(&expr, "id"));
+    }
+
+    #[test]
+    fn pk_eq_other_column_rejected() {
+        let expr = col("id").eq(col("other_id"));
+        assert!(!pk_column_equals_literal(&expr, "id"));
+    }
+
+    #[test]
+    fn rewrites_consecutive_inlist_to_between() {
+        let in_list = Expr::InList(datafusion_expr::expr::InList::new(
+            Box::new(col("id")),
+            vec![lit_i64(5), lit_i64(6), lit_i64(7), lit_i64(8)],
+            false,
+        ));
+        let rewritten = rewrite_consecutive_inlist_to_range(in_list);
+        let expected = col("id").gt_eq(lit_i64(5)).and(col("id").lt_eq(lit_i64(8)));
+        assert_eq!(rewritten, expected);
+    }
+
+    #[test]
+    fn rewrites_consecutive_inlist_out_of_order() {
+        let in_list = Expr::InList(datafusion_expr::expr::InList::new(
+            Box::new(col("id")),
+            vec![lit_i64(8), lit_i64(5), lit_i64(7), lit_i64(6)],
+            false,
+        ));
+        let rewritten = rewrite_consecutive_inlist_to_range(in_list);
+        let expected = col("id").gt_eq(lit_i64(5)).and(col("id").lt_eq(lit_i64(8)));
+        assert_eq!(rewritten, expected);
+    }
+
+    #[test]
+    fn leaves_sparse_inlist_unchanged() {
+        let in_list = Expr::InList(datafusion_expr::expr::InList::new(
+            Box::new(col("id")),
+            vec![lit_i64(1), lit_i64(100), lit_i64(1000)],
+            false,
+        ));
+        let rewritten = rewrite_consecutive_inlist_to_range(in_list.clone());
+        assert_eq!(rewritten, in_list);
+    }
+
+    #[test]
+    fn leaves_negated_inlist_unchanged() {
+        let in_list = Expr::InList(datafusion_expr::expr::InList::new(
+            Box::new(col("id")),
+            vec![lit_i64(5), lit_i64(6), lit_i64(7)],
+            true,
+        ));
+        let rewritten = rewrite_consecutive_inlist_to_range(in_list.clone());
+        assert_eq!(rewritten, in_list);
+    }
+
+    #[test]
+    fn leaves_inlist_with_duplicates_unchanged() {
+        let in_list = Expr::InList(datafusion_expr::expr::InList::new(
+            Box::new(col("id")),
+            vec![lit_i64(5), lit_i64(6), lit_i64(6), lit_i64(7)],
+            false,
+        ));
+        let rewritten = rewrite_consecutive_inlist_to_range(in_list.clone());
+        assert_eq!(rewritten, in_list);
+    }
+
+    #[test]
+    fn leaves_inlist_with_string_literals_unchanged() {
+        let in_list = Expr::InList(datafusion_expr::expr::InList::new(
+            Box::new(col("name")),
+            vec![
+                Expr::Literal(ScalarValue::Utf8(Some("a".into())), None),
+                Expr::Literal(ScalarValue::Utf8(Some("b".into())), None),
+            ],
+            false,
+        ));
+        let rewritten = rewrite_consecutive_inlist_to_range(in_list.clone());
+        assert_eq!(rewritten, in_list);
+    }
+
+    #[test]
+    fn rewrites_inlist_with_mixed_int_widths() {
+        let in_list = Expr::InList(datafusion_expr::expr::InList::new(
+            Box::new(col("id")),
+            vec![
+                Expr::Literal(ScalarValue::Int32(Some(5)), None),
+                Expr::Literal(ScalarValue::Int32(Some(6)), None),
+                Expr::Literal(ScalarValue::Int32(Some(7)), None),
+            ],
+            false,
+        ));
+        let rewritten = rewrite_consecutive_inlist_to_range(in_list);
+        let expected = col("id").gt_eq(lit_i64(5)).and(col("id").lt_eq(lit_i64(7)));
+        assert_eq!(rewritten, expected);
     }
 }
