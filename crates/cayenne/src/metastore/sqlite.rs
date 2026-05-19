@@ -725,7 +725,11 @@ impl MetastoreBackend for SqliteMetastore {
                 if !conn.is_autocommit() {
                     let _ = conn.execute_batch("ROLLBACK");
                 }
-                conn.execute_batch("BEGIN TRANSACTION")?;
+                // Metastore transactions are write transactions. Acquiring the
+                // reserved lock up front lets SQLite's busy timeout serialize
+                // contending writers instead of failing later while upgrading a
+                // deferred transaction after reads have already run.
+                conn.execute_batch("BEGIN IMMEDIATE")?;
                 Ok::<_, rusqlite::Error>(())
             })
             .await

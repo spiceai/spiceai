@@ -2609,6 +2609,12 @@ impl MetadataCatalog for CayenneCatalog {
 pub fn is_retryable_write_conflict(error: &CatalogError) -> bool {
     match error {
         CatalogError::Database { message } => is_retryable_write_conflict_message(message),
+        CatalogError::Sqlite {
+            source: rusqlite::Error::SqliteFailure(err, _),
+        } => matches!(
+            err.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        ),
         _ => false,
     }
 }
@@ -3369,11 +3375,11 @@ mod tests {
         };
 
         catalog
-            .commit_on_conflict_deletions(vec![delete_file.clone()], &table_id, vec![vec![1_u8]], 1)
+            .commit_on_conflict_deletions(vec![delete_file.clone()], &table_id, vec![vec![1_u8]], 2)
             .await
             .expect("initial on-conflict deletion commit should succeed");
         catalog
-            .commit_on_conflict_deletions(vec![delete_file], &table_id, vec![vec![1_u8]], 1)
+            .commit_on_conflict_deletions(vec![delete_file], &table_id, vec![vec![1_u8]], 2)
             .await
             .expect("replayed on-conflict deletion commit should be idempotent");
 
@@ -3388,7 +3394,7 @@ mod tests {
             .get_insert_records(&table_id)
             .await
             .expect("Failed to get insert records");
-        assert_eq!(insert_records.get([1_u8].as_slice()), Some(&1));
+        assert_eq!(insert_records.get([1_u8].as_slice()), Some(&2));
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
@@ -3439,7 +3445,7 @@ mod tests {
         };
 
         catalog
-            .commit_on_conflict_deletions(vec![delete_file.clone()], &table_id, vec![vec![1_u8]], 1)
+            .commit_on_conflict_deletions(vec![delete_file.clone()], &table_id, vec![vec![1_u8]], 2)
             .await
             .expect("initial on-conflict deletion commit should succeed");
 
@@ -3451,7 +3457,7 @@ mod tests {
                 vec![conflicting_delete_file],
                 &table_id,
                 vec![vec![2_u8]],
-                2,
+                3,
             )
             .await
             .expect_err("conflicting delete-file metadata should be rejected");
@@ -3487,7 +3493,7 @@ mod tests {
             .get_insert_records(&table_id)
             .await
             .expect("Failed to get insert records");
-        assert_eq!(insert_records.get([1_u8].as_slice()), Some(&1));
+        assert_eq!(insert_records.get([1_u8].as_slice()), Some(&2));
         assert!(!insert_records.contains_key([2_u8].as_slice()));
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
@@ -3545,7 +3551,7 @@ mod tests {
         let insert_pks: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8]).collect();
 
         catalog
-            .commit_on_conflict_deletions(delete_files.clone(), &table_id, insert_pks, 1)
+            .commit_on_conflict_deletions(delete_files.clone(), &table_id, insert_pks, 2)
             .await
             .expect("batched on-conflict deletion commit should succeed");
 
@@ -3566,7 +3572,7 @@ mod tests {
 
         // Replay should be idempotent across the whole batch.
         catalog
-            .commit_on_conflict_deletions(delete_files, &table_id, vec![vec![0_u8]], 1)
+            .commit_on_conflict_deletions(delete_files, &table_id, vec![vec![0_u8]], 2)
             .await
             .expect("replayed batched on-conflict deletion commit should be idempotent");
         let stored = catalog
