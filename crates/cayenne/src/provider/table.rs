@@ -7833,7 +7833,12 @@ fn rewrite_consecutive_inlist_to_range(expr: Expr) -> Expr {
     let col_expr = (*in_list.expr).clone();
     let lit_min = Expr::Literal(ScalarValue::Int64(Some(min)), None);
     let lit_max = Expr::Literal(ScalarValue::Int64(Some(max)), None);
-    col_expr.clone().gt_eq(lit_min).and(col_expr.lt_eq(lit_max))
+    Expr::Between(datafusion_expr::expr::Between::new(
+        Box::new(col_expr),
+        false,
+        Box::new(lit_min),
+        Box::new(lit_max),
+    ))
 }
 
 /// Returns `Some(v)` if `expr` is an integer-typed literal (possibly wrapped
@@ -10078,6 +10083,15 @@ mod tests {
         assert!(!pk_column_equals_literal(&expr, "id"));
     }
 
+    fn between_int(name: &str, lo: i64, hi: i64) -> Expr {
+        Expr::Between(datafusion_expr::expr::Between::new(
+            Box::new(col(name)),
+            false,
+            Box::new(lit_i64(lo)),
+            Box::new(lit_i64(hi)),
+        ))
+    }
+
     #[test]
     fn rewrites_consecutive_inlist_to_between() {
         let in_list = Expr::InList(datafusion_expr::expr::InList::new(
@@ -10086,8 +10100,7 @@ mod tests {
             false,
         ));
         let rewritten = rewrite_consecutive_inlist_to_range(in_list);
-        let expected = col("id").gt_eq(lit_i64(5)).and(col("id").lt_eq(lit_i64(8)));
-        assert_eq!(rewritten, expected);
+        assert_eq!(rewritten, between_int("id", 5, 8));
     }
 
     #[test]
@@ -10098,8 +10111,7 @@ mod tests {
             false,
         ));
         let rewritten = rewrite_consecutive_inlist_to_range(in_list);
-        let expected = col("id").gt_eq(lit_i64(5)).and(col("id").lt_eq(lit_i64(8)));
-        assert_eq!(rewritten, expected);
+        assert_eq!(rewritten, between_int("id", 5, 8));
     }
 
     #[test]
@@ -10161,7 +10173,6 @@ mod tests {
             false,
         ));
         let rewritten = rewrite_consecutive_inlist_to_range(in_list);
-        let expected = col("id").gt_eq(lit_i64(5)).and(col("id").lt_eq(lit_i64(7)));
-        assert_eq!(rewritten, expected);
+        assert_eq!(rewritten, between_int("id", 5, 7));
     }
 }
