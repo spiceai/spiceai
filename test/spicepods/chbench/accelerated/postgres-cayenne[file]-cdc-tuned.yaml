@@ -5,25 +5,155 @@ name: postgres-cayenne[file]-cdc-tuned
 
 runtime:
   params:
-    cdc_prefetch_buffer: "1024"
-    cdc_max_coalesced_envelopes: "1024"
-    cdc_max_coalesced_bytes: "268435456"  # 256 MB
+    cdc_prefetch_buffer: '1024'
+    cdc_max_coalesced_envelopes: '1024'
+    cdc_max_coalesced_bytes: '67108864' # 64 MB
+    cdc_max_coalesce_age_ms: '2000'
+    cdc_commit_timeout_ms: '60000'
+    cayenne_sort_merge_min_rows: '50000000'
+  query:
+    target_partitions: 32
 
 datasets:
-  # ---- TPC-C core tables (mutated by OLTP workload) ----
+  # ------------------------------------------------------------------
+  # High-volume PK upsert tables.
+  # ------------------------------------------------------------------
 
-  - from: postgres:warehouse
-    name: warehouse
-    params: &postgres_params
+  - from: postgres:district
+    name: district
+    params: &pg_base
       pg_host: 127.0.0.1
-      pg_port: 5432
+      pg_port: '5432'
       pg_db: chbench
       pg_user: bench
       pg_pass: bench
       pg_sslmode: disable
+      pg_replication_slot: spice_district
+      pg_replication_initial_snapshot: 'true'
+      pg_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (d_w_id, d_id)
+      on_conflict:
+        (d_w_id, d_id): upsert
+      params: &accel_high_volume
+        cayenne_metastore: sqlite
+        cayenne_file_path: ./spice/cayenne/district
+        cayenne_write_concurrency: '16'
+        cayenne_upload_concurrency: '32'
+        cayenne_footer_cache_mb: '256'
+        cayenne_segment_cache_mb: '1024'
+        cayenne_compaction_trigger_protected_snapshots: '4'
+        cayenne_compaction_trigger_snapshot_age_ms: '15000'
+        cayenne_compaction_max_files_per_pick: '64'
+        cayenne_compaction_background_interval_ms: '3000'
+
+  - from: postgres:customer
+    name: customer
+    params:
+      <<: *pg_base
+      pg_replication_slot: spice_customer
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (c_w_id, c_d_id, c_id)
+      on_conflict:
+        (c_w_id, c_d_id, c_id): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: ./spice/cayenne/customer
+        cayenne_target_file_size_mb: '256'
+
+  - from: postgres:new_order
+    name: new_order
+    params:
+      <<: *pg_base
+      pg_replication_slot: spice_new_order
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (no_w_id, no_d_id, no_o_id)
+      on_conflict:
+        (no_w_id, no_d_id, no_o_id): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: ./spice/cayenne/new_order
+
+  - from: postgres:orders
+    name: orders
+    params:
+      <<: *pg_base
+      pg_replication_slot: spice_orders
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (o_w_id, o_d_id, o_id)
+      on_conflict:
+        (o_w_id, o_d_id, o_id): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: ./spice/cayenne/orders
+
+  - from: postgres:order_line
+    name: order_line
+    params:
+      <<: *pg_base
+      pg_replication_slot: spice_order_line
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (ol_w_id, ol_d_id, ol_o_id, ol_number)
+      on_conflict:
+        (ol_w_id, ol_d_id, ol_o_id, ol_number): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: ./spice/cayenne/order_line
+        cayenne_write_concurrency: '32'
+        cayenne_target_file_size_mb: '256'
+        cayenne_compaction_trigger_files: '8'
+        cayenne_compaction_trigger_snapshot_age_ms: '30000'
+        cayenne_compaction_max_files_per_pick: '128'
+        cayenne_segment_cache_mb: '2048'
+
+  - from: postgres:stock
+    name: stock
+    params:
+      <<: *pg_base
+      pg_replication_slot: spice_stock
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (s_w_id, s_i_id)
+      on_conflict:
+        (s_w_id, s_i_id): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: ./spice/cayenne/stock
+        cayenne_target_file_size_mb: '256'
+
+  # ------------------------------------------------------------------
+  # Low-volume reference tables.
+  # ------------------------------------------------------------------
+
+  - from: postgres:warehouse
+    name: warehouse
+    params:
+      <<: *pg_base
       pg_replication_slot: spice_warehouse
-      pg_replication_initial_snapshot: "true"
-    acceleration: &cayenne_accel
+    acceleration:
       enabled: true
       engine: cayenne
       mode: file
@@ -31,146 +161,104 @@ datasets:
       primary_key: w_id
       on_conflict:
         w_id: upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
-
-  - from: postgres:district
-    name: district
-    params:
-      <<: *postgres_params
-      pg_replication_slot: spice_district
-    acceleration:
-      <<: *cayenne_accel
-      primary_key: (d_w_id, d_id)
-      on_conflict:
-        (d_w_id, d_id): upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
-
-  - from: postgres:customer
-    name: customer
-    params:
-      <<: *postgres_params
-      pg_replication_slot: spice_customer
-    acceleration:
-      <<: *cayenne_accel
-      primary_key: (c_w_id, c_d_id, c_id)
-      on_conflict:
-        (c_w_id, c_d_id, c_id): upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
-
-  - from: postgres:new_order
-    name: new_order
-    params:
-      <<: *postgres_params
-      pg_replication_slot: spice_new_order
-    acceleration:
-      <<: *cayenne_accel
-      primary_key: (no_w_id, no_d_id, no_o_id)
-      on_conflict:
-        (no_w_id, no_d_id, no_o_id): upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
-
-  - from: postgres:orders
-    name: orders
-    params:
-      <<: *postgres_params
-      pg_replication_slot: spice_orders
-    acceleration:
-      <<: *cayenne_accel
-      primary_key: (o_w_id, o_d_id, o_id)
-      on_conflict:
-        (o_w_id, o_d_id, o_id): upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
-
-  - from: postgres:order_line
-    name: order_line
-    params:
-      <<: *postgres_params
-      pg_replication_slot: spice_order_line
-    acceleration:
-      <<: *cayenne_accel
-      primary_key: (ol_w_id, ol_d_id, ol_o_id, ol_number)
-      on_conflict:
-        (ol_w_id, ol_d_id, ol_o_id, ol_number): upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
+      params: &accel_medium
+        cayenne_metastore: sqlite
+        cayenne_file_path: ./spice/cayenne/warehouse
+        cayenne_write_concurrency: '4'
+        cayenne_upload_concurrency: '4'
+        cayenne_footer_cache_mb: '32'
+        cayenne_segment_cache_mb: '64'
 
   - from: postgres:item
     name: item
     params:
-      <<: *postgres_params
+      <<: *pg_base
       pg_replication_slot: spice_item
     acceleration:
-      <<: *cayenne_accel
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
       primary_key: i_id
       on_conflict:
         i_id: upsert
       params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
+        <<: *accel_medium
+        cayenne_file_path: ./spice/cayenne/item
 
-  - from: postgres:stock
-    name: stock
-    params:
-      <<: *postgres_params
-      pg_replication_slot: spice_stock
-    acceleration:
-      <<: *cayenne_accel
-      primary_key: (s_w_id, s_i_id)
-      on_conflict:
-        (s_w_id, s_i_id): upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
+  # ------------------------------------------------------------------
+  # Tiny TPC-H tables.
+  # ------------------------------------------------------------------
 
   - from: postgres:region
     name: region
     params:
-      <<: *postgres_params
+      <<: *pg_base
       pg_replication_slot: spice_region
     acceleration:
-      <<: *cayenne_accel
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
       primary_key: r_regionkey
       on_conflict:
         r_regionkey: upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
+      params: &accel_small
+        cayenne_metastore: sqlite
+        cayenne_file_path: ./spice/cayenne/region
+        cayenne_write_concurrency: '2'
+        cayenne_upload_concurrency: '2'
+        cayenne_footer_cache_mb: '8'
+        cayenne_segment_cache_mb: '16'
 
   - from: postgres:nation
     name: nation
     params:
-      <<: *postgres_params
+      <<: *pg_base
       pg_replication_slot: spice_nation
     acceleration:
-      <<: *cayenne_accel
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
       primary_key: n_nationkey
       on_conflict:
         n_nationkey: upsert
       params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
+        <<: *accel_small
+        cayenne_file_path: ./spice/cayenne/nation
 
   - from: postgres:supplier
     name: supplier
     params:
-      <<: *postgres_params
+      <<: *pg_base
       pg_replication_slot: spice_supplier
     acceleration:
-      <<: *cayenne_accel
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
       primary_key: su_suppkey
       on_conflict:
         su_suppkey: upsert
       params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
+        <<: *accel_small
+        cayenne_file_path: ./spice/cayenne/supplier
+
+
+  # - from: postgres:freshness_marker
+  #   name: freshness_marker
+  #   params:
+  #     <<: *pg_base
+  #     pg_replication_slot: spice_freshness_marker
+  #   acceleration:
+  #     enabled: true
+  #     engine: cayenne
+  #     mode: file
+  #     refresh_mode: changes
+  #     primary_key: marker_id
+  #     on_conflict:
+  #       marker_id: upsert
+  #     params:
+  #       <<: *accel_small
+  #       cayenne_file_path: ./spice/cayenne/freshness_marker
