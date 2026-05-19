@@ -3053,6 +3053,7 @@ impl CayenneTableProvider {
             scan_listing_tables: Arc::new(ParkingMutex::new(HashMap::new())),
             table_statistics: Arc::new(RwLock::new(CachedTableStatistics {
                 optimizer: table_statistics,
+                raw: None, // will be populated on first load/persist
             })),
             table_statistics_persistence_lock: Arc::new(tokio::sync::Mutex::new(())),
             retention_filters,
@@ -6160,18 +6161,31 @@ impl CayenneTableProvider {
         else {
             return;
         };
-        let existing_stats = match self
-            .catalog
-            .get_table_statistics(&self.table_metadata.table_id)
-            .await
-        {
-            Ok(stats) => stats,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to load existing table stats for {} before merge: {e}",
-                    self.table_metadata.table_name
-                );
-                None
+
+        // Prefer an in-memory cached raw blob (populated by previous persist or load)
+        // to avoid a catalog round-trip on every write. Only hit the catalog when
+        // the cache is cold.
+        let cached_raw = {
+            let guard = self.table_statistics.read();
+            guard.raw.clone()
+        };
+
+        let existing_stats = if let Some(raw) = cached_raw {
+            Some(raw)
+        } else {
+            match self
+                .catalog
+                .get_table_statistics(&self.table_metadata.table_id)
+                .await
+            {
+                Ok(stats) => stats,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load existing table stats for {} before merge: {e}",
+                        self.table_metadata.table_name
+                    );
+                    None
+                }
             }
         };
 
