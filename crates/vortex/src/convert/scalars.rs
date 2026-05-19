@@ -11,7 +11,6 @@ use vortex::dtype::PType;
 use vortex::dtype::arrow::FromArrowType;
 use vortex::dtype::half::f16;
 use vortex::dtype::i256;
-use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::extension::datetime::AnyTemporal;
@@ -167,8 +166,8 @@ impl TryToDataFusion<ScalarValue> for Scalar {
 }
 
 impl FromDataFusion<ScalarValue> for Scalar {
-    fn from_df(value: &ScalarValue) -> Scalar {
-        match value {
+    fn from_df(value: &ScalarValue) -> VortexResult<Scalar> {
+        Ok(match value {
             ScalarValue::Null => Scalar::null(DType::Null),
             ScalarValue::Boolean(b) => b
                 .map(Scalar::from)
@@ -223,8 +222,7 @@ impl FromDataFusion<ScalarValue> for Scalar {
             | ScalarValue::Time32Second(v)
             | ScalarValue::Time32Millisecond(v) => {
                 let dtype = DType::from_arrow((&value.data_type(), Nullability::Nullable));
-                Scalar::try_new(dtype, v.map(vortex::scalar::ScalarValue::from))
-                    .vortex_expect("unable to create a time `Scalar`")
+                Scalar::try_new(dtype, v.map(vortex::scalar::ScalarValue::from))?
             }
             ScalarValue::Date64(v)
             | ScalarValue::Time64Microsecond(v)
@@ -234,8 +232,7 @@ impl FromDataFusion<ScalarValue> for Scalar {
             | ScalarValue::TimestampMicrosecond(v, _)
             | ScalarValue::TimestampNanosecond(v, _) => {
                 let dtype = DType::from_arrow((&value.data_type(), Nullability::Nullable));
-                Scalar::try_new(dtype, v.map(vortex::scalar::ScalarValue::from))
-                    .vortex_expect("unable to create a time `Scalar`")
+                Scalar::try_new(dtype, v.map(vortex::scalar::ScalarValue::from))?
             }
             ScalarValue::Decimal32(decimal, precision, scale) => {
                 let decimal_dtype = DecimalDType::new(*precision, *scale);
@@ -289,9 +286,9 @@ impl FromDataFusion<ScalarValue> for Scalar {
                     Scalar::null(DType::Decimal(decimal_dtype, nullable))
                 }
             }
-            ScalarValue::Dictionary(_, v) => Scalar::from_df(v.as_ref()),
-            _ => unimplemented!("Can't convert {value:?} value to a Vortex scalar"),
-        }
+            ScalarValue::Dictionary(_, v) => Scalar::from_df(v.as_ref())?,
+            _ => vortex_bail!("Can't convert {value:?} value to a Vortex scalar"),
+        })
     }
 }
 
@@ -496,7 +493,8 @@ mod tests {
         #[case] df_scalar: ScalarValue,
         #[case] expected_vortex: Scalar,
     ) {
-        let result = Scalar::from_df(&df_scalar);
+        let result = Scalar::from_df(&df_scalar)
+            .expect("supported DataFusion scalar should convert to Vortex scalar");
         assert_eq!(result.dtype(), expected_vortex.dtype());
         assert_eq!(result.is_null(), expected_vortex.is_null());
 
@@ -514,7 +512,8 @@ mod tests {
     #[case::decimal256_some(ScalarValue::Decimal256(Some(arrow_i256::from_i128(12345)), 50, 10))]
     #[case::decimal256_null(ScalarValue::Decimal256(None, 50, 10))]
     fn test_from_datafusion_decimals(#[case] df_scalar: ScalarValue) {
-        let result = Scalar::from_df(&df_scalar);
+        let result = Scalar::from_df(&df_scalar)
+            .expect("supported DataFusion scalar should convert to Vortex scalar");
         match &df_scalar {
             ScalarValue::Decimal128(value, precision, scale) => {
                 if let DType::Decimal(decimal_type, _) = result.dtype() {
@@ -561,7 +560,8 @@ mod tests {
         None
     ))]
     fn test_from_datafusion_temporals(#[case] df_scalar: ScalarValue) {
-        let result = Scalar::from_df(&df_scalar);
+        let result = Scalar::from_df(&df_scalar)
+            .expect("supported DataFusion scalar should convert to Vortex scalar");
 
         // All temporal types should convert to extension types
         if let DType::Extension(_) = result.dtype() {
@@ -590,7 +590,8 @@ mod tests {
     #[case::binary(Scalar::binary(ByteBuffer::from(vec![1u8, 2, 3, 4, 5]), Nullability::NonNullable))]
     fn test_round_trip_conversions(#[case] original: Scalar) {
         let df_scalar = original.try_to_df().unwrap();
-        let round_trip = Scalar::from_df(&df_scalar);
+        let round_trip = Scalar::from_df(&df_scalar)
+            .expect("round-trip DataFusion scalar should convert back to Vortex scalar");
 
         // Check that core types match (ignoring nullability differences that can occur in round-trip)
         assert!(
@@ -659,7 +660,8 @@ mod tests {
         assert_eq!(df_result, expected_df_null);
 
         // Test DataFusion -> Vortex
-        let vortex_result = Scalar::from_df(&expected_df_null);
+        let vortex_result = Scalar::from_df(&expected_df_null)
+            .expect("supported null DataFusion scalar should convert to Vortex scalar");
         assert!(vortex_result.is_null());
         assert!(
             vortex_result
@@ -673,7 +675,8 @@ mod tests {
     #[case::utf8_view(ScalarValue::Utf8View(Some("test string".to_string())))]
     #[case::large_utf8(ScalarValue::LargeUtf8(Some("test string".to_string())))]
     fn test_utf8_variants(#[case] variant: ScalarValue) {
-        let result = Scalar::from_df(&variant);
+        let result = Scalar::from_df(&variant)
+            .expect("supported DataFusion scalar variant should convert to Vortex scalar");
         assert_eq!(result.as_utf8().value().unwrap().as_str(), "test string");
     }
 
@@ -683,7 +686,8 @@ mod tests {
     #[case::large_binary(ScalarValue::LargeBinary(Some(vec![1u8, 2, 3, 4, 5])))]
     #[case::fixed_size_binary(ScalarValue::FixedSizeBinary(5, Some(vec![1u8, 2, 3, 4, 5])))]
     fn test_binary_variants(#[case] variant: ScalarValue) {
-        let result = Scalar::from_df(&variant);
+        let result = Scalar::from_df(&variant)
+            .expect("supported DataFusion scalar variant should convert to Vortex scalar");
         let result_bytes: Vec<u8> = result
             .as_binary()
             .value()

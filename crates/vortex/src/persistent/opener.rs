@@ -70,10 +70,10 @@ pub(crate) struct VortexOpener {
     /// all fields in the final scan result not including the partition columns.
     pub projection: ProjectionExprs,
     /// Filter expression optimized for pushdown into Vortex scan operations.
-    /// This may be a subset of `file_pruning_predicate` containing only expressions
+    /// This may be a subset of file_pruning_predicate containing only expressions
     /// that Vortex can efficiently evaluate.
     pub filter: Option<PhysicalExprRef>,
-    /// Filter expression used by `DataFusion`'s `FilePruner` to eliminate files based on
+    /// Filter expression used by DataFusion's FilePruner to eliminate files based on
     /// statistics and partition values without opening them.
     pub file_pruning_predicate: Option<PhysicalExprRef>,
     pub expr_adapter_factory: Arc<dyn PhysicalExprAdapterFactory>,
@@ -88,7 +88,7 @@ pub(crate) struct VortexOpener {
     pub metrics_registry: Arc<dyn MetricsRegistry>,
     /// A shared cache of file readers.
     ///
-    /// To save on the overhead of reparsing `FlatBuffers` and rebuilding the layout tree, we cache
+    /// To save on the overhead of reparsing FlatBuffers and rebuilding the layout tree, we cache
     /// a file reader the first time we read a file.
     pub layout_readers: Arc<DashMap<Path, Weak<dyn LayoutReader>>>,
     /// Shared full-file natural split ranges keyed by file path.
@@ -107,7 +107,7 @@ pub(crate) struct VortexOpener {
 impl FileOpener for VortexOpener {
     fn open(&self, file: PartitionedFile) -> DFResult<FileOpenFuture> {
         let session = self.session.clone();
-        let metrics_registry = Arc::clone(&self.metrics_registry);
+        let metrics_registry = self.metrics_registry.clone();
         let labels = vec![
             Label::new(PATH_LABEL, file.path().to_string()),
             Label::new(PARTITION_LABEL, self.partition.to_string()),
@@ -123,10 +123,10 @@ impl FileOpener for VortexOpener {
         let reader =
             InstrumentedReadAt::new_with_labels(reader, metrics_registry.as_ref(), labels.clone());
 
-        let file_pruning_predicate = self.file_pruning_predicate.as_ref().map(Arc::clone);
-        let expr_adapter_factory = Arc::clone(&self.expr_adapter_factory);
-        let file_metadata_cache = self.file_metadata_cache.as_ref().map(Arc::clone);
-        let segment_cache = self.segment_cache.as_ref().map(Arc::clone);
+        let file_pruning_predicate = self.file_pruning_predicate.clone();
+        let expr_adapter_factory = self.expr_adapter_factory.clone();
+        let file_metadata_cache = self.file_metadata_cache.clone();
+        let segment_cache = self.segment_cache.clone();
 
         let unified_file_schema = Arc::clone(self.table_schema.file_schema());
         let batch_size = self.batch_size;
@@ -140,14 +140,14 @@ impl FileOpener for VortexOpener {
         let projection_pushdown = self.projection_pushdown;
 
         // Replace column access for partition columns with literals
-        let literal_value_cols = self
+        let literal_value_cols: std::collections::HashMap<String, ScalarValue> = self
             .table_schema
             .table_partition_cols()
             .iter()
             .map(|f| f.name())
             .cloned()
             .zip(file.partition_values.clone())
-            .collect::<std::collections::HashMap<String, ScalarValue>>();
+            .collect();
 
         if !literal_value_cols.is_empty() {
             projection = projection.try_map_exprs(|expr| {
@@ -172,7 +172,7 @@ impl FileOpener for VortexOpener {
                 })
                 .and_then(|predicate| {
                     FilePruner::try_new(
-                        Arc::clone(&predicate),
+                        predicate.clone(),
                         &unified_file_schema,
                         &file,
                         Count::default(),
@@ -190,12 +190,13 @@ impl FileOpener for VortexOpener {
             let mut open_opts = session
                 .open_options()
                 .with_file_size(file.object_meta.size)
-                .with_metrics_registry(Arc::clone(&metrics_registry))
+                .with_metrics_registry(metrics_registry.clone())
                 .with_labels(labels);
 
             if let Some(segment_cache) = segment_cache {
-                open_opts = open_opts
-                    .with_segment_cache(segment_cache.for_path(file.object_meta.location.clone()));
+                open_opts = open_opts.with_segment_cache(
+                    segment_cache.for_path(file.object_meta.location.clone()),
+                );
             }
 
             if let Some(file_metadata_cache) = file_metadata_cache
@@ -357,20 +358,14 @@ impl FileOpener for VortexOpener {
                             });
 
                     if !unpushed.is_empty() {
-                        return Some(Err(exec_datafusion_err!(
-                            r"VortexSource accepted but failed to push {} filters.
-                            This should never happen if you have a properly configured
-                            PhysicalExprAdapterFactory configured on the source.
-
-                            Failed filters:
-
-                            {unpushed:#?}
-                            ",
-                            unpushed.len()
-                        )));
+                                tracing::debug!(filters = ?unpushed, "VortexSource accepted filters that could not be pushed down");
+                                return Some(Err(exec_datafusion_err!("VortexSource accepted but failed to push {} filters; configure a PhysicalExprAdapterFactory that can rewrite missing or reordered columns before pushdown", unpushed.len())));
                     }
 
-                    make_vortex_predicate(expr_convertor.as_ref(), &pushed).map(Ok)
+                            match make_vortex_predicate(expr_convertor.as_ref(), &pushed) {
+                                Ok(predicate) => predicate.map(Ok),
+                                Err(err) => Some(Err(err)),
+                            }
                 })
                 .transpose()?;
 
@@ -477,7 +472,7 @@ fn compute_natural_split_ranges(layout_reader: &dyn LayoutReader) -> DFResult<Ar
     Ok(split_points.into())
 }
 
-/// Translate a `DataFusion` byte range to the contiguous natural split ranges it owns.
+/// Translate a DataFusion byte range to the contiguous natural split ranges it owns.
 fn split_aligned_row_range(
     byte_range: Range<u64>,
     total_size: u64,
