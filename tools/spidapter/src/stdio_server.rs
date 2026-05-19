@@ -51,7 +51,9 @@ use ingestion_targets::cayenne::{
 use ingestion_targets::postgres_cdc::{
     PgConfig, generate_postgres_wal_spicepod, setup_postgres_for_wal, teardown_postgres,
 };
-use provision_local::{provision_local_cluster, provision_local_single_node, teardown_local_run};
+use provision_local::{
+    provision_local_single_node, provision_local_spiced_cluster, teardown_local_run,
+};
 use provision_scp::provision_scp_app;
 
 const POST_SETUP_SQL_MAX_RETRIES: u64 = 5;
@@ -324,7 +326,7 @@ impl Handler for SpidapterHandler {
                 .await
             }
             (BackendMode::Local, DeploymentMode::Distributed) => {
-                provision_local_cluster(
+                provision_local_spiced_cluster(
                     run_id,
                     Duration::from_secs(self.args.ready_wait),
                     &setup_config,
