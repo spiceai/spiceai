@@ -120,15 +120,21 @@ impl ChBenchDriver for PostgresChBenchDriver {
     /// Drop and recreate all 12 CH-benCH tables, then load seed data.
     async fn prepare(&self) -> Result<()> {
         println!(
-            "Preparing CH-benCH schema with {} warehouse(s)",
+            "Preparing CH-benCHmark schema with {} warehouse(s)",
             self.config.warehouses,
         );
 
         schema::drop_tables(&self.client).await?;
         schema::create_tables(&self.client).await?;
-        loader::load_all(&self.client, self.config.warehouses, self.config.seed).await?;
+        let conn_str = self.source.connection_string();
+        loader::load_all(
+            &self.client,
+            &conn_str,
+            self.config.warehouses,
+            self.config.seed,
+        )
+        .await?;
 
-        println!("CH-benCH prepare complete");
         Ok(())
     }
 
@@ -143,17 +149,19 @@ impl ChBenchDriver for PostgresChBenchDriver {
         let warehouses = i32::try_from(self.config.warehouses).unwrap_or(1);
         let base_seed = self.config.seed.unwrap_or(42);
 
+        let assignments = txn::TerminalAssignment::compute(terminals, warehouses);
+
         println!(
             "Starting OLTP workload: {warehouses} warehouse(s), {terminals} terminals, mix={mix:?}",
         );
 
         let mut handles = Vec::with_capacity(terminals);
-        for terminal_id in 0..terminals {
+        for (terminal_id, &assignment) in assignments.iter().enumerate() {
             let conn_str = self.source.connection_string();
             let stop = stop.clone();
 
             handles.push(tokio::spawn(async move {
-                run_terminal(terminal_id, &conn_str, stop, warehouses, mix, base_seed).await
+                run_terminal(terminal_id, &conn_str, stop, assignment, mix, base_seed).await
             }));
         }
 
@@ -215,7 +223,7 @@ async fn run_terminal(
     terminal_id: usize,
     conn_str: &str,
     stop: CancellationToken,
-    warehouses: i32,
+    assignment: txn::TerminalAssignment,
     mix: [u32; 5],
     base_seed: u64,
 ) -> Result<metrics::OltpMetrics> {
@@ -238,6 +246,8 @@ async fn run_terminal(
         }
     });
 
+    let stmts = txn::PreparedStatements::prepare(&client).await?;
+
     let mut rng = StdRng::seed_from_u64(base_seed.wrapping_add(terminal_id as u64));
     let mut metrics = metrics::OltpMetrics::new();
 
@@ -248,7 +258,7 @@ async fn run_terminal(
 
         let txn_type = txn::pick_txn_type(&mut rng, &mix);
 
-        match txn::execute(&mut client, &mut rng, txn_type, warehouses).await {
+        match txn::execute(&mut client, &mut rng, txn_type, &assignment, &stmts).await {
             Ok(()) => {
                 metrics.record_success(txn_type);
             }
