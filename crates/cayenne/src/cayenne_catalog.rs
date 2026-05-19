@@ -2326,14 +2326,13 @@ impl MetadataCatalog for CayenneCatalog {
 
             if let Some((chunk_idx, batched_err)) = batched_failure {
                 let chunk_start = chunk_idx * MAX_DELETE_FILE_ROWS_PER_CHUNK;
-                let chunk_end = (chunk_start + MAX_DELETE_FILE_ROWS_PER_CHUNK)
-                    .min(delete_files.len());
+                let chunk_end =
+                    (chunk_start + MAX_DELETE_FILE_ROWS_PER_CHUNK).min(delete_files.len());
                 let chunk = &delete_files[chunk_start..chunk_end];
                 for delete_file in chunk {
-                    let (sql, params) =
-                        Self::build_insert_delete_files_chunk_sql(std::slice::from_ref(
-                            delete_file,
-                        ));
+                    let (sql, params) = Self::build_insert_delete_files_chunk_sql(
+                        std::slice::from_ref(delete_file),
+                    );
                     let res = tx.execute(ExecuteParams { sql: &sql, params }).await;
                     if let Err(e) = res {
                         if retry_on_metastore_write_conflict(
@@ -2363,9 +2362,8 @@ impl MetadataCatalog for CayenneCatalog {
                             });
                         }
                         return Err(CatalogError::InvalidOperation {
-                            message:
-                                "Failed to insert delete file inside on-conflict transaction"
-                                    .to_string(),
+                            message: "Failed to insert delete file inside on-conflict transaction"
+                                .to_string(),
                             source: Box::new(e),
                         });
                     }
@@ -2377,10 +2375,9 @@ impl MetadataCatalog for CayenneCatalog {
                 // silently committing an inconsistent prefix.
                 drop(tx);
                 return Err(CatalogError::InvalidOperation {
-                    message:
-                        "Batched delete-file INSERT failed but per-row replay succeeded; \
+                    message: "Batched delete-file INSERT failed but per-row replay succeeded; \
                          aborting transaction to avoid inconsistent commit"
-                            .to_string(),
+                        .to_string(),
                     source: Box::new(batched_err),
                 });
             }
