@@ -70,7 +70,7 @@ The vendored crate exposes Spice-shaped options on the DataFusion `config_namesp
 * `footer_initial_read_size_bytes` — bounded footer prefetch.
 * `target_file_size_mb` — size-based file splitting for non-partitioned writes.
 * `projection_pushdown` — opt-in pushdown of projection expressions.
-* `scan_concurrency` — intra-partition Vortex scan concurrency.
+* `scan_concurrency` — `auto`/`off`/explicit intra-file Vortex scan concurrency, derived from `DataFusion` target partitions and planned file count in `auto` mode.
 * `segment_cache_size_bytes` — capacity of the shared segment cache.
 
 These are surfaced through Cayenne's accelerator configuration (e.g. `cayenne_footer_cache_mb`, `cayenne_segment_cache_mb`).

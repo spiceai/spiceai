@@ -3,6 +3,7 @@
 
 use std::any::Any;
 use std::fmt::Debug;
+use std::fmt::Display;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
@@ -75,6 +76,77 @@ use crate::convert::TryToDataFusion;
 const DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES: usize = MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE;
 const DEFAULT_TARGET_FILE_SIZE_MB: usize = 128;
 
+/// Controls intra-file Vortex scan concurrency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanConcurrency {
+    /// Derive per-file scan concurrency from `DataFusion` target partitions and planned file count.
+    #[default]
+    Auto,
+    /// Force serial processing within each Vortex file scan.
+    Off,
+    /// Use an explicit concurrency value for every Vortex file scan.
+    Explicit(usize),
+}
+
+impl Display for ScanConcurrency {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Off => f.write_str("off"),
+            Self::Explicit(value) => write!(f, "{value}"),
+        }
+    }
+}
+
+impl ConfigField for ScanConcurrency {
+    fn visit<V: datafusion_common::config::Visit>(
+        &self,
+        v: &mut V,
+        key: &str,
+        description: &'static str,
+    ) {
+        v.some(key, self, description);
+    }
+
+    fn set(&mut self, key: &str, value: &str) -> DFResult<()> {
+        if !key.is_empty() {
+            return Err(DataFusionError::Configuration(format!(
+                "Config field scan_concurrency is a scalar and does not have nested field {key}"
+            )));
+        }
+
+        *self = match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Self::Auto,
+            "off" | "disabled" | "none" | "0" => Self::Off,
+            value => {
+                let concurrency = value.parse::<usize>().map_err(|err| {
+                    DataFusionError::Configuration(format!(
+                        "Invalid scan_concurrency value {value:?}; expected 'auto', 'off', or a positive integer: {err}"
+                    ))
+                })?;
+                if concurrency == 0 {
+                    Self::Off
+                } else {
+                    Self::Explicit(concurrency)
+                }
+            }
+        };
+
+        Ok(())
+    }
+
+    fn reset(&mut self, key: &str) -> DFResult<()> {
+        if key.is_empty() {
+            *self = Self::default();
+            Ok(())
+        } else {
+            Err(DataFusionError::Configuration(format!(
+                "Config field scan_concurrency is a scalar and does not have nested field {key}"
+            )))
+        }
+    }
+}
+
 /// Vortex implementation of a `DataFusion` [`FileFormat`].
 pub struct VortexFormat {
     session: VortexSession,
@@ -120,12 +192,13 @@ config_namespace! {
         /// the scan. When disabled, Vortex reads only the referenced columns and
         /// all expressions are evaluated after the scan.
         pub projection_pushdown: bool, default = false
-        /// The intra-partition scan concurrency, controlling the number of row splits to process
-        /// concurrently per-thread within each file.
+        /// The intra-file scan concurrency, controlling the number of row splits to process
+        /// concurrently within each file.
         ///
-        /// This does not affect the overall parallelism
-        /// across partitions, which is controlled by DataFusion's execution configuration.
-        pub scan_concurrency: Option<usize>, default = None
+        /// Accepted values are `auto`, `off`, or a positive integer. In `auto` mode, Vortex derives
+        /// per-file scan concurrency from DataFusion's target partitions and the number of planned
+        /// files in the scan.
+        pub scan_concurrency: ScanConcurrency, default = ScanConcurrency::Auto
         /// Total byte capacity for a path-aware segment cache shared by scans using this format.
         pub segment_cache_size_bytes: Option<usize>, default = None
     }
@@ -656,11 +729,8 @@ impl FileFormat for VortexFormat {
 
     fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
         let mut source = VortexSource::new(table_schema, self.session.clone())
-            .with_projection_pushdown(self.opts.projection_pushdown);
-
-        if let Some(scan_concurrency) = self.opts.scan_concurrency {
-            source = source.with_scan_concurrency(scan_concurrency);
-        }
+            .with_projection_pushdown(self.opts.projection_pushdown)
+            .with_scan_concurrency(self.opts.scan_concurrency);
 
         if let Some(segment_cache) = self.segment_cache.clone() {
             source = source.with_segment_cache(segment_cache);
@@ -735,5 +805,27 @@ mod tests {
     fn format_target_file_size_default_is_128mb() {
         let opts = VortexTableOptions::default();
         assert_eq!(opts.target_file_size_mb, 128);
+    }
+
+    #[test]
+    fn format_scan_concurrency_default_is_auto() {
+        let opts = VortexTableOptions::default();
+        assert_eq!(opts.scan_concurrency, ScanConcurrency::Auto);
+    }
+
+    #[test]
+    fn format_plumbs_scan_concurrency_modes() {
+        let mut opts = VortexTableOptions::default();
+        opts.set("scan_concurrency", "auto").unwrap();
+        assert_eq!(opts.scan_concurrency, ScanConcurrency::Auto);
+
+        opts.set("scan_concurrency", "off").unwrap();
+        assert_eq!(opts.scan_concurrency, ScanConcurrency::Off);
+
+        opts.set("scan_concurrency", "00").unwrap();
+        assert_eq!(opts.scan_concurrency, ScanConcurrency::Off);
+
+        opts.set("scan_concurrency", "3").unwrap();
+        assert_eq!(opts.scan_concurrency, ScanConcurrency::Explicit(3));
     }
 }

@@ -12,9 +12,12 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::exec_datafusion_err;
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::FileSource;
+use datafusion_datasource::file_groups::FileGroup;
+use datafusion_datasource::file_groups::FileGroupPartitioner;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::file_stream::FileOpener;
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
+use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_expr::conjunction;
 use datafusion_physical_expr::projection::ProjectionExprs;
@@ -37,6 +40,7 @@ use vortex_utils::aliases::dash_map::DashMap;
 
 use super::opener::VortexOpener;
 use super::segment_cache::SharedSegmentCache;
+use crate::ScanConcurrency;
 use crate::VortexTableOptions;
 use crate::convert::exprs::DefaultExpressionConvertor;
 use crate::convert::exprs::ExpressionConvertor;
@@ -70,6 +74,7 @@ pub struct VortexSource {
     vx_metrics_registry: Arc<dyn MetricsRegistry>,
     file_metadata_cache: Option<Arc<dyn FileMetadataCache>>,
     segment_cache: Option<Arc<SharedSegmentCache>>,
+    target_partitions: Option<usize>,
     /// Whether to enable expression pushdown into the underlying Vortex scan.
     options: VortexTableOptions,
 }
@@ -100,6 +105,7 @@ impl VortexSource {
             vx_metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             file_metadata_cache: None,
             segment_cache: None,
+            target_partitions: None,
             options: VortexTableOptions::default(),
         }
     }
@@ -155,10 +161,10 @@ impl VortexSource {
         self
     }
 
-    /// Set the underlying scan concurrency. This limit is used per Vortex scan operations.
+    /// Set the underlying scan concurrency mode. This limit is used per Vortex scan operation.
     #[must_use]
-    pub fn with_scan_concurrency(mut self, scan_concurrency: usize) -> Self {
-        self.options.scan_concurrency = Some(scan_concurrency);
+    pub fn with_scan_concurrency(mut self, scan_concurrency: ScanConcurrency) -> Self {
+        self.options.scan_concurrency = scan_concurrency;
         self
     }
 
@@ -197,6 +203,28 @@ impl FileSource for VortexSource {
             Arc::clone,
         );
 
+        let planned_file_count = planned_file_count(&base_config.file_groups);
+        let target_partitions = self
+            .target_partitions
+            .unwrap_or_else(|| base_config.file_groups.len().max(1));
+        let scan_concurrency = resolve_scan_concurrency(
+            self.options.scan_concurrency,
+            target_partitions,
+            planned_file_count,
+            base_config.limit.is_some() && self.vortex_predicate.is_none(),
+        );
+
+        tracing::debug!(
+            scan_concurrency,
+            mode = %self.options.scan_concurrency,
+            target_partitions,
+            planned_partitions = base_config.file_groups.len(),
+            planned_file_count,
+            limit = ?base_config.limit,
+            has_filter = self.vortex_predicate.is_some(),
+            "Resolved Vortex scan concurrency"
+        );
+
         let opener = VortexOpener {
             partition,
             session: self.session.clone(),
@@ -216,7 +244,7 @@ impl FileSource for VortexSource {
             file_metadata_cache: self.file_metadata_cache.as_ref().map(Arc::clone),
             segment_cache: self.segment_cache.as_ref().map(Arc::clone),
             projection_pushdown: self.options.projection_pushdown,
-            scan_concurrency: self.options.scan_concurrency,
+            scan_concurrency: Some(scan_concurrency),
         };
 
         Ok(Arc::new(opener))
@@ -265,10 +293,40 @@ impl FileSource for VortexSource {
         true
     }
 
+    fn repartitioned(
+        &self,
+        target_partitions: usize,
+        repartition_file_min_size: usize,
+        output_ordering: Option<LexOrdering>,
+        config: &FileScanConfig,
+    ) -> DFResult<Option<FileScanConfig>> {
+        let target_partitions = target_partitions.max(1);
+        let mut source = self.clone();
+        source.target_partitions = Some(target_partitions);
+
+        let mut updated_config = config.clone();
+        updated_config.file_source = Arc::new(source);
+
+        if config.file_compression_type.is_compressed() || !self.supports_repartitioning() {
+            return Ok(Some(updated_config));
+        }
+
+        if let Some(repartitioned_file_groups) = FileGroupPartitioner::new()
+            .with_target_partitions(target_partitions)
+            .with_repartition_file_min_size(repartition_file_min_size)
+            .with_preserve_order_within_groups(output_ordering.is_some())
+            .repartition_file_groups(&config.file_groups)
+        {
+            updated_config.file_groups = repartitioned_file_groups;
+        }
+
+        Ok(Some(updated_config))
+    }
+
     fn try_pushdown_filters(
         &self,
         filters: Vec<Arc<dyn PhysicalExpr>>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> DFResult<FilterPushdownPropagation<Arc<dyn FileSource>>> {
         if filters.is_empty() {
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
@@ -277,6 +335,7 @@ impl FileSource for VortexSource {
         }
 
         let mut source = self.clone();
+        source.target_partitions = Some(config.execution.target_partitions.max(1));
 
         // Combine new filters with existing predicate for file pruning.
         // This full predicate is used by FilePruner to eliminate files.
@@ -349,5 +408,67 @@ impl FileSource for VortexSource {
 
     fn table_schema(&self) -> &TableSchema {
         &self.table_schema
+    }
+}
+
+fn planned_file_count(file_groups: &[FileGroup]) -> usize {
+    file_groups.iter().map(FileGroup::len).sum::<usize>().max(1)
+}
+
+fn resolve_scan_concurrency(
+    mode: ScanConcurrency,
+    target_partitions: usize,
+    planned_file_count: usize,
+    has_limit_without_filter: bool,
+) -> usize {
+    match mode {
+        ScanConcurrency::Auto if has_limit_without_filter => 1,
+        ScanConcurrency::Auto => target_partitions
+            .max(1)
+            .div_ceil(planned_file_count.max(1))
+            .max(1),
+        ScanConcurrency::Off => 1,
+        ScanConcurrency::Explicit(value) => value.max(1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_scan_concurrency_uses_file_count() {
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Auto, 16, 1, false),
+            16
+        );
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Auto, 16, 4, false),
+            4
+        );
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Auto, 16, 32, false),
+            1
+        );
+    }
+
+    #[test]
+    fn auto_scan_concurrency_clamps_limit_without_filter_to_serial() {
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Auto, 16, 1, true),
+            1
+        );
+    }
+
+    #[test]
+    fn explicit_and_off_scan_concurrency_override_auto() {
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Explicit(3), 16, 1, true),
+            3
+        );
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Off, 16, 1, false),
+            1
+        );
     }
 }

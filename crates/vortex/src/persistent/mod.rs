@@ -14,6 +14,7 @@ mod source;
 mod stream;
 
 pub use access_plan::{VortexAccessPlan, VortexAccessPlanProvider};
+pub use format::ScanConcurrency;
 pub use format::VortexFormat;
 pub use format::VortexFormatFactory;
 pub use format::VortexTableOptions;
