@@ -192,7 +192,7 @@ impl AcceleratorEngineRegistry {
         }
     }
 
-    async fn register_accelerator_engine(
+    pub(crate) async fn register_accelerator_engine(
         &self,
         engine: Engine,
         accelerator_engine: Arc<dyn DataAccelerator>,

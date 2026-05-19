@@ -281,6 +281,8 @@ fn emit_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
     let mut inserts: BTreeMap<String, f64> = BTreeMap::new();
     let mut updates: BTreeMap<String, f64> = BTreeMap::new();
     let mut deletes: BTreeMap<String, f64> = BTreeMap::new();
+    let mut recv_errors: BTreeMap<String, f64> = BTreeMap::new();
+    let mut reconnects: BTreeMap<String, f64> = BTreeMap::new();
 
     let gauge_metrics = [
         (
@@ -296,6 +298,14 @@ fn emit_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
         ),
         ("dataset_postgres_replication_updates_total", &mut updates),
         ("dataset_postgres_replication_deletes_total", &mut deletes),
+        (
+            "dataset_postgres_replication_recv_errors_total",
+            &mut recv_errors,
+        ),
+        (
+            "dataset_postgres_replication_reconnects_total",
+            &mut reconnects,
+        ),
     ];
 
     for (metric_name, map) in gauge_metrics {
@@ -326,18 +336,40 @@ fn emit_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
         }
     }
 
-    if lag_ms.is_empty() && inserts.is_empty() {
+    if lag_ms.is_empty()
+        && lag_bytes.is_empty()
+        && inserts.is_empty()
+        && updates.is_empty()
+        && deletes.is_empty()
+        && recv_errors.is_empty()
+        && reconnects.is_empty()
+    {
         return;
     }
 
     println!("\nReplication Metrics (last scrape from spiced)");
     // Header
     println!(
-        "  {:<14} {:>10} {:>12} {:>10} {:>10} {:>10}",
-        "dataset", "lag_ms", "lag_bytes", "inserts", "updates", "deletes"
+        "  {:<14} {:>10} {:>12} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "dataset",
+        "lag_ms",
+        "lag_bytes",
+        "inserts",
+        "updates",
+        "deletes",
+        "recv_errs",
+        "reconnects"
     );
 
-    let all_datasets: BTreeSet<&String> = lag_ms.keys().chain(inserts.keys()).collect();
+    let all_datasets: BTreeSet<&String> = lag_ms
+        .keys()
+        .chain(lag_bytes.keys())
+        .chain(inserts.keys())
+        .chain(updates.keys())
+        .chain(deletes.keys())
+        .chain(recv_errors.keys())
+        .chain(reconnects.keys())
+        .collect();
 
     let mut worst_lag_ms: f64 = 0.0;
     for dataset in &all_datasets {
@@ -346,8 +378,10 @@ fn emit_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
         let ins = inserts.get(*dataset).copied().unwrap_or(0.0);
         let upd = updates.get(*dataset).copied().unwrap_or(0.0);
         let del = deletes.get(*dataset).copied().unwrap_or(0.0);
+        let recv = recv_errors.get(*dataset).copied().unwrap_or(0.0);
+        let reconn = reconnects.get(*dataset).copied().unwrap_or(0.0);
         println!(
-            "  {dataset:<14} {l_ms:>10.0} {l_bytes:>12.0} {ins:>10.0} {upd:>10.0} {del:>10.0}",
+            "  {dataset:<14} {l_ms:>10.0} {l_bytes:>12.0} {ins:>10.0} {upd:>10.0} {del:>10.0} {recv:>10.0} {reconn:>10.0}",
         );
 
         crate::metrics::REPLICATION_LAG_MS

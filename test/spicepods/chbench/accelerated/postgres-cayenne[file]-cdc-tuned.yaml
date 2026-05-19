@@ -10,6 +10,7 @@ runtime:
     cdc_max_coalesce_age_ms: '2000'
     cdc_commit_timeout_ms: '60000'
     cayenne_sort_merge_min_rows: '50000000'
+    cayenne_footer_cache_mb: '256'
   query:
     memory_limit: 40GiB
     target_partitions: 32
@@ -44,7 +45,6 @@ datasets:
         cayenne_file_path: ./spice/cayenne/district
         cayenne_write_concurrency: '16'
         cayenne_upload_concurrency: '32'
-        cayenne_footer_cache_mb: '256'
         cayenne_segment_cache_mb: '1024'
         cayenne_compaction_trigger_protected_snapshots: '4'
         cayenne_compaction_trigger_snapshot_age_ms: '15000'
@@ -166,7 +166,6 @@ datasets:
         cayenne_file_path: ./spice/cayenne/warehouse
         cayenne_write_concurrency: '4'
         cayenne_upload_concurrency: '4'
-        cayenne_footer_cache_mb: '32'
         cayenne_segment_cache_mb: '64'
 
   - from: postgres:item
@@ -208,7 +207,6 @@ datasets:
         cayenne_file_path: ./spice/cayenne/region
         cayenne_write_concurrency: '2'
         cayenne_upload_concurrency: '2'
-        cayenne_footer_cache_mb: '8'
         cayenne_segment_cache_mb: '16'
 
   - from: postgres:nation
