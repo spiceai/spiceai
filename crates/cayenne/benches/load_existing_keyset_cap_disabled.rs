@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 //! Regression bench: per-CDC-commit cost of rebuilding the existing-PK keyset
-//! from scratch when the in-memory cache is disabled by
-//! [`PK_KEYSET_CACHE_MAX_ENTRIES`].
+//! from scratch when the in-memory cache is exceeded by the byte-budget cap
+//! [`PK_KEYSET_CACHE_MAX_BYTES`] (256 MiB).
 //!
 //! `CayenneTableProvider::prepare_stream_for_insert`
 //! (`crates/cayenne/src/provider/table.rs:3935`) calls `take_cached_pk_keyset`,
@@ -26,15 +26,14 @@ limitations under the License.
 //! `HashMap<OwnedRow, RowLocation>`. After the write,
 //! `OnConflictValidationStream::store_existing_keyset`
 //! (`provider/table.rs:1626`) tries to restore the cache via
-//! `store_cached_pk_keyset` — but that function has a hard cap:
+//! `store_cached_pk_keyset` — but that function applies a byte-budget cap:
 //!
 //! ```ignore
-//! // table.rs:114
-//! const PK_KEYSET_CACHE_MAX_ENTRIES: usize = 1_000_000;
+//! // table.rs
+//! const PK_KEYSET_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 //!
-//! // table.rs:3534-3543
 //! fn store_cached_pk_keyset(&self, keyset: HashMap<OwnedRow, RowLocation>) {
-//!     if keyset.len() > PK_KEYSET_CACHE_MAX_ENTRIES {
+//!     if estimated_bytes(&keyset) > PK_KEYSET_CACHE_MAX_BYTES {
 //!         *self.pk_keyset_cache.lock() = None;   // <-- cache *dropped*
 //!         return;
 //!     }
@@ -42,28 +41,31 @@ limitations under the License.
 //! }
 //! ```
 //!
-//! Every CH-benCH SF100 PK-mode table exceeds 1 M rows
-//! (`customer` ≈ 3 M, `stock` ≈ 10 M, `new_order` ≈ 9 M,
-//! `order_line` ≈ 300 M), so for these tables the cache is *permanently
-//! disabled* — every CDC commit pays a cold-start scan of the main listing
-//! table plus every protected snapshot.
+//! At ~40-64 bytes per entry (key bytes + `RowLocation` + `HashMap` overhead),
+//! the 256 MiB byte budget accommodates ~4 M entries for narrow int64 PKs and
+//! proportionally fewer for wide composite PKs. SF100 CH-benCH tables fall
+//! into two regimes against this budget: `customer` (~3 M) now stays cached
+//! across commits, while `stock` (~10 M), `new_order` (~9 M), and
+//! `order_line` (~300 M) still exceed the budget — every CDC commit on those
+//! tables pays a cold-start scan of the main listing table plus every
+//! protected snapshot.
 //!
 //! The May 18 2026 SF100 retest reported "file write" times of 113 s
 //! (new_order), 61 s (stock), 30.5 s (order_line) per 256 MB CDC batch. The
 //! `load_existing_keyset` rebuild dominates that wall time on every PK-mode
-//! table because of the cap: it touches `O(rows + protected_snapshot_count ·
-//! rows_per_protected_snapshot)` rows and pays one heap alloc + one
-//! `HashMap::insert` per row.
+//! table that exceeds the budget because it touches `O(rows +
+//! protected_snapshot_count · rows_per_protected_snapshot)` rows and pays one
+//! heap alloc + one `HashMap::insert` per row.
 //!
 //! ## TigerStyle remedy
 //!
 //! Three layered options ranked by effort:
 //!
-//! - **(A) Cap by memory, not by entry count.** Replace the entry-count cap
-//!   with a byte-budget cap (`cayenne_pk_keyset_cache_max_bytes`, default
-//!   1 GiB). Keeps the existing data structure; recovers the cache for
-//!   customer/stock/new_order at SF100. For order_line (300 M × 50 B ≈ 15 GB)
-//!   the cap still kicks in.
+//! - **(A) Byte-budget cap — landed.** Replaced the entry-count cap with a
+//!   byte-budget cap (`PK_KEYSET_CACHE_MAX_BYTES`, default 256 MiB). Recovers
+//!   the cache for narrow-PK tables up to ~4 M rows. For larger tables
+//!   (`stock`, `new_order`, `order_line`) the cap still kicks in and the
+//!   rebuild cost modelled by this bench still applies.
 //! - **(B) Existence-bloom fallback.** Above the budget, maintain a
 //!   space-bounded bloom filter of existing PKs and replace the `HashMap` probe
 //!   with `bloom.contains(key)` → conditional targeted lookup. Bloom at 1 % FPR
@@ -84,13 +86,14 @@ limitations under the License.
 //!
 //! Three lanes per `(rows_per_snapshot, snapshot_count)`:
 //!
-//! - `current_full_rebuild` — mirrors today's `load_existing_keyset`: allocate
-//!   one `Box<[u8]>` per row, insert into a fresh `HashMap` for the
-//!   `(main + snapshot_count)` snapshots. Cost scales as `O((1 + N) · M)`.
-//! - `cached_clone_of_warm_keyset` — mirrors the *cache-hit* path that the
-//!   cap forbids today: clone a pre-built `HashMap` of the full keyset.
-//!   Wall time is one `HashMap::clone` — what the production path *would*
-//!   pay if the cap were removed.
+//! - `full_rebuild_when_over_budget` — mirrors `load_existing_keyset` on
+//!   tables that exceed the byte budget: allocate one `Box<[u8]>` per row,
+//!   insert into a fresh `HashMap` for the `(main + snapshot_count)`
+//!   snapshots. Cost scales as `O((1 + N) · M)`.
+//! - `cached_clone_of_warm_keyset` — mirrors the cache-hit path now available
+//!   for tables that fit within the budget: clone a pre-built `HashMap` of
+//!   the full keyset. Wall time is one `HashMap::clone` — what narrow-PK
+//!   tables pay per commit after the byte-budget cap landed.
 //! - `bloom_prefilter_then_targeted_lookups` — mirrors option (B): a
 //!   pre-built bloom filter answers existence in O(1) bits per probe;
 //!   incoming batch is fixed at 1024 keys, of which ~10 require a targeted
@@ -100,11 +103,13 @@ limitations under the License.
 //!
 //! `cargo bench --bench load_existing_keyset_cap_disabled -p cayenne`.
 //!
-//! - `current_full_rebuild/M=3000000/N=87` — what `customer`-shaped CDC
-//!   upserts pay today on every commit when the cache is capped out.
+//! - `full_rebuild_when_over_budget/M=3000000/N=87` — what `customer`-shaped
+//!   CDC upserts would pay if the table fell over the byte budget; for
+//!   `stock`-shaped (M=10 M) and larger this is what production pays today.
 //! - `cached_clone_of_warm_keyset/M=3000000/N=87` is essentially independent
 //!   of N (the clone size is `M`, not `N · M`): showing the gap is the
-//!   total wall-time the (A) fix would save per commit.
+//!   total wall-time the byte-budget cap saves per commit on tables that
+//!   fit. For tables above the budget the rebuild lane still applies.
 //! - `bloom_prefilter_then_targeted_lookups/M=...` collapses to ~µs at any
 //!   M: 1024 bloom probes + ~10 HashMap lookups. Shows the achievable
 //!   floor for option (B).
@@ -334,7 +339,7 @@ fn bench_keyset_cap(c: &mut Criterion) {
             let id = format!("M={rows_per_snapshot}/N={snapshot_count}");
 
             group.bench_with_input(
-                BenchmarkId::new("current_full_rebuild", &id),
+                BenchmarkId::new("full_rebuild_when_over_budget", &id),
                 &snapshot_count,
                 |b, &snapshot_count| {
                     b.iter(|| {
