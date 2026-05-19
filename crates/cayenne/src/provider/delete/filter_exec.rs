@@ -407,32 +407,16 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     // Build keep mask: bloom-prefiltered probe per row + visibility check.
                     let mut keep_mask: Vec<bool> = Vec::with_capacity(batch_size);
                     let mut keep_count: usize = 0;
-                    match self.min_delete_seq_to_apply {
-                        Some(min_delete_seq_to_apply) => {
-                            for row in &rows {
-                                let key: &[u8] = row.as_ref();
-                                let visible = is_pk_visible_row_key_after_min(
-                                    key,
-                                    &self.deleted_row_keys,
-                                    &self.insert_records,
-                                    min_delete_seq_to_apply,
-                                );
-                                keep_mask.push(visible);
-                                keep_count += usize::from(visible);
-                            }
-                        }
-                        None => {
-                            for row in &rows {
-                                let key: &[u8] = row.as_ref();
-                                let visible = is_pk_visible_row_key_without_min(
-                                    key,
-                                    &self.deleted_row_keys,
-                                    &self.insert_records,
-                                );
-                                keep_mask.push(visible);
-                                keep_count += usize::from(visible);
-                            }
-                        }
+                    for row in &rows {
+                        let key: &[u8] = row.as_ref();
+                        let visible = is_pk_visible_row_key(
+                            key,
+                            &self.deleted_row_keys,
+                            &self.insert_records,
+                            self.min_delete_seq_to_apply,
+                        );
+                        keep_mask.push(visible);
+                        keep_count += usize::from(visible);
                     }
 
                     tracing::debug!(
@@ -681,30 +665,15 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                     let pk_slice = pk_array.values();
                     let mut keep_mask: Vec<bool> = Vec::with_capacity(batch_size);
                     let mut keep_count: usize = 0;
-                    match self.min_delete_seq_to_apply {
-                        Some(min_delete_seq_to_apply) => {
-                            for &pk_value in pk_slice {
-                                let visible = is_pk_visible_i64_after_min(
-                                    pk_value,
-                                    &self.deleted_pk_values,
-                                    &self.insert_records,
-                                    min_delete_seq_to_apply,
-                                );
-                                keep_mask.push(visible);
-                                keep_count += usize::from(visible);
-                            }
-                        }
-                        None => {
-                            for &pk_value in pk_slice {
-                                let visible = is_pk_visible_i64_without_min(
-                                    pk_value,
-                                    &self.deleted_pk_values,
-                                    &self.insert_records,
-                                );
-                                keep_mask.push(visible);
-                                keep_count += usize::from(visible);
-                            }
-                        }
+                    for &pk_value in pk_slice {
+                        let visible = is_pk_visible_i64(
+                            pk_value,
+                            &self.deleted_pk_values,
+                            &self.insert_records,
+                            self.min_delete_seq_to_apply,
+                        );
+                        keep_mask.push(visible);
+                        keep_count += usize::from(visible);
                     }
 
                     tracing::debug!(

@@ -105,8 +105,10 @@ fn build_new_row_ids(existing_size: usize, new_count: usize) -> Vec<u64> {
 
 /// Mirrors `position_based.rs:671-697` AND `vector_io.rs:227-228` — the
 /// two-sort hot path on a single touched file.
-fn current_two_sort_path(existing: &RoaringBitmap, new_row_ids: &[u64]) -> (Vec<u64>, RoaringBitmap)
-{
+fn current_two_sort_path(
+    existing: &RoaringBitmap,
+    new_row_ids: &[u64],
+) -> (Vec<u64>, RoaringBitmap) {
     // position_based.rs:671-676 — first walk + first sort/dedup.
     let mut combined_ids: Vec<u64> = existing.iter().map(u64::from).collect();
     combined_ids.extend(new_row_ids.iter().copied());
@@ -115,11 +117,7 @@ fn current_two_sort_path(existing: &RoaringBitmap, new_row_ids: &[u64]) -> (Vec<
 
     // position_based.rs:685-693 — second walk to rebuild the cache bitmap.
     let mut updated_bitmap = existing.clone();
-    updated_bitmap.extend(
-        new_row_ids
-            .iter()
-            .filter_map(|&id| u32::try_from(id).ok()),
-    );
+    updated_bitmap.extend(new_row_ids.iter().filter_map(|&id| u32::try_from(id).ok()));
 
     // vector_io.rs:227-228 — second sort/dedup on the already-sorted vec.
     let mut spec_ids = combined_ids;
@@ -138,11 +136,7 @@ fn proposed_single_walk_path(
     new_row_ids: &[u64],
 ) -> (Vec<u64>, RoaringBitmap) {
     let mut updated_bitmap = existing.clone();
-    updated_bitmap.extend(
-        new_row_ids
-            .iter()
-            .filter_map(|&id| u32::try_from(id).ok()),
-    );
+    updated_bitmap.extend(new_row_ids.iter().filter_map(|&id| u32::try_from(id).ok()));
     let spec_ids: Vec<u64> = updated_bitmap.iter().map(u64::from).collect();
     (spec_ids, updated_bitmap)
 }
