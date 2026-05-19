@@ -3,7 +3,7 @@
 # The enterprise version is ent_testoperator_dispatch.yml
 # This file is kept only to prevent merge conflicts with upstream.
 # ============================================================================
-name: "testoperator dispatch (upstream - disabled)"
+name: 'testoperator dispatch (upstream - disabled)'
 
 on: [workflow_dispatch]
 
