@@ -275,16 +275,6 @@ pub async fn register_all() {
         ),
     );
 
-    #[cfg(not(windows))]
-    registry.insert(
-        cayenne::PREFIX.to_string(),
-        CatalogConnectorFactory::new(
-            cayenne::CayenneCatalogConnector::new_connector,
-            cayenne::PREFIX,
-            cayenne::PARAMETERS,
-        ),
-    );
-
     #[cfg(feature = "adbc")]
     registry.insert(
         adbc::PREFIX.to_string(),
@@ -551,11 +541,6 @@ mod tests {
             assert!(
                 guard.contains_key(oracle::PREFIX),
                 "oracle should be registered"
-            );
-            #[cfg(not(windows))]
-            assert!(
-                guard.contains_key(cayenne::PREFIX),
-                "cayenne should be registered"
             );
         }
 
