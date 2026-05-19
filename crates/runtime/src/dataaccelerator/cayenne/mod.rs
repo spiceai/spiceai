@@ -169,10 +169,6 @@ fn parse_usize(acceleration: &Acceleration, key: &str, default: usize) -> usize 
         })
 }
 
-fn parse_u64(acceleration: &Acceleration, key: &str, default: u64) -> u64 {
-    parse_u64_with_hint(acceleration, key, default, "")
-}
-
 fn parse_u64_with_hint(
     acceleration: &Acceleration,
     key: &str,
