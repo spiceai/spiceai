@@ -3639,6 +3639,7 @@ impl CayenneTableProvider {
     fn clear_cached_table_statistics_unlocked(&self) {
         let mut cache = self.table_statistics.write();
         cache.optimizer = None;
+        cache.raw = None;
     }
 
     fn take_cached_pk_keyset(&self) -> Option<HashMap<OwnedRow, RowLocation>> {
@@ -6222,6 +6223,7 @@ impl CayenneTableProvider {
         let df_stats = Self::table_statistics_to_df(&self.table_metadata.schema, &stats);
         let mut cache = self.table_statistics.write();
         cache.optimizer = df_stats;
+        cache.raw = Some(stats);   // keep the raw blob for the next persist (avoids catalog GET)
     }
 
     /// Write small batches directly to the metastore, optionally atomically
