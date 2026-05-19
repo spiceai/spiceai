@@ -1,27 +1,28 @@
-select
-    sum(ol_amount) as revenue
-from
-    order_line, item
-where
+SELECT
+    sum(ol_amount) AS revenue
+FROM
+    order_line,
+    item
+WHERE
     (
         ol_i_id = i_id
-        and i_data like '%a'
-        and ol_quantity >= 1
-        and ol_quantity <= 10
-        and i_price between 1 and 400000
-        and ol_w_id in (1,2,3)
-    ) or (
+        AND i_data LIKE '%a'
+        AND ol_quantity >= 1
+        AND ol_quantity <= 10
+        AND i_price BETWEEN 1 AND 400000
+        AND ol_w_id IN (1,2,3)
+    ) OR (
         ol_i_id = i_id
-        and i_data like '%b'
-        and ol_quantity >= 1
-        and ol_quantity <= 10
-        and i_price between 1 and 400000
-        and ol_w_id in (1,2,4)
-    ) or (
+        AND i_data LIKE '%b'
+        AND ol_quantity >= 1
+        AND ol_quantity <= 10
+        AND i_price BETWEEN 1 AND 400000
+        AND ol_w_id IN (1,2,4)
+    ) OR (
         ol_i_id = i_id
-        and i_data like '%c'
-        and ol_quantity >= 1
-        and ol_quantity <= 10
-        and i_price between 1 and 400000
-        and ol_w_id in (1,5,3)
+        AND i_data LIKE '%c'
+        AND ol_quantity >= 1
+        AND ol_quantity <= 10
+        AND i_price BETWEEN 1 AND 400000
+        AND ol_w_id IN (1,5,3)
     );

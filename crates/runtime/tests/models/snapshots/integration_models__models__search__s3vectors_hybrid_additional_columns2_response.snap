@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp)
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "[score]",
+      "_score": "0.02",
       "data": {
         "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
       },
@@ -21,7 +21,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "[score]",
+      "_score": "0.02",
       "data": {
         "answer": "The number of ways is \\( 18 \\times 17 \\times 16 = \\boxed{4896} \\)."
       },
@@ -36,7 +36,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "[score]",
+      "_score": "0.02",
       "data": {
         "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
       },
@@ -51,7 +51,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "[score]",
+      "_score": "0.02",
       "data": {
         "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
       },

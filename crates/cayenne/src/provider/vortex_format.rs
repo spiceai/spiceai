@@ -32,6 +32,7 @@ use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
+use super::deletion_strategy::PositionBitmap;
 use arc_swap::ArcSwap;
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
@@ -55,9 +56,7 @@ use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, Pushe
 use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use object_store::{ObjectMeta, ObjectStore};
-use roaring::{RoaringBitmap, RoaringTreemap};
-use vortex_datafusion::{VortexAccessPlan, VortexFormat};
-use vortex_scan::Selection;
+use vortex_datafusion::VortexFormat;
 /// A wrapper around `VortexFormat` that injects per-file deletion vectors.
 ///
 /// This format delegates all operations to the underlying `VortexFormat`, except for
@@ -66,9 +65,9 @@ use vortex_scan::Selection;
 pub struct DeletionFilteringVortexFormat {
     /// The underlying Vortex file format.
     inner: Arc<VortexFormat>,
-    /// Per-file deletion cache. Key is the file path, value is the bitmap of deleted row indices.
+    /// Per-file deletion cache. Key is the file path, value is the deleted row set plus access plan.
     /// Uses `Arc<ArcSwap<...>>` so readers always see a wait-free immutable snapshot.
-    deletion_cache: Arc<ArcSwap<HashMap<String, RoaringBitmap>>>,
+    deletion_cache: Arc<ArcSwap<PositionBitmap>>,
 }
 
 impl std::fmt::Debug for DeletionFilteringVortexFormat {
@@ -88,7 +87,7 @@ impl std::fmt::Debug for DeletionFilteringVortexFormat {
 /// # Arguments
 ///
 /// * `config` - The file scan configuration to modify
-/// * `deletion_cache` - Shared cache of per-file deletion vectors (file path -> deleted row indices)
+/// * `deletion_cache` - Shared cache of per-file deletion vectors and access plans
 ///
 /// # Returns
 ///
@@ -96,10 +95,9 @@ impl std::fmt::Debug for DeletionFilteringVortexFormat {
 /// - The modified `FileScanConfig` with `VortexAccessPlan` extensions attached to files with deletions
 /// - A boolean indicating if any deletions were attached
 ///
-#[expect(clippy::implicit_hasher)]
 pub fn attach_deletion_vectors_to_config(
     mut config: FileScanConfig,
-    deletion_cache: &ArcSwap<HashMap<String, RoaringBitmap>>,
+    deletion_cache: &ArcSwap<PositionBitmap>,
 ) -> (FileScanConfig, bool) {
     // ArcSwap load is wait-free; the snapshot is immutable for the lifetime of `deletion_map`.
     let deletion_map = deletion_cache.load_full();
@@ -143,35 +141,27 @@ pub fn attach_deletion_vectors_to_config(
 /// # Arguments
 ///
 /// * `file` - The partitioned file to potentially modify
-/// * `deletion_map` - Map of file path to deletion bitmap
+/// * `deletion_map` - Map of file path to cached deletion vector state
 ///
 /// # Returns
 ///
 /// A tuple of the (potentially modified) file and a boolean indicating if deletions were attached.
 fn attach_access_plan_to_file(
     mut file: PartitionedFile,
-    deletion_map: &HashMap<String, RoaringBitmap>,
+    deletion_map: &PositionBitmap,
 ) -> (PartitionedFile, bool) {
     // Extract the file path from the PartitionedFile
     let file_path = file.object_meta.location.to_string();
 
     // Check if this file has deletions
-    if let Some(bitmap) = deletion_map.get(&file_path)
-        && !bitmap.is_empty()
+    if let Some(deletion_vector) = deletion_map.get(&file_path)
+        && !deletion_vector.is_empty()
     {
-        // ExcludeRoaring is preferred over ExcludeByIndex: less memory (~2 bits vs 8 bytes/row)
-        // and enables native bitmap operations in Vortex (intersection, is_disjoint) which is faster
-        let exclude: RoaringTreemap = bitmap.iter().map(u64::from).collect();
-
-        // Use Vortex built-in mechanism for exclusions
-        let access_plan =
-            VortexAccessPlan::default().with_selection(Selection::ExcludeRoaring(exclude));
-
-        file = file.with_extensions(Arc::new(access_plan));
+        file = file.with_extensions(deletion_vector.access_plan());
 
         tracing::trace!(
             file_path = %file_path,
-            deleted_rows = bitmap.len(),
+            deleted_rows = deletion_vector.len(),
             "Attached VortexAccessPlan with deletion vector"
         );
 
@@ -188,10 +178,7 @@ impl DeletionFilteringVortexFormat {
     ///
     /// * `inner` - The underlying `VortexFormat` to delegate to.
     /// * `deletion_cache` - Shared cache of per-file deletion vectors.
-    pub fn new(
-        inner: Arc<VortexFormat>,
-        deletion_cache: Arc<ArcSwap<HashMap<String, RoaringBitmap>>>,
-    ) -> Self {
+    pub fn new(inner: Arc<VortexFormat>, deletion_cache: Arc<ArcSwap<PositionBitmap>>) -> Self {
         Self {
             inner,
             deletion_cache,
@@ -213,6 +200,7 @@ impl DeletionFilteringVortexFormat {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl FileFormat for DeletionFilteringVortexFormat {
     fn as_any(&self) -> &dyn Any {

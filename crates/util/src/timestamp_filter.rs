@@ -19,8 +19,8 @@ limitations under the License.
 
 use arrow::datatypes::DataType;
 use datafusion::{
-    logical_expr::{Expr, Operator, binary_expr, cast, col, lit},
-    prelude::and,
+    logical_expr::{Expr, Operator, binary_expr, cast, lit},
+    prelude::{and, ident},
     scalar::ScalarValue,
 };
 use std::sync::Arc;
@@ -55,10 +55,9 @@ fn convert_timestamp_expr(
     time_format: &TimestampFormat,
     op: Operator,
 ) -> Expr {
-    let time_column: &str = &format!(r#""{}""#, &time_column);
     match time_format {
         TimestampFormat::UnixTimestamp { scale } => binary_expr(
-            col(time_column),
+            ident(time_column),
             op,
             lit((timestamp_in_nanos / scale) as u64),
         ),
@@ -67,11 +66,11 @@ fn convert_timestamp_expr(
             // produces correct results without a CAST, which avoids issues with engines
             // (e.g. Vortex/Cayenne) that lack a utf8→timestamp cast kernel.
             let iso_string = nanos_to_iso8601_string(timestamp_in_nanos);
-            binary_expr(col(time_column), op, lit(iso_string))
+            binary_expr(ident(time_column), op, lit(iso_string))
         }
         TimestampFormat::Date | TimestampFormat::Timestamp => binary_expr(
             cast(
-                col(time_column),
+                ident(time_column),
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
             ),
             op,
@@ -82,7 +81,7 @@ fn convert_timestamp_expr(
         ),
         TimestampFormat::Timestamptz(tz) => binary_expr(
             cast(
-                col(time_column),
+                ident(time_column),
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, tz.clone()),
             ),
             op,
@@ -240,6 +239,10 @@ pub fn parse_iso8601_to_nanos(s: &str) -> Option<u128> {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, TimeUnit};
+    use datafusion::arrow::datatypes::{Field, Schema};
+    use datafusion::datasource::{DefaultTableSource, TableProvider, empty::EmptyTable};
+    use datafusion::logical_expr::LogicalPlanBuilder;
+    use datafusion::sql::unparser::Unparser;
 
     /// Helper: build a converter from a data type + optional scale, assert expr output.
     fn test_convert(
@@ -262,6 +265,44 @@ mod tests {
             Some(1_000_000),
             1_620_000_000_000_000_000,
             "timestamp > UInt64(1620000000000)",
+        );
+    }
+
+    #[test]
+    fn test_preserves_mixed_case_column_when_unparsed() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col_Timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]));
+        let table_provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(Arc::clone(&schema)));
+        let table_source = Arc::new(DefaultTableSource::new(table_provider));
+        let converter = TimestampFilterConvert::new(
+            "col_Timestamp".to_string(),
+            TimestampFormat::Timestamptz(None),
+            None,
+            None,
+        );
+        let filter = converter.convert(1_620_000_000_000_000_000, Operator::Gt);
+
+        let plan = LogicalPlanBuilder::scan("test_table", table_source, None)
+            .expect("logical scan should be created")
+            .filter(filter)
+            .expect("filter should be applied")
+            .build()
+            .expect("logical plan should be built");
+        let sql = Unparser::default()
+            .plan_to_sql(&plan)
+            .expect("logical plan should unparse")
+            .to_string();
+
+        assert!(
+            sql.contains(r#""col_Timestamp""#),
+            "mixed-case timestamp column should stay quoted in SQL, got: {sql}"
+        );
+        assert!(
+            !sql.contains("col_timestamp"),
+            "mixed-case timestamp column must not be normalized to lowercase, got: {sql}"
         );
     }
 

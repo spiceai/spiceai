@@ -45,6 +45,8 @@ pub const JOURNAL_MODE_SQL_LITERAL: &str = "'mvcc'";
 /// transaction after retryable conflicts.
 pub const DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS: u32 = 4;
 
+const _: () = assert!(DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS > 0);
+
 /// Base delay in milliseconds used by [`retry_backoff_delay`] for
 /// exponential backoff between concurrent write retries.
 pub const DEFAULT_CONCURRENT_RETRY_BASE_DELAY_MS: u64 = 10;

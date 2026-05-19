@@ -98,10 +98,19 @@ impl PreparedOverwrite {
     /// Apply the catalog mutation for this overwrite inside the caller's
     /// transaction.
     ///
-    /// Executes the same SQL batch as
-    /// [`crate::MetadataCatalog::commit_compaction`] (delete files cleared,
-    /// insert records cleared, snapshot sequences cleared, snapshot pointer
-    /// updated) but against `txn` instead of opening a new transaction.
+    /// Executes the SQL batch from
+    /// [`crate::CayenneCatalog::commit_overwrite_in_txn`] — the per-snapshot
+    /// delete/insert/sequence tables are cleared, the inlined memtable and
+    /// table statistics are dropped (everything keyed on the old snapshot),
+    /// and the snapshot pointer is advanced — all against the caller's `txn`
+    /// instead of opening a new transaction.
+    ///
+    /// The atomic inlined-data clear is what differentiates this from
+    /// `commit_compaction_in_txn`: scans UNION the listing table with
+    /// inlined data, so if the pointer flip committed but a subsequent
+    /// (non-transactional) clear failed mid-flight, stale inlined rows
+    /// would re-appear in scans of the new snapshot. Bundling them into
+    /// the same transaction closes that consistency window.
     ///
     /// The caller owns the transaction lifecycle: this method does not
     /// commit, roll back, or retry. Cross-partition coordinators batch every
@@ -109,7 +118,7 @@ impl PreparedOverwrite {
     /// so the pointer flips happen atomically.
     ///
     /// Single-partition callers can use [`Self::apply_owned_txn`] instead,
-    /// which goes through the trait-based [`crate::MetadataCatalog::commit_compaction`]
+    /// which goes through the trait-based [`crate::MetadataCatalog::commit_overwrite`]
     /// (own transaction, retry-on-conflict, no concrete-catalog dependency).
     ///
     /// # Errors
@@ -123,7 +132,7 @@ impl PreparedOverwrite {
         txn: &mut dyn MetastoreTransaction,
     ) -> CatalogResult<()> {
         catalog
-            .commit_compaction_in_txn(txn, self.table_id(), &self.new_snapshot_id)
+            .commit_overwrite_in_txn(txn, self.table_id(), &self.new_snapshot_id)
             .await
     }
 
@@ -132,54 +141,57 @@ impl PreparedOverwrite {
     ///
     /// Convenience for callers that don't need to batch with other partitions
     /// (e.g. [`super::sink::CayenneDataSink::write_all`] in overwrite mode).
-    /// Delegates to [`crate::MetadataCatalog::commit_compaction`] which opens
-    /// its own transaction with retry-on-conflict. The retry semantics match
-    /// the pre-issue-#10125 behavior exactly.
+    /// Delegates to [`crate::MetadataCatalog::commit_overwrite`] which opens
+    /// its own transaction with retry-on-conflict and atomically clears the
+    /// inlined data, inlined deletes, and table statistics along with the
+    /// snapshot pointer flip.
     ///
     /// # Errors
     ///
-    /// Returns any error surfaced by the catalog's `commit_compaction`.
+    /// Returns any error surfaced by the catalog's `commit_overwrite`.
     pub async fn apply_owned_txn(&self) -> CatalogResult<()> {
         self.table
             .catalog()
-            .commit_compaction(self.table_id(), &self.new_snapshot_id)
+            .commit_overwrite(self.table_id(), &self.new_snapshot_id)
             .await
     }
 
     /// Publish the new snapshot in memory after the caller's transaction has
     /// committed.
     ///
-    /// Performs the bookkeeping that `CayenneDataSink::write_all_overwrite`
-    /// did inline before this lifecycle existed:
+    /// The catalog-side clears (inlined data, inlined deletes, table stats,
+    /// delete files, insert records, snapshot sequences) happen ATOMICALLY
+    /// with the snapshot pointer flip inside `apply_in_txn` / `apply_owned_txn`
+    /// — see [`crate::CayenneCatalog::commit_overwrite_in_txn`]. This method
+    /// only has to sync the in-memory state to match what the catalog now
+    /// reflects:
     ///
-    /// - Update the in-memory `current_snapshot_id` to match the catalog.
+    /// - Update the in-memory `current_snapshot_id`.
     /// - Clear all deletion caches (the new snapshot has no pending deletions).
     /// - Atomically swap the in-memory `ListingTable` to the new snapshot
     ///   (under [`CayenneTableProvider::listing_fence`] write — §6.4).
-    /// - Trigger background cleanup of old snapshot directories.
-    /// - Clear inlined data, inlined deletes, and table-level statistics that
-    ///   were tied to the old snapshot.
+    /// - Invalidate the in-memory optimizer cache (the catalog stats row was
+    ///   already dropped by `commit_overwrite_in_txn`).
     /// - Persist the new statistics accumulator.
+    /// - Trigger background cleanup of old snapshot directories.
     ///
-    /// Failures inside the bookkeeping steps are logged as warnings; the
-    /// visibility flip itself has already been observed by readers via the
-    /// catalog pointer, so the return value reflects success of the whole
-    /// commit.
+    /// If `finish` itself fails or the process crashes between
+    /// `apply_*_txn` and `finish`, the next `CayenneTableProviderBuilder::open`
+    /// will reconstruct the same in-memory state from the catalog (which
+    /// already reflects the new snapshot), so durability is preserved.
     ///
     /// # Errors
     ///
-    /// Returns an error if updating the in-memory snapshot id or swapping the
-    /// listing table fails. Other steps are best-effort.
+    /// Returns an error if swapping the listing table fails. Other steps are best-effort.
     pub async fn finish(self) -> Result<u64> {
-        self.table
-            .update_current_snapshot_id(&self.new_snapshot_id)?;
-
-        if let Err(e) = self.table.clear_all_deletion_caches() {
-            tracing::warn!(
-                "Failed to clear deletion caches after overwrite for table {}: {e}",
-                self.table.table_name()
-            );
-        }
+        self.table.update_current_snapshot_id(&self.new_snapshot_id);
+        self.table.clear_all_deletion_caches();
+        // commit_overwrite_in_txn DELETEs cayenne_inlined_data /
+        // cayenne_inlined_delete for this table atomically with the snapshot
+        // flip, but doesn't go through the inline-mutation path that bumps
+        // `inlined_generation`. Bump it here so scans don't return stale
+        // pre-overwrite inline batches alongside the new snapshot.
+        self.table.invalidate_inlined_cache();
 
         self.table
             .update_listing_table_for_snapshot(&self.new_snapshot_id)
@@ -189,51 +201,13 @@ impl PreparedOverwrite {
             .trigger_old_snapshot_cleanup(&self.new_snapshot_id)
             .await;
 
-        if let Err(e) = self
-            .table
-            .catalog()
-            .clear_inlined_data(self.table.table_id())
-            .await
-        {
-            tracing::warn!(
-                "Failed to clear inlined data after overwrite for table {}: {e}",
-                self.table.table_name()
-            );
-        }
-        if let Err(e) = self
-            .table
-            .catalog()
-            .clear_inlined_deletes(self.table.table_id())
-            .await
-        {
-            tracing::warn!(
-                "Failed to clear inlined deletes after overwrite for table {}: {e}",
-                self.table.table_name()
-            );
-        }
-        // Clear the prior statistics row before upserting so a zero-row
-        // overwrite leaves no stats at all (rather than stale stats that
-        // describe rows the overwrite just deleted). `persist_table_stats`
-        // is a no-op when the accumulator is empty, so the clear is what
-        // actually removes the stale row in that case.
-        if let Err(e) = self
-            .table
-            .catalog()
-            .clear_table_statistics(self.table.table_id())
-            .await
-        {
-            tracing::warn!(
-                "Failed to clear table statistics after overwrite for table {}: {e}",
-                self.table.table_name()
-            );
-        } else {
-            // Invalidate the in-memory optimizer cache before persisting new
-            // stats so a zero-row overwrite leaves the cache empty rather
-            // than stale; `persist_table_stats` repopulates it when the
-            // accumulator has rows.
-            self.table.clear_cached_table_statistics();
-        }
-        self.table.persist_table_stats(&self.write_stats_acc).await;
+        // Invalidate the in-memory optimizer cache so a zero-row overwrite
+        // leaves the cache empty rather than stale; `persist_table_stats`
+        // repopulates it when the accumulator has rows. The catalog row was
+        // already cleared atomically with the snapshot pointer flip.
+        self.table
+            .reset_table_stats_after_overwrite(&self.write_stats_acc)
+            .await;
 
         // Drop the write guard last so all visibility-related updates happen
         // under exclusive table access.

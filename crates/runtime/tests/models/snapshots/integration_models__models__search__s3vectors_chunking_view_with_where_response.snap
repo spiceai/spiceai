@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: "serde_json::to_string_pretty(&normalize_search_response_json(resp, true))\n    .expect(\"search response snapshot serialization should succeed\")"
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "[score]",
+      "_score": "0.34",
       "dataset": "qs_view",
       "matches": {
         "answer": [
@@ -18,7 +18,7 @@ expression: "serde_json::to_string_pretty(&normalize_search_response_json(resp, 
       }
     },
     {
-      "_score": "[score]",
+      "_score": "0.31",
       "dataset": "qs_view",
       "matches": {
         "answer": [
@@ -30,19 +30,7 @@ expression: "serde_json::to_string_pretty(&normalize_search_response_json(resp, 
       }
     },
     {
-      "_score": "[score]",
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          " Late recurrences can occur beyond 10 years, so patients requir"
-        ]
-      },
-      "primary_key": {
-        "id": 551
-      }
-    },
-    {
-      "_score": "[score]",
+      "_score": "0.30",
       "dataset": "qs_view",
       "matches": {
         "answer": [
@@ -51,6 +39,18 @@ expression: "serde_json::to_string_pretty(&normalize_search_response_json(resp, 
       },
       "primary_key": {
         "id": 1035
+      }
+    },
+    {
+      "_score": "0.29",
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          " Late recurrences can occur beyond 10 years, so patients requir"
+        ]
+      },
+      "primary_key": {
+        "id": 551
       }
     }
   ]

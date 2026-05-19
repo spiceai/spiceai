@@ -12,7 +12,7 @@ and the contracts each method has with the Spice Cloud API.
 `spice cloud login` authenticates the local CLI against Spice Cloud and writes
 a bearer token (and, when available, an app API key) to the local credential
 store. All methods converge on the same post-login path: write
-`SPICE_SPICEAI_TOKEN`, fetch `/v1/auth/context`, and (if present) write
+`SPICE_SPICEAI_TOKEN`, fetch `/api/spice-cli/auth`, and (if present) write
 `SPICE_SPICEAI_API_KEY`.
 
 There are three methods, addressed by Clap subcommands under
@@ -38,7 +38,7 @@ implemented in `execute_login_with_chooser`.
 - Subscription is the **default** human flow. `--device` is the
   headless/manual fallback for SSH or environments where `open::that`
   cannot launch a browser. Both modes use the same browser-mediated OAuth
-  flow against `/v1/auth/device`; they differ only in whether the CLI
+  flow against `/auth/token`; they differ only in whether the CLI
   auto-opens the URL.
 - PAT and API are **non-interactive**. They support env-only invocation for
   CI/headless use and never prompt when both stdin is non-TTY and the value
@@ -60,7 +60,7 @@ After a successful login, all methods call
    token that was just acquired.
 2. Calls `merge_auth_config("SPICEAI", &[("TOKEN", token)])` to persist
    `SPICE_SPICEAI_TOKEN` to `.env.local` (preferred) or `.env`.
-3. Calls `get_auth_context()` against `/v1/auth/context`. If the call
+3. Calls `get_auth_context()` against `/api/spice-cli/auth`. If the call
    succeeds and returns an `app_api_key`, writes
    `SPICE_SPICEAI_API_KEY` to the same env file.
 4. On failure, writes the token anyway and prints a yellow warning. The login
@@ -89,13 +89,15 @@ with `open_browser = !args.device`:
 
 1. Generates an 8-character `[A-Z0-9]` auth code locally.
 2. Builds the auth URL via `CloudClient::get_auth_url(auth_code)`, which
-   resolves to `{oauth_base_url}/v1/auth/device?code=<CODE>`.
+   resolves to `{oauth_base_url}/auth/token?code=<CODE>`.
 3. If `--device` is **not** set: auto-opens the URL in the system browser
    via `open::that`. If `--device` **is** set: only prints the URL and code,
    leaving it to the user to open them on another device.
-4. Polls `GET /v1/auth/device/exchange?code=<CODE>` once per second for up
-   to 5 minutes. The server returns `202 Accepted` while pending and
-   `200 OK` with `{ access_token, access_denied }` once complete.
+4. Polls `POST {oauth_base_url}/auth/token/exchange` with body
+   `{ "code": "<CODE>" }` once per second for up to 5 minutes. The server
+   returns `200 OK` with `{ access_token: null }` while pending (or
+   `202 Accepted`), and `200 OK` with `{ access_token, access_denied }`
+   once complete.
 5. On success, runs the shared post-login flow.
 
 User-facing characteristics:
@@ -191,10 +193,11 @@ Characteristics:
 
 ## OAuth host resolution
 
-The non-API OAuth host serves `/v1/auth/device` and `/api/oauth/token`. By
-contrast, `/v1/auth/device/exchange` polling uses the **API** base URL. When
-building non-API OAuth URLs, the data-plane API base URL contains an `api`
-segment that must be stripped.
+The non-API OAuth host serves `/auth/token`, `/auth/token/exchange`,
+`/api/spice-cli/auth`, and `/api/oauth/token`. The data-plane API base URL
+(used for `/v1/apps`, `/v1/regions`, etc.) is a separate host. When building
+non-API OAuth URLs, the data-plane API base URL contains an `api` segment
+that must be stripped.
 
 `CloudClient::oauth_base_url` parses with `reqwest::Url` and rewrites the
 host:
@@ -223,16 +226,21 @@ whatever that env var resolves to.
 Request:
 
 ```http
-GET {oauth_base}/v1/auth/device?code=ABCD1234
+GET {oauth_base}/auth/token?code=ABCD1234
 ```
 
 Polling:
 
 ```http
-GET {api_base}/v1/auth/device/exchange?code=ABCD1234
-202 Accepted                              # pending
-200 OK { "access_token": "...", "access_denied": false }   # done
-200 OK { "access_token": null, "access_denied": true }     # rejected
+POST {oauth_base}/auth/token/exchange
+Content-Type: application/json
+
+{ "code": "ABCD1234" }
+
+202 Accepted                                                 # pending
+200 OK { "access_token": null }                              # pending
+200 OK { "access_token": "...", "access_denied": false }     # done
+200 OK { "access_token": null, "access_denied": true }       # rejected
 ```
 
 ### Client credentials
@@ -257,21 +265,22 @@ token types fail loudly.
 ### Auth context (post-login probe)
 
 ```http
-GET {api_base}/v1/auth/context
+GET {oauth_base}/api/spice-cli/auth
 Authorization: Bearer <token>
 
 200 OK
 {
   "username": "...",
   "email": "...",
-  "org_name": "...",
-  "app_name": "...",          # optional
-  "app_api_key": "..."        # optional
+  "org":  { "name": "..." },
+  "app":  { "name": "...", "api_key": "..." }     # both optional
 }
 ```
 
-For client credentials logins, `username`/`email` may reflect the service
-principal rather than a person.
+The CLI flattens this into the in-memory `AuthContext` struct
+(`org_name`, `app_name`, `app_api_key`) via `AuthContextRaw::into()`. For
+client credentials logins, `username`/`email` may reflect the service
+principal rather than a person, and `app` may be absent.
 
 ## Adding a new login method
 

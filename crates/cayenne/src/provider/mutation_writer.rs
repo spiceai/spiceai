@@ -14,7 +14,57 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Append-side mutation writer for [`CayenneTableProvider`].
+//!
+//! `AppendMutationWriter` owns the logic that turns a `SendableRecordBatchStream`
+//! into either an inline-memtable update (small writes, no blocking config) or a
+//! staged Vortex write. Two entry points:
+//!
+//! - [`AppendMutationWriter::write`] — the synchronous append path used by
+//!   `DataFusion`'s `INSERT INTO` and by CDC fallback. Runs prepare →
+//!   try-inline-or-stage → optional on-conflict deletion vectors → optional
+//!   retention/sort → schedule post-write maintenance (debounced refresh +
+//!   stats + compaction).
+//! - [`AppendMutationWriter::write_cdc_pipelined`] — the CDC fast path. Stage A
+//!   writes Vortex files into the staging dir and returns a [`super::table::CayenneCdcWrite`]
+//!   that owns the staging-WAL receipt and the still-held per-table write
+//!   guard. The runtime spawns Stage B on a background task so the next CDC
+//!   burst can begin while burst N's catalog/listing finalization is in flight.
+//!
+//! ## Pipelined vs. synchronous routing
+//!
+//! `write_cdc_pipelined` short-circuits to the synchronous `write_prepared_stream`
+//! path when any of these hold:
+//!
+//! - the table has pending PK deletions
+//! - the burst produced file-level on-conflict deletions
+//! - the table has any on-conflict deletions
+//! - the table has `sort_columns` configured
+//! - the table is partitioned
+//! - the table has write-time retention delete filters
+//!
+//! Those paths can't be safely deferred to Stage B because they require holding
+//! state (deletion vectors, sort order, retention pruning) until the visibility
+//! flip is durable.
+//!
+//! ## Inline-memtable admission
+//!
+//! `try_inline_or_restream` buffers up to
+//! [`crate::metadata::VortexConfig::inline_max_buffer_bytes`] of Arrow data and
+//! checks the per-write admission gate (`inline_max_rows`, `inline_max_bytes`).
+//! If it fits, the batch is serialized to Arrow IPC and inserted into the
+//! metastore's `cayenne_inlined_data` table. Otherwise the buffered batches are
+//! restreamed into the regular staged-write path.
+//!
+//! The cumulative memtable flush thresholds (`inline_flush_max_*` on
+//! `VortexConfig`) are evaluated by
+//! [`super::table::CayenneTableProvider::checkpoint_inlined_data_if_memtable_pressure_exceeded`]
+//! after every inline insert, and trigger a checkpoint to a Vortex file when
+//! exceeded.
+
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -23,13 +73,15 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_execution::TaskContext;
 use datafusion_physical_plan::{SendableRecordBatchStream, execute_stream};
 use futures::StreamExt;
+use parking_lot::Mutex as ParkingMutex;
+use tokio::sync::OwnedMutexGuard;
 
 use super::Result;
-use super::constants::STAGING_DIR_NAME;
 use super::context::CayenneContext;
+use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 use super::table::{
-    CayenneTableProvider, ColumnStatsAccumulator, INLINE_MAX_BUFFER_BYTES, INLINE_MAX_ROWS,
-    PreparedInsertStream,
+    CayenneCdcWrite, CayenneTableProvider, ColumnStatsAccumulator, PostValidationState,
+    record_cayenne_write_phase,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +92,7 @@ pub(crate) enum InlineMutationPolicy {
 
 impl InlineMutationPolicy {
     #[must_use]
-    pub(crate) fn from_blocking_conditions(blocking_conditions: [bool; 5]) -> Self {
+    pub(crate) fn from_blocking_conditions(blocking_conditions: [bool; 4]) -> Self {
         if blocking_conditions.into_iter().any(|condition| condition) {
             Self::Vortex
         } else {
@@ -58,6 +110,8 @@ impl InlineMutationPolicy {
 pub(crate) struct InlineBatchBuffer {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
+    max_rows: usize,
+    max_buffer_bytes: usize,
     total_rows: usize,
     total_bytes: usize,
     exceeded: bool,
@@ -65,10 +119,12 @@ pub(crate) struct InlineBatchBuffer {
 
 impl InlineBatchBuffer {
     #[must_use]
-    pub(crate) fn new(schema: SchemaRef) -> Self {
+    pub(crate) fn new(schema: SchemaRef, max_rows: usize, max_buffer_bytes: usize) -> Self {
         Self {
             schema,
             batches: Vec::new(),
+            max_rows,
+            max_buffer_bytes,
             total_rows: 0,
             total_bytes: 0,
             exceeded: false,
@@ -81,8 +137,7 @@ impl InlineBatchBuffer {
             .total_bytes
             .saturating_add(batch.get_array_memory_size());
         self.batches.push(batch);
-        self.exceeded =
-            self.total_rows > INLINE_MAX_ROWS || self.total_bytes > INLINE_MAX_BUFFER_BYTES;
+        self.exceeded = self.total_rows > self.max_rows || self.total_bytes > self.max_buffer_bytes;
     }
 
     #[must_use]
@@ -117,8 +172,24 @@ impl InlineBatchBuffer {
 }
 
 enum InlineMutationOutcome {
-    Inlined(u64),
+    Inlined {
+        rows: u64,
+        post_validation: PostValidationState,
+    },
     Fallback(SendableRecordBatchStream),
+}
+
+fn take_post_validation(
+    post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
+) -> PostValidationState {
+    post_validation.lock().take().unwrap_or_default()
+}
+
+fn restore_post_validation(
+    post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
+    state: PostValidationState,
+) {
+    *post_validation.lock() = Some(state);
 }
 
 pub(super) struct AppendMutationWriter<'a> {
@@ -141,6 +212,90 @@ impl<'a> AppendMutationWriter<'a> {
         }
     }
 
+    pub(super) async fn write_cdc_pipelined(
+        &self,
+        data: SendableRecordBatchStream,
+        write_guard: OwnedMutexGuard<()>,
+    ) -> Result<CayenneCdcWrite> {
+        self.table.ensure_no_incomplete_write().await?;
+
+        let pending_pk_deletions = !self.table.pk_deletion_strategy().is_position_based()
+            && self.table.has_pending_deletions();
+
+        let prepared = self.table.prepare_stream_for_insert(data).await?;
+        let post_validation = prepared.post_validation();
+        let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
+        let mut prepared_stream = prepared.stream;
+
+        let can_stage_for_pipeline = !pending_pk_deletions
+            && !may_have_on_conflict_deletions
+            && self.table.metadata().partition_column.is_none()
+            && !self.table.has_retention_delete_filters();
+
+        if !can_stage_for_pipeline {
+            let _write_guard = write_guard;
+            let rows = self
+                .write_prepared_stream(
+                    prepared_stream,
+                    post_validation,
+                    pending_pk_deletions,
+                    may_have_on_conflict_deletions,
+                )
+                .await?;
+            return Ok(CayenneCdcWrite::completed(
+                self.table.clone_for_write_operations(),
+                rows,
+            ));
+        }
+
+        match self
+            .try_inline_or_restream(prepared_stream, &post_validation)
+            .await?
+        {
+            InlineMutationOutcome::Inlined {
+                rows,
+                post_validation,
+            } => {
+                self.table
+                    .record_inlined_pk_keys(&post_validation.validated_keys);
+                Ok(CayenneCdcWrite::completed(
+                    self.table.clone_for_write_operations(),
+                    rows,
+                ))
+            }
+            InlineMutationOutcome::Fallback(re_stream) => {
+                prepared_stream = re_stream;
+                let staging_snapshot_id = CayenneTableProvider::new_staging_snapshot_id();
+                let target_size_bytes = self.context.target_file_size_bytes();
+                self.table
+                    .clear_staging_snapshot_dir(&staging_snapshot_id)
+                    .await?;
+                let (rows, writer_ops, stats_acc, prepared_append) = self
+                    .write_staged_append_prepared(
+                        prepared_stream,
+                        target_size_bytes,
+                        Some(write_guard),
+                        staging_snapshot_id,
+                    )
+                    .await?;
+
+                tracing::debug!(
+                    "CDC append staged, wrote {} rows to Vortex in {} writer operation(s); WAL is durable",
+                    rows,
+                    writer_ops
+                );
+
+                Ok(CayenneCdcWrite::prepared_append(
+                    self.table.clone_for_write_operations(),
+                    rows,
+                    prepared_append,
+                    stats_acc,
+                    take_post_validation(&post_validation).validated_keys,
+                ))
+            }
+        }
+    }
+
     pub(super) async fn write(&self, data: SendableRecordBatchStream) -> Result<u64> {
         self.table.ensure_no_incomplete_write().await?;
 
@@ -154,85 +309,65 @@ impl<'a> AppendMutationWriter<'a> {
             );
         }
 
-        let PreparedInsertStream {
-            stream: mut prepared_stream,
-            on_conflict_deletions,
-        } = self.table.prepare_stream_for_insert(data).await?;
+        let prepared = self.table.prepare_stream_for_insert(data).await?;
+        let post_validation = prepared.post_validation();
+        let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
+        let prepared_stream = prepared.stream;
 
-        let has_file_on_conflict_deletions = on_conflict_deletions.has_file_deletions();
-        let has_on_conflict_deletions = !on_conflict_deletions.is_empty();
+        self.write_prepared_stream(
+            prepared_stream,
+            post_validation,
+            pending_pk_deletions,
+            may_have_on_conflict_deletions,
+        )
+        .await
+    }
+
+    async fn write_prepared_stream(
+        &self,
+        mut prepared_stream: SendableRecordBatchStream,
+        post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
+        pending_pk_deletions: bool,
+        may_have_on_conflict_deletions: bool,
+    ) -> Result<u64> {
+        let has_on_conflict_deletions = may_have_on_conflict_deletions;
 
         tracing::debug!(
-            "write_all_append: delete_specs={} files, deleted_keys={} keys, pending_deletions={}, on_conflict_deletions={}",
-            on_conflict_deletions.file_delete_specs_count(),
-            on_conflict_deletions.deleted_key_count(),
+            "write_all_append: pending_deletions={}, on_conflict_deletions_possible={}",
             pending_pk_deletions,
             has_on_conflict_deletions
         );
 
-        let needs_new_snapshot = pending_pk_deletions || has_file_on_conflict_deletions;
-
-        self.table.clear_staging_dir().await?;
-
         let inline_policy = InlineMutationPolicy::from_blocking_conditions([
             pending_pk_deletions,
-            has_file_on_conflict_deletions,
-            self.context.has_sort_columns(),
+            false,
             self.table.metadata().partition_column.is_some(),
-            self.table.has_retention_filters(),
+            self.table.has_retention_delete_filters(),
         ]);
 
         if inline_policy.can_inline() {
             match self
-                .try_inline_or_restream(
-                    prepared_stream,
-                    &on_conflict_deletions.deleted_inlined_pk_i64,
-                    &on_conflict_deletions.deleted_inlined_row_keys,
-                )
+                .try_inline_or_restream(prepared_stream, &post_validation)
                 .await?
             {
-                InlineMutationOutcome::Inlined(rows) => return Ok(rows),
+                InlineMutationOutcome::Inlined {
+                    rows,
+                    post_validation,
+                } => {
+                    self.table
+                        .record_inlined_pk_keys(&post_validation.validated_keys);
+                    return Ok(rows);
+                }
                 InlineMutationOutcome::Fallback(re_stream) => {
                     prepared_stream = re_stream;
-                    let target_size_bytes = self.context.target_file_size_bytes();
-                    let (rows, _writer_ops, stats_acc) = self
-                        .write_staged_append(prepared_stream, target_size_bytes)
-                        .await?;
-
-                    self.table
-                        .apply_on_conflict_deletions(on_conflict_deletions)
-                        .await?;
-
-                    let retention_deleted_rows = self.apply_retention_if_configured().await?;
-                    let sorted = self.sort_if_configured().await?;
-                    if should_refresh_listing_table_after_post_write(retention_deleted_rows, sorted)
-                    {
-                        self.table.refresh_listing_table().await?;
-                    }
-                    self.table.persist_table_stats(&stats_acc).await;
-
-                    return Ok(rows);
                 }
             }
         }
 
-        let (total_rows, write_stats_acc) = if needs_new_snapshot {
-            self.table
-                .apply_on_conflict_deletions(on_conflict_deletions)
-                .await?;
+        let needs_new_snapshot = pending_pk_deletions || may_have_on_conflict_deletions;
 
-            let new_sequence = self
-                .table
-                .catalog()
-                .increment_sequence_number(self.table.table_id())
-                .await?;
-
-            self.table
-                .insert_to_new_snapshot_with_sequence(
-                    prepared_stream,
-                    new_sequence,
-                    self.task_context.session_config().target_partitions(),
-                )
+        let (total_rows, write_stats_acc, validated_keys) = if needs_new_snapshot {
+            self.write_new_snapshot_after_validation(prepared_stream, &post_validation)
                 .await?
         } else {
             let target_size_bytes = self.context.target_file_size_bytes();
@@ -246,37 +381,106 @@ impl<'a> AppendMutationWriter<'a> {
                 writer_ops
             );
 
+            let PostValidationState {
+                on_conflict_deletions,
+                validated_keys,
+            } = take_post_validation(&post_validation);
+
             self.table
                 .apply_on_conflict_deletions(on_conflict_deletions)
                 .await?;
 
-            (rows, stats_acc)
+            (rows, stats_acc, validated_keys)
         };
 
-        if needs_new_snapshot {
-            self.table.refresh_listing_table().await?;
-        }
-
         let retention_deleted_rows = self.apply_retention_if_configured().await?;
-        let sorted = self.sort_if_configured().await?;
 
-        if should_refresh_listing_table_after_post_write(retention_deleted_rows, sorted) {
-            self.table.refresh_listing_table().await?;
+        self.table.schedule_post_write_maintenance(
+            Some(write_stats_acc),
+            needs_new_snapshot
+                || should_refresh_listing_table_after_post_write(retention_deleted_rows),
+        );
+
+        if retention_deleted_rows > 0 {
+            self.table.clear_cached_pk_keyset();
+        } else {
+            self.table.record_file_pk_keys(&validated_keys);
         }
-
-        self.table.persist_table_stats(&write_stats_acc).await;
 
         Ok(total_rows)
+    }
+
+    async fn write_new_snapshot_after_validation(
+        &self,
+        prepared_stream: SendableRecordBatchStream,
+        post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
+    ) -> Result<(
+        u64,
+        Arc<ColumnStatsAccumulator>,
+        std::collections::HashSet<arrow_row::OwnedRow>,
+    )> {
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let target_size_bytes = self.context.target_file_size_bytes();
+        let write_start = Instant::now();
+        let (rows, writer_ops, stats_acc) = self
+            .table
+            .write_to_snapshot(
+                prepared_stream,
+                target_size_bytes,
+                &new_snapshot_id,
+                self.task_context.session_config().target_partitions(),
+            )
+            .await?;
+        record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
+
+        tracing::debug!(
+            "Insert to deferred-validation snapshot {} completed, wrote {} rows to Vortex in {} writer operation(s)",
+            new_snapshot_id,
+            rows,
+            writer_ops
+        );
+
+        let PostValidationState {
+            on_conflict_deletions,
+            validated_keys,
+        } = take_post_validation(post_validation);
+
+        let deletion_start = Instant::now();
+        self.table
+            .apply_on_conflict_deletions(on_conflict_deletions)
+            .await?;
+        record_cayenne_write_phase(
+            self.table.table_name(),
+            "apply_on_conflict_deletions",
+            deletion_start,
+        );
+
+        let publish_start = Instant::now();
+        let new_sequence = self
+            .table
+            .catalog()
+            .increment_sequence_number(self.table.table_id())
+            .await?;
+
+        self.table
+            .publish_written_snapshot_with_sequence(&new_snapshot_id, new_sequence)
+            .await?;
+        record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
+
+        Ok((rows, stats_acc, validated_keys))
     }
 
     async fn try_inline_or_restream(
         &self,
         mut prepared_stream: SendableRecordBatchStream,
-        deleted_inlined_pk_i64: &[i64],
-        deleted_inlined_row_keys: &[Box<[u8]>],
+        post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
     ) -> Result<InlineMutationOutcome> {
         let schema = prepared_stream.schema();
-        let mut buffer = InlineBatchBuffer::new(Arc::clone(&schema));
+        let mut buffer = InlineBatchBuffer::new(
+            Arc::clone(&schema),
+            self.context.inline_max_rows(),
+            self.context.inline_max_buffer_bytes(),
+        );
 
         while let Some(batch) = StreamExt::next(&mut prepared_stream).await {
             buffer.push(batch?);
@@ -285,41 +489,44 @@ impl<'a> AppendMutationWriter<'a> {
             }
         }
 
-        if buffer.should_continue_buffering() && buffer.total_rows() == 0 {
-            return Ok(InlineMutationOutcome::Inlined(0));
-        }
+        if buffer.should_continue_buffering() {
+            let state = take_post_validation(post_validation);
 
-        if buffer.should_continue_buffering()
-            && self
-                .table
-                .try_inline_batches_with_inlined_deletions(
-                    buffer.batches(),
-                    deleted_inlined_pk_i64,
-                    deleted_inlined_row_keys,
-                )
-                .await?
-        {
-            let stats_acc = ColumnStatsAccumulator::new(&schema);
-            for batch in buffer.batches() {
-                stats_acc.update(batch);
+            if buffer.total_rows() == 0 {
+                return Ok(InlineMutationOutcome::Inlined {
+                    rows: 0,
+                    post_validation: state,
+                });
             }
 
-            self.table.persist_table_stats(&stats_acc).await;
-
-            if let Err(e) = self
-                .table
-                .checkpoint_inlined_data_if_memtable_pressure_exceeded()
-                .await
+            if !state.on_conflict_deletions.has_file_deletions()
+                && self
+                    .table
+                    .try_inline_batches_with_inlined_deletions(
+                        buffer.batches(),
+                        &state.on_conflict_deletions.deleted_inlined_pk_i64,
+                        &state.on_conflict_deletions.deleted_inlined_row_keys,
+                    )
+                    .await?
             {
-                tracing::warn!(
-                    "Auto-checkpoint of inline memtable failed for {}: {e}",
-                    self.table.table_name(),
-                );
+                let stats_acc = ColumnStatsAccumulator::new(&schema);
+                for batch in buffer.batches() {
+                    stats_acc.update(batch);
+                }
+
+                self.table
+                    .schedule_post_write_maintenance(Some(Arc::new(stats_acc)), false);
+
+                self.table
+                    .schedule_inline_checkpoint_if_memtable_pressure_exceeded();
+
+                return Ok(InlineMutationOutcome::Inlined {
+                    rows: u64::try_from(buffer.total_rows()).unwrap_or(u64::MAX),
+                    post_validation: state,
+                });
             }
 
-            return Ok(InlineMutationOutcome::Inlined(
-                u64::try_from(buffer.total_rows()).unwrap_or(u64::MAX),
-            ));
+            restore_post_validation(post_validation, state);
         }
 
         let re_stream = buffer.into_chained_stream(prepared_stream, self.task_context)?;
@@ -331,19 +538,37 @@ impl<'a> AppendMutationWriter<'a> {
         stream: SendableRecordBatchStream,
         target_size_bytes: usize,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
+        let staging_snapshot_id = CayenneTableProvider::new_staging_snapshot_id();
+        self.table
+            .clear_staging_snapshot_dir(&staging_snapshot_id)
+            .await?;
+
+        // We are about to (or have started to) write Vortex files into the
+        // staging directory. Mark it "dirty" so recovery/root cleanup
+        // (on this or a future writer, or on recovery after a crash) will
+        // actually perform the cleanup instead of taking the fast path.
+        self.table
+            .staging_may_have_files()
+            .store(true, Ordering::Release);
+
+        let write_start = Instant::now();
         let result = match self
             .table
             .write_to_snapshot(
                 stream,
                 target_size_bytes,
-                STAGING_DIR_NAME,
+                &staging_snapshot_id,
                 self.task_context.session_config().target_partitions(),
             )
             .await
         {
             Ok(result) => result,
             Err(e) => {
-                if let Err(cleanup_err) = self.table.clear_staging_dir().await {
+                if let Err(cleanup_err) = self
+                    .table
+                    .clear_staging_snapshot_dir(&staging_snapshot_id)
+                    .await
+                {
                     tracing::warn!(
                         "Failed to clean staging dir after write error for table {}: {cleanup_err}",
                         self.table.table_name(),
@@ -352,15 +577,95 @@ impl<'a> AppendMutationWriter<'a> {
                 return Err(e);
             }
         };
+        record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
 
-        let staged_append = self.table.staged_append_for_existing_staging();
+        let staged_append = CayenneStagedAppend::from_staged_append_in(
+            self.table.clone_for_write_operations(),
+            None,
+            staging_snapshot_id,
+            result.0,
+        );
+        let publish_start = Instant::now();
         staged_append.finalize_staged_write().await?;
+        record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
 
         Ok(result)
     }
 
+    async fn write_staged_append_prepared(
+        &self,
+        stream: SendableRecordBatchStream,
+        target_size_bytes: usize,
+        write_guard: Option<OwnedMutexGuard<()>>,
+        staging_snapshot_id: String,
+    ) -> Result<(
+        u64,
+        usize,
+        Arc<ColumnStatsAccumulator>,
+        PreparedStagedAppend,
+    )> {
+        self.table
+            .staging_may_have_files()
+            .store(true, Ordering::Release);
+
+        let write_start = Instant::now();
+        let (rows, writer_ops, stats_acc) = match self
+            .table
+            .write_to_snapshot(
+                stream,
+                target_size_bytes,
+                &staging_snapshot_id,
+                self.task_context.session_config().target_partitions(),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                if let Err(cleanup_err) = self
+                    .table
+                    .clear_staging_snapshot_dir(&staging_snapshot_id)
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to clean staging dir after write error for table {}: {cleanup_err}",
+                        self.table.table_name(),
+                    );
+                }
+                return Err(e);
+            }
+        };
+        record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
+
+        let staged_append = CayenneStagedAppend::from_staged_append_in(
+            self.table.clone_for_write_operations(),
+            write_guard,
+            staging_snapshot_id.clone(),
+            rows,
+        );
+        let prepare_start = Instant::now();
+        let prepared_append = match staged_append.prepare().await {
+            Ok(prepared_append) => prepared_append,
+            Err(e) => {
+                if let Err(cleanup_err) = self
+                    .table
+                    .clear_staging_snapshot_dir(&staging_snapshot_id)
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to clean staging dir after WAL prepare error for table {}: {cleanup_err}",
+                        self.table.table_name(),
+                    );
+                }
+                return Err(e);
+            }
+        };
+        record_cayenne_write_phase(self.table.table_name(), "stage_wal_prepare", prepare_start);
+
+        Ok((rows, writer_ops, stats_acc, prepared_append))
+    }
+
     async fn apply_retention_if_configured(&self) -> Result<u64> {
-        if !self.table.has_retention_filters() {
+        if !self.table.has_retention_delete_filters() {
             return Ok(0);
         }
 
@@ -379,37 +684,25 @@ impl<'a> AppendMutationWriter<'a> {
         }
         Ok(deleted)
     }
-
-    async fn sort_if_configured(&self) -> Result<bool> {
-        if !self.context.has_sort_columns() {
-            return Ok(false);
-        }
-
-        let target_size_bytes = self.context.target_file_size_bytes();
-        self.table.sort_and_rewrite_data(target_size_bytes).await?;
-        Ok(true)
-    }
 }
 
-fn should_refresh_listing_table_after_post_write(
-    retention_deleted_rows: u64,
-    sorted: bool,
-) -> bool {
-    retention_deleted_rows > 0 || sorted
+fn should_refresh_listing_table_after_post_write(retention_deleted_rows: u64) -> bool {
+    retention_deleted_rows > 0
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::table::{INLINE_MAX_BUFFER_BYTES, INLINE_MAX_ROWS};
     use super::*;
     use arrow::array::{BinaryArray, Int64Array};
     use arrow_schema::{DataType, Field, Schema};
 
     #[test]
     fn inline_policy_requires_simple_append_shape() {
-        assert!(InlineMutationPolicy::from_blocking_conditions([false; 5]).can_inline());
+        assert!(InlineMutationPolicy::from_blocking_conditions([false; 4]).can_inline());
 
-        for blocking_condition_index in 0..5 {
-            let mut blocking_conditions = [false; 5];
+        for blocking_condition_index in 0..4 {
+            let mut blocking_conditions = [false; 4];
             blocking_conditions[blocking_condition_index] = true;
             assert!(
                 !InlineMutationPolicy::from_blocking_conditions(blocking_conditions).can_inline()
@@ -428,7 +721,7 @@ mod tests {
         )
         .expect("batch should be valid");
 
-        let mut buffer = InlineBatchBuffer::new(schema);
+        let mut buffer = InlineBatchBuffer::new(schema, INLINE_MAX_ROWS, INLINE_MAX_BUFFER_BYTES);
         buffer.push(batch);
 
         assert_eq!(buffer.total_rows(), INLINE_MAX_ROWS);
@@ -446,7 +739,7 @@ mod tests {
         )
         .expect("batch should be valid");
 
-        let mut buffer = InlineBatchBuffer::new(schema);
+        let mut buffer = InlineBatchBuffer::new(schema, INLINE_MAX_ROWS, INLINE_MAX_BUFFER_BYTES);
         buffer.push(batch);
 
         assert_eq!(buffer.total_rows(), INLINE_MAX_ROWS + 1);
@@ -467,7 +760,7 @@ mod tests {
         )
         .expect("batch should be valid");
 
-        let mut buffer = InlineBatchBuffer::new(schema);
+        let mut buffer = InlineBatchBuffer::new(schema, INLINE_MAX_ROWS, INLINE_MAX_BUFFER_BYTES);
         buffer.push(batch);
 
         assert!(!buffer.should_continue_buffering());
@@ -475,9 +768,7 @@ mod tests {
 
     #[test]
     fn refresh_listing_table_only_when_post_write_steps_changed_files() {
-        assert!(!should_refresh_listing_table_after_post_write(0, false));
-        assert!(should_refresh_listing_table_after_post_write(1, false));
-        assert!(should_refresh_listing_table_after_post_write(0, true));
-        assert!(should_refresh_listing_table_after_post_write(1, true));
+        assert!(!should_refresh_listing_table_after_post_write(0));
+        assert!(should_refresh_listing_table_after_post_write(1));
     }
 }

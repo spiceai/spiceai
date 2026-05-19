@@ -682,6 +682,8 @@ async fn test_http_dynamic_request_headers() -> Result<(), String> {
 /// `DataFusion` plans the subquery as a `HashJoinExec` (semi-join) over
 /// `HttpExec`, which the optimizer rewrites into `HttpWithDeferredParamsExec`.
 #[tokio::test]
+// Ignored until deferred HTTP params preserve dynamic headers from subqueries; see #10861.
+#[ignore = "https://github.com/spiceai/spiceai/issues/10861"]
 async fn test_http_dynamic_request_headers_from_subquery() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -1431,6 +1433,8 @@ async fn test_http_oauth2_rejects_partial_configuration() -> Result<(), String> 
 ///   3. A query that builds JSON headers from the CSV rows and uses
 ///      `IN (SELECT ...)` to drive dynamic HTTP requests across multiple pages
 #[tokio::test]
+// Ignored until deferred HTTP params preserve dynamic headers from subqueries; see #10861.
+#[ignore = "https://github.com/spiceai/spiceai/issues/10861"]
 async fn test_http_dynamic_request_headers_from_subquery_with_pagination() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;

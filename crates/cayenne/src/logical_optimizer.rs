@@ -35,12 +35,12 @@ limitations under the License.
 //! ## What the rule does
 //!
 //! For every `LogicalPlan::Join` with `JoinType::Inner`, `JoinType::LeftSemi`,
-//! `JoinType::RightSemi`, `JoinType::Left`, or `JoinType::Right`, default SQL
-//! NULL equality (`NULL != NULL`), and one or more equi-key pairs whose data
-//! types match, the rule inspects each side for a non-trivial `Filter` that
-//! references at least one column other than each candidate join key. If one
-//! side is dim-like and has a projectable column key, it wraps the *opposite*
-//! side with
+//! or `JoinType::RightSemi`, default SQL NULL equality (`NULL != NULL`), and
+//! one or more column-vs-column equi-key pairs whose data types match, the rule
+//! inspects each side for a non-trivial `Filter` that references at least one
+//! column other than each candidate join key. If one side is dim-like, has a
+//! projectable column key, and the opposite side is a Cayenne-backed scan
+//! subtree, it wraps that opposite side with
 //!
 //! ```text
 //! Filter(other_side.key IN (SELECT this_side.key FROM this_side_subtree))
@@ -64,13 +64,10 @@ limitations under the License.
 //! semantics: wrapping either input with `IN (SELECT key FROM other_side)`
 //! produces a subset of rows that the semi-join would already retain.
 //!
-//! For outer joins (`Left`, `Right`) the rule fires *only* in the
-//! preserved-side → lookup-side direction. Filtering the lookup side narrows
-//! matches the outer join would already drop (and substitute `NULL` for);
-//! filtering the preserved side would silently delete rows the outer join is
-//! supposed to emit as `NULL`-padded, which would change the output.
-//! `FullOuter` is excluded — both sides are preserved, so neither direction is
-//! safe.
+//! Outer joins and expression join keys are excluded. They can be legal to
+//! rewrite in narrow cases, but HTAP workloads showed the extra semi-join shape
+//! can cost more than it saves outside the q17/q21-style column-domain pruning
+//! path.
 //!
 //! ## Termination
 //!
@@ -92,37 +89,41 @@ limitations under the License.
 //! (`Filter(n_name='CHINA') → TableScan(nation)`) and small dimension snowflakes
 //! are cheap to re-execute.
 //!
-//! Two cardinality gates further suppress propagations that wouldn't pay off
-//! at runtime, when the underlying [`TableSource`]s expose row counts via
+//! Two cardinality gates further suppress propagations that wouldn't pay off at
+//! runtime, when the underlying [`TableSource`]s expose row counts via
 //! `TableProvider::statistics`:
 //!
-//! * [`MIN_DIM_ROWS_FOR_PROPAGATION`] — skip when the dim subtree's known
-//!   upper-bound row count is below the threshold. Very small dims (≪ 1k
-//!   rows) already participate in fast hash builds; the extra `InSubquery →
-//!   LeftSemi` shape we'd introduce doesn't recover its own decorrelation /
-//!   planning cost.
 //! * [`MIN_FACT_ROWS_FOR_PROPAGATION`] — skip when the receiving fact
 //!   subtree's known upper-bound row count is below the threshold. Below it
 //!   there isn't enough probe-side cardinality for the filter to save
 //!   meaningful work, and the plain hash join wins.
+//! * [`MIN_FACT_TO_DIM_KEY_DOMAIN_RATIO`] — skip unless the receiving side is
+//!   much larger than the filtered side's join-key domain. This keeps q17/q21
+//!   style small-domain pruning, while avoiding broad propagation across
+//!   similarly sized HTAP joins.
 //!
-//! The dim-side gate requires stats to be present: if the dim side has no
-//! statistics the rule skips propagation entirely. Acceleration engines
-//! (`DuckDB`, Arrow, Cayenne, etc.) always expose row counts via
-//! `TableProvider::statistics`, so this gate is transparent for accelerated
-//! tables. Data sources without statistics (e.g. HTTP virtual tables) are
-//! excluded.
+//! When statistics are present, the cardinality gates suppress propagation only
+//! when they prove the receiving side is too small or insufficiently larger
+//! than the filtered key domain. Missing statistics fall back to the same
+//! structural safety checks as known-cardinality plans: the receiving subtree
+//! must still contain a Cayenne-backed scan, the filtered side must be
+//! dim-like, the join key must be preserved through summaries, and propagation
+//! markers must not already target the key.
 
+use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DataFusionError, NullEquality, Result, Spans, TableReference};
+use datafusion::datasource::DefaultTableSource;
 use datafusion::logical_expr::{
     Filter, Join, JoinType, LogicalPlan, Projection, Subquery, SubqueryAlias,
 };
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
-use datafusion_expr::Expr;
 use datafusion_expr::ExprSchemable;
 use datafusion_expr::expr::InSubquery;
+use datafusion_expr::{Expr, TableSource};
 use std::{collections::BTreeSet, sync::Arc};
+
+use crate::provider::CayenneTableProvider;
 
 /// Prefix for [`SubqueryAlias`] names introduced by
 /// [`CayennePropagateFilterAcrossEquiJoinKeys`].
@@ -132,21 +133,61 @@ use std::{collections::BTreeSet, sync::Arc};
 /// a marker in explain output so the rewrite is recognizable when reading plans.
 pub const PROPAGATED_FILTER_ALIAS_PREFIX: &str = "__cayenne_xclos__";
 
+type TableProviderPredicate = Arc<dyn Fn(&dyn TableProvider) -> bool + Send + Sync>;
+type TableSourcePredicate = Arc<dyn Fn(&dyn TableSource) -> bool + Send + Sync>;
+
 /// Logical optimizer rule that, for each `Inner`, `LeftSemi`, or `RightSemi`
-/// join with default SQL NULL equality and a simple equi-key
+/// join with default SQL NULL equality and a simple column equi-key
 /// `(left.a = right.b)`, introduces
 /// `Filter(other_side.key IN (SELECT this_side.key FROM this_side_subtree))`
-/// on the side opposite a non-key filter.
+/// on the Cayenne-backed side opposite a non-key filter.
 ///
 /// See the module-level docs for the full design and the q21 motivation.
-#[derive(Default)]
-pub struct CayennePropagateFilterAcrossEquiJoinKeys;
+pub struct CayennePropagateFilterAcrossEquiJoinKeys {
+    is_cayenne_table_source: TableSourcePredicate,
+}
+
+impl Default for CayennePropagateFilterAcrossEquiJoinKeys {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl CayennePropagateFilterAcrossEquiJoinKeys {
     /// Create a new instance of the rule.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::new_with_table_provider_predicate(|provider| {
+            provider.as_any().is::<CayenneTableProvider>()
+        })
+    }
+
+    /// Create a new instance with a caller-provided table-provider predicate.
+    ///
+    /// Runtime registration uses this to recognize `AcceleratedTable`s whose
+    /// inner accelerator is Cayenne, while this crate's default stays scoped to
+    /// direct [`CayenneTableProvider`] scans.
+    #[must_use]
+    pub fn new_with_table_provider_predicate(
+        is_cayenne_table_provider: impl Fn(&dyn TableProvider) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        let is_cayenne_table_provider: TableProviderPredicate = Arc::new(is_cayenne_table_provider);
+        Self::new_with_table_source_predicate(move |source| {
+            source
+                .as_any()
+                .downcast_ref::<DefaultTableSource>()
+                .is_some_and(|source| is_cayenne_table_provider(source.table_provider.as_ref()))
+        })
+    }
+
+    /// Create a new instance with a caller-provided table-source predicate.
+    #[must_use]
+    pub fn new_with_table_source_predicate(
+        is_cayenne_table_source: impl Fn(&dyn TableSource) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            is_cayenne_table_source: Arc::new(is_cayenne_table_source),
+        }
     }
 }
 
@@ -163,8 +204,8 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
     }
 
     fn apply_order(&self) -> Option<ApplyOrder> {
-        // TopDown: process outer joins first so the propagation seeds reach
-        // inner joins on the next pass.
+        // TopDown: process higher joins first so propagation seeds reach
+        // nested joins on the next pass.
         Some(ApplyOrder::TopDown)
     }
 
@@ -179,11 +220,7 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
         };
         if !matches!(
             join.join_type,
-            JoinType::Inner
-                | JoinType::LeftSemi
-                | JoinType::RightSemi
-                | JoinType::Left
-                | JoinType::Right,
+            JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi,
         ) {
             return Ok(Transformed::no(LogicalPlan::Join(join)));
         }
@@ -195,20 +232,6 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
         {
             return Ok(Transformed::no(LogicalPlan::Join(join)));
         }
-        // For outer joins, propagation is only safe in the *preserved-side →
-        // lookup-side* direction. Filtering the lookup side can only narrow
-        // matches that the join would already drop; filtering the preserved
-        // side would drop output rows that the outer join would have emitted
-        // as `NULL`-padded. Inner and semi joins are unrestricted.
-        let allow_left_to_right = matches!(
-            join.join_type,
-            JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi | JoinType::Left,
-        );
-        let allow_right_to_left = matches!(
-            join.join_type,
-            JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi | JoinType::Right,
-        );
-
         let equijoin_keys = matching_equijoin_keys(&join);
         if equijoin_keys.is_empty() {
             return Ok(Transformed::no(LogicalPlan::Join(join)));
@@ -216,121 +239,62 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
 
         let mut left_analysis = analyze_logical_side(&join.left);
         let mut right_analysis = analyze_logical_side(&join.right);
+        let left_contains_cayenne =
+            contains_cayenne_table_scan(&join.left, &self.is_cayenne_table_source);
+        let right_contains_cayenne =
+            contains_cayenne_table_scan(&join.right, &self.is_cayenne_table_source);
 
         let mut new_left: Arc<LogicalPlan> = Arc::clone(&join.left);
         let mut new_right: Arc<LogicalPlan> = Arc::clone(&join.right);
         let mut changed = false;
 
-        for key in &equijoin_keys {
-            match key {
-                EquiKey::BothColumns { left, right } => {
-                    // Propagate the LEFT-side filtered key domain → the RIGHT side.
-                    if allow_left_to_right
-                        && left_analysis.is_dim_like
-                        && left_analysis.has_non_key_filter(&left.name)
-                        && key_preserved_through_summaries(&join.left, left)
-                        && !skip_propagation_by_cardinality(&join.left, &join.right)
-                        && !right_analysis.has_propagated_filter_target(&column_expr(right))
-                    {
-                        let subquery_plan = build_key_projection_subquery(
-                            Arc::clone(&join.left),
-                            left,
-                            config.alias_generator(),
-                        )?;
-                        let target = column_expr(right);
-                        let wrapped = wrap_with_in_subquery_filter_expr(
-                            Arc::clone(&new_right),
-                            &target,
-                            subquery_plan,
-                        )?;
-                        new_right = Arc::new(wrapped);
-                        right_analysis.add_propagated_filter_target(&target);
-                        changed = true;
-                    }
+        for EquiKey { left, right } in &equijoin_keys {
+            // Propagate the LEFT-side filtered key domain → the RIGHT side.
+            if right_contains_cayenne
+                && left_analysis.is_dim_like
+                && left_analysis.has_non_key_filter(&left.name)
+                && key_preserved_through_summaries(&join.left, left)
+                && !skip_propagation_by_cardinality(&join.left, &join.right, left)
+                && !right_analysis.has_propagated_filter_target(&column_expr(right))
+            {
+                let subquery_plan = build_key_projection_subquery(
+                    Arc::clone(&join.left),
+                    left,
+                    config.alias_generator(),
+                )?;
+                let target = column_expr(right);
+                let wrapped = wrap_with_in_subquery_filter_expr(
+                    Arc::clone(&new_right),
+                    &target,
+                    subquery_plan,
+                )?;
+                new_right = Arc::new(wrapped);
+                right_analysis.add_propagated_filter_target(&target);
+                changed = true;
+            }
 
-                    // Propagate the RIGHT-side filtered key domain → the LEFT side.
-                    if allow_right_to_left
-                        && right_analysis.is_dim_like
-                        && right_analysis.has_non_key_filter(&right.name)
-                        && key_preserved_through_summaries(&join.right, right)
-                        && !skip_propagation_by_cardinality(&join.right, &join.left)
-                        && !left_analysis.has_propagated_filter_target(&column_expr(left))
-                    {
-                        let subquery_plan = build_key_projection_subquery(
-                            Arc::clone(&join.right),
-                            right,
-                            config.alias_generator(),
-                        )?;
-                        let target = column_expr(left);
-                        let wrapped = wrap_with_in_subquery_filter_expr(
-                            Arc::clone(&new_left),
-                            &target,
-                            subquery_plan,
-                        )?;
-                        new_left = Arc::new(wrapped);
-                        left_analysis.add_propagated_filter_target(&target);
-                        changed = true;
-                    }
-                }
-                EquiKey::LeftColumnRightExpr {
-                    left_col,
-                    right_expr,
-                } => {
-                    // Only LEFT-dim → RIGHT-expr direction can fire: the right
-                    // side has an expression key, so the fact-side filter
-                    // target must be that expression. Propagation in the other
-                    // direction would require projecting an expression
-                    // (potentially referencing fact-side rows) inside the dim
-                    // subquery, which would no longer be a cheap re-execution.
-                    if allow_left_to_right
-                        && left_analysis.is_dim_like
-                        && left_analysis.has_non_key_filter(&left_col.name)
-                        && key_preserved_through_summaries(&join.left, left_col)
-                        && !skip_propagation_by_cardinality(&join.left, &join.right)
-                        && !right_analysis.has_propagated_filter_target(right_expr)
-                    {
-                        let subquery_plan = build_key_projection_subquery(
-                            Arc::clone(&join.left),
-                            left_col,
-                            config.alias_generator(),
-                        )?;
-                        let wrapped = wrap_with_in_subquery_filter_expr(
-                            Arc::clone(&new_right),
-                            right_expr,
-                            subquery_plan,
-                        )?;
-                        new_right = Arc::new(wrapped);
-                        right_analysis.add_propagated_filter_target(right_expr);
-                        changed = true;
-                    }
-                }
-                EquiKey::LeftExprRightColumn {
-                    left_expr,
-                    right_col,
-                } => {
-                    // Symmetric: only RIGHT-dim → LEFT-expr direction.
-                    if allow_right_to_left
-                        && right_analysis.is_dim_like
-                        && right_analysis.has_non_key_filter(&right_col.name)
-                        && key_preserved_through_summaries(&join.right, right_col)
-                        && !skip_propagation_by_cardinality(&join.right, &join.left)
-                        && !left_analysis.has_propagated_filter_target(left_expr)
-                    {
-                        let subquery_plan = build_key_projection_subquery(
-                            Arc::clone(&join.right),
-                            right_col,
-                            config.alias_generator(),
-                        )?;
-                        let wrapped = wrap_with_in_subquery_filter_expr(
-                            Arc::clone(&new_left),
-                            left_expr,
-                            subquery_plan,
-                        )?;
-                        new_left = Arc::new(wrapped);
-                        left_analysis.add_propagated_filter_target(left_expr);
-                        changed = true;
-                    }
-                }
+            // Propagate the RIGHT-side filtered key domain → the LEFT side.
+            if left_contains_cayenne
+                && right_analysis.is_dim_like
+                && right_analysis.has_non_key_filter(&right.name)
+                && key_preserved_through_summaries(&join.right, right)
+                && !skip_propagation_by_cardinality(&join.right, &join.left, right)
+                && !left_analysis.has_propagated_filter_target(&column_expr(left))
+            {
+                let subquery_plan = build_key_projection_subquery(
+                    Arc::clone(&join.right),
+                    right,
+                    config.alias_generator(),
+                )?;
+                let target = column_expr(left);
+                let wrapped = wrap_with_in_subquery_filter_expr(
+                    Arc::clone(&new_left),
+                    &target,
+                    subquery_plan,
+                )?;
+                new_left = Arc::new(wrapped);
+                left_analysis.add_propagated_filter_target(&target);
+                changed = true;
             }
         }
 
@@ -358,9 +322,7 @@ struct SideAnalysis {
     filter_columns: BTreeSet<String>,
     /// Targets of already-propagated `InSubquery` filters on this side, keyed
     /// by the `Display` form of the target expression. Used for cycle
-    /// prevention — the same target should not be wrapped twice. Tracks both
-    /// pure-column and expression targets uniformly, so the chbench
-    /// `ascii(substr(c_state,1,1)) - 65` shape is also cycle-guarded.
+    /// prevention — the same target should not be wrapped twice.
     propagated_filter_targets: BTreeSet<String>,
 }
 
@@ -419,6 +381,24 @@ fn analyze_logical_side(plan: &LogicalPlan) -> SideAnalysis {
     analysis
 }
 
+fn contains_cayenne_table_scan(
+    plan: &LogicalPlan,
+    is_cayenne_table_source: &TableSourcePredicate,
+) -> bool {
+    let mut found = false;
+    let _ = plan.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node
+            && is_cayenne_table_source(scan.source.as_ref())
+        {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
 /// Returns `true` if `plan` is — possibly behind a chain of `Projection` or
 /// `SubqueryAlias` wrappers added by later optimizer rules — a `SubqueryAlias`
 /// whose name starts with [`PROPAGATED_FILTER_ALIAS_PREFIX`].
@@ -439,26 +419,15 @@ fn right_side_carries_propagation_marker(plan: &LogicalPlan) -> bool {
     }
 }
 
-/// An equi-join key from `Join::on`, classified by which sides are pure
-/// columns. Propagation requires the *dim* side to be a `Column` so the IN
-/// subquery has a cheap, projectable key; the *fact* side may be an arbitrary
-/// expression (e.g. the chbench `ascii(substr(c_state,1,1)) - 65` pattern).
-enum EquiKey {
-    /// Both join keys are columns. The rule may fire in either direction
-    /// depending on which side is dim-like.
-    BothColumns { left: Column, right: Column },
-    /// Left key is a column, right key is an expression. Only the
-    /// `LEFT → RIGHT` propagation direction is supported.
-    LeftColumnRightExpr { left_col: Column, right_expr: Expr },
-    /// Right key is a column, left key is an expression. Only the
-    /// `RIGHT → LEFT` propagation direction is supported.
-    LeftExprRightColumn { left_expr: Expr, right_col: Column },
+/// A column-vs-column equi-join key from `Join::on`.
+struct EquiKey {
+    left: Column,
+    right: Column,
 }
 
-/// Return the equi-join keys from `join.on` whose data types match. Drops
-/// pairs where both sides are expressions (no dim-like column to project) and
-/// pairs whose types differ (the `IN` subquery would need an implicit cast we
-/// don't insert here).
+/// Return the column-vs-column equi-join keys from `join.on` whose data types
+/// match. Drops expression keys and pairs whose types differ (the `IN` subquery
+/// would need an implicit cast we don't insert here).
 fn matching_equijoin_keys(join: &Join) -> Vec<EquiKey> {
     join.on
         .iter()
@@ -468,20 +437,10 @@ fn matching_equijoin_keys(join: &Join) -> Vec<EquiKey> {
             }
 
             match (left, right) {
-                (Expr::Column(l), Expr::Column(r)) => Some(EquiKey::BothColumns {
+                (Expr::Column(l), Expr::Column(r)) => Some(EquiKey {
                     left: l.clone(),
                     right: r.clone(),
                 }),
-                (Expr::Column(l), other) => Some(EquiKey::LeftColumnRightExpr {
-                    left_col: l.clone(),
-                    right_expr: other.clone(),
-                }),
-                (other, Expr::Column(r)) => Some(EquiKey::LeftExprRightColumn {
-                    left_expr: other.clone(),
-                    right_col: r.clone(),
-                }),
-                // Both sides are non-trivial expressions — no cheap projection
-                // target on either side, skip.
                 _ => None,
             }
         })
@@ -511,16 +470,14 @@ fn join_key_types_match(
 /// large dim joins whose re-execution under an `InSubquery` would be expensive.
 const MAX_DIM_LIKE_TABLE_SCANS: usize = 3;
 
-/// Skip propagation when the dim subtree's known upper-bound row count is
-/// below this threshold. Below it the dim is already small enough that the
-/// stock hash build is fast, and the `InSubquery → LeftSemi` decorrelation +
-/// planning cost outweighs the saved probe work.
-const MIN_DIM_ROWS_FOR_PROPAGATION: usize = 1_000;
-
 /// Skip propagation when the receiving fact subtree's known upper-bound row
 /// count is below this threshold. Below it there isn't enough probe
 /// cardinality for the filter to recoup the propagation overhead.
 const MIN_FACT_ROWS_FOR_PROPAGATION: usize = 100_000;
+
+/// Skip propagation unless the receiving fact subtree is at least this many
+/// times larger than the dim side's propagated join-key domain.
+const MIN_FACT_TO_DIM_KEY_DOMAIN_RATIO: usize = 10;
 
 /// Returns `true` if `plan` is a "dim-like" subtree — a small snowflake of
 /// dimensions composed of at most [`MAX_DIM_LIKE_TABLE_SCANS`] `TableScan`s
@@ -582,23 +539,11 @@ fn distinct_input(distinct: &datafusion::logical_expr::Distinct) -> &LogicalPlan
 /// is the right direction for the "skip if known small" gate (a true upper
 /// bound below the threshold guarantees the subtree is actually small).
 fn subtree_upper_bound_rows(plan: &LogicalPlan) -> Option<usize> {
-    use datafusion::common::stats::Precision;
-    use datafusion::datasource::DefaultTableSource;
-
     let mut total: usize = 0;
     let mut any_unknown = false;
     let _ = plan.apply(|node| {
         if let LogicalPlan::TableScan(scan) = node {
-            let rows = scan
-                .source
-                .as_any()
-                .downcast_ref::<DefaultTableSource>()
-                .and_then(|default| default.table_provider.statistics())
-                .and_then(|stats| match stats.num_rows {
-                    Precision::Exact(n) | Precision::Inexact(n) => Some(n),
-                    Precision::Absent => None,
-                });
-            if let Some(n) = rows {
+            if let Some(n) = table_scan_upper_bound_rows(scan) {
                 total = total.saturating_add(n);
             } else {
                 any_unknown = true;
@@ -610,32 +555,123 @@ fn subtree_upper_bound_rows(plan: &LogicalPlan) -> Option<usize> {
     if any_unknown { None } else { Some(total) }
 }
 
+fn table_scan_upper_bound_rows(scan: &datafusion::logical_expr::TableScan) -> Option<usize> {
+    use datafusion::common::stats::Precision;
+
+    scan.source
+        .as_any()
+        .downcast_ref::<DefaultTableSource>()
+        .and_then(|default| default.table_provider.statistics())
+        .and_then(|stats| match stats.num_rows {
+            Precision::Exact(n) | Precision::Inexact(n) => Some(n),
+            Precision::Absent => None,
+        })
+}
+
+fn key_for_input_schema(input: &LogicalPlan, key: &Column) -> Option<Column> {
+    input
+        .schema()
+        .qualified_field_with_unqualified_name(&key.name)
+        .ok()
+        .map(|(qualifier, field)| Column::new(qualifier.cloned(), field.name().clone()))
+}
+
+/// Upper bound for the number of rows that can contribute values for `key`.
+///
+/// This intentionally tracks the key's source domain instead of summing every
+/// scan under the dim side. For q17-like aggregates, the filtered side may
+/// include a large fact scan, but the propagated key domain is still bounded by
+/// the grouped dimension key (for example `item.i_id`).
+fn key_domain_upper_bound_rows(plan: &LogicalPlan, key: &Column) -> Option<usize> {
+    if !plan.schema().has_column(key) {
+        return None;
+    }
+
+    match plan {
+        LogicalPlan::TableScan(scan) => table_scan_upper_bound_rows(scan),
+        LogicalPlan::Filter(filter) => key_domain_upper_bound_rows(&filter.input, key),
+        LogicalPlan::Limit(limit) => key_domain_upper_bound_rows(&limit.input, key),
+        LogicalPlan::Projection(projection) => {
+            let index = projection.schema.maybe_index_of_column(key)?;
+            let expr = projection.expr.get(index)?;
+            key_domain_upper_bound_rows_for_expr(&projection.input, expr)
+        }
+        LogicalPlan::SubqueryAlias(alias) => key_for_input_schema(&alias.input, key)
+            .and_then(|input_key| key_domain_upper_bound_rows(&alias.input, &input_key)),
+        LogicalPlan::Aggregate(aggregate) => {
+            let key_in_group = aggregate
+                .group_expr
+                .iter()
+                .any(|expr| matches!(expr, Expr::Column(column) if column == key));
+            if key_in_group {
+                key_domain_upper_bound_rows(&aggregate.input, key)
+            } else {
+                None
+            }
+        }
+        LogicalPlan::Distinct(distinct) => {
+            use datafusion::logical_expr::Distinct;
+            let key_kept = match distinct {
+                Distinct::All(_) => true,
+                Distinct::On(on) => on
+                    .on_expr
+                    .iter()
+                    .any(|expr| matches!(expr, Expr::Column(column) if column == key)),
+            };
+            if key_kept {
+                key_domain_upper_bound_rows(distinct_input(distinct), key)
+            } else {
+                None
+            }
+        }
+        LogicalPlan::Join(join)
+            if join.join_type == JoinType::Inner
+                && join.null_equality == NullEquality::NullEqualsNothing =>
+        {
+            let left_rows = if join.left.schema().has_column(key) {
+                key_domain_upper_bound_rows(&join.left, key)
+            } else {
+                None
+            };
+            let right_rows = if join.right.schema().has_column(key) {
+                key_domain_upper_bound_rows(&join.right, key)
+            } else {
+                None
+            };
+            match (left_rows, right_rows) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (Some(rows), None) | (None, Some(rows)) => Some(rows),
+                (None, None) => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn key_domain_upper_bound_rows_for_expr(input: &LogicalPlan, expr: &Expr) -> Option<usize> {
+    match expr {
+        Expr::Column(column) => key_domain_upper_bound_rows(input, column),
+        Expr::Alias(alias) => key_domain_upper_bound_rows_for_expr(input, &alias.expr),
+        _ => None,
+    }
+}
+
 /// `true` when propagation should be skipped based on cardinality.
 ///
-/// Skips when:
-/// * The dim side has **no statistics** — data sources that don't expose row
-///   counts are excluded because the rule cannot gauge
-///   whether the subquery re-execution cost is justified.
-///   Acceleration engines (`DuckDB`, Arrow, Cayenne, etc.) always provide
-///   `Exact` or `Inexact` row counts via `TableProvider::statistics`.
-/// * The dim side's known upper-bound row count is below
-///   [`MIN_DIM_ROWS_FOR_PROPAGATION`].
-/// * The fact side's known upper-bound row count is below
-///   [`MIN_FACT_ROWS_FOR_PROPAGATION`] (missing fact-side stats fall back
-///   to allowing propagation — over-filtering the fact side is safe).
-fn skip_propagation_by_cardinality(dim_side: &LogicalPlan, fact_side: &LogicalPlan) -> bool {
-    let dim_rows = subtree_upper_bound_rows(dim_side);
+/// Skips only when stats prove the fact side is too small, or not much larger
+/// than the propagated join-key domain. Missing stats fall back to the
+/// structural safety checks instead of disabling propagation.
+fn skip_propagation_by_cardinality(
+    dim_side: &LogicalPlan,
+    fact_side: &LogicalPlan,
+    dim_key: &Column,
+) -> bool {
+    let dim_key_domain_rows = key_domain_upper_bound_rows(dim_side, dim_key);
 
     tracing::debug!(
-        dim_rows = ?dim_rows,
-        "CayennePropagateFilterAcrossEquiJoinKeys: dim-side cardinality"
+        dim_key_domain_rows = ?dim_key_domain_rows,
+        "CayennePropagateFilterAcrossEquiJoinKeys: dim-side key-domain cardinality"
     );
-
-    match dim_rows {
-        None => return true,
-        Some(n) if n < MIN_DIM_ROWS_FOR_PROPAGATION => return true,
-        Some(_) => {}
-    }
 
     let fact_rows = subtree_upper_bound_rows(fact_side);
 
@@ -644,11 +680,25 @@ fn skip_propagation_by_cardinality(dim_side: &LogicalPlan, fact_side: &LogicalPl
         "CayennePropagateFilterAcrossEquiJoinKeys: fact-side cardinality"
     );
 
-    if let Some(n) = fact_rows
-        && n < MIN_FACT_ROWS_FOR_PROPAGATION
-    {
+    let Some(fact_rows) = fact_rows else {
+        return false;
+    };
+    if fact_rows < MIN_FACT_ROWS_FOR_PROPAGATION {
         return true;
     }
+
+    let Some(dim_key_domain_rows) = dim_key_domain_rows else {
+        return false;
+    };
+
+    if dim_key_domain_rows == 0 {
+        return false;
+    }
+
+    if fact_rows < dim_key_domain_rows.saturating_mul(MIN_FACT_TO_DIM_KEY_DOMAIN_RATIO) {
+        return true;
+    }
+
     false
 }
 
@@ -666,14 +716,6 @@ fn skip_propagation_by_cardinality(dim_side: &LogicalPlan, fact_side: &LogicalPl
 /// the same shape `is_dim_like_subtree` accepts. Anything outside that vocab
 /// (`Sort`, `Window`, etc.) is conservatively rejected by returning `false`.
 fn key_preserved_through_summaries(plan: &LogicalPlan, key: &Column) -> bool {
-    fn key_for_input_schema(input: &LogicalPlan, key: &Column) -> Option<Column> {
-        input
-            .schema()
-            .qualified_field_with_unqualified_name(&key.name)
-            .ok()
-            .map(|(qualifier, field)| Column::new(qualifier.cloned(), field.name().clone()))
-    }
-
     fn walk(plan: &LogicalPlan, key: &Column) -> bool {
         match plan {
             LogicalPlan::TableScan(_) => plan.schema().has_column(key),
@@ -821,10 +863,7 @@ fn build_key_projection_subquery(
 
 /// Wrap `input` with `Filter(target IN (subquery))` using the `subquery_plan`
 /// (which must already be a `SubqueryAlias` named with
-/// [`PROPAGATED_FILTER_ALIAS_PREFIX`]) as the right-hand side. `target` may be
-/// a column or any expression whose columns all resolve in `input`'s schema —
-/// the chbench `ascii(substr(c_state,1,1)) - 65` shape is supported through
-/// this entry point.
+/// [`PROPAGATED_FILTER_ALIAS_PREFIX`]) as the right-hand side.
 fn wrap_with_in_subquery_filter_expr(
     input: Arc<LogicalPlan>,
     target: &Expr,
@@ -846,7 +885,10 @@ fn wrap_with_in_subquery_filter_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::arrow::util::pretty::pretty_format_batches;
     use datafusion::catalog::MemTable;
     use datafusion::common::stats::Precision;
     use datafusion::datasource::{DefaultTableSource, TableProvider};
@@ -866,6 +908,11 @@ mod tests {
         num_rows: usize,
     }
 
+    #[derive(Debug)]
+    struct NoStatsTable {
+        inner: MemTable,
+    }
+
     impl StatMemTable {
         fn try_new(
             schema: Arc<Schema>,
@@ -875,6 +922,14 @@ mod tests {
             Ok(Self {
                 inner: MemTable::try_new(schema, batches)?,
                 num_rows,
+            })
+        }
+    }
+
+    impl NoStatsTable {
+        fn try_new(schema: Arc<Schema>, batches: Vec<Vec<RecordBatch>>) -> Result<Self> {
+            Ok(Self {
+                inner: MemTable::try_new(schema, batches)?,
             })
         }
     }
@@ -912,8 +967,37 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl TableProvider for NoStatsTable {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> Arc<Schema> {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn datafusion::catalog::Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+
+        fn statistics(&self) -> Option<Statistics> {
+            None
+        }
+    }
+
     fn rule() -> CayennePropagateFilterAcrossEquiJoinKeys {
-        CayennePropagateFilterAcrossEquiJoinKeys::new()
+        CayennePropagateFilterAcrossEquiJoinKeys::new_with_table_source_predicate(|_| true)
     }
 
     /// Build a [`LogicalPlan::TableScan`] backed by a [`StatMemTable`] that
@@ -934,7 +1018,6 @@ mod tests {
         let ctx = SessionContext::new();
         // dim-like nation table — gains an `n_regionkey` so the multi-hop
         // `region ⋈ nation` propagation tests can join through it.
-        // Row count ≥ MIN_DIM_ROWS_FOR_PROPAGATION so the cardinality gate allows propagation.
         let nation_schema = Arc::new(Schema::new(vec![
             Field::new("n_nationkey", DataType::Int64, false),
             Field::new("n_name", DataType::Utf8, true),
@@ -950,20 +1033,20 @@ mod tests {
             Field::new("s_suppkey", DataType::Int64, false),
             Field::new("s_nationkey", DataType::Int64, false),
         ]));
-        // fact-like customer table for expression-equi-key tests
+        // fact-like customer table for expression-equi-key no-op tests
         // (chbench `ascii(substr(c_state, 1, 1)) - 65` nation mapping).
         let customer_schema = Arc::new(Schema::new(vec![
             Field::new("c_id", DataType::Int64, false),
             Field::new("c_state", DataType::Utf8, true),
         ]));
-        // Dim tables: row count above MIN_DIM_ROWS_FOR_PROPAGATION (1_000).
-        // Fact tables: row count above MIN_FACT_ROWS_FOR_PROPAGATION (100_000).
+        // Dim tables use realistic small domains; fact tables are large enough
+        // for the fact-to-dim key-domain ratio gate to allow q21-style pruning.
         ctx.register_table(
             "nation",
             Arc::new(StatMemTable::try_new(
                 Arc::clone(&nation_schema),
                 vec![vec![]],
-                100_000,
+                25,
             )?),
         )?;
         ctx.register_table(
@@ -971,7 +1054,7 @@ mod tests {
             Arc::new(StatMemTable::try_new(
                 Arc::clone(&region_schema),
                 vec![vec![]],
-                100_000,
+                5,
             )?),
         )?;
         ctx.register_table(
@@ -1043,6 +1126,27 @@ mod tests {
             "cayenne_propagate_filter_across_equi_join_keys"
         );
         assert_eq!(rule().apply_order(), Some(ApplyOrder::TopDown));
+    }
+
+    #[tokio::test]
+    async fn default_rule_skips_non_cayenne_table_scans() -> Result<()> {
+        let ctx = make_ctx()?;
+        let plan = ctx
+            .sql(
+                "SELECT s_suppkey FROM supplier, nation \
+                 WHERE s_nationkey = n_nationkey AND n_name = 'CHINA'",
+            )
+            .await?
+            .into_optimized_plan()?;
+
+        let r = CayennePropagateFilterAcrossEquiJoinKeys::new();
+        let cfg = datafusion::optimizer::OptimizerContext::new();
+        let (_, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
+        assert!(
+            !changed,
+            "default rule must not rewrite non-Cayenne scans; plan was:\n{plan}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -1145,6 +1249,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stats_less_provider_propagation_matches_unoptimized_results() -> Result<()> {
+        let ctx = SessionContext::new();
+        let nation_schema = Arc::new(Schema::new(vec![
+            Field::new("n_nationkey", DataType::Int64, false),
+            Field::new("n_name", DataType::Utf8, true),
+        ]));
+        let supplier_schema = Arc::new(Schema::new(vec![
+            Field::new("s_suppkey", DataType::Int64, false),
+            Field::new("s_nationkey", DataType::Int64, false),
+        ]));
+
+        let nation_batch = RecordBatch::try_new(
+            Arc::clone(&nation_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("CHINA"), Some("FRANCE"), None])) as ArrayRef,
+            ],
+        )?;
+        let supplier_batch = RecordBatch::try_new(
+            Arc::clone(&supplier_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![10, 11, 12, 13])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 2, 1, 4])) as ArrayRef,
+            ],
+        )?;
+
+        ctx.register_table(
+            "nation",
+            Arc::new(NoStatsTable::try_new(
+                nation_schema,
+                vec![vec![nation_batch]],
+            )?),
+        )?;
+        ctx.register_table(
+            "supplier",
+            Arc::new(NoStatsTable::try_new(
+                supplier_schema,
+                vec![vec![supplier_batch]],
+            )?),
+        )?;
+
+        let plan = ctx
+            .sql(
+                "SELECT s_suppkey FROM supplier JOIN nation \
+                 ON s_nationkey = n_nationkey \
+                 WHERE n_name = 'CHINA' ORDER BY s_suppkey",
+            )
+            .await?
+            .into_optimized_plan()?;
+
+        let r = rule();
+        let cfg = datafusion::optimizer::OptimizerContext::new();
+        let (transformed_plan, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
+        assert!(
+            changed,
+            "rule should propagate when MemTable statistics are absent; plan was:\n{plan}"
+        );
+        assert_eq!(count_propagated_filter_exprs(&transformed_plan), 1);
+
+        let baseline_batches = ctx.execute_logical_plan(plan).await?.collect().await?;
+        let transformed_batches = ctx
+            .execute_logical_plan(transformed_plan)
+            .await?
+            .collect()
+            .await?;
+
+        let baseline = pretty_format_batches(&baseline_batches)?.to_string();
+        let transformed = pretty_format_batches(&transformed_batches)?.to_string();
+        assert_eq!(transformed, baseline);
+        assert_eq!(
+            baseline,
+            "+-----------+\n\
+             | s_suppkey |\n\
+             +-----------+\n\
+             | 10        |\n\
+             | 12        |\n\
+             +-----------+"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn left_semi_join_with_dim_filter_propagates_via_subquery() -> Result<()> {
         // The `IN (subquery)` shape that `decorrelate_predicate_subquery`
         // rewrites into a `LeftSemi` join. The propagation rule must still
@@ -1192,10 +1379,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn left_outer_join_propagates_only_left_to_right() -> Result<()> {
+    async fn left_outer_join_is_unchanged_even_when_preserved_side_has_filter() -> Result<()> {
         // `supplier LEFT JOIN nation ON s_nationkey = n_nationkey WHERE
         // s_name = 'X'`. The LEFT side (supplier) has a non-key filter; it is
-        // the preserved side. Propagating to the lookup side (nation) is safe.
+        // the preserved side. This could be semantically safe to propagate to
+        // the lookup side, but it adds an extra semi-join shape and was too
+        // easy to over-apply in HTAP workloads.
         //
         // Note: `eliminate_outer_join` will rewrite the LEFT JOIN to an INNER
         // JOIN only if the WHERE clause forces the right side to be non-null
@@ -1212,18 +1401,10 @@ mod tests {
 
         let r = rule();
         let cfg = datafusion::optimizer::OptimizerContext::new();
-        let (transformed_plan, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
-        // The supplier-side filter (`s_suppkey > 5`) is a non-key filter on
-        // the LEFT/preserved side. Direction LEFT→RIGHT is allowed; the rule
-        // should propagate `n_nationkey IN (SELECT s_nationkey FROM filtered_supplier)`
-        // onto nation.
+        let (_, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
         assert!(
-            changed,
-            "rule should fire LEFT→RIGHT for LEFT OUTER; plan was:\n{plan}"
-        );
-        assert!(
-            find_propagated_side(&transformed_plan).is_some(),
-            "rule fired but produced no propagated-filter marker; plan was:\n{transformed_plan}"
+            !changed,
+            "LEFT OUTER joins must stay unchanged by the rule; plan was:\n{plan}"
         );
         Ok(())
     }
@@ -1246,9 +1427,6 @@ mod tests {
         let r = rule();
         let cfg = datafusion::optimizer::OptimizerContext::new();
         let (_, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
-        // The filter is on the RIGHT side. RIGHT→LEFT propagation is forbidden
-        // for LEFT OUTER. LEFT→RIGHT is allowed but there's no LEFT-side filter
-        // to propagate. So the rule must be a no-op here.
         assert!(
             !changed,
             "RIGHT→LEFT propagation must not fire on LEFT OUTER; plan was:\n{plan}"
@@ -1539,13 +1717,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inner_join_with_expression_fact_key_propagates_dim_filter() -> Result<()> {
+    async fn inner_join_with_expression_fact_key_is_unchanged() -> Result<()> {
         // The canonical chbench Q5/Q7/Q10 shape: a non-trivial expression on
         // the fact side and a pure column on the dim side, with the dim side
         // carrying the selective non-key filter.
         //
-        // The rule must fire on `(Column, Expr)` (or `(Expr, Column)`) equi-key
-        // pairs even though neither side is a pure column-column join.
+        // These expression-key joins were valid to rewrite but too easy to
+        // over-apply, so the q17/q21-focused rule now leaves them alone.
         let ctx = make_ctx()?;
         let plan = ctx
             .sql(
@@ -1558,23 +1736,10 @@ mod tests {
 
         let r = rule();
         let cfg = datafusion::optimizer::OptimizerContext::new();
-        let (transformed_plan, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
+        let (_, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
         assert!(
-            changed,
-            "rule should fire on expression-vs-column equi-key; plan was:\n{plan}"
-        );
-        assert!(
-            find_propagated_side(&transformed_plan).is_some(),
-            "rule fired but produced no propagated-filter marker; plan was:\n{transformed_plan}"
-        );
-
-        // Cycle prevention: running the rule a second time must be a no-op
-        // (the unified Display-keyed cycle guard tracks the InSubquery target
-        // expression, not just column targets).
-        let (_, changed2) = apply_rule_to_all_joins(&r, transformed_plan, &cfg)?;
-        assert!(
-            !changed2,
-            "second pass must not re-propagate (cycle guard) on expression target"
+            !changed,
+            "rule must not fire on expression-vs-column equi-key; plan was:\n{plan}"
         );
         Ok(())
     }
@@ -1667,6 +1832,65 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn q17_shaped_aggregate_propagates_using_group_key_domain() -> Result<()> {
+        // CH-benCH q17 joins a large outer `order_line` scan to an aggregate
+        // over `item ⋈ order_line`. The aggregate subtree contains a large
+        // fact scan, but the propagated `i_id` domain is bounded by `item`, so
+        // the ratio gate should still allow the q17 pruning path.
+        let ctx = SessionContext::new();
+        let item_schema = Arc::new(Schema::new(vec![
+            Field::new("i_id", DataType::Int64, false),
+            Field::new("i_data", DataType::Utf8, true),
+        ]));
+        let order_line_schema = Arc::new(Schema::new(vec![
+            Field::new("ol_i_id", DataType::Int64, false),
+            Field::new("ol_quantity", DataType::Int64, false),
+        ]));
+        ctx.register_table(
+            "item",
+            Arc::new(StatMemTable::try_new(
+                Arc::clone(&item_schema),
+                vec![vec![]],
+                100_000,
+            )?),
+        )?;
+        ctx.register_table(
+            "order_line",
+            Arc::new(StatMemTable::try_new(
+                Arc::clone(&order_line_schema),
+                vec![vec![]],
+                5_000_000,
+            )?),
+        )?;
+
+        let plan = ctx
+            .sql(
+                "SELECT sum(ol_outer.ol_quantity) FROM order_line ol_outer, \
+                 (SELECT i_id, avg(ol_inner.ol_quantity) AS a \
+                  FROM item, order_line ol_inner \
+                  WHERE i_data LIKE '%b' AND ol_inner.ol_i_id = i_id \
+                  GROUP BY i_id) t \
+                 WHERE ol_outer.ol_i_id = t.i_id AND ol_outer.ol_quantity < t.a",
+            )
+            .await?
+            .into_optimized_plan()?;
+
+        let r = rule();
+        let cfg = datafusion::optimizer::OptimizerContext::new();
+        let (transformed_plan, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
+
+        assert!(
+            changed,
+            "rule should keep q17-shaped aggregate propagation; plan was:\n{plan}"
+        );
+        assert!(
+            find_propagated_side(&transformed_plan).is_some(),
+            "rule fired but produced no propagated-filter marker; plan was:\n{transformed_plan}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn key_preserved_through_summaries_rejects_aggregate_without_key_in_group() -> Result<()> {
         // Sanity-check the helper: an aggregate that does NOT group by `a`
@@ -1700,41 +1924,50 @@ mod tests {
     }
 
     #[test]
-    fn subtree_upper_bound_rows_sums_stats_across_dim_subtree() -> Result<()> {
+    fn cardinality_gate_uses_key_domain_and_fact_ratio() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let key = Column::new(Some("dim"), "k");
 
         // Single scan: row count is reported directly.
-        let small = stat_table_scan("t", &schema, 500)?;
+        let small = stat_table_scan("dim", &schema, 500)?;
         assert_eq!(subtree_upper_bound_rows(&small), Some(500));
+        assert_eq!(key_domain_upper_bound_rows(&small, &key), Some(500));
 
-        // Below the dim threshold → gate fires (skip propagation).
-        let fact = stat_table_scan("t", &schema, 1_000_000)?;
-        assert!(skip_propagation_by_cardinality(&small, &fact));
+        // Large fact-to-dim ratio → gate is silent.
+        let fact = stat_table_scan("fact", &schema, 1_000_000)?;
+        assert!(!skip_propagation_by_cardinality(&small, &fact, &key));
 
-        // Above the dim threshold + above the fact threshold → gate is silent.
-        let big_dim = stat_table_scan("t", &schema, 5_000)?;
-        assert!(!skip_propagation_by_cardinality(&big_dim, &fact));
+        // Comparable sides → gate fires to avoid adding a semi-join that is
+        // unlikely to pay for itself.
+        let big_dim = stat_table_scan("dim", &schema, 50_000)?;
+        let comparable_fact = stat_table_scan("fact", &schema, 200_000)?;
+        assert!(skip_propagation_by_cardinality(
+            &big_dim,
+            &comparable_fact,
+            &key
+        ));
 
         // Below the fact threshold → gate fires from the fact side.
-        let tiny_fact = stat_table_scan("t", &schema, 50_000)?;
-        assert!(skip_propagation_by_cardinality(&big_dim, &tiny_fact));
+        let tiny_fact = stat_table_scan("fact", &schema, 50_000)?;
+        assert!(skip_propagation_by_cardinality(&big_dim, &tiny_fact, &key));
 
         Ok(())
     }
 
     #[test]
-    fn skip_propagation_by_cardinality_skips_when_dim_stats_absent() -> Result<()> {
+    fn skip_propagation_by_cardinality_allows_when_stats_absent() -> Result<()> {
         // MemTable doesn't expose row counts via `TableProvider::statistics()`,
-        // so the gate must skip propagation
+        // so the gate must allow the structural safety checks to decide.
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
         let provider = Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]])?);
         let source = Arc::new(DefaultTableSource::new(provider));
         let scan = LogicalPlanBuilder::scan("t", source, None)?.build()?;
+        let key = Column::new(Some("t"), "k");
 
         assert_eq!(subtree_upper_bound_rows(&scan), None);
         assert!(
-            skip_propagation_by_cardinality(&scan, &scan),
-            "absent dim-side stats must trigger skip"
+            !skip_propagation_by_cardinality(&scan, &scan, &key),
+            "absent stats must not trigger the cardinality gate"
         );
         Ok(())
     }

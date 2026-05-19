@@ -236,6 +236,14 @@ impl RuntimeBuilder {
         // URL tables are opt-in via `runtime.params.url_tables=enabled`
         let url_tables_enabled =
             spicepod_rt.params.get("url_tables").map(String::as_str) == Some("enabled");
+        let cayenne_sort_merge_min_rows =
+            parse_usize_runtime_param(&spicepod_rt.params, "cayenne_sort_merge_min_rows");
+        let cayenne_sort_merge_memory_pool_fraction = parse_f64_runtime_param(
+            &spicepod_rt.params,
+            "cayenne_sort_merge_memory_pool_fraction",
+        );
+        let cayenne_filter_propagation_enabled =
+            parse_cayenne_filter_propagation(&spicepod_rt.params).is_enabled();
 
         let caching = Runtime::init_caching(Some(&spicepod_rt.caching));
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
@@ -381,7 +389,10 @@ impl RuntimeBuilder {
         .with_caching(caching)
         .with_metrics(metrics)
         .with_resource_monitor(resource_monitor.clone())
-        .with_url_tables(url_tables_enabled);
+        .with_url_tables(url_tables_enabled)
+        .cayenne_sort_merge_min_rows(cayenne_sort_merge_min_rows)
+        .cayenne_sort_merge_memory_pool_fraction(cayenne_sort_merge_memory_pool_fraction)
+        .cayenne_filter_propagation_enabled(cayenne_filter_propagation_enabled);
 
         if let Some(DistributedNode::Scheduler {
             executor_registry,
@@ -628,6 +639,73 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
     }
 }
 
+fn parse_usize_runtime_param(params: &HashMap<String, String>, key: &str) -> Option<usize> {
+    let raw = params.get(key)?;
+    if raw.eq_ignore_ascii_case("usize::MAX") || raw.eq_ignore_ascii_case("max") {
+        return Some(usize::MAX);
+    }
+
+    match raw.parse::<usize>() {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::warn!(
+                "runtime.params.{key}={raw:?} is not a valid usize ({e}); using default"
+            );
+            None
+        }
+    }
+}
+
+fn parse_f64_runtime_param(params: &HashMap<String, String>, key: &str) -> Option<f64> {
+    let raw = params.get(key)?;
+    match raw.parse::<f64>() {
+        Ok(value) if value.is_finite() && value >= 0.0 => Some(value),
+        Ok(_) => {
+            tracing::warn!(
+                "runtime.params.{key}={raw:?} must be a finite non-negative number; using default"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                "runtime.params.{key}={raw:?} is not a valid number ({e}); using default"
+            );
+            None
+        }
+    }
+}
+
+const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CayenneFilterPropagation {
+    Disabled,
+    Enabled,
+}
+
+impl CayenneFilterPropagation {
+    fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+fn parse_cayenne_filter_propagation(params: &HashMap<String, String>) -> CayenneFilterPropagation {
+    let Some(raw) = params.get(CAYENNE_FILTER_PROPAGATION_PARAM) else {
+        return CayenneFilterPropagation::Disabled;
+    };
+
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "enabled" => CayenneFilterPropagation::Enabled,
+        "disabled" => CayenneFilterPropagation::Disabled,
+        _ => {
+            tracing::warn!(
+                "runtime.params.{CAYENNE_FILTER_PROPAGATION_PARAM}={raw:?} must be 'enabled' or 'disabled'; using disabled"
+            );
+            CayenneFilterPropagation::Disabled
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -670,5 +748,81 @@ mod test {
             let result = parse_memory_limit(input.map(ToString::to_string));
             assert_eq!(result, expected, "Input: {input:?}");
         }
+    }
+
+    #[test]
+    fn test_parse_usize_runtime_param() {
+        let params = HashMap::from([
+            (
+                "cayenne_sort_merge_min_rows".to_string(),
+                "100000000".to_string(),
+            ),
+            ("disabled".to_string(), "usize::MAX".to_string()),
+            ("bad".to_string(), "not-a-number".to_string()),
+        ]);
+
+        assert_eq!(
+            parse_usize_runtime_param(&params, "cayenne_sort_merge_min_rows"),
+            Some(100_000_000)
+        );
+        assert_eq!(
+            parse_usize_runtime_param(&params, "disabled"),
+            Some(usize::MAX)
+        );
+        assert_eq!(parse_usize_runtime_param(&params, "bad"), None);
+        assert_eq!(parse_usize_runtime_param(&params, "missing"), None);
+    }
+
+    #[test]
+    fn test_parse_f64_runtime_param() {
+        let params = HashMap::from([
+            (
+                "cayenne_sort_merge_memory_pool_fraction".to_string(),
+                "0.25".to_string(),
+            ),
+            ("negative".to_string(), "-1.0".to_string()),
+            ("nan".to_string(), "NaN".to_string()),
+            ("bad".to_string(), "nope".to_string()),
+        ]);
+
+        assert_eq!(
+            parse_f64_runtime_param(&params, "cayenne_sort_merge_memory_pool_fraction"),
+            Some(0.25)
+        );
+        assert_eq!(parse_f64_runtime_param(&params, "negative"), None);
+        assert_eq!(parse_f64_runtime_param(&params, "nan"), None);
+        assert_eq!(parse_f64_runtime_param(&params, "bad"), None);
+        assert_eq!(parse_f64_runtime_param(&params, "missing"), None);
+    }
+
+    #[test]
+    fn test_parse_cayenne_filter_propagation() {
+        let params = HashMap::from([(
+            CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
+            "enabled".to_string(),
+        )]);
+
+        assert_eq!(
+            parse_cayenne_filter_propagation(&params),
+            CayenneFilterPropagation::Enabled
+        );
+        assert_eq!(
+            parse_cayenne_filter_propagation(&HashMap::from([(
+                CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
+                "disabled".to_string(),
+            )])),
+            CayenneFilterPropagation::Disabled
+        );
+        assert_eq!(
+            parse_cayenne_filter_propagation(&HashMap::from([(
+                CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
+                "true".to_string(),
+            )])),
+            CayenneFilterPropagation::Disabled
+        );
+        assert_eq!(
+            parse_cayenne_filter_propagation(&HashMap::new()),
+            CayenneFilterPropagation::Disabled
+        );
     }
 }

@@ -17,8 +17,8 @@ limitations under the License.
 use arrow_schema::SchemaRef;
 use async_stream::stream;
 use data_components::{
-    cdc::ChangesStream,
-    kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics},
+    cdc::{ChangesStream, CommitError},
+    kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset, KafkaOffsetCommitHook},
 };
 use dataformat_json::{SpiceJsonOptions, unnest_struct_schema};
 use datafusion::catalog::TableProvider;
@@ -303,17 +303,19 @@ impl DataConnector for Kafka {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        ensure!(
-            dataset.is_accelerated(),
-            super::InvalidConfigurationNoSourceSnafu {
+        let Some(acceleration) = dataset
+            .acceleration
+            .as_ref()
+            .filter(|acceleration| acceleration.enabled)
+        else {
+            return super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "kafka",
                 message: "The Kafka data connector requires an accelerated dataset. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka",
                 connector_component: ConnectorComponent::from(dataset),
             }
-        );
-        let Some(ref acceleration) = dataset.acceleration else {
-            unreachable!("Dataset acceleration already verified. This should never be None here.");
+            .fail();
         };
+
         ensure!(
             acceleration.refresh_mode == Some(RefreshMode::Append),
             super::InvalidConfigurationNoSourceSnafu {
@@ -323,12 +325,34 @@ impl DataConnector for Kafka {
             }
         );
 
-        let dataset_name = dataset.name.to_string();
+        let kafka_sys = if dataset.is_file_accelerated() {
+            Some(Arc::new(
+                KafkaSys::try_new(dataset, OpenOption::CreateIfNotExists)
+                    .await
+                    .boxed()
+                    .context(super::UnableToGetReadProviderSnafu {
+                        dataconnector: "kafka",
+                        connector_component: ConnectorComponent::from(dataset),
+                    })?,
+            ))
+        } else {
+            tracing::warn!(
+                dataset = %dataset.name,
+                "Kafka dataset is not file-accelerated. Connector state is ephemeral and the stream will restart on every runtime restart"
+            );
+            None
+        };
 
         let topic = dataset.path();
 
-        let (kafka_consumer, schema) =
-            init_kafka_consumer(dataset, topic, &self.config, &self.json_options).await?;
+        let (kafka_consumer, schema) = init_kafka_consumer(
+            dataset,
+            topic,
+            &self.config,
+            &self.json_options,
+            kafka_sys.as_deref(),
+        )
+        .await?;
 
         let refresh_sql = dataset.refresh_sql();
         let schema = if let Some(refresh_sql) = &refresh_sql {
@@ -345,17 +369,16 @@ impl DataConnector for Kafka {
             schema
         };
 
-        if !dataset.is_file_accelerated() {
-            tracing::warn!(
-                "Dataset {dataset_name} is not file accelerated. This may result in full message replay from Kafka on restarts. It is recommended to use file acceleration with the Kafka connector for optimal performance. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka",
-            );
+        let mut kafka = data_components::kafka::Kafka::new(schema, kafka_consumer)
+            .with_flatten_json(self.json_options.flatten_json.clone())
+            .with_batching(self.batching);
+
+        if let Some(kafka_sys) = kafka_sys {
+            kafka =
+                kafka.with_offset_commit_hook(Arc::new(SidecarOffsetCommitHook::new(kafka_sys)));
         }
 
-        Ok(Arc::new(
-            data_components::kafka::Kafka::new(schema, kafka_consumer)
-                .with_flatten_json(self.json_options.flatten_json.clone())
-                .with_batching(self.batching),
-        ))
+        Ok(Arc::new(kafka))
     }
 
     fn supports_append_stream(&self) -> bool {
@@ -427,9 +450,23 @@ async fn init_kafka_consumer(
     topic: &str,
     kafka_config: &KafkaConfig,
     json_options: &Arc<SpiceJsonOptions>,
+    kafka_sys: Option<&KafkaSys>,
 ) -> super::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
-    let Some(metadata) = get_metadata_from_accelerator(dataset).await else {
-        return bootstrap_new_kafka_consumer(dataset, topic, kafka_config, json_options).await;
+    let metadata = if let Some(kafka_sys) = kafka_sys {
+        get_metadata_from_accelerator(kafka_sys)
+            .await
+            .boxed()
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "kafka",
+                connector_component: ConnectorComponent::from(dataset),
+            })?
+    } else {
+        None
+    };
+
+    let Some(metadata) = metadata else {
+        return bootstrap_new_kafka_consumer(dataset, topic, kafka_config, json_options, kafka_sys)
+            .await;
     };
 
     ensure!(
@@ -474,6 +511,14 @@ async fn init_kafka_consumer(
             connector_component: ConnectorComponent::from(dataset),
         })?;
 
+    kafka_consumer
+        .restore_offsets(&metadata.offsets)
+        .boxed()
+        .context(super::UnableToGetReadProviderSnafu {
+            dataconnector: "kafka",
+            connector_component: ConnectorComponent::from(dataset),
+        })?;
+
     Ok((kafka_consumer, metadata.schema))
 }
 
@@ -482,21 +527,57 @@ pub(crate) struct KafkaMetadata {
     pub(crate) consumer_group_id: String,
     pub(crate) topic: String,
     pub(crate) schema: SchemaRef,
+    #[serde(default)]
+    pub(crate) offsets: Vec<KafkaOffset>,
 }
 
-async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<KafkaMetadata> {
-    let kafka_sys = KafkaSys::try_new(dataset, OpenOption::OpenExisting)
-        .await
-        .ok()?;
+async fn get_metadata_from_accelerator(
+    kafka_sys: &KafkaSys,
+) -> Result<Option<KafkaMetadata>, spice_sys::Error> {
     kafka_sys.get().await
 }
 
 async fn set_metadata_to_accelerator(
-    dataset: &Dataset,
+    kafka_sys: &KafkaSys,
     metadata: &KafkaMetadata,
 ) -> Result<(), spice_sys::Error> {
-    let kafka_sys = KafkaSys::try_new(dataset, OpenOption::CreateIfNotExists).await?;
     kafka_sys.upsert(metadata).await
+}
+
+#[async_trait]
+pub(crate) trait SidecarOffsetStore: Send + Sync {
+    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> spice_sys::Result<()>;
+}
+
+#[async_trait]
+impl SidecarOffsetStore for KafkaSys {
+    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> spice_sys::Result<()> {
+        KafkaSys::upsert_offsets(self, offsets).await
+    }
+}
+
+pub(crate) struct SidecarOffsetCommitHook<T> {
+    store: Arc<T>,
+}
+
+impl<T> SidecarOffsetCommitHook<T> {
+    pub(crate) fn new(store: Arc<T>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl<T> KafkaOffsetCommitHook for SidecarOffsetCommitHook<T>
+where
+    T: SidecarOffsetStore,
+{
+    async fn commit_offsets(&self, offsets: &[KafkaOffset]) -> Result<(), CommitError> {
+        self.store
+            .upsert_offsets(offsets)
+            .await
+            .boxed()
+            .map_err(|e| CommitError::UnableToCommitChange { source: e })
+    }
 }
 
 async fn bootstrap_new_kafka_consumer(
@@ -504,6 +585,7 @@ async fn bootstrap_new_kafka_consumer(
     topic: &str,
     kafka_config: &KafkaConfig,
     json_options: &Arc<SpiceJsonOptions>,
+    kafka_sys: Option<&KafkaSys>,
 ) -> super::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
     let kafka_consumer = KafkaConsumer::create_for_dataset(
@@ -578,10 +660,11 @@ async fn bootstrap_new_kafka_consumer(
         consumer_group_id: kafka_consumer.group_id().to_string(),
         topic: topic.to_string(),
         schema: Arc::clone(&schema),
+        offsets: Vec::new(),
     };
 
-    if dataset.is_file_accelerated() {
-        set_metadata_to_accelerator(dataset, &metadata)
+    if let Some(kafka_sys) = kafka_sys {
+        set_metadata_to_accelerator(kafka_sys, &metadata)
             .await
             .boxed()
             .context(super::UnableToGetReadProviderSnafu {

@@ -116,10 +116,10 @@ jobs:
             "$SPICEPOD_VALIDATOR" "$file"
           done
 
-      - name: Validate spicepods - CH-BenCHmark - SF1
+      - name: Validate spicepods - CH-BenCHmark
         run: |
           shopt -s globstar nullglob
-          for file in ./test/spicepods/chbench/sf1/**/*.yaml; do
+          for file in ./test/spicepods/chbench/**/*.yaml; do
             echo "Validating $file"
             "$SPICEPOD_VALIDATOR" "$file"
           done
@@ -283,11 +283,11 @@ jobs:
             "$SPICEPOD_VALIDATOR" "$file"
           done
 
-      - name: Validate spicepods - CH-BenCHmark - SF1
+      - name: Validate spicepods - CH-BenCHmark
         if: ${{ github.event.inputs.workflow_type == 'htap' }}
         run: |
           shopt -s globstar nullglob
-          for file in ./test/spicepods/chbench/sf1/**/*.yaml; do
+          for file in ./test/spicepods/chbench/**/*.yaml; do
             echo "Validating $file"
             "$SPICEPOD_VALIDATOR" "$file"
           done
