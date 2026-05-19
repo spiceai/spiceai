@@ -1,0 +1,8 @@
+tests:
+  htap:
+    spicepod_path: accelerated/postgres-cayenne[file].yaml
+    runner_type: spiceai-dev-large-runner
+    scale_factor: 100
+    terminals: 100
+    duration: 600
+    ready_wait: 600
