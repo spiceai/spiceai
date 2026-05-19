@@ -431,10 +431,8 @@ fn try_rewrite_large_same_source_join(
     let should_rewrite = match (memory_gate_bytes, estimated_build_bytes) {
         // Memory gate active + byte estimate available — byte gate alone decides.
         (Some(gate_bytes), Some(bytes)) => bytes > gate_bytes,
-        // Memory gate active but no byte estimate — fall back to row gate.
-        (Some(_), None) => row_gate_passes,
-        // No memory gate configured — pure row-count gate.
-        (None, _) => row_gate_passes,
+        // Memory gate active but no byte estimate, or no gate configured — fall back to row gate.
+        (Some(_), None) | (None, _) => row_gate_passes,
     };
 
     if !should_rewrite {
@@ -2171,10 +2169,8 @@ mod tests {
         // `build_side_memory_estimate`'s hash-table overhead factor. Well below
         // the 10M row threshold but well above the 64 KB byte gate below.
         let small_rows = Precision::Exact(200_000);
-        let left =
-            cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", small_rows);
-        let right =
-            cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", small_rows);
+        let left = cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", small_rows);
+        let right = cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", small_rows);
         let join = Arc::new(hash_join_with_join_type(
             left,
             right,
@@ -2190,7 +2186,10 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.as_any().downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized
+                .as_any()
+                .downcast_ref::<SortMergeJoinExec>()
+                .is_some(),
             "low-row-count + wide-row build exceeding the byte gate should be rewritten to sort-merge"
         );
     }
