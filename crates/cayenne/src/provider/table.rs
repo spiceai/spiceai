@@ -3067,6 +3067,8 @@ impl CayenneTableProvider {
                 .await?;
         let inlined_row_count = catalog.get_inlined_data_count(&table_id).await?;
 
+        let force_staging_probe_on_startup = table_metadata.path.starts_with("s3://");
+
         // Register the S3 object store in the shared RuntimeEnv once during
         // construction. Every code path that creates a SessionContext from
         // `self.context.runtime_env()` (e.g. `create_session_context`, keyset
@@ -3122,8 +3124,15 @@ impl CayenneTableProvider {
                 batches: Arc::new(Vec::new()),
                 view: Arc::new(Vec::new()),
             }))),
-            staging_wal_present: Arc::new(AtomicBool::new(true)),
-            staging_may_have_files: Arc::new(AtomicBool::new(true)),
+            // Local providers can use `ensure_no_incomplete_write`'s
+            // non-destructive fast path: it probes `_staging/` and returns if
+            // the directory is absent or empty. Starting every provider in the
+            // dirty state makes concurrent read-only opens race while removing
+            // and recreating the same staging directory. S3 keeps the forced
+            // probe because the fast path intentionally avoids an object-store
+            // list when both flags are clear.
+            staging_wal_present: Arc::new(AtomicBool::new(force_staging_probe_on_startup)),
+            staging_may_have_files: Arc::new(AtomicBool::new(force_staging_probe_on_startup)),
             inflight_staging_appends: Arc::new(ParkingMutex::new(HashSet::new())),
             new_files_since_last_compaction: Arc::new(AtomicUsize::new(0)),
             compaction_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -4762,7 +4771,9 @@ impl CayenneTableProvider {
                         DeletionIdentifier::KeyBased(keys) => Some(keys),
                         DeletionIdentifier::PositionBased { .. } => None,
                     })
-                    .expect("RowConverterBased branch must produce a KeyBased write result");
+                    .ok_or_else(|| CatalogError::InvalidOperationNoSource {
+                        message: "RowConverterBased on-conflict deletion did not produce a key-based write result".to_string(),
+                    })?;
                 let current = deletion_snapshot.load_full();
                 let updated_deleted = current.deleted_row_keys.extend_max(
                     written_keys
@@ -4770,11 +4781,9 @@ impl CayenneTableProvider {
                         .map(|key| (key.clone(), delete_sequence)),
                 );
                 let deleted_count = updated_deleted.len();
-                let updated_inserts = current.insert_records.extend_max(
-                    written_keys
-                        .into_iter()
-                        .map(|key| (key, insert_sequence)),
-                );
+                let updated_inserts = current
+                    .insert_records
+                    .extend_max(written_keys.into_iter().map(|key| (key, insert_sequence)));
                 let insert_count = updated_inserts.len();
                 deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_indices(
                     updated_deleted,
@@ -7631,17 +7640,17 @@ impl CayenneTableProvider {
             PkDeletionSnapshot::RowConverterBased {
                 deleted_row_keys, ..
             } => {
-                if let Some(ref row_converter) = self.pk_row_converter {
-                    if !deleted_row_keys.is_empty() {
-                        return Ok(Arc::new(KeyBasedDeletionFilterExec::new(
-                            plan,
-                            Arc::clone(deleted_row_keys),
-                            KeyDeletionIndex::shared_empty(),
-                            pk_indices_in_projection.to_vec(),
-                            Arc::clone(row_converter),
-                            None,
-                        )));
-                    }
+                if let Some(ref row_converter) = self.pk_row_converter
+                    && !deleted_row_keys.is_empty()
+                {
+                    return Ok(Arc::new(KeyBasedDeletionFilterExec::new(
+                        plan,
+                        Arc::clone(deleted_row_keys),
+                        KeyDeletionIndex::shared_empty(),
+                        pk_indices_in_projection.to_vec(),
+                        Arc::clone(row_converter),
+                        None,
+                    )));
                 }
             }
             PkDeletionSnapshot::PositionBased => {

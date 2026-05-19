@@ -103,10 +103,7 @@ fn current_clone_then_build(deleted: &Vec<Box<[u8]>>) -> (Vec<Box<[u8]>>, Vec<Ve
 /// the original `deleted` into the deletion-spec position. Saves one
 /// `Vec<Box<[u8]>>` clone (N `Box<[u8]>` allocations).
 fn proposed_move_then_build(deleted: Vec<Box<[u8]>>) -> (Vec<Box<[u8]>>, Vec<Vec<u8>>) {
-    let pk_bytes_list: Vec<Vec<u8>> = deleted
-        .iter()
-        .map(|key| key.as_ref().to_vec())
-        .collect();
+    let pk_bytes_list: Vec<Vec<u8>> = deleted.iter().map(|key| key.as_ref().to_vec()).collect();
     // No clone — `deleted` is the caller's owned vector. After this point
     // the borrow above is released so the move is legal.
     (deleted, pk_bytes_list)
