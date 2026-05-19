@@ -92,7 +92,7 @@ async fn test_retention_filters_apply_on_insert_impl(
 
     // Retention runs asynchronously via the post-write maintenance scheduler;
     // drain it before asserting on the delete file.
-    table_provider.flush_pending_maintenance().await;
+    table_provider.flush_pending_maintenance().await?;
 
     // Retention should have created a delete file containing row IDs 0 and 1.
     let delete_files = table_provider

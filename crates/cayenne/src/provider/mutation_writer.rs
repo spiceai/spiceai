@@ -41,11 +41,9 @@ limitations under the License.
 //! - the table has any on-conflict deletions
 //! - the table has `sort_columns` configured
 //! - the table is partitioned
-//! - the table has write-time retention delete filters
 //!
 //! Those paths can't be safely deferred to Stage B because they require holding
-//! state (deletion vectors, sort order, retention pruning) until the visibility
-//! flip is durable.
+//! state (deletion vectors, sort order) until the visibility flip is durable.
 //!
 //! ## Inline-memtable admission
 //!
@@ -231,7 +229,7 @@ impl<'a> AppendMutationWriter<'a> {
         // under `write_lock`. Now that retention is scheduled via
         // `PostWriteMaintenance`, the pipelined path can run for retention-
         // configured tables — the bg scheduler picks up the retention request
-        // after publish (see `CayenneStagedAppend::finish`).
+        // after publish (see `CayenneCdcWrite::finish`).
         let can_stage_for_pipeline = !pending_pk_deletions
             && !may_have_on_conflict_deletions
             && self.table.metadata().partition_column.is_none();

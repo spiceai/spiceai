@@ -289,6 +289,11 @@ impl PostWriteMaintenanceState {
     }
 }
 
+enum RetentionFailureAction {
+    Requeue,
+    ReturnError,
+}
+
 #[derive(Default)]
 struct PostWriteMaintenance {
     state: ParkingMutex<PostWriteMaintenanceState>,
@@ -5197,20 +5202,31 @@ impl CayenneTableProvider {
     ///
     /// Loops until both (a) the queued maintenance state is empty AND (b) the
     /// background loop is not active (so no iteration is mid-flight). Within
-    /// each pass, queued state is drained synchronously; if the background
-    /// loop is still active afterward, the caller yields briefly and re-checks.
-    pub async fn flush_pending_maintenance(&self) {
+    /// each pass, queued state is drained synchronously; if retention fails
+    /// while flushing, the error is returned instead of re-queueing, avoiding
+    /// an unbounded synchronous retry loop during tests or shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if retention maintenance fails while the explicit flush
+    /// is draining queued work.
+    pub async fn flush_pending_maintenance(&self) -> CatalogResult<()> {
         loop {
             let state = {
                 let mut guard = self.post_write_maintenance.state.lock();
                 std::mem::take(&mut *guard)
             };
             if !state.is_empty() {
-                self.run_maintenance_state(state).await;
+                self.run_maintenance_state(state, RetentionFailureAction::ReturnError)
+                    .await?;
                 continue;
             }
-            if !self.post_write_maintenance.scheduled.load(Ordering::Acquire) {
-                return;
+            if !self
+                .post_write_maintenance
+                .scheduled
+                .load(Ordering::Acquire)
+            {
+                return Ok(());
             }
             // The background loop has the state lock and is mid-iteration.
             // Wait briefly and re-check; we cannot drain its work from here,
@@ -5227,7 +5243,11 @@ impl CayenneTableProvider {
     /// Listing-table refresh is deferred until after retention so the pass
     /// rebuilds the listing at most once, even when both
     /// `state.refresh_listing` is set and retention deletes rows.
-    async fn run_maintenance_state(&self, state: PostWriteMaintenanceState) {
+    async fn run_maintenance_state(
+        &self,
+        state: PostWriteMaintenanceState,
+        retention_failure_action: RetentionFailureAction,
+    ) -> CatalogResult<()> {
         let had_stats = state.stats.is_some();
         if let Some(stats) = state.stats {
             self.persist_table_stats(&stats).await;
@@ -5246,39 +5266,44 @@ impl CayenneTableProvider {
                     }
                 }
                 Err(e) => {
-                    // Re-queue so the next debounce cycle retries. A
-                    // persistently failing retention scan would otherwise leave
-                    // expired rows undeleted indefinitely; re-queueing makes
-                    // delivery eventual and the repeated error log
-                    // observable. Logged at `error` (not `warn`) because the
-                    // retry semantics turn a single failure into a steady
-                    // signal worth alerting on.
-                    tracing::error!(
-                        table = self.table_metadata.table_name.as_str(),
-                        "Background retention scan failed: {e}. Re-queueing for retry."
-                    );
-                    self.post_write_maintenance
-                        .state
-                        .lock()
-                        .retention_requested = true;
+                    match retention_failure_action {
+                        RetentionFailureAction::Requeue => {
+                            // Re-queue so the next debounce cycle retries. A
+                            // persistently failing retention scan would
+                            // otherwise leave expired rows undeleted
+                            // indefinitely; re-queueing makes delivery eventual
+                            // and the repeated error log observable. Logged at
+                            // `error` (not `warn`) because the retry semantics
+                            // turn a single failure into a steady signal worth
+                            // alerting on.
+                            tracing::error!(
+                                table = self.table_metadata.table_name.as_str(),
+                                "Background retention scan failed: {e}. Re-queueing for retry."
+                            );
+                            self.post_write_maintenance.state.lock().retention_requested = true;
+                        }
+                        RetentionFailureAction::ReturnError => return Err(e),
+                    }
                 }
             }
         }
 
         // One refresh per pass, deferred until after retention so deleted
         // rows are reflected in the rebuilt listing table.
-        if state.refresh_listing || retention_deleted > 0 {
-            if let Err(e) = self.refresh_listing_table().await {
-                tracing::warn!(
-                    table = self.table_metadata.table_name.as_str(),
-                    "Post-write listing refresh failed: {e}"
-                );
-            }
+        if (state.refresh_listing || retention_deleted > 0)
+            && let Err(e) = self.refresh_listing_table().await
+        {
+            tracing::warn!(
+                table = self.table_metadata.table_name.as_str(),
+                "Post-write listing refresh failed: {e}"
+            );
         }
 
         if state.refresh_listing || had_stats || retention_deleted > 0 {
             self.schedule_post_write_compaction();
         }
+
+        Ok(())
     }
 
     async fn run_post_write_maintenance_loop(self) {
@@ -5290,7 +5315,15 @@ impl CayenneTableProvider {
                 std::mem::take(&mut *guard)
             };
 
-            self.run_maintenance_state(state).await;
+            if let Err(e) = self
+                .run_maintenance_state(state, RetentionFailureAction::Requeue)
+                .await
+            {
+                tracing::error!(
+                    table = self.table_metadata.table_name.as_str(),
+                    "Post-write maintenance failed: {e}"
+                );
+            }
 
             self.post_write_maintenance
                 .scheduled
