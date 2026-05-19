@@ -11,6 +11,7 @@ runtime:
     cdc_commit_timeout_ms: '60000'
     cayenne_sort_merge_min_rows: '50000000'
   query:
+    memory_limit: 40GiB
     target_partitions: 32
 
 datasets:
