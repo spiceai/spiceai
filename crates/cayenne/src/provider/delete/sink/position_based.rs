@@ -667,21 +667,11 @@ impl CayenneDeletionSink {
                 .count();
             new_deletion_count += newly_added_for_file;
 
-            // Deletion vector must contain ALL deleted positions (existing + new).
-            let mut combined_ids: Vec<u64> = existing_deletion.map_or_else(Vec::new, |deletion| {
-                deletion.iter().map(u64::from).collect()
-            });
-            combined_ids.extend(unique_new_row_ids.iter().copied());
-            combined_ids.sort_unstable();
-            combined_ids.dedup();
-            specs.push(DeletionVectorWriteSpec::new_position_based(
-                file_path.clone(),
-                combined_ids,
-            ));
-
-            // Pre-build updated cache bitmap (u32 representable positions only).
-            // Clone only THIS file's bitmap; unchanged file bitmaps remain
-            // shared through their existing `Arc`s in the outer map snapshot.
+            // Union existing + new into one bitmap, then derive the writer-bound
+            // `Vec<u64>` from its monotone iterator — saves a separate
+            // `Vec<u64> + sort/dedup` pass. See `position_delete_redundant_walks`
+            // bench. Only THIS file's bitmap is cloned; unchanged file bitmaps
+            // stay shared through `Arc`s in the outer snapshot.
             let mut updated_bitmap = existing_deletion
                 .map_or_else(RoaringBitmap::new, |deletion_vector| {
                     deletion_vector.to_bitmap()
@@ -691,6 +681,13 @@ impl CayenneDeletionSink {
                     .iter()
                     .filter_map(|&id| u32::try_from(id).ok()),
             );
+
+            let combined_ids: Vec<u64> = updated_bitmap.iter().map(u64::from).collect();
+            specs.push(DeletionVectorWriteSpec::new_position_based(
+                file_path.clone(),
+                combined_ids,
+            ));
+
             cache_updates.insert(
                 file_path.clone(),
                 Arc::new(PositionDeletionVector::new(updated_bitmap)),

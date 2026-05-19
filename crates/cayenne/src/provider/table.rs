@@ -401,6 +401,18 @@ impl CayenneCdcWrite {
     }
 }
 
+/// Joint accumulator state held under a single mutex so `update()` and
+/// `merge_from()` only pay one acquire per batch. `seeded[i]` is `true`
+/// once column i has been assigned its first batch — the first batch is
+/// assigned directly (not merged) because `StatsSet::default()` is
+/// `merge_unordered`'s identity-less "unknown" and merging into it drops
+/// the new stats.
+#[derive(Debug, Default)]
+struct ColumnStatsState {
+    columns: Vec<vortex::array::stats::StatsSet>,
+    seeded: Vec<bool>,
+}
+
 /// Accumulates per-column statistics across multiple `RecordBatch`es during a write.
 ///
 /// Builds Vortex [`StatsSet`] objects per column (min, max, null count) and tracks
@@ -412,13 +424,7 @@ impl CayenneCdcWrite {
 /// [`StatsSet`]: vortex::array::stats::StatsSet
 #[derive(Debug)]
 pub(crate) struct ColumnStatsAccumulator {
-    /// Per-column accumulated stats as Vortex `StatsSet`
-    columns: std::sync::Mutex<Vec<vortex::array::stats::StatsSet>>,
-    /// Per-column "has any batch been merged yet" flag. The first batch is
-    /// assigned directly (not merged) because `StatsSet::default()` represents
-    /// "unknown" — and `merge_unordered(unknown, known) == unknown`, which
-    /// would silently drop the first batch's stats.
-    columns_seeded: std::sync::Mutex<Vec<bool>>,
+    state: std::sync::Mutex<ColumnStatsState>,
     /// Column dtypes (Vortex types, derived from Arrow schema)
     dtypes: Vec<vortex::dtype::DType>,
     /// Total accumulated row count across all batches
@@ -431,7 +437,6 @@ impl ColumnStatsAccumulator {
     /// Create a new accumulator for the given schema.
     pub(crate) fn new(schema: &arrow_schema::Schema) -> Self {
         let num_cols = schema.fields().len();
-        let columns = vec![vortex::array::stats::StatsSet::default(); num_cols];
         let dtypes: Vec<vortex::dtype::DType> = schema
             .fields()
             .iter()
@@ -447,8 +452,10 @@ impl ColumnStatsAccumulator {
             })
             .collect();
         Self {
-            columns: std::sync::Mutex::new(columns),
-            columns_seeded: std::sync::Mutex::new(vec![false; num_cols]),
+            state: std::sync::Mutex::new(ColumnStatsState {
+                columns: vec![vortex::array::stats::StatsSet::default(); num_cols],
+                seeded: vec![false; num_cols],
+            }),
             dtypes,
             row_count: std::sync::atomic::AtomicI64::new(0),
             schema: schema.clone(),
@@ -457,12 +464,8 @@ impl ColumnStatsAccumulator {
 
     /// Update accumulated stats from a `RecordBatch`.
     pub(crate) fn update(&self, batch: &RecordBatch) {
-        let Ok(mut cols) = self.columns.lock() else {
+        let Ok(mut state) = self.state.lock() else {
             tracing::warn!("ColumnStatsAccumulator: mutex poisoned in update(), skipping");
-            return;
-        };
-        let Ok(mut seeded) = self.columns_seeded.lock() else {
-            tracing::warn!("ColumnStatsAccumulator: seeded-mutex poisoned in update(), skipping");
             return;
         };
 
@@ -478,7 +481,7 @@ impl ColumnStatsAccumulator {
         );
 
         for (i, col) in batch.columns().iter().enumerate() {
-            if i >= cols.len() || i >= self.dtypes.len() || i >= seeded.len() {
+            if i >= state.columns.len() || i >= self.dtypes.len() || i >= state.seeded.len() {
                 continue;
             }
 
@@ -492,12 +495,12 @@ impl ColumnStatsAccumulator {
             // first batch's stats. On subsequent batches, merge using the
             // commutative unordered merge so statistics stay correct
             // regardless of the order batches arrive in.
-            if seeded[i] {
-                let existing = std::mem::take(&mut cols[i]);
-                cols[i] = existing.merge_unordered(&batch_stats, &self.dtypes[i]);
+            if state.seeded[i] {
+                let existing = std::mem::take(&mut state.columns[i]);
+                state.columns[i] = existing.merge_unordered(&batch_stats, &self.dtypes[i]);
             } else {
-                cols[i] = batch_stats;
-                seeded[i] = true;
+                state.columns[i] = batch_stats;
+                state.seeded[i] = true;
             }
         }
     }
@@ -788,27 +791,15 @@ impl ColumnStatsAccumulator {
         }
 
         let (other_columns, other_seeded) = {
-            let Ok(cols) = other.columns.lock() else {
+            let Ok(other_state) = other.state.lock() else {
                 tracing::warn!("ColumnStatsAccumulator: mutex poisoned in merge_from(), skipping");
                 return;
             };
-            let Ok(seeded) = other.columns_seeded.lock() else {
-                tracing::warn!(
-                    "ColumnStatsAccumulator: seeded-mutex poisoned in merge_from(), skipping"
-                );
-                return;
-            };
-            (cols.clone(), seeded.clone())
+            (other_state.columns.clone(), other_state.seeded.clone())
         };
 
-        let Ok(mut cols) = self.columns.lock() else {
+        let Ok(mut state) = self.state.lock() else {
             tracing::warn!("ColumnStatsAccumulator: mutex poisoned in merge_from(), skipping");
-            return;
-        };
-        let Ok(mut seeded) = self.columns_seeded.lock() else {
-            tracing::warn!(
-                "ColumnStatsAccumulator: seeded-mutex poisoned in merge_from(), skipping"
-            );
             return;
         };
 
@@ -819,20 +810,20 @@ impl ColumnStatsAccumulator {
         );
 
         for (idx, other_stats) in other_columns.into_iter().enumerate() {
-            if idx >= cols.len()
-                || idx >= seeded.len()
+            if idx >= state.columns.len()
+                || idx >= state.seeded.len()
                 || idx >= self.dtypes.len()
                 || !other_seeded.get(idx).copied().unwrap_or(false)
             {
                 continue;
             }
 
-            if seeded[idx] {
-                let existing = std::mem::take(&mut cols[idx]);
-                cols[idx] = existing.merge_unordered(&other_stats, &self.dtypes[idx]);
+            if state.seeded[idx] {
+                let existing = std::mem::take(&mut state.columns[idx]);
+                state.columns[idx] = existing.merge_unordered(&other_stats, &self.dtypes[idx]);
             } else {
-                cols[idx] = other_stats;
-                seeded[idx] = true;
+                state.columns[idx] = other_stats;
+                state.seeded[idx] = true;
             }
         }
     }
@@ -842,14 +833,14 @@ impl ColumnStatsAccumulator {
         if row_count == 0 {
             return None;
         }
-        let Ok(cols) = self.columns.lock() else {
+        let Ok(state) = self.state.lock() else {
             tracing::warn!(
                 "ColumnStatsAccumulator: mutex poisoned in to_file_statistics_blob(), returning None"
             );
             return None;
         };
 
-        let file_stats = crate::stats::build_file_statistics(cols.clone(), &self.schema);
+        let file_stats = crate::stats::build_file_statistics(state.columns.clone(), &self.schema);
         match crate::stats::serialize_file_statistics(&file_stats) {
             Ok(bytes) => Some((bytes, row_count)),
             Err(e) => {
@@ -860,14 +851,19 @@ impl ColumnStatsAccumulator {
     }
 
     fn merged_file_statistics_blob(&self, existing_blob: &[u8]) -> Option<Vec<u8>> {
-        let Ok(cols) = self.columns.lock() else {
+        let Ok(state) = self.state.lock() else {
             tracing::warn!(
                 "ColumnStatsAccumulator: mutex poisoned in merged_file_statistics_blob(), returning None"
             );
             return None;
         };
 
-        crate::stats::merge_serialized_stats(existing_blob, &cols, &self.dtypes, &self.schema)
+        crate::stats::merge_serialized_stats(
+            existing_blob,
+            &state.columns,
+            &self.dtypes,
+            &self.schema,
+        )
     }
 }
 
@@ -1043,6 +1039,11 @@ impl OnConflictExt for OnConflict {
 #[derive(Debug, Clone, Default)]
 struct CachedTableStatistics {
     optimizer: Option<Statistics>,
+    /// Pre-converted `to_inexact` view of `optimizer`. Populated at every
+    /// cache write so the overlay-active scan path skips a per-call
+    /// per-column transform. See `cached_table_statistics_wide` bench.
+    /// `None` falls back to computing on-the-fly from `optimizer`.
+    optimizer_inexact: Option<Statistics>,
     /// Raw blob last read from (or written to) the catalog.
     /// Allows `persist_table_stats_locked` to attempt an in-memory merge
     /// and avoid a catalog GET on the common steady-state path.
@@ -3088,6 +3089,9 @@ impl CayenneTableProvider {
             listing_fence: Arc::new(tokio::sync::RwLock::new(())),
             scan_listing_tables: Arc::new(ParkingMutex::new(HashMap::new())),
             table_statistics: Arc::new(RwLock::new(CachedTableStatistics {
+                optimizer_inexact: table_statistics
+                    .as_ref()
+                    .map(|s| Self::statistics_to_inexact(s.clone())),
                 optimizer: table_statistics,
                 raw: None, // will be populated on first load/persist
             })),
@@ -3610,7 +3614,18 @@ impl CayenneTableProvider {
         let has_pending_visibility_changes =
             self.has_pending_deletions() || self.inlined_row_count.load(Ordering::Relaxed) > 0;
 
-        let stats = self.table_statistics.read().optimizer.clone()?;
+        let cache = self.table_statistics.read();
+        let stats = if has_pending_visibility_changes {
+            // Prefer the pre-converted inexact cache; fall back to transforming
+            // on-the-fly if the cache hasn't been populated yet (e.g. test seed).
+            match cache.optimizer_inexact.clone() {
+                Some(inexact) => inexact,
+                None => Self::statistics_to_inexact(cache.optimizer.clone()?),
+            }
+        } else {
+            cache.optimizer.clone()?
+        };
+        drop(cache);
 
         if stats.column_statistics.len() > TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT {
             tracing::trace!(
@@ -3619,17 +3634,10 @@ impl CayenneTableProvider {
                 full_column_sync_limit = TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT,
                 "Returning top-level table statistics only for wide table"
             );
-            return Some(Self::top_level_statistics_only(
-                &stats,
-                has_pending_visibility_changes,
-            ));
+            return Some(Self::top_level_statistics_only(&stats, false));
         }
 
-        if has_pending_visibility_changes {
-            Some(Self::statistics_to_inexact(stats))
-        } else {
-            Some(stats)
-        }
+        Some(stats)
     }
 
     fn top_level_statistics_only(stats: &Statistics, inexact: bool) -> Statistics {
@@ -3677,6 +3685,7 @@ impl CayenneTableProvider {
     fn clear_cached_table_statistics_unlocked(&self) {
         let mut cache = self.table_statistics.write();
         cache.optimizer = None;
+        cache.optimizer_inexact = None;
         cache.raw = None;
     }
 
@@ -4636,15 +4645,16 @@ impl CayenneTableProvider {
 
         // For on-conflict (upsert) handling, use key-based deletion vectors.
         // Position-based tables don't support upserts, so we always use row keys here.
-        // Build the row keys based on the deletion strategy:
-        // - Int64Pk: Convert i64 values to 8-byte big-endian representations
-        // - RowConverterBased: Use the provided row keys directly
+        // Move `deleted_row_keys` into the spec; the cache-extend block below
+        // takes owned keys from the write result so we avoid a Vec<Box<[u8]>>
+        // clone plus the per-element clones for both extend_max calls. See
+        // `benches/apply_on_conflict_keys_double_clone.rs`.
         let row_keys_for_deletion: Vec<Box<[u8]>> = match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk { .. } => deleted_pk_i64
                 .iter()
                 .map(|&pk| pk.to_be_bytes().to_vec().into_boxed_slice())
                 .collect(),
-            PkDeletionStrategyWithCache::RowConverterBased { .. } => deleted_row_keys.clone(),
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => deleted_row_keys,
             PkDeletionStrategyWithCache::PositionBased { .. } => {
                 // Position-based tables don't support upserts
                 vec![]
@@ -4742,17 +4752,28 @@ impl CayenneTableProvider {
                 );
             }
             PkDeletionStrategyWithCache::RowConverterBased { deletion_snapshot } => {
+                // Consume `results` to take owned `Box<[u8]>` keys; the second
+                // extend_max then MOVES them in instead of cloning. The branch
+                // is invariantly the sole `KeyBased` producer (one spec built
+                // above, results non-empty by the early-return at 4669).
+                let written_keys: Vec<Box<[u8]>> = results
+                    .into_iter()
+                    .find_map(|r| match r.identifiers {
+                        DeletionIdentifier::KeyBased(keys) => Some(keys),
+                        DeletionIdentifier::PositionBased { .. } => None,
+                    })
+                    .expect("RowConverterBased branch must produce a KeyBased write result");
                 let current = deletion_snapshot.load_full();
                 let updated_deleted = current.deleted_row_keys.extend_max(
-                    deleted_row_keys
+                    written_keys
                         .iter()
                         .map(|key| (key.clone(), delete_sequence)),
                 );
                 let deleted_count = updated_deleted.len();
                 let updated_inserts = current.insert_records.extend_max(
-                    deleted_row_keys
-                        .iter()
-                        .map(|key| (key.clone(), insert_sequence)),
+                    written_keys
+                        .into_iter()
+                        .map(|key| (key, insert_sequence)),
                 );
                 let insert_count = updated_inserts.len();
                 deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_indices(
@@ -6257,8 +6278,12 @@ impl CayenneTableProvider {
         }
 
         let df_stats = Self::table_statistics_to_df(&self.table_metadata.schema, &stats);
+        let df_stats_inexact = df_stats
+            .as_ref()
+            .map(|s| Self::statistics_to_inexact(s.clone()));
         let mut cache = self.table_statistics.write();
         cache.optimizer = df_stats;
+        cache.optimizer_inexact = df_stats_inexact;
         // Keep the raw blob for the next persist to avoid a catalog read.
         cache.raw = Some(stats);
     }
@@ -7534,11 +7559,10 @@ impl CayenneTableProvider {
                         )
                     })?;
 
-                let empty_insert_records = Arc::new(DeletionIndex::empty());
                 Ok(Arc::new(Int64PkDeletionFilterExec::new(
                     plan,
                     Arc::clone(deleted_pk_values),
-                    empty_insert_records,
+                    DeletionIndex::shared_empty(),
                     pk_column_index,
                     Some(min_delete_seq_to_apply),
                 )))
@@ -7554,11 +7578,10 @@ impl CayenneTableProvider {
                         return Ok(Arc::new(CayenneAccelerationExec::new(plan)));
                     }
 
-                    let empty_insert_records = Arc::new(KeyDeletionIndex::empty());
                     Ok(Arc::new(KeyBasedDeletionFilterExec::new(
                         plan,
                         Arc::clone(deleted_row_keys),
-                        empty_insert_records,
+                        KeyDeletionIndex::shared_empty(),
                         pk_indices_in_projection.to_vec(),
                         Arc::clone(row_converter),
                         Some(min_delete_seq_to_apply),
@@ -7585,10 +7608,8 @@ impl CayenneTableProvider {
             PkDeletionSnapshot::Int64Pk {
                 deleted_pk_values, ..
             } => {
-                // Don't use insert_records for protected snapshot approach
-                // The protected snapshots already handle new data without filtering
-                let empty_insert_records = Arc::new(DeletionIndex::empty());
-
+                // Protected snapshots already handle new data without filtering,
+                // so insert_records is the shared-static empty index.
                 if !deleted_pk_values.is_empty() {
                     let pk_column_index =
                         pk_indices_in_projection.first().copied().ok_or_else(|| {
@@ -7601,7 +7622,7 @@ impl CayenneTableProvider {
                     return Ok(Arc::new(Int64PkDeletionFilterExec::new(
                         plan,
                         Arc::clone(deleted_pk_values),
-                        empty_insert_records,
+                        DeletionIndex::shared_empty(),
                         pk_column_index,
                         None,
                     )));
@@ -7611,14 +7632,11 @@ impl CayenneTableProvider {
                 deleted_row_keys, ..
             } => {
                 if let Some(ref row_converter) = self.pk_row_converter {
-                    // Don't use insert_records for protected snapshot approach
-                    let empty_insert_records = Arc::new(KeyDeletionIndex::empty());
-
                     if !deleted_row_keys.is_empty() {
                         return Ok(Arc::new(KeyBasedDeletionFilterExec::new(
                             plan,
                             Arc::clone(deleted_row_keys),
-                            empty_insert_records,
+                            KeyDeletionIndex::shared_empty(),
                             pk_indices_in_projection.to_vec(),
                             Arc::clone(row_converter),
                             None,

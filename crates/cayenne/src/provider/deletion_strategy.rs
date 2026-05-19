@@ -74,10 +74,6 @@ impl PositionDeletionVector {
         self.row_ids.contains(row_id)
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = u32> + '_ {
-        self.row_ids.iter()
-    }
-
     #[must_use]
     pub(crate) fn to_bitmap(&self) -> RoaringBitmap {
         self.row_ids.clone()
