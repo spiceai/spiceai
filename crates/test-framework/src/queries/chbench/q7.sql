@@ -4,7 +4,7 @@ SELECT
     extract(year FROM o_entry_d) AS l_year,
     sum(ol_amount) AS revenue
 FROM
-    supplier, stock, order_line, orders, customer, nation n1, nation n2
+    supplier, stock, order_line, oorder, customer, nation n1, nation n2
 WHERE
     ol_supply_w_id = s_w_id
     AND ol_i_id = s_i_id

@@ -9,7 +9,7 @@ WHERE
     AND c_balance > (SELECT avg(c_balance) FROM customer
                      WHERE c_balance > 0.00
                        AND substr(c_phone,1,1) IN ('1','2','3','4','5','6','7'))
-    AND NOT EXISTS (SELECT * FROM orders
+    AND NOT EXISTS (SELECT * FROM oorder
                     WHERE o_c_id = c_id
                       AND o_w_id = c_w_id
                       AND o_d_id = c_d_id)

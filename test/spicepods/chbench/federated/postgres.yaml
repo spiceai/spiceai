@@ -22,8 +22,8 @@ datasets:
   - from: postgres:history
     name: history
     params: *postgres_params
-  - from: postgres:orders
-    name: orders
+  - from: postgres:oorder
+    name: oorder
     params: *postgres_params
   - from: postgres:new_order
     name: new_order
