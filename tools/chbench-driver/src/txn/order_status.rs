@@ -106,7 +106,7 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
     // SELECT latest order
     let o_row = tx
         .query_opt(
-            "SELECT o_id, o_carrier_id, o_entry_d FROM orders WHERE o_w_id = $1 AND o_d_id = $2 AND o_c_id = $3 ORDER BY o_id DESC LIMIT 1",
+            "SELECT o_id, o_carrier_id, o_entry_d FROM oorder WHERE o_w_id = $1 AND o_d_id = $2 AND o_c_id = $3 ORDER BY o_id DESC LIMIT 1",
             &[&w_id, &d_id, &c_id],
         )
         .await
