@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::kafka::{MessageBatchCommitter, inject_ready_signal_on_caught_up};
+use crate::kafka::{
+    KafkaOffsetCommitHook, MessageBatchCommitter, inject_ready_signal_on_caught_up,
+};
 use crate::{
     cdc::{self, ChangeEnvelope, ChangesStream},
     debezium::{
@@ -43,6 +45,7 @@ pub struct DebeziumKafka {
     constraints: Option<Constraints>,
     consumer: &'static KafkaConsumer,
     batching: (usize, Duration),
+    offset_commit_hook: Option<Arc<dyn KafkaOffsetCommitHook>>,
 }
 
 impl std::fmt::Debug for DebeziumKafka {
@@ -88,7 +91,17 @@ impl DebeziumKafka {
             constraints,
             consumer: Box::leak(Box::new(consumer)),
             batching,
+            offset_commit_hook: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_offset_commit_hook(
+        mut self,
+        offset_commit_hook: Arc<dyn KafkaOffsetCommitHook>,
+    ) -> Self {
+        self.offset_commit_hook = Some(offset_commit_hook);
+        self
     }
 
     #[must_use]
@@ -102,6 +115,7 @@ impl DebeziumKafka {
         let primary_keys = self.primary_keys.clone();
         let consumer = self.consumer;
         let metrics = Arc::clone(self.consumer.metrics());
+        let offset_commit_hook = self.offset_commit_hook.clone();
         let inner = self
             .consumer
             .stream_json::<ChangeEventKey, ChangeEvent>()
@@ -127,7 +141,8 @@ impl DebeziumKafka {
                 let rb = changes::vector_to_change_batch(&schema, &pk, &changes)
                     .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
 
-                let committer = MessageBatchCommitter::from_messages(consumer, &messages);
+                let committer = MessageBatchCommitter::from_messages(consumer, &messages)
+                    .with_offset_commit_hook(offset_commit_hook.clone());
 
                 Ok(ChangeEnvelope::new(Box::new(committer), rb, true))
             });

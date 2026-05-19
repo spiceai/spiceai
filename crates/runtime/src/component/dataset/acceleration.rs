@@ -106,6 +106,37 @@ impl Display for Mode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageProfile {
+    #[default]
+    Auto,
+    LocalSsd,
+    Ebs,
+    Tmpfs,
+}
+
+impl From<spicepod_acceleration::StorageProfile> for StorageProfile {
+    fn from(storage: spicepod_acceleration::StorageProfile) -> Self {
+        match storage {
+            spicepod_acceleration::StorageProfile::Auto => StorageProfile::Auto,
+            spicepod_acceleration::StorageProfile::LocalSsd => StorageProfile::LocalSsd,
+            spicepod_acceleration::StorageProfile::Ebs => StorageProfile::Ebs,
+            spicepod_acceleration::StorageProfile::Tmpfs => StorageProfile::Tmpfs,
+        }
+    }
+}
+
+impl Display for StorageProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StorageProfile::Auto => write!(f, "auto"),
+            StorageProfile::LocalSsd => write!(f, "local_ssd"),
+            StorageProfile::Ebs => write!(f, "ebs"),
+            StorageProfile::Tmpfs => write!(f, "tmpfs"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum RefreshOnStartup {
     /// Always start a new refresh when Spice starts.
@@ -321,6 +352,8 @@ pub struct Acceleration {
 
     pub write_mode: spicepod_acceleration::WriteMode,
 
+    pub storage_profile: StorageProfile,
+
     pub disable_federation: bool,
 
     pub partition_by: Vec<PartitionedBy>,
@@ -524,6 +557,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             primary_key,
             on_conflict,
             write_mode: acceleration.write_mode,
+            storage_profile: StorageProfile::from(acceleration.storage_profile),
             partition_by: acceleration.partition_by,
             snapshot_behavior: SnapshotBehavior::disabled(),
             snapshots_trigger: acceleration.snapshots_trigger,
@@ -567,6 +601,7 @@ impl Default for Acceleration {
             primary_key: None,
             on_conflict: HashMap::default(),
             write_mode: spicepod_acceleration::WriteMode::default(),
+            storage_profile: StorageProfile::default(),
             disable_federation: false,
             refresh_on_startup: RefreshOnStartup::default(),
             partition_by: vec![],
@@ -754,5 +789,16 @@ mod tests {
         let parsed = Acceleration::try_from(acceleration).expect("acceleration should parse");
         assert!(!parsed.params.contains_key("hash_index"));
         assert!(!parsed.is_hash_index_enabled());
+    }
+
+    #[test]
+    fn test_storage_profile_is_parsed_from_spicepod_acceleration() {
+        let acceleration = spicepod_acceleration::Acceleration {
+            storage_profile: spicepod_acceleration::StorageProfile::Ebs,
+            ..Default::default()
+        };
+
+        let parsed = Acceleration::try_from(acceleration).expect("acceleration should parse");
+        assert_eq!(parsed.storage_profile, StorageProfile::Ebs);
     }
 }

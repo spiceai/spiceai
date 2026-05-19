@@ -818,6 +818,7 @@ async fn doput_refresh_and_assert(
 }
 
 #[tokio::test]
+#[ignore = "Requires non-distributed Cayenne catalog support: https://github.com/spiceai/spiceai/issues/9942"]
 async fn test_cayenne_doput_upsert_cycle_stale() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -1203,6 +1204,7 @@ impl CayenneTestHarness {
 ///
 /// Each scenario uses its own table so failures are independent.
 #[test]
+#[ignore = "Requires non-distributed Cayenne catalog support: https://github.com/spiceai/spiceai/issues/9942"]
 fn test_cayenne_dml_comprehensive() -> Result<(), String> {
     const STACK_SIZE: usize = 16 * 1024 * 1024;
 

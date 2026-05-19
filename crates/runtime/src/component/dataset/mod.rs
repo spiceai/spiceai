@@ -188,6 +188,37 @@ impl From<UnsupportedTypeAction> for datafusion_table_providers::UnsupportedType
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum OnSchemaChange {
+    #[default]
+    Block,
+    Fail,
+    AppendNewColumns,
+    SyncAllColumns,
+}
+
+impl From<spicepod_dataset::OnSchemaChange> for OnSchemaChange {
+    fn from(on_schema_change: spicepod_dataset::OnSchemaChange) -> Self {
+        match on_schema_change {
+            spicepod_dataset::OnSchemaChange::Block => OnSchemaChange::Block,
+            spicepod_dataset::OnSchemaChange::Fail => OnSchemaChange::Fail,
+            spicepod_dataset::OnSchemaChange::AppendNewColumns => OnSchemaChange::AppendNewColumns,
+            spicepod_dataset::OnSchemaChange::SyncAllColumns => OnSchemaChange::SyncAllColumns,
+        }
+    }
+}
+
+impl Display for OnSchemaChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OnSchemaChange::Block => write!(f, "block"),
+            OnSchemaChange::Fail => write!(f, "fail"),
+            OnSchemaChange::AppendNewColumns => write!(f, "append_new_columns"),
+            OnSchemaChange::SyncAllColumns => write!(f, "sync_all_columns"),
+        }
+    }
+}
+
 /// Controls when the table is marked ready for queries.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum ReadyState {
@@ -268,6 +299,7 @@ pub struct Dataset {
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Arc<App>,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
+    pub on_schema_change: OnSchemaChange,
     pub ready_state: ReadyState,
     pub metrics: Metrics,
     pub runtime: Arc<Runtime>,
@@ -295,6 +327,7 @@ impl std::fmt::Debug for Dataset {
             .field("embeddings", &self.embeddings)
             .field("app", &self.app)
             .field("unsupported_type_action", &self.unsupported_type_action)
+            .field("on_schema_change", &self.on_schema_change)
             .field("ready_state", &self.ready_state)
             .field("metrics", &self.metrics)
             .field("vectors", &self.vectors)
@@ -323,6 +356,7 @@ impl PartialEq for Dataset {
             && self.embeddings == other.embeddings
             && self.columns == other.columns
             && self.metrics == other.metrics
+            && self.on_schema_change == other.on_schema_change
             && self.vectors == other.vectors
             && self.full_text_search == other.full_text_search
             && self.check_availability == other.check_availability

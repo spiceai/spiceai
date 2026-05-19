@@ -19,7 +19,10 @@ use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::metrics::MetricsProvider;
 use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::DebeziumKafkaSys};
-use crate::dataconnector::ConnectorComponent;
+use crate::dataconnector::{
+    ConnectorComponent,
+    kafka::{SidecarOffsetCommitHook, SidecarOffsetStore},
+};
 use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
 use arrow::datatypes::SchemaRef;
@@ -29,7 +32,7 @@ use data_components::cdc::ChangesStream;
 use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
-use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics};
+use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset};
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -68,6 +71,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Debezium {
     kafka_config: KafkaConfig,
     batching: (usize, Duration),
+    schema_evolution: bool,
 }
 
 impl Debezium {
@@ -165,9 +169,19 @@ impl Debezium {
             .and_then(|v| fundu::parse_duration(v).ok())
             .unwrap_or(Duration::from_secs(1));
 
+        let schema_evolution = params
+            .get("schema_evolution")
+            .expose()
+            .ok()
+            .unwrap_or("false")
+            .to_string()
+            .parse()
+            .unwrap_or(false);
+
         Ok(Self {
             kafka_config,
             batching: (batch_max_size, batch_max_duration),
+            schema_evolution,
         })
     }
 }
@@ -230,6 +244,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("batch_max_duration")
         .description("Maximum time to wait for a batch to fill before processing")
         .default("1s"),
+    ParameterSpec::runtime("schema_evolution")
+        .default("false")
+        .description("Enable automatic schema evolution detection on reload. When true, the connector peeks at the latest Kafka message to detect schema changes. Default: false."),
 ];
 
 impl DataConnectorFactory for DebeziumFactory {
@@ -272,17 +289,19 @@ impl DataConnector for Debezium {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        ensure!(
-            dataset.is_accelerated(),
-            super::InvalidConfigurationNoSourceSnafu {
+        let Some(acceleration) = dataset
+            .acceleration
+            .as_ref()
+            .filter(|acceleration| acceleration.enabled)
+        else {
+            return super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
                 message: "The Debezium data connector requires an accelerated dataset. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
                 connector_component: ConnectorComponent::from(dataset),
             }
-        );
-        let Some(ref acceleration) = dataset.acceleration else {
-            unreachable!("Dataset acceleration already verified. This should never be None here.");
+            .fail();
         };
+
         ensure!(
             self.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Changes,
             super::InvalidConfigurationNoSourceSnafu {
@@ -294,16 +313,40 @@ impl DataConnector for Debezium {
 
         let dataset_name = dataset.name.to_string();
 
-        if !dataset.is_file_accelerated() {
+        let debezium_kafka_sys = if dataset.is_file_accelerated() {
+            Some(Arc::new(
+                DebeziumKafkaSys::try_new(dataset, OpenOption::CreateIfNotExists)
+                    .await
+                    .boxed()
+                    .context(super::UnableToGetReadProviderSnafu {
+                        dataconnector: "debezium",
+                        connector_component: ConnectorComponent::from(dataset),
+                    })?,
+            ))
+        } else {
             tracing::warn!(
-                "Dataset {dataset_name} is not file accelerated, which forces full change replay on restarts. It is recommended only to use file acceleration with the Debezium connector. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+                dataset = %dataset_name,
+                "Debezium dataset is not file-accelerated. Connector state is ephemeral and the stream will restart on every runtime restart"
             );
-        }
+            None
+        };
 
         let topic = dataset.path();
 
-        let (kafka_consumer, metadata, schema) = match get_metadata_from_accelerator(dataset).await
-        {
+        let metadata_from_accelerator =
+            if let Some(debezium_kafka_sys) = debezium_kafka_sys.as_deref() {
+                get_metadata_from_accelerator(debezium_kafka_sys)
+                    .await
+                    .boxed()
+                    .context(super::UnableToGetReadProviderSnafu {
+                        dataconnector: "debezium",
+                        connector_component: ConnectorComponent::from(dataset),
+                    })?
+            } else {
+                None
+            };
+
+        let (kafka_consumer, metadata, schema) = match metadata_from_accelerator {
             Some(metadata) => {
                 if let Some(config_consumer_group_id) = &self.kafka_config.consumer_group_id {
                     ensure!(
@@ -341,14 +384,27 @@ impl DataConnector for Debezium {
                     }
                 );
 
-                let schema = debezium::arrow::convert_fields_to_arrow_schema(
-                    metadata.schema_fields.iter().collect(),
-                )
-                .boxed()
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "debezium",
-                    connector_component: ConnectorComponent::from(dataset),
-                })?;
+                let (metadata, schema) = if self.schema_evolution {
+                    // Check for schema evolution by peeking at the latest Kafka message
+                    refresh_schema_if_evolved(
+                        metadata,
+                        dataset,
+                        topic,
+                        &self.kafka_config,
+                        debezium_kafka_sys.as_deref(),
+                    )
+                    .await?
+                } else {
+                    let schema = debezium::arrow::convert_fields_to_arrow_schema(
+                        metadata.schema_fields.iter().collect(),
+                    )
+                    .boxed()
+                    .context(super::UnableToGetReadProviderSnafu {
+                        dataconnector: "debezium",
+                        connector_component: ConnectorComponent::from(dataset),
+                    })?;
+                    (metadata, Arc::new(schema))
+                };
 
                 kafka_consumer.subscribe(topic).boxed().context(
                     super::UnableToGetReadProviderSnafu {
@@ -357,9 +413,25 @@ impl DataConnector for Debezium {
                     },
                 )?;
 
-                (kafka_consumer, metadata, Arc::new(schema))
+                kafka_consumer
+                    .restore_offsets(&metadata.offsets)
+                    .boxed()
+                    .context(super::UnableToGetReadProviderSnafu {
+                        dataconnector: "debezium",
+                        connector_component: ConnectorComponent::from(dataset),
+                    })?;
+
+                (kafka_consumer, metadata, schema)
             }
-            None => get_metadata_from_kafka(dataset, topic, &self.kafka_config).await?,
+            None => {
+                get_metadata_from_kafka(
+                    dataset,
+                    topic,
+                    &self.kafka_config,
+                    debezium_kafka_sys.as_deref(),
+                )
+                .await?
+            }
         };
 
         ensure!(
@@ -394,14 +466,20 @@ impl DataConnector for Debezium {
             schema
         };
 
-        let debezium_kafka = Arc::new(DebeziumKafka::new(
+        let mut debezium_kafka = DebeziumKafka::new(
             refresh_schema,
             metadata.primary_keys,
             kafka_consumer,
             self.batching,
-        ));
+        );
 
-        Ok(debezium_kafka)
+        if let Some(debezium_kafka_sys) = debezium_kafka_sys {
+            debezium_kafka = debezium_kafka.with_offset_commit_hook(Arc::new(
+                SidecarOffsetCommitHook::new(debezium_kafka_sys),
+            ));
+        }
+
+        Ok(Arc::new(debezium_kafka))
     }
 
     fn supports_changes_stream(&self) -> bool {
@@ -447,28 +525,35 @@ pub(crate) struct DebeziumKafkaMetadata {
     pub(crate) topic: String,
     pub(crate) primary_keys: Vec<String>,
     pub(crate) schema_fields: Vec<change_event::Field>,
+    #[serde(default)]
+    pub(crate) offsets: Vec<KafkaOffset>,
 }
 
-async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<DebeziumKafkaMetadata> {
-    let debezium_kafka_sys = DebeziumKafkaSys::try_new(dataset, OpenOption::OpenExisting)
-        .await
-        .ok()?;
+async fn get_metadata_from_accelerator(
+    debezium_kafka_sys: &DebeziumKafkaSys,
+) -> Result<Option<DebeziumKafkaMetadata>, spice_sys::Error> {
     debezium_kafka_sys.get().await
 }
 
 async fn set_metadata_to_accelerator(
-    dataset: &Dataset,
+    debezium_kafka_sys: &DebeziumKafkaSys,
     metadata: &DebeziumKafkaMetadata,
 ) -> Result<(), spice_sys::Error> {
-    let debezium_kafka_sys =
-        DebeziumKafkaSys::try_new(dataset, OpenOption::CreateIfNotExists).await?;
     debezium_kafka_sys.upsert(metadata).await
+}
+
+#[async_trait]
+impl SidecarOffsetStore for DebeziumKafkaSys {
+    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> spice_sys::Result<()> {
+        DebeziumKafkaSys::upsert_offsets(self, offsets).await
+    }
 }
 
 async fn get_metadata_from_kafka(
     dataset: &Dataset,
     topic: &str,
     kafka_config: &KafkaConfig,
+    debezium_kafka_sys: Option<&DebeziumKafkaSys>,
 ) -> super::DataConnectorResult<(KafkaConsumer, DebeziumKafkaMetadata, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
     let kafka_consumer = KafkaConsumer::create_for_dataset(
@@ -535,10 +620,11 @@ async fn get_metadata_from_kafka(
         topic: topic.to_string(),
         primary_keys,
         schema_fields: schema_fields.into_iter().cloned().collect(),
+        offsets: Vec::new(),
     };
 
-    if dataset.is_file_accelerated() {
-        set_metadata_to_accelerator(dataset, &metadata)
+    if let Some(debezium_kafka_sys) = debezium_kafka_sys {
+        set_metadata_to_accelerator(debezium_kafka_sys, &metadata)
             .await
             .boxed()
             .context(super::UnableToGetReadProviderSnafu {
@@ -557,4 +643,87 @@ async fn get_metadata_from_kafka(
         })?;
 
     Ok((kafka_consumer, metadata, Arc::new(schema)))
+}
+
+/// Peek at the latest Kafka message to detect schema evolution. If the schema has
+/// changed from the cached metadata, update the stored metadata and return the fresh
+/// schema. Falls back to the cached schema if the peek fails or no messages are available.
+async fn refresh_schema_if_evolved(
+    metadata: DebeziumKafkaMetadata,
+    dataset: &Dataset,
+    topic: &str,
+    kafka_config: &KafkaConfig,
+    debezium_kafka_sys: Option<&DebeziumKafkaSys>,
+) -> super::DataConnectorResult<(DebeziumKafkaMetadata, SchemaRef)> {
+    let dataset_name = dataset.name.to_string();
+
+    let cached_schema =
+        debezium::arrow::convert_fields_to_arrow_schema(metadata.schema_fields.iter().collect())
+            .boxed()
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "debezium",
+                connector_component: ConnectorComponent::from(dataset),
+            })?;
+
+    // Try to peek at the latest Kafka message for the current schema
+    let peek_result = KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
+        topic,
+        kafka_config,
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let value = match peek_result {
+        Ok(Some((_key, value))) => value,
+        Ok(None) => {
+            tracing::debug!(
+                "Could not peek at latest Kafka message for schema check on dataset {dataset_name}. Using cached schema."
+            );
+            return Ok((metadata, Arc::new(cached_schema)));
+        }
+        Err(e) => {
+            tracing::debug!(
+                "Failed to peek at latest Kafka message for schema check on dataset {dataset_name}: {e}. Using cached schema."
+            );
+            return Ok((metadata, Arc::new(cached_schema)));
+        }
+    };
+
+    let Some(fresh_fields) = value.get_schema_fields() else {
+        return Ok((metadata, Arc::new(cached_schema)));
+    };
+
+    let fresh_schema = match debezium::arrow::convert_fields_to_arrow_schema(fresh_fields.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to convert fresh schema from Kafka for {dataset_name}: {e}. Using cached schema."
+            );
+            return Ok((metadata, Arc::new(cached_schema)));
+        }
+    };
+
+    if fresh_schema == cached_schema {
+        return Ok((metadata, Arc::new(cached_schema)));
+    }
+
+    tracing::info!("Detected schema evolution for dataset {dataset_name}. Updating cached schema.");
+
+    let updated_metadata = DebeziumKafkaMetadata {
+        consumer_group_id: metadata.consumer_group_id,
+        topic: metadata.topic,
+        primary_keys: metadata.primary_keys,
+        schema_fields: fresh_fields.into_iter().cloned().collect(),
+        offsets: metadata.offsets,
+    };
+
+    if let Some(debezium_kafka_sys) = debezium_kafka_sys
+        && let Err(e) = set_metadata_to_accelerator(debezium_kafka_sys, &updated_metadata).await
+    {
+        tracing::warn!(
+            "Failed to persist updated schema for {dataset_name}: {e}. Using fresh schema in-memory only."
+        );
+    }
+
+    Ok((updated_metadata, Arc::new(fresh_schema)))
 }

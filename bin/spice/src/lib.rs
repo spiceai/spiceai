@@ -28,6 +28,7 @@ pub mod commands;
 pub mod context;
 pub mod error;
 pub mod github;
+pub mod manifest;
 pub mod output;
 pub mod registry;
 

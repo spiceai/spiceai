@@ -73,6 +73,7 @@ iceberg-datafusion.workspace = true
 imap = { workspace = true, optional = true }
 indexmap.workspace = true
 logos.workspace = true
+mongodb = { workspace = true, optional = true }
 mailparse = { workspace = true, optional = true }
 mysql_async = { workspace = true, optional = true }
 native-tls = { workspace = true, optional = true }
@@ -89,6 +90,7 @@ rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex.workspace = true
 reqwest.workspace = true
 runtime-rate-control = { path = "../runtime-rate-control" }
+runtime-request-context = { path = "../runtime-request-context" }
 rusqlite = { workspace = true, optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 s3_vectors_metadata_filter = { path = "../s3_vectors_metadata_filter", optional = true }
@@ -154,7 +156,7 @@ elasticsearch = ["dep:elasticsearch"]
 flightsql = []
 imap = ["dep:charset", "dep:imap", "dep:mailparse"]
 kafka = ["dep:rdkafka"]
-mongodb = ["datafusion-table-providers/mongodb"]
+mongodb = ["dep:mongodb", "datafusion-table-providers/mongodb"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
 mysql = [
     "dep:mysql_async",
@@ -222,3 +224,8 @@ required-features = ["bench"]
 [[bench]]
 harness = false
 name = "object_filter"
+
+[[bench]]
+harness = false
+name = "mongodb_change_stream"
+required-features = ["mongodb"]

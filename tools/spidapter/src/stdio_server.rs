@@ -129,6 +129,10 @@ struct SetupConfig {
     region: Option<String>,
     endpoint: Option<String>,
     sink_type: Option<EtlSinkType>,
+    /// Absolute path to a spicepod the client wants deployed verbatim
+    /// (testoperator's cluster-bench path passes this; spicebench leaves it
+    /// empty and relies on the `datasets` JSON-RPC parameter instead).
+    spicepod_path: Option<String>,
 }
 
 impl SetupConfig {
@@ -137,6 +141,7 @@ impl SetupConfig {
             region: metadata_string(metadata, "etl_region"),
             endpoint: metadata_string(metadata, "etl_endpoint"),
             sink_type: None,
+            spicepod_path: metadata_string(metadata, "spicepod_path"),
         }
     }
 
@@ -281,6 +286,30 @@ impl Handler for SpidapterHandler {
             );
         }
 
+        // Advertise the cluster's HTTP query endpoint so testoperator (or any
+        // other client) can drive the Ballista `/v1/queries` path and the
+        // `/v1/ready` probe at the correct region URL. Without this the client
+        // would have to guess the URL from the Flight host, which fails for
+        // region-prefixed Spice Cloud deployments.
+        let mut endpoints: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, serde_json::Value>,
+        > = std::collections::HashMap::new();
+        let http_base = state.sql_url().trim_end_matches("/v1/sql").to_string();
+        let mut queries_kwargs: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+        queries_kwargs.insert(
+            "url".to_string(),
+            serde_json::Value::String(format!("{http_base}/v1/queries")),
+        );
+        if let Some(api_key) = state.api_key() {
+            queries_kwargs.insert(
+                "authorization_header".to_string(),
+                serde_json::Value::String(format!("Bearer {api_key}")),
+            );
+        }
+        endpoints.insert("spice.http.v1.queries".to_string(), queries_kwargs);
+
         let response = SetupResponse {
             driver: AdbcDriver::Flightsql,
             db_kwargs,
@@ -289,6 +318,7 @@ impl Handler for SpidapterHandler {
                 .filter(|sink_type| matches!(sink_type, EtlSinkType::Adbc))
                 .map(|_| "spicebench.bench".to_string()),
             read_driver: None,
+            endpoints,
         };
 
         self.runs.insert(run_id, state);
@@ -697,7 +727,7 @@ async fn provision_spice_cloud_app(
 
     eprintln!("[stdio] App ID: {app_id}");
 
-    let spicepod = generate_initial_spicepod(&run_id, setup_config, datasets, None, args)?;
+    let spicepod = generate_initial_spicepod(&run_id, setup_config, datasets, None, args).await?;
     let spicepod_yaml = serialize_spicepod(&spicepod)?;
     eprintln!("[stdio] Generated spicepod:\n{spicepod_yaml}");
 
@@ -729,7 +759,7 @@ async fn provision_spice_cloud_app(
                 app_id,
                 &UpdateAppRequest {
                     image_tag: args.image_tag.clone(),
-                    update_channel: args.channel.clone(),
+                    update_channel: args.channel.as_ref().map(ToString::to_string),
                     ..UpdateAppRequest::default()
                 },
             )
@@ -741,7 +771,7 @@ async fn provision_spice_cloud_app(
     }
 
     eprintln!("[stdio] Creating deployment...");
-    commands::create_deployment(&cloud, app_id, args.channel.as_deref()).await?;
+    commands::create_deployment(&cloud, app_id, args.channel.as_ref()).await?;
 
     let poll_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
@@ -839,7 +869,8 @@ async fn provision_local_spiced_cluster(
             datasets,
             local_flight_api_key.as_deref(),
             args,
-        )?;
+        )
+        .await?;
         let spicepod_path = write_local_spicepod(&spicepod, &working_dir, "spicepod.yaml").await?;
 
         let run_id_str = run_id.to_string();
@@ -1493,6 +1524,26 @@ async fn cleanup_local_artifacts(working_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Read a spicepod YAML file from disk and rename it to the per-run app name
+/// before deploying. Used by testoperator's cluster-bench path: the client
+/// passes a `spicepod_path` in setup metadata; we deploy whatever's there
+/// (datasets, runtime config, etc.) verbatim, only overriding the `name`.
+async fn load_spicepod_from_path(path: &str, run_id: &Uuid) -> anyhow::Result<SpicepodDefinition> {
+    let contents = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read spicepod from `{path}`: {e}"))?;
+    parse_and_rename_spicepod(&contents, run_id)
+        .map_err(|e| anyhow::anyhow!("failed to parse spicepod YAML at `{path}`: {e}"))
+}
+
+fn parse_and_rename_spicepod(yaml_str: &str, run_id: &Uuid) -> anyhow::Result<SpicepodDefinition> {
+    let mut spicepod: SpicepodDefinition = yaml::from_str(yaml_str)?;
+    let run_id_str = run_id.to_string();
+    let short_id = run_id_str.split('-').next().unwrap_or_default();
+    spicepod.name = format!("spidapter-{short_id}");
+    Ok(spicepod)
+}
+
 fn generate_hive_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
@@ -1627,7 +1678,7 @@ fn generate_adbc_spicepod(
 }
 
 /// Generate the initial [`SpicepodDefinition`] for the benchmark run.
-fn generate_initial_spicepod(
+async fn generate_initial_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
@@ -1637,10 +1688,19 @@ fn generate_initial_spicepod(
     let scheduler_state_location = args.scheduler_state_location.as_deref();
     let aws_region = args.aws_region.as_deref();
 
-    let mut spicepod = match setup_config.sink_type {
-        Some(EtlSinkType::Adbc) => Ok(generate_adbc_spicepod(run_id, flight_api_key, args)),
-        _ => generate_hive_spicepod(run_id, setup_config, datasets, aws_region),
-    }?;
+    // If the client supplied a spicepod path in setup metadata
+    // (testoperator's cluster-bench path), use the contents of that file
+    // verbatim as the deployable spicepod and only layer scheduler config on
+    // top. The spicebench `datasets` HashMap path is only consulted when no
+    // spicepod_path is provided.
+    let mut spicepod = if let Some(path) = setup_config.spicepod_path.as_deref() {
+        load_spicepod_from_path(path, run_id).await?
+    } else {
+        match setup_config.sink_type {
+            Some(EtlSinkType::Adbc) => Ok(generate_adbc_spicepod(run_id, flight_api_key, args)),
+            _ => generate_hive_spicepod(run_id, setup_config, datasets, aws_region),
+        }?
+    };
 
     if let Some(loc) = scheduler_state_location {
         let mut path = loc.trim();
@@ -1649,12 +1709,25 @@ fn generate_initial_spicepod(
         }
         let state_location = format!("{path}/{run_id}");
         if !path.is_empty() {
+            // Wire `s3_key`/`s3_secret` through `${secrets:...}` references
+            // so the runtime's cluster-secret lookup resolves them against
+            // the AWS_*-named secrets `set_spicepod_secrets` already uploads.
+            // Without these references, the scheduler's S3 client asks the
+            // cluster secret store for literal keys `s3_key`/`s3_secret` and
+            // fails ("Secret not found").
             let mut sched = Scheduler {
                 state_location,
-                params: Some(Params::from_string_map(HashMap::from([(
-                    "s3_auth".to_string(),
-                    "key".to_string(),
-                )]))),
+                params: Some(Params::from_string_map(HashMap::from([
+                    ("s3_auth".to_string(), "key".to_string()),
+                    (
+                        "s3_key".to_string(),
+                        "${secrets:AWS_ACCESS_KEY_ID}".to_string(),
+                    ),
+                    (
+                        "s3_secret".to_string(),
+                        "${secrets:AWS_SECRET_ACCESS_KEY}".to_string(),
+                    ),
+                ]))),
                 partition_assignment_interval: default_partition_assignment_interval(),
                 max_partition_assignments_per_interval:
                     default_max_partition_assignments_per_interval(),
@@ -1745,15 +1818,17 @@ mod tests {
 
     #[test]
     fn backend_mode_parser_rejects_unknown_values() {
-        BackendMode::from_str("unexpected", true).expect("'BackendMode' should be constructed");
+        BackendMode::from_str("unexpected", true)
+            .expect_err("unknown backend mode should be rejected");
     }
 
-    #[test]
-    fn generate_spicepod_includes_dataset_entries() {
+    #[tokio::test]
+    async fn generate_spicepod_includes_dataset_entries() {
         let setup_config = SetupConfig {
             region: Some("us-west-2".to_string()),
             endpoint: Some("http://localhost:9000".to_string()),
             sink_type: None,
+            spicepod_path: None,
         };
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -1771,6 +1846,7 @@ mod tests {
         let args = test_stdio_args();
         let spicepod =
             generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None, &args)
+                .await
                 .expect("spicepod should generate");
         let spicepod_yaml =
             serialize_spicepod(&spicepod).expect("spicepod should serialize to YAML");
@@ -1792,12 +1868,13 @@ mod tests {
         assert!(spicepod_yaml.contains("s3_auth: key"));
     }
 
-    #[test]
-    fn generate_spicepod_errors_on_missing_dataset_source() {
+    #[tokio::test]
+    async fn generate_spicepod_errors_on_missing_dataset_source() {
         let setup_config = SetupConfig {
             region: None,
             endpoint: None,
             sink_type: None,
+            spicepod_path: None,
         };
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -1814,10 +1891,50 @@ mod tests {
 
         let args = test_stdio_args();
         let err = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None, &args)
+            .await
             .expect_err("missing source should fail");
         assert!(
             err.to_string().contains("missing_table"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_initial_spicepod_uses_loaded_spicepod_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("input.yaml");
+        // Original name is intentionally different from the per-run name so we
+        // can assert the override below.
+        tokio::fs::write(
+            &path,
+            "version: v1\nkind: Spicepod\nname: user-supplied\ndatasets:\n  - from: s3://public-bucket/customer.parquet\n    name: customer\n    params:\n      file_format: parquet\n      s3_auth: public\n",
+        )
+        .await
+        .expect("write yaml");
+
+        let setup_config = SetupConfig {
+            region: None,
+            endpoint: None,
+            sink_type: None,
+            spicepod_path: Some(path.to_string_lossy().into_owned()),
+        };
+        let datasets: HashMap<String, DatasetConfig> = HashMap::new();
+        let args = test_stdio_args();
+        let run_id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").expect("parse uuid");
+
+        let spicepod = generate_initial_spicepod(&run_id, &setup_config, &datasets, None, &args)
+            .await
+            .expect("spicepod loads from disk");
+
+        assert_eq!(spicepod.name, "spidapter-01234567");
+        let yaml = serialize_spicepod(&spicepod).expect("serialize");
+        assert!(
+            yaml.contains("customer.parquet"),
+            "dataset from file is missing in deployed spicepod: {yaml}"
+        );
+        assert!(
+            yaml.contains("s3_auth: public"),
+            "public auth from file is missing: {yaml}"
         );
     }
 

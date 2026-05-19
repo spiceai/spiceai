@@ -16,18 +16,21 @@ limitations under the License.
 
 #![deny(missing_docs)]
 
-//! Cayenne: A minimal `DuckLake`-inspired lakehouse format using `SQLite` for metadata
+//! Cayenne: a lakehouse format using `SQLite` (or Turso) for transactional metadata
 //! and Vortex files as the data lake.
 //!
 //! This module provides a lakehouse format that combines:
-//! - `SQLite` for transactional metadata management (schemas, tables, files)
+//! - `SQLite` or Turso for transactional metadata management (schemas, tables, files,
+//!   inline-data memtable, deletion vectors, snapshot sequences)
 //! - Vortex files for efficient columnar data storage
 //!
 //! # Architecture
 //!
-//! Cayenne follows the `DuckLake` specification with these key components:
-//! - **Metadata Catalog**: `SQLite` database storing table metadata and file references
-//! - **Data Lake**: Directory of Vortex files containing the actual data
+//! Cayenne has three key components:
+//! - **Metadata catalog**: `SQLite`/Turso database storing table metadata, file
+//!   references, deletion vectors, and the inline-data level-0 memtable.
+//! - **Data lake**: directory of Vortex files containing the persistent data.
+//! - **Staging WAL**: crash-safe write-ahead log for in-progress appends.
 //!
 //! # Virtual Files Concept
 //!
@@ -60,6 +63,7 @@ pub mod cayenne_catalog;
 pub mod ddl;
 #[cfg(feature = "partition-table-provider")]
 pub use ddl::CayenneDdlHandler;
+pub mod logical_optimizer;
 pub mod metadata;
 pub mod metastore;
 pub mod optimizer_rules;
@@ -74,14 +78,15 @@ pub use catalog::{CatalogError, CatalogResult};
 pub use catalog_provider::{
     CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider,
 };
-pub use cayenne_catalog::CayenneCatalog;
+pub use cayenne_catalog::{CayenneCatalog, is_retryable_write_conflict};
 pub use metadata::{
     DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete, ObjectStoreConfig,
     PartitionMetadata, TableMetadata, TableStatistics,
 };
-pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME};
+pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 pub use provider::{
-    CayenneContext, CayenneStagedAppend, CayenneTableProvider, CayenneTableProviderBuilder,
-    TimeRetentionFilterBuilder,
+    CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneTableProvider,
+    CayenneTableProviderBuilder, PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry,
+    PreparedOverwrite, PreparedStagedAppend, TimeRetentionFilterBuilder,
 };
 pub use schema::transform_schema_for_vortex;

@@ -28,28 +28,44 @@ use std::io::{self, Write};
 
 /// Arguments for the `search` command.
 #[derive(Args, Debug)]
+#[command(
+    about = "Run vector / hybrid search across embedded datasets",
+    long_about = r#"Run vector or hybrid search across datasets that have been
+configured with embeddings.
+
+Opens an interactive REPL by default. Within the REPL you can scope a query to
+specific datasets, project additional columns, and apply a SQL `WHERE` filter.
+Datasets must declare `embeddings:` in `spicepod.yaml` for search to work.
+
+EXAMPLES
+  spice search                          # Interactive REPL
+  spice search --limit 25 -o json       # JSON output, larger result set
+  spice search --model my_embed         # Use a specific embedding model
+
+Docs: https://spiceai.org/docs"#
+)]
 pub struct SearchArgs {
-    /// Limit number of search results
+    /// Maximum number of results to return per query.
     #[arg(long, short, default_value = "10")]
     pub limit: u32,
 
-    /// Control whether the results cache is used for searches
+    /// Whether to use the runtime results cache (`cache` or `no-cache`).
     #[arg(long, default_value = "cache", value_parser = ["cache", "no-cache"])]
     pub cache_control: String,
 
-    /// Model to use for search
+    /// Embedding model id to use (defaults to the dataset's configured embedding).
     #[arg(long)]
     pub model: Option<String>,
 
-    /// Remote Spice instance HTTP endpoint (e.g., `http://localhost:8090`)
+    /// Override the runtime HTTP endpoint (e.g. `http://localhost:8090`).
     #[arg(long)]
     pub endpoint: Option<String>,
 
-    /// Custom HTTP headers in format 'Key:Value' (can be specified multiple times)
+    /// Custom HTTP headers in `Key:Value` form (repeatable).
     #[arg(long = "headers", value_name = "KEY:VALUE")]
     pub custom_headers: Vec<String>,
 
-    /// Output format
+    /// Output format.
     #[arg(long, short = 'o', default_value = "table")]
     pub output: OutputFormat,
 }

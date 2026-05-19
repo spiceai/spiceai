@@ -23,12 +23,31 @@ use clap_complete::Shell;
 
 /// Arguments for the completions command.
 #[derive(Args, Debug)]
+#[command(
+    about = "Generate shell completions for the spice CLI",
+    long_about = r#"Generate shell completion scripts for the `spice` CLI.
+
+With no shell argument the shell is detected from the `$SHELL` environment
+variable. By default the completion script is written to the standard location
+for the chosen shell; use `--stdout` to print it to standard output instead so
+you can pipe it into your own configuration.
+
+SUPPORTED SHELLS
+  bash, zsh, fish, elvish, powershell
+
+EXAMPLES
+  spice completions                 # Detect $SHELL and install
+  spice completions zsh             # Install zsh completions to a standard path
+  spice completions bash --stdout   # Print bash completions to stdout
+  spice completions fish > ~/.config/fish/completions/spice.fish
+"#
+)]
 pub struct CompletionsArgs {
-    /// The shell to generate completions for (detected from $SHELL if omitted)
+    /// The shell to generate completions for (detected from `$SHELL` if omitted).
     #[arg(value_enum)]
     pub shell: Option<Shell>,
 
-    /// Print completions to stdout instead of writing to a file
+    /// Print completions to stdout instead of writing to a file.
     #[arg(long)]
     pub stdout: bool,
 }

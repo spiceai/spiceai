@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q73"
+---
++-------------+--------------+--------------+-----------------------+------------------+-----+
+| c_last_name | c_first_name | c_salutation | c_preferred_cust_flag | ss_ticket_number | cnt |
++-------------+--------------+--------------+-----------------------+------------------+-----+
+| Brown       | Angel        | Ms.          | Y                     | 5715600          | 5   |
+| Clark       | Marilyn      | Dr.          | N                     | 5611405          | 5   |
+| Dexter      | Steven       | Mr.          | Y                     | 12860087         | 5   |
+| Folsom      | Tracie       | Mrs.         | Y                     | 12972050         | 5   |
+| Fountain    | Stanley      | Mr.          | N                     | 15211499         | 5   |
+| Garcia      | Ena          | Dr.          | N                     | 18529312         | 5   |
+| Garza       | Irene        | Dr.          | N                     | 12571695         | 5   |
+| Gunn        | Raymond      | Dr.          | N                     | 22222662         | 5   |
+| Hall        | Gary         | Dr.          | N                     | 18449382         | 5   |
+| Harris      | Mattie       | Dr.          | N                     | 21507385         | 5   |
++-------------+--------------+--------------+-----------------------+------------------+-----+

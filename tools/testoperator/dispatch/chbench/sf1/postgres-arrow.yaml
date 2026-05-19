@@ -1,0 +1,7 @@
+tests:
+  htap:
+    spicepod_path: accelerated/postgres-arrow.yaml
+    runner_type: spiceai-dev-large-runners
+    scale_factor: 1
+    duration: 600
+    ready_wait: 60

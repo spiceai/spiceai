@@ -153,6 +153,20 @@ macro_rules! generate_clickbench_query_overrides {
   }
 }
 
+macro_rules! generate_chbench_queries {
+    ( $( $i:literal ),* ) => {
+        vec![
+            $(
+                Query::new(
+                    concat!("chbench_q", stringify!($i)).into(),
+                    include_str!(concat!("./chbench/q", stringify!($i), ".sql")).into(),
+                    false
+                )
+            ),*
+        ]
+    }
+}
+
 macro_rules! generate_saffron_queries {
     ( $( $i:literal ),* ) => {
         vec![
@@ -332,6 +346,7 @@ pub enum QuerySet {
     Tpch,
     Tpcds,
     Clickbench,
+    ChBench,
     ParameterizedTpch,
     #[serde(rename = "saffron[parameterized]")]
     ParameterizedSaffron,
@@ -381,6 +396,7 @@ impl QuerySet {
             QuerySet::Tpch => Ok(get_tpch_test_queries(overrides)),
             QuerySet::Tpcds => Ok(get_tpcds_test_queries(overrides)),
             QuerySet::Clickbench => Ok(get_clickbench_test_queries(overrides)),
+            QuerySet::ChBench => Ok(get_chbench_test_queries(overrides)),
             QuerySet::Scenario { queries, .. } => Ok(queries.clone()),
             QuerySet::ParameterizedSaffron => {
                 get_saffron_test_queries(overrides, instance, random_param_set_count).await
@@ -418,7 +434,6 @@ impl QuerySet {
     #[must_use]
     pub fn row_counts(&self) -> Vec<TableWithRowCount> {
         match self {
-            QuerySet::Scenario { .. } => vec![],
             QuerySet::Tpch | QuerySet::ParameterizedTpch => [
                 ("customer", 150_000),
                 ("lineitem", 6_001_215),
@@ -465,14 +480,15 @@ impl QuerySet {
                 .iter()
                 .map(TableWithRowCount::from)
                 .collect(),
-            QuerySet::ParameterizedSaffron => [].iter().map(TableWithRowCount::from).collect(),
+            QuerySet::ParameterizedSaffron | QuerySet::Scenario { .. } | QuerySet::ChBench => {
+                vec![]
+            }
         }
     }
 
     #[must_use]
     pub fn append_time_columns(&self) -> Vec<TableWithTimeColumn> {
         match self {
-            QuerySet::Scenario { .. } => vec![],
             QuerySet::Tpch | QuerySet::ParameterizedTpch => [
                 ("customer", "c_created_at"),
                 ("lineitem", "l_created_at"),
@@ -519,7 +535,9 @@ impl QuerySet {
                 .iter()
                 .map(TableWithTimeColumn::from)
                 .collect(),
-            QuerySet::ParameterizedSaffron => [].iter().map(TableWithTimeColumn::from).collect(),
+            QuerySet::ParameterizedSaffron | QuerySet::Scenario { .. } | QuerySet::ChBench => {
+                vec![]
+            }
         }
     }
 
@@ -615,9 +633,35 @@ impl QuerySet {
                     "clickbench_q43",
                 ]
             }
-            QuerySet::Scenario { .. } | QuerySet::ParameterizedSaffron => {
-                vec![]
+            QuerySet::ChBench => {
+                // CH-benCH results are non-deterministic under concurrent OLTP load;
+                // skip row count validation for all queries
+                vec![
+                    "chbench_q1",
+                    "chbench_q2",
+                    "chbench_q3",
+                    "chbench_q4",
+                    "chbench_q5",
+                    "chbench_q6",
+                    "chbench_q7",
+                    "chbench_q8",
+                    "chbench_q9",
+                    "chbench_q10",
+                    "chbench_q11",
+                    "chbench_q12",
+                    "chbench_q13",
+                    "chbench_q14",
+                    "chbench_q15",
+                    "chbench_q16",
+                    "chbench_q17",
+                    "chbench_q18",
+                    "chbench_q19",
+                    "chbench_q20",
+                    "chbench_q21",
+                    "chbench_q22",
+                ]
             }
+            QuerySet::Scenario { .. } | QuerySet::ParameterizedSaffron => vec![],
         }
     }
 }
@@ -628,6 +672,7 @@ impl Display for QuerySet {
             QuerySet::Tpch => write!(f, "tpch"),
             QuerySet::Tpcds => write!(f, "tpcds"),
             QuerySet::Clickbench => write!(f, "clickbench"),
+            QuerySet::ChBench => write!(f, "chbench"),
             QuerySet::ParameterizedTpch => write!(f, "tpch[parameterized]"),
             QuerySet::ParameterizedSaffron => write!(f, "saffron[parameterized]"),
             QuerySet::Scenario { scenario_set, .. } => {
@@ -1250,6 +1295,18 @@ pub async fn get_saffron_test_queries(
             // Use fixed parameters for deterministic testing
             Ok(saffron::add_saffron_fixed_parameters(queries))
         }
+    }
+}
+
+#[must_use]
+pub fn get_chbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
+    let queries = generate_chbench_queries!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
+    );
+
+    match overrides {
+        // No engine-specific overrides yet
+        Some(_) | None => queries,
     }
 }
 

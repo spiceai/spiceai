@@ -34,19 +34,50 @@ limitations under the License.
 //!
 //! # Module Organization
 //!
-//! - [`table`]: Main `CayenneTableProvider` implementation
-//! - [`delete`]: Deletion vector handling and filtering
-//! - [`streaming`]: Streaming execution plan for write operations
-//! - [`utils`]: Numeric conversion utilities
-//! - [`constants`]: Shared constants
-//! - [`context`]: Shared context for Cayenne operations
-//! - [`staging_wal`]: Staging WAL for crash-safe staged appends
+//! - [`table`]: `CayenneTableProvider` implementation — schema, deletion strategy,
+//!   listing-fence, snapshot state, post-write maintenance scheduler, and the
+//!   `DataFusion` `TableProvider` impl.
+//! - [`scan`]: `CayenneAccelerationExec` wrapper and round-robin repartitioning
+//!   used to fan unsorted writes across multiple writer partitions.
+//! - [`vortex_format`]: `DeletionFilteringVortexFormat` wrapping
+//!   `vortex_datafusion::VortexFormat` to attach per-file position-based
+//!   deletion vectors and to gate decimal→float predicate pushdown.
+//! - [`sink`]: `CayenneDataSink` — `DataFusion` `DataSink` adapter that the
+//!   regular (non-CDC) write path uses for both append and overwrite modes.
+//! - [`mutation_writer`]: `AppendMutationWriter` — append-side write logic,
+//!   inline-memtable admission, and `write_cdc_pipelined` for the Stage A /
+//!   Stage B CDC path consumed by `runtime/src/accelerated_table/refresh_task`.
+//! - [`staging_wal`]: Staging WAL for crash-safe staged appends. Three-phase
+//!   commit lifecycle: `prepare` (write WAL) → `apply_under_barrier` (move +
+//!   listing-cache invalidation) → `finish` (drop write guard).
+//! - [`overwrite`]: Catalog-pointer-flip path for overwrite-mode writes.
+//! - [`delete`]: Deletion vector handling and filtering.
+//!   - [`delete::sink`]: position- and key-based deletion sinks for SQL `DELETE`.
+//!   - [`delete::filter_exec`]: `Int64PkDeletionFilterExec` and
+//!     `KeyBasedDeletionFilterExec` — per-row PK probes applied at scan time.
+//!   - [`delete::vector_io`]: Arrow IPC deletion-vector file writer / reader.
+//! - [`deletion_index`]: Bloom-prefiltered `DeletionIndex` (Int64 PKs) and
+//!   `KeyDeletionIndex` (composite byte keys) used by the filter execs.
+//! - [`deletion_strategy`]: `PkDeletionStrategyWithCache` — the per-table
+//!   deletion strategy and its atomically-published `ArcSwap<DeletionSnapshot>`.
+//! - [`compaction`]: Tiered small-files picker and `BackgroundCompactor`.
+//! - [`retention`]: Time-based retention filter builder + SQL retention DDL.
+//! - [`streaming`]: Streaming execution plan for write operations.
+//! - [`context`]: `CayenneContext` — shared Vortex format, upload semaphore,
+//!   `RuntimeEnv`, and config.
+//! - [`utils`]: Numeric conversion utilities.
+//! - [`constants`]: Staging-dir name, WAL filename, and other shared constants.
+//! - [`partitioned_wal`]: Cross-partition WAL for the partitioned-table
+//!   coordinator (feature-gated).
+pub(crate) mod compaction;
 pub(crate) mod constants;
 pub(crate) mod context;
 pub(crate) mod delete;
 pub mod deletion_index;
 pub(crate) mod deletion_strategy;
 pub(crate) mod mutation_writer;
+pub(crate) mod overwrite;
+pub mod partitioned_wal;
 pub(crate) mod retention;
 pub(crate) mod scan;
 pub(crate) mod sink;
@@ -58,12 +89,12 @@ pub(crate) mod vortex_format;
 
 // Re-export the main type at the module level for convenience
 pub use context::CayenneContext;
-pub use deletion_strategy::{PkDeletionStrategy, PkDeletionStrategyWithCache};
+pub use overwrite::PreparedOverwrite;
+pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
-pub use staging_wal::CayenneStagedAppend;
-pub use table::{CayenneTableProvider, CayenneTableProviderBuilder};
-pub use vortex_format::{DeletionFilteringVortexFormat, attach_deletion_vectors_to_config};
+pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
+pub use table::{CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder};
 
 // Re-export deletion utilities for advanced use cases
 pub use delete::CayenneDeletionSink;
@@ -741,6 +772,14 @@ mod tests {
         collect(insert_plan, ctx.task_ctx())
             .await
             .expect("Failed to insert data");
+
+        // Ordinary writes are intentionally unsorted for throughput.
+        // Compaction (sort_and_rewrite_data) sorts the data and flushes inline
+        // rows to Vortex files with tight zone-map bounds.
+        table
+            .sort_and_rewrite_data(128 * 1024 * 1024)
+            .await
+            .expect("Failed to sort and rewrite data");
 
         // Verify data is sorted by timestamp, then by id
         let ctx = SessionContext::new();

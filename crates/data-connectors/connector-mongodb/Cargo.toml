@@ -24,15 +24,22 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+async-stream.workspace = true
 async-trait.workspace = true
 data_components = { path = "../../data_components", features = ["mongodb"] }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true, features = ["mongodb"] }
+fundu.workspace = true
+futures.workspace = true
 linkme.workspace = true
+mongodb.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime" }
+runtime = { path = "../../runtime", features = ["mongodb"] }
 secrecy.workspace = true
+serde_json.workspace = true
 snafu.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
 tracing.workspace = true
 
 [features]

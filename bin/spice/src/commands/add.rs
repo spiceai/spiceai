@@ -17,17 +17,34 @@ limitations under the License.
 //! Add command - adds a Spicepod to the project.
 
 use crate::context::RuntimeContext;
-use crate::error::{ConfigIoSnafu, Result};
+use crate::error::Result;
+use crate::manifest;
 use crate::registry;
 use clap::Args;
-use snafu::ResultExt;
-use spicepod::spec::SpicepodDefinition;
 use std::path::Path;
 
 /// Arguments for the add command.
 #[derive(Args, Debug)]
+#[command(
+    about = "Add a Spicepod dependency to the current project",
+    long_about = r#"Add a Spicepod dependency to the current project.
+
+Fetches a Spicepod from a registry, Spice.ai Cloud, or a local path and writes
+it into `./spicepods/<name>/`, then registers it under `dependencies:` in
+`spicepod.yaml`.
+
+EXAMPLES
+  spice add spiceai/quickstart            # Add a registry Spicepod
+  spice add spiceai/quickstart@v1.0       # Pin to a specific version
+  spice add ./local/path                  # Add a Spicepod from a local directory
+
+Use `spice connect <pod>` instead if the Spicepod is hosted on Spice.ai Cloud
+and requires authentication.
+
+Docs: https://spiceai.org/docs"#
+)]
 pub struct AddArgs {
-    /// Spicepod path (e.g., spiceai/quickstart, ./local/path, or spiceai/quickstart@v1.0)
+    /// Spicepod path (e.g. `spiceai/quickstart`, `./local/path`, or `spiceai/quickstart@v1.0`).
     pub pod_path: String,
 }
 
@@ -78,39 +95,21 @@ pub async fn execute_add_or_connect(
     // Get relative path for display
     let relative_path = get_relative_path(ctx.app_dir(), &download_path);
 
-    // Read or create spicepod.yaml
-    let spicepod_path = ctx.app_dir().join("spicepod.yaml");
-    let mut spicepod: SpicepodDefinition = if spicepod_path.exists() {
-        let contents = std::fs::read_to_string(&spicepod_path).context(ConfigIoSnafu {
-            operation: "read",
-            path: spicepod_path.clone(),
-        })?;
-        yaml::from_str(&contents).map_err(|e| crate::error::Error::ConfigParse {
-            message: e.to_string(),
-        })?
-    } else {
-        // Create a new spicepod.yaml
-        let name = ctx
-            .app_dir()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("app");
-        println!("\x1b[32mspicepod.yaml initialized!\x1b[0m");
-        SpicepodDefinition::new(name)
-    };
+    let name = ctx
+        .app_dir()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("app");
+    let (spicepod_path, mut spicepod, created) =
+        manifest::load_or_create_spicepod_value(ctx.app_dir(), name)?;
 
-    // Add dependency if not already present
-    if !spicepod.dependencies.contains(&pod_path.clone()) {
-        spicepod.dependencies.push(pod_path.clone());
+    if created {
+        println!("\x1b[32m{} initialized!\x1b[0m", spicepod_path.display());
+    }
 
-        // Write updated spicepod.yaml
-        let yaml = yaml::to_string(&spicepod).map_err(|e| crate::error::Error::ConfigParse {
-            message: format!("Failed to serialize spicepod.yaml: {e}"),
-        })?;
-        std::fs::write(&spicepod_path, yaml).context(ConfigIoSnafu {
-            operation: "write",
-            path: spicepod_path,
-        })?;
+    let dependency_path = dependency_reference(pod_path, ctx.app_dir(), &download_path)?;
+    if manifest::ensure_string_sequence_item(&mut spicepod, "dependencies", &dependency_path)? {
+        manifest::write_spicepod_value(&spicepod_path, &spicepod)?;
     }
 
     println!("added {relative_path}");
@@ -120,6 +119,63 @@ pub async fn execute_add_or_connect(
 
 /// Get a relative path from a base directory.
 fn get_relative_path(base: &Path, path: &Path) -> String {
-    path.strip_prefix(base)
-        .map_or_else(|_| path.display().to_string(), |p| p.display().to_string())
+    path.strip_prefix(base).map_or_else(
+        |_| manifest::path_to_spicepod_ref(path),
+        manifest::path_to_spicepod_ref,
+    )
+}
+
+fn get_relative_dependency_path(base: &Path, path: &Path) -> Result<String> {
+    let relative_path = path.strip_prefix(base).map_err(|_| crate::error::Error::InvalidArgument {
+        message: format!(
+            "Downloaded Spicepod path '{}' is outside the app directory '{}'. Dependencies must be stored relative to the app manifest.",
+            path.display(),
+            base.display()
+        ),
+    })?;
+    Ok(manifest::path_to_spicepod_ref(relative_path))
+}
+
+fn dependency_reference(pod_path: &str, base: &Path, download_path: &Path) -> Result<String> {
+    if registry::is_local_path(pod_path) {
+        return get_relative_dependency_path(base, download_path);
+    }
+
+    Ok(pod_path.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dependency_reference_preserves_remote_version_pin() {
+        let reference = dependency_reference(
+            "spiceai/quickstart@v1.0",
+            Path::new("/app"),
+            Path::new("/app/spicepods/spiceai/quickstart"),
+        )
+        .expect("remote dependency reference should be built");
+
+        assert_eq!(reference, "spiceai/quickstart@v1.0");
+    }
+
+    #[test]
+    fn dependency_reference_uses_relative_path_for_local_sources() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let local_source = temp_dir.path().join("localpod");
+        std::fs::create_dir_all(&local_source).expect("local source should be created");
+        let download_path = temp_dir.path().join("spicepods/localpod");
+
+        let reference = dependency_reference(
+            local_source
+                .to_str()
+                .expect("local source path should be utf-8"),
+            temp_dir.path(),
+            &download_path,
+        )
+        .expect("local dependency reference should be built");
+
+        assert_eq!(reference, "spicepods/localpod");
+    }
 }

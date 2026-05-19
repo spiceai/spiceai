@@ -64,6 +64,7 @@ pub enum TestType {
     Streaming,
     StreamingCorrectness,
     Schema,
+    Htap,
 }
 
 impl TestType {
@@ -80,6 +81,7 @@ impl TestType {
             TestType::Streaming => "testoperator_run_streaming_bench.yml",
             TestType::StreamingCorrectness => "testoperator_run_streaming_correctness.yml",
             TestType::Schema => "testoperator_run_schema.yml",
+            TestType::Htap => "testoperator_run_htap.yml",
         }
     }
 }
@@ -97,6 +99,7 @@ impl Display for TestType {
             TestType::Streaming => write!(f, "streaming"),
             TestType::StreamingCorrectness => write!(f, "streaming_correctness"),
             TestType::Schema => write!(f, "schema"),
+            TestType::Htap => write!(f, "htap"),
         }
     }
 }

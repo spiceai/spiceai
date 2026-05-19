@@ -57,6 +57,33 @@ macro_rules! extract_attr {
     };
 }
 
+/// Hook for rewriting an `OTel` [`SpanData`] before the `task_history`
+/// exporter converts it to a row. Implementors can adjust timestamps,
+/// inject attributes, redact fields, etc. Transforms run in registration
+/// order, so later transforms observe the effects of earlier ones.
+///
+/// Implementations should be cheap (each runs per span per export batch)
+/// and should be no-ops for spans they don't recognize.
+pub trait SpanTransform: Send + Sync {
+    fn transform(&self, span: &mut SpanData);
+}
+
+/// Hook expressing a retention dependency between spans in a batch.
+///
+/// When a rule returns `Some(parent_id)` for a span, the span is kept
+/// iff the span with `parent_id` was kept by the exporter's base rules
+/// (the `PLAN_CAPTURE_LABEL` short-circuit and the `min_sql_duration_ms`
+/// filter). Returning `None` leaves the span subject to base rules on
+/// its own merits.
+///
+/// Rules are evaluated in registration order; the first rule returning
+/// `Some` wins. This expresses cases like "a child summary span should
+/// be written if and only if its parent query span is also written" —
+/// without baking that policy into the exporter itself.
+pub trait SpanRetention: Send + Sync {
+    fn parent_dependency(&self, span: &TaskSpan) -> Option<Arc<str>>;
+}
+
 #[derive(Clone)]
 pub struct TaskHistoryExporter {
     df: Arc<DataFusion>,
@@ -68,6 +95,13 @@ pub struct TaskHistoryExporter {
     /// The node ID (advertise address) for this node.
     /// Only populated in cluster mode.
     node_id: Option<Arc<str>>,
+    /// Span transforms applied to each `SpanData` before it is converted
+    /// to a row. See [`SpanTransform`]. Transforms run in registration
+    /// order.
+    transforms: Vec<Arc<dyn SpanTransform>>,
+    /// Retention dependency rules consulted during the batch retention
+    /// decision. See [`SpanRetention`].
+    retentions: Vec<Arc<dyn SpanRetention>>,
 }
 
 impl Debug for TaskHistoryExporter {
@@ -94,7 +128,43 @@ impl TaskHistoryExporter {
             captured_plan,
             min_plan_duration_ms,
             node_id,
+            transforms: Vec::new(),
+            retentions: Vec::new(),
         }
+    }
+
+    /// Append a [`SpanTransform`] that will run on every `SpanData`
+    /// processed by this exporter, before conversion to a row.
+    ///
+    /// Transforms run in the order they were registered. Returns `self`
+    /// so the call is chainable on a freshly-built exporter.
+    #[must_use]
+    pub fn with_transform(mut self, transform: Arc<dyn SpanTransform>) -> Self {
+        self.transforms.push(transform);
+        self
+    }
+
+    /// Append a [`SpanRetention`] rule consulted when deciding which
+    /// spans in a batch to write. Rules can declare that a span depends
+    /// on another span being retained (e.g., a child summary on its
+    /// parent query); they run in registration order, first match wins.
+    #[must_use]
+    pub fn with_retention(mut self, retention: Arc<dyn SpanRetention>) -> Self {
+        self.retentions.push(retention);
+        self
+    }
+
+    /// Exporter's intrinsic retention rule. A span is kept by base
+    /// rules if it carries the plan-capture label (already filtered by
+    /// `min_plan_duration_ms` at emission time), is a policy/audit span,
+    /// or if it passes the `min_sql_duration_ms` cutoff.
+    fn passes_base_retention(span: &TaskSpan, min_sql_duration_ms: Option<f64>) -> bool {
+        if span.labels.contains_key(PLAN_CAPTURE_LABEL)
+            || Self::is_policy_or_audit_task(span.task.as_ref())
+        {
+            return true;
+        }
+        min_sql_duration_ms.is_none_or(|min| span.execution_duration_ms >= min)
     }
 
     fn process_output(&self, output: Arc<str>, force_capture: bool) -> Arc<str> {
@@ -126,13 +196,7 @@ impl TaskHistoryExporter {
     }
 
     fn should_include_task_span(task_span: &TaskSpan, min_sql_duration_ms: Option<f64>) -> bool {
-        if task_span.labels.contains_key(PLAN_CAPTURE_LABEL)
-            || Self::is_policy_or_audit_task(task_span.task.as_ref())
-        {
-            return true;
-        }
-
-        min_sql_duration_ms.is_none_or(|min| task_span.execution_duration_ms >= min)
+        Self::passes_base_retention(task_span, min_sql_duration_ms)
     }
 
     fn process_context_payload(
@@ -255,7 +319,10 @@ impl TaskHistoryExporter {
         }
     }
 
-    fn span_to_task_span(&self, span: SpanData) -> TaskSpan {
+    fn span_to_task_span(&self, mut span: SpanData) -> TaskSpan {
+        for transform in &self.transforms {
+            transform.transform(&mut span);
+        }
         let trace_id: Arc<str> = span.span_context.trace_id().to_string().into();
         let span_id: Arc<str> = span.span_context.span_id().to_string().into();
         let parent_span_id: Option<Arc<str>> = if span.parent_span_id == SpanId::INVALID {
@@ -384,11 +451,35 @@ impl SpanExporter for TaskHistoryExporter {
         let min_plan_duration_ms = self.min_plan_duration_ms;
         let df = Arc::clone(&self.df);
 
-        let spans: Vec<TaskSpan> = batch
+        let candidates: Vec<TaskSpan> = batch
             .into_iter()
             .map(|span| self.span_to_task_span(span))
-            .filter(|task_span| Self::should_include_task_span(task_span, min_sql_duration_ms))
             .collect();
+
+        // Compute the set of spans that pass the exporter's base
+        // retention rules: anything explicitly tagged for plan capture,
+        // or anything passing the `min_sql_duration_ms` filter. Stored
+        // by span id so dependency rules can ask "was my parent kept?".
+        let base_retained_ids: std::collections::HashSet<Arc<str>> = candidates
+            .iter()
+            .filter(|task_span| Self::passes_base_retention(task_span, min_sql_duration_ms))
+            .map(|task_span| Arc::clone(&task_span.span_id))
+            .collect();
+
+        let retentions = self.retentions.clone();
+        let should_include = |task_span: &TaskSpan| {
+            // Spans with an explicit parent dependency (e.g.,
+            // `ballista_stage` rows on their parent query) inherit that
+            // parent's decision; otherwise they would be orphans whose
+            // `parent_span_id` references a row that was never written.
+            for rule in &retentions {
+                if let Some(parent_id) = rule.parent_dependency(task_span) {
+                    return base_retained_ids.contains(&parent_id);
+                }
+            }
+            base_retained_ids.contains(&task_span.span_id)
+        };
+        let spans: Vec<TaskSpan> = candidates.into_iter().filter(should_include).collect();
 
         async move {
             // Separate logic: if plan capture is disabled, write all spans directly

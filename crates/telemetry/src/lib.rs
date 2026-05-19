@@ -362,6 +362,69 @@ pub fn track_hash_index_lookup_rows(rows: u64, dimensions: &[KeyValue]) {
         .add(rows, dimensions);
 }
 
+static CAYENNE_SCAN_LISTING_TABLE_CACHE_ENTRIES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+pub fn track_cayenne_scan_listing_table_cache_entries(entries: u64, dimensions: &[KeyValue]) {
+    let Some(m) = meter::METER.get() else { return };
+    CAYENNE_SCAN_LISTING_TABLE_CACHE_ENTRIES
+        .get_or_init(|| {
+            m.u64_gauge("cayenne_scan_listing_table_cache_entries")
+                .with_description("Number of entries in the Cayenne scan ListingTable cache.")
+                .with_unit("entries")
+                .build()
+        })
+        .record(entries, dimensions);
+}
+
+static CAYENNE_LISTING_FENCE_WAIT_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
+
+pub fn track_cayenne_listing_fence_wait_duration(duration: Duration, dimensions: &[KeyValue]) {
+    let Some(m) = meter::METER.get() else { return };
+    CAYENNE_LISTING_FENCE_WAIT_DURATION_MS
+        .get_or_init(|| {
+            m.f64_histogram("cayenne_listing_fence_wait_duration_ms")
+                .with_description(
+                    "Time Cayenne scans spend waiting to acquire the listing fence read lock.",
+                )
+                .with_unit("ms")
+                .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+                .build()
+        })
+        .record(duration.as_secs_f64() * 1000.0, dimensions);
+}
+
+static CAYENNE_LISTING_SCAN_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
+
+pub fn track_cayenne_listing_scan_duration(duration: Duration, dimensions: &[KeyValue]) {
+    let Some(m) = meter::METER.get() else { return };
+    CAYENNE_LISTING_SCAN_DURATION_MS
+        .get_or_init(|| {
+            m.f64_histogram("cayenne_listing_scan_duration_ms")
+                .with_description(
+                    "Time Cayenne scans spend building the main ListingTable execution plan while holding the listing fence.",
+                )
+                .with_unit("ms")
+                .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+                .build()
+        })
+        .record(duration.as_secs_f64() * 1000.0, dimensions);
+}
+
+static CAYENNE_WRITE_PHASE_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
+
+pub fn track_cayenne_write_phase_duration(duration: Duration, dimensions: &[KeyValue]) {
+    let Some(m) = meter::METER.get() else { return };
+    CAYENNE_WRITE_PHASE_DURATION_MS
+        .get_or_init(|| {
+            m.f64_histogram("cayenne_write_phase_duration_ms")
+                .with_description("Time spent in Cayenne write-path phases.")
+                .with_unit("ms")
+                .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+                .build()
+        })
+        .record(duration.as_secs_f64() * 1000.0, dimensions);
+}
+
 static SNAPSHOT_BOOTSTRAP_DURATION_MS: OnceLock<Counter<f64>> = OnceLock::new();
 static SNAPSHOT_BOOTSTRAP_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
 

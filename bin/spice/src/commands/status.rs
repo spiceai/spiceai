@@ -24,8 +24,22 @@ use serde::{Deserialize, Serialize};
 
 /// Arguments for the status command.
 #[derive(Args, Debug)]
+#[command(
+    about = "Show component status reported by a running Spice runtime",
+    long_about = r#"Query the runtime's `/v1/status` endpoint and print the status
+of each registered component (HTTP, Flight, OpenTelemetry, metrics, ...).
+
+The runtime must be running and reachable at `--http-endpoint`
+(default `http://127.0.0.1:8090`).
+
+EXAMPLES
+  spice status
+  spice status -o json
+  spice --http-endpoint http://prod:8090 status
+"#
+)]
 pub struct StatusArgs {
-    /// Output format
+    /// Output format.
     #[arg(long, short = 'o', default_value = "table", alias = "format")]
     pub output: OutputFormat,
 }

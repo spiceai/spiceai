@@ -1385,8 +1385,47 @@
           "Ready"
         ],
         "summary": "Check Readiness",
-        "description": "Check the runtime status of all the components of the runtime. If the service is ready, it returns an HTTP 200 status with the message \"ready\". If not, it returns a 503 status with the message \"not ready\".\n\nThe behavior for when an accelerated dataset is considered ready is configurable via the `ready_state` parameter. See [Data refresh](https://spiceai.org/docs/components/data-accelerators/data-refresh#ready-state) for more details.\n\n### Readiness Probe\nIn production deployments, the /v1/ready endpoint can be used as a readiness probe for a Spice deployment to ensure traffic is routed to the Spice runtime only after all datasets have finished loading.\n\nExample Kubernetes readiness probe:\n```yaml\nreadinessProbe:\n httpGet:\n   path: /v1/ready\n   port: 8090\n```",
+        "description": "Check the runtime status of all the components of the runtime. If the service is ready, it returns an HTTP 200 status with the message \"ready\". If not, it returns a 503 status with the message \"not ready\".\n\nThe behavior for when an accelerated dataset is considered ready is configurable via the `ready_state` parameter. See [Data refresh](https://spiceai.org/docs/components/data-accelerators/data-refresh#ready-state) for more details.\n\nIn distributed (scheduler) mode the readiness response can additionally be gated on executor\navailability via the `min_ready_executors` and `min_ready_executors_percent` query parameters\n(both optional). Both must pass when supplied. Pass `verbose=true` to get a multi-line\ndiagnostic body explaining each gate.\n\n### Readiness Probe\nIn production deployments, the /v1/ready endpoint can be used as a readiness probe for a Spice deployment to ensure traffic is routed to the Spice runtime only after all datasets have finished loading.\n\nExample Kubernetes readiness probe:\n```yaml\nreadinessProbe:\n httpGet:\n   path: /v1/ready\n   port: 8090\n```\n\nExample with executor gating (scheduler role):\n```yaml\nreadinessProbe:\n httpGet:\n   path: /v1/ready?min_ready_executors=3&min_ready_executors_percent=80\n   port: 8090\n```",
         "operationId": "ready",
+        "parameters": [
+          {
+            "name": "min_ready_executors",
+            "in": "query",
+            "description": "Minimum number of currently-ready executors required for the probe to succeed. \"Ready\"\nmeans the scheduler has a live `FlightSQL` client for the executor — i.e. it can route\nqueries to it. A value of `0` is treated as \"gate disabled\" and never blocks. Requires\nscheduler role; supplying a non-zero value outside scheduler role returns `400`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "min_ready_executors_percent",
+            "in": "query",
+            "description": "Minimum percentage (0-100) of currently-ready executors relative to the number of\nexecutors currently registered (control stream open). A value of `0` is treated as \"gate\ndisabled\" and never blocks. Values above 100 return `400`. Requires scheduler role;\nsupplying a non-zero value outside scheduler role returns `400`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "verbose",
+            "in": "query",
+            "description": "When `true`, the response body becomes a multi-line diagnostic listing the result of each\ngate. The HTTP status code is unchanged. Useful for `kubectl describe` / curl debugging.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Service is ready",
@@ -1396,6 +1435,17 @@
                   "type": "string"
                 },
                 "example": "ready"
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query parameter or executor gate requested outside scheduler role",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "min_ready_executors_percent must be between 0 and 100"
               }
             }
           },

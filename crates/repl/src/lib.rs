@@ -37,7 +37,7 @@ use arrow_flight::{
 };
 
 use crate::completer::SchemaCache;
-use crate::pretty::format_batches_with_types;
+use crate::pretty::{format_batches_expanded, format_batches_with_types};
 use ansi_colors::Color;
 use arrow::array::RecordBatch;
 use clap::Parser;
@@ -136,6 +136,11 @@ pub struct ReplConfig {
     /// Custom HTTP headers in format 'Key:Value' (can be specified multiple times)
     #[arg(long = "headers", value_name = "KEY:VALUE", help_heading = "SQL REPL")]
     pub custom_headers: Vec<String>,
+
+    /// Start the REPL in expanded view mode, rendering each column on its own
+    /// line per record (useful for wide tables). Toggle at runtime with `.expanded`.
+    #[arg(long, short = 'x', help_heading = "SQL REPL")]
+    pub expanded: bool,
 }
 
 const NQL_LINE_PREFIX: &str = "nql ";
@@ -169,7 +174,7 @@ async fn send_nsql_request(
         .await
 }
 
-const SPECIAL_COMMANDS: [&str; 9] = [
+const SPECIAL_COMMANDS: [&str; 12] = [
     ".exit",
     "exit",
     "quit",
@@ -179,6 +184,9 @@ const SPECIAL_COMMANDS: [&str; 9] = [
     "?",
     ".clear",
     ".clear history",
+    ".expanded",
+    ".expanded on",
+    ".expanded off",
 ];
 const PROMPT_COLOR: Color = Color::Fixed(8);
 
@@ -280,89 +288,9 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     // Note: custom_headers are currently not applied to the gRPC Flight connection.
     // Adding gRPC metadata headers requires interceptor changes.
     // For now, this flag is accepted but not used.
-    if !repl_config.custom_headers.is_empty() {
-        tracing::warn!(
-            "Custom headers are not currently supported for the SQL REPL's Flight gRPC connection"
-        );
-    }
-
-    let mut repl_flight_endpoint = repl_config.repl_flight_endpoint;
-    let mut user_agent = get_user_agent();
-    if let Some(user_agent_override) = repl_config.user_agent {
-        // Prepend the user agent with the Spice.ai user agent
-        let mut new_agent = user_agent_override;
-        new_agent.push(' ');
-        new_agent.push_str(&user_agent);
-        user_agent = new_agent;
-    }
-    // Build mTLS client identity if both cert and key are provided.
-    // Clap `requires` on the CLI flags enforces that both are present or both absent.
-    let client_identity = if let (Some(cert_path), Some(key_path)) = (
-        &repl_config.client_tls_certificate_file,
-        &repl_config.client_tls_key_file,
-    ) {
-        let cert_pem = tokio::fs::read(cert_path).await.map_err(|e| {
-            format!("Failed to read TLS client certificate from '{cert_path}': {e}. Verify the file path and permissions.")
-        })?;
-        let key_pem = tokio::fs::read(key_path).await.map_err(|e| {
-            format!("Failed to read TLS client key from '{key_path}': {e}. Verify the file path and permissions.")
-        })?;
-        Some(tonic::transport::Identity::from_pem(cert_pem, key_pem))
-    } else {
-        None
-    };
-
-    let channel = if let Some(tls_root_certificate_file) = repl_config.tls_root_certificate_file {
-        let tls_root_certificate = tokio::fs::read(&tls_root_certificate_file)
-            .await
-            .map_err(|e| {
-                format!("Failed to read TLS root certificate from '{tls_root_certificate_file}': {e}. Verify the file path and permissions.")
-            })?;
-        let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);
-        let mut client_tls_config = ClientTlsConfig::new().ca_certificate(tls_root_certificate);
-        if let Some(identity) = client_identity {
-            client_tls_config = client_tls_config.identity(identity);
-        }
-        if repl_flight_endpoint.starts_with("http://") {
-            repl_flight_endpoint = repl_flight_endpoint.replacen("http://", "https://", 1);
-        }
-        Channel::from_shared(repl_flight_endpoint.clone())?
-            .user_agent(user_agent.clone())?
-            .tls_config(client_tls_config)?
-            .connect()
-            .await
-    } else if client_identity.is_some() || repl_flight_endpoint.starts_with("https://") {
-        // For HTTPS endpoints or mTLS client identity without an explicit CA, use system certificates
-        let mut client_tls_config = ClientTlsConfig::new().with_native_roots();
-        if let Some(identity) = client_identity {
-            client_tls_config = client_tls_config.identity(identity);
-        }
-        if repl_flight_endpoint.starts_with("http://") {
-            repl_flight_endpoint = repl_flight_endpoint.replacen("http://", "https://", 1);
-        }
-        Channel::from_shared(repl_flight_endpoint.clone())?
-            .user_agent(user_agent.clone())?
-            .tls_config(client_tls_config)?
-            .connect()
-            .await
-    } else {
-        Channel::from_shared(repl_flight_endpoint.clone())?
-            .user_agent(user_agent.clone())?
-            .connect()
-            .await
-    };
-
-    // Set up the Flight client
-    let channel = channel.map_err(|e| {
-        Box::<dyn Error>::from(format!(
-            "Connection failed to spiced at '{repl_flight_endpoint}': {e}. Check if the Spice runtime is running, endpoint including port is correct, and TLS config (if used) is valid."
-        ))
-    })?;
-
-    // The encoder/decoder size is limited to 500MB.
-    let client = FlightServiceClient::new(channel)
-        .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
-        .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
+    warn_if_custom_headers_are_unsupported(&repl_config);
+    let user_agent = build_user_agent(repl_config.user_agent.as_deref());
+    let client = connect_flight_client(&repl_config, &user_agent).await?;
 
     let config = Config::builder()
         .completion_type(CompletionType::List)
@@ -436,6 +364,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     println!();
 
     let mut last_error: Option<Status> = None;
+    let mut expanded = repl_config.expanded;
 
     'outer: loop {
         let mut first_line = true;
@@ -483,7 +412,15 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         if line.is_empty() {
             continue;
         }
-        let line = match line {
+        // Normalise once so every meta-command arm matches case-insensitively
+        // (the multi-line read loop already breaks out on lower-cased
+        // SPECIAL_COMMANDS, so the dispatch here should agree).  `lower` and
+        // `line` have identical byte lengths because `to_ascii_lowercase`
+        // only touches ASCII bytes, so we can safely index into `line` using
+        // offsets derived from `lower` where we need the original-case input
+        // (e.g., for `describe <Table>` identifiers or `nql <Question>`).
+        let lower = line.to_ascii_lowercase();
+        let line = match lower.as_str() {
             ".exit" | "exit" | "quit" | "q" => break,
             ".error" => {
                 match last_error {
@@ -523,6 +460,27 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 let _ = std::io::stdout().flush();
                 continue;
             }
+            ".expanded" => {
+                expanded = !expanded;
+                println!(
+                    "Expanded display is {}.",
+                    if expanded { "on" } else { "off" }
+                );
+                let _ = std::io::stdout().flush();
+                continue;
+            }
+            ".expanded on" => {
+                expanded = true;
+                println!("Expanded display is on.");
+                let _ = std::io::stdout().flush();
+                continue;
+            }
+            ".expanded off" => {
+                expanded = false;
+                println!("Expanded display is off.");
+                let _ = std::io::stdout().flush();
+                continue;
+            }
             "help" | "?" => {
                 println!("Meta-commands:\n");
                 println!(
@@ -540,6 +498,10 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 println!(
                     "  {} Clear persisted query history",
                     PROMPT_COLOR.paint(".clear history        ")
+                );
+                println!(
+                    "  {} Toggle expanded (column-per-line) display; pass `on`/`off` to set",
+                    PROMPT_COLOR.paint(".expanded [on|off]    ")
                 );
                 println!(
                     "  {} Show this help message",
@@ -576,15 +538,15 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             "show schemas" | "show schemas;" | "show databases" | "show databases;" => {
                 "select catalog_name, schema_name from information_schema.schemata where schema_name != 'information_schema';"
             }
-            line if {
-                // Match the `describe`/`desc` keyword case-insensitively but keep
-                // the identifier token in its original case.
-                let without_semi = line.trim_end_matches(';').trim();
+            _ if {
+                // `describe`/`desc` is matched case-insensitively via `lower`;
+                // the identifier token is read from the outer `line` so quoted
+                // or mixed-case table names are preserved.
+                let without_semi = lower.trim_end_matches(';').trim();
                 let mut parts = without_semi.splitn(2, char::is_whitespace);
                 let first = parts.next().unwrap_or_default();
                 let rest = parts.next().unwrap_or_default().trim();
-                let kw =
-                    first.eq_ignore_ascii_case("describe") || first.eq_ignore_ascii_case("desc");
+                let kw = first == "describe" || first == "desc";
                 kw && !rest.is_empty() && !rest.contains(char::is_whitespace)
             } =>
             {
@@ -633,7 +595,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 .await
                 {
                     Ok((records, total_rows, from_cache)) => {
-                        display_records(&records, start_time, total_rows, from_cache)?;
+                        display_records(&records, start_time, total_rows, from_cache, expanded)?;
                     }
                     Err(FlightError::Tonic(status)) => {
                         display_grpc_error(&status);
@@ -649,14 +611,17 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 }
                 continue;
             }
-            line if line.to_lowercase().starts_with(NQL_LINE_PREFIX) => {
+            _ if lower.starts_with(NQL_LINE_PREFIX) => {
                 let _ = rl.add_history_entry(line);
+                // `lower` and `line` have the same byte length, so slicing
+                // off the prefix on the original line yields the user's
+                // original-case question.
+                let question = line[NQL_LINE_PREFIX.len()..].to_string();
                 if let Err(e) = get_and_display_nql_records(
                     repl_config.http_endpoint.clone(),
-                    line.strip_prefix(NQL_LINE_PREFIX)
-                        .unwrap_or(line)
-                        .to_string(),
+                    question,
                     &user_agent,
+                    expanded,
                 )
                 .await
                 {
@@ -683,7 +648,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         .await
         {
             Ok((records, total_rows, from_cache)) => {
-                display_records(&records, start_time, total_rows, from_cache)?;
+                display_records(&records, start_time, total_rows, from_cache, expanded)?;
             }
             Err(FlightError::Tonic(status)) => {
                 display_grpc_error(&status);
@@ -713,6 +678,188 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     }
 
     Ok(())
+}
+
+/// Run one SQL query through the Flight SQL client and print the formatted result.
+///
+/// # Errors
+///
+/// Returns an error if the Flight connection or query execution fails.
+pub async fn run_query(
+    repl_config: ReplConfig,
+    sql: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    warn_if_custom_headers_are_unsupported(&repl_config);
+    let user_agent = build_user_agent(repl_config.user_agent.as_deref());
+    let client = connect_flight_client(&repl_config, &user_agent).await?;
+    let start_time = Instant::now();
+
+    match get_records(
+        client,
+        sql,
+        repl_config.api_key.as_ref(),
+        &user_agent,
+        repl_config.cache_control,
+    )
+    .await
+    {
+        Ok((records, total_rows, from_cache)) => {
+            display_records(
+                &records,
+                start_time,
+                total_rows,
+                from_cache,
+                repl_config.expanded,
+            )?;
+            Ok(())
+        }
+        Err(FlightError::Tonic(status)) => {
+            Err(Box::<dyn Error>::from(format_flight_sql_status(&status)))
+        }
+        Err(error) => Err(Box::<dyn Error>::from(format!(
+            "Unexpected Flight error: {error}. Check connection or query syntax."
+        ))),
+    }
+}
+
+/// Run one SQL query through the Flight SQL client and print the result as JSON.
+///
+/// # Errors
+///
+/// Returns an error if the Flight connection, query execution, or JSON serialization fails.
+pub async fn run_query_json(
+    repl_config: ReplConfig,
+    sql: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    warn_if_custom_headers_are_unsupported(&repl_config);
+    let user_agent = build_user_agent(repl_config.user_agent.as_deref());
+    let client = connect_flight_client(&repl_config, &user_agent).await?;
+
+    match get_records(
+        client,
+        sql,
+        repl_config.api_key.as_ref(),
+        &user_agent,
+        repl_config.cache_control,
+    )
+    .await
+    {
+        Ok((records, _total_rows, _from_cache)) => write_records_json(&records),
+        Err(FlightError::Tonic(status)) => {
+            Err(Box::<dyn Error>::from(format_flight_sql_status(&status)))
+        }
+        Err(error) => Err(Box::<dyn Error>::from(format!(
+            "Unexpected Flight error: {error}. Check connection or query syntax."
+        ))),
+    }
+}
+
+fn write_records_json(records: &[RecordBatch]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = arrow_json::ArrayWriter::new(&mut buf);
+        writer.write_batches(&records.iter().collect::<Vec<_>>())?;
+        writer.finish()?;
+    }
+    let json = String::from_utf8(buf)?;
+    println!("{json}");
+    Ok(())
+}
+
+fn warn_if_custom_headers_are_unsupported(repl_config: &ReplConfig) {
+    if !repl_config.custom_headers.is_empty() {
+        tracing::warn!(
+            "Custom headers are not currently supported for the SQL REPL's Flight gRPC connection"
+        );
+    }
+}
+
+fn build_user_agent(user_agent_override: Option<&str>) -> String {
+    let user_agent = get_user_agent();
+    match user_agent_override {
+        Some(override_value) => format!("{override_value} {user_agent}"),
+        None => user_agent,
+    }
+}
+
+fn format_flight_sql_status(status: &Status) -> String {
+    format!(
+        "Flight SQL query failed ({:?}): {}",
+        status.code(),
+        status.message()
+    )
+}
+
+async fn connect_flight_client(
+    repl_config: &ReplConfig,
+    user_agent: &str,
+) -> Result<FlightServiceClient<Channel>, Box<dyn std::error::Error>> {
+    let mut repl_flight_endpoint = repl_config.repl_flight_endpoint.clone();
+    let client_identity = if let (Some(cert_path), Some(key_path)) = (
+        &repl_config.client_tls_certificate_file,
+        &repl_config.client_tls_key_file,
+    ) {
+        let cert_pem = tokio::fs::read(cert_path).await.map_err(|e| {
+            format!("Failed to read TLS client certificate from '{cert_path}': {e}. Verify the file path and permissions.")
+        })?;
+        let key_pem = tokio::fs::read(key_path).await.map_err(|e| {
+            format!("Failed to read TLS client key from '{key_path}': {e}. Verify the file path and permissions.")
+        })?;
+        Some(tonic::transport::Identity::from_pem(cert_pem, key_pem))
+    } else {
+        None
+    };
+
+    let mut client_tls_config = if let Some(tls_root_certificate_file) =
+        &repl_config.tls_root_certificate_file
+    {
+        let tls_root_certificate = tokio::fs::read(tls_root_certificate_file)
+            .await
+            .map_err(|e| {
+                format!("Failed to read TLS root certificate from '{tls_root_certificate_file}': {e}. Verify the file path and permissions.")
+            })?;
+        let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);
+        Some(ClientTlsConfig::new().ca_certificate(tls_root_certificate))
+    } else if client_identity.is_some() || repl_flight_endpoint.starts_with("https://") {
+        Some(ClientTlsConfig::new().with_native_roots())
+    } else {
+        None
+    };
+
+    if let Some(identity) = client_identity {
+        let tls_config =
+            client_tls_config.unwrap_or_else(|| ClientTlsConfig::new().with_native_roots());
+        client_tls_config = Some(tls_config.identity(identity));
+    }
+
+    if client_tls_config.is_some() && repl_flight_endpoint.starts_with("http://") {
+        repl_flight_endpoint = repl_flight_endpoint.replacen("http://", "https://", 1);
+    }
+
+    let channel = connect_channel(repl_flight_endpoint.clone(), user_agent, client_tls_config)
+        .await
+        .map_err(|e| {
+        Box::<dyn Error>::from(format!(
+            "Connection failed to spiced at '{repl_flight_endpoint}': {e}. Check if the Spice runtime is running, endpoint including port is correct, and TLS config (if used) is valid."
+        ))
+    })?;
+
+    Ok(FlightServiceClient::new(channel)
+        .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
+        .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE))
+}
+
+async fn connect_channel(
+    endpoint: String,
+    user_agent: &str,
+    tls_config: Option<ClientTlsConfig>,
+) -> Result<Channel, Box<dyn std::error::Error>> {
+    let mut endpoint = Channel::from_shared(endpoint)?.user_agent(user_agent.to_string())?;
+    if let Some(tls_config) = tls_config {
+        endpoint = endpoint.tls_config(tls_config)?;
+    }
+
+    Ok(endpoint.connect().await?)
 }
 
 /// Send a SQL query to the Flight service and return the resulting record batches.
@@ -810,6 +957,9 @@ fn add_api_key<T>(
 
 /// Display a set of record batches to the user. This function will display the first 500 rows.
 ///
+/// When `expanded` is true, each row is rendered as a vertical block of
+/// `column | value` lines instead of a table, similar to `PostgreSQL`'s `\x`.
+///
 /// # Errors
 ///
 /// Returns an error if the record batches cannot be formatted.
@@ -818,6 +968,7 @@ fn display_records(
     start_time: Instant,
     total_rows: usize,
     from_cache: bool,
+    expanded: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut limited_records = Vec::new();
     let mut rows_collected = 0;
@@ -836,7 +987,12 @@ fn display_records(
         }
     }
 
-    let pretty_batches = match format_batches_with_types(&limited_records) {
+    let format_result = if expanded {
+        format_batches_expanded(&limited_records)
+    } else {
+        format_batches_with_types(&limited_records)
+    };
+    let pretty_batches = match format_result {
         Ok(pretty) => pretty,
         Err(e) => {
             println!(
@@ -883,6 +1039,7 @@ async fn get_and_display_nql_records(
     endpoint: String,
     query: String,
     user_agent: &str,
+    expanded: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
 
@@ -921,7 +1078,7 @@ async fn get_and_display_nql_records(
         .reduce(|x, y| x + y)
         .unwrap_or(0) as usize;
 
-    display_records(&records, start_time, total_rows, false)?;
+    display_records(&records, start_time, total_rows, false, expanded)?;
 
     Ok(())
 }
@@ -1055,6 +1212,14 @@ mod tests {
     }
 
     #[test]
+    fn flight_sql_status_error_includes_grpc_code() {
+        let message = format_flight_sql_status(&Status::permission_denied("missing token"));
+
+        assert!(message.contains("PermissionDenied"));
+        assert!(message.contains("missing token"));
+    }
+
+    #[test]
     fn test_display_records() {
         let test_cases = vec![
             (
@@ -1101,10 +1266,23 @@ mod tests {
         let start_time = Instant::now();
         let from_cache = false;
 
-        let result = display_records(records, start_time, total_rows, from_cache)
+        let result = display_records(records, start_time, total_rows, from_cache, false)
             .expect("Failed to display records");
 
         insta::assert_snapshot!(test_name, result);
+    }
+
+    #[test]
+    fn test_display_records_expanded() {
+        let records = vec![create_test_batch(3, 1)];
+        let total_rows = 3;
+        let start_time = Instant::now();
+        let from_cache = false;
+
+        let result = display_records(&records, start_time, total_rows, from_cache, true)
+            .expect("Failed to display records in expanded view");
+
+        insta::assert_snapshot!("display_records_expanded", result);
     }
 
     #[test]
