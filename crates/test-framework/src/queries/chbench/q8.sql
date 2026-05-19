@@ -2,7 +2,7 @@ SELECT
     extract(year FROM o_entry_d) AS l_year,
     sum(CASE WHEN n2.n_name = 'INDIA' THEN ol_amount ELSE 0 END) / sum(ol_amount) AS mkt_share
 FROM
-    item, supplier, stock, order_line, orders, customer, nation n1, nation n2, region
+    item, supplier, stock, order_line, oorder, customer, nation n1, nation n2, region
 WHERE
     i_id = s_i_id
     AND ol_i_id = s_i_id

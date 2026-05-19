@@ -58,11 +58,11 @@ datasets:
       on_conflict:
         (no_w_id, no_d_id, no_o_id): upsert
 
-  - from: postgres:orders
-    name: orders
+  - from: postgres:oorder
+    name: oorder
     params:
       <<: *postgres_params
-      pg_replication_slot: spice_orders
+      pg_replication_slot: spice_oorder
     acceleration:
       <<: *cayenne_accel
       primary_key: (o_w_id, o_d_id, o_id)

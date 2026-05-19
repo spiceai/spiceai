@@ -6,7 +6,7 @@ SELECT
     c_phone,
     n_name
 FROM
-    customer, orders, order_line, nation
+    customer, oorder, order_line, nation
 WHERE
     c_id = o_c_id
     AND c_w_id = o_w_id

@@ -58,7 +58,6 @@ use super::{
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{FilePathError, storage::resolve_acceleration_storage_async},
-    datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_functions_for_duckdb},
     parameters::ParameterSpec,
     register_data_accelerator, spice_data_base_path,
 };
