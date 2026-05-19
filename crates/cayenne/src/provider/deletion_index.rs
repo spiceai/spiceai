@@ -56,6 +56,9 @@ pub struct DeletionIndex {
     /// Monotonic upper bound for the current immutable entries. This stays
     /// exact because indexes are build-once / extend-only; any future removal
     /// API must recompute it instead of carrying a stale high-water mark.
+    /// `CayenneTableProvider::apply_partial_deletion_filter` relies on this
+    /// exact value to decide whether a protected snapshot can skip deletion
+    /// filtering without letting deleted rows through.
     max_sequence_number: Option<i64>,
     /// Item count the current `bloom` was sized for. When `entries.len()` exceeds
     /// `2 * bloom_capacity`, `extend_max` rebuilds the bloom from scratch to keep the
@@ -255,6 +258,9 @@ pub struct KeyDeletionIndex {
     /// Monotonic upper bound for the current immutable entries. This stays
     /// exact because indexes are build-once / extend-only; any future removal
     /// API must recompute it instead of carrying a stale high-water mark.
+    /// `CayenneTableProvider::apply_partial_deletion_filter` relies on this
+    /// exact value to decide whether a protected snapshot can skip deletion
+    /// filtering without letting deleted rows through.
     max_sequence_number: Option<i64>,
     /// Item count the current `bloom` was sized for. Mirrors
     /// [`DeletionIndex::bloom_capacity`] to amortize bloom rebuilds.

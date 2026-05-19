@@ -242,11 +242,8 @@ impl RuntimeBuilder {
             &spicepod_rt.params,
             "cayenne_sort_merge_memory_pool_fraction",
         );
-        let cayenne_filter_propagation_enabled = parse_bool_runtime_param(
-            &spicepod_rt.params,
-            "cayenne_propagate_filter_across_equi_join_keys",
-            false,
-        );
+        let cayenne_filter_propagation_enabled =
+            parse_cayenne_filter_propagation(&spicepod_rt.params).is_enabled();
 
         let caching = Runtime::init_caching(Some(&spicepod_rt.caching));
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
@@ -678,19 +675,33 @@ fn parse_f64_runtime_param(params: &HashMap<String, String>, key: &str) -> Optio
     }
 }
 
-fn parse_bool_runtime_param(params: &HashMap<String, String>, key: &str, default: bool) -> bool {
-    let Some(raw) = params.get(key) else {
-        return default;
+const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CayenneFilterPropagation {
+    Disabled,
+    Enabled,
+}
+
+impl CayenneFilterPropagation {
+    fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+fn parse_cayenne_filter_propagation(params: &HashMap<String, String>) -> CayenneFilterPropagation {
+    let Some(raw) = params.get(CAYENNE_FILTER_PROPAGATION_PARAM) else {
+        return CayenneFilterPropagation::Disabled;
     };
 
     match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "enabled" | "enable" | "yes" | "on" => true,
-        "0" | "false" | "disabled" | "disable" | "no" | "off" => false,
+        "enabled" => CayenneFilterPropagation::Enabled,
+        "disabled" => CayenneFilterPropagation::Disabled,
         _ => {
             tracing::warn!(
-                "runtime.params.{key}={raw:?} is not a valid boolean; using default {default}"
+                "runtime.params.{CAYENNE_FILTER_PROPAGATION_PARAM}={raw:?} must be 'enabled' or 'disabled'; using disabled"
             );
-            default
+            CayenneFilterPropagation::Disabled
         }
     }
 }
@@ -785,27 +796,33 @@ mod test {
     }
 
     #[test]
-    fn test_parse_bool_runtime_param() {
-        let params = HashMap::from([
-            (
-                "cayenne_propagate_filter_across_equi_join_keys".to_string(),
-                "enabled".to_string(),
-            ),
-            ("disabled".to_string(), "false".to_string()),
-            ("one".to_string(), "1".to_string()),
-            ("zero".to_string(), "0".to_string()),
-            ("bad".to_string(), "maybe".to_string()),
-        ]);
+    fn test_parse_cayenne_filter_propagation() {
+        let params = HashMap::from([(
+            CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
+            "enabled".to_string(),
+        )]);
 
-        assert!(parse_bool_runtime_param(
-            &params,
-            "cayenne_propagate_filter_across_equi_join_keys",
-            false
-        ));
-        assert!(!parse_bool_runtime_param(&params, "disabled", true));
-        assert!(parse_bool_runtime_param(&params, "one", false));
-        assert!(!parse_bool_runtime_param(&params, "zero", true));
-        assert!(parse_bool_runtime_param(&params, "missing", true));
-        assert!(!parse_bool_runtime_param(&params, "bad", false));
+        assert_eq!(
+            parse_cayenne_filter_propagation(&params),
+            CayenneFilterPropagation::Enabled
+        );
+        assert_eq!(
+            parse_cayenne_filter_propagation(&HashMap::from([(
+                CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
+                "disabled".to_string(),
+            )])),
+            CayenneFilterPropagation::Disabled
+        );
+        assert_eq!(
+            parse_cayenne_filter_propagation(&HashMap::from([(
+                CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
+                "true".to_string(),
+            )])),
+            CayenneFilterPropagation::Disabled
+        );
+        assert_eq!(
+            parse_cayenne_filter_propagation(&HashMap::new()),
+            CayenneFilterPropagation::Disabled
+        );
     }
 }

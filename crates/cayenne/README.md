@@ -122,9 +122,10 @@ pub trait MetadataCatalog: Send + Sync {
     async fn get_table(&self, table_name: &str) -> CatalogResult<TableMetadata>;
     async fn drop_table(&self, table_name: &str) -> CatalogResult<bool>;
 
-    // Sequence numbers
+    // Sequence numbers (reserve reduces round-trips on serialized backends)
     async fn increment_sequence_number(&self, table_id: &str) -> CatalogResult<i64>;
     async fn get_sequence_number(&self, table_id: &str) -> CatalogResult<i64>;
+    async fn reserve_sequence_numbers(&self, table_id: &str, count: u32) -> CatalogResult<i64>;
 
     // Delete files (position- and key-based)
     async fn add_delete_file(&self, delete_file: DeleteFile) -> CatalogResult<String>;

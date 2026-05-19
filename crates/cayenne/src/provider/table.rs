@@ -146,29 +146,29 @@ fn protected_snapshot_age(snapshot_id: &str, now: SystemTime) -> Option<Duration
         if should_warn_protected_snapshot_age(snapshot_id, "invalid_uuid") {
             tracing::warn!(
                 snapshot_id,
-                "Cayenne protected snapshot id is not a valid UUID; treating age as expired"
+                "Cayenne protected snapshot id is not a valid UUID; ignoring it for age-based maintenance"
             );
         }
-        return Some(Duration::MAX);
+        return None;
     };
     let Some(timestamp) = snapshot_uuid.get_timestamp() else {
         if should_warn_protected_snapshot_age(snapshot_id, "missing_uuid_timestamp") {
             tracing::warn!(
                 snapshot_id,
-                "Cayenne protected snapshot id does not contain a UUID timestamp; treating age as expired"
+                "Cayenne protected snapshot id does not contain a UUID timestamp; ignoring it for age-based maintenance"
             );
         }
-        return Some(Duration::MAX);
+        return None;
     };
     let (seconds, nanos) = timestamp.to_unix();
     let Some(snapshot_time) = UNIX_EPOCH.checked_add(Duration::new(seconds, nanos)) else {
         if should_warn_protected_snapshot_age(snapshot_id, "timestamp_overflow") {
             tracing::warn!(
                 snapshot_id,
-                "Cayenne protected snapshot timestamp overflowed SystemTime; treating age as expired"
+                "Cayenne protected snapshot timestamp overflowed SystemTime; ignoring it for age-based maintenance"
             );
         }
-        return Some(Duration::MAX);
+        return None;
     };
     match now.duration_since(snapshot_time) {
         Ok(age) => Some(age),
@@ -176,10 +176,10 @@ fn protected_snapshot_age(snapshot_id: &str, now: SystemTime) -> Option<Duration
             if should_warn_protected_snapshot_age(snapshot_id, "future_timestamp") {
                 tracing::warn!(
                     snapshot_id,
-                    "Cayenne protected snapshot timestamp is in the future; treating age as expired"
+                    "Cayenne protected snapshot timestamp is in the future; ignoring it for age-based maintenance"
                 );
             }
-            Some(Duration::MAX)
+            None
         }
     }
 }
@@ -1699,13 +1699,10 @@ impl OnConflictValidationStream {
     }
 }
 
-pub(crate) fn record_cayenne_write_phase(table_name: &str, phase: &'static str, start: Instant) {
+pub(crate) fn record_cayenne_write_phase(_table_name: &str, phase: &'static str, start: Instant) {
     telemetry::track_cayenne_write_phase_duration(
         start.elapsed(),
-        &[
-            telemetry::KeyValue::new("table", table_name.to_string()),
-            telemetry::KeyValue::new("phase", phase),
-        ],
+        &[telemetry::KeyValue::new("phase", phase)],
     );
 }
 
@@ -4523,24 +4520,28 @@ impl CayenneTableProvider {
             return Ok(());
         }
 
-        // Get a fresh sequence number for this deletion operation.
-        // This ensures proper ordering: data written after this delete but before
-        // the next delete will be properly filtered.
-        let delete_sequence = self
+        // Reserve two consecutive sequence numbers in one metastore round-trip.
+        // The on-conflict path needs a delete sequence (for the DeleteFile that
+        // hides the old row) and a strictly higher insert sequence (for the
+        // replacement row's insert record so it is visible after the delete).
+        //
+        // Using `reserve_sequence_numbers(2)` instead of two separate
+        // `increment_sequence_number` calls reduces writer-lock acquisitions on
+        // the serialized SQLite/Turso metastore and is the main lever for the
+        // "metastore round-trips" concern on the hot upsert path.
+        let base = self
             .catalog
-            .increment_sequence_number(&self.table_metadata.table_id)
+            .reserve_sequence_numbers(&self.table_metadata.table_id, 2)
             .await
             .map_err(|err| CatalogError::InvalidOperationNoSource {
-                message: format!("Failed to get delete sequence number: {err}"),
+                message: format!("Failed to reserve sequence numbers for on-conflict: {err}"),
             })?;
-
-        // The insert sequence must be higher than delete sequence so the new row
-        // isn't filtered out. We use delete_sequence + 1 for the re-insertion.
-        let insert_sequence = delete_sequence + 1;
+        let delete_sequence = base;
+        let insert_sequence = base + 1;
 
         // Create a temporary metadata with the fresh delete sequence number.
         // The table_metadata's current_sequence_number is stale (set at table open time),
-        // so we must use the actual delete_sequence from increment_sequence_number().
+        // so we must use the actual delete_sequence we just reserved.
         let mut temp_metadata = self.table_metadata.clone();
         temp_metadata.current_sequence_number = delete_sequence;
         let writer = DeletionVectorWriter::new(&temp_metadata);
@@ -7269,7 +7270,7 @@ impl CayenneTableProvider {
             "Cayenne scan includes protected snapshots"
         );
         let protected_snapshot_trigger = self.context.compaction_trigger_protected_snapshots();
-        let protected_snapshot_warn_threshold = (protected_snapshot_trigger / 2).max(1);
+        let protected_snapshot_warn_threshold = protected_snapshot_trigger.max(1);
         if protected_snapshots.len() >= protected_snapshot_warn_threshold {
             tracing::warn!(
                 table = %self.table_metadata.table_name,
@@ -8483,7 +8484,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_snapshot_maintenance_trigger_treats_invalid_uuid_as_old() {
+    fn protected_snapshot_maintenance_trigger_ignores_invalid_uuid_for_age() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
         let protected_snapshots = HashMap::from([("not-a-uuid".to_string(), 1)]);
 
@@ -8494,16 +8495,12 @@ mod tests {
                 Some(Duration::from_secs(60)),
                 now,
             ),
-            Some(SnapshotMaintenanceTrigger::ProtectedSnapshotAge {
-                protected_snapshot_count: 1,
-                oldest_snapshot_age: Duration::MAX,
-                trigger_age: Duration::from_secs(60),
-            })
+            None
         );
     }
 
     #[test]
-    fn protected_snapshot_maintenance_trigger_treats_future_uuid_as_old() {
+    fn protected_snapshot_maintenance_trigger_ignores_future_uuid_for_age() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
         let protected_snapshots = HashMap::from([(protected_snapshot_id_at_unix_time(1_100), 1)]);
 
@@ -8514,11 +8511,7 @@ mod tests {
                 Some(Duration::from_secs(60)),
                 now,
             ),
-            Some(SnapshotMaintenanceTrigger::ProtectedSnapshotAge {
-                protected_snapshot_count: 1,
-                oldest_snapshot_age: Duration::MAX,
-                trigger_age: Duration::from_secs(60),
-            })
+            None
         );
     }
 

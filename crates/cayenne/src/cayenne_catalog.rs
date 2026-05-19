@@ -1012,20 +1012,38 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn increment_sequence_number(&self, table_id: &str) -> CatalogResult<i64> {
-        // Atomically increment and return the new sequence number
+        self.reserve_sequence_numbers(table_id, 1).await
+    }
+
+    async fn reserve_sequence_numbers(&self, table_id: &str, count: u32) -> CatalogResult<i64> {
+        if count == 0 {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "reserve_sequence_numbers called with count=0".to_string(),
+            });
+        }
+        let delta = count as i64;
+
+        // Single atomic bump of the high-water mark.
+        // We then read back the *new* high water mark and compute the base of the
+        // reserved block. This keeps the SQL simple and works for both SQLite and
+        // Turso without requiring RETURNING support in the current execute path.
         self.metastore
             .execute_helper(ExecuteParams {
-                sql: "UPDATE cayenne_table SET current_sequence_number = current_sequence_number + 1 WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id.to_string())],
+                sql: "UPDATE cayenne_table SET current_sequence_number = current_sequence_number + ?2 WHERE table_id = ?1",
+                params: vec![
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Integer(delta),
+                ],
             })
             .await
             .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to increment sequence number".to_string(),
+                message: format!("Failed to reserve {count} sequence numbers"),
                 source: Box::new(e),
             })?;
 
-        // Retrieve the new sequence number
-        self.get_sequence_number(table_id).await
+        let new_high = self.get_sequence_number(table_id).await?;
+        // The reserved block is [new_high - delta + 1, new_high]
+        Ok(new_high - delta + 1)
     }
 
     async fn get_sequence_number(&self, table_id: &str) -> CatalogResult<i64> {
@@ -1956,10 +1974,11 @@ impl MetadataCatalog for CayenneCatalog {
         // Atomic replacement for the legacy `add_delete_file × N` +
         // `add_insert_records_batch` sequence in `apply_on_conflict_deletions`.
         // See `crates/cayenne/benches/apply_on_conflict_rpc_ceiling.rs` for the
-        // before-numbers and the atomicity tradeoff. The caller still pays
-        // `increment_sequence_number` itself; this transaction wraps the
-        // delete-file and insert-record catalog writes so they commit all-or-
-        // nothing.
+        // before-numbers and the atomicity tradeoff.
+        // The caller now uses `reserve_sequence_numbers(2)` (one round-trip for
+        // the delete+insert pair) before entering this transaction; the txn
+        // itself only does the durable catalog writes for the DeleteFiles and
+        // InsertRecords.
         if delete_files.is_empty() && insert_pk_bytes_list.is_empty() {
             return Ok(());
         }
@@ -3131,7 +3150,7 @@ mod tests {
         let mut conflicting_delete_file = delete_file;
         conflicting_delete_file.file_size_bytes = 1024;
 
-        catalog
+        let err = catalog
             .commit_on_conflict_deletions(
                 vec![conflicting_delete_file],
                 &table_id,
@@ -3140,6 +3159,26 @@ mod tests {
             )
             .await
             .expect_err("conflicting delete-file metadata should be rejected");
+
+        match err {
+            CatalogError::InvalidOperation { message, source } => {
+                assert!(
+                    message.contains("Delete-file metadata conflicts"),
+                    "expected descriptive on-conflict conflict message, got: {message}"
+                );
+                match source.downcast_ref::<CatalogError>() {
+                    Some(CatalogError::ConstraintViolation { message }) => {
+                        assert!(
+                            message.contains("file_size_bytes"),
+                            "expected file_size_bytes mismatch in error, got: {message}"
+                        );
+                    }
+                    Some(other) => panic!("expected nested ConstraintViolation, got: {other}"),
+                    None => panic!("expected nested CatalogError, got: {source}"),
+                }
+            }
+            other => panic!("expected InvalidOperation, got: {other}"),
+        }
 
         let delete_files = catalog
             .get_table_delete_files(&table_id)

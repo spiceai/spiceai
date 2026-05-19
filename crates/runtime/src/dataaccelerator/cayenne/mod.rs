@@ -210,6 +210,10 @@ const SMALL_WRITE_COMPACTION_TRIGGER_FILES: usize = 4;
 const SMALL_WRITE_COMPACTION_TRIGGER_PROTECTED_SNAPSHOTS: usize = 4;
 const SMALL_WRITE_COMPACTION_TRIGGER_SNAPSHOT_AGE_MS: u64 = 60_000;
 const SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS: u64 = 10_000;
+const SMALL_WRITE_INLINE_MAX_ROWS: usize = cayenne::metadata::DEFAULT_INLINE_MAX_ROWS;
+const SMALL_WRITE_INLINE_MAX_BYTES: usize = cayenne::metadata::DEFAULT_INLINE_MAX_BYTES;
+const SMALL_WRITE_INLINE_MAX_BUFFER_BYTES: usize =
+    cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES;
 const SMALL_WRITE_INLINE_FLUSH_MAX_ROWS: i64 = 2_048;
 const SMALL_WRITE_INLINE_FLUSH_MAX_SEGMENTS: i64 = 16;
 const SMALL_WRITE_INLINE_FLUSH_MAX_BYTES: i64 = 2 * 1_048_576;
@@ -225,6 +229,9 @@ fn apply_refresh_mode_defaults(
             SMALL_WRITE_COMPACTION_TRIGGER_PROTECTED_SNAPSHOTS;
         config.compaction_trigger_snapshot_age_ms = SMALL_WRITE_COMPACTION_TRIGGER_SNAPSHOT_AGE_MS;
         config.compaction_background_interval_ms = SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS;
+        config.inline_max_rows = SMALL_WRITE_INLINE_MAX_ROWS;
+        config.inline_max_bytes = SMALL_WRITE_INLINE_MAX_BYTES;
+        config.inline_max_buffer_bytes = SMALL_WRITE_INLINE_MAX_BUFFER_BYTES;
         config.inline_flush_max_rows = SMALL_WRITE_INLINE_FLUSH_MAX_ROWS;
         config.inline_flush_max_segments = SMALL_WRITE_INLINE_FLUSH_MAX_SEGMENTS;
         config.inline_flush_max_bytes = SMALL_WRITE_INLINE_FLUSH_MAX_BYTES;
@@ -2549,17 +2556,11 @@ mod tests {
                 config.compaction_background_interval_ms,
                 SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS
             );
-            assert_eq!(
-                config.inline_max_rows,
-                cayenne::metadata::DEFAULT_INLINE_MAX_ROWS
-            );
-            assert_eq!(
-                config.inline_max_bytes,
-                cayenne::metadata::DEFAULT_INLINE_MAX_BYTES
-            );
+            assert_eq!(config.inline_max_rows, SMALL_WRITE_INLINE_MAX_ROWS);
+            assert_eq!(config.inline_max_bytes, SMALL_WRITE_INLINE_MAX_BYTES);
             assert_eq!(
                 config.inline_max_buffer_bytes,
-                cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES
+                SMALL_WRITE_INLINE_MAX_BUFFER_BYTES
             );
             assert_eq!(
                 config.inline_flush_max_rows,
