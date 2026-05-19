@@ -415,29 +415,29 @@ fn try_rewrite_large_same_source_join(
     let optimizer_config = cayenne_optimizer_config(config);
     let row_count_threshold = optimizer_config.sort_merge_min_rows;
     let row_gate_passes = build_row_count > row_count_threshold;
-
     let memory_gate_bytes = sort_merge_memory_gate_bytes(&optimizer_config);
-    let estimated_build_bytes = if memory_gate_bytes.is_some() {
-        build_side_memory_estimate(hash_join.left().as_ref(), build_row_count)
-    } else {
-        None
+
+    // When a memory gate is configured, it's the *primary* signal — the row gate
+    // becomes irrelevant unless the byte estimate is unavailable. This lets the
+    // rule catch wide-row builds (e.g. q21 self-joins over `stock` at SF1) whose
+    // row count is well below the row threshold but whose materialised hash
+    // table would still exhaust the memory pool. When the gate is *inactive*
+    // (no memory pool wired through config — direct DataFusion users), fall back
+    // to the row-count threshold alone.
+    let estimated_build_bytes = match memory_gate_bytes {
+        Some(_) => build_side_memory_estimate(hash_join.left().as_ref(), build_row_count),
+        None => None,
     };
-    let byte_gate_passes = match (memory_gate_bytes, estimated_build_bytes) {
+    let should_rewrite = match (memory_gate_bytes, estimated_build_bytes) {
+        // Memory gate active + byte estimate available — byte gate alone decides.
         (Some(gate_bytes), Some(bytes)) => bytes > gate_bytes,
-        _ => false,
+        // Memory gate active but no byte estimate — fall back to row gate.
+        (Some(_), None) => row_gate_passes,
+        // No memory gate configured — pure row-count gate.
+        (None, _) => row_gate_passes,
     };
 
-    // Rewrite when either gate fires. The row gate alone catches large-cardinality
-    // builds even when the byte estimate is unavailable; the byte gate alone
-    // catches wide-row builds (e.g. q21 self-joins over `stock` at SF1) where the
-    // row count is well below the row threshold but the materialised hash table
-    // would still exhaust the memory pool. Both gates failing => the hash join is
-    // expected to be the faster plan; preserve DataFusion's default.
-    //
-    // When the memory gate is configured but the build-side bytes can't be
-    // estimated (no stats yet on a freshly-loaded snapshot, etc.), fall back to
-    // the row gate alone — the same conservative behaviour the prior version had.
-    if !row_gate_passes && !byte_gate_passes {
+    if !should_rewrite {
         tracing::debug!(
             join_type = ?hash_join.join_type(),
             build_row_count,
@@ -2157,6 +2157,41 @@ mod tests {
         assert!(
             optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
             "configured min-row threshold should keep smaller build sides as hash joins"
+        );
+    }
+
+    /// q21-shape regression: low row count but wide projection produces a build
+    /// big enough to OOM `HashJoinExec`'s non-spillable hash table. The byte gate
+    /// must catch this case even though the row count is below
+    /// `sort_merge_min_rows`.
+    #[test]
+    fn rewrites_low_row_count_wide_build_when_byte_estimate_exceeds_memory_gate() {
+        let schema = order_line_schema();
+        // 200K rows × ~24 bytes/row ≈ 4.8 MB, plus inflated overhead from
+        // `build_side_memory_estimate`'s hash-table overhead factor. Well below
+        // the 10M row threshold but well above the 64 KB byte gate below.
+        let small_rows = Precision::Exact(200_000);
+        let left =
+            cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", small_rows);
+        let right =
+            cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", small_rows);
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::LeftAnti,
+            NullEquality::NullEqualsNothing,
+        ));
+        // 64 KB pool × 0.125 = 8 KB byte gate. The 200K-row build is enormously
+        // above that, so the rewrite should fire despite row count below 10M.
+        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(64 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.as_any().downcast_ref::<SortMergeJoinExec>().is_some(),
+            "low-row-count + wide-row build exceeding the byte gate should be rewritten to sort-merge"
         );
     }
 
