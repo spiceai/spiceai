@@ -290,13 +290,14 @@ impl Handler for SpidapterHandler {
         metadata: HashMap<String, serde_json::Value>,
         datasets: HashMap<String, DatasetConfig>,
         etl_sink_type: Option<EtlSinkType>,
+        _seed_data: HashMap<String, String>,
     ) -> Result<SetupResponse, String> {
         eprintln!(
             "[stdio] setup: run_id={run_id}, metadata_keys={:?}",
             metadata.keys().collect::<Vec<_>>()
         );
 
-        let pg_config = PgConfig::from_args(&self.args);
+        let pg_config = PgConfig::from_args(&self.args, &run_id);
 
         // WAL CDC mode: set up PostgreSQL tables, replication slot, and publication
         // before provisioning Spice so the spicepod can reference them immediately.
@@ -361,9 +362,13 @@ impl Handler for SpidapterHandler {
                 SetupResponse {
                     driver: AdbcDriver::Postgresql,
                     db_kwargs: pg.adbc_kwargs(),
-                    catalog_namespace: Some(pg.schema.clone()),
+                    catalog_namespace: None,
                     read_driver: Some((AdbcDriver::Flightsql, flight_kwargs)),
                     endpoints: HashMap::new(),
+                    table_name_map: datasets
+                        .keys()
+                        .map(|name| (name.clone(), format!("{}.{name}", pg.schema)))
+                        .collect(),
                 }
             }
             IngestionTarget::Cayenne => build_cayenne_setup_response(etl_sink_type, &state),
@@ -881,7 +886,6 @@ mod tests {
             pg_user: None,
             pg_password: String::new(),
             pg_database: None,
-            pg_schema: "public".to_string(),
             pg_acceleration: PgAccelerationEngine::Cayenne,
             spiced_binary: "spiced".to_string(),
         }

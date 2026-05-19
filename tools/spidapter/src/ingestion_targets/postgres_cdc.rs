@@ -28,7 +28,12 @@ use uuid::Uuid;
 
 use crate::args::StdioArgs;
 
+#[expect(dead_code)]
 pub(crate) const PG_REPLICATION_SLOT_NAME: &str = "spicebench_slot";
+
+fn tpch_schema_name(run_id: &Uuid) -> String {
+    format!("tpch_{}", crate::commands::run_id_short(run_id))
+}
 /// Legacy single-publication name kept for teardown cleanup only.
 const PG_PUBLICATION_NAME: &str = "spicebench_pub";
 
@@ -48,7 +53,7 @@ pub(crate) struct PgConfig {
 }
 
 impl PgConfig {
-    pub(crate) fn from_args(args: &StdioArgs) -> Option<Self> {
+    pub(crate) fn from_args(args: &StdioArgs, run_id: &Uuid) -> Option<Self> {
         let host = args.pg_host.clone()?;
         Some(Self {
             host,
@@ -62,7 +67,7 @@ impl PgConfig {
                 .pg_database
                 .clone()
                 .unwrap_or_else(|| "spicebench".to_string()),
-            schema: args.pg_schema.clone(),
+            schema: tpch_schema_name(run_id),
         })
     }
 
@@ -96,7 +101,14 @@ impl PgConfig {
             "host={} port={} user={} password={} dbname={}",
             self.host, self.port, self.user, self.password, self.database
         );
-        let (client, conn) = tokio_postgres::connect(&config, NoTls).await?;
+        let (client, conn) = tokio_postgres::connect(&config, NoTls).await.map_err(|e| {
+            anyhow::anyhow!(
+                "failed to connect to PostgreSQL ({}:{}): {}",
+                self.host,
+                self.port,
+                pg_error_message(&e)
+            )
+        })?;
         tokio::spawn(async move {
             if let Err(e) = conn.await {
                 eprintln!("[stdio] pg connection error: {e}");
@@ -153,7 +165,10 @@ pub(crate) fn generate_postgres_wal_spicepod(
             Some(pk) => HashMap::from([(pk.clone(), OnConflictBehavior::Upsert)]),
         };
 
-        let mut dataset = Dataset::new(format!("postgres:{dataset_name}"), dataset_name.as_str());
+        let mut dataset = Dataset::new(
+            format!("postgres:{}.{dataset_name}", pg.schema),
+            dataset_name.as_str(),
+        );
         dataset.params = Some(Params::from_string_map(param_map));
         dataset.acceleration = Some(Acceleration {
             enabled: true,
@@ -256,7 +271,10 @@ pub(crate) async fn setup_postgres_for_wal(
     let client = pg.connect().await?;
 
     // Verify WAL level
-    let row = client.query_one("SHOW wal_level", &[]).await?;
+    let row = client
+        .query_one("SHOW wal_level", &[])
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to query wal_level: {}", pg_error_message(&e)))?;
     let wal_level: &str = row.get(0);
     if wal_level != "logical" {
         anyhow::bail!(
@@ -266,18 +284,27 @@ pub(crate) async fn setup_postgres_for_wal(
     }
 
     // Create schema
-    client
-        .execute(&format!("CREATE SCHEMA IF NOT EXISTS {}", pg.schema), &[])
-        .await?;
+    let create_schema = format!("CREATE SCHEMA IF NOT EXISTS {}", pg.schema);
+    client.execute(&create_schema, &[]).await.map_err(|e| {
+        anyhow::anyhow!(
+            "failed to create schema '{}': {}",
+            pg.schema,
+            pg_error_message(&e)
+        )
+    })?;
 
     // Drop and recreate tables to ensure clean state on each benchmark run.
     for (name, dataset) in datasets {
         let drop_ddl = format!("DROP TABLE IF EXISTS {}.{}", pg.schema, name);
         eprintln!("[stdio] pg WAL setup: {drop_ddl}");
-        client.execute(&drop_ddl, &[]).await?;
+        client.execute(&drop_ddl, &[]).await.map_err(|e| {
+            anyhow::anyhow!("failed to drop table '{name}': {}", pg_error_message(&e))
+        })?;
         let ddl = pg_create_table_ddl(&pg.schema, name, dataset)?;
         eprintln!("[stdio] pg WAL setup: {ddl}");
-        client.execute(&ddl, &[]).await?;
+        client.execute(&ddl, &[]).await.map_err(|e| {
+            anyhow::anyhow!("failed to create table '{name}': {}", pg_error_message(&e))
+        })?;
     }
 
     // Create one publication per table so each dataset's replication slot only
@@ -288,7 +315,13 @@ pub(crate) async fn setup_postgres_for_wal(
         // Drop first for idempotency across benchmark runs.
         client
             .execute(&format!("DROP PUBLICATION IF EXISTS {pub_name}"), &[])
-            .await?;
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to drop publication '{pub_name}': {}",
+                    pg_error_message(&e)
+                )
+            })?;
         let create_pub = format!("CREATE PUBLICATION {pub_name} FOR TABLE {qualified_table}");
         eprintln!("[stdio] pg WAL setup: {create_pub}");
         client.execute(&create_pub, &[]).await.map_err(|e| {
@@ -311,46 +344,119 @@ pub(crate) async fn teardown_postgres(
     for name in datasets.keys() {
         let drop_table = format!("DROP TABLE IF EXISTS {}.{}", pg.schema, name);
         eprintln!("[stdio] pg teardown: {drop_table}");
-        client.execute(&drop_table, &[]).await?;
+        client.execute(&drop_table, &[]).await.map_err(|e| {
+            anyhow::anyhow!("failed to drop table '{name}': {}", pg_error_message(&e))
+        })?;
 
         let slots: Vec<String> = client
             .query(
                 "SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE $1",
                 &[&format!("spice_{name}_%")],
             )
-            .await?
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to query replication slots for '{name}': {}",
+                    pg_error_message(&e)
+                )
+            })?
             .into_iter()
             .map(|row| row.get::<_, String>(0))
             .collect();
         for slot in slots {
-            let drop_slot = format!("SELECT pg_drop_replication_slot('{slot}')");
-            eprintln!("[stdio] pg teardown: {drop_slot}");
-            client.execute(&drop_slot, &[]).await?;
+            drop_replication_slot(&client, &slot).await;
         }
 
         let pub_name = pub_name_for_table(name);
         let drop_pub = format!("DROP PUBLICATION IF EXISTS {pub_name}");
         eprintln!("[stdio] pg teardown: {drop_pub}");
-        client.execute(&drop_pub, &[]).await?;
+        client.execute(&drop_pub, &[]).await.map_err(|e| {
+            anyhow::anyhow!(
+                "failed to drop publication '{pub_name}': {}",
+                pg_error_message(&e)
+            )
+        })?;
     }
+
+    // Drop the schema (and everything remaining in it) created for this run
+    let drop_schema = format!("DROP SCHEMA IF EXISTS {} CASCADE", pg.schema);
+    eprintln!("[stdio] pg teardown: {drop_schema}");
+    client.execute(&drop_schema, &[]).await.map_err(|e| {
+        anyhow::anyhow!(
+            "failed to drop schema '{}': {}",
+            pg.schema,
+            pg_error_message(&e)
+        )
+    })?;
 
     // Drop legacy publication if it exists
     let drop_legacy_pub = format!("DROP PUBLICATION IF EXISTS {PG_PUBLICATION_NAME}");
     eprintln!("[stdio] pg teardown: {drop_legacy_pub}");
-    client.execute(&drop_legacy_pub, &[]).await?;
-
-    // Drop legacy named slot if it exists
-    let legacy_rows = client
-        .query(
-            "SELECT slot_name FROM pg_replication_slots WHERE slot_name = $1",
-            &[&PG_REPLICATION_SLOT_NAME],
+    client.execute(&drop_legacy_pub, &[]).await.map_err(|e| {
+        anyhow::anyhow!(
+            "failed to drop legacy publication: {}",
+            pg_error_message(&e)
         )
-        .await?;
-    if !legacy_rows.is_empty() {
-        let drop_legacy = format!("SELECT pg_drop_replication_slot('{PG_REPLICATION_SLOT_NAME}')");
-        eprintln!("[stdio] pg teardown: {drop_legacy}");
-        client.execute(&drop_legacy, &[]).await?;
+    })?;
+
+    // Final sweep: drop any remaining spice-related replication slots not caught
+    // by the per-table loop above (e.g. legacy names, slots from a previous
+    // interrupted run, or slots whose naming doesn't match the per-table pattern).
+    let remaining_slots: Vec<String> = client
+        .query(
+            "SELECT slot_name FROM pg_replication_slots \
+             WHERE slot_name LIKE 'spice%' OR slot_name LIKE 'spicebench%'",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to query remaining replication slots: {}",
+                pg_error_message(&e)
+            )
+        })?
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect();
+    for slot in remaining_slots {
+        drop_replication_slot(&client, &slot).await;
     }
 
     Ok(())
+}
+
+/// Terminate any backend holding `slot`, then drop it.
+///
+/// Spiced is sometimes SIGKILL'd, leaving the backend connection alive in
+/// postgres long enough for the slot to still appear active at teardown time.
+/// We terminate it first so `pg_drop_replication_slot` doesn't fail with
+/// "replication slot is active". Failures are logged as warnings rather than
+/// propagated so that a stuck slot doesn't prevent the rest of teardown.
+async fn drop_replication_slot(client: &tokio_postgres::Client, slot: &str) {
+    // Terminate the walsender holding this slot (no-op if already idle).
+    if let Err(e) = client
+        .execute(
+            "SELECT pg_terminate_backend(active_pid) \
+             FROM pg_replication_slots \
+             WHERE slot_name = $1 AND active_pid IS NOT NULL",
+            &[&slot],
+        )
+        .await
+    {
+        eprintln!(
+            "[stdio] pg teardown: warning: could not terminate backend for slot '{slot}': {}",
+            pg_error_message(&e)
+        );
+    }
+
+    eprintln!("[stdio] pg teardown: SELECT pg_drop_replication_slot('{slot}')");
+    if let Err(e) = client
+        .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .await
+    {
+        eprintln!(
+            "[stdio] pg teardown: warning: could not drop replication slot '{slot}': {}",
+            pg_error_message(&e)
+        );
+    }
 }

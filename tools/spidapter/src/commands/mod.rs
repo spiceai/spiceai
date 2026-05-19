@@ -401,6 +401,15 @@ pub(crate) fn flight_url_from_cname(cname: &str) -> String {
 /// App names can only contain letters, numbers, and hyphens.
 /// Truncated to 42 characters to leave room for Kubernetes name prefixes
 /// and suffixes (e.g. `spicepod-{name}-scheduler-0` must be ≤63 chars).
+pub(crate) fn run_id_short(run_id: &uuid::Uuid) -> String {
+    run_id
+        .to_string()
+        .split('-')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
 pub(crate) fn sanitize_app_name(name: &str) -> String {
     let sanitized: String = name
         .chars()

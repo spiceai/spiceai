@@ -67,6 +67,7 @@ pub(crate) fn build_cayenne_setup_response(
             .map(|_| "spicebench.bench".to_string()),
         read_driver: None,
         endpoints: HashMap::new(),
+        table_name_map: HashMap::new(),
     }
 }
 

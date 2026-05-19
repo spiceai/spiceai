@@ -77,6 +77,7 @@ impl Handler for CayenneFlightsqlHandler {
         _metadata: HashMap<String, serde_json::Value>,
         datasets: HashMap<String, DatasetConfig>,
         etl_sink_type: Option<EtlSinkType>,
+        _seed_data: HashMap<String, String>,
     ) -> Result<SetupResponse, String> {
         eprintln!("[cayenne] setup: run_id={run_id}");
 
@@ -172,6 +173,7 @@ impl Handler for CayenneFlightsqlHandler {
             catalog_namespace,
             read_driver: None,
             endpoints: HashMap::new(),
+            table_name_map: HashMap::new(),
         };
 
         self.runs.insert(run_id, state);

@@ -189,10 +189,6 @@ pub struct StdioArgs {
     #[arg(long, env = "PG_DATABASE")]
     pub pg_database: Option<String>,
 
-    /// `PostgreSQL` schema for WAL CDC mode.
-    #[arg(long, env = "PG_SCHEMA", default_value = "public")]
-    pub pg_schema: String,
-
     /// Acceleration engine for `PostgreSQL` WAL CDC datasets (`cayenne` or `duckdb`).
     #[arg(long, env = "PG_ACCELERATION", default_value = "cayenne")]
     pub pg_acceleration: PgAccelerationEngine,
