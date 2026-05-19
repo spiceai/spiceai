@@ -194,7 +194,7 @@ pub struct VortexConfig {
     // Vortex caches and file shape
     pub footer_cache_mb: usize,               // default 128
     pub segment_cache_mb: usize,              // default 256 (currently ignored until Vortex exposes segment cache sizing)
-    pub target_vortex_file_size_mb: usize,    // default 128
+    pub target_vortex_file_size_mb: usize,    // default 256
 
     // Encoding / sort
     pub sort_columns: Vec<String>,            // default []

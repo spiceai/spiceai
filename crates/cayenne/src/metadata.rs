@@ -295,7 +295,7 @@ pub struct VortexConfig {
     /// Target size for individual Vortex files in MB. When writes exceed this size,
     /// a new Vortex file will be created in the same listing directory. This allows
     /// for better parallelism and more granular statistics for query optimization.
-    /// Defaults to 128 MB.
+    /// Defaults to 256 MB.
     pub target_vortex_file_size_mb: usize,
     /// Columns to sort data by on refresh operations (empty = no sorting)
     pub sort_columns: Vec<String>,
@@ -459,8 +459,8 @@ impl Default for VortexConfig {
             // Larger caches improve read performance
             footer_cache_mb: 128,
             segment_cache_mb: 256,
-            // Smaller files = better parallelism and predicate pushdown
-            target_vortex_file_size_mb: 128,
+            // Balanced file size for scan throughput and write amplification
+            target_vortex_file_size_mb: 256,
             // No sort columns by default
             sort_columns: Vec::new(),
             compression_strategy: CompressionStrategy::default(),

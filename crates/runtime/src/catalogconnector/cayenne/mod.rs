@@ -49,8 +49,8 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .description("Vortex segment cache size in MB. Default: 256.")
         .default("256"),
     ParameterSpec::component("target_file_size_mb")
-        .description("Target Vortex file size in MB. Default: 128.")
-        .default("128"),
+        .description("Target Vortex file size in MB. Default: 256.")
+        .default("256"),
     ParameterSpec::component("compression_strategy")
         .description("Compression: 'btrblocks' (default) or 'zstd'.")
         .default("btrblocks"),
