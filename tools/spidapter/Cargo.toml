@@ -28,3 +28,7 @@ tonic.workspace = true
 url.workspace = true
 uuid.workspace = true
 yaml = { path = "../../crates/yaml" }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros"] }

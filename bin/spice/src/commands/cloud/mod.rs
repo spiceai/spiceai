@@ -16,6 +16,7 @@ limitations under the License.
 
 //! Cloud commands for managing Spice Cloud resources.
 
+pub mod bytes;
 mod client;
 mod config;
 
@@ -27,12 +28,35 @@ use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use snafu::ResultExt;
 use std::{fmt, io::IsTerminal};
 
-pub use client::CloudClient;
+pub use client::{CloudClient, is_device_authorization_denied_error};
 pub use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
-use spice_cloud_client::types::IngestionMetrics;
+use spice_cloud_client::{
+    endpoints::{data_region_name, normalize_data_region},
+    types::{AppKind, IngestionMetrics, PodMetrics, UpdateChannel},
+};
 
 /// Arguments for the cloud command.
 #[derive(Args, Debug)]
+#[command(
+    about = "Manage Spice Cloud resources (apps, deployments, secrets, ...)",
+    long_about = r#"Manage resources on Spice Cloud: authenticate, list and inspect
+apps and deployments, manage secrets, view logs and metrics, and deploy.
+
+Most subcommands require an active Spice Cloud session. Sign in with one of:
+  spice cloud login subscription      # Browser-based subscription login
+  spice cloud login pat               # Personal access token
+  spice cloud login api               # OAuth client credentials (automation)
+
+EXAMPLES
+  spice cloud whoami                  # Show the active Spice Cloud identity
+  spice cloud apps                    # List apps
+  spice cloud link <app>              # Link the current directory to an app
+  spice cloud deploy                  # Deploy the linked app
+  spice cloud logs --tail             # Stream logs for the linked deployment
+  spice cloud secrets set MY_KEY=...  # Manage app secrets
+
+Docs: https://spiceai.org/docs/spice-cloud"#
+)]
 pub struct CloudArgs {
     #[command(subcommand)]
     pub command: CloudCommands,
@@ -96,9 +120,6 @@ pub enum CloudCommands {
 
     /// Inspect current deployment status
     Inspect(InspectArgs),
-
-    /// Rollback to a previous deployment
-    Rollback(RollbackArgs),
 
     /// Show API keys for an app
     #[command(name = "api-keys")]
@@ -325,21 +346,6 @@ pub struct InspectArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct RollbackArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
-
-    /// Target deployment ID to rollback to
-    #[arg(long)]
-    pub target: Option<i64>,
-
-    /// Output format
-    #[arg(long, short = 'o', default_value = "table")]
-    pub output: OutputFormat,
-}
-
-#[derive(Args, Debug)]
 pub struct ApiKeysArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
@@ -463,6 +469,14 @@ pub struct CreateAppArgs {
     /// App name
     pub name: String,
 
+    /// Deployment region (e.g. us-east-1-prod-aws-data)
+    #[arg(long, value_parser = parse_create_app_region)]
+    pub region: String,
+
+    /// App kind (set or cluster)
+    #[arg(long, value_parser = clap::value_parser!(AppKind), default_value = "set")]
+    pub kind: AppKind,
+
     /// App description
     #[arg(long)]
     pub description: Option<String>,
@@ -470,6 +484,42 @@ pub struct CreateAppArgs {
     /// App visibility (public or private)
     #[arg(long, default_value = "private")]
     pub visibility: String,
+
+    /// Number of scheduler replicas
+    #[arg(long)]
+    pub replicas: Option<i32>,
+
+    /// Scheduler CPU limit in vCPUs (e.g. 4)
+    #[arg(long)]
+    pub cpu: Option<i32>,
+
+    /// Scheduler memory limit (e.g. 16Gi, 16GiB)
+    #[arg(long)]
+    pub memory: Option<bytes::NumBytes>,
+
+    /// Block storage size in GB
+    #[arg(long)]
+    pub storage_size_gb: Option<f64>,
+
+    /// Number of executor replicas
+    #[arg(long)]
+    pub executor_replicas: Option<i32>,
+
+    /// Executor CPU limit in vCPUs (e.g. 8)
+    #[arg(long)]
+    pub executor_cpu: Option<i32>,
+
+    /// Executor memory limit (e.g. 32Gi, 32GiB)
+    #[arg(long)]
+    pub executor_memory: Option<bytes::NumBytes>,
+
+    /// Path to a spicepod.yaml file
+    #[arg(long)]
+    pub spicepod: Option<String>,
+
+    /// Update channel (stable, preview, nightly, internal)
+    #[arg(long, value_parser = clap::value_parser!(UpdateChannel))]
+    pub channel: Option<UpdateChannel>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -543,7 +593,7 @@ pub struct UpdateAppArgs {
     #[arg(long)]
     pub visibility: Option<String>,
 
-    /// Number of replicas
+    /// Number of scheduler replicas
     #[arg(long)]
     pub replicas: Option<i32>,
 
@@ -554,6 +604,38 @@ pub struct UpdateAppArgs {
     /// Deployment region
     #[arg(long)]
     pub region: Option<String>,
+
+    /// Scheduler CPU limit in vCPUs (e.g. 4)
+    #[arg(long)]
+    pub cpu: Option<i32>,
+
+    /// Scheduler memory limit (e.g. 16Gi, 16GiB)
+    #[arg(long)]
+    pub memory: Option<bytes::NumBytes>,
+
+    /// Block storage size in GB
+    #[arg(long)]
+    pub storage_size_gb: Option<f64>,
+
+    /// Number of executor replicas
+    #[arg(long)]
+    pub executor_replicas: Option<i32>,
+
+    /// Executor CPU limit in vCPUs (e.g. 8)
+    #[arg(long)]
+    pub executor_cpu: Option<i32>,
+
+    /// Executor memory limit (e.g. 32Gi, 32GiB)
+    #[arg(long)]
+    pub executor_memory: Option<bytes::NumBytes>,
+
+    /// Path to a spicepod.yaml file
+    #[arg(long)]
+    pub spicepod: Option<String>,
+
+    /// Update channel (stable, preview, nightly, internal)
+    #[arg(long, value_parser = clap::value_parser!(UpdateChannel))]
+    pub channel: Option<UpdateChannel>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -612,7 +694,6 @@ pub async fn execute(_ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
         CloudCommands::Delete(delete_cmd) => execute_delete(delete_cmd).await,
         CloudCommands::Deploy(deploy_args) => execute_deploy(deploy_args).await,
         CloudCommands::Inspect(inspect_args) => execute_inspect(inspect_args).await,
-        CloudCommands::Rollback(rollback_args) => execute_rollback(rollback_args).await,
         CloudCommands::ApiKeys(api_keys_args) => execute_api_keys(api_keys_args).await,
         CloudCommands::Metrics(metrics_args) => execute_metrics(metrics_args).await,
     }
@@ -886,7 +967,16 @@ async fn execute_login_device_flow(open_browser: bool) -> Result<()> {
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        if let Ok(Some(response)) = client.exchange_code(&auth_code).await {
+        let response = match client.exchange_code(&auth_code).await {
+            Ok(response) => response,
+            Err(error) if is_device_authorization_denied_error(&error) => return Err(error),
+            Err(error) => {
+                tracing::debug!("Failed to poll device login status; retrying: {error}");
+                continue;
+            }
+        };
+
+        if let Some(response) = response {
             if response.access_denied {
                 return InvalidArgumentSnafu {
                     message: "Access denied",
@@ -1024,11 +1114,7 @@ async fn execute_apps(args: &AppsArgs) -> Result<()> {
         "CREATED",
     ]);
     for app in &apps {
-        let display_name = if app.org.is_empty() {
-            format!("{}/{}", context.org_name, app.name)
-        } else {
-            app.full_name()
-        };
+        let display_name = display_app_name(app, &context.org_name);
         table.add_row(vec![
             display_name,
             app.description.clone().unwrap_or_default(),
@@ -1042,6 +1128,23 @@ async fn execute_apps(args: &AppsArgs) -> Result<()> {
     table.print();
 
     Ok(())
+}
+
+/// Format an app's display name as `org/name`, falling back to the auth
+/// context org when the app payload does not include one. The Spice Cloud
+/// `/v1/apps` endpoint does not currently populate `org` on each app, so the
+/// auth context provides the only source of truth for the user's org.
+fn display_app_name(app: &spice_cloud_client::types::App, context_org: &str) -> String {
+    let org = if app.org.is_empty() {
+        context_org
+    } else {
+        app.org.as_str()
+    };
+    if org.is_empty() {
+        app.name.clone()
+    } else {
+        format!("{org}/{}", app.name)
+    }
 }
 
 async fn execute_deployments(args: &DeploymentsArgs) -> Result<()> {
@@ -1225,15 +1328,73 @@ async fn execute_logs(args: &LogsArgs) -> Result<()> {
 async fn execute_create(cmd: &CreateCommands) -> Result<()> {
     match cmd {
         CreateCommands::App(args) => {
+            let create_region = validate_create_app_args(args)?;
+
             let client = CloudClient::new()?;
+            let spicepod_content = if let Some(path) = args.spicepod.as_deref() {
+                Some(read_spicepod_file(path).await?)
+            } else {
+                None
+            };
+
             let app = client
-                .create_app(&args.name, args.description.as_deref(), &args.visibility)
+                .create_app(
+                    &args.name,
+                    &create_region,
+                    args.kind,
+                    args.description.as_deref(),
+                    &args.visibility,
+                    args.replicas,
+                    args.cpu,
+                    args.memory,
+                    args.storage_size_gb,
+                    args.executor_replicas,
+                    args.executor_cpu,
+                    args.executor_memory,
+                )
                 .await?;
+
+            let org_app = app.full_name();
+
+            let app = if spicepod_content.is_some() || args.channel.is_some() {
+                match client
+                    .update_app(
+                        &org_app,
+                        client::UpdateAppParams {
+                            spicepod: spicepod_content,
+                            channel: args.channel,
+                            ..client::UpdateAppParams::default()
+                        },
+                    )
+                    .await
+                {
+                    Ok(updated_app) => updated_app,
+                    Err(error) => {
+                        let update_error = error.to_string();
+                        let cleanup_result = client.delete_app(&org_app).await;
+                        let cleanup_message = match cleanup_result {
+                            Ok(()) => {
+                                "The app was deleted to roll back the failed create.".to_string()
+                            }
+                            Err(cleanup_error) => format!(
+                                "The app still exists, and an automatic delete attempt failed: {cleanup_error}. Run 'spice cloud api-keys {org_app}' if you need to inspect its provisioned API keys, or delete the app manually."
+                            ),
+                        };
+                        return Err(crate::error::Error::InvalidResponse {
+                            message: format!(
+                                "Created app {org_app}, but failed to update spicepod/channel: {update_error}. {cleanup_message}"
+                            ),
+                        });
+                    }
+                }
+            } else {
+                app
+            };
+
             if args.output == OutputFormat::Json {
                 return write_json(&app);
             }
-            println!("\x1b[32m✓ Created app {}\x1b[0m", app.full_name());
-            let org_app = app.full_name();
+            println!("\x1b[32m✓ Created app {org_app}\x1b[0m");
             if let Ok(api_keys) = client.get_api_keys(&org_app).await
                 && let Some(api_key) = api_keys.api_key
             {
@@ -1257,6 +1418,40 @@ async fn execute_create(cmd: &CreateCommands) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_create_app_args(args: &CreateAppArgs) -> Result<String> {
+    let region = normalize_create_app_region(&args.region)?;
+
+    if args.kind == AppKind::Cluster {
+        if args.replicas != Some(1) {
+            return Err(crate::error::Error::InvalidArgument {
+                message: "Cluster apps require --replicas 1".to_string(),
+            });
+        }
+
+        let mut missing = Vec::new();
+        if args.executor_replicas.is_none() {
+            missing.push("--executor-replicas");
+        }
+        if args.executor_cpu.is_none() {
+            missing.push("--executor-cpu");
+        }
+        if args.executor_memory.is_none() {
+            missing.push("--executor-memory");
+        }
+
+        if !missing.is_empty() {
+            return Err(crate::error::Error::InvalidArgument {
+                message: format!(
+                    "Cluster apps require explicit executor configuration: {}",
+                    missing.join(", ")
+                ),
+            });
+        }
+    }
+
+    Ok(region)
 }
 
 async fn execute_get(cmd: &GetCommands) -> Result<()> {
@@ -1292,15 +1487,30 @@ async fn execute_update(cmd: &UpdateCommands) -> Result<()> {
         UpdateCommands::App(args) => {
             let client = CloudClient::new()?;
             let app_name = require_app(args.app.as_deref())?;
+            let spicepod_content = if let Some(path) = args.spicepod.as_deref() {
+                Some(read_spicepod_file(path).await?)
+            } else {
+                None
+            };
 
             let app = client
                 .update_app(
                     &app_name,
-                    args.description.as_deref(),
-                    args.visibility.as_deref(),
-                    args.replicas,
-                    args.image.as_deref(),
-                    args.region.as_deref(),
+                    client::UpdateAppParams {
+                        description: args.description.as_deref(),
+                        visibility: args.visibility.as_deref(),
+                        replicas: args.replicas,
+                        image_tag: args.image.as_deref(),
+                        region: args.region.as_deref(),
+                        cpu: args.cpu,
+                        memory: args.memory,
+                        storage_size_gb: args.storage_size_gb,
+                        executor_replicas: args.executor_replicas,
+                        executor_cpu: args.executor_cpu,
+                        executor_memory: args.executor_memory,
+                        spicepod: spicepod_content,
+                        channel: args.channel,
+                    },
                 )
                 .await?;
 
@@ -1416,38 +1626,6 @@ async fn execute_inspect(args: &InspectArgs) -> Result<()> {
     Ok(())
 }
 
-async fn execute_rollback(args: &RollbackArgs) -> Result<()> {
-    let client = CloudClient::new()?;
-    let app_name = require_app(args.app.as_deref())?;
-
-    let target_id = if let Some(id) = args.target {
-        id
-    } else {
-        // Get the second-to-last deployment
-        let deployments = client.list_deployments(&app_name, 2, None).await?;
-        if deployments.len() < 2 {
-            return InvalidArgumentSnafu {
-                message: "No previous deployment to rollback to",
-            }
-            .fail();
-        }
-        deployments[1].id
-    };
-
-    let deployment = client.rollback(&app_name, target_id).await?;
-
-    if args.output == OutputFormat::Json {
-        return write_json(&deployment);
-    }
-
-    println!(
-        "\x1b[32m✓ Rollback to deployment {} initiated (new deployment: {})\x1b[0m",
-        target_id, deployment.id
-    );
-
-    Ok(())
-}
-
 async fn execute_api_keys(args: &ApiKeysArgs) -> Result<()> {
     let client = CloudClient::new()?;
     let app_name = require_app(args.app.as_deref())?;
@@ -1503,32 +1681,9 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
         println!("No metrics available for {app_name}");
         return Ok(());
     }
-    let has_window = args.window.is_some();
-
-    let mut table = TableOutput::new(vec![
-        "POD",
-        "CPU %",
-        "MEMORY",
-        "DISK USED",
-        "DISK AVAIL",
-        "DISK CAP",
-    ]);
+    let mut table = TableOutput::new(metrics_table_headers());
     for (pod, m) in &response.metrics {
-        table.add_row(vec![
-            pod.clone(),
-            m.cpu_usage_percent
-                .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
-            m.memory_usage_bytes
-                .map_or_else(|| "-".to_string(), format_bytes),
-            m.disk_read_bytes
-                .map_or_else(|| "-".to_string(), |v| format_bytes_f64(v, has_window)),
-            m.disk_read_operations
-                .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
-            m.disk_write_bytes
-                .map_or_else(|| "-".to_string(), |v| format_bytes_f64(v, has_window)),
-            m.disk_write_operations
-                .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
-        ]);
+        table.add_row(metrics_table_row(pod, m));
     }
     table.print();
 
@@ -1538,7 +1693,10 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
             rows_ingested: Some(rows),
             bytes_ingested: Some(bytes),
         }) => {
-            println!("Ingestion: {rows} rows, {}", format_bytes(*bytes));
+            println!(
+                "Ingestion: {rows} rows, {}",
+                bytes::NumBytes::from_bytes(*bytes)
+            );
         }
         Some(IngestionMetrics {
             rows_ingested: Some(rows),
@@ -1550,7 +1708,7 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
             rows_ingested: None,
             bytes_ingested: Some(bytes),
         }) => {
-            println!("Ingestion: {}", format_bytes(*bytes));
+            println!("Ingestion: {}", bytes::NumBytes::from_bytes(*bytes));
         }
         Some(IngestionMetrics {
             rows_ingested: None,
@@ -1562,55 +1720,73 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
     Ok(())
 }
 
-fn format_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = KIB * 1024;
-    const GIB: u64 = MIB * 1024;
-
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes} B")
-    }
+fn metrics_table_headers() -> Vec<&'static str> {
+    vec![
+        "POD",
+        "CPU %",
+        "MEMORY",
+        "DISK READ",
+        "READ OPS",
+        "DISK WRITE",
+        "WRITE OPS",
+    ]
 }
 
-fn format_bytes_f64(bytes: f64, is_windowed: bool) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
+fn metrics_table_row(pod: &str, m: &PodMetrics) -> Vec<String> {
+    vec![
+        pod.to_string(),
+        m.cpu_usage_percent
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
+        m.memory_usage_bytes
+            .map_or_else(|| "-".to_string(), format_bytes),
+        m.disk_read_bytes
+            .map_or_else(|| "-".to_string(), bytes::format_bytes_f64),
+        m.disk_read_operations
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
+        m.disk_write_bytes
+            .map_or_else(|| "-".to_string(), bytes::format_bytes_f64),
+        m.disk_write_operations
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
+    ]
+}
 
-    if is_windowed {
-        // increase() over window — show as a delta amount
-        if bytes >= GIB {
-            format!("{:.1} GiB", bytes / GIB)
-        } else if bytes >= MIB {
-            format!("{:.1} MiB", bytes / MIB)
-        } else if bytes >= KIB {
-            format!("{:.1} KiB", bytes / KIB)
-        } else {
-            format!("{bytes:.0} B")
-        }
-    } else {
-        // Raw cumulative counter — show total bytes
-        if bytes >= GIB {
-            format!("{:.1} GiB", bytes / GIB)
-        } else if bytes >= MIB {
-            format!("{:.1} MiB", bytes / MIB)
-        } else if bytes >= KIB {
-            format!("{:.1} KiB", bytes / KIB)
-        } else {
-            format!("{bytes:.0} B")
-        }
-    }
+fn format_bytes(bytes: u64) -> String {
+    bytes::NumBytes::from_bytes(bytes).to_string()
+}
+
+fn normalize_create_app_region(region: &str) -> Result<String> {
+    let Some(endpoint_region) = normalize_data_region(region) else {
+        return Err(crate::error::Error::InvalidArgument {
+            message: format!(
+                "Invalid region '{region}': expected lowercase letters, digits, and hyphens, starting and ending with a letter or digit"
+            ),
+        });
+    };
+
+    data_region_name(&endpoint_region).ok_or_else(|| crate::error::Error::InvalidArgument {
+        message: format!("Invalid region '{region}': expected a Spice Cloud data region"),
+    })
+}
+
+fn parse_create_app_region(region: &str) -> std::result::Result<String, String> {
+    normalize_create_app_region(region).map_err(|error| match error {
+        crate::error::Error::InvalidArgument { message } => message,
+        error => error.to_string(),
+    })
 }
 
 // ============================================================================
 // Helper functions
 // ============================================================================
+
+/// Read a spicepod YAML file from disk and return its contents as a string.
+async fn read_spicepod_file(path: &str) -> Result<String> {
+    tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| crate::error::Error::InvalidArgument {
+            message: format!("Failed to read spicepod file '{path}': {e}"),
+        })
+}
 
 /// Validate that `--window` parses as a duration via `fundu`.
 fn parse_window(s: &str) -> std::result::Result<String, String> {
@@ -1638,6 +1814,69 @@ fn require_app(flag_value: Option<&str>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metrics_table_row_matches_header_count() {
+        // Regression for #9989: row was emitting one more cell than the header
+        // had columns, so the `disk_write_operations` value rendered without a
+        // label and the disk columns were captioned with unrelated names.
+        let headers = metrics_table_headers();
+
+        let none_metrics = PodMetrics::default();
+        let none_row = metrics_table_row("pod-none", &none_metrics);
+        assert_eq!(
+            none_row.len(),
+            headers.len(),
+            "row count must match header count when fields are None"
+        );
+
+        let full_metrics = PodMetrics {
+            cpu_usage_percent: Some(123.4),
+            memory_usage_bytes: Some(1024 * 1024 * 1024),
+            disk_read_bytes: Some(2048.0),
+            disk_read_operations: Some(11.0),
+            disk_write_bytes: Some(4096.0),
+            disk_write_operations: Some(22.0),
+        };
+        let full_row = metrics_table_row("pod-full", &full_metrics);
+        assert_eq!(
+            full_row.len(),
+            headers.len(),
+            "row count must match header count when fields are populated"
+        );
+    }
+
+    #[test]
+    fn metrics_table_headers_label_every_disk_column() {
+        // Regression for #9989: the original labels "DISK USED / DISK AVAIL /
+        // DISK CAP" were both wrong (they described capacity, not I/O) and
+        // omitted `disk_write_operations` entirely. Lock the labels in.
+        let headers = metrics_table_headers();
+        assert_eq!(
+            headers,
+            vec![
+                "POD",
+                "CPU %",
+                "MEMORY",
+                "DISK READ",
+                "READ OPS",
+                "DISK WRITE",
+                "WRITE OPS",
+            ]
+        );
+    }
+
+    #[test]
+    fn metrics_table_row_renders_dash_for_missing_values() {
+        let m = PodMetrics::default();
+        let row = metrics_table_row("p", &m);
+        // Pod name is always present; the six metric cells should be "-".
+        assert_eq!(row[0], "p");
+        assert!(
+            row[1..].iter().all(|cell| cell == "-"),
+            "missing metric cells should render as '-', got: {row:?}"
+        );
+    }
 
     #[test]
     fn login_chooser_requires_tty() {
@@ -1728,5 +1967,116 @@ mod tests {
         unsafe { std::env::remove_var(env_var) };
 
         assert_eq!(value, "from-env");
+    }
+
+    fn create_app_args(kind: AppKind, replicas: Option<i32>) -> CreateAppArgs {
+        CreateAppArgs {
+            name: "app".to_string(),
+            region: "us-east-1-prod-aws-data".to_string(),
+            kind,
+            description: None,
+            visibility: "private".to_string(),
+            replicas,
+            cpu: None,
+            memory: None,
+            storage_size_gb: None,
+            executor_replicas: None,
+            executor_cpu: None,
+            executor_memory: None,
+            spicepod: None,
+            channel: None,
+            output: OutputFormat::Table,
+        }
+    }
+
+    fn cluster_app_args(replicas: Option<i32>) -> CreateAppArgs {
+        let mut args = create_app_args(AppKind::Cluster, replicas);
+        args.executor_replicas = Some(1);
+        args.executor_cpu = Some(1);
+        args.executor_memory = Some(bytes::NumBytes::from_bytes(1024));
+        args
+    }
+
+    #[test]
+    fn create_cluster_requires_explicit_single_replica() {
+        let err = validate_create_app_args(&create_app_args(AppKind::Cluster, None))
+            .expect_err("cluster without replicas should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "Invalid argument: Cluster apps require --replicas 1"
+        );
+    }
+
+    #[test]
+    fn create_cluster_requires_executor_configuration() {
+        let err = validate_create_app_args(&create_app_args(AppKind::Cluster, Some(1)))
+            .expect_err("cluster without executor configuration should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "Invalid argument: Cluster apps require explicit executor configuration: --executor-replicas, --executor-cpu, --executor-memory"
+        );
+    }
+
+    #[test]
+    fn create_cluster_accepts_one_replica() {
+        validate_create_app_args(&cluster_app_args(Some(1)))
+            .expect("cluster with one scheduler replica should pass");
+    }
+
+    #[test]
+    fn create_app_rejects_invalid_region_syntax() {
+        let mut args = create_app_args(AppKind::Set, None);
+        args.region = "bad_region".to_string();
+
+        let err = validate_create_app_args(&args).expect_err("invalid region should fail");
+
+        assert!(err.to_string().contains("Invalid region 'bad_region'"));
+    }
+
+    #[test]
+    fn create_app_region_accepts_short_and_data_region_names() {
+        assert_eq!(
+            normalize_create_app_region("us-east-1").expect("short region should normalize"),
+            "us-east-1-prod-aws-data"
+        );
+        assert_eq!(
+            normalize_create_app_region("us-east-1-prod-aws-data")
+                .expect("data region should normalize"),
+            "us-east-1-prod-aws-data"
+        );
+    }
+
+    fn test_app(org: &str, name: &str) -> spice_cloud_client::types::App {
+        spice_cloud_client::types::App {
+            id: 1,
+            name: name.to_string(),
+            org: org.to_string(),
+            description: None,
+            visibility: None,
+            created_at: None,
+            region: None,
+            production_branch: None,
+            config: None,
+        }
+    }
+
+    #[test]
+    fn display_app_name_uses_app_org_when_present() {
+        let app = test_app("analytics", "dashboard");
+        assert_eq!(display_app_name(&app, "fallback"), "analytics/dashboard");
+    }
+
+    #[test]
+    fn display_app_name_falls_back_to_context_org_when_app_org_is_empty() {
+        let app = test_app("", "dashboard");
+        assert_eq!(display_app_name(&app, "analytics"), "analytics/dashboard");
+    }
+
+    #[test]
+    fn display_app_name_omits_leading_slash_when_org_unavailable() {
+        let app = test_app("", "dashboard");
+        assert_eq!(display_app_name(&app, ""), "dashboard");
     }
 }

@@ -29,24 +29,34 @@ limitations under the License.
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::fmt::Formatter;
 use std::sync::Arc;
 
+use super::deletion_strategy::PositionBitmap;
 use arc_swap::ArcSwap;
+use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use datafusion::datasource::file_format::FileFormat;
 use datafusion_catalog::Session;
 use datafusion_common::Result as DFResult;
 use datafusion_common::Statistics;
+use datafusion_common::config::ConfigOptions;
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::TableSchema;
+use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_datasource::file_stream::FileOpener;
+use datafusion_datasource::source::DataSourceExec;
+use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::expressions as df_expr;
+use datafusion_physical_expr::projection::ProjectionExprs;
+use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
+use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use object_store::{ObjectMeta, ObjectStore};
-use roaring::{RoaringBitmap, RoaringTreemap};
-use vortex_datafusion::{VortexAccessPlan, VortexFormat};
-use vortex_scan::Selection;
+use vortex_datafusion::VortexFormat;
 /// A wrapper around `VortexFormat` that injects per-file deletion vectors.
 ///
 /// This format delegates all operations to the underlying `VortexFormat`, except for
@@ -55,9 +65,9 @@ use vortex_scan::Selection;
 pub struct DeletionFilteringVortexFormat {
     /// The underlying Vortex file format.
     inner: Arc<VortexFormat>,
-    /// Per-file deletion cache. Key is the file path, value is the bitmap of deleted row indices.
+    /// Per-file deletion cache. Key is the file path, value is the deleted row set plus access plan.
     /// Uses `Arc<ArcSwap<...>>` so readers always see a wait-free immutable snapshot.
-    deletion_cache: Arc<ArcSwap<HashMap<String, RoaringBitmap>>>,
+    deletion_cache: Arc<ArcSwap<PositionBitmap>>,
 }
 
 impl std::fmt::Debug for DeletionFilteringVortexFormat {
@@ -77,7 +87,7 @@ impl std::fmt::Debug for DeletionFilteringVortexFormat {
 /// # Arguments
 ///
 /// * `config` - The file scan configuration to modify
-/// * `deletion_cache` - Shared cache of per-file deletion vectors (file path -> deleted row indices)
+/// * `deletion_cache` - Shared cache of per-file deletion vectors and access plans
 ///
 /// # Returns
 ///
@@ -85,10 +95,9 @@ impl std::fmt::Debug for DeletionFilteringVortexFormat {
 /// - The modified `FileScanConfig` with `VortexAccessPlan` extensions attached to files with deletions
 /// - A boolean indicating if any deletions were attached
 ///
-#[expect(clippy::implicit_hasher)]
 pub fn attach_deletion_vectors_to_config(
     mut config: FileScanConfig,
-    deletion_cache: &ArcSwap<HashMap<String, RoaringBitmap>>,
+    deletion_cache: &ArcSwap<PositionBitmap>,
 ) -> (FileScanConfig, bool) {
     // ArcSwap load is wait-free; the snapshot is immutable for the lifetime of `deletion_map`.
     let deletion_map = deletion_cache.load_full();
@@ -132,35 +141,27 @@ pub fn attach_deletion_vectors_to_config(
 /// # Arguments
 ///
 /// * `file` - The partitioned file to potentially modify
-/// * `deletion_map` - Map of file path to deletion bitmap
+/// * `deletion_map` - Map of file path to cached deletion vector state
 ///
 /// # Returns
 ///
 /// A tuple of the (potentially modified) file and a boolean indicating if deletions were attached.
 fn attach_access_plan_to_file(
     mut file: PartitionedFile,
-    deletion_map: &HashMap<String, RoaringBitmap>,
+    deletion_map: &PositionBitmap,
 ) -> (PartitionedFile, bool) {
     // Extract the file path from the PartitionedFile
     let file_path = file.object_meta.location.to_string();
 
     // Check if this file has deletions
-    if let Some(bitmap) = deletion_map.get(&file_path)
-        && !bitmap.is_empty()
+    if let Some(deletion_vector) = deletion_map.get(&file_path)
+        && !deletion_vector.is_empty()
     {
-        // ExcludeRoaring is preferred over ExcludeByIndex: less memory (~2 bits vs 8 bytes/row)
-        // and enables native bitmap operations in Vortex (intersection, is_disjoint) which is faster
-        let exclude: RoaringTreemap = bitmap.iter().map(u64::from).collect();
-
-        // Use Vortex built-in mechanism for exclusions
-        let access_plan =
-            VortexAccessPlan::default().with_selection(Selection::ExcludeRoaring(exclude));
-
-        file = file.with_extensions(Arc::new(access_plan));
+        file = file.with_extensions(deletion_vector.access_plan());
 
         tracing::trace!(
             file_path = %file_path,
-            deleted_rows = bitmap.len(),
+            deleted_rows = deletion_vector.len(),
             "Attached VortexAccessPlan with deletion vector"
         );
 
@@ -177,14 +178,18 @@ impl DeletionFilteringVortexFormat {
     ///
     /// * `inner` - The underlying `VortexFormat` to delegate to.
     /// * `deletion_cache` - Shared cache of per-file deletion vectors.
-    pub fn new(
-        inner: Arc<VortexFormat>,
-        deletion_cache: Arc<ArcSwap<HashMap<String, RoaringBitmap>>>,
-    ) -> Self {
+    pub fn new(inner: Arc<VortexFormat>, deletion_cache: Arc<ArcSwap<PositionBitmap>>) -> Self {
         Self {
             inner,
             deletion_cache,
         }
+    }
+
+    /// Create a wrapper that installs Cayenne Vortex predicate-pushdown guards
+    /// without applying any deletion vectors.
+    #[must_use]
+    pub fn without_deletion_vectors(inner: Arc<VortexFormat>) -> Self {
+        Self::new(inner, Arc::new(ArcSwap::from_pointee(HashMap::new())))
     }
 
     /// Attach `VortexAccessPlan` extensions to files with deletion vectors.
@@ -195,10 +200,11 @@ impl DeletionFilteringVortexFormat {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl FileFormat for DeletionFilteringVortexFormat {
     fn as_any(&self) -> &dyn Any {
-        self
+        self.inner.as_any()
     }
 
     fn compression_type(&self) -> Option<FileCompressionType> {
@@ -274,6 +280,7 @@ impl FileFormat for DeletionFilteringVortexFormat {
             .inner
             .create_physical_plan(state, modified_config)
             .await?;
+        let plan = wrap_vortex_file_sources(plan)?;
 
         // If there are deletions, wrap the plan to force inexact statistics.
         // This prevents AggregateStatistics optimizer from short-circuiting
@@ -306,6 +313,229 @@ impl FileFormat for DeletionFilteringVortexFormat {
     }
 }
 
+fn wrap_vortex_file_sources(plan: Arc<dyn ExecutionPlan>) -> DFResult<Arc<dyn ExecutionPlan>> {
+    if let Some(data_source_exec) = plan.as_any().downcast_ref::<DataSourceExec>()
+        && let Some(file_scan_config) = data_source_exec
+            .data_source()
+            .as_any()
+            .downcast_ref::<FileScanConfig>()
+    {
+        let mut wrapped_config = file_scan_config.clone();
+        wrapped_config.file_source = Arc::new(CayenneVortexFileSource::new(Arc::clone(
+            file_scan_config.file_source(),
+        )));
+
+        let new_exec = data_source_exec
+            .clone()
+            .with_data_source(Arc::new(wrapped_config));
+        return Ok(Arc::new(new_exec));
+    }
+
+    let children = plan.children();
+    if children.is_empty() {
+        return Ok(plan);
+    }
+
+    let new_children = children
+        .into_iter()
+        .map(|child| wrap_vortex_file_sources(Arc::clone(child)))
+        .collect::<DFResult<Vec<_>>>()?;
+
+    plan.with_new_children(new_children)
+}
+
+#[derive(Clone)]
+struct CayenneVortexFileSource {
+    inner: Arc<dyn FileSource>,
+}
+
+impl CayenneVortexFileSource {
+    fn new(inner: Arc<dyn FileSource>) -> Self {
+        Self { inner }
+    }
+}
+
+impl std::fmt::Debug for CayenneVortexFileSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CayenneVortexFileSource")
+            .field("file_type", &self.inner.file_type())
+            .finish()
+    }
+}
+
+impl FileSource for CayenneVortexFileSource {
+    fn create_file_opener(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+    ) -> DFResult<Arc<dyn FileOpener>> {
+        self.inner
+            .create_file_opener(object_store, base_config, partition)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn table_schema(&self) -> &TableSchema {
+        self.inner.table_schema()
+    }
+
+    fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
+        Arc::new(Self::new(self.inner.with_batch_size(batch_size)))
+    }
+
+    fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
+        self.inner.filter()
+    }
+
+    fn projection(&self) -> Option<&ProjectionExprs> {
+        self.inner.projection()
+    }
+
+    fn metrics(&self) -> &ExecutionPlanMetricsSet {
+        self.inner.metrics()
+    }
+
+    fn file_type(&self) -> &str {
+        self.inner.file_type()
+    }
+
+    fn fmt_extra(&self, t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt_extra(t, f)
+    }
+
+    fn supports_repartitioning(&self) -> bool {
+        self.inner.supports_repartitioning()
+    }
+
+    fn repartitioned(
+        &self,
+        target_partitions: usize,
+        repartition_file_min_size: usize,
+        output_ordering: Option<datafusion_physical_expr::LexOrdering>,
+        config: &FileScanConfig,
+    ) -> DFResult<Option<FileScanConfig>> {
+        self.inner.repartitioned(
+            target_partitions,
+            repartition_file_min_size,
+            output_ordering,
+            config,
+        )
+    }
+
+    fn try_pushdown_filters(
+        &self,
+        filters: Vec<Arc<dyn PhysicalExpr>>,
+        config: &ConfigOptions,
+    ) -> DFResult<FilterPushdownPropagation<Arc<dyn FileSource>>> {
+        let schema = self.inner.table_schema().file_schema();
+        let mut safe_filters = Vec::new();
+        let mut safe_filter_indexes = Vec::new();
+        let mut pushdown_results = vec![PushedDown::No; filters.len()];
+
+        for (index, filter) in filters.into_iter().enumerate() {
+            if contains_decimal_to_floating_cast(filter.as_ref(), schema) {
+                tracing::debug!(
+                    %filter,
+                    "Skipping Vortex predicate pushdown for decimal-to-floating cast"
+                );
+                continue;
+            }
+
+            safe_filter_indexes.push(index);
+            safe_filters.push(filter);
+        }
+
+        if safe_filters.is_empty() {
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                pushdown_results,
+            ));
+        }
+
+        let inner_propagation = self.inner.try_pushdown_filters(safe_filters, config)?;
+
+        for (safe_index, result) in safe_filter_indexes
+            .into_iter()
+            .zip(inner_propagation.filters.into_iter())
+        {
+            pushdown_results[safe_index] = result;
+        }
+
+        let mut propagation =
+            FilterPushdownPropagation::with_parent_pushdown_result(pushdown_results);
+        if let Some(updated_node) = inner_propagation.updated_node {
+            propagation = propagation.with_updated_node(Arc::new(Self::new(updated_node)) as _);
+        }
+
+        Ok(propagation)
+    }
+
+    fn try_pushdown_projection(
+        &self,
+        projection: &ProjectionExprs,
+    ) -> DFResult<Option<Arc<dyn FileSource>>> {
+        let schema = self.inner.table_schema().file_schema();
+        if contains_decimal_to_floating_projection(projection, schema) {
+            tracing::debug!(
+                %projection,
+                "Skipping Vortex projection pushdown for decimal-to-floating cast"
+            );
+            return Ok(None);
+        }
+
+        self.inner
+            .try_pushdown_projection(projection)
+            .map(|source| source.map(|source| Arc::new(Self::new(source)) as _))
+    }
+}
+
+fn contains_decimal_to_floating_projection(projection: &ProjectionExprs, schema: &Schema) -> bool {
+    projection
+        .iter()
+        .any(|expr| contains_decimal_to_floating_cast(expr.expr.as_ref(), schema))
+}
+
+fn contains_decimal_to_floating_cast(expr: &dyn PhysicalExpr, schema: &Schema) -> bool {
+    if let Some(cast) = expr.as_any().downcast_ref::<df_expr::CastExpr>() {
+        let casts_to_floating = matches!(cast.cast_type(), DataType::Float32 | DataType::Float64);
+        // Resolve the input type of the cast using the provided schema.
+        // If resolution fails (e.g. Column index mismatch because the schema passed
+        // is the raw file_schema while the filter expr was built against a projected
+        // or wrapper-adjusted schema), conservatively treat it as a bad cast.
+        // This prevents accidentally pushing a decimal→float cast filter to Vortex,
+        // which can produce wrong comparison/NULL results due to precision differences.
+        let casts_from_decimal = match cast.expr().data_type(schema) {
+            Ok(data_type) => matches!(
+                data_type,
+                DataType::Decimal32(_, _)
+                    | DataType::Decimal64(_, _)
+                    | DataType::Decimal128(_, _)
+                    | DataType::Decimal256(_, _)
+            ),
+            Err(_) => true, // cannot prove safe → skip pushdown (correctness first)
+        };
+
+        if casts_to_floating && casts_from_decimal {
+            return true;
+        }
+    }
+
+    if let Some(dynamic_filter) = expr
+        .as_any()
+        .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+        && let Ok(current) = dynamic_filter.current()
+        && contains_decimal_to_floating_cast(current.as_ref(), schema)
+    {
+        return true;
+    }
+
+    expr.children()
+        .into_iter()
+        .any(|child| contains_decimal_to_floating_cast(child.as_ref(), schema))
+}
+
 /// A wrapper execution plan that forces inexact row count statistics.
 ///
 /// This is used to wrap scan plans when there are deletions, preventing
@@ -314,13 +544,11 @@ impl FileFormat for DeletionFilteringVortexFormat {
 #[derive(Debug)]
 struct InexactStatsExec {
     inner: Arc<dyn ExecutionPlan>,
-    properties: PlanProperties,
 }
 
 impl InexactStatsExec {
     fn new(inner: Arc<dyn ExecutionPlan>) -> Self {
-        let properties = inner.properties().clone();
-        Self { inner, properties }
+        Self { inner }
     }
 }
 
@@ -346,7 +574,7 @@ impl ExecutionPlan for InexactStatsExec {
     }
 
     fn properties(&self) -> &PlanProperties {
-        &self.properties
+        self.inner.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -381,5 +609,165 @@ impl ExecutionPlan for InexactStatsExec {
             total_byte_size: stats.total_byte_size,
             column_statistics: stats.column_statistics,
         })
+    }
+
+    #[expect(deprecated)]
+    fn statistics(&self) -> DFResult<Statistics> {
+        // Delegate and then force inexact row count for safety, in case any code path
+        // still uses the deprecated statistics() method.
+        let stats = self.inner.statistics()?;
+        Ok(Statistics {
+            num_rows: stats.num_rows.to_inexact(),
+            total_byte_size: stats.total_byte_size,
+            column_statistics: stats.column_statistics,
+        })
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        self.inner.metrics()
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        self.inner.supports_limit_pushdown()
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.inner.fetch()
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        self.inner
+            .with_fetch(limit)
+            .map(|plan| Arc::new(Self::new(plan)) as Arc<dyn ExecutionPlan>)
+    }
+
+    fn repartitioned(
+        &self,
+        target_partitions: usize,
+        config: &ConfigOptions,
+    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+        self.inner
+            .repartitioned(target_partitions, config)
+            .map(|plan| plan.map(|plan| Arc::new(Self::new(plan)) as Arc<dyn ExecutionPlan>))
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        projection: &datafusion_physical_plan::projection::ProjectionExec,
+    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+        self.inner
+            .try_swapping_with_projection(projection)
+            .map(|plan| plan.map(|plan| Arc::new(Self::new(plan)) as _))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion_common::ScalarValue;
+    use datafusion_expr::Operator;
+    use datafusion_physical_expr::expressions::{
+        BinaryExpr, CastExpr, Column, DynamicFilterPhysicalExpr, Literal,
+    };
+    use datafusion_physical_expr::expressions::{col, lit};
+    use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
+
+    #[test]
+    fn detects_decimal_to_floating_cast_predicate() {
+        let schema = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(15, 2),
+            true,
+        )]);
+        let amount = Arc::new(Column::new("amount", 0)) as Arc<dyn PhysicalExpr>;
+        let cast =
+            Arc::new(CastExpr::new(amount, DataType::Float64, None)) as Arc<dyn PhysicalExpr>;
+        let literal =
+            Arc::new(Literal::new(ScalarValue::Float64(Some(1.0)))) as Arc<dyn PhysicalExpr>;
+        let predicate = BinaryExpr::new(cast, Operator::Lt, literal);
+
+        assert!(contains_decimal_to_floating_cast(&predicate, &schema));
+    }
+
+    #[test]
+    fn allows_decimal_to_decimal_predicate() {
+        let schema = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(15, 2),
+            true,
+        )]);
+        let amount = col("amount", &schema).expect("amount column should exist");
+        let literal = lit(ScalarValue::Decimal128(Some(100), 15, 2));
+        let predicate = BinaryExpr::new(amount, Operator::Lt, literal);
+
+        assert!(!contains_decimal_to_floating_cast(&predicate, &schema));
+    }
+
+    #[test]
+    fn allows_dynamic_filter_without_decimal_to_floating_current_predicate() {
+        let schema = Schema::new(vec![Field::new("amount", DataType::Int64, true)]);
+        let amount = col("amount", &schema).expect("amount column should exist");
+        let dynamic_filter = DynamicFilterPhysicalExpr::new(vec![amount], lit(true));
+
+        assert!(!contains_decimal_to_floating_cast(&dynamic_filter, &schema));
+    }
+
+    #[test]
+    fn detects_dynamic_filter_decimal_to_floating_current_predicate() {
+        let schema = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(15, 2),
+            true,
+        )]);
+        let amount = Arc::new(Column::new("amount", 0)) as Arc<dyn PhysicalExpr>;
+        let cast = Arc::new(CastExpr::new(amount, DataType::Float64, None));
+        let literal = Arc::new(Literal::new(ScalarValue::Float64(Some(1.0))));
+        let predicate = Arc::new(BinaryExpr::new(cast, Operator::Lt, literal));
+        let dynamic_filter = DynamicFilterPhysicalExpr::new(
+            vec![col("amount", &schema).expect("amount column should exist")],
+            predicate,
+        );
+
+        assert!(contains_decimal_to_floating_cast(&dynamic_filter, &schema));
+    }
+
+    #[test]
+    fn detects_decimal_to_floating_cast_projection() {
+        let schema = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(15, 2),
+            true,
+        )]);
+        let amount = Arc::new(Column::new("amount", 0)) as Arc<dyn PhysicalExpr>;
+        let cast = Arc::new(CastExpr::new(amount, DataType::Float64, None));
+        let projection = ProjectionExprs::new([ProjectionExpr {
+            expr: cast,
+            alias: "amount_f64".to_string(),
+        }]);
+
+        assert!(contains_decimal_to_floating_projection(
+            &projection,
+            &schema
+        ));
+    }
+
+    #[test]
+    fn allows_plain_decimal_projection() {
+        let schema = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(15, 2),
+            true,
+        )]);
+        let amount = Arc::new(Column::new("amount", 0)) as Arc<dyn PhysicalExpr>;
+        let projection = ProjectionExprs::new([ProjectionExpr {
+            expr: amount,
+            alias: "amount".to_string(),
+        }]);
+
+        assert!(!contains_decimal_to_floating_projection(
+            &projection,
+            &schema
+        ));
     }
 }

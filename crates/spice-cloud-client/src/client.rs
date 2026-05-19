@@ -23,11 +23,11 @@ use snafu::ResultExt;
 
 use crate::error::{self, HttpRequestSnafu, Result};
 use crate::types::{
-    ApiKeysResponse, App, AppsResponse, AuthContext, AuthExchangeResponse, ContainerImagesResponse,
-    CreateAppRequest, CreateDeploymentRequest, Deployment, DeploymentsResponse, LogsResponse,
-    MetricsResponse, OAuthTokenRequest, OAuthTokenResponse, RegenerateApiKeyRequest,
-    RegenerateApiKeyResponse, RegionsResponse, RollbackRequest, Secret, SecretsResponse,
-    SetSecretRequest, UpdateAppRequest,
+    ApiKeysResponse, App, AppsResponse, AuthContext, AuthContextRaw, AuthExchangeRequest,
+    AuthExchangeResponse, ContainerImagesResponse, CreateAppRequest, CreateDeploymentRequest,
+    Deployment, DeploymentsResponse, LogsResponse, MetricsResponse, OAuthTokenRequest,
+    OAuthTokenResponse, RegenerateApiKeyRequest, RegenerateApiKeyResponse, RegionsResponse, Secret,
+    SecretsResponse, SetSecretRequest, UpdateAppRequest,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
@@ -104,30 +104,28 @@ impl CloudClient {
     /// Build the browser auth URL for the device login flow.
     #[must_use]
     pub fn get_auth_url(&self, auth_code: &str) -> String {
-        format!(
-            "{}/v1/auth/device?code={}",
-            self.oauth_base_url(),
-            auth_code
-        )
+        format!("{}/auth/token?code={}", self.oauth_base_url(), auth_code)
     }
 
     /// Exchange a device auth code for an access token.
     ///
     /// Returns `Ok(None)` while the user has not yet completed the browser flow.
+    /// Returns [`error::Error::AuthorizationDenied`] when the user denies the
+    /// browser authorization request. Other errors represent HTTP transport
+    /// failures, non-success API responses, or response parsing failures.
     pub async fn exchange_code(&self, auth_code: &str) -> Result<Option<AuthExchangeResponse>> {
-        let url = format!(
-            "{}/v1/auth/device/exchange?code={}",
-            self.base_url, auth_code
-        );
+        let url = format!("{}/auth/token/exchange", self.oauth_base_url());
+        let request = AuthExchangeRequest { code: auth_code };
         let response = self
             .client
-            .get(&url)
+            .post(&url)
+            .json(&request)
             .send()
             .await
             .context(HttpRequestSnafu)?;
 
         let status = response.status();
-        if status == reqwest::StatusCode::ACCEPTED {
+        if auth_exchange_status_is_pending(status) {
             return Ok(None);
         }
 
@@ -140,7 +138,7 @@ impl CloudClient {
         }
 
         let body: AuthExchangeResponse = response.json().await.context(HttpRequestSnafu)?;
-        Ok(Some(body))
+        auth_exchange_result(body)
     }
 
     /// Returns the base URL for OAuth endpoints by stripping the API host segment.
@@ -192,7 +190,7 @@ impl CloudClient {
 
     /// Get the authentication context for the current token.
     pub async fn get_auth_context(&self) -> Result<AuthContext> {
-        let url = format!("{}/v1/auth/context", self.base_url);
+        let url = format!("{}/api/spice-cli/auth", self.oauth_base_url());
         let response = self
             .client
             .get(&url)
@@ -201,7 +199,8 @@ impl CloudClient {
             .await
             .context(HttpRequestSnafu)?;
 
-        self.handle_response(response).await
+        let raw: AuthContextRaw = self.handle_response(response).await?;
+        Ok(raw.into())
     }
 
     // ========================================================================
@@ -355,25 +354,6 @@ impl CloudClient {
             .client
             .get(&url)
             .bearer_auth(self.token_str())
-            .send()
-            .await
-            .context(HttpRequestSnafu)?;
-
-        self.handle_response(response).await
-    }
-
-    /// Rollback to a previous deployment.
-    pub async fn rollback(&self, app_id: i64, target_deployment_id: i64) -> Result<Deployment> {
-        let url = format!("{}/v1/apps/{}/rollback", self.base_url, app_id);
-        let request = RollbackRequest {
-            target_deployment_id,
-        };
-
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(self.token_str())
-            .json(&request)
             .send()
             .await
             .context(HttpRequestSnafu)?;
@@ -627,6 +607,29 @@ impl CloudClient {
     }
 }
 
+fn auth_exchange_result(body: AuthExchangeResponse) -> Result<Option<AuthExchangeResponse>> {
+    if body.access_denied {
+        return error::AuthorizationDeniedSnafu.fail();
+    }
+
+    if body.access_token.is_none() {
+        return Ok(None);
+    }
+
+    if body.access_token.as_deref().is_some_and(str::is_empty) {
+        return error::InvalidResponseSnafu {
+            message: "Auth token exchange completed without an access token".to_string(),
+        }
+        .fail();
+    }
+
+    Ok(Some(body))
+}
+
+fn auth_exchange_status_is_pending(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::ACCEPTED
+}
+
 fn body_or<'a>(fallback: &'a str, body: &'a str) -> &'a str {
     if body.trim().is_empty() {
         fallback
@@ -656,7 +659,9 @@ fn oauth_host(host: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::CloudClient;
+    use super::{CloudClient, auth_exchange_result, auth_exchange_status_is_pending};
+    use crate::types::{AuthContext, AuthContextApp, AuthContextOrg, AuthContextRaw};
+    use crate::{error, types::AuthExchangeResponse};
 
     #[test]
     fn oauth_base_url_rewrites_api_hosts() {
@@ -677,5 +682,115 @@ mod tests {
     fn oauth_base_url_leaves_non_api_hosts_unchanged() {
         let client = CloudClient::new("https://localhost:8090").expect("cloud client should build");
         assert_eq!(client.oauth_base_url(), "https://localhost:8090");
+    }
+
+    #[test]
+    fn auth_url_uses_oauth_token_path() {
+        let client = CloudClient::new("https://api.spice.ai").expect("cloud client should build");
+        assert_eq!(
+            client.get_auth_url("ABCD1234"),
+            "https://spice.ai/auth/token?code=ABCD1234"
+        );
+    }
+
+    #[test]
+    fn auth_exchange_denial_is_error() {
+        let result = auth_exchange_result(AuthExchangeResponse {
+            access_token: None,
+            access_denied: true,
+        });
+
+        let Err(error::Error::AuthorizationDenied) = result else {
+            panic!("denied auth exchange should return an authorization-denied error");
+        };
+    }
+
+    #[test]
+    fn auth_exchange_without_token_is_pending() {
+        let result = auth_exchange_result(AuthExchangeResponse {
+            access_token: None,
+            access_denied: false,
+        })
+        .expect("pending auth exchange should not fail");
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn auth_exchange_empty_token_is_error() {
+        let result = auth_exchange_result(AuthExchangeResponse {
+            access_token: Some(String::new()),
+            access_denied: false,
+        });
+
+        let Err(error::Error::InvalidResponse { message }) = result else {
+            panic!("empty auth token should return an invalid-response error");
+        };
+        assert!(message.contains("without an access token"));
+    }
+
+    #[test]
+    fn auth_exchange_accepted_status_is_pending() {
+        assert!(auth_exchange_status_is_pending(
+            reqwest::StatusCode::ACCEPTED
+        ));
+        assert!(!auth_exchange_status_is_pending(reqwest::StatusCode::OK));
+    }
+
+    #[test]
+    fn auth_exchange_with_token_is_success() {
+        let result = auth_exchange_result(AuthExchangeResponse {
+            access_token: Some("token".to_string()),
+            access_denied: false,
+        })
+        .expect("completed auth exchange should not fail");
+
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn auth_context_raw_flattens_nested_org_and_app() {
+        let raw = AuthContextRaw {
+            username: "ada".to_string(),
+            email: "ada@example.com".to_string(),
+            org: Some(AuthContextOrg {
+                name: Some("analytics".to_string()),
+            }),
+            app: Some(AuthContextApp {
+                name: Some("dashboard".to_string()),
+                api_key: Some("secret".to_string()),
+            }),
+        };
+        let ctx: AuthContext = raw.into();
+        assert_eq!(ctx.org_name, "analytics");
+        assert_eq!(ctx.app_name.as_deref(), Some("dashboard"));
+        assert_eq!(ctx.app_api_key.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn auth_context_raw_tolerates_missing_org_and_app() {
+        let raw: AuthContextRaw =
+            serde_json::from_str(r#"{"username":"ada","email":"ada@example.com"}"#)
+                .expect("parse minimal auth context");
+        let ctx: AuthContext = raw.into();
+        assert_eq!(ctx.username, "ada");
+        assert_eq!(ctx.org_name, "");
+        assert!(ctx.app_name.is_none());
+        assert!(ctx.app_api_key.is_none());
+    }
+
+    #[test]
+    fn auth_context_raw_parses_nested_wire_format() {
+        let body = r#"{
+            "username": "ada",
+            "email": "ada@example.com",
+            "org": {"name": "analytics"},
+            "app": {"name": "dashboard", "api_key": "secret"}
+        }"#;
+        let raw: AuthContextRaw = serde_json::from_str(body).expect("parse nested auth context");
+        let ctx: AuthContext = raw.into();
+        assert_eq!(ctx.org_name, "analytics");
+        assert_eq!(ctx.app_name.as_deref(), Some("dashboard"));
+        assert_eq!(ctx.app_api_key.as_deref(), Some("secret"));
     }
 }

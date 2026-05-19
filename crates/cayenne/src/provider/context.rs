@@ -24,7 +24,7 @@ use vortex::VortexSessionDefault;
 use vortex_datafusion::{VortexFormat, VortexTableOptions};
 use vortex_session::VortexSession;
 
-use crate::metadata::VortexConfig;
+use crate::metadata::{PkConflictDetection, VortexConfig};
 
 /// Shared context for Cayenne table operations.
 ///
@@ -68,7 +68,7 @@ impl CayenneContext {
             vortex_format,
             config: config.clone(),
             session_config: SessionConfig::default(),
-            upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency)),
+            upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency.max(1))),
             runtime_env,
         })
     }
@@ -123,6 +123,105 @@ impl CayenneContext {
         self.config.upload_concurrency.max(1)
     }
 
+    /// Get the configured writer partition override for unsorted snapshot writes.
+    #[must_use]
+    pub fn write_concurrency(&self) -> Option<usize> {
+        self.config.write_concurrency.map(|v| v.max(1))
+    }
+
+    /// Maximum rows in one write that may be inlined into the metastore.
+    #[must_use]
+    pub(crate) fn inline_max_rows(&self) -> usize {
+        self.config.inline_max_rows
+    }
+
+    /// Maximum serialized IPC bytes in one inlined metastore entry.
+    #[must_use]
+    pub(crate) fn inline_max_bytes(&self) -> usize {
+        self.config.inline_max_bytes
+    }
+
+    /// Maximum in-memory Arrow bytes buffered while deciding whether to inline.
+    #[must_use]
+    pub(crate) fn inline_max_buffer_bytes(&self) -> usize {
+        self.config.inline_max_buffer_bytes
+    }
+
+    /// Maximum inline rows before checkpointing to Vortex.
+    #[must_use]
+    pub(crate) fn inline_flush_max_rows(&self) -> i64 {
+        self.config.inline_flush_max_rows.max(0)
+    }
+
+    /// Maximum inline entries before checkpointing to Vortex.
+    #[must_use]
+    pub(crate) fn inline_flush_max_segments(&self) -> i64 {
+        self.config.inline_flush_max_segments.max(0)
+    }
+
+    /// Maximum inline IPC bytes before checkpointing to Vortex.
+    #[must_use]
+    pub(crate) fn inline_flush_max_bytes(&self) -> i64 {
+        self.config.inline_flush_max_bytes.max(0)
+    }
+
+    /// Primary-key conflict detection behavior for inserts.
+    #[must_use]
+    pub(crate) fn pk_conflict_detection(&self) -> PkConflictDetection {
+        self.config.pk_conflict_detection
+    }
+
+    /// Build the compaction picker config from the underlying `VortexConfig`.
+    #[must_use]
+    pub(crate) fn compaction_picker_config(&self) -> super::compaction::CompactionPickerConfig {
+        // `target_file_size_bytes` returns `usize`; widen via checked
+        // conversion so a future 128-bit `usize` couldn't silently truncate
+        // the tier thresholds. `u64::MAX` is a safe fallback because the
+        // picker only ever asks "is bucket size < threshold".
+        let target_bytes = u64::try_from(self.target_file_size_bytes()).unwrap_or(u64::MAX);
+        super::compaction::CompactionPickerConfig::new(
+            self.config.compaction_trigger_files,
+            self.config.compaction_max_files_per_pick,
+            target_bytes,
+        )
+    }
+
+    /// Protected snapshot count that should trigger maintenance compaction.
+    #[must_use]
+    pub(crate) fn compaction_trigger_protected_snapshots(&self) -> usize {
+        self.config.compaction_trigger_protected_snapshots.max(1)
+    }
+
+    /// Maximum number of consecutive compaction passes per trigger.
+    #[must_use]
+    pub(crate) fn compaction_max_levels(&self) -> usize {
+        self.config.compaction_max_levels.max(1)
+    }
+
+    /// Protected snapshot age that should trigger maintenance compaction.
+    #[must_use]
+    pub(crate) fn compaction_trigger_snapshot_age(&self) -> Option<std::time::Duration> {
+        if self.config.compaction_trigger_snapshot_age_ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(
+                self.config.compaction_trigger_snapshot_age_ms,
+            ))
+        }
+    }
+
+    /// Background compaction interval. Returns `None` when disabled (interval = 0).
+    #[must_use]
+    pub(crate) fn compaction_background_interval(&self) -> Option<std::time::Duration> {
+        if self.config.compaction_background_interval_ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(
+                self.config.compaction_background_interval_ms,
+            ))
+        }
+    }
+
     /// Get the shared semaphore for limiting concurrent file writes / uploads.
     #[must_use]
     pub fn upload_semaphore(&self) -> &Arc<Semaphore> {
@@ -156,9 +255,23 @@ impl CayenneContext {
 
         let vortex_opts = VortexTableOptions {
             target_file_size_mb: config.target_vortex_file_size_mb,
+            projection_pushdown: true,
             ..VortexTableOptions::default()
         };
 
         Arc::new(VortexFormat::new_with_options(vortex_session, vortex_opts))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cayenne_enables_vortex_projection_pushdown_by_default() {
+        let runtime_env = Arc::new(RuntimeEnv::default());
+        let context = CayenneContext::new(&VortexConfig::default(), runtime_env);
+
+        assert!(context.file_format().options().projection_pushdown);
     }
 }

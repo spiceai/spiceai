@@ -1134,3 +1134,123 @@ async fn test_multiple_concurrent_overwrites(backend: BackendType) -> TestResult
 
     Ok(())
 }
+
+// ============================================================================
+// Concurrent catalog DB first-creation + table lookup + restart
+// ============================================================================
+
+// Test concurrent table creation (triggering catalog DB dir + file creation)
+// followed immediately by catalog lookups, then "restart" by creating new
+// providers from the same catalog. This is a comprehensive regression for the
+// catalog DB first-creation edge case under load.
+test_with_backends_multithreaded!(test_concurrent_table_creation_lookup_restart_impl);
+
+async fn test_concurrent_table_creation_lookup_restart_impl(
+    backend: BackendType,
+) -> TestResult<()> {
+    let temp_dir = TempDir::new()?;
+    let data_path = temp_dir.path().join("data");
+    std::fs::create_dir_all(&data_path)?;
+
+    let db_path = temp_dir.path().join("concurrent_create_write.db");
+    let connection_string = connection_string_for_backend(backend, &db_path);
+
+    // Two tasks will concurrently create their own CayenneCatalog (triggering
+    // the catalog DB dir + file creation logic in init()) and then immediately
+    // create and read back a table through the shared catalog.
+    let barrier = Arc::new(Barrier::new(2));
+
+    let task1 = {
+        let connection_string = connection_string.clone();
+        let data_path = data_path.clone();
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+
+            let catalog = Arc::new(CayenneCatalog::new(&connection_string)?);
+            catalog.init().await?; // concurrent first-creation of catalog DB dir/file
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("value", DataType::Utf8, false),
+            ]));
+
+            let table_options = CreateTableOptions {
+                table_name: "concurrent_t1".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: None,
+                base_path: data_path.to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            };
+
+            let table_id = catalog.create_table(table_options).await?;
+
+            let table = catalog.get_table("concurrent_t1").await?;
+            assert_eq!(table.table_name, "concurrent_t1");
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((table_id, "t1_ok"))
+        })
+    };
+
+    let task2 = {
+        let connection_string = connection_string.clone();
+        let data_path = data_path.clone();
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+
+            let catalog = Arc::new(CayenneCatalog::new(&connection_string)?);
+            catalog.init().await?; // concurrent first-creation of catalog DB dir/file
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("value", DataType::Utf8, false),
+            ]));
+
+            let table_options = CreateTableOptions {
+                table_name: "concurrent_t2".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: None,
+                base_path: data_path.to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            };
+
+            let table_id = catalog.create_table(table_options).await?;
+
+            let table = catalog.get_table("concurrent_t2").await?;
+            assert_eq!(table.table_name, "concurrent_t2");
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((table_id, "t2_ok"))
+        })
+    };
+
+    let (res1, res2) = tokio::join!(task1, task2);
+
+    let (id1, msg1) = res1.expect("task1 panicked").expect("task1 error");
+    let (id2, msg2) = res2.expect("task2 panicked").expect("task2 error");
+
+    assert_ne!(id1, id2, "two tables must have different IDs");
+    assert_eq!(msg1, "t1_ok");
+    assert_eq!(msg2, "t2_ok");
+
+    // "Restart": create a fresh catalog instance from the same DB file.
+    let catalog_restart = Arc::new(CayenneCatalog::new(&connection_string)?);
+    catalog_restart.init().await?;
+
+    // Both tables must still be visible after restart.
+    let t1 = catalog_restart.get_table("concurrent_t1").await;
+    let t2 = catalog_restart.get_table("concurrent_t2").await;
+
+    assert!(
+        t1.is_ok(),
+        "table concurrent_t1 must survive restart after concurrent creation + lookup path"
+    );
+    assert!(
+        t2.is_ok(),
+        "table concurrent_t2 must survive restart after concurrent creation + lookup path"
+    );
+
+    Ok(())
+}

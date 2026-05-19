@@ -8,6 +8,7 @@ description = "Type-safe object storage with optimistic concurrency control"
 
 [dependencies]
 async-trait.workspace = true
+bytes.workspace = true
 futures.workspace = true
 object_store.workspace = true
 parking_lot.workspace = true

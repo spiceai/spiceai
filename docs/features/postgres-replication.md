@@ -134,10 +134,11 @@ runtime:
     cdc_prefetch_buffer: '128'
     cdc_max_coalesced_envelopes: '256'
     cdc_max_coalesced_bytes: '134217728'
+    cdc_max_coalesce_age_ms: '0'
     cdc_commit_timeout_ms: '30000'
 ```
 
-`cdc_prefetch_buffer` controls decoded envelope buffering between the source reader and accelerator writer. `cdc_max_coalesced_envelopes` and `cdc_max_coalesced_bytes` control how many envelopes are merged into one accelerator write. Larger values improve catch-up throughput by amortizing planning and write overhead, but increase peak memory.
+  `cdc_prefetch_buffer` controls decoded envelope buffering between the source reader and accelerator writer. `cdc_max_coalesced_envelopes` and `cdc_max_coalesced_bytes` control how many envelopes are merged into one accelerator write. Larger values improve catch-up throughput by amortizing planning and write overhead, but increase peak memory. `cdc_max_coalesce_age_ms` controls the runtime CDC coalesce age used by accelerators that apply age-based maintenance; `0` keeps the accelerator default.
 
 For standalone analytical query benchmarks, `runtime.query.target_partitions` can be set to control DataFusion's local query parallelism:
 

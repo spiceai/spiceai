@@ -158,14 +158,17 @@ impl DataSink for WriteThroughDataSink {
     async fn write_all(
         &self,
         mut data: SendableRecordBatchStream,
-        _context: &Arc<TaskContext>,
+        context: &Arc<TaskContext>,
     ) -> datafusion::common::Result<u64> {
+        let target_partitions = context.session_config().target_partitions();
+
         if let CayenneWriteTarget::Partitioned(accelerator) = &self.accelerator {
             return write_all_with_partitioned_cayenne(
                 Arc::clone(&self.refresher),
                 Arc::clone(accelerator),
                 Arc::clone(&self.federated),
                 data,
+                target_partitions,
             )
             .await;
         }
@@ -184,6 +187,7 @@ impl DataSink for WriteThroughDataSink {
             accelerator.clone_for_write_operations(),
             Arc::clone(&schema),
             accelerator_rx,
+            target_partitions,
         );
 
         let mut upstream_error: Option<DataFusionError> = None;
@@ -258,6 +262,7 @@ async fn write_all_with_partitioned_cayenne(
     accelerator: Arc<dyn TableProvider>,
     federated: Arc<dyn TableProvider>,
     mut data: SendableRecordBatchStream,
+    target_partitions: usize,
 ) -> datafusion::common::Result<u64> {
     let partitioned = accelerator
         .as_any()
@@ -305,6 +310,7 @@ async fn write_all_with_partitioned_cayenne(
                             cayenne.clone_for_write_operations(),
                             Arc::clone(&schema),
                             partition_rx,
+                            target_partitions,
                         ));
                         partition_tx
                     };
@@ -532,11 +538,12 @@ fn spawn_staged_append(
     accelerator: CayenneTableProvider,
     schema: SchemaRef,
     receiver: mpsc::Receiver<datafusion::common::Result<arrow::record_batch::RecordBatch>>,
+    target_partitions: usize,
 ) -> JoinHandle<datafusion::common::Result<CayenneStagedAppend>> {
     tokio::spawn(async move {
         let stream = RecordBatchStreamAdapter::new(schema, ReceiverStream::new(receiver));
         accelerator
-            .begin_staged_append(Box::pin(stream))
+            .begin_staged_append(Box::pin(stream), target_partitions)
             .await
             .map_err(Into::into)
     })

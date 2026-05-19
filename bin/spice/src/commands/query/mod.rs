@@ -67,7 +67,7 @@ pub struct QueryArgs {
     pub output: OutputFormat,
 
     #[command(subcommand)]
-    command: Option<QuerySubcommand>,
+    pub command: Option<QuerySubcommand>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -111,6 +111,10 @@ pub enum QuerySubcommand {
     Cancel {
         /// Query ID to cancel
         query_id: String,
+
+        /// Output format
+        #[arg(long, short = 'o', default_value = "table")]
+        output: OutputFormat,
     },
 }
 
@@ -256,12 +260,18 @@ async fn execute_subcommand(client: &Arc<Client>, cmd: &QuerySubcommand) -> Resu
         QuerySubcommand::Results { query_id, output } => {
             display_results(client, query_id, Duration::ZERO, *output).await?;
         }
-        QuerySubcommand::Cancel { query_id } => {
+        QuerySubcommand::Cancel { query_id, output } => {
             let info = client.cancel_query(query_id).await.map_err(|e| {
                 crate::error::Error::InvalidResponse {
                     message: e.to_string(),
                 }
             })?;
+            if *output == OutputFormat::Json {
+                return write_json(&serde_json::json!({
+                    "query_id": info.query_id,
+                    "status": info.status.to_string(),
+                }));
+            }
             println!(
                 "Query {} cancelled (status: {})",
                 info.query_id, info.status

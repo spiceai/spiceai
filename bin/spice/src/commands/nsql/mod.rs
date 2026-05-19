@@ -31,8 +31,23 @@ use std::time::Instant;
 
 /// Arguments for the `nsql` command.
 #[derive(Args, Debug)]
+#[command(
+    about = "Translate natural language into SQL via a configured LLM",
+    long_about = r#"Open a Text-to-SQL REPL that uses a configured LLM to translate
+natural-language questions into SQL queries against the runtime's datasets.
+
+The model must be registered under `models:` in `spicepod.yaml` and reported by
+`spice models`. If `--model` is not provided you will be prompted to pick one.
+
+EXAMPLES
+  spice nsql                                 # Interactive REPL
+  spice nsql --model llm                     # REPL pinned to a specific model
+  spice nsql analyze --suite my_suite.yaml   # Score generated SQL against expected SQL
+
+Docs: https://spiceai.org/docs"#
+)]
 pub struct NsqlArgs {
-    /// Model to use for text-to-SQL conversion
+    /// Model id to use for text-to-SQL (must be registered in `spicepod.yaml`).
     #[arg(long, short)]
     pub model: Option<String>,
 

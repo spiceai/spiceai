@@ -174,7 +174,47 @@ impl<'a> DeletionVectorWriter<'a> {
             }
 
             let deletion_dir = self.table_snapshot_deletion_dir();
-            tokio::fs::create_dir_all(&deletion_dir).await?;
+            let snapshot_dir = deletion_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| Error::Internal {
+                    table: self.table.path.clone(),
+                    message: format!(
+                        "Deletion vector directory '{}' has no snapshot parent",
+                        deletion_dir.display()
+                    ),
+                })?;
+
+            // Ensure the deletions/ subdirectory exists.
+            // If we just created it, sync its parent (the snapshot directory)
+            // so the subdir entry is durable on local FS.
+            //
+            // This is required for the same contract we now enforce for
+            // snapshot directories themselves (ensure_snapshot_dir_exists)
+            // and for the _partitioned_wal/ coordination directory:
+            // on POSIX, mkdir in a directory updates the parent's metadata.
+            // A crash immediately after this create_dir_all but before the
+            // subsequent file write + file fsync + catalog record could
+            // otherwise leave a catalog entry pointing at a deletions/
+            // directory whose creation was lost.
+            //
+            // The sync is one-time per snapshot (first deletion vector
+            // written to it). Subsequent deletions reuse the directory.
+            let sync_snapshot_parent = match tokio::fs::create_dir(&deletion_dir).await {
+                Ok(()) => true,
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    tokio::fs::create_dir_all(&deletion_dir).await?;
+                    true
+                }
+                Err(source) => return Err(Error::IoError { source }),
+            };
+            if sync_snapshot_parent {
+                let table = self.table.path.clone();
+                tokio::task::spawn_blocking(move || std::fs::File::open(&snapshot_dir)?.sync_all())
+                    .await
+                    .map_err(|source| Error::TaskPanicked { table, source })??;
+            }
 
             let file_path = Self::deletion_file_path(&deletion_dir);
 
@@ -469,12 +509,44 @@ async fn write_deletion_file(
     tokio::task::spawn_blocking(move || -> Result<u64> {
         use arrow::ipc::writer::FileWriter;
 
+        // Crash-safe write. Ensure the deletion vector file content is durable
+        // before we record a pointer to it in the catalog. A crash without
+        // this sync could leave a zero-length or partial .arrow file while the
+        // catalog transaction that references it has committed (or is about
+        // to). On recovery, readers would then hit a missing/corrupt deletion
+        // vector for a "committed" delete — either erroring or (worse)
+        // returning deleted rows. This is the exact durability requirement we
+        // enforce for data files and WAL markers in the append path.
+        //
+        // 1. Stream Arrow IPC into the file.
+        // 2. Recover the underlying std::fs::File from the writer and fsync
+        //    its data (sync_all flushes data + metadata). A previous revision
+        //    also re-opened the file to fsync it a second time — that
+        //    reopen+fsync was redundant work on every delete and has been
+        //    removed.
+        // 3. fsync the parent directory so the new directory entry is durable
+        //    across a power-loss restart — without this, the catalog can
+        //    record a delete file path that fails to resolve after a crash
+        //    because the file's inode is on disk but the dirent isn't.
         let file = std::fs::File::create(&output_path)?;
         let mut writer = FileWriter::try_new(file, &schema)?;
         writer.write(&batch)?;
         writer.finish()?;
+        let inner = writer.into_inner()?;
+        inner.sync_all()?;
+        drop(inner);
 
         let metadata = std::fs::metadata(&output_path)?;
+
+        // Best-effort parent-dir fsync. Matches the partitioned_wal /
+        // staging_wal write patterns: a failure here is unusual and logged
+        // by the caller; the deletion file's content is already durable
+        // regardless.
+        if let Some(parent) = output_path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
 
         Ok(metadata.len())
     })

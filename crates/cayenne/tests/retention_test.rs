@@ -31,8 +31,10 @@ use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog
 use common::TestFixture;
 
 use datafusion::datasource::TableProvider;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 
 use datafusion::prelude::*;
+use datafusion_common::DataFusionError;
 
 use std::sync::Arc;
 
@@ -40,6 +42,7 @@ test_with_backends!(test_retention_filters_apply_on_insert_impl);
 test_with_backends!(test_retention_filters_skip_when_no_matches_impl);
 test_with_backends!(test_time_retention_filter_scan_expiry_impl);
 test_with_backends!(test_time_retention_with_user_filter_impl);
+test_with_backends!(test_time_retention_cdc_stages_before_finalize_impl);
 
 async fn test_retention_filters_apply_on_insert_impl(
     fixture: TestFixture,
@@ -201,6 +204,84 @@ async fn test_retention_filters_skip_when_no_matches_impl(
         delete_files.is_empty(),
         "Retention should not create delete files when no rows match"
     );
+
+    Ok(())
+}
+
+async fn test_time_retention_cdc_stages_before_finalize_impl(
+    fixture: TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let table_dir = fixture.data_path.join("time_retention_cdc");
+    std::fs::create_dir_all(&table_dir)?;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+    ]));
+
+    let table_options = CreateTableOptions {
+        table_name: "time_retention_cdc".to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec![],
+        on_conflict: None,
+        base_path: table_dir.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: cayenne::metadata::VortexConfig {
+            inline_max_rows: 0,
+            compaction_background_interval_ms: 0,
+            ..Default::default()
+        },
+    };
+
+    let retention_builder = cayenne::TimeRetentionFilterBuilder::try_new("event_time", 60, &schema)
+        .expect("to create retention builder");
+
+    let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table_provider = Arc::new(
+        CayenneTableProviderBuilder::new(catalog_arc, ctx.runtime_env())
+            .with_time_retention_filter_builder(retention_builder)
+            .create(table_options)
+            .await?,
+    );
+
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![chrono::Utc::now().timestamp_micros()])
+                    .with_timezone("UTC"),
+            ),
+        ],
+    )?;
+    let stream = Box::pin(RecordBatchStreamAdapter::new(
+        Arc::clone(&schema),
+        futures::stream::iter(vec![Ok::<_, DataFusionError>(batch)]),
+    ));
+    let task_ctx = ctx.task_ctx();
+
+    let write = table_provider
+        .write_cdc_append_stream(stream, &task_ctx)
+        .await?;
+    assert!(
+        write.has_pending_finalize(),
+        "scan-time time retention should not block CDC staged finalization"
+    );
+    write.finish().await?;
+
+    ctx.register_table(
+        "time_retention_cdc",
+        Arc::clone(&table_provider) as Arc<dyn TableProvider>,
+    )?;
+    let df = ctx.sql("SELECT id FROM time_retention_cdc").await?;
+    let batches = df.collect().await?;
+    let visible_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(visible_rows, 1);
 
     Ok(())
 }

@@ -117,6 +117,9 @@ pub enum QuerySetArg {
     Tpch,
     Tpcds,
     Clickbench,
+    #[value(name = "chbench")]
+    #[serde(rename = "chbench")]
+    ChBench,
     #[value(name = "tpch[parameterized]")]
     #[serde(rename = "tpch[parameterized]")]
     ParameterizedTpch,
@@ -205,6 +208,7 @@ impl From<QuerySetArg> for QuerySet {
             QuerySetArg::Tpch => QuerySet::Tpch,
             QuerySetArg::Tpcds => QuerySet::Tpcds,
             QuerySetArg::Clickbench => QuerySet::Clickbench,
+            QuerySetArg::ChBench => QuerySet::ChBench,
             QuerySetArg::ParameterizedTpch => QuerySet::ParameterizedTpch,
             QuerySetArg::ParameterizedSaffron => QuerySet::ParameterizedSaffron,
             QuerySetArg::Scenario => {
@@ -225,6 +229,7 @@ impl PartialEq<QuerySet> for QuerySetArg {
             (QuerySetArg::Tpch, QuerySet::Tpch)
                 | (QuerySetArg::Tpcds, QuerySet::Tpcds)
                 | (QuerySetArg::Clickbench, QuerySet::Clickbench)
+                | (QuerySetArg::ChBench, QuerySet::ChBench)
                 | (QuerySetArg::ParameterizedTpch, QuerySet::ParameterizedTpch)
                 | (
                     QuerySetArg::ParameterizedSaffron,

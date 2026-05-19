@@ -157,6 +157,7 @@ fn parse_partition_values(
     Some(part_values)
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for LocationPruningListingTable {
     fn as_any(&self) -> &dyn Any {
@@ -308,6 +309,69 @@ impl TableProvider for LocationPruningListingTable {
             .format
             .create_physical_plan(state, config)
             .await
+    }
+
+    fn get_logical_plan(
+        &self,
+    ) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
+        self.inner.get_logical_plan()
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&datafusion_expr::Expr> {
+        self.inner.get_column_default(column)
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> datafusion::error::Result<datafusion::catalog::ScanResult> {
+        let plan = self
+            .scan(
+                state,
+                args.projection().map(<[usize]>::to_vec).as_ref(),
+                args.filters().unwrap_or(&[]),
+                args.limit(),
+            )
+            .await?;
+        Ok(plan.into())
+    }
+
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        self.inner.statistics()
+    }
+
+    async fn insert_into(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        input: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        insert_op: datafusion::logical_expr::dml::InsertOp,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.inner.insert_into(state, input, insert_op).await
+    }
+
+    async fn delete_from(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        filters: Vec<datafusion_expr::Expr>,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.inner.delete_from(state, filters).await
+    }
+
+    async fn update(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        assignments: Vec<(String, datafusion_expr::Expr)>,
+        filters: Vec<datafusion_expr::Expr>,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.inner.update(state, assignments, filters).await
+    }
+
+    async fn truncate(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.inner.truncate(state).await
     }
 }
 

@@ -43,6 +43,7 @@ util = { path = "../util", features = ["datafusion"] }
 chrono.workspace = true
 criterion = { version = "0.7", features = ["html_reports"] }
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
+datafusion-pruning.workspace = true
 insta.workspace = true
 object_store.workspace = true
 tokio.workspace = true

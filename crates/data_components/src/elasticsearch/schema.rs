@@ -73,6 +73,8 @@ fn es_type_to_arrow(mapping: &FieldMapping) -> DataType {
             DataType::Utf8
         }
         Some("long") => DataType::Int64,
+        // unsigned_long covers the full u64 range; Int64 would silently overflow values > i64::MAX.
+        Some("unsigned_long") => DataType::UInt64,
         Some("integer") => DataType::Int32,
         Some("short") => DataType::Int16,
         Some("byte") => DataType::Int8,
@@ -151,5 +153,23 @@ mod tests {
             embed_field.data_type(),
             DataType::FixedSizeList(_, 384)
         ));
+    }
+
+    #[test]
+    fn test_unsigned_long_mapping() {
+        let mut properties = HashMap::new();
+        properties.insert(
+            "big".to_string(),
+            FieldMapping {
+                field_type: Some("unsigned_long".to_string()),
+                properties: None,
+                dims: None,
+                similarity: None,
+            },
+        );
+
+        let schema = mapping_to_schema(&properties);
+        let big = schema.field_with_name("big").expect("big field");
+        assert_eq!(big.data_type(), &DataType::UInt64);
     }
 }
