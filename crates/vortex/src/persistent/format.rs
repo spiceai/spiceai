@@ -613,13 +613,10 @@ impl FileFormat for VortexFormat {
                     min_value: min.to_df(),
                     max_value: max.to_df(),
                     sum_value: Precision::Absent,
-                    distinct_count: stats_set
-                        .get_as::<bool>(Stat::IsConstant, &DType::Bool(Nullability::NonNullable))
-                        .and_then(|is_constant| match is_constant.as_exact() {
-                            Some(true) => Some(Precision::Exact(1)),
-                            Some(false) | None => None,
-                        })
-                        .unwrap_or(Precision::Absent),
+                    distinct_count: distinct_count_from_is_constant(stats_set.get_as::<bool>(
+                        Stat::IsConstant,
+                        &DType::Bool(Nullability::NonNullable),
+                    )),
                     // TODO(connor): Is this correct?
                     byte_size: column_size.to_df(),
                 });
@@ -735,6 +732,15 @@ impl FileFormat for VortexFormat {
     }
 }
 
+fn distinct_count_from_is_constant(
+    is_constant: Option<stats::Precision<bool>>,
+) -> Precision<usize> {
+    match is_constant.and_then(stats::Precision::as_exact) {
+        Some(true) => Precision::Exact(1),
+        Some(false) | None => Precision::Absent,
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -822,5 +828,22 @@ mod tests {
 
         opts.set("scan_concurrency", "3").unwrap();
         assert_eq!(opts.scan_concurrency, ScanConcurrency::Explicit(3));
+    }
+
+    #[test]
+    fn distinct_count_is_exact_only_for_exact_constant_true() {
+        assert_eq!(
+            distinct_count_from_is_constant(Some(stats::Precision::exact(true))),
+            Precision::Exact(1)
+        );
+        assert_eq!(
+            distinct_count_from_is_constant(Some(stats::Precision::exact(false))),
+            Precision::Absent
+        );
+        assert_eq!(
+            distinct_count_from_is_constant(Some(stats::Precision::inexact(true))),
+            Precision::Absent
+        );
+        assert_eq!(distinct_count_from_is_constant(None), Precision::Absent);
     }
 }
