@@ -99,7 +99,7 @@ fn adjust_num_rows_for_deletions(
             row_count.saturating_sub(deleted_rows_within_file(deletion_vector, row_count)),
         ),
         Precision::Inexact(row_count) => Precision::Inexact(
-            row_count.saturating_sub(usize::try_from(deletion_vector.len()).unwrap_or(usize::MAX)),
+            row_count.saturating_sub(deleted_rows_within_file(deletion_vector, row_count)),
         ),
         Precision::Absent => Precision::Absent,
     }
@@ -110,4 +110,20 @@ fn deleted_rows_within_file(deletion_vector: &PositionDeletionVector, row_count:
         .iter()
         .take_while(|row_id| usize::try_from(*row_id).is_ok_and(|row_id| row_id < row_count))
         .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use roaring::RoaringBitmap;
+
+    #[test]
+    fn inexact_row_count_only_subtracts_deletions_within_file() {
+        let deletion_vector = PositionDeletionVector::new(RoaringBitmap::from_iter([0, 2, 9, 10]));
+
+        assert_eq!(
+            adjust_num_rows_for_deletions(Precision::Inexact(10), &deletion_vector),
+            Precision::Inexact(7)
+        );
+    }
 }

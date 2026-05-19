@@ -141,23 +141,28 @@ impl TryToDataFusion<ScalarValue> for Scalar {
                         TimeUnit::Seconds => {
                             ScalarValue::TimestampSecond(pv.as_::<i64>(), tz.clone())
                         }
-                        TimeUnit::Days => {
-                            unreachable!("Unsupported TimeUnit {unit} for {}", ext.id())
-                        }
+                        TimeUnit::Days => vortex_bail!(
+                            "unsupported timestamp TimeUnit {unit} for extension {}",
+                            ext.id()
+                        ),
                     },
                     TemporalMetadata::Date(unit) => match unit {
                         TimeUnit::Milliseconds => ScalarValue::Date64(pv.as_::<i64>()),
                         TimeUnit::Days => ScalarValue::Date32(pv.as_::<i32>()),
-                        _ => unreachable!("Unsupported TimeUnit {unit} for {}", ext.id()),
+                        _ => vortex_bail!(
+                            "unsupported date TimeUnit {unit} for extension {}",
+                            ext.id()
+                        ),
                     },
                     TemporalMetadata::Time(unit) => match unit {
                         TimeUnit::Nanoseconds => ScalarValue::Time64Nanosecond(pv.as_::<i64>()),
                         TimeUnit::Microseconds => ScalarValue::Time64Microsecond(pv.as_::<i64>()),
                         TimeUnit::Milliseconds => ScalarValue::Time32Millisecond(pv.as_::<i32>()),
                         TimeUnit::Seconds => ScalarValue::Time32Second(pv.as_::<i32>()),
-                        TimeUnit::Days => {
-                            unreachable!("Unsupported TimeUnit {unit} for {}", ext.id())
-                        }
+                        TimeUnit::Days => vortex_bail!(
+                            "unsupported time TimeUnit {unit} for extension {}",
+                            ext.id()
+                        ),
                     },
                 }
             }

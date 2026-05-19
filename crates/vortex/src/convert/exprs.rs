@@ -272,8 +272,12 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
                 })
                 .try_collect()?;
 
+            let Some(first_element) = list_elements.first() else {
+                return Ok(lit(Scalar::from(in_list.negated())));
+            };
+
             let list = Scalar::list(
-                list_elements[0].dtype().clone(),
+                first_element.dtype().clone(),
                 list_elements,
                 Nullability::Nullable,
             );
@@ -836,6 +840,27 @@ mod tests {
         let pruning_display = pruning_expr.to_string();
         assert!(pruning_display.contains("id_min"));
         assert!(pruning_display.contains("id_max"));
+    }
+
+    #[rstest]
+    #[case::in_empty(false, "false")]
+    #[case::not_in_empty(true, "true")]
+    fn test_empty_in_list_conversion_produces_boolean_literal(
+        #[case] negated: bool,
+        #[case] expected_literal: &str,
+    ) {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let column = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let in_list = df_expr::InListExpr::try_new(column, vec![], negated, &schema)
+            .expect("empty IN-list expression should be valid");
+
+        let result = DefaultExpressionConvertor::default()
+            .convert(&in_list)
+            .expect("empty IN-list should convert to a boolean literal");
+
+        let display = result.display_tree().to_string();
+        assert!(display.contains("vortex.literal"));
+        assert!(display.contains(expected_literal));
     }
 
     #[rstest]

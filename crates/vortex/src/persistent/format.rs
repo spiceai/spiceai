@@ -51,9 +51,7 @@ use vortex::dtype::DType;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
 use vortex::dtype::arrow::FromArrowType;
-use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
-use vortex::error::vortex_err;
 use vortex::expr::stats;
 use vortex::expr::stats::Stat;
 use vortex::file::EOF_SIZE;
@@ -525,19 +523,25 @@ impl FileFormat for VortexFormat {
                 )
             };
 
-            let struct_dtype = dtype
-                .as_struct_fields_opt()
-                .vortex_expect("dtype is not a struct");
+            let Some(struct_dtype) = dtype.as_struct_fields_opt() else {
+                return Err(DataFusionError::Execution(format!(
+                    "Failed to infer statistics for Vortex file {}: file dtype is not a struct",
+                    object.location
+                )));
+            };
+
+            let num_rows = usize::try_from(row_count).map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "Failed to infer statistics for Vortex file {}: row count {row_count} cannot be represented as usize",
+                    object.location
+                ))
+            })?;
 
             // Evaluate the statistics for each column that we are able to return to DataFusion.
             let Some(file_stats) = file_stats else {
                 // If the file has no column stats, the best we can do is return a row count.
                 return Ok::<Statistics, DataFusionError>(Statistics {
-                    num_rows: Precision::Exact(
-                        usize::try_from(row_count)
-                            .map_err(|_| vortex_err!("Row count overflow"))
-                            .vortex_expect("Row count overflow"),
-                    ),
+                    num_rows: Precision::Exact(num_rows),
                     total_byte_size: Precision::Absent,
                     column_statistics: vec![
                         ColumnStatistics::default();
@@ -576,17 +580,13 @@ impl FileFormat for VortexFormat {
                             // Because of DataFusion's Schema evolution, it is possible that the
                             // type of the min/max stat has changed. Thus we construct the stat as
                             // the file datatype first and only then do we cast accordingly.
-                            Scalar::try_new(
-                                Stat::Min
-                                    .dtype(stats_dtype)
-                                    .vortex_expect("must have a valid dtype"),
-                                Some(stat_val),
-                            )
-                            .vortex_expect("`Stat::Min` somehow had an incompatible `DType`")
-                            .cast(&DType::from_arrow(field.as_ref()))
-                            .vortex_expect("Unable to cast to target type that DataFusion wants")
-                            .try_to_df()
-                            .ok()
+                            let stat_dtype = Stat::Min.dtype(stats_dtype)?;
+                            Scalar::try_new(stat_dtype, Some(stat_val))
+                                .ok()?
+                                .cast(&DType::from_arrow(field.as_ref()))
+                                .ok()?
+                                .try_to_df()
+                                .ok()
                         })
                         .transpose()
                 });
@@ -595,17 +595,13 @@ impl FileFormat for VortexFormat {
                 let max = stats_set.get(Stat::Max).and_then(|pstat_val| {
                     pstat_val
                         .map(|stat_val| {
-                            Scalar::try_new(
-                                Stat::Max
-                                    .dtype(stats_dtype)
-                                    .vortex_expect("must have a valid dtype"),
-                                Some(stat_val),
-                            )
-                            .vortex_expect("`Stat::Max` somehow had an incompatible `DType`")
-                            .cast(&DType::from_arrow(field.as_ref()))
-                            .vortex_expect("Unable to cast to target type that DataFusion wants")
-                            .try_to_df()
-                            .ok()
+                            let stat_dtype = Stat::Max.dtype(stats_dtype)?;
+                            Scalar::try_new(stat_dtype, Some(stat_val))
+                                .ok()?
+                                .cast(&DType::from_arrow(field.as_ref()))
+                                .ok()?
+                                .try_to_df()
+                                .ok()
                         })
                         .transpose()
                 });
@@ -629,11 +625,7 @@ impl FileFormat for VortexFormat {
             let total_byte_size = sum_of_column_byte_sizes.to_df();
 
             Ok::<Statistics, DataFusionError>(Statistics {
-                num_rows: Precision::Exact(
-                    usize::try_from(row_count)
-                        .map_err(|_| vortex_err!("Row count overflow"))
-                        .vortex_expect("Row count overflow"),
-                ),
+                num_rows: Precision::Exact(num_rows),
                 total_byte_size,
                 column_statistics,
             })
