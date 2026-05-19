@@ -67,10 +67,12 @@ pub(super) async fn provision_scp_app(
     };
     let app_id = commands::ensure_spice_cloud_app(&cloud, &app_name, &app_create_config).await?;
 
+    // Fetch API key from the dedicated api-keys endpoint
     let api_keys = cloud
         .get_api_keys(app_id)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to fetch API keys for app '{app_name}': {e}"))?;
+
     let api_key = api_keys.api_key.ok_or_else(|| {
         anyhow::anyhow!("Spice Cloud did not return an API key for app '{app_name}'")
     })?;
@@ -85,6 +87,7 @@ pub(super) async fn provision_scp_app(
     commands::apply_spicepod_to_app(&cloud, app_id, &spicepod_yaml).await?;
     eprintln!("[stdio] Spicepod uploaded");
 
+    // Set secrets from environment for any secret references in the spicepod
     eprintln!("[stdio] Setting secrets from spicepod...");
     commands::secrets::set_spicepod_secrets(&cloud, app_id, &spicepod_yaml).await?;
     eprintln!("[stdio] Spicepod secrets set");
@@ -93,7 +96,12 @@ pub(super) async fn provision_scp_app(
     commands::secrets::set_secret(&cloud, app_id, "RUNNER", "spidapter").await?;
     eprintln!("[stdio] RUNNER secret set");
 
-    if args.image_tag.is_some() || args.channel.is_some() {
+    // Apply custom image configuration if any image-related overrides are provided.
+    // This updates the app's image_tag/update_channel before creating the deployment,
+    // so the deployment picks up the requested image version instead of the default.
+    let has_custom_image = args.image_tag.is_some() || args.channel.is_some();
+
+    if has_custom_image {
         eprintln!(
             "[stdio] Applying custom image config: tag={:?}, channel={:?}",
             args.image_tag, args.channel
@@ -103,7 +111,7 @@ pub(super) async fn provision_scp_app(
                 app_id,
                 &UpdateAppRequest {
                     image_tag: args.image_tag.clone(),
-                    update_channel: args.channel.clone(),
+                    update_channel: args.channel.as_ref().map(ToString::to_string),
                     ..UpdateAppRequest::default()
                 },
             )
@@ -115,7 +123,7 @@ pub(super) async fn provision_scp_app(
     }
 
     eprintln!("[stdio] Creating deployment...");
-    commands::create_deployment(&cloud, app_id, args.channel.as_deref()).await?;
+    commands::create_deployment(&cloud, app_id, args.channel.as_ref()).await?;
 
     let poll_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
@@ -128,14 +136,23 @@ pub(super) async fn provision_scp_app(
     )
     .await?;
 
+    let _expected_executors: u64 = std::env::var("SPIDAPTER_NUM_EXECUTORS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
     let executor_wait_timeout = std::env::var("SPIDAPTER_DEPLOYMENT_READY_WAIT")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(120);
+
+    // after the deployment is reported "ready", wait for another 10 seconds (or SPIDAPTER_DEPLOYMENT_READY_WAIT seconds if set)
+    // not all executors may be connected yet. executors should know to create missing tables when they join: https://github.com/spiceai/spiceai/issues/9848
     eprintln!(
         "[stdio] Deployment is ready, waiting an additional {executor_wait_timeout}s for executors to connect..."
     );
     tokio::time::sleep(Duration::from_secs(executor_wait_timeout)).await;
+    // wait_for_scp_executor_count(&cloud, app_id, expected_executors, Duration::from_secs(executor_wait_timeout)).await;
 
     eprintln!("[stdio] Spice Cloud deployment ready for app '{app_name}' at {flight_url}");
 

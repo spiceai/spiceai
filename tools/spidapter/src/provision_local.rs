@@ -403,6 +403,221 @@ pub(super) async fn provision_local_cluster(
     })))
 }
 
+pub(super) async fn provision_local_spiced_cluster(
+    run_id: Uuid,
+    ready_wait: Duration,
+    setup_config: &SetupConfig,
+    datasets: &HashMap<String, DatasetConfig>,
+    args: &StdioArgs,
+) -> anyhow::Result<RunState> {
+    let num_exec = num_executors()?;
+    eprintln!("[stdio] local backend: provisioning cluster with {num_exec} executor(s)");
+    let ports = allocate_cluster_ports(LOCAL_BIND_HOST, num_exec)?;
+
+    let working_dir = create_local_working_dir(run_id).await?;
+    let local_flight_api_key = (setup_config.sink_type == Some(EtlSinkType::Adbc))
+        .then(|| format!("spidapter-local-{run_id}"));
+
+    let setup_result = async {
+        let scheduler_dir = working_dir.join("scheduler");
+        tokio::fs::create_dir_all(&scheduler_dir).await?;
+
+        let mut executor_dirs = Vec::with_capacity(num_exec);
+        for i in 0..num_exec {
+            let dir = working_dir.join(format!("executor-{i}"));
+            tokio::fs::create_dir_all(&dir).await?;
+            executor_dirs.push(dir);
+        }
+
+        let spicepod = generate_initial_spicepod(
+            &run_id,
+            setup_config,
+            datasets,
+            local_flight_api_key.as_deref(),
+            args,
+        )
+        .await?;
+        let spicepod_path = write_local_spicepod(&spicepod, &working_dir).await?;
+
+        let run_id_str = run_id.to_string();
+        let short_run_id = run_id_str.split('-').next().unwrap_or_default();
+        let process_id = std::process::id();
+        let scheduler_cert_name = format!("spidapter-scheduler-{short_run_id}-{process_id}");
+        let executor_cert_names: Vec<String> = (0..num_exec)
+            .map(|i| format!("spidapter-executor{i}-{short_run_id}-{process_id}"))
+            .collect();
+
+        let pki_paths = ensure_local_cluster_pki(
+            LOCAL_SPICE_BINARY,
+            LOCAL_CONNECT_HOST,
+            &scheduler_cert_name,
+            &executor_cert_names,
+        )
+        .await?;
+
+        Ok::<(PathBuf, Vec<PathBuf>, PathBuf, LocalPkiPaths), anyhow::Error>((
+            scheduler_dir,
+            executor_dirs,
+            spicepod_path,
+            pki_paths,
+        ))
+    }
+    .await;
+
+    let (scheduler_dir, executor_dirs, spicepod_path, pki_paths) = match setup_result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = cleanup_local_artifacts(&working_dir).await;
+            return Err(error);
+        }
+    };
+
+    let extra_envs = build_local_extra_envs(setup_config);
+    let scheduler_args = scheduler_spiced_args(
+        LOCAL_BIND_HOST,
+        LOCAL_CONNECT_HOST,
+        &ports,
+        &pki_paths,
+        spicepod_path.as_path(),
+    );
+    let mut scheduler_child = match spawn_local_spiced(
+        &args.spiced_binary,
+        &scheduler_dir,
+        &scheduler_args,
+        "scheduler",
+        &extra_envs,
+    ) {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = cleanup_local_artifacts(&working_dir).await;
+            return Err(error);
+        }
+    };
+
+    let scheduler_http_url = format!("http://{}:{}", LOCAL_CONNECT_HOST, ports.scheduler_http);
+    let scheduler_sql_url = format!("{scheduler_http_url}/v1/sql");
+
+    if let Err(error) = wait_for_local_http_ready(
+        &scheduler_http_url,
+        &mut scheduler_child,
+        ready_wait,
+        "scheduler",
+    )
+    .await
+    {
+        let _ = stop_child_process(&mut scheduler_child, "scheduler").await;
+        let _ = cleanup_local_artifacts(&working_dir).await;
+        return Err(error);
+    }
+
+    let executor_http_urls = ports
+        .executor_ports
+        .iter()
+        .take(num_exec)
+        .map(|ports| format!("http://{}:{}", LOCAL_CONNECT_HOST, ports.0))
+        .collect::<Vec<_>>();
+
+    let mut executor_children = Vec::with_capacity(num_exec);
+    for (i, executor_dir) in executor_dirs.iter().enumerate().take(num_exec) {
+        let (executor_cert, executor_key) = &pki_paths.executor_pki[i];
+        let executor_args = executor_spiced_args(
+            LOCAL_BIND_HOST,
+            LOCAL_CONNECT_HOST,
+            ports.scheduler_node,
+            ports.executor_ports[i],
+            &pki_paths.ca_cert,
+            executor_cert,
+            executor_key,
+        );
+        let label = format!("executor-{i}");
+        match spawn_local_spiced(
+            &args.spiced_binary,
+            executor_dir,
+            &executor_args,
+            &label,
+            &extra_envs,
+        ) {
+            Ok(child) => executor_children.push(child),
+            Err(error) => {
+                for child in &mut executor_children {
+                    let _ = stop_child_process(child, "executor").await;
+                }
+                let _ = stop_child_process(&mut scheduler_child, "scheduler").await;
+                let _ = cleanup_local_artifacts(&working_dir).await;
+                return Err(error);
+            }
+        }
+    }
+
+    if let Err(error) = wait_for_local_sql_ready(
+        &scheduler_sql_url,
+        &mut scheduler_child,
+        ready_wait,
+        local_flight_api_key.as_deref(),
+    )
+    .await
+    {
+        for child in &mut executor_children {
+            let _ = stop_child_process(child, "executor").await;
+        }
+        let _ = stop_child_process(&mut scheduler_child, "scheduler").await;
+        let _ = cleanup_local_artifacts(&working_dir).await;
+        return Err(error);
+    }
+
+    if num_exec > 1 {
+        let remaining = num_exec.saturating_sub(1);
+        eprintln!(
+            "[stdio] local backend: waiting for remaining {remaining} executor(s) to register with the scheduler..."
+        );
+        if let Err(error) = wait_for_local_executor_count(
+            &scheduler_http_url,
+            &executor_http_urls,
+            &mut scheduler_child,
+            &mut executor_children,
+            num_exec,
+            ready_wait,
+        )
+        .await
+        {
+            for child in &mut executor_children {
+                let _ = stop_child_process(child, "executor").await;
+            }
+            let _ = stop_child_process(&mut scheduler_child, "scheduler").await;
+            let _ = cleanup_local_artifacts(&working_dir).await;
+            return Err(error);
+        }
+    }
+
+    if let Err(error) = post_setup_sink_action(
+        setup_config,
+        datasets,
+        &scheduler_sql_url,
+        local_flight_api_key.as_deref(),
+    )
+    .await
+    {
+        for child in &mut executor_children {
+            let _ = stop_child_process(child, "executor").await;
+        }
+        let _ = stop_child_process(&mut scheduler_child, "scheduler").await;
+        let _ = cleanup_local_artifacts(&working_dir).await;
+        return Err(error);
+    }
+
+    Ok(RunState::Local(Box::new(LocalRunState {
+        processes: LocalProcesses::Cluster {
+            scheduler_child,
+            executor_children,
+        },
+        flight_url: format!("grpc://{}:{}", LOCAL_CONNECT_HOST, ports.scheduler_flight),
+        flight_api_key: local_flight_api_key,
+        sql_url: scheduler_sql_url,
+        working_dir,
+        pg_config: setup_config.pg_config.clone(),
+    })))
+}
+
 pub(super) async fn teardown_local_run(local_state: &mut LocalRunState) -> anyhow::Result<()> {
     eprintln!(
         "[stdio] teardown: stopping local process(es) (sql endpoint: {})",
