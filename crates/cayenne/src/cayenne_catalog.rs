@@ -1021,7 +1021,7 @@ impl MetadataCatalog for CayenneCatalog {
                 message: "reserve_sequence_numbers called with count=0".to_string(),
             });
         }
-        let delta = count as i64;
+        let delta = i64::from(count);
 
         // Single atomic bump of the high-water mark.
         // We then read back the *new* high water mark and compute the base of the
@@ -2003,18 +2003,17 @@ impl MetadataCatalog for CayenneCatalog {
         'attempts: for attempt in 1..=max_attempts {
             let tx = match self.metastore.begin_transaction().await {
                 Ok(tx) => tx,
-                Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
-                    let delay = retry_backoff_delay(attempt);
-                    tracing::debug!(
+                Err(e) => {
+                    if retry_on_metastore_write_conflict(
+                        &e,
                         attempt,
                         max_attempts,
-                        ?delay,
-                        "Retrying on-conflict deletion transaction after begin conflict"
-                    );
-                    tokio::time::sleep(delay).await;
-                    continue 'attempts;
-                }
-                Err(e) => {
+                        "begin on-conflict deletion transaction",
+                    )
+                    .await
+                    {
+                        continue 'attempts;
+                    }
                     return Err(CatalogError::InvalidOperation {
                         message: "Failed to begin on-conflict deletion transaction".to_string(),
                         source: Box::new(e),
@@ -2066,16 +2065,15 @@ impl MetadataCatalog for CayenneCatalog {
                     })
                     .await;
                 if let Err(e) = res {
-                    if attempt < max_attempts && is_retryable_write_conflict(&e) {
+                    if retry_on_metastore_write_conflict(
+                        &e,
+                        attempt,
+                        max_attempts,
+                        "insert delete file inside on-conflict transaction",
+                    )
+                    .await
+                    {
                         drop(tx);
-                        let delay = retry_backoff_delay(attempt);
-                        tracing::debug!(
-                            attempt,
-                            max_attempts,
-                            ?delay,
-                            "Retrying on-conflict deletion transaction after delete-file insert conflict"
-                        );
-                        tokio::time::sleep(delay).await;
                         continue 'attempts;
                     }
                     drop(tx);
@@ -2103,16 +2101,15 @@ impl MetadataCatalog for CayenneCatalog {
                 let (sql, params) =
                     Self::build_insert_records_chunk_sql(table_id, chunk, insert_sequence);
                 if let Err(e) = tx.execute(ExecuteParams { sql: &sql, params }).await {
-                    if attempt < max_attempts && is_retryable_write_conflict(&e) {
+                    if retry_on_metastore_write_conflict(
+                        &e,
+                        attempt,
+                        max_attempts,
+                        "insert insert-record chunk inside on-conflict transaction",
+                    )
+                    .await
+                    {
                         drop(tx);
-                        let delay = retry_backoff_delay(attempt);
-                        tracing::debug!(
-                            attempt,
-                            max_attempts,
-                            ?delay,
-                            "Retrying on-conflict deletion transaction after insert-record insert conflict"
-                        );
-                        tokio::time::sleep(delay).await;
                         continue 'attempts;
                     }
                     drop(tx);
@@ -2127,17 +2124,17 @@ impl MetadataCatalog for CayenneCatalog {
 
             match tx.commit().await {
                 Ok(()) => return Ok(()),
-                Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
-                    let delay = retry_backoff_delay(attempt);
-                    tracing::debug!(
+                Err(e) => {
+                    if retry_on_metastore_write_conflict(
+                        &e,
                         attempt,
                         max_attempts,
-                        ?delay,
-                        "Retrying on-conflict deletion transaction after commit conflict"
-                    );
-                    tokio::time::sleep(delay).await;
-                }
-                Err(e) => {
+                        "commit on-conflict deletion transaction",
+                    )
+                    .await
+                    {
+                        continue 'attempts;
+                    }
                     return Err(CatalogError::InvalidOperation {
                         message: "Failed to commit on-conflict deletion transaction".to_string(),
                         source: Box::new(e),
@@ -2353,6 +2350,28 @@ pub fn is_retryable_write_conflict(error: &CatalogError) -> bool {
         CatalogError::Database { message } => is_retryable_write_conflict_message(message),
         _ => false,
     }
+}
+
+async fn retry_on_metastore_write_conflict(
+    error: &CatalogError,
+    attempt: u32,
+    max_attempts: u32,
+    operation: &'static str,
+) -> bool {
+    if attempt >= max_attempts || !is_retryable_write_conflict(error) {
+        return false;
+    }
+
+    let delay = retry_backoff_delay(attempt);
+    tracing::debug!(
+        attempt,
+        max_attempts,
+        ?delay,
+        operation,
+        "Retrying metastore transaction after retryable write conflict"
+    );
+    tokio::time::sleep(delay).await;
+    true
 }
 
 fn validate_existing_delete_file_record(

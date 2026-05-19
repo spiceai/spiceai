@@ -249,7 +249,7 @@ pub trait MetadataCatalog: Send + Sync {
     /// logical operation (most notably the on-conflict/upsert path, which needs a
     /// delete sequence and a higher insert sequence for the replacement rows).
     ///
-    /// On serialized backends such as the embedded SQLite metastore, this
+    /// On serialized backends such as the embedded `SQLite` metastore, this
     /// significantly reduces writer-lock acquisitions and RPC latency compared
     /// with calling `increment_sequence_number` multiple times.
     ///

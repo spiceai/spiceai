@@ -149,7 +149,7 @@ impl DeletionIndex {
     /// rebuild a filtered index, e.g. partial-deletion filters).
     #[must_use]
     pub fn entries(&self) -> &HashMap<i64, i64> {
-        &*self.entries
+        &self.entries
     }
 
     /// Build a new index from `self`'s entries plus `additions`, taking the max sequence
@@ -347,7 +347,7 @@ impl KeyDeletionIndex {
     /// Direct read-only access to the underlying entries.
     #[must_use]
     pub fn entries(&self) -> &HashMap<Box<[u8]>, i64> {
-        &*self.entries
+        &self.entries
     }
 
     /// Build a new index from `self`'s entries plus `additions`, taking the max sequence

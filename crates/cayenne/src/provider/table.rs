@@ -115,7 +115,7 @@ const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
 /// Using a byte budget instead of a hard entry count allows small-PK tables
 /// (e.g. single Int64) to cache far more rows before eviction, while still
 /// protecting memory on wide composite-PK tables. At ~40-64 bytes per entry
-/// (key bytes + RowLocation + HashMap overhead) this is ~2-4M rows for int64 PKs.
+/// (key bytes + `RowLocation` + `HashMap` overhead) this is ~2-4M rows for int64 PKs.
 const PK_KEYSET_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
 
@@ -170,17 +170,16 @@ fn protected_snapshot_age(snapshot_id: &str, now: SystemTime) -> Option<Duration
         }
         return None;
     };
-    match now.duration_since(snapshot_time) {
-        Ok(age) => Some(age),
-        Err(_) => {
-            if should_warn_protected_snapshot_age(snapshot_id, "future_timestamp") {
-                tracing::warn!(
-                    snapshot_id,
-                    "Cayenne protected snapshot timestamp is in the future; ignoring it for age-based maintenance"
-                );
-            }
-            None
+    if let Ok(age) = now.duration_since(snapshot_time) {
+        Some(age)
+    } else {
+        if should_warn_protected_snapshot_age(snapshot_id, "future_timestamp") {
+            tracing::warn!(
+                snapshot_id,
+                "Cayenne protected snapshot timestamp is in the future; ignoring it for age-based maintenance"
+            );
         }
+        None
     }
 }
 
