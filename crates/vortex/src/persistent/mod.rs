@@ -93,7 +93,6 @@ mod tests {
     #[tokio::test]
     async fn test_addition_pushdown() -> anyhow::Result<()> {
         let ctx = TestSessionContext::default();
-        dbg!(&ctx.store);
 
         ctx.session
             .sql(

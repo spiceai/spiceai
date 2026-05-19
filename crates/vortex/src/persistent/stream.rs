@@ -31,10 +31,10 @@ impl Stream for PrunableStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.as_mut().file_pruner.should_prune()? {
-            Poll::Ready(None)
-        } else {
-            self.stream.poll_next_unpin(cx)
+        match self.as_mut().file_pruner.should_prune() {
+            Ok(true) => Poll::Ready(None),
+            Ok(false) => self.stream.poll_next_unpin(cx),
+            Err(err) => Poll::Ready(Some(Err(err))),
         }
     }
 }

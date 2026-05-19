@@ -51,16 +51,13 @@ pub struct ProcessedProjection {
 pub(crate) fn make_vortex_predicate(
     expr_convertor: &dyn ExpressionConvertor,
     predicate: &[Arc<dyn PhysicalExpr>],
-) -> Option<Expression> {
+) -> DFResult<Option<Expression>> {
     let exprs: Vec<_> = predicate
         .iter()
-        .filter_map(|e| {
-            // If conversion fails, skip this expression (equivalent to lit(true) in AND conjunction)
-            expr_convertor.convert(e.as_ref()).ok()
-        })
-        .collect();
+        .map(|e| expr_convertor.convert(e.as_ref()))
+        .collect::<DFResult<_>>()?;
 
-    and_collect(exprs)
+    Ok(and_collect(exprs))
 }
 
 /// Trait for converting `DataFusion` expressions to Vortex ones.
@@ -225,7 +222,9 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
         }
 
         if let Some(literal) = df.as_any().downcast_ref::<df_expr::Literal>() {
-            let value = Scalar::from_df(literal.value());
+            let value = Scalar::from_df(literal.value()).map_err(|e| {
+                exec_datafusion_err!("Failed to convert literal to a Vortex scalar: {e}")
+            })?;
             return Ok(lit(value));
         }
 
@@ -260,7 +259,11 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
                 .iter()
                 .map(|e| {
                     if let Some(lit) = e.as_any().downcast_ref::<df_expr::Literal>() {
-                        Ok(Scalar::from_df(lit.value()))
+                        Scalar::from_df(lit.value()).map_err(|e| {
+                            exec_datafusion_err!(
+                                "Failed to convert IN list literal to a Vortex scalar: {e}"
+                            )
+                        })
                     } else {
                         Err(exec_datafusion_err!("Failed to cast sub-expression"))
                     }
@@ -652,7 +655,8 @@ mod tests {
     #[test]
     fn test_make_vortex_predicate_empty() {
         let expr_convertor = DefaultExpressionConvertor::default();
-        let result = make_vortex_predicate(&expr_convertor, &[]);
+        let result = make_vortex_predicate(&expr_convertor, &[])
+            .expect("empty predicate conversion should succeed");
         assert!(result.is_none());
     }
 
@@ -660,7 +664,8 @@ mod tests {
     fn test_make_vortex_predicate_single() {
         let expr_convertor = DefaultExpressionConvertor::default();
         let col_expr = Arc::new(df_expr::Column::new("test", 0)) as Arc<dyn PhysicalExpr>;
-        let result = make_vortex_predicate(&expr_convertor, &[col_expr]);
+        let result = make_vortex_predicate(&expr_convertor, &[col_expr])
+            .expect("single predicate conversion should succeed");
         assert!(result.is_some());
     }
 
@@ -669,7 +674,8 @@ mod tests {
         let expr_convertor = DefaultExpressionConvertor::default();
         let col1 = Arc::new(df_expr::Column::new("col1", 0)) as Arc<dyn PhysicalExpr>;
         let col2 = Arc::new(df_expr::Column::new("col2", 1)) as Arc<dyn PhysicalExpr>;
-        let result = make_vortex_predicate(&expr_convertor, &[col1, col2]);
+        let result = make_vortex_predicate(&expr_convertor, &[col1, col2])
+            .expect("multiple predicate conversion should succeed");
         assert!(result.is_some());
         // Result should be an AND expression combining the two columns
     }

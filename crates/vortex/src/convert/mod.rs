@@ -9,7 +9,7 @@ pub(crate) mod schema;
 
 /// First-party trait for implementing conversion from `DataFusion` types to Vortex types.
 pub(crate) trait FromDataFusion<D: ?Sized>: Sized {
-    fn from_df(df: &D) -> Self;
+    fn from_df(df: &D) -> VortexResult<Self>;
 }
 
 /// First-party trait for implementing conversion from Vortex to `DataFusion` types.

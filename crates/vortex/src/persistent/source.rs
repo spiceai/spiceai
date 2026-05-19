@@ -9,6 +9,7 @@ use std::sync::Weak;
 
 use datafusion_common::Result as DFResult;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::exec_datafusion_err;
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
@@ -27,7 +28,6 @@ use datafusion_physical_plan::filter_pushdown::PushedDownPredicate;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use object_store::ObjectStore;
 use object_store::path::Path;
-use vortex::error::VortexExpect;
 use vortex::file::VORTEX_FILE_EXTENSION;
 use vortex::layout::LayoutReader;
 use vortex::metrics::DefaultMetricsRegistry;
@@ -185,7 +185,7 @@ impl FileSource for VortexSource {
     ) -> DFResult<Arc<dyn FileOpener>> {
         let batch_size = self
             .batch_size
-            .vortex_expect("batch_size must be supplied to VortexSource");
+            .ok_or_else(|| exec_datafusion_err!("batch_size must be supplied to VortexSource"))?;
 
         let expr_adapter_factory = base_config
             .expr_adapter_factory
@@ -212,7 +212,7 @@ impl FileSource for VortexSource {
             layout_readers: Arc::clone(&self.layout_readers),
             natural_split_ranges: Arc::clone(&self.natural_split_ranges),
             has_output_ordering: !base_config.output_ordering.is_empty(),
-            expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
+            expression_convertor: Arc::clone(&self.expression_convertor),
             file_metadata_cache: self.file_metadata_cache.as_ref().map(Arc::clone),
             segment_cache: self.segment_cache.as_ref().map(Arc::clone),
             projection_pushdown: self.options.projection_pushdown,
