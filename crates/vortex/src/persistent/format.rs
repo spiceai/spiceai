@@ -461,7 +461,10 @@ impl FileFormat for VortexFormat {
                             .vortex_expect("Row count overflow"),
                     ),
                     total_byte_size: Precision::Absent,
-                    column_statistics: vec![ColumnStatistics::default(); struct_dtype.nfields()],
+                    column_statistics: vec![
+                        ColumnStatistics::default();
+                        table_schema.fields().len()
+                    ],
                 });
             };
 
