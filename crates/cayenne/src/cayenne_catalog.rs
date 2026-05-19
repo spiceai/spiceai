@@ -3548,7 +3548,7 @@ mod tests {
         };
 
         let delete_files: Vec<DeleteFile> = (0..5).map(make_delete_file).collect();
-        let insert_pks: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8]).collect();
+        let insert_pks: Vec<Vec<u8>> = (0..5_u8).map(|i| vec![i]).collect();
 
         catalog
             .commit_on_conflict_deletions(delete_files.clone(), &table_id, insert_pks, 2)
