@@ -37,13 +37,12 @@ use datafusion::{
 };
 use datafusion_table_providers::{
     duckdb::{
-        DuckDB, DuckDBSettingsRegistry, DuckDBTableFactory, DuckDBTableProviderFactory,
-        TableDefinition, write::DuckDBTableWriter,
+        DuckDB, DuckDBTableFactory, DuckDBTableProviderFactory, TableDefinition,
+        write::DuckDBTableWriter,
     },
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
     util::{constraints::UpsertOptions, on_conflict::OnConflict},
 };
-use duckdb::AccessMode;
 use runtime_table_partition::{
     Partition,
     creator::{self, PartitionCreator, filename::parse_partition_value},
@@ -57,16 +56,13 @@ use crate::{
     component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{
         AccelerationSource, DataAccelerator, FilePathError,
-        duckdb::{
-            DuckDBAccelerator, create_table_provider, duckdb_file_path,
-            settings::OrderByNonIntegerLiteral,
-        },
+        duckdb::{DuckDBAccelerator, create_factory, create_table_provider, duckdb_file_path},
         partitioned_duckdb::{
             ExpectedAccelerationSourceSnafu, FailedToCreateConnectionPoolSnafu, FileModeOnlySnafu,
         },
         storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
     },
-    datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_functions_for_duckdb},
+    datafusion::dialect::new_duckdb_dialect,
     make_spice_data_directory,
     parameters::ParameterSpec,
     register_data_accelerator,
@@ -453,15 +449,6 @@ impl PartitionCreator for DuckDBPartitionCreator {
             Some(&self.cmd.constraints)
         }
     }
-}
-
-fn create_factory() -> DuckDBTableProviderFactory {
-    DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
-        .with_dialect(new_duckdb_dialect())
-        .with_settings_registry(
-            DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
-        )
-        .with_function_support(deny_spice_functions_for_duckdb().as_ref().clone())
 }
 
 async fn get_pool(
