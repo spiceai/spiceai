@@ -229,8 +229,8 @@ impl CayenneContext {
 
     /// Create a `VortexFormat` from configuration.
     ///
-    /// The format contains a `VortexFileCache` that can be accessed via `file_cache()`
-    /// and shared with other `VortexFormat` instances using `new_with_cache()`.
+    /// The format carries Vortex scan/write options, including the shared
+    /// segment-cache capacity for scans created from this context.
     fn create_vortex_format(config: &VortexConfig) -> Arc<VortexFormat> {
         // Create a Vortex session with default encodings
         // Note: Write strategy configuration (e.g., compression) is applied at write time via
@@ -238,17 +238,22 @@ impl CayenneContext {
         let vortex_session = VortexSession::default();
 
         // Configure VortexFormat.
-        let default_config = VortexConfig::default();
-        if config.segment_cache_mb != default_config.segment_cache_mb {
-            tracing::warn!(
-                segment_cache_mb = config.segment_cache_mb,
-                "Vortex config `segment_cache_mb` is currently ignored in Spice.ai 2.0.0-unstable"
-            );
-        }
+        let segment_cache_size_bytes =
+            config
+                .segment_cache_mb
+                .checked_mul(1024 * 1024)
+                .or_else(|| {
+                    tracing::warn!(
+                        segment_cache_mb = config.segment_cache_mb,
+                        "Vortex config `segment_cache_mb` is too large; disabling segment cache"
+                    );
+                    None
+                });
 
         let vortex_opts = VortexTableOptions {
             target_file_size_mb: config.target_vortex_file_size_mb,
             projection_pushdown: true,
+            segment_cache_size_bytes,
             ..VortexTableOptions::default()
         };
 

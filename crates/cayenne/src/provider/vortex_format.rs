@@ -14,150 +14,55 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Cayenne-specific wrapper around `VortexFormat` that supports per-file deletion vectors.
+//! Cayenne-specific integration with `vortex-datafusion`.
 //!
-//! This module provides [`CayenneVortexFormat`], a [`FileFormat`] implementation that wraps
-//! the upstream `VortexFormat` and injects per-file deletion vectors via `VortexAccessPlan`
-//! extensions on `PartitionedFile`s.
-//!
-//! # Deletion Vector Integration
-//!
-//! When scanning files, `CayenneVortexFormat` attaches a `VortexAccessPlan` to each
-//! `PartitionedFile` based on the deletion cache. The `VortexOpener` then uses the
-//! `Selection::ExcludeRoaring` to skip deleted rows during decompression, which is more
-//! efficient than post-scan filtering.
+//! Position-based deletes are exposed through `VortexAccessPlanProvider` so the
+//! local Vortex fork can attach per-file access plans and adjust statistics where
+//! `DataFusion` may otherwise answer aggregates from stale footer metadata.
 
-use std::any::Any;
-use std::collections::HashMap;
-use std::fmt::Formatter;
 use std::sync::Arc;
 
-use super::deletion_strategy::PositionBitmap;
+use super::deletion_strategy::{PositionBitmap, PositionDeletionVector};
 use arc_swap::ArcSwap;
-use arrow_schema::{DataType, Schema};
-use async_trait::async_trait;
-use datafusion::datasource::file_format::FileFormat;
-use datafusion_catalog::Session;
-use datafusion_common::Result as DFResult;
+use datafusion_common::ColumnStatistics;
 use datafusion_common::Statistics;
-use datafusion_common::config::ConfigOptions;
+use datafusion_common::stats::Precision;
 use datafusion_datasource::PartitionedFile;
-use datafusion_datasource::TableSchema;
-use datafusion_datasource::file::FileSource;
-use datafusion_datasource::file_compression_type::FileCompressionType;
-use datafusion_datasource::file_groups::FileGroup;
-use datafusion_datasource::file_scan_config::FileScanConfig;
-use datafusion_datasource::file_stream::FileOpener;
-use datafusion_datasource::source::DataSourceExec;
-use datafusion_physical_expr::PhysicalExpr;
-use datafusion_physical_expr::expressions as df_expr;
-use datafusion_physical_expr::projection::ProjectionExprs;
-use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
-use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
-use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
-use object_store::{ObjectMeta, ObjectStore};
-use vortex_datafusion::VortexFormat;
-/// A wrapper around `VortexFormat` that injects per-file deletion vectors.
-///
-/// This format delegates all operations to the underlying `VortexFormat`, except for
-/// `create_physical_plan` where it attaches `VortexAccessPlan` extensions to files
-/// that have deletion vectors.
-pub struct DeletionFilteringVortexFormat {
-    /// The underlying Vortex file format.
-    inner: Arc<VortexFormat>,
-    /// Per-file deletion cache. Key is the file path, value is the deleted row set plus access plan.
-    /// Uses `Arc<ArcSwap<...>>` so readers always see a wait-free immutable snapshot.
+use object_store::ObjectMeta;
+use vortex_datafusion::{VortexAccessPlan, VortexAccessPlanProvider};
+
+/// Provides Cayenne's position-based deletion vectors to `vortex-datafusion`.
+#[derive(Clone)]
+pub(crate) struct PositionDeletionAccessPlanProvider {
     deletion_cache: Arc<ArcSwap<PositionBitmap>>,
 }
 
-impl std::fmt::Debug for DeletionFilteringVortexFormat {
+impl PositionDeletionAccessPlanProvider {
+    #[must_use]
+    pub(crate) fn new(deletion_cache: Arc<ArcSwap<PositionBitmap>>) -> Self {
+        Self { deletion_cache }
+    }
+
+    fn deletion_vector_for_path(&self, file_path: &str) -> Option<Arc<PositionDeletionVector>> {
+        let snapshot = self.deletion_cache.load();
+        snapshot
+            .get(file_path)
+            .filter(|deletion_vector| !deletion_vector.is_empty())
+            .cloned()
+    }
+}
+
+impl std::fmt::Debug for PositionDeletionAccessPlanProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeletionFilteringVortexFormat")
-            .field("inner", &"VortexFormat")
-            .finish()
+        f.debug_struct("PositionDeletionAccessPlanProvider")
+            .finish_non_exhaustive()
     }
 }
 
-/// Attach `VortexAccessPlan` deletion vectors to files in a `FileScanConfig`.
-///
-/// This is a standalone function that can be used both by `CayenneVortexFormat::create_physical_plan`
-/// and by external code (e.g., retention filter scanning in `delete.rs`) that needs to apply
-/// deletion vectors to a file scan configuration.
-///
-/// # Arguments
-///
-/// * `config` - The file scan configuration to modify
-/// * `deletion_cache` - Shared cache of per-file deletion vectors and access plans
-///
-/// # Returns
-///
-/// A tuple of:
-/// - The modified `FileScanConfig` with `VortexAccessPlan` extensions attached to files with deletions
-/// - A boolean indicating if any deletions were attached
-///
-pub fn attach_deletion_vectors_to_config(
-    mut config: FileScanConfig,
-    deletion_cache: &ArcSwap<PositionBitmap>,
-) -> (FileScanConfig, bool) {
-    // ArcSwap load is wait-free; the snapshot is immutable for the lifetime of `deletion_map`.
-    let deletion_map = deletion_cache.load_full();
-
-    // If no deletions, return config unchanged
-    if deletion_map.is_empty() {
-        return (config, false);
-    }
-
-    // Track if any files had deletions attached
-    let mut has_any_deletions = false;
-
-    // Modify file_groups in place to attach VortexAccessPlan extensions
-    config.file_groups = config
-        .file_groups
-        .into_iter()
-        .map(|file_group| {
-            let modified_files: Vec<PartitionedFile> = file_group
-                .into_inner()
-                .into_iter()
-                .map(|file| {
-                    let (modified_file, had_deletion) =
-                        attach_access_plan_to_file(file, &deletion_map);
-                    if had_deletion {
-                        has_any_deletions = true;
-                    }
-                    modified_file
-                })
-                .collect();
-            FileGroup::new(modified_files)
-        })
-        .collect();
-
-    (config, has_any_deletions)
-}
-
-/// Attach a `VortexAccessPlan` to a single file if it has deletions.
-///
-/// This is a helper function used by `attach_deletion_vectors_to_config`.
-///
-/// # Arguments
-///
-/// * `file` - The partitioned file to potentially modify
-/// * `deletion_map` - Map of file path to cached deletion vector state
-///
-/// # Returns
-///
-/// A tuple of the (potentially modified) file and a boolean indicating if deletions were attached.
-fn attach_access_plan_to_file(
-    mut file: PartitionedFile,
-    deletion_map: &PositionBitmap,
-) -> (PartitionedFile, bool) {
-    // Extract the file path from the PartitionedFile
-    let file_path = file.object_meta.location.to_string();
-
-    // Check if this file has deletions
-    if let Some(deletion_vector) = deletion_map.get(&file_path)
-        && !deletion_vector.is_empty()
-    {
-        file = file.with_extensions(deletion_vector.access_plan());
+impl VortexAccessPlanProvider for PositionDeletionAccessPlanProvider {
+    fn access_plan_for_file(&self, file: &PartitionedFile) -> Option<Arc<VortexAccessPlan>> {
+        let file_path = file.object_meta.location.to_string();
+        let deletion_vector = self.deletion_vector_for_path(&file_path)?;
 
         tracing::trace!(
             file_path = %file_path,
@@ -165,609 +70,44 @@ fn attach_access_plan_to_file(
             "Attached VortexAccessPlan with deletion vector"
         );
 
-        return (file, true);
+        Some(deletion_vector.access_plan())
     }
 
-    (file, false)
-}
-
-impl DeletionFilteringVortexFormat {
-    /// Create a new `CayenneVortexFormat` wrapping the given `VortexFormat`.
-    ///
-    /// # Arguments
-    ///
-    /// * `inner` - The underlying `VortexFormat` to delegate to.
-    /// * `deletion_cache` - Shared cache of per-file deletion vectors.
-    pub fn new(inner: Arc<VortexFormat>, deletion_cache: Arc<ArcSwap<PositionBitmap>>) -> Self {
-        Self {
-            inner,
-            deletion_cache,
-        }
-    }
-
-    /// Create a wrapper that installs Cayenne Vortex predicate-pushdown guards
-    /// without applying any deletion vectors.
-    #[must_use]
-    pub fn without_deletion_vectors(inner: Arc<VortexFormat>) -> Self {
-        Self::new(inner, Arc::new(ArcSwap::from_pointee(HashMap::new())))
-    }
-
-    /// Attach `VortexAccessPlan` extensions to files with deletion vectors.
-    ///
-    /// This is a convenience method that delegates to [`attach_deletion_vectors_to_config`].
-    fn attach_deletion_vectors(&self, config: FileScanConfig) -> (FileScanConfig, bool) {
-        attach_deletion_vectors_to_config(config, &self.deletion_cache)
-    }
-}
-
-#[deny(clippy::missing_trait_methods)]
-#[async_trait]
-impl FileFormat for DeletionFilteringVortexFormat {
-    fn as_any(&self) -> &dyn Any {
-        self.inner.as_any()
-    }
-
-    fn compression_type(&self) -> Option<FileCompressionType> {
-        self.inner.compression_type()
-    }
-
-    fn get_ext(&self) -> String {
-        self.inner.get_ext()
-    }
-
-    fn get_ext_with_compression(
-        &self,
-        file_compression_type: &datafusion_datasource::file_compression_type::FileCompressionType,
-    ) -> DFResult<String> {
-        self.inner.get_ext_with_compression(file_compression_type)
-    }
-
-    async fn infer_schema(
-        &self,
-        state: &dyn Session,
-        store: &Arc<dyn ObjectStore>,
-        objects: &[ObjectMeta],
-    ) -> DFResult<arrow_schema::SchemaRef> {
-        self.inner.infer_schema(state, store, objects).await
-    }
-
-    async fn infer_stats(
-        &self,
-        state: &dyn Session,
-        store: &Arc<dyn ObjectStore>,
-        table_schema: arrow_schema::SchemaRef,
-        object: &ObjectMeta,
-    ) -> DFResult<datafusion_common::Statistics> {
-        let file_stats = self
-            .inner
-            .infer_stats(state, store, table_schema, object)
-            .await?;
-
-        // Check if there are any deletions for this file. If so, we need to return
-        // inexact statistics to prevent DataFusion from using AggregateStatistics
-        // optimization which would skip the actual scan and return wrong row counts.
+    fn adjust_statistics(&self, object: &ObjectMeta, statistics: Statistics) -> Statistics {
         let file_path = object.location.to_string();
-        let has_deletions = {
-            // Wait-free read of the current snapshot.
-            let snapshot = self.deletion_cache.load();
-            snapshot
-                .get(&file_path)
-                .is_some_and(|bitmap| !bitmap.is_empty())
+        let Some(deletion_vector) = self.deletion_vector_for_path(&file_path) else {
+            return statistics;
         };
 
-        if has_deletions {
-            // Convert exact statistics to inexact to force actual scanning
-            Ok(datafusion_common::Statistics {
-                num_rows: file_stats.num_rows.to_inexact(),
-                total_byte_size: file_stats.total_byte_size,
-                column_statistics: file_stats.column_statistics,
-            })
-        } else {
-            Ok(file_stats)
+        Statistics {
+            num_rows: adjust_num_rows_for_deletions(statistics.num_rows, &deletion_vector),
+            total_byte_size: statistics.total_byte_size,
+            column_statistics: vec![
+                ColumnStatistics::new_unknown();
+                statistics.column_statistics.len()
+            ],
         }
-    }
-
-    async fn create_physical_plan(
-        &self,
-        state: &dyn Session,
-        file_scan_config: FileScanConfig,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Attach deletion vectors to files before creating the plan
-        let (modified_config, has_any_deletions) = self.attach_deletion_vectors(file_scan_config);
-
-        // Delegate to the underlying VortexFormat
-        let plan = self
-            .inner
-            .create_physical_plan(state, modified_config)
-            .await?;
-        let plan = wrap_vortex_file_sources(plan)?;
-
-        // If there are deletions, wrap the plan to force inexact statistics.
-        // This prevents AggregateStatistics optimizer from short-circuiting
-        // COUNT(*) queries using stale exact row counts.
-        if has_any_deletions {
-            Ok(Arc::new(InexactStatsExec::new(plan)))
-        } else {
-            Ok(plan)
-        }
-    }
-
-    async fn create_writer_physical_plan(
-        &self,
-        input: Arc<dyn ExecutionPlan>,
-        state: &dyn Session,
-        conf: datafusion_datasource::file_sink_config::FileSinkConfig,
-        order_requirements: Option<datafusion_physical_expr::LexRequirement>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Delegate to the underlying VortexFormat for writing
-        self.inner
-            .create_writer_physical_plan(input, state, conf, order_requirements)
-            .await
-    }
-
-    fn file_source(
-        &self,
-        table_schema: TableSchema,
-    ) -> Arc<dyn datafusion_datasource::file::FileSource> {
-        self.inner.file_source(table_schema)
     }
 }
 
-fn wrap_vortex_file_sources(plan: Arc<dyn ExecutionPlan>) -> DFResult<Arc<dyn ExecutionPlan>> {
-    if let Some(data_source_exec) = plan.as_any().downcast_ref::<DataSourceExec>()
-        && let Some(file_scan_config) = data_source_exec
-            .data_source()
-            .as_any()
-            .downcast_ref::<FileScanConfig>()
-    {
-        let mut wrapped_config = file_scan_config.clone();
-        wrapped_config.file_source = Arc::new(CayenneVortexFileSource::new(Arc::clone(
-            file_scan_config.file_source(),
-        )));
-
-        let new_exec = data_source_exec
-            .clone()
-            .with_data_source(Arc::new(wrapped_config));
-        return Ok(Arc::new(new_exec));
-    }
-
-    let children = plan.children();
-    if children.is_empty() {
-        return Ok(plan);
-    }
-
-    let new_children = children
-        .into_iter()
-        .map(|child| wrap_vortex_file_sources(Arc::clone(child)))
-        .collect::<DFResult<Vec<_>>>()?;
-
-    plan.with_new_children(new_children)
-}
-
-#[derive(Clone)]
-struct CayenneVortexFileSource {
-    inner: Arc<dyn FileSource>,
-}
-
-impl CayenneVortexFileSource {
-    fn new(inner: Arc<dyn FileSource>) -> Self {
-        Self { inner }
+fn adjust_num_rows_for_deletions(
+    num_rows: Precision<usize>,
+    deletion_vector: &PositionDeletionVector,
+) -> Precision<usize> {
+    match num_rows {
+        Precision::Exact(row_count) => Precision::Exact(
+            row_count.saturating_sub(deleted_rows_within_file(deletion_vector, row_count)),
+        ),
+        Precision::Inexact(row_count) => Precision::Inexact(
+            row_count.saturating_sub(usize::try_from(deletion_vector.len()).unwrap_or(usize::MAX)),
+        ),
+        Precision::Absent => Precision::Absent,
     }
 }
 
-impl std::fmt::Debug for CayenneVortexFileSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CayenneVortexFileSource")
-            .field("file_type", &self.inner.file_type())
-            .finish()
-    }
-}
-
-impl FileSource for CayenneVortexFileSource {
-    fn create_file_opener(
-        &self,
-        object_store: Arc<dyn ObjectStore>,
-        base_config: &FileScanConfig,
-        partition: usize,
-    ) -> DFResult<Arc<dyn FileOpener>> {
-        self.inner
-            .create_file_opener(object_store, base_config, partition)
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn table_schema(&self) -> &TableSchema {
-        self.inner.table_schema()
-    }
-
-    fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
-        Arc::new(Self::new(self.inner.with_batch_size(batch_size)))
-    }
-
-    fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
-        self.inner.filter()
-    }
-
-    fn projection(&self) -> Option<&ProjectionExprs> {
-        self.inner.projection()
-    }
-
-    fn metrics(&self) -> &ExecutionPlanMetricsSet {
-        self.inner.metrics()
-    }
-
-    fn file_type(&self) -> &str {
-        self.inner.file_type()
-    }
-
-    fn fmt_extra(&self, t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.inner.fmt_extra(t, f)
-    }
-
-    fn supports_repartitioning(&self) -> bool {
-        self.inner.supports_repartitioning()
-    }
-
-    fn repartitioned(
-        &self,
-        target_partitions: usize,
-        repartition_file_min_size: usize,
-        output_ordering: Option<datafusion_physical_expr::LexOrdering>,
-        config: &FileScanConfig,
-    ) -> DFResult<Option<FileScanConfig>> {
-        self.inner.repartitioned(
-            target_partitions,
-            repartition_file_min_size,
-            output_ordering,
-            config,
-        )
-    }
-
-    fn try_pushdown_filters(
-        &self,
-        filters: Vec<Arc<dyn PhysicalExpr>>,
-        config: &ConfigOptions,
-    ) -> DFResult<FilterPushdownPropagation<Arc<dyn FileSource>>> {
-        let schema = self.inner.table_schema().file_schema();
-        let mut safe_filters = Vec::new();
-        let mut safe_filter_indexes = Vec::new();
-        let mut pushdown_results = vec![PushedDown::No; filters.len()];
-
-        for (index, filter) in filters.into_iter().enumerate() {
-            if contains_decimal_to_floating_cast(filter.as_ref(), schema) {
-                tracing::debug!(
-                    %filter,
-                    "Skipping Vortex predicate pushdown for decimal-to-floating cast"
-                );
-                continue;
-            }
-
-            safe_filter_indexes.push(index);
-            safe_filters.push(filter);
-        }
-
-        if safe_filters.is_empty() {
-            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-                pushdown_results,
-            ));
-        }
-
-        let inner_propagation = self.inner.try_pushdown_filters(safe_filters, config)?;
-
-        for (safe_index, result) in safe_filter_indexes
-            .into_iter()
-            .zip(inner_propagation.filters.into_iter())
-        {
-            pushdown_results[safe_index] = result;
-        }
-
-        let mut propagation =
-            FilterPushdownPropagation::with_parent_pushdown_result(pushdown_results);
-        if let Some(updated_node) = inner_propagation.updated_node {
-            propagation = propagation.with_updated_node(Arc::new(Self::new(updated_node)) as _);
-        }
-
-        Ok(propagation)
-    }
-
-    fn try_pushdown_projection(
-        &self,
-        projection: &ProjectionExprs,
-    ) -> DFResult<Option<Arc<dyn FileSource>>> {
-        let schema = self.inner.table_schema().file_schema();
-        if contains_decimal_to_floating_projection(projection, schema) {
-            tracing::debug!(
-                %projection,
-                "Skipping Vortex projection pushdown for decimal-to-floating cast"
-            );
-            return Ok(None);
-        }
-
-        self.inner
-            .try_pushdown_projection(projection)
-            .map(|source| source.map(|source| Arc::new(Self::new(source)) as _))
-    }
-}
-
-fn contains_decimal_to_floating_projection(projection: &ProjectionExprs, schema: &Schema) -> bool {
-    projection
+fn deleted_rows_within_file(deletion_vector: &PositionDeletionVector, row_count: usize) -> usize {
+    deletion_vector
         .iter()
-        .any(|expr| contains_decimal_to_floating_cast(expr.expr.as_ref(), schema))
-}
-
-fn contains_decimal_to_floating_cast(expr: &dyn PhysicalExpr, schema: &Schema) -> bool {
-    if let Some(cast) = expr.as_any().downcast_ref::<df_expr::CastExpr>() {
-        let casts_to_floating = matches!(cast.cast_type(), DataType::Float32 | DataType::Float64);
-        // Resolve the input type of the cast using the provided schema.
-        // If resolution fails (e.g. Column index mismatch because the schema passed
-        // is the raw file_schema while the filter expr was built against a projected
-        // or wrapper-adjusted schema), conservatively treat it as a bad cast.
-        // This prevents accidentally pushing a decimal→float cast filter to Vortex,
-        // which can produce wrong comparison/NULL results due to precision differences.
-        let casts_from_decimal = match cast.expr().data_type(schema) {
-            Ok(data_type) => matches!(
-                data_type,
-                DataType::Decimal32(_, _)
-                    | DataType::Decimal64(_, _)
-                    | DataType::Decimal128(_, _)
-                    | DataType::Decimal256(_, _)
-            ),
-            Err(_) => true, // cannot prove safe → skip pushdown (correctness first)
-        };
-
-        if casts_to_floating && casts_from_decimal {
-            return true;
-        }
-    }
-
-    if let Some(dynamic_filter) = expr
-        .as_any()
-        .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
-        && let Ok(current) = dynamic_filter.current()
-        && contains_decimal_to_floating_cast(current.as_ref(), schema)
-    {
-        return true;
-    }
-
-    expr.children()
-        .into_iter()
-        .any(|child| contains_decimal_to_floating_cast(child.as_ref(), schema))
-}
-
-/// A wrapper execution plan that forces inexact row count statistics.
-///
-/// This is used to wrap scan plans when there are deletions, preventing
-/// `DataFusion`'s `AggregateStatistics` optimizer from short-circuiting
-/// COUNT(*) queries using stale exact statistics.
-#[derive(Debug)]
-struct InexactStatsExec {
-    inner: Arc<dyn ExecutionPlan>,
-}
-
-impl InexactStatsExec {
-    fn new(inner: Arc<dyn ExecutionPlan>) -> Self {
-        Self { inner }
-    }
-}
-
-impl DisplayAs for InexactStatsExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "InexactStatsExec: ")?;
-                self.inner.fmt_as(t, f)
-            }
-            DisplayFormatType::TreeRender => self.inner.fmt_as(t, f),
-        }
-    }
-}
-
-impl ExecutionPlan for InexactStatsExec {
-    fn name(&self) -> &'static str {
-        "InexactStatsExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
-        self.inner.properties()
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.inner]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return Err(datafusion_common::DataFusionError::Internal(
-                "InexactStatsExec requires exactly one child".to_string(),
-            ));
-        }
-        Ok(Arc::new(Self::new(Arc::clone(&children[0]))))
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<datafusion_execution::TaskContext>,
-    ) -> DFResult<datafusion_physical_plan::SendableRecordBatchStream> {
-        self.inner.execute(partition, context)
-    }
-
-    fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Statistics> {
-        let stats = self.inner.partition_statistics(partition)?;
-        // Convert exact row count to inexact to prevent AggregateStatistics optimization
-        Ok(Statistics {
-            num_rows: stats.num_rows.to_inexact(),
-            total_byte_size: stats.total_byte_size,
-            column_statistics: stats.column_statistics,
-        })
-    }
-
-    #[expect(deprecated)]
-    fn statistics(&self) -> DFResult<Statistics> {
-        // Delegate and then force inexact row count for safety, in case any code path
-        // still uses the deprecated statistics() method.
-        let stats = self.inner.statistics()?;
-        Ok(Statistics {
-            num_rows: stats.num_rows.to_inexact(),
-            total_byte_size: stats.total_byte_size,
-            column_statistics: stats.column_statistics,
-        })
-    }
-
-    fn metrics(&self) -> Option<MetricsSet> {
-        self.inner.metrics()
-    }
-
-    fn supports_limit_pushdown(&self) -> bool {
-        self.inner.supports_limit_pushdown()
-    }
-
-    fn fetch(&self) -> Option<usize> {
-        self.inner.fetch()
-    }
-
-    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        self.inner
-            .with_fetch(limit)
-            .map(|plan| Arc::new(Self::new(plan)) as Arc<dyn ExecutionPlan>)
-    }
-
-    fn repartitioned(
-        &self,
-        target_partitions: usize,
-        config: &ConfigOptions,
-    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
-        self.inner
-            .repartitioned(target_partitions, config)
-            .map(|plan| plan.map(|plan| Arc::new(Self::new(plan)) as Arc<dyn ExecutionPlan>))
-    }
-
-    fn try_swapping_with_projection(
-        &self,
-        projection: &datafusion_physical_plan::projection::ProjectionExec,
-    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
-        self.inner
-            .try_swapping_with_projection(projection)
-            .map(|plan| plan.map(|plan| Arc::new(Self::new(plan)) as _))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow_schema::{DataType, Field, Schema};
-    use datafusion_common::ScalarValue;
-    use datafusion_expr::Operator;
-    use datafusion_physical_expr::expressions::{
-        BinaryExpr, CastExpr, Column, DynamicFilterPhysicalExpr, Literal,
-    };
-    use datafusion_physical_expr::expressions::{col, lit};
-    use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
-
-    #[test]
-    fn detects_decimal_to_floating_cast_predicate() {
-        let schema = Schema::new(vec![Field::new(
-            "amount",
-            DataType::Decimal128(15, 2),
-            true,
-        )]);
-        let amount = Arc::new(Column::new("amount", 0)) as Arc<dyn PhysicalExpr>;
-        let cast =
-            Arc::new(CastExpr::new(amount, DataType::Float64, None)) as Arc<dyn PhysicalExpr>;
-        let literal =
-            Arc::new(Literal::new(ScalarValue::Float64(Some(1.0)))) as Arc<dyn PhysicalExpr>;
-        let predicate = BinaryExpr::new(cast, Operator::Lt, literal);
-
-        assert!(contains_decimal_to_floating_cast(&predicate, &schema));
-    }
-
-    #[test]
-    fn allows_decimal_to_decimal_predicate() {
-        let schema = Schema::new(vec![Field::new(
-            "amount",
-            DataType::Decimal128(15, 2),
-            true,
-        )]);
-        let amount = col("amount", &schema).expect("amount column should exist");
-        let literal = lit(ScalarValue::Decimal128(Some(100), 15, 2));
-        let predicate = BinaryExpr::new(amount, Operator::Lt, literal);
-
-        assert!(!contains_decimal_to_floating_cast(&predicate, &schema));
-    }
-
-    #[test]
-    fn allows_dynamic_filter_without_decimal_to_floating_current_predicate() {
-        let schema = Schema::new(vec![Field::new("amount", DataType::Int64, true)]);
-        let amount = col("amount", &schema).expect("amount column should exist");
-        let dynamic_filter = DynamicFilterPhysicalExpr::new(vec![amount], lit(true));
-
-        assert!(!contains_decimal_to_floating_cast(&dynamic_filter, &schema));
-    }
-
-    #[test]
-    fn detects_dynamic_filter_decimal_to_floating_current_predicate() {
-        let schema = Schema::new(vec![Field::new(
-            "amount",
-            DataType::Decimal128(15, 2),
-            true,
-        )]);
-        let amount = Arc::new(Column::new("amount", 0)) as Arc<dyn PhysicalExpr>;
-        let cast = Arc::new(CastExpr::new(amount, DataType::Float64, None));
-        let literal = Arc::new(Literal::new(ScalarValue::Float64(Some(1.0))));
-        let predicate = Arc::new(BinaryExpr::new(cast, Operator::Lt, literal));
-        let dynamic_filter = DynamicFilterPhysicalExpr::new(
-            vec![col("amount", &schema).expect("amount column should exist")],
-            predicate,
-        );
-
-        assert!(contains_decimal_to_floating_cast(&dynamic_filter, &schema));
-    }
-
-    #[test]
-    fn detects_decimal_to_floating_cast_projection() {
-        let schema = Schema::new(vec![Field::new(
-            "amount",
-            DataType::Decimal128(15, 2),
-            true,
-        )]);
-        let amount = Arc::new(Column::new("amount", 0)) as Arc<dyn PhysicalExpr>;
-        let cast = Arc::new(CastExpr::new(amount, DataType::Float64, None));
-        let projection = ProjectionExprs::new([ProjectionExpr {
-            expr: cast,
-            alias: "amount_f64".to_string(),
-        }]);
-
-        assert!(contains_decimal_to_floating_projection(
-            &projection,
-            &schema
-        ));
-    }
-
-    #[test]
-    fn allows_plain_decimal_projection() {
-        let schema = Schema::new(vec![Field::new(
-            "amount",
-            DataType::Decimal128(15, 2),
-            true,
-        )]);
-        let amount = Arc::new(Column::new("amount", 0)) as Arc<dyn PhysicalExpr>;
-        let projection = ProjectionExprs::new([ProjectionExpr {
-            expr: amount,
-            alias: "amount".to_string(),
-        }]);
-
-        assert!(!contains_decimal_to_floating_projection(
-            &projection,
-            &schema
-        ));
-    }
+        .take_while(|row_id| usize::try_from(*row_id).is_ok_and(|row_id| row_id < row_count))
+        .count()
 }
