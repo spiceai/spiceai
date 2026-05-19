@@ -489,8 +489,10 @@ impl CayenneAccelerator {
         source: &dyn AccelerationSource,
         footer_cache_mb: Option<usize>,
     ) -> cayenne::metadata::VortexConfig {
-        let mut config = cayenne::metadata::VortexConfig::default();
-        config.footer_cache_mb = footer_cache_mb;
+        let mut config = cayenne::metadata::VortexConfig {
+            footer_cache_mb,
+            ..Default::default()
+        };
 
         // Storage-aware default for target Vortex file size on local disk.
         // Smaller files reduce write amplification on EBS-class network
