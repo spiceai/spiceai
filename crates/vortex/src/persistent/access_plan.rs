@@ -43,6 +43,7 @@ pub trait VortexAccessPlanProvider: Debug + Send + Sync + 'static {
 
 impl VortexAccessPlan {
     /// Sets a [`Selection`] for this plan.
+    #[must_use]
     pub fn with_selection(mut self, selection: Selection) -> Self {
         self.selection = Some(selection);
         self

@@ -153,7 +153,7 @@ fn metric_value_to_datafusion(name: &str, metric: &MetricValue) -> Vec<Datafusio
             res
         }
         // TODO(os): add more metric types when added to VortexMetrics
-        _ => vec![],
+        MetricValue::Gauge(_) => Vec::new(),
     }
 }
 
@@ -184,14 +184,12 @@ fn df_timer(name: String, value: Duration) -> DatafusionMetricValue {
     }
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "truncation is checked before cast"
-)]
 fn f_to_u(f: f64) -> Option<usize> {
-    (f.is_finite() && f >= usize::MIN as f64 && f <= usize::MAX as f64).then(||
-        // After the range check, truncation is guaranteed to keep the value in usize bounds.
-        f.trunc() as usize)
+    if !f.is_finite() || f.is_sign_negative() {
+        return None;
+    }
+
+    format!("{:.0}", f.trunc()).parse().ok()
 }
 
 #[cfg(test)]

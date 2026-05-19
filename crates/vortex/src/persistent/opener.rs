@@ -107,7 +107,7 @@ pub(crate) struct VortexOpener {
 impl FileOpener for VortexOpener {
     fn open(&self, file: PartitionedFile) -> DFResult<FileOpenFuture> {
         let session = self.session.clone();
-        let metrics_registry = self.metrics_registry.clone();
+        let metrics_registry = Arc::clone(&self.metrics_registry);
         let labels = vec![
             Label::new(PATH_LABEL, file.path().to_string()),
             Label::new(PARTITION_LABEL, self.partition.to_string()),
@@ -123,12 +123,12 @@ impl FileOpener for VortexOpener {
         let reader =
             InstrumentedReadAt::new_with_labels(reader, metrics_registry.as_ref(), labels.clone());
 
-        let file_pruning_predicate = self.file_pruning_predicate.clone();
-        let expr_adapter_factory = self.expr_adapter_factory.clone();
-        let file_metadata_cache = self.file_metadata_cache.clone();
-        let segment_cache = self.segment_cache.clone();
+        let file_pruning_predicate = self.file_pruning_predicate.as_ref().map(Arc::clone);
+        let expr_adapter_factory = Arc::clone(&self.expr_adapter_factory);
+        let file_metadata_cache = self.file_metadata_cache.as_ref().map(Arc::clone);
+        let segment_cache = self.segment_cache.as_ref().map(Arc::clone);
 
-        let unified_file_schema = self.table_schema.file_schema().clone();
+        let unified_file_schema = Arc::clone(self.table_schema.file_schema());
         let batch_size = self.batch_size;
         let limit = self.limit;
         let layout_reader = Arc::clone(&self.layout_readers);
@@ -136,11 +136,10 @@ impl FileOpener for VortexOpener {
         let has_output_ordering = self.has_output_ordering;
         let scan_concurrency = self.scan_concurrency;
 
-        let expr_convertor = self.expression_convertor.clone();
+        let expr_convertor = Arc::clone(&self.expression_convertor);
         let projection_pushdown = self.projection_pushdown;
 
         // Replace column access for partition columns with literals
-        #[expect(clippy::disallowed_types)]
         let literal_value_cols = self
             .table_schema
             .table_partition_cols()
@@ -173,7 +172,7 @@ impl FileOpener for VortexOpener {
                 })
                 .and_then(|predicate| {
                     FilePruner::try_new(
-                        predicate.clone(),
+                        Arc::clone(&predicate),
                         &unified_file_schema,
                         &file,
                         Count::default(),
@@ -191,7 +190,7 @@ impl FileOpener for VortexOpener {
             let mut open_opts = session
                 .open_options()
                 .with_file_size(file.object_meta.size)
-                .with_metrics_registry(metrics_registry.clone())
+                .with_metrics_registry(Arc::clone(&metrics_registry))
                 .with_labels(labels);
 
             if let Some(segment_cache) = segment_cache {
@@ -371,7 +370,7 @@ impl FileOpener for VortexOpener {
                         )));
                     }
 
-                    make_vortex_predicate(expr_convertor.as_ref(), &pushed).transpose()
+                    make_vortex_predicate(expr_convertor.as_ref(), &pushed).map(Ok)
                 })
                 .transpose()?;
 

@@ -62,9 +62,6 @@ pub fn calculate_physical_schema(
 fn calculate_physical_field_type(dtype: &DType, logical_type: &DataType) -> DFResult<DataType> {
     // Check if the logical type is one that doesn't roundtrip through DType
     Ok(match logical_type {
-        // Dictionary types lose their encoding when converted to DType
-        DataType::Dictionary(..) => logical_type.clone(),
-
         // Non-view string/binary types become view types after roundtrip
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
             if dtype.is_binary() || dtype.is_utf8() {
@@ -76,8 +73,8 @@ fn calculate_physical_field_type(dtype: &DType, logical_type: &DataType) -> DFRe
             }
         }
 
-        // RunEndEncoded loses its encoding
-        DataType::RunEndEncoded(..) => logical_type.clone(),
+        // Dictionary types lose their encoding when converted to DType, and RunEndEncoded loses its encoding.
+        DataType::Dictionary(..) | DataType::RunEndEncoded(..) => logical_type.clone(),
 
         // For struct types, recursively check each field
         DataType::Struct(logical_fields) => {

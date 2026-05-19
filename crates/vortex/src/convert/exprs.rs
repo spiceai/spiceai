@@ -41,7 +41,7 @@ use vortex::scalar_fn::fns::operators::Operator;
 
 use crate::convert::FromDataFusion;
 
-/// Result of splitting a projection into Vortex expressions and leftover DataFusion projections.
+/// Result of splitting a projection into Vortex expressions and leftover `DataFusion` projections.
 pub struct ProcessedProjection {
     pub scan_projection: Expression,
     pub leftover_projection: ProjectionExprs,
@@ -63,7 +63,7 @@ pub(crate) fn make_vortex_predicate(
     and_collect(exprs)
 }
 
-/// Trait for converting DataFusion expressions to Vortex ones.
+/// Trait for converting `DataFusion` expressions to Vortex ones.
 pub trait ExpressionConvertor: Send + Sync {
     /// Can an expression be pushed down given a specific schema
     fn can_be_pushed_down(&self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool;
@@ -124,7 +124,7 @@ pub trait ExpressionConvertor: Send + Sync {
 pub struct DefaultExpressionConvertor {}
 
 impl DefaultExpressionConvertor {
-    /// Attempts to convert a DataFusion ScalarFunctionExpr to a Vortex expression.
+    /// Attempts to convert a `DataFusion` `ScalarFunctionExpr` to a Vortex expression.
     fn try_convert_scalar_function(&self, scalar_fn: &ScalarFunctionExpr) -> DFResult<Expression> {
         if let Some(get_field_fn) = ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn)
         {
@@ -476,8 +476,8 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
     }
 }
 
-/// Checks if an expression type is one that convert() can handle.
-/// This is less restrictive than can_be_pushed_down since it only checks
+/// Checks if an expression type is one that `convert()` can handle.
+/// This is less restrictive than `can_be_pushed_down` since it only checks
 /// expression types, not data type support.
 fn is_convertible_expr(df_expr: &Arc<dyn PhysicalExpr>) -> bool {
     let expr = df_expr.as_any();
@@ -555,7 +555,10 @@ fn can_case_be_pushed_down(case_expr: &df_expr::CaseExpr, schema: &Schema) -> bo
 }
 
 fn supported_data_types(dt: &DataType) -> bool {
-    use DataType::*;
+    use DataType::{
+        Binary, BinaryView, Boolean, Date32, Date64, Dictionary, LargeBinary, LargeUtf8,
+        Time32, Time64, Timestamp, Utf8, Utf8View,
+    };
 
     // For dictionary types, check if the value type is supported.
     if let Dictionary(_, value_type) = dt {
@@ -588,7 +591,7 @@ fn supported_data_types(dt: &DataType) -> bool {
 }
 
 /// Checks if a scalar function can be pushed down.
-/// Currently only GetFieldFunc is supported, and its arguments must also be pushable.
+/// Currently only `GetFieldFunc` is supported, and its arguments must also be pushable.
 fn can_scalar_fn_be_pushed_down(scalar_fn: &ScalarFunctionExpr, schema: &Schema) -> bool {
     ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn).is_some()
         && scalar_fn

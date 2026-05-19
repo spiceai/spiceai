@@ -111,9 +111,11 @@ impl TryToDataFusion<ScalarValue> for Scalar {
                     .cloned()
                     .map(|b| Vec::<u8>::from(b.into_inner())),
             ),
-            DType::Struct(..) => todo!("struct scalar conversion"),
-            DType::List(..) => todo!("list scalar conversion"),
-            DType::FixedSizeList(..) => todo!("fixed-size list scalar conversion"),
+            DType::Struct(..) => vortex_bail!("struct scalar conversion is not supported"),
+            DType::List(..) => vortex_bail!("list scalar conversion is not supported"),
+            DType::FixedSizeList(..) => {
+                vortex_bail!("fixed-size list scalar conversion is not supported")
+            }
             DType::Extension(ext) => {
                 let storage_scalar = self.as_extension().to_storage_scalar();
 
@@ -204,13 +206,19 @@ impl FromDataFusion<ScalarValue> for Scalar {
             ScalarValue::UInt64(i) => i.map(Scalar::from).unwrap_or_else(|| {
                 Scalar::null(DType::Primitive(PType::U64, Nullability::Nullable))
             }),
-            ScalarValue::Utf8(s) | ScalarValue::Utf8View(s) | ScalarValue::LargeUtf8(s) => s
-                .as_ref().map_or_else(|| Scalar::null(DType::Utf8(Nullability::Nullable)), |s| Scalar::from(s.as_str())),
+            ScalarValue::Utf8(s) | ScalarValue::Utf8View(s) | ScalarValue::LargeUtf8(s) => {
+                s.as_ref().map_or_else(
+                    || Scalar::null(DType::Utf8(Nullability::Nullable)),
+                    |s| Scalar::from(s.as_str()),
+                )
+            }
             ScalarValue::Binary(b)
             | ScalarValue::BinaryView(b)
             | ScalarValue::LargeBinary(b)
-            | ScalarValue::FixedSizeBinary(_, b) => b
-                .as_ref().map_or_else(|| Scalar::null(DType::Binary(Nullability::Nullable)), |b| Scalar::binary(ByteBuffer::from(b.clone()), Nullability::Nullable)),
+            | ScalarValue::FixedSizeBinary(_, b) => b.as_ref().map_or_else(
+                || Scalar::null(DType::Binary(Nullability::Nullable)),
+                |b| Scalar::binary(ByteBuffer::from(b.clone()), Nullability::Nullable),
+            ),
             ScalarValue::Date32(v)
             | ScalarValue::Time32Second(v)
             | ScalarValue::Time32Millisecond(v) => {

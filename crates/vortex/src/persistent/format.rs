@@ -92,7 +92,7 @@ impl Debug for VortexFormat {
                 &self.access_plan_provider.as_ref().map(|_| "configured"),
             )
             .field("segment_cache", &self.segment_cache)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -152,7 +152,7 @@ impl VortexFormatFactory {
         clippy::new_without_default,
         reason = "FormatFactory defines `default` method, so having `Default` implementation is confusing"
     )]
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             session: VortexSession::default(),
@@ -163,7 +163,7 @@ impl VortexFormatFactory {
     /// Creates a new instance with customized session and default options for all [`VortexFormat`] instances created from this factory.
     ///
     /// The options can be overridden by table-level configuration pass in [`FileFormatFactory::create`].
-    #[must_use] 
+    #[must_use]
     pub fn new_with_options(session: VortexSession, options: VortexTableOptions) -> Self {
         Self {
             session,
@@ -179,7 +179,7 @@ impl VortexFormatFactory {
     ///
     /// let factory = VortexFormatFactory::new().with_options(VortexTableOptions::default());
     /// ```
-    #[must_use] 
+    #[must_use]
     pub fn with_options(mut self, options: VortexTableOptions) -> Self {
         self.options = Some(options);
         self
@@ -187,7 +187,6 @@ impl VortexFormatFactory {
 }
 
 impl FileFormatFactory for VortexFormatFactory {
-    #[expect(clippy::disallowed_types, reason = "required by trait signature")]
     fn create(
         &self,
         _state: &dyn Session,
@@ -219,13 +218,13 @@ impl FileFormatFactory for VortexFormatFactory {
 
 impl VortexFormat {
     /// Create a new instance with default options.
-    #[must_use] 
+    #[must_use]
     pub fn new(session: VortexSession) -> Self {
         Self::new_with_options(session, VortexTableOptions::default())
     }
 
     /// Creates a new instance with configured by a [`VortexTableOptions`].
-    #[must_use] 
+    #[must_use]
     pub fn new_with_options(session: VortexSession, opts: VortexTableOptions) -> Self {
         let segment_cache = opts
             .segment_cache_size_bytes
@@ -242,13 +241,14 @@ impl VortexFormat {
     }
 
     /// Return the format specific configuration
-    #[must_use] 
+    #[must_use]
     pub fn options(&self) -> &VortexTableOptions {
         &self.opts
     }
 
     /// Creates a format that attaches access plans and adjusts footer-derived
     /// statistics using the provided provider.
+    #[must_use]
     pub fn with_access_plan_provider(
         &self,
         access_plan_provider: Arc<dyn VortexAccessPlanProvider>,
@@ -257,7 +257,7 @@ impl VortexFormat {
             session: self.session.clone(),
             opts: self.opts.clone(),
             access_plan_provider: Some(access_plan_provider),
-            segment_cache: self.segment_cache.clone(),
+            segment_cache: self.segment_cache.as_ref().map(Arc::clone),
         }
     }
 }
@@ -329,10 +329,10 @@ impl FileFormat for VortexFormat {
 
         let mut file_schemas = stream::iter(objects.iter().cloned())
             .map(|object| {
-                let store = store.clone();
+                let store = Arc::clone(store);
                 let session = self.session.clone();
                 let opts = self.opts.clone();
-                let cache = file_metadata_cache.clone();
+                let cache = Arc::clone(&file_metadata_cache);
 
                 SpawnedTask::spawn(async move {
                     // Check if we have cached metadata for this file
@@ -389,7 +389,7 @@ impl FileFormat for VortexFormat {
     ) -> DFResult<Statistics> {
         let object = object.clone();
         let object_for_adjustment = object.clone();
-        let store = store.clone();
+        let store = Arc::clone(store);
         let session = self.session.clone();
         let opts = self.opts.clone();
         let file_metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
@@ -409,7 +409,9 @@ impl FileFormat for VortexFormat {
                     })
             });
 
-            let (dtype, file_stats, row_count) = if let Some(metadata) = cached_metadata { metadata } else {
+            let (dtype, file_stats, row_count) = if let Some(metadata) = cached_metadata {
+                metadata
+            } else {
                 // Not cached - open the file
                 let reader = Arc::new(ObjectStoreReadAt::new(
                     store,
@@ -627,7 +629,7 @@ impl FileFormat for VortexFormat {
             input
         };
 
-        let schema = conf.output_schema().clone();
+        let schema = Arc::clone(conf.output_schema());
         let sink = Arc::new(VortexSink::new(
             conf,
             schema,
