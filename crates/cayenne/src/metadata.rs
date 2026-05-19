@@ -285,8 +285,9 @@ impl PkConflictDetection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VortexConfig {
-    /// Footer metadata cache size in MB.
-    pub footer_cache_mb: usize,
+    /// Runtime-global footer metadata cache size in MB, when explicitly configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer_cache_mb: Option<usize>,
     /// Segment cache size in MB.
     ///
     /// Currently ignored because the current Vortex DataFusion API does not expose
@@ -456,8 +457,7 @@ fn default_inline_flush_max_bytes() -> i64 {
 impl Default for VortexConfig {
     fn default() -> Self {
         Self {
-            // Larger caches improve read performance
-            footer_cache_mb: 128,
+            footer_cache_mb: None,
             segment_cache_mb: 256,
             // Balanced file size for scan throughput and write amplification
             target_vortex_file_size_mb: 256,

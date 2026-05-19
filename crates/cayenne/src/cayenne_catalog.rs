@@ -2728,8 +2728,11 @@ async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResul
 /// Checks if the existing stored configuration matches the new [`CreateTableOptions`].
 ///
 /// Returns `true` if the configuration matches (no recreation needed).
-/// Only compares data-affecting fields; runtime tuning parameters like cache sizes
-/// and write/upload concurrency are excluded since they don't affect data correctness.
+/// Only compares data-affecting fields by default; runtime tuning parameters like
+/// write/upload concurrency are excluded since they don't affect data correctness.
+/// When a runtime-global footer cache value is explicitly configured, compare it
+/// to any value stored in the metastore so configuration drift is surfaced during
+/// dataset registration.
 fn configuration_matches(stored: &TableMetadata, options: &CreateTableOptions) -> bool {
     // Compare primary keys
     if stored.primary_key != options.primary_key {
@@ -2758,6 +2761,13 @@ fn configuration_matches(stored: &TableMetadata, options: &CreateTableOptions) -
         return false;
     }
     if stored.vortex_config.compression_strategy != options.vortex_config.compression_strategy {
+        return false;
+    }
+    if let (Some(stored_footer_cache_mb), Some(configured_footer_cache_mb)) = (
+        stored.vortex_config.footer_cache_mb,
+        options.vortex_config.footer_cache_mb,
+    ) && stored_footer_cache_mb != configured_footer_cache_mb
+    {
         return false;
     }
 
@@ -2837,6 +2847,16 @@ fn log_configuration_differences(
         differences.push(format!(
             "compression_strategy: {:?} -> {:?}",
             stored.vortex_config.compression_strategy, options.vortex_config.compression_strategy
+        ));
+    }
+
+    if let (Some(stored_footer_cache_mb), Some(configured_footer_cache_mb)) = (
+        stored.vortex_config.footer_cache_mb,
+        options.vortex_config.footer_cache_mb,
+    ) && stored_footer_cache_mb != configured_footer_cache_mb
+    {
+        differences.push(format!(
+            "footer_cache_mb: {stored_footer_cache_mb} -> {configured_footer_cache_mb}"
         ));
     }
 
@@ -4353,7 +4373,7 @@ mod tests {
 
         // Change only cache sizes (non-data-affecting) — should NOT trigger recreation
         let vortex_config = crate::metadata::VortexConfig {
-            footer_cache_mb: 512,
+            footer_cache_mb: Some(512),
             segment_cache_mb: 1024,
             upload_concurrency: 8,
             write_concurrency: Some(16),
@@ -5297,6 +5317,64 @@ mod tests {
         );
 
         // Cleanup
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_existing_table_configuration_checks_configured_footer_cache() {
+        let test_db = format!(
+            "sqlite://./.test_footer_cache_validate_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+
+        let options = CreateTableOptions {
+            table_name: "footer_cache_validate_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_footer_cache_validate_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig {
+                footer_cache_mb: Some(128),
+                ..Default::default()
+            },
+        };
+        catalog
+            .create_table(options)
+            .await
+            .expect("Failed to create table");
+
+        let changed_options = CreateTableOptions {
+            table_name: "footer_cache_validate_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_footer_cache_validate_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig {
+                footer_cache_mb: Some(256),
+                ..Default::default()
+            },
+        };
+        let result = catalog
+            .validate_existing_table_configuration("footer_cache_validate_table", &changed_options)
+            .await;
+        assert!(
+            matches!(&result, Err(CatalogError::ChangedConfiguration { .. })),
+            "Expected ChangedConfiguration error from footer cache validation, got: {result:?}"
+        );
+
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));

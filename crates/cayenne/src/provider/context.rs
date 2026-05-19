@@ -58,12 +58,10 @@ pub struct CayenneContext {
 impl CayenneContext {
     /// Create a new Cayenne context from configuration.
     ///
-    /// This creates a new `VortexFormat` and applies cache sizing to the shared runtime.
-    /// The returned `Arc` should be shared across all table providers that should
-    /// use the same caches.
+    /// This creates a new `VortexFormat`. The shared runtime's file metadata cache
+    /// is configured once by the owning runtime before table providers are created.
     #[must_use]
     pub fn new(config: &VortexConfig, runtime_env: Arc<RuntimeEnv>) -> Arc<Self> {
-        Self::configure_runtime_caches(config, &runtime_env);
         let vortex_format = Self::create_vortex_format(config);
         Arc::new(Self {
             vortex_format,
@@ -256,14 +254,6 @@ impl CayenneContext {
 
         Arc::new(VortexFormat::new_with_options(vortex_session, vortex_opts))
     }
-
-    fn configure_runtime_caches(config: &VortexConfig, runtime_env: &RuntimeEnv) {
-        let footer_cache_bytes = config.footer_cache_mb.saturating_mul(1024 * 1024);
-        runtime_env
-            .cache_manager
-            .get_file_metadata_cache()
-            .update_cache_limit(footer_cache_bytes);
-    }
 }
 
 #[cfg(test)]
@@ -276,23 +266,5 @@ mod tests {
         let context = CayenneContext::new(&VortexConfig::default(), runtime_env);
 
         assert!(context.file_format().options().projection_pushdown);
-    }
-
-    #[test]
-    fn cayenne_applies_footer_cache_size_to_runtime_metadata_cache() {
-        let runtime_env = Arc::new(RuntimeEnv::default());
-        let config = VortexConfig {
-            footer_cache_mb: 8,
-            ..VortexConfig::default()
-        };
-        let context = CayenneContext::new(&config, runtime_env);
-
-        assert_eq!(
-            context
-                .runtime_env()
-                .cache_manager
-                .get_metadata_cache_limit(),
-            8 * 1024 * 1024
-        );
     }
 }

@@ -145,6 +145,7 @@ pub(crate) fn transform_schema_for_vortex(
 
 pub struct CayenneAccelerator {
     catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
+    footer_cache_mb: Option<usize>,
     /// Shared semaphore that bounds the number of concurrent per-table
     /// background compactions across all Cayenne tables registered with this
     /// accelerator. Sized at `available_parallelism()` so a fleet of tables
@@ -275,12 +276,18 @@ fn is_local_path(path: &str) -> bool {
 impl CayenneAccelerator {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_footer_cache_mb(None)
+    }
+
+    #[must_use]
+    pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
         let permits = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1)
             .max(1);
         Self {
             catalog: Arc::new(OnceCell::new()),
+            footer_cache_mb,
             compaction_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
         }
     }
@@ -469,11 +476,21 @@ impl CayenneAccelerator {
     /// Parse Vortex encoding configuration from acceleration parameters.
     /// This allows fine-grained control over which SIMD-optimized encodings to use.
     ///
+    #[cfg(test)]
     async fn get_vortex_config(
         table_name: &str,
         source: &dyn AccelerationSource,
     ) -> cayenne::metadata::VortexConfig {
+        Self::get_vortex_config_with_footer_cache(table_name, source, None).await
+    }
+
+    async fn get_vortex_config_with_footer_cache(
+        table_name: &str,
+        source: &dyn AccelerationSource,
+        footer_cache_mb: Option<usize>,
+    ) -> cayenne::metadata::VortexConfig {
         let mut config = cayenne::metadata::VortexConfig::default();
+        config.footer_cache_mb = footer_cache_mb;
 
         // Storage-aware default for target Vortex file size on local disk.
         // Smaller files reduce write amplification on EBS-class network
@@ -524,12 +541,6 @@ impl CayenneAccelerator {
         if let Some(acceleration) = source.acceleration() {
             apply_refresh_mode_defaults(&mut config, acceleration);
 
-            // Parse cache options - use VortexConfig defaults if not specified
-            config.footer_cache_mb = parse_usize(
-                acceleration,
-                "cayenne_footer_cache_mb",
-                config.footer_cache_mb,
-            );
             config.segment_cache_mb = parse_usize(
                 acceleration,
                 "cayenne_segment_cache_mb",
@@ -705,7 +716,7 @@ impl CayenneAccelerator {
             );
 
             tracing::debug!(
-                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, pk_conflict_detection={}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}",
+                "Cayenne Vortex config: runtime_footer_cache={:?}MB, segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, pk_conflict_detection={}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}",
                 config.footer_cache_mb,
                 config.segment_cache_mb,
                 config.target_vortex_file_size_mb,
@@ -872,7 +883,9 @@ impl CayenneAccelerator {
 
         // Check if using S3 Express One Zone storage
         let is_s3_express = s3::is_s3_express_data_path(source);
-        let vortex_config = Self::get_vortex_config(table_name, source).await;
+        let vortex_config =
+            Self::get_vortex_config_with_footer_cache(table_name, source, self.footer_cache_mb)
+                .await;
 
         // Build S3 object store if using S3 Express One Zone storage
         let object_store =
@@ -1016,8 +1029,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    25,
-    { S3_PARAMS_LEN + 25 },
+    24,
+    { S3_PARAMS_LEN + 24 },
 >(
     S3_PARAMETERS,
     [
@@ -1034,9 +1047,6 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("How to handle data types not natively supported by Cayenne (internally using Vortex format) (Time32, Time64, Duration, Interval, etc.). Options: 'string' (convert schema to Utf8, default - requires data source to provide string data), 'error' (fail on unsupported types), 'warn' (include in schema, may fail on insert), 'ignore' (skip unsupported fields)")
             .one_of(&["string", "error", "ignore", "warn"])
             .default("string"),
-        ParameterSpec::component("footer_cache_mb")
-            .description("Size of the in-memory Vortex footer cache in MB. Larger values improve query performance for repeated scans. Default: 128 MB")
-            .default("128"),
         ParameterSpec::component("segment_cache_mb")
             .description("Size of the in-memory Vortex segment cache in MB. Set > 0 to cache decompressed data segments. Default: 256 MB")
             .default("256"),
@@ -1605,7 +1615,12 @@ impl DataAccelerator for CayenneAccelerator {
             // Create partition creator
             let unsupported_type_action = Self::get_unsupported_type_action(source);
             let is_s3_express = s3::is_s3_express_data_path(source);
-            let vortex_config = Self::get_vortex_config(&table_name, source).await;
+            let vortex_config = Self::get_vortex_config_with_footer_cache(
+                &table_name,
+                source,
+                self.footer_cache_mb,
+            )
+            .await;
 
             // Log S3 Express configuration for partitioned tables
             if is_s3_express {
