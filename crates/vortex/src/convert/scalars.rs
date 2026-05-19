@@ -205,19 +205,17 @@ impl FromDataFusion<ScalarValue> for Scalar {
             ScalarValue::UInt64(i) => i.map(Scalar::from).unwrap_or_else(|| {
                 Scalar::null(DType::Primitive(PType::U64, Nullability::Nullable))
             }),
-            ScalarValue::Utf8(s) | ScalarValue::Utf8View(s) | ScalarValue::LargeUtf8(s) => {
-                s.as_ref().map_or_else(
-                    || Scalar::null(DType::Utf8(Nullability::Nullable)),
-                    |s| Scalar::from(s.as_str()),
-                )
-            }
+            ScalarValue::Utf8(s) | ScalarValue::Utf8View(s) | ScalarValue::LargeUtf8(s) => s
+                .as_ref()
+                .map(|s| Scalar::from(s.as_str()))
+                .unwrap_or_else(|| Scalar::null(DType::Utf8(Nullability::Nullable))),
             ScalarValue::Binary(b)
             | ScalarValue::BinaryView(b)
             | ScalarValue::LargeBinary(b)
-            | ScalarValue::FixedSizeBinary(_, b) => b.as_ref().map_or_else(
-                || Scalar::null(DType::Binary(Nullability::Nullable)),
-                |b| Scalar::binary(ByteBuffer::from(b.clone()), Nullability::Nullable),
-            ),
+            | ScalarValue::FixedSizeBinary(_, b) => b
+                .as_ref()
+                .map(|b| Scalar::binary(ByteBuffer::from(b.clone()), Nullability::Nullable))
+                .unwrap_or_else(|| Scalar::null(DType::Binary(Nullability::Nullable))),
             ScalarValue::Date32(v)
             | ScalarValue::Time32Second(v)
             | ScalarValue::Time32Millisecond(v) => {
@@ -513,7 +511,7 @@ mod tests {
     #[case::decimal256_null(ScalarValue::Decimal256(None, 50, 10))]
     fn test_from_datafusion_decimals(#[case] df_scalar: ScalarValue) {
         let result = Scalar::from_df(&df_scalar)
-            .expect("supported DataFusion scalar should convert to Vortex scalar");
+            .expect("supported decimal scalar should convert to Vortex scalar");
         match &df_scalar {
             ScalarValue::Decimal128(value, precision, scale) => {
                 if let DType::Decimal(decimal_type, _) = result.dtype() {
@@ -561,7 +559,7 @@ mod tests {
     ))]
     fn test_from_datafusion_temporals(#[case] df_scalar: ScalarValue) {
         let result = Scalar::from_df(&df_scalar)
-            .expect("supported DataFusion scalar should convert to Vortex scalar");
+            .expect("supported temporal scalar should convert to Vortex scalar");
 
         // All temporal types should convert to extension types
         if let DType::Extension(_) = result.dtype() {
@@ -676,7 +674,7 @@ mod tests {
     #[case::large_utf8(ScalarValue::LargeUtf8(Some("test string".to_string())))]
     fn test_utf8_variants(#[case] variant: ScalarValue) {
         let result = Scalar::from_df(&variant)
-            .expect("supported DataFusion scalar variant should convert to Vortex scalar");
+            .expect("UTF-8 DataFusion scalar should convert to Vortex scalar");
         assert_eq!(result.as_utf8().value().unwrap().as_str(), "test string");
     }
 
@@ -687,7 +685,7 @@ mod tests {
     #[case::fixed_size_binary(ScalarValue::FixedSizeBinary(5, Some(vec![1u8, 2, 3, 4, 5])))]
     fn test_binary_variants(#[case] variant: ScalarValue) {
         let result = Scalar::from_df(&variant)
-            .expect("supported DataFusion scalar variant should convert to Vortex scalar");
+            .expect("binary DataFusion scalar should convert to Vortex scalar");
         let result_bytes: Vec<u8> = result
             .as_binary()
             .value()
