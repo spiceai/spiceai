@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Staleness gap measurement for HTAP benchmarks.
 //!
-//! Probes TPC-C tables every 1s by comparing `MAX(_bench_ts)` between the
+//! Probes TPC-C tables every 5s by comparing `MAX(_bench_ts)` between the
 //! source and the Spice accelerated copy. The gap is the replication
 //! staleness — how far behind Spice is from the source at any given moment.
 //!
@@ -102,7 +102,7 @@ async fn run_staleness_probe(
     spice_client: spiceai::Client,
     cancel: CancellationToken,
 ) -> anyhow::Result<StalenessReport> {
-    let poll_interval = Duration::from_secs(1);
+    let poll_interval = Duration::from_secs(5);
     let probe_tables = driver.probe_tables();
 
     // Per-table gap samples (microseconds).
