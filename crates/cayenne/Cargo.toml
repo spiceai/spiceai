@@ -255,3 +255,8 @@ name = "position_delete_redundant_walks"
 [[bench]]
 harness = false
 name = "apply_partial_filter_empty_alloc"
+
+[[bench]]
+harness = false
+name = "pk_lookup_file_group_fanout"
+required-features = ["duckdb-bench"]
