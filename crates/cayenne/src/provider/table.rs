@@ -5223,16 +5223,11 @@ impl CayenneTableProvider {
     ///
     /// Extracted from [`Self::run_post_write_maintenance_loop`] so
     /// [`Self::flush_pending_maintenance`] can reuse the same work.
+    ///
+    /// Listing-table refresh is deferred until after retention so the pass
+    /// rebuilds the listing at most once, even when both
+    /// `state.refresh_listing` is set and retention deletes rows.
     async fn run_maintenance_state(&self, state: PostWriteMaintenanceState) {
-        if state.refresh_listing
-            && let Err(e) = self.refresh_listing_table().await
-        {
-            tracing::warn!(
-                table = self.table_metadata.table_name.as_str(),
-                "Post-write listing refresh failed: {e}"
-            );
-        }
-
         let had_stats = state.stats.is_some();
         if let Some(stats) = state.stats {
             self.persist_table_stats(&stats).await;
@@ -5251,21 +5246,34 @@ impl CayenneTableProvider {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    // Re-queue so the next debounce cycle retries. A
+                    // persistently failing retention scan would otherwise leave
+                    // expired rows undeleted indefinitely; re-queueing makes
+                    // delivery eventual and the repeated error log
+                    // observable. Logged at `error` (not `warn`) because the
+                    // retry semantics turn a single failure into a steady
+                    // signal worth alerting on.
+                    tracing::error!(
                         table = self.table_metadata.table_name.as_str(),
-                        "Background retention scan failed: {e}"
+                        "Background retention scan failed: {e}. Re-queueing for retry."
                     );
+                    self.post_write_maintenance
+                        .state
+                        .lock()
+                        .retention_requested = true;
                 }
             }
         }
 
-        if retention_deleted > 0
-            && let Err(e) = self.refresh_listing_table().await
-        {
-            tracing::warn!(
-                table = self.table_metadata.table_name.as_str(),
-                "Listing refresh after retention failed: {e}"
-            );
+        // One refresh per pass, deferred until after retention so deleted
+        // rows are reflected in the rebuilt listing table.
+        if state.refresh_listing || retention_deleted > 0 {
+            if let Err(e) = self.refresh_listing_table().await {
+                tracing::warn!(
+                    table = self.table_metadata.table_name.as_str(),
+                    "Post-write listing refresh failed: {e}"
+                );
+            }
         }
 
         if state.refresh_listing || had_stats || retention_deleted > 0 {
