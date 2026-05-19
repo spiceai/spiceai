@@ -1,0 +1,189 @@
+version: v1
+kind: Spicepod
+name: file[parquet]-cayenne[file]-pk
+# Variant of file[parquet]-cayenne[file] that:
+#   1. Declares the standard TPC-DS primary keys on every dataset. This feeds
+#      Cayenne's PK-deletion-cache and dynamic-filter pipeline so the planner
+#      can use exact stats on join keys and the PK fast paths kick in for
+#      point-lookups. PK source: standard TPC-DS spec (24 dimension+fact
+#      tables). Indexes from test/tpc-bench/tpcds_index.sql are reflected
+#      where they correspond to the PK; the rest are secondary indexes that
+#      Cayenne does not currently model.
+#   2. Drops target_partitions from the runtime default (= num_cpus, ~16 on
+#      most boxes) to 4. q72-shape multi-way joins shuffle far less data
+#      (~4× reduction) and the per-partition hash table cost remains
+#      well within typical memory budgets at SF1-SF10.
+runtime:
+  query:
+    target_partitions: 4
+datasets:
+  # ---- dimension tables (single-column surrogate PK) ----
+  - from: file:data/call_center.parquet
+    name: call_center
+    acceleration: &acceleration_call_center
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: cc_call_center_sk
+  - from: file:data/catalog_page.parquet
+    name: catalog_page
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: cp_catalog_page_sk
+  - from: file:data/customer.parquet
+    name: customer
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: c_customer_sk
+  - from: file:data/customer_address.parquet
+    name: customer_address
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: ca_address_sk
+  - from: file:data/customer_demographics.parquet
+    name: customer_demographics
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: cd_demo_sk
+  - from: file:data/date_dim.parquet
+    name: date_dim
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: d_date_sk
+  - from: file:data/household_demographics.parquet
+    name: household_demographics
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: hd_demo_sk
+  - from: file:data/income_band.parquet
+    name: income_band
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: ib_income_band_sk
+  - from: file:data/item.parquet
+    name: item
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: i_item_sk
+  - from: file:data/promotion.parquet
+    name: promotion
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: p_promo_sk
+  - from: file:data/reason.parquet
+    name: reason
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: r_reason_sk
+  - from: file:data/ship_mode.parquet
+    name: ship_mode
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: sm_ship_mode_sk
+  - from: file:data/store.parquet
+    name: store
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: s_store_sk
+  - from: file:data/time_dim.parquet
+    name: time_dim
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: t_time_sk
+  - from: file:data/warehouse.parquet
+    name: warehouse
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: w_warehouse_sk
+  - from: file:data/web_page.parquet
+    name: web_page
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: wp_web_page_sk
+  - from: file:data/web_site.parquet
+    name: web_site
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: web_site_sk
+  # ---- fact tables (composite PKs) ----
+  - from: file:data/inventory.parquet
+    name: inventory
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: (inv_date_sk, inv_item_sk, inv_warehouse_sk)
+  - from: file:data/store_sales.parquet
+    name: store_sales
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: (ss_item_sk, ss_ticket_number)
+  - from: file:data/store_returns.parquet
+    name: store_returns
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: (sr_item_sk, sr_ticket_number)
+  - from: file:data/catalog_sales.parquet
+    name: catalog_sales
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: (cs_item_sk, cs_order_number)
+  - from: file:data/catalog_returns.parquet
+    name: catalog_returns
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: (cr_item_sk, cr_order_number)
+  - from: file:data/web_sales.parquet
+    name: web_sales
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: (ws_item_sk, ws_order_number)
+  - from: file:data/web_returns.parquet
+    name: web_returns
+    acceleration:
+      engine: cayenne
+      mode: file
+      enabled: true
+      primary_key: (wr_item_sk, wr_order_number)
