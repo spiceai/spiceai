@@ -270,11 +270,9 @@ async fn apply_sqlite_pragmas(
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
     let conn = pool.connect().await?;
-    let async_conn =
-        conn.as_async()
-            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-                "SQLite connection does not expose async interface".into()
-            })?;
+    let Some(async_conn) = conn.as_async() else {
+        unreachable!("SqliteConnectionPool only returns async-capable SQLite connections");
+    };
     for pragma in pragmas {
         if let Err(err) = async_conn.execute(pragma, &[]).await {
             tracing::warn!(
