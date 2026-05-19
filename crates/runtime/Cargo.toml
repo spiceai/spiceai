@@ -90,7 +90,7 @@ indexmap.workspace = true
 itertools.workspace = true
 logos.workspace = true
 opendal.workspace = true
-jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs"] }
 linkme.workspace = true
 llms = { path = "../llms", default-features = false }
 mediatype = "0.21.0"
