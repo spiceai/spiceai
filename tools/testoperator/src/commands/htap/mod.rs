@@ -356,6 +356,7 @@ fn emit_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
             worst_lag_ms = l_ms;
         }
     }
+    println!();
 
     // Headline: worst replication lag across all datasets.
     crate::metrics::REPLICATION_LAG_MS.record(worst_lag_ms, &[]);

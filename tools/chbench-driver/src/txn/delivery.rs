@@ -73,24 +73,24 @@ pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Re
 
         // 3. UPDATE orders with carrier
         tx.execute(
-            "UPDATE orders SET o_carrier_id = $1 WHERE o_w_id = $2 AND o_d_id = $3 AND o_id = $4",
+            "UPDATE oorder SET o_carrier_id = $1 WHERE o_w_id = $2 AND o_d_id = $3 AND o_id = $4",
             &[&o_carrier_id, &w_id, &d_id, &no_o_id],
         )
         .await
         .map_err(|source| crate::Error::Sql {
-            action: "delivery: update orders".into(),
+            action: "delivery: update oorder".into(),
             source,
         })?;
 
         // 4. Get customer ID for this order
         let o_row = tx
             .query_one(
-                "SELECT o_c_id FROM orders WHERE o_w_id = $1 AND o_d_id = $2 AND o_id = $3",
+                "SELECT o_c_id FROM oorder WHERE o_w_id = $1 AND o_d_id = $2 AND o_id = $3",
                 &[&w_id, &d_id, &no_o_id],
             )
             .await
             .map_err(|source| crate::Error::Sql {
-                action: "delivery: select orders c_id".into(),
+                action: "delivery: select oorder c_id".into(),
                 source,
             })?;
 
