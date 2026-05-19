@@ -110,7 +110,7 @@ arrow-json = "57.0.0"
 arrow-odbc = { git = "https://github.com/pacman82/arrow-odbc", rev = "7316b13" }
 arrow-row = "57.0.0"
 arrow-schema = "57.0.0"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "8dbb88bcd14b70dfd92ddd02aeb9f31112c7b63b", features = [
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "98e0c53be444e2427177cc77554d70813913d775", features = [
     "byot",
     "embedding",
     "chat-completion",
@@ -426,9 +426,9 @@ datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev 
 
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "b798c391b6566c172d44361f8acc8472c958ca75" } # spiceai-52
 
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "c25e25b9e88c50404e230c698a35cbde2fdd30ae" }      # spiceai-52.5
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "c25e25b9e88c50404e230c698a35cbde2fdd30ae" } # spiceai-52.5
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "c25e25b9e88c50404e230c698a35cbde2fdd30ae" } # spiceai-52.5
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "47e2b4946762c834d4a11532a25cc99c9e8a0b9d" }      # spiceai-52.5
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "47e2b4946762c834d4a11532a25cc99c9e8a0b9d" } # spiceai-52.5
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "47e2b4946762c834d4a11532a25cc99c9e8a0b9d" } # spiceai-52.5
 
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "47034733a0477f72e4f6abbbf6a27d0da069860a" } # spiceai-0.18.2
 

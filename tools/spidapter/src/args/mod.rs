@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use clap::{Parser, Subcommand, ValueEnum};
+use spice_cloud_client::types::UpdateChannel;
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum BackendMode {
@@ -52,7 +53,7 @@ pub struct StdioArgs {
 
     /// Release channel for the spice.ai runtime image (stable, preview, nightly, internal).
     #[arg(long)]
-    pub channel: Option<String>,
+    pub channel: Option<UpdateChannel>,
 
     /// Custom container image tag (e.g. `spicebench-sf10`).
     /// When set, the app's image tag is updated before deploying.

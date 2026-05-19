@@ -107,6 +107,10 @@ pub enum Error {
     #[snafu(display("Invalid argument: {message}"))]
     InvalidArgument { message: String },
 
+    /// User denied device authorization during cloud login.
+    #[snafu(display("Device authorization was denied"))]
+    DeviceAuthorizationDenied,
+
     /// Home directory not found
     #[snafu(display(
         "Could not determine home directory. Set HOME (Unix) or USERPROFILE (Windows) environment variable."

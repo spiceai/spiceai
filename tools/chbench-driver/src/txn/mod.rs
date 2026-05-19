@@ -27,6 +27,7 @@ pub mod delivery;
 pub mod new_order;
 pub mod order_status;
 pub mod payment;
+pub mod prepared;
 pub mod stock_level;
 
 use std::fmt;
@@ -35,6 +36,7 @@ use ::rand::{Rng, RngExt};
 use tokio_postgres::Client;
 
 use crate::Result;
+pub use prepared::PreparedStatements;
 
 /// The five TPC-C transaction types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -85,6 +87,69 @@ pub fn pick_txn_type(rng: &mut impl Rng, mix: &[u32; 5]) -> TxnType {
     TxnType::NewOrder
 }
 
+/// Per-terminal warehouse/district assignment to reduce contention.
+///
+/// Each terminal "owns" a home warehouse and a slice of districts within it.
+/// Transactions use the home warehouse and pick districts only from the assigned
+/// range, eliminating `d_next_o_id` lock collisions between terminals.
+///
+/// Follows TPC-C spec clause 4.2.2 (each terminal is "home" to one warehouse)
+/// and `BenchBase`'s `TPCCBenchmark.createTerminals()` district-partitioning strategy.
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalAssignment {
+    /// Home warehouse ID (1-based).
+    pub home_w_id: i32,
+    /// Lower district ID (inclusive, 1-based).
+    pub district_lo: i32,
+    /// Upper district ID (inclusive, 1-based).
+    pub district_hi: i32,
+    /// Total number of warehouses (for remote warehouse selection).
+    pub num_warehouses: i32,
+}
+
+impl TerminalAssignment {
+    /// Compute assignments for all terminals, distributing evenly across
+    /// warehouses and districts (like `BenchBase`'s `createTerminals`).
+    #[must_use]
+    pub fn compute(num_terminals: usize, num_warehouses: i32) -> Vec<Self> {
+        let nw = usize::try_from(num_warehouses.max(1)).unwrap_or(1);
+        let mut assignments = Vec::with_capacity(num_terminals);
+
+        for w in 0..nw {
+            let w_id = i32::try_from(w).unwrap_or(i32::MAX - 1) + 1;
+            // Terminals assigned to this warehouse: [lower, upper)
+            let lower = w * num_terminals / nw;
+            let upper = if w + 1 == nw {
+                num_terminals
+            } else {
+                (w + 1) * num_terminals / nw
+            };
+            let wh_terminals = upper - lower;
+            if wh_terminals == 0 {
+                continue;
+            }
+
+            for t in 0..wh_terminals {
+                // Districts assigned to this terminal: [d_lo, d_hi]
+                let d_lo = i32::try_from(t * 10 / wh_terminals).unwrap_or(0) + 1;
+                let d_hi = if t + 1 == wh_terminals {
+                    10
+                } else {
+                    i32::try_from((t + 1) * 10 / wh_terminals).unwrap_or(10)
+                };
+                assignments.push(Self {
+                    home_w_id: w_id,
+                    district_lo: d_lo,
+                    district_hi: d_hi.max(d_lo),
+                    num_warehouses: num_warehouses.max(1),
+                });
+            }
+        }
+
+        assignments
+    }
+}
+
 /// Execute one TPC-C transaction of the given type.
 ///
 /// # Errors
@@ -94,13 +159,14 @@ pub async fn execute(
     client: &mut Client,
     rng: &mut impl Rng,
     txn_type: TxnType,
-    warehouses: i32,
+    assignment: &TerminalAssignment,
+    stmts: &PreparedStatements,
 ) -> Result<()> {
     match txn_type {
-        TxnType::NewOrder => new_order::run(client, rng, warehouses).await,
-        TxnType::Payment => payment::run(client, rng, warehouses).await,
-        TxnType::Delivery => delivery::run(client, rng, warehouses).await,
-        TxnType::OrderStatus => order_status::run(client, rng, warehouses).await,
-        TxnType::StockLevel => stock_level::run(client, rng, warehouses).await,
+        TxnType::NewOrder => new_order::run(client, rng, assignment, &stmts.new_order).await,
+        TxnType::Payment => payment::run(client, rng, assignment, &stmts.payment).await,
+        TxnType::Delivery => delivery::run(client, rng, assignment.num_warehouses).await,
+        TxnType::OrderStatus => order_status::run(client, rng, assignment.num_warehouses).await,
+        TxnType::StockLevel => stock_level::run(client, rng, assignment.num_warehouses).await,
     }
 }

@@ -84,6 +84,9 @@ pub mod dynamodb;
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
 
+#[cfg(any(feature = "kafka", feature = "debezium"))]
+mod offsets;
+
 pub mod caching_engine;
 
 enum AccelerationConnection {

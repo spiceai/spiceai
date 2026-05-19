@@ -25,11 +25,11 @@ Spice is a SQL query, search, and LLM-inference engine in Rust for data apps and
 
 **Never force push** — not on `trunk`, not on feature branches, not even with `--force-with-lease`. Always merge or rebase normally, then push without force.
 
-- **Why force-push is banned**: It silently destroys collaborator commits and orphans PR review history (comments lose their anchor, reviewers re-read the entire diff, CI re-runs). `--force-with-lease` only protects against the *latest fetch* — it cannot see commits a collaborator pushed since you fetched, so it does not make force-push safe on shared branches.
+- **Why force-push is banned**: It silently destroys collaborator commits and orphans PR review history (comments lose their anchor, reviewers re-read the entire diff, CI re-runs). `--force-with-lease` only protects against the _latest fetch_ — it cannot see commits a collaborator pushed since you fetched, so it does not make force-push safe on shared branches.
 - **What to do instead of force-push**:
   - Branch out of date with `trunk`? `git pull --rebase` or `git merge trunk`, then `git push` normally.
   - Want to fix history on a branch with open review? Add a follow-up commit and squash on merge — don't rewrite published commits.
-  - Pre-commit hook failed and the commit didn't actually land? Re-stage, fix, create a *new* commit. Never `--amend` after pushing.
+  - Pre-commit hook failed and the commit didn't actually land? Re-stage, fix, create a _new_ commit. Never `--amend` after pushing.
 - **Never bypass hooks** (`--no-verify`, etc.). If a hook fails, fix the underlying issue — these checks exist because earlier failures escaped review. Likewise, don't bypass required commit signing (e.g. `--no-gpg-sign`) just to get a commit through.
 - **Investigate before destroying**: unfamiliar files, branches, or lock files may represent in-progress work. Don't `git reset --hard`, `checkout --`, or `clean -f` to "make it go away" — find the root cause first.
 
@@ -63,6 +63,14 @@ cargo run -p testoperator -- run bench -p ./test/spicepods/tpch/sf1/federated/du
 
 ## Rust Coding Standards
 
+### Configuration & User-Facing Parameters
+
+- **Avoid boolean parameters in user-facing configuration** (Spicepod fields, connector `params`, CLI flags, public API options). Booleans paint you into a corner the moment a third state is needed and force readers to know which value means "on": `on_schema_change: append_new_columns` reads better than `schema_evolution_enabled: true`, and leaves room for `block`, `fail`, `sync_all_columns`, … without breaking changes.
+- **Prefer named enum variants** (`#[serde(rename_all = "snake_case")]`). Pick verbs/states that describe behavior, not capability — `block` / `fail` / `append_new_columns` / `sync_all_columns`, not `disabled` / `enabled` / `auto`. Default to the conservative or back-compat-preserving variant via `#[derive(Default)]` + `#[default]` so the safe behavior is what users get when they omit the field.
+- **Mirror precedent** already in the codebase: `on_zero_results: return_empty|use_source`, `unsupported_type_action: error|warn|ignore|string`, `ready_state: on_load|on_registration|on_schema_resolved`, `check_availability: auto|disabled`, `on_schema_change: block|fail|append_new_columns|sync_all_columns`. Reach for an existing enum-shaped pattern before inventing a new boolean.
+- **Make each connector or engine explicitly opt in** when a setting depends on implementation behavior. Add a trait or capability method whose default returns only the modes that work universally, validate user configuration against that list, and surface a structured configuration error instead of silently ignoring unsupported modes. Audit every wrapper/decorator impl (`EmbeddingConnector`, `FullTextConnector`, `DeferredConnector`, …) to forward new trait methods to the inner connector; see "Trait Evolution & Wrapper Delegation" below.
+- **Booleans are still fine in internal, non-config code paths** (struct fields, function arguments, in-memory flags, test helpers). This rule is about _what users type into YAML / pass on the CLI_, not about Rust's primitive types.
+
 ### Rust Version Baseline
 
 - **Workspace Rust version is 1.94.1**: Treat Rust 1.94.1 as the minimum supported compiler version for workspace code unless a specific crate or integration explicitly documents a different constraint.
@@ -75,7 +83,7 @@ cargo run -p testoperator -- run bench -p ./test/spicepods/tpch/sf1/federated/du
 - **Use SNAFU**: Derive `Snafu` and `Debug` on error enums
 - **NO `.unwrap()`/`.expect()` in non-test code**: Use `?` operator or `match`
 - **In tests**: Use `.expect("descriptive message")` instead of `.unwrap()`
-- **`unreachable!()` / `unimplemented!()` / `todo!()`**: Only for *provably unreachable* code. Never for unfinished-but-callable code — they panic at runtime, which violates the data-correctness rule of failing safely with a structured error. For not-yet-implemented method bodies, return a typed error (`DataFusionError::NotImplemented("...")`, an `Err(NotImplementedSnafu { ... })` variant, etc.) so callers can degrade gracefully or surface a useful message
+- **`unreachable!()` / `unimplemented!()` / `todo!()`**: Only for _provably unreachable_ code. Never for unfinished-but-callable code — they panic at runtime, which violates the data-correctness rule of failing safely with a structured error. For not-yet-implemented method bodies, return a typed error (`DataFusionError::NotImplemented("...")`, an `Err(NotImplementedSnafu { ... })` variant, etc.) so callers can degrade gracefully or surface a useful message
 - **Use `ensure!` macro**: Preferred over `if` + `return Err`
 - **Define `Result` type alias**: `pub type Result<T, E = Error> = std::result::Result<T, E>;`
 - **Don't use `assert!()` (or related) macros in non-test code**: Prefer proper error handling, or marking with `unreachable!()` if the assertion is truly unreachable. Alternatively, make the assertion a `debug_assert!()` assertion to only fire in debug builds instead of release builds. `assert!()` macros can have case-by-case exceptions, for example for compile-time assertions that would prevent a build from being released to begin with.
@@ -477,7 +485,7 @@ export PATH="$PATH:$HOME/.spice/bin"
 ### Async Patterns
 
 - Use `tokio` runtime (see `bin/spiced/src/main.rs`).
-- **Trait async methods**: prefer `#[async_trait]`. Native `async fn` in traits has been stable since Rust 1.75 and is fine for traits that *don't* need to be `dyn`-compatible — but most internal traits in this codebase (`DataConnector`, `Chat`, `Embed`, `SecretStore`, `Index`, `CacheProvider`, etc.) are stored as `Arc<dyn Trait>`, and native AFIT isn't `dyn`-safe without manual workarounds. Default to `async_trait` to keep the dyn path consistent; reach for native AFIT only on non-dyn helper traits.
+- **Trait async methods**: prefer `#[async_trait]`. Native `async fn` in traits has been stable since Rust 1.75 and is fine for traits that _don't_ need to be `dyn`-compatible — but most internal traits in this codebase (`DataConnector`, `Chat`, `Embed`, `SecretStore`, `Index`, `CacheProvider`, etc.) are stored as `Arc<dyn Trait>`, and native AFIT isn't `dyn`-safe without manual workarounds. Default to `async_trait` to keep the dyn path consistent; reach for native AFIT only on non-dyn helper traits.
 - **Lazy globals**: prefer `std::sync::LazyLock` / `OnceLock` (modern stable Rust) over `lazy_static!` and `once_cell::sync::Lazy` for new code. Existing `once_cell` callsites are fine to leave.
 - Use `CancellationToken` for shutdown (see `runtime/src/cancellable_task.rs`).
 
