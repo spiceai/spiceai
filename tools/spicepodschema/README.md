@@ -318,7 +318,7 @@ Parameters are currently extracted directly in `crates/runtime/src/model/embed.r
 
 Tool types:
 - `auto` - Builtin tools (get_readiness, list_datasets, sql, search, etc.)
-- `mcp` - Model Context Protocol tools (has `mcp_args` param)
+- `mcp` - Model Context Protocol tools (has `mcp_args`, `mcp_auth_token`, and `mcp_headers` params)
 - `memory` - Memory tools (store, load)
 
 Parameters are currently handled inline in `crates/runtime/src/tools/`.

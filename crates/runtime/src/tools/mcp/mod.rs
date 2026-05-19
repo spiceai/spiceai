@@ -21,6 +21,7 @@ pub mod tool;
 
 use std::{collections::HashMap, str::FromStr};
 
+use http::{HeaderName, HeaderValue, header::AUTHORIZATION};
 use rmcp::ErrorData as McpError;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -53,6 +54,9 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+const MCP_AUTH_TOKEN_PARAM: &str = "mcp_auth_token";
+const MCP_HEADERS_PARAM: &str = "mcp_headers";
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MCPType {
@@ -74,7 +78,7 @@ impl FromStr for MCPType {
     }
 }
 
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone)]
 pub(crate) enum MCPConfig {
     Stdio {
         command: String,
@@ -83,6 +87,8 @@ pub(crate) enum MCPConfig {
     },
     StreamableHttp {
         url: url::Url,
+        auth_token: Option<SecretString>,
+        headers: HashMap<HeaderName, HeaderValue>,
     },
 }
 impl MCPConfig {
@@ -108,9 +114,64 @@ impl MCPConfig {
 
                 Self::Stdio { command, args, env }
             }
-            MCPType::StreamableHttp(url) => Self::StreamableHttp { url },
+            MCPType::StreamableHttp(url) => {
+                let auth_token = params.get(MCP_AUTH_TOKEN_PARAM).cloned();
+                let mut headers = parse_custom_headers(params);
+                if auth_token.is_some() && headers.remove(&AUTHORIZATION).is_some() {
+                    tracing::warn!(
+                        "Ignoring 'authorization' header from MCP custom headers because '{MCP_AUTH_TOKEN_PARAM}' is configured"
+                    );
+                }
+                Self::StreamableHttp {
+                    url,
+                    auth_token,
+                    headers,
+                }
+            }
         }
     }
+}
+
+fn parse_custom_headers(
+    params: &HashMap<String, SecretString>,
+) -> HashMap<HeaderName, HeaderValue> {
+    let mut custom_headers = HashMap::new();
+    let Some(headers) = params.get(MCP_HEADERS_PARAM) else {
+        return custom_headers;
+    };
+    let param_name = MCP_HEADERS_PARAM;
+
+    // Same UX as the HTTP connector's `http_headers` parameter:
+    // `Header1: Value1, Header2: Value2` (or semicolon-delimited).
+    let headers_str = headers.expose_secret();
+    let delimiter = if headers_str.contains(';') { ';' } else { ',' };
+    for header in headers_str.split(delimiter) {
+        let Some((name, value)) = header.split_once(':') else {
+            tracing::warn!(
+                "Malformed MCP HTTP header in '{param_name}'. Expected format 'Name: Value'. Skipping this header."
+            );
+            continue;
+        };
+
+        let name = name.trim();
+        let value = value.trim();
+        let Ok(header_name) = HeaderName::try_from(name) else {
+            tracing::warn!(
+                "Invalid MCP HTTP header name in '{param_name}': '{name}'. Skipping this header."
+            );
+            continue;
+        };
+        let Ok(mut header_value) = HeaderValue::from_str(value) else {
+            tracing::warn!(
+                "Invalid MCP HTTP header value for '{name}' in '{param_name}'. Skipping this header."
+            );
+            continue;
+        };
+        header_value.set_sensitive(true);
+        custom_headers.insert(header_name, header_value);
+    }
+
+    custom_headers
 }
 
 #[cfg(test)]
@@ -180,7 +241,101 @@ mod tests {
         let mcp_type = MCPType::StreamableHttp(url.clone());
         let cfg = MCPConfig::from_type(&mcp_type, &HashMap::new(), &HashMap::new());
         match cfg {
-            MCPConfig::StreamableHttp { url: u } => assert_eq!(u, url),
+            MCPConfig::StreamableHttp {
+                url: u,
+                auth_token,
+                headers,
+            } => {
+                assert_eq!(u, url);
+                assert!(auth_token.is_none());
+                assert!(headers.is_empty());
+            }
+            MCPConfig::Stdio { .. } => panic!("expected https config"),
+        }
+    }
+
+    #[test]
+    fn mcp_config_from_https_collects_auth_token() {
+        let url = url::Url::parse("https://example.com/v1/mcp").expect("valid url");
+        let mcp_type = MCPType::StreamableHttp(url);
+        let mut params = HashMap::new();
+        params.insert(
+            "mcp_auth_token".to_string(),
+            SecretString::from("test-api-key"),
+        );
+
+        let cfg = MCPConfig::from_type(&mcp_type, &params, &HashMap::new());
+        match cfg {
+            MCPConfig::StreamableHttp {
+                auth_token,
+                headers,
+                ..
+            } => {
+                assert_eq!(
+                    auth_token.as_ref().map(ExposeSecret::expose_secret),
+                    Some("test-api-key")
+                );
+                assert!(headers.is_empty());
+            }
+            MCPConfig::Stdio { .. } => panic!("expected https config"),
+        }
+    }
+
+    #[test]
+    fn mcp_config_from_https_collects_custom_headers() {
+        let url = url::Url::parse("https://example.com/v1/mcp").expect("valid url");
+        let mcp_type = MCPType::StreamableHttp(url);
+        let mut params = HashMap::new();
+        params.insert(
+            MCP_HEADERS_PARAM.to_string(),
+            SecretString::from("X-API-Key: test-api-key, X-Tenant: acme"),
+        );
+
+        let cfg = MCPConfig::from_type(&mcp_type, &params, &HashMap::new());
+        match cfg {
+            MCPConfig::StreamableHttp { headers, .. } => {
+                assert_eq!(
+                    headers
+                        .get(&HeaderName::from_static("x-api-key"))
+                        .and_then(|value| value.to_str().ok()),
+                    Some("test-api-key")
+                );
+                assert_eq!(
+                    headers
+                        .get(&HeaderName::from_static("x-tenant"))
+                        .and_then(|value| value.to_str().ok()),
+                    Some("acme")
+                );
+            }
+            MCPConfig::Stdio { .. } => panic!("expected https config"),
+        }
+    }
+
+    #[test]
+    fn mcp_auth_token_removes_custom_authorization_header() {
+        let url = url::Url::parse("https://example.com/v1/mcp").expect("valid url");
+        let mcp_type = MCPType::StreamableHttp(url);
+        let mut params = HashMap::new();
+        params.insert(
+            MCP_AUTH_TOKEN_PARAM.to_string(),
+            SecretString::from("test-api-key"),
+        );
+        params.insert(
+            MCP_HEADERS_PARAM.to_string(),
+            SecretString::from("Authorization: Basic abc, X-Tenant: acme"),
+        );
+
+        let cfg = MCPConfig::from_type(&mcp_type, &params, &HashMap::new());
+        match cfg {
+            MCPConfig::StreamableHttp { headers, .. } => {
+                assert!(!headers.contains_key(&AUTHORIZATION));
+                assert_eq!(
+                    headers
+                        .get(&HeaderName::from_static("x-tenant"))
+                        .and_then(|value| value.to_str().ok()),
+                    Some("acme")
+                );
+            }
             MCPConfig::Stdio { .. } => panic!("expected https config"),
         }
     }
