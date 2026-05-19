@@ -20,13 +20,14 @@ use crate::{
     component::{
         dataset::{
             Dataset,
-            acceleration::{Acceleration, Engine, Mode, RefreshMode},
+            acceleration::{Acceleration, Engine, Mode, RefreshMode, StorageProfile},
         },
         view::View,
     },
     dataaccelerator::{
         FilePathError,
         snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
+        storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
     },
     datafusion::{
         dialect::new_duckdb_dialect,
@@ -80,6 +81,7 @@ use std::{
 pub(crate) mod settings;
 
 pub(crate) const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
+pub(crate) const DEFAULT_EBS_MIN_IDLE_CONNECTIONS: u32 = 4;
 pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
 pub(crate) const SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY: &str =
     "spice.optimizer.duckdb_aggregate_pushdown";
@@ -166,11 +168,24 @@ impl DuckDBAccelerator {
                     &source.app(),
                     source.runtime(),
                 );
-                let max_size = Self::get_pool_max_size(num_accelerating_datasets, acceleration);
-                let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
+                let storage =
+                    resolve_acceleration_storage_async(acceleration.storage_profile, &duckdb_file)
+                        .await;
+                tracing::debug!(
+                    dataset = %source.name(),
+                    storage = %storage,
+                    "Resolved DuckDB acceleration storage profile"
+                );
+                let max_size =
+                    Self::get_pool_max_size(num_accelerating_datasets, acceleration, storage);
+                let min_idle = Self::get_pool_min_idle(storage, max_size);
+                let mut pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
                     .with_max_size(Some(max_size))
-                    .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS))
+                    .with_min_idle(Some(min_idle))
                     .with_connection_setup_query("PRAGMA enable_checkpoint_on_shutdown");
+                for pragma in Self::storage_setup_queries(storage) {
+                    pool_builder = pool_builder.with_connection_setup_query(*pragma);
+                }
                 self.duckdb_factory
                     .get_or_init_instance_with_builder(pool_builder)
                     .await
@@ -180,10 +195,16 @@ impl DuckDBAccelerator {
             (_, Mode::Memory) => {
                 let num_accelerating_datasets =
                     self.get_num_accelerating_datasets(None, &source.app(), source.runtime());
-                let max_size = Self::get_pool_max_size(num_accelerating_datasets, acceleration);
+                let max_size = Self::get_pool_max_size(
+                    num_accelerating_datasets,
+                    acceleration,
+                    ResolvedAccelerationStorage::Unknown,
+                );
+                let min_idle =
+                    Self::get_pool_min_idle(ResolvedAccelerationStorage::Unknown, max_size);
                 let pool_builder = DuckDbConnectionPoolBuilder::memory()
                     .with_max_size(Some(max_size))
-                    .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS))
+                    .with_min_idle(Some(min_idle))
                     .with_connection_setup_query("PRAGMA enable_checkpoint_on_shutdown");
                 self.duckdb_factory
                     .get_or_init_instance_with_builder(pool_builder)
@@ -238,14 +259,58 @@ impl DuckDBAccelerator {
         instance_usage
     }
 
-    fn get_pool_max_size(num_accelerating_datasets: u32, acceleration: &Acceleration) -> u32 {
+    pub(crate) fn default_connection_pool_size(storage: ResolvedAccelerationStorage) -> u32 {
+        match storage {
+            ResolvedAccelerationStorage::Ebs => DEFAULT_EBS_MIN_IDLE_CONNECTIONS,
+            ResolvedAccelerationStorage::LocalSsd
+            | ResolvedAccelerationStorage::Tmpfs
+            | ResolvedAccelerationStorage::Unknown => DEFAULT_MIN_IDLE_CONNECTIONS,
+        }
+    }
+
+    pub(crate) fn get_pool_min_idle(storage: ResolvedAccelerationStorage, max_size: u32) -> u32 {
+        Self::default_connection_pool_size(storage).min(max_size)
+    }
+
+    /// Storage-profile-specific DuckDB pragmas applied to every connection in
+    /// the pool. These tune DuckDB's I/O behavior to match the underlying
+    /// medium's latency and durability profile.
+    pub(crate) fn storage_setup_queries(
+        storage: ResolvedAccelerationStorage,
+    ) -> &'static [&'static str] {
+        match storage {
+            // Network-attached block storage (e.g. EBS, Azure Managed Disks)
+            // pays per-IO latency on every flush. Raise the checkpoint
+            // threshold so WAL flushes are larger and less frequent, which
+            // reduces write amplification on the slow link.
+            ResolvedAccelerationStorage::Ebs => &["PRAGMA checkpoint_threshold='256MiB'"],
+            // tmpfs/ramfs is volatile and effectively free to write, but
+            // checkpointing still copies pages around. Push the threshold up
+            // so steady-state workloads don't pay checkpoint cost on tiny
+            // amounts of dirty data.
+            ResolvedAccelerationStorage::Tmpfs => &["PRAGMA checkpoint_threshold='1GiB'"],
+            // Local SSD/NVMe handles small frequent flushes well; keep
+            // DuckDB defaults.
+            ResolvedAccelerationStorage::LocalSsd | ResolvedAccelerationStorage::Unknown => &[],
+        }
+    }
+
+    fn get_pool_max_size(
+        num_accelerating_datasets: u32,
+        acceleration: &Acceleration,
+        storage: ResolvedAccelerationStorage,
+    ) -> u32 {
         let pool_size_param = acceleration
             .params
             .get("connection_pool_size")
             .and_then(|size_str| size_str.parse::<u32>().ok());
 
-        pool_size_param
-            .unwrap_or_else(|| max(DEFAULT_MIN_IDLE_CONNECTIONS, num_accelerating_datasets))
+        pool_size_param.unwrap_or_else(|| {
+            max(
+                Self::default_connection_pool_size(storage),
+                num_accelerating_datasets,
+            )
+        })
     }
 }
 
@@ -2105,5 +2170,34 @@ mod tests {
         underlying
             .execute(&format!("DROP TABLE IF EXISTS \"{table_name}\""), [])
             .expect("drop of non-existent table should succeed");
+    }
+
+    #[test]
+    fn storage_profile_drives_setup_pragmas() {
+        use crate::dataaccelerator::storage::ResolvedAccelerationStorage;
+
+        // EBS bumps the checkpoint threshold to amortize remote-disk writes.
+        let ebs = DuckDBAccelerator::storage_setup_queries(ResolvedAccelerationStorage::Ebs);
+        assert!(
+            ebs.iter().any(|q| q.contains("checkpoint_threshold")),
+            "EBS profile should tune checkpoint_threshold, got {ebs:?}"
+        );
+
+        // Tmpfs also raises checkpoint threshold (volatile, RAM-backed).
+        let tmpfs = DuckDBAccelerator::storage_setup_queries(ResolvedAccelerationStorage::Tmpfs);
+        assert!(
+            tmpfs.iter().any(|q| q.contains("checkpoint_threshold")),
+            "Tmpfs profile should tune checkpoint_threshold, got {tmpfs:?}"
+        );
+
+        // Local SSD and Unknown keep DuckDB defaults.
+        assert!(
+            DuckDBAccelerator::storage_setup_queries(ResolvedAccelerationStorage::LocalSsd)
+                .is_empty()
+        );
+        assert!(
+            DuckDBAccelerator::storage_setup_queries(ResolvedAccelerationStorage::Unknown)
+                .is_empty()
+        );
     }
 }

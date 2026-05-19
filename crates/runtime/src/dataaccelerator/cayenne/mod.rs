@@ -54,6 +54,7 @@ use super::{
 };
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode};
 use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
+use crate::dataaccelerator::storage::{ResolvedAccelerationStorage, resolve_acceleration_storage};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
@@ -408,6 +409,52 @@ impl CayenneAccelerator {
         source: &dyn AccelerationSource,
     ) -> cayenne::metadata::VortexConfig {
         let mut config = cayenne::metadata::VortexConfig::default();
+
+        // Storage-aware default for target Vortex file size on local disk.
+        // Smaller files reduce write amplification on EBS-class network
+        // storage; larger files improve scan throughput on tmpfs / RAM-backed
+        // mounts. Skip for S3 (cayenne_file_path/s3:// or s3_zone_ids) where
+        // we always use the engine default; the network-attached object
+        // store doesn't benefit from local mount classification.
+        if let Some(acceleration) = source.acceleration() {
+            let is_s3 = acceleration
+                .params
+                .get("cayenne_s3_zone_ids")
+                .is_some_and(|v| !v.trim().is_empty())
+                || acceleration
+                    .params
+                    .get("cayenne_file_path")
+                    .is_some_and(|p| p.starts_with("s3://"));
+            let user_set_file_size = acceleration
+                .params
+                .contains_key("cayenne_target_file_size_mb");
+
+            if !is_s3 && !user_set_file_size {
+                if let Ok(data_dir) = CayenneAccelerator::new().cayenne_data_dir(source) {
+                    let storage = resolve_acceleration_storage(
+                        acceleration.storage_profile,
+                        std::path::Path::new(&data_dir),
+                    );
+                    let storage_default = match storage {
+                        ResolvedAccelerationStorage::Ebs => Some(256_usize),
+                        ResolvedAccelerationStorage::Tmpfs => Some(64_usize),
+                        ResolvedAccelerationStorage::LocalSsd
+                        | ResolvedAccelerationStorage::Unknown => None,
+                    };
+                    if let Some(size_mb) = storage_default {
+                        tracing::debug!(
+                            target: "spiced::acceleration::cayenne",
+                            table = %table_name,
+                            configured = %acceleration.storage_profile,
+                            resolved = ?storage,
+                            target_file_size_mb = size_mb,
+                            "Applying storage-aware default cayenne_target_file_size_mb"
+                        );
+                        config.target_vortex_file_size_mb = size_mb;
+                    }
+                }
+            }
+        }
 
         if let Some(acceleration) = source.acceleration() {
             // Parse cache options - use VortexConfig defaults if not specified
