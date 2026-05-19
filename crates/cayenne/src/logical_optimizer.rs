@@ -102,13 +102,11 @@ limitations under the License.
 //!   style small-domain pruning, while avoiding broad propagation across
 //!   similarly sized HTAP joins.
 //!
-//! When statistics are present, the cardinality gates suppress propagation only
-//! when they prove the receiving side is too small or insufficiently larger
-//! than the filtered key domain. Missing statistics fall back to the same
-//! structural safety checks as known-cardinality plans: the receiving subtree
-//! must still contain a Cayenne-backed scan, the filtered side must be
-//! dim-like, the join key must be preserved through summaries, and propagation
-//! markers must not already target the key.
+//! Statistics are required before propagation fires: the receiving subtree must
+//! have a known row-count upper bound, and the filtered side's join-key domain
+//! must be known to be much smaller. Missing cardinality evidence is treated as
+//! a no-op because the duplicated subquery and added semi-join only pay off
+//! when the fact-to-dim ratio is clear.
 
 use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -120,7 +118,7 @@ use datafusion::logical_expr::{
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use datafusion_expr::ExprSchemable;
 use datafusion_expr::expr::InSubquery;
-use datafusion_expr::{Expr, TableSource};
+use datafusion_expr::{Expr, Operator, TableSource};
 use std::{collections::BTreeSet, sync::Arc};
 
 use crate::provider::CayenneTableProvider;
@@ -239,20 +237,18 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
 
         let mut left_analysis = analyze_logical_side(&join.left);
         let mut right_analysis = analyze_logical_side(&join.right);
-        let left_contains_cayenne =
-            contains_cayenne_table_scan(&join.left, &self.is_cayenne_table_source);
-        let right_contains_cayenne =
-            contains_cayenne_table_scan(&join.right, &self.is_cayenne_table_source);
-
         let mut new_left: Arc<LogicalPlan> = Arc::clone(&join.left);
         let mut new_right: Arc<LogicalPlan> = Arc::clone(&join.right);
         let mut changed = false;
 
         for EquiKey { left, right } in &equijoin_keys {
             // Propagate the LEFT-side filtered key domain → the RIGHT side.
-            if right_contains_cayenne
-                && left_analysis.is_dim_like
-                && left_analysis.has_non_key_filter(&left.name)
+            if contains_cayenne_table_scan_with_column(
+                &join.right,
+                right,
+                &self.is_cayenne_table_source,
+            ) && left_analysis.is_dim_like
+                && left_analysis.has_selective_non_key_filter(left)
                 && key_preserved_through_summaries(&join.left, left)
                 && !skip_propagation_by_cardinality(&join.left, &join.right, left)
                 && !right_analysis.has_propagated_filter_target(&column_expr(right))
@@ -274,9 +270,12 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
             }
 
             // Propagate the RIGHT-side filtered key domain → the LEFT side.
-            if left_contains_cayenne
-                && right_analysis.is_dim_like
-                && right_analysis.has_non_key_filter(&right.name)
+            if contains_cayenne_table_scan_with_column(
+                &join.left,
+                left,
+                &self.is_cayenne_table_source,
+            ) && right_analysis.is_dim_like
+                && right_analysis.has_selective_non_key_filter(right)
                 && key_preserved_through_summaries(&join.right, right)
                 && !skip_propagation_by_cardinality(&join.right, &join.left, right)
                 && !left_analysis.has_propagated_filter_target(&column_expr(left))
@@ -319,7 +318,7 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
 #[derive(Default)]
 struct SideAnalysis {
     is_dim_like: bool,
-    filter_columns: BTreeSet<String>,
+    selective_filter_columns: Vec<Column>,
     /// Targets of already-propagated `InSubquery` filters on this side, keyed
     /// by the `Display` form of the target expression. Used for cycle
     /// prevention — the same target should not be wrapped twice.
@@ -327,8 +326,10 @@ struct SideAnalysis {
 }
 
 impl SideAnalysis {
-    fn has_non_key_filter(&self, key_name: &str) -> bool {
-        self.filter_columns.iter().any(|column| column != key_name)
+    fn has_selective_non_key_filter(&self, key: &Column) -> bool {
+        self.selective_filter_columns
+            .iter()
+            .any(|column| !columns_match(column, key))
     }
 
     fn has_propagated_filter_target(&self, target: &Expr) -> bool {
@@ -412,7 +413,10 @@ fn analyze_logical_side(plan: &LogicalPlan) -> SideAnalysis {
 
     let _ = plan.apply(|node| {
         if let LogicalPlan::Filter(filter) = node {
-            collect_filter_column_names(&filter.predicate, &mut analysis.filter_columns);
+            collect_selective_filter_columns(
+                &filter.predicate,
+                &mut analysis.selective_filter_columns,
+            );
             collect_propagated_filter_targets(
                 &filter.predicate,
                 &mut analysis.propagated_filter_targets,
@@ -441,14 +445,16 @@ fn analyze_logical_side(plan: &LogicalPlan) -> SideAnalysis {
     analysis
 }
 
-fn contains_cayenne_table_scan(
+fn contains_cayenne_table_scan_with_column(
     plan: &LogicalPlan,
+    target_column: &Column,
     is_cayenne_table_source: &TableSourcePredicate,
 ) -> bool {
     let mut found = false;
     let _ = plan.apply(|node| {
         if let LogicalPlan::TableScan(scan) = node
             && is_cayenne_table_source(scan.source.as_ref())
+            && table_scan_has_column(scan, target_column)
         {
             found = true;
             return Ok(TreeNodeRecursion::Stop);
@@ -457,6 +463,14 @@ fn contains_cayenne_table_scan(
         Ok(TreeNodeRecursion::Continue)
     });
     found
+}
+
+fn table_scan_has_column(scan: &datafusion::logical_expr::TableScan, column: &Column) -> bool {
+    scan.projected_schema.has_column(column)
+        || scan
+            .projected_schema
+            .qualified_field_with_unqualified_name(&column.name)
+            .is_ok()
 }
 
 /// Returns `true` if `plan` is — possibly behind a chain of `Projection` or
@@ -718,9 +732,9 @@ fn key_domain_upper_bound_rows_for_expr(input: &LogicalPlan, expr: &Expr) -> Opt
 
 /// `true` when propagation should be skipped based on cardinality.
 ///
-/// Skips only when stats prove the fact side is too small, or not much larger
-/// than the propagated join-key domain. Missing stats fall back to the
-/// structural safety checks instead of disabling propagation.
+/// Propagation only pays when the receiving side is known large and the
+/// filtered key domain is known small. Missing statistics are therefore a
+/// skip, not a fallback to shape-only heuristics.
 fn skip_propagation_by_cardinality(
     dim_side: &LogicalPlan,
     fact_side: &LogicalPlan,
@@ -741,14 +755,14 @@ fn skip_propagation_by_cardinality(
     );
 
     let Some(fact_rows) = fact_rows else {
-        return false;
+        return true;
     };
     if fact_rows < MIN_FACT_ROWS_FOR_PROPAGATION {
         return true;
     }
 
     let Some(dim_key_domain_rows) = dim_key_domain_rows else {
-        return false;
+        return true;
     };
 
     if dim_key_domain_rows == 0 {
@@ -822,14 +836,72 @@ fn key_preserved_through_summaries(plan: &LogicalPlan, key: &Column) -> bool {
     walk(plan, key)
 }
 
-fn collect_filter_column_names(expr: &Expr, columns: &mut BTreeSet<String>) {
+fn collect_selective_filter_columns(expr: &Expr, columns: &mut Vec<Column>) {
+    match expr {
+        Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+            collect_selective_filter_columns(&binary.left, columns);
+            collect_selective_filter_columns(&binary.right, columns);
+        }
+        Expr::BinaryExpr(binary) if comparison_operator_is_selective(binary.op) => {
+            collect_literal_comparison_columns(&binary.left, &binary.right, columns);
+            collect_literal_comparison_columns(&binary.right, &binary.left, columns);
+        }
+        Expr::Between(between) if !between.negated => {
+            if expr_is_literal_like(&between.low) && expr_is_literal_like(&between.high) {
+                collect_columns_from_expr(&between.expr, columns);
+            }
+        }
+        Expr::InList(in_list) if !in_list.negated && !in_list.list.is_empty() => {
+            if in_list.list.iter().all(expr_is_literal_like) {
+                collect_columns_from_expr(&in_list.expr, columns);
+            }
+        }
+        Expr::Like(like) if !like.negated && expr_is_literal_like(&like.pattern) => {
+            collect_columns_from_expr(&like.expr, columns);
+        }
+        _ => {}
+    }
+}
+
+fn comparison_operator_is_selective(op: Operator) -> bool {
+    matches!(
+        op,
+        Operator::Eq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+    )
+}
+
+fn collect_literal_comparison_columns(expr: &Expr, other: &Expr, columns: &mut Vec<Column>) {
+    if expr_is_literal_like(other) {
+        collect_columns_from_expr(expr, columns);
+    }
+}
+
+fn expr_is_literal_like(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_, _) => true,
+        Expr::Cast(cast) => expr_is_literal_like(&cast.expr),
+        Expr::TryCast(cast) => expr_is_literal_like(&cast.expr),
+        _ => false,
+    }
+}
+
+fn collect_columns_from_expr(expr: &Expr, columns: &mut Vec<Column>) {
     let _ = expr.apply(|e| {
-        if let Expr::Column(column) = e {
-            columns.insert(column.name.clone());
+        if let Expr::Column(column) = e
+            && !columns
+                .iter()
+                .any(|existing| columns_match(existing, column))
+        {
+            columns.push(column.clone());
         }
 
         Ok(TreeNodeRecursion::Continue)
     });
+}
+
+fn columns_match(left: &Column, right: &Column) -> bool {
+    left == right
+        || (left.name == right.name && (left.relation.is_none() || right.relation.is_none()))
 }
 
 fn collect_propagated_filter_targets(expr: &Expr, targets: &mut BTreeSet<String>) {
@@ -948,7 +1020,6 @@ mod tests {
     use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::arrow::util::pretty::pretty_format_batches;
     use datafusion::catalog::MemTable;
     use datafusion::common::stats::Precision;
     use datafusion::datasource::{DefaultTableSource, TableProvider};
@@ -1309,7 +1380,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stats_less_provider_propagation_matches_unoptimized_results() -> Result<()> {
+    async fn stats_less_provider_propagation_is_skipped() -> Result<()> {
         let ctx = SessionContext::new();
         let nation_schema = Arc::new(Schema::new(vec![
             Field::new("n_nationkey", DataType::Int64, false),
@@ -1361,31 +1432,10 @@ mod tests {
 
         let r = rule();
         let cfg = datafusion::optimizer::OptimizerContext::new();
-        let (transformed_plan, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
+        let (_, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
         assert!(
-            changed,
-            "rule should propagate when MemTable statistics are absent; plan was:\n{plan}"
-        );
-        assert_eq!(count_propagated_filter_exprs(&transformed_plan), 1);
-
-        let baseline_batches = ctx.execute_logical_plan(plan).await?.collect().await?;
-        let transformed_batches = ctx
-            .execute_logical_plan(transformed_plan)
-            .await?
-            .collect()
-            .await?;
-
-        let baseline = pretty_format_batches(&baseline_batches)?.to_string();
-        let transformed = pretty_format_batches(&transformed_batches)?.to_string();
-        assert_eq!(transformed, baseline);
-        assert_eq!(
-            baseline,
-            "+-----------+\n\
-             | s_suppkey |\n\
-             +-----------+\n\
-             | 10        |\n\
-             | 12        |\n\
-             +-----------+"
+            !changed,
+            "rule should not propagate without cardinality evidence; plan was:\n{plan}"
         );
 
         Ok(())
@@ -2015,9 +2065,9 @@ mod tests {
     }
 
     #[test]
-    fn skip_propagation_by_cardinality_allows_when_stats_absent() -> Result<()> {
+    fn skip_propagation_by_cardinality_blocks_when_stats_absent() -> Result<()> {
         // MemTable doesn't expose row counts via `TableProvider::statistics()`,
-        // so the gate must allow the structural safety checks to decide.
+        // so there is no clear evidence that the extra subquery will pay off.
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
         let provider = Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]])?);
         let source = Arc::new(DefaultTableSource::new(provider));
@@ -2026,8 +2076,8 @@ mod tests {
 
         assert_eq!(subtree_upper_bound_rows(&scan), None);
         assert!(
-            !skip_propagation_by_cardinality(&scan, &scan, &key),
-            "absent stats must not trigger the cardinality gate"
+            skip_propagation_by_cardinality(&scan, &scan, &key),
+            "absent stats must trigger the cardinality gate"
         );
         Ok(())
     }
@@ -2086,6 +2136,27 @@ mod tests {
         assert!(
             !changed,
             "rule must not fire when filter references only the join key; plan was:\n{plan}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inner_join_with_non_selective_non_key_filter_is_noop() -> Result<()> {
+        let ctx = make_ctx()?;
+        let plan = ctx
+            .sql(
+                "SELECT s_suppkey FROM supplier, nation \
+                 WHERE s_nationkey = n_nationkey AND n_name IS NOT NULL",
+            )
+            .await?
+            .into_optimized_plan()?;
+
+        let r = rule();
+        let cfg = datafusion::optimizer::OptimizerContext::new();
+        let (_, changed) = apply_rule_to_all_joins(&r, plan.clone(), &cfg)?;
+        assert!(
+            !changed,
+            "rule must not fire for broad non-key predicates like IS NOT NULL; plan was:\n{plan}"
         );
         Ok(())
     }
@@ -2303,7 +2374,7 @@ mod tests {
         ]));
         let scan = table_scan(Some("t"), &schema, None)?.build()?;
         let in_list = Expr::Column(Column::new(Some("t"), "id"))
-            .in_list(vec![lit(5_i64), lit(6_i64), lit(7_i64)], false);
+            .in_list(vec![lit(5_i64), lit(6_i64), lit(7_i64), lit(8_i64)], false);
         let combined = in_list.and(Expr::Column(Column::new(Some("t"), "status")).eq(lit(1_i64)));
         let plan = LogicalPlanBuilder::from(scan).filter(combined)?.build()?;
 
@@ -2313,6 +2384,28 @@ mod tests {
         assert!(
             transformed.transformed,
             "rule should rewrite InList even when nested inside AND"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inlist_to_range_rule_leaves_short_consecutive_inlist_untouched() -> Result<()> {
+        use datafusion::optimizer::OptimizerContext;
+        use datafusion_expr::builder::table_scan;
+        use datafusion_expr::{LogicalPlanBuilder, lit};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let scan = table_scan(Some("t"), &schema, None)?.build()?;
+        let in_list = Expr::Column(Column::new(Some("t"), "id"))
+            .in_list(vec![lit(5_i64), lit(6_i64), lit(7_i64)], false);
+        let plan = LogicalPlanBuilder::from(scan).filter(in_list)?.build()?;
+
+        let rule = CayenneInListToRangeRewrite::new();
+        let cfg = OptimizerContext::new();
+        let transformed = rule.rewrite(plan, &cfg)?;
+        assert!(
+            !transformed.transformed,
+            "rule should leave short consecutive IN-list untouched"
         );
         Ok(())
     }

@@ -123,6 +123,7 @@ const PK_KEYSET_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 const PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES: usize = 16;
 const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
 const PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT: usize = 1024;
+const MIN_CONSECUTIVE_INLIST_REWRITE_VALUES: usize = 4;
 
 #[derive(Debug, Default)]
 struct BoundedWarningKeys {
@@ -7801,12 +7802,13 @@ fn is_literal_like(expr: &Expr) -> bool {
 /// per-row predicate evaluation level (two `i64` comparisons vs an N-element
 /// `HashSet` membership probe) and is semantically equivalent. See
 /// `pk_in_list_vs_range_rewrite` bench. Non-rewritable inputs (negated list,
-/// non-integer literals, sparse values, single element) are returned unchanged.
+/// short list, non-integer literals, sparse values, duplicate values) are
+/// returned unchanged.
 pub(crate) fn rewrite_consecutive_inlist_to_range(expr: Expr) -> Expr {
     let Expr::InList(in_list) = &expr else {
         return expr;
     };
-    if in_list.negated || in_list.list.len() < 2 {
+    if in_list.negated || in_list.list.len() < MIN_CONSECUTIVE_INLIST_REWRITE_VALUES {
         return expr;
     }
     let original_len = in_list.list.len();
@@ -10119,7 +10121,18 @@ mod tests {
     fn leaves_sparse_inlist_unchanged() {
         let in_list = Expr::InList(datafusion_expr::expr::InList::new(
             Box::new(col("id")),
-            vec![lit_i64(1), lit_i64(100), lit_i64(1000)],
+            vec![lit_i64(1), lit_i64(100), lit_i64(1000), lit_i64(1001)],
+            false,
+        ));
+        let rewritten = rewrite_consecutive_inlist_to_range(in_list.clone());
+        assert_eq!(rewritten, in_list);
+    }
+
+    #[test]
+    fn leaves_short_consecutive_inlist_unchanged() {
+        let in_list = Expr::InList(datafusion_expr::expr::InList::new(
+            Box::new(col("id")),
+            vec![lit_i64(5), lit_i64(6), lit_i64(7)],
             false,
         ));
         let rewritten = rewrite_consecutive_inlist_to_range(in_list.clone());
@@ -10155,6 +10168,8 @@ mod tests {
             vec![
                 Expr::Literal(ScalarValue::Utf8(Some("a".into())), None),
                 Expr::Literal(ScalarValue::Utf8(Some("b".into())), None),
+                Expr::Literal(ScalarValue::Utf8(Some("c".into())), None),
+                Expr::Literal(ScalarValue::Utf8(Some("d".into())), None),
             ],
             false,
         ));
@@ -10170,10 +10185,11 @@ mod tests {
                 Expr::Literal(ScalarValue::Int32(Some(5)), None),
                 Expr::Literal(ScalarValue::Int32(Some(6)), None),
                 Expr::Literal(ScalarValue::Int32(Some(7)), None),
+                Expr::Literal(ScalarValue::Int32(Some(8)), None),
             ],
             false,
         ));
         let rewritten = rewrite_consecutive_inlist_to_range(in_list);
-        assert_eq!(rewritten, between_int("id", 5, 7));
+        assert_eq!(rewritten, between_int("id", 5, 8));
     }
 }
