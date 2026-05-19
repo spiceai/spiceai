@@ -23,6 +23,7 @@ use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
 use datafusion_physical_expr_common::physical_expr::is_dynamic_physical_expr;
+use datafusion_physical_plan::expressions as df_expr;
 use datafusion_physical_plan::metrics::Count;
 use datafusion_pruning::FilePruner;
 use futures::FutureExt;
@@ -349,23 +350,32 @@ impl FileOpener for VortexOpener {
                     // PhysicalExprAdapterFactory on the file source to handle rewriting the
                     // expression to handle missing/reordered columns in the Vortex file.
 
-                    let (pushed, unpushed): (Vec<PhysicalExprRef>, Vec<PhysicalExprRef>) =
-                        split_conjunction(&f)
-                            .into_iter()
-                            .cloned()
-                            .partition(|expr| {
-                                expr_convertor.can_be_pushed_down(expr, &this_file_schema)
-                            });
+                    let PushdownConjuncts {
+                        pushed,
+                        unpushed,
+                        skipped_dynamic,
+                    } = match split_vortex_pushdown_conjuncts(
+                        expr_convertor.as_ref(),
+                        &f,
+                        &this_file_schema,
+                    ) {
+                        Ok(conjuncts) => conjuncts,
+                        Err(err) => return Some(Err(err)),
+                    };
 
                     if !unpushed.is_empty() {
-                                tracing::debug!(filters = ?unpushed, "VortexSource accepted filters that could not be pushed down");
-                                return Some(Err(exec_datafusion_err!("VortexSource accepted but failed to push {} filters; configure a PhysicalExprAdapterFactory that can rewrite missing or reordered columns before pushdown", unpushed.len())));
+                        tracing::debug!(filters = ?unpushed, "VortexSource accepted filters that could not be pushed down");
+                        return Some(Err(exec_datafusion_err!("VortexSource accepted but failed to push {} filters; configure a PhysicalExprAdapterFactory that can rewrite missing or reordered columns before pushdown", unpushed.len())));
                     }
 
-                            match make_vortex_predicate(expr_convertor.as_ref(), &pushed) {
-                                Ok(predicate) => predicate.map(Ok),
-                                Err(err) => Some(Err(err)),
-                            }
+                    if !skipped_dynamic.is_empty() {
+                        tracing::debug!(filters = ?skipped_dynamic, "Skipping dynamic filter fragments that Vortex can't push down");
+                    }
+
+                    match make_vortex_predicate(expr_convertor.as_ref(), &pushed) {
+                        Ok(predicate) => predicate.map(Ok),
+                        Err(err) => Some(Err(err)),
+                    }
                 })
                 .transpose()?;
 
@@ -436,6 +446,59 @@ impl FileOpener for VortexOpener {
         .in_current_span()
         .boxed())
     }
+}
+
+struct PushdownConjuncts {
+    pushed: Vec<PhysicalExprRef>,
+    unpushed: Vec<PhysicalExprRef>,
+    skipped_dynamic: Vec<PhysicalExprRef>,
+}
+
+fn split_vortex_pushdown_conjuncts(
+    expr_convertor: &dyn ExpressionConvertor,
+    expr: &PhysicalExprRef,
+    schema: &Schema,
+) -> DFResult<PushdownConjuncts> {
+    let mut conjuncts = PushdownConjuncts {
+        pushed: Vec::new(),
+        unpushed: Vec::new(),
+        skipped_dynamic: Vec::new(),
+    };
+
+    for conjunct in split_conjunction(expr).into_iter().cloned() {
+        collect_vortex_pushdown_conjunct(expr_convertor, conjunct, schema, false, &mut conjuncts)?;
+    }
+
+    Ok(conjuncts)
+}
+
+fn collect_vortex_pushdown_conjunct(
+    expr_convertor: &dyn ExpressionConvertor,
+    expr: PhysicalExprRef,
+    schema: &Schema,
+    from_dynamic_filter: bool,
+    conjuncts: &mut PushdownConjuncts,
+) -> DFResult<()> {
+    if let Some(dynamic_filter) = expr
+        .as_any()
+        .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+    {
+        let current = dynamic_filter.current()?;
+        for conjunct in split_conjunction(&current).into_iter().cloned() {
+            collect_vortex_pushdown_conjunct(expr_convertor, conjunct, schema, true, conjuncts)?;
+        }
+        return Ok(());
+    }
+
+    if expr_convertor.can_be_pushed_down(&expr, schema) {
+        conjuncts.pushed.push(expr);
+    } else if from_dynamic_filter || is_dynamic_physical_expr(&expr) {
+        conjuncts.skipped_dynamic.push(expr);
+    } else {
+        conjuncts.unpushed.push(expr);
+    }
+
+    Ok(())
 }
 
 fn natural_split_ranges_for_file(

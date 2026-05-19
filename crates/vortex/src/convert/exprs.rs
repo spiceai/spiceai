@@ -280,6 +280,14 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
             return Ok(if in_list.negated() { not(expr) } else { expr });
         }
 
+        if let Some(dynamic_filter) = df
+            .as_any()
+            .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+        {
+            let current = dynamic_filter.current()?;
+            return self.convert(current.as_ref());
+        }
+
         if let Some(scalar_fn) = df.as_any().downcast_ref::<ScalarFunctionExpr>() {
             return self.try_convert_scalar_function(scalar_fn);
         }
@@ -467,12 +475,14 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
         can_scalar_fn_be_pushed_down(scalar_fn, schema)
     } else if let Some(case_expr) = expr.downcast_ref::<df_expr::CaseExpr>() {
         can_case_be_pushed_down(case_expr, schema)
-    } else if expr
-        .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
-        .is_some()
-    {
-        // Assume dynamic filters can be pushed down - the child won't be specified until execution time
-        true
+    } else if let Some(dynamic_filter) = expr.downcast_ref::<df_expr::DynamicFilterPhysicalExpr>() {
+        match dynamic_filter.current() {
+            Ok(current) => can_be_pushed_down_impl(&current, schema),
+            Err(err) => {
+                tracing::debug!(%err, "DataFusion dynamic filter current expression can't be read");
+                false
+            }
+        }
     } else {
         tracing::debug!(%df_expr, "DataFusion expression can't be pushed down");
         false
@@ -628,6 +638,10 @@ mod tests {
     use datafusion_physical_plan::expressions as df_expr;
     use insta::assert_snapshot;
     use rstest::rstest;
+    use vortex::dtype::Field as VortexField;
+    use vortex::dtype::FieldPath;
+    use vortex::dtype::FieldPathSet;
+    use vortex::expr::pruning::checked_pruning_expr;
 
     use super::*;
     use crate::common_tests::TestSessionContext;
@@ -757,6 +771,69 @@ mod tests {
         │   └── input: vortex.root()
         └── rhs: vortex.literal(42i32)
         ");
+    }
+
+    #[test]
+    fn test_expr_from_dynamic_filter_in_list_uses_current_expression() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let column = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let values = vec![
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(3)))) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(7)))) as Arc<dyn PhysicalExpr>,
+        ];
+        let in_list = Arc::new(
+            df_expr::InListExpr::try_new(Arc::clone(&column), values, false, &schema)
+                .expect("IN-list expression should be valid"),
+        ) as Arc<dyn PhysicalExpr>;
+        let dynamic_filter = df_expr::DynamicFilterPhysicalExpr::new(
+            vec![column],
+            Arc::new(df_expr::Literal::new(ScalarValue::Boolean(Some(true)))),
+        );
+        dynamic_filter
+            .update(in_list)
+            .expect("dynamic filter update should succeed");
+
+        let result = DefaultExpressionConvertor::default()
+            .convert(&dynamic_filter)
+            .expect("dynamic IN-list should convert through its current expression");
+
+        let display = result.display_tree().to_string();
+        assert!(display.contains("vortex.list.contains"));
+        assert!(display.contains("vortex.get_item(id)"));
+    }
+
+    #[test]
+    fn test_in_list_conversion_produces_pruning_expression() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let column = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let values = vec![
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(3)))) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(7)))) as Arc<dyn PhysicalExpr>,
+        ];
+        let in_list = df_expr::InListExpr::try_new(column, values, false, &schema)
+            .expect("IN-list expression should be valid");
+
+        let result = DefaultExpressionConvertor::default()
+            .convert(&in_list)
+            .expect("IN-list should convert to a Vortex expression");
+        let (pruning_expr, _required_stats) = checked_pruning_expr(
+            &result,
+            &FieldPathSet::from_iter([
+                FieldPath::from_iter([
+                    VortexField::Name("id".into()),
+                    VortexField::Name("min".into()),
+                ]),
+                FieldPath::from_iter([
+                    VortexField::Name("id".into()),
+                    VortexField::Name("max".into()),
+                ]),
+            ]),
+        )
+        .expect("converted IN-list should support min/max pruning");
+
+        let pruning_display = pruning_expr.to_string();
+        assert!(pruning_display.contains("id_min"));
+        assert!(pruning_display.contains("id_max"));
     }
 
     #[rstest]
