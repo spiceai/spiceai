@@ -247,3 +247,7 @@ name = "scan_listing_cache_invalidation"
 [[bench]]
 harness = false
 name = "int64_pk_filter_keep_mask_alloc"
+
+[[bench]]
+harness = false
+name = "position_delete_redundant_walks"
