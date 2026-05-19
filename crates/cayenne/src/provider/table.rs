@@ -106,7 +106,7 @@ use super::deletion_strategy::{
     PositionDeletionVector, RowConverterDeletionSnapshot,
 };
 use super::staging_wal::PreparedStagedAppend;
-use super::vortex_format::DeletionFilteringVortexFormat;
+use super::vortex_format::PositionDeletionAccessPlanProvider;
 use arc_swap::ArcSwap;
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -2346,11 +2346,9 @@ impl CayenneTableProvider {
 
     // Create listing options for Vortex format.
     ///
-    /// Always wraps the `VortexFormat` so Cayenne-specific Vortex predicate
-    /// pushdown guards apply to every scan. `PositionBased` additionally
-    /// attaches deletion vectors during file reading; PK-based strategies
-    /// (`Int64Pk`, `RowConverterBased`) still filter at the `ExecutionPlan`
-    /// level.
+    /// `PositionBased` attaches deletion vectors during file reading; PK-based
+    /// strategies (`Int64Pk`, `RowConverterBased`) still filter at the
+    /// `ExecutionPlan` level.
     fn create_listing_options(
         vortex_format: &Arc<VortexFormat>,
         strategy: &PkDeletionStrategyWithCache,
@@ -2359,14 +2357,17 @@ impl CayenneTableProvider {
         let file_format: Arc<dyn FileFormat> = match strategy {
             PkDeletionStrategyWithCache::PositionBased {
                 cached_deleted_row_ids,
-            } => Arc::new(DeletionFilteringVortexFormat::new(
-                Arc::clone(vortex_format),
-                Arc::clone(cached_deleted_row_ids),
-            )),
+            } => {
+                let provider = Arc::new(PositionDeletionAccessPlanProvider::new(Arc::clone(
+                    cached_deleted_row_ids,
+                )));
+                Arc::new(vortex_format.with_access_plan_provider(provider))
+            }
             PkDeletionStrategyWithCache::Int64Pk { .. }
-            | PkDeletionStrategyWithCache::RowConverterBased { .. } => Arc::new(
-                DeletionFilteringVortexFormat::without_deletion_vectors(Arc::clone(vortex_format)),
-            ),
+            | PkDeletionStrategyWithCache::RowConverterBased { .. } => {
+                let file_format: Arc<dyn FileFormat> = vortex_format.clone();
+                file_format
+            }
         };
         ListingOptions::new(file_format).with_session_config_options(session_config)
     }
