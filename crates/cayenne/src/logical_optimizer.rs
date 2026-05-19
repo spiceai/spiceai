@@ -344,7 +344,7 @@ impl SideAnalysis {
 /// `column BETWEEN k AND k+N-1` when the list contents are integer literals
 /// sorted unique and consecutive. BETWEEN is ~50 % faster than IN-list at
 /// per-row predicate evaluation. Running this as a logical-plan rule (rather
-/// than in `TableProvider::scan`) lets DataFusion's downstream simplification
+/// than in `TableProvider::scan`) lets `DataFusion`'s downstream simplification
 /// passes treat the result identically to a SQL-parsed `BETWEEN`. See bench
 /// `pk_in_list_vs_range_rewrite`.
 #[derive(Debug, Default)]
@@ -2236,6 +2236,84 @@ mod tests {
             .filter(Expr::Column(Column::new(Some("t"), "x")).eq(lit("v")))?
             .build()?;
         assert!(is_dim_like_subtree(&filtered));
+        Ok(())
+    }
+
+    #[test]
+    fn inlist_to_range_rule_rewrites_filter_predicate() -> Result<()> {
+        use datafusion::optimizer::OptimizerContext;
+        use datafusion_expr::builder::table_scan;
+        use datafusion_expr::{LogicalPlanBuilder, lit};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let scan = table_scan(Some("t"), &schema, None)?.build()?;
+        let in_list = Expr::Column(Column::new(Some("t"), "id"))
+            .in_list(vec![lit(5_i64), lit(6_i64), lit(7_i64), lit(8_i64)], false);
+        let plan = LogicalPlanBuilder::from(scan).filter(in_list)?.build()?;
+
+        let rule = CayenneInListToRangeRewrite::new();
+        let cfg = OptimizerContext::new();
+        let transformed = rule.rewrite(plan, &cfg)?;
+        assert!(
+            transformed.transformed,
+            "rule should transform a Filter whose predicate is a rewritable InList"
+        );
+        let LogicalPlan::Filter(filter) = transformed.data else {
+            panic!("expected Filter after rewrite")
+        };
+        assert!(
+            matches!(filter.predicate, Expr::Between(_)),
+            "predicate should be rewritten to Expr::Between, got: {:?}",
+            filter.predicate
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inlist_to_range_rule_leaves_sparse_inlist_untouched() -> Result<()> {
+        use datafusion::optimizer::OptimizerContext;
+        use datafusion_expr::builder::table_scan;
+        use datafusion_expr::{LogicalPlanBuilder, lit};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let scan = table_scan(Some("t"), &schema, None)?.build()?;
+        let in_list = Expr::Column(Column::new(Some("t"), "id"))
+            .in_list(vec![lit(1_i64), lit(100_i64), lit(1000_i64)], false);
+        let plan = LogicalPlanBuilder::from(scan).filter(in_list)?.build()?;
+
+        let rule = CayenneInListToRangeRewrite::new();
+        let cfg = OptimizerContext::new();
+        let transformed = rule.rewrite(plan, &cfg)?;
+        assert!(
+            !transformed.transformed,
+            "rule should leave sparse IN-list untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inlist_to_range_rule_rewrites_nested_inside_and() -> Result<()> {
+        use datafusion::optimizer::OptimizerContext;
+        use datafusion_expr::builder::table_scan;
+        use datafusion_expr::{LogicalPlanBuilder, lit};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("status", DataType::Int64, false),
+        ]));
+        let scan = table_scan(Some("t"), &schema, None)?.build()?;
+        let in_list = Expr::Column(Column::new(Some("t"), "id"))
+            .in_list(vec![lit(5_i64), lit(6_i64), lit(7_i64)], false);
+        let combined = in_list.and(Expr::Column(Column::new(Some("t"), "status")).eq(lit(1_i64)));
+        let plan = LogicalPlanBuilder::from(scan).filter(combined)?.build()?;
+
+        let rule = CayenneInListToRangeRewrite::new();
+        let cfg = OptimizerContext::new();
+        let transformed = rule.rewrite(plan, &cfg)?;
+        assert!(
+            transformed.transformed,
+            "rule should rewrite InList even when nested inside AND"
+        );
         Ok(())
     }
 }
