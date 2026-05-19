@@ -68,7 +68,7 @@ pub trait ExpressionConvertor: Send + Sync {
     /// Can an expression be pushed down given a specific schema
     fn can_be_pushed_down(&self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool;
 
-    /// Try and convert a DataFusion [`PhysicalExpr`] into a Vortex [`Expression`].
+    /// Try and convert a `DataFusion` [`PhysicalExpr`] into a Vortex [`Expression`].
     ///
     /// # Errors
     ///
@@ -76,7 +76,7 @@ pub trait ExpressionConvertor: Send + Sync {
     fn convert(&self, expr: &dyn PhysicalExpr) -> DFResult<Expression>;
 
     /// Split a projection into Vortex expressions that can be pushed down and leftover
-    /// DataFusion projections that need to be evaluated after the scan.
+    /// `DataFusion` projections that need to be evaluated after the scan.
     ///
     /// # Errors
     ///
@@ -556,8 +556,8 @@ fn can_case_be_pushed_down(case_expr: &df_expr::CaseExpr, schema: &Schema) -> bo
 
 fn supported_data_types(dt: &DataType) -> bool {
     use DataType::{
-        Binary, BinaryView, Boolean, Date32, Date64, Dictionary, LargeBinary, LargeUtf8,
-        Time32, Time64, Timestamp, Utf8, Utf8View,
+        Binary, BinaryView, Boolean, Date32, Date64, Dictionary, LargeBinary, LargeUtf8, Time32,
+        Time64, Timestamp, Utf8, Utf8View,
     };
 
     // For dictionary types, check if the value type is supported.

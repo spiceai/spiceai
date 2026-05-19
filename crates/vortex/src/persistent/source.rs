@@ -190,14 +190,12 @@ impl FileSource for VortexSource {
         let expr_adapter_factory = base_config
             .expr_adapter_factory
             .as_ref()
-            .map(Arc::clone)
-            .unwrap_or_else(|| Arc::new(DefaultPhysicalExprAdapterFactory));
+            .map_or_else(|| Arc::new(DefaultPhysicalExprAdapterFactory), Arc::clone);
 
-        let vortex_reader_factory = self
-            .vortex_reader_factory
-            .as_ref()
-            .map(Arc::clone)
-            .unwrap_or_else(|| Arc::new(DefaultVortexReaderFactory::new(object_store)));
+        let vortex_reader_factory = self.vortex_reader_factory.as_ref().map_or_else(
+            || Arc::new(DefaultVortexReaderFactory::new(object_store)),
+            Arc::clone,
+        );
 
         let opener = VortexOpener {
             partition,

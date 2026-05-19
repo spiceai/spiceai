@@ -2365,7 +2365,8 @@ impl CayenneTableProvider {
             }
             PkDeletionStrategyWithCache::Int64Pk { .. }
             | PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                let file_format: Arc<dyn FileFormat> = vortex_format.clone();
+                let file_format: Arc<VortexFormat> = Arc::clone(vortex_format);
+                let file_format: Arc<dyn FileFormat> = file_format;
                 file_format
             }
         };

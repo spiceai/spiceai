@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! Position-based deletes are exposed through `VortexAccessPlanProvider` so the
 //! local Vortex fork can attach per-file access plans and adjust statistics where
-//! DataFusion may otherwise answer aggregates from stale footer metadata.
+//! `DataFusion` may otherwise answer aggregates from stale footer metadata.
 
 use std::sync::Arc;
 
