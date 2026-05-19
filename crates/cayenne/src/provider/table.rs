@@ -117,6 +117,9 @@ const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
 /// protecting memory on wide composite-PK tables. At ~40-64 bytes per entry
 /// (key bytes + `RowLocation` + `HashMap` overhead) this is ~2-4M rows for int64 PKs.
 const PK_KEYSET_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+// Approximate per-entry `HashMap` control/allocation overhead used for the
+// cache budget. The exact value is allocator-dependent, so keep this estimate
+// centralized with `approx_pk_keyset_entry_bytes`.
 const PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES: usize = 16;
 const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
 const PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT: usize = 1024;
@@ -6223,7 +6226,8 @@ impl CayenneTableProvider {
         let df_stats = Self::table_statistics_to_df(&self.table_metadata.schema, &stats);
         let mut cache = self.table_statistics.write();
         cache.optimizer = df_stats;
-        cache.raw = Some(stats);   // keep the raw blob for the next persist (avoids catalog GET)
+        // Keep the raw blob for the next persist to avoid a catalog read.
+        cache.raw = Some(stats);
     }
 
     /// Write small batches directly to the metastore, optionally atomically
