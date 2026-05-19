@@ -38,8 +38,8 @@ limitations under the License.
 //! cheaper" — and as a documented dead end for future iterations of the
 //! deletion-filter hot path.
 //!
-//! This bench measures three shapes of the keep-mask path so the win is
-//! visible per-batch and at the all-keep / mixed-keep / no-keep extremes:
+//! The benchmark keeps three visibility shapes so allocation and packing costs
+//! are visible at the all-keep, mixed-keep, and no-keep extremes:
 //!
 //!   - `all_visible`     — every row passes the visibility check (matches the
 //!     hot path for non-deleted batches; pre-fix code still pays the
@@ -70,9 +70,7 @@ use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::Arc;
 
-use arrow::array::{
-    BooleanArray, BooleanBufferBuilder, Int64Array, RecordBatch, StringArray, builder,
-};
+use arrow::array::{BooleanArray, BooleanBufferBuilder, Int64Array, RecordBatch, StringArray};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::provider::deletion_index::DeletionIndex;
@@ -193,11 +191,6 @@ fn keep_mask_boolean_buffer(
 }
 
 fn bench_keep_mask(c: &mut Criterion) {
-    // Surface a compile-time guard against the unused `builder` import below
-    // — exposing it here documents that this is the same Arrow builder family
-    // that the production code should switch to.
-    let _ = std::mem::size_of::<builder::BooleanBuilder>();
-
     let mut group = c.benchmark_group("int64_pk_filter_keep_mask_alloc");
     group.throughput(Throughput::Elements(ROWS_PER_BATCH as u64));
 

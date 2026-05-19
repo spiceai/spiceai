@@ -619,9 +619,9 @@ impl MetastoreBackend for TursoMetastore {
             .map(|i| {
                 row.get_value(i)
                     .map(|v| convert_turso_value(&v))
-                    .unwrap_or(MetastoreValue::Null)
+                    .map_err(convert_turso_error)
             })
-            .collect();
+            .collect::<CatalogResult<_>>()?;
 
         let turso_row = TursoRow { values };
         f(&turso_row)
@@ -659,9 +659,9 @@ impl MetastoreBackend for TursoMetastore {
                         .map(|i| {
                             row.get_value(i)
                                 .map(|v| convert_turso_value(&v))
-                                .unwrap_or(MetastoreValue::Null)
+                                .map_err(convert_turso_error)
                         })
-                        .collect();
+                        .collect::<CatalogResult<_>>()?;
 
                     let turso_row = TursoRow { values };
                     results.push(f(&turso_row)?);
@@ -779,13 +779,13 @@ impl MetastoreTransaction for TursoTransaction {
             message: "Query returned no rows".to_string(),
         })?;
 
-        Ok((0..row.column_count())
+        (0..row.column_count())
             .map(|i| {
                 row.get_value(i)
                     .map(|v| convert_turso_value(&v))
-                    .unwrap_or(MetastoreValue::Null)
+                    .map_err(convert_turso_error)
             })
-            .collect())
+            .collect::<CatalogResult<_>>()
     }
 
     async fn execute_batch(&self, sql: &str) -> CatalogResult<()> {

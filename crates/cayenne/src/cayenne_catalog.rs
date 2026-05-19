@@ -1172,15 +1172,14 @@ impl MetadataCatalog for CayenneCatalog {
             {
                 Ok(row_values) => row_values,
                 Err(e) => {
-                    if retry_on_metastore_write_conflict(
-                        &e,
-                        attempt,
-                        max_attempts,
-                        "validate sequence reservation table row",
-                    )
-                    .await
-                    {
+                    if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
                         drop(tx);
+                        sleep_before_metastore_write_retry(
+                            attempt,
+                            max_attempts,
+                            "validate sequence reservation table row",
+                        )
+                        .await;
                         continue;
                     }
                     return Err(CatalogError::InvalidOperation {
@@ -1220,15 +1219,14 @@ impl MetadataCatalog for CayenneCatalog {
                 })
                 .await
             {
-                if retry_on_metastore_write_conflict(
-                    &e,
-                    attempt,
-                    max_attempts,
-                    "update sequence reservation high-water mark",
-                )
-                .await
-                {
+                if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
                     drop(tx);
+                    sleep_before_metastore_write_retry(
+                        attempt,
+                        max_attempts,
+                        "update sequence reservation high-water mark",
+                    )
+                    .await;
                     continue;
                 }
                 return Err(CatalogError::InvalidOperation {
@@ -1246,15 +1244,14 @@ impl MetadataCatalog for CayenneCatalog {
             {
                 Ok(row_values) => row_values,
                 Err(e) => {
-                    if retry_on_metastore_write_conflict(
-                        &e,
-                        attempt,
-                        max_attempts,
-                        "read sequence reservation high-water mark",
-                    )
-                    .await
-                    {
+                    if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
                         drop(tx);
+                        sleep_before_metastore_write_retry(
+                            attempt,
+                            max_attempts,
+                            "read sequence reservation high-water mark",
+                        )
+                        .await;
                         continue;
                     }
                     return Err(CatalogError::InvalidOperation {
@@ -2262,6 +2259,14 @@ impl MetadataCatalog for CayenneCatalog {
                     ),
                 });
             }
+            if !insert_pk_bytes_list.is_empty() && insert_sequence <= delete_file.sequence_number {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Insert sequence {insert_sequence} must be greater than delete-file sequence {} for on-conflict replacement rows",
+                        delete_file.sequence_number
+                    ),
+                });
+            }
         }
 
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
@@ -2296,90 +2301,61 @@ impl MetadataCatalog for CayenneCatalog {
             // that error path we fall back to per-row INSERTs inside the same
             // txn to pinpoint the offending delete file for the descriptive
             // validation error.
-            let mut batched_failure: Option<(usize, CatalogError)> = None;
-            'chunks: for (chunk_idx, chunk) in delete_files
-                .chunks(MAX_DELETE_FILE_ROWS_PER_CHUNK)
-                .enumerate()
-            {
+            for chunk in delete_files.chunks(MAX_DELETE_FILE_ROWS_PER_CHUNK) {
                 let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
                 let res = tx.execute(ExecuteParams { sql: &sql, params }).await;
                 if let Err(e) = res {
-                    if retry_on_metastore_write_conflict(
-                        &e,
-                        attempt,
-                        max_attempts,
-                        "insert delete file chunk inside on-conflict transaction",
-                    )
-                    .await
-                    {
+                    if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
                         drop(tx);
-                        continue 'attempts;
-                    }
-                    // Non-retryable error from the batched INSERT. Remember
-                    // the chunk and the original error, then break so the
-                    // row-by-row fallback can pinpoint the offending delete
-                    // file for the descriptive validation message.
-                    batched_failure = Some((chunk_idx, e));
-                    break 'chunks;
-                }
-            }
-
-            if let Some((chunk_idx, batched_err)) = batched_failure {
-                let chunk_start = chunk_idx * MAX_DELETE_FILE_ROWS_PER_CHUNK;
-                let chunk_end =
-                    (chunk_start + MAX_DELETE_FILE_ROWS_PER_CHUNK).min(delete_files.len());
-                let chunk = &delete_files[chunk_start..chunk_end];
-                for delete_file in chunk {
-                    let (sql, params) = Self::build_insert_delete_files_chunk_sql(
-                        std::slice::from_ref(delete_file),
-                    );
-                    let res = tx.execute(ExecuteParams { sql: &sql, params }).await;
-                    if let Err(e) = res {
-                        if retry_on_metastore_write_conflict(
-                            &e,
+                        sleep_before_metastore_write_retry(
                             attempt,
                             max_attempts,
-                            "insert delete file inside on-conflict transaction",
+                            "insert delete file chunk inside on-conflict transaction",
                         )
-                        .await
-                        {
+                        .await;
+                        continue 'attempts;
+                    }
+
+                    for delete_file in chunk {
+                        let (sql, params) = Self::build_insert_delete_files_chunk_sql(
+                            std::slice::from_ref(delete_file),
+                        );
+                        let res = tx.execute(ExecuteParams { sql: &sql, params }).await;
+                        if let Err(e) = res {
+                            if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
+                                drop(tx);
+                                sleep_before_metastore_write_retry(
+                                    attempt,
+                                    max_attempts,
+                                    "insert delete file inside on-conflict transaction",
+                                )
+                                .await;
+                                continue 'attempts;
+                            }
+                            let validation_result =
+                                Self::validate_existing_delete_file_if_present_in_transaction(
+                                    tx.as_ref(),
+                                    delete_file,
+                                )
+                                .await;
                             drop(tx);
-                            continue 'attempts;
-                        }
-                        let validation_result =
-                            Self::validate_existing_delete_file_if_present_in_transaction(
-                                tx.as_ref(),
-                                delete_file,
-                            )
-                            .await;
-                        drop(tx);
-                        if let Err(validation_error) = validation_result {
+                            if let Err(validation_error) = validation_result {
+                                return Err(CatalogError::InvalidOperation {
+                                    message:
+                                        "Delete-file metadata conflicts with an existing row inside on-conflict transaction"
+                                            .to_string(),
+                                    source: Box::new(validation_error),
+                                });
+                            }
                             return Err(CatalogError::InvalidOperation {
                                 message:
-                                    "Delete-file metadata conflicts with an existing row inside on-conflict transaction"
+                                    "Failed to insert delete file inside on-conflict transaction"
                                         .to_string(),
-                                source: Box::new(validation_error),
+                                source: Box::new(e),
                             });
                         }
-                        return Err(CatalogError::InvalidOperation {
-                            message: "Failed to insert delete file inside on-conflict transaction"
-                                .to_string(),
-                            source: Box::new(e),
-                        });
                     }
                 }
-                // Per-row replay of the failing chunk succeeded, but earlier
-                // chunks already applied batched are already in the txn —
-                // committing now would persist a state the batched INSERT
-                // rejected. Surface the original batched error rather than
-                // silently committing an inconsistent prefix.
-                drop(tx);
-                return Err(CatalogError::InvalidOperation {
-                    message: "Batched delete-file INSERT failed but per-row replay succeeded; \
-                         aborting transaction to avoid inconsistent commit"
-                        .to_string(),
-                    source: Box::new(batched_err),
-                });
             }
 
             // Chunked INSERTs for the insert_record rows.
@@ -2387,15 +2363,14 @@ impl MetadataCatalog for CayenneCatalog {
                 let (sql, params) =
                     Self::build_insert_records_chunk_sql(table_id, chunk, insert_sequence);
                 if let Err(e) = tx.execute(ExecuteParams { sql: &sql, params }).await {
-                    if retry_on_metastore_write_conflict(
-                        &e,
-                        attempt,
-                        max_attempts,
-                        "insert insert-record chunk inside on-conflict transaction",
-                    )
-                    .await
-                    {
+                    if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
                         drop(tx);
+                        sleep_before_metastore_write_retry(
+                            attempt,
+                            max_attempts,
+                            "insert insert-record chunk inside on-conflict transaction",
+                        )
+                        .await;
                         continue 'attempts;
                     }
                     drop(tx);
@@ -2644,10 +2619,27 @@ async fn retry_on_metastore_write_conflict(
     max_attempts: u32,
     operation: &'static str,
 ) -> bool {
-    if attempt >= max_attempts || !is_retryable_write_conflict(error) {
+    if !should_retry_metastore_write_conflict(error, attempt, max_attempts) {
         return false;
     }
 
+    sleep_before_metastore_write_retry(attempt, max_attempts, operation).await;
+    true
+}
+
+fn should_retry_metastore_write_conflict(
+    error: &CatalogError,
+    attempt: u32,
+    max_attempts: u32,
+) -> bool {
+    attempt < max_attempts && is_retryable_write_conflict(error)
+}
+
+async fn sleep_before_metastore_write_retry(
+    attempt: u32,
+    max_attempts: u32,
+    operation: &'static str,
+) {
     let delay = retry_backoff_delay(attempt);
     tracing::debug!(
         attempt,
@@ -2657,7 +2649,6 @@ async fn retry_on_metastore_write_conflict(
         "Retrying metastore transaction after retryable write conflict"
     );
     tokio::time::sleep(delay).await;
-    true
 }
 
 fn validate_existing_delete_file_record(

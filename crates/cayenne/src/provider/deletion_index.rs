@@ -157,9 +157,10 @@ impl DeletionIndex {
     ///
     /// # Performance
     ///
-    /// With `Arc<HashMap>` + `Arc::make_mut`, the map clone is O(1) (refcount bump)
-    /// on the common single-writer path; only when readers hold the latest generation
-    /// do we pay O(N). The bloom filter is updated incrementally (O(K) inserts
+    /// With `Arc<HashMap>` + `Arc::make_mut`, the map is mutated in place on the
+    /// common single-writer path where no reader pins the latest generation; when
+    /// readers do pin it, `Arc::make_mut` performs an O(N) clone. The bloom filter
+    /// is updated incrementally (O(K) inserts
     /// for K new keys) instead of being rebuilt from scratch every call. A full
     /// O(N) rebuild only happens when the entry count crosses `2 * bloom_capacity`,
     /// giving amortized O(K) bloom cost per call.
@@ -173,9 +174,9 @@ impl DeletionIndex {
     /// regression that prompted this fix.
     #[must_use]
     pub fn extend_max(&self, additions: impl IntoIterator<Item = (i64, i64)>) -> Self {
-        // Arc::make_mut gives O(1) "clone" (just bump rc) on the common single-writer
-        // path where the latest DeletionIndex Arc is not held by any concurrent reader.
-        // Only when readers pin the current generation do we pay the O(N) map clone.
+        // Arc::make_mut mutates in place on the common single-writer path where
+        // the latest DeletionIndex Arc is not held by any concurrent reader. Only
+        // when readers pin the current generation do we pay the O(N) map clone.
         let mut entries_arc = Arc::clone(&self.entries);
         let entries = Arc::make_mut(&mut entries_arc);
         let mut max_sequence_number = self.max_sequence_number;
@@ -358,10 +359,10 @@ impl KeyDeletionIndex {
     /// the new keys are inserted into a clone of the existing bloom.
     #[must_use]
     pub fn extend_max(&self, additions: impl IntoIterator<Item = (Box<[u8]>, i64)>) -> Self {
-        // Arc::make_mut gives O(1) "clone" (just bump rc) on the common single-writer
-        // path where the latest KeyDeletionIndex Arc is not held by any concurrent reader.
-        // Only when readers pin the current generation (or for composite PKs with heavier
-        // Box<[u8]> keys) do we pay the O(N) map + key clone.
+        // Arc::make_mut mutates in place on the common single-writer path where
+        // the latest KeyDeletionIndex Arc is not held by any concurrent reader.
+        // Only when readers pin the current generation (or for composite PKs with
+        // heavier Box<[u8]> keys) do we pay the O(N) map + key clone.
         let mut entries_arc = Arc::clone(&self.entries);
         let entries = Arc::make_mut(&mut entries_arc);
         let mut max_sequence_number = self.max_sequence_number;

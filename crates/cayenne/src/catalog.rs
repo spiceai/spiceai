@@ -242,6 +242,7 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Reserve `count` consecutive sequence numbers for this table in one atomic
     /// operation and return the *first* number of the reserved block.
+    /// `count` must be at least 1.
     ///
     /// The caller may then use `[result, result + count)` locally (e.g. `result`,
     /// `result+1`) without any further catalog round-trips. This is the
@@ -320,6 +321,8 @@ pub trait MetadataCatalog: Send + Sync {
     /// may leave a sequence-number gap, but it must not leave a partially
     /// committed delete-file / insert-record pair. A non-atomic implementation
     /// reintroduces the crash window this method exists to close.
+    /// When insert records are provided, `insert_sequence` must be greater than
+    /// each delete file's sequence number so replacement rows remain visible.
     ///
     /// This replaces the legacy 3-call sequence on the on-conflict path
     /// (`add_delete_file` per file → `add_insert_records_batch`), which

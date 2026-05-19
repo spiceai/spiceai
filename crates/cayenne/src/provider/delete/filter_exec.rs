@@ -80,7 +80,6 @@ use std::sync::Arc;
 /// rejects most non-matching probes from reaching). `None` means apply every
 /// deletion in `deleted_pks` (main scan path).
 #[inline]
-#[cfg(test)]
 pub(crate) fn is_pk_visible_i64(
     pk: i64,
     deleted_pks: &DeletionIndex,
@@ -137,7 +136,6 @@ fn is_pk_visible_i64_after_min(
 /// `min_delete_seq_to_apply` is the protected-snapshot cutoff. See
 /// [`is_pk_visible_i64`] for the rationale.
 #[inline]
-#[cfg(test)]
 pub(crate) fn is_pk_visible_row_key(
     key: &[u8],
     deleted_keys: &KeyDeletionIndex,
