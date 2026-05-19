@@ -67,14 +67,6 @@ struct ForeignKeyConstraint {
 /// FK constraints grouped by source table name within a schema.
 type ForeignKeyMap = HashMap<String, Vec<ForeignKeyConstraint>>;
 
-fn format_foreign_table_name(
-    catalog_name: &str,
-    referenced_schema: &str,
-    referenced_table: &str,
-) -> String {
-    format!("{catalog_name}.{referenced_schema}.{referenced_table}")
-}
-
 /// A catalog provider for `PostgreSQL` that discovers schemas and tables
 /// by querying `information_schema`.
 pub struct PostgresCatalogProvider {
@@ -114,10 +106,7 @@ impl PostgresCatalogProvider {
 
         let mut schemas = HashMap::new();
         for schema_name in &schema_names {
-            let foreign_keys = match self
-                .list_foreign_keys(&self.catalog_name, schema_name)
-                .await
-            {
+            let foreign_keys = match self.list_foreign_keys(schema_name).await {
                 Ok(fks) => fks,
                 Err(e) => {
                     tracing::warn!(
@@ -153,11 +142,7 @@ impl PostgresCatalogProvider {
     /// Query all foreign key constraints for tables in the given schema.
     ///
     /// Returns a map from source table name to its FK constraints.
-    async fn list_foreign_keys(
-        &self,
-        catalog_name: &str,
-        schema_name: &str,
-    ) -> Result<ForeignKeyMap> {
+    async fn list_foreign_keys(&self, schema_name: &str) -> Result<ForeignKeyMap> {
         let conn = self
             .pool
             .connect_direct()
@@ -207,8 +192,10 @@ impl PostgresCatalogProvider {
 
             let table_constraints = constraints_by_table.entry(table_name).or_default();
 
-            let foreign_table =
-                format_foreign_table_name(catalog_name, &referenced_schema, &referenced_table);
+            let foreign_table = format!(
+                "{}.{}.{}",
+                self.catalog_name, referenced_schema, referenced_table
+            );
             let fk =
                 table_constraints
                     .entry(constraint_name)
@@ -472,8 +459,7 @@ impl SchemaProvider for PostgresSchemaProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        ForeignKeyConstraint, ForeignKeyMap, build_table_providers_for_schema,
-        format_foreign_table_name, is_table_included,
+        ForeignKeyConstraint, ForeignKeyMap, build_table_providers_for_schema, is_table_included,
     };
     use crate::{FOREIGN_KEYS_METADATA_KEY, Read};
     use async_trait::async_trait;
@@ -579,14 +565,6 @@ mod tests {
         let include = make_include(&["public.orders"]);
         assert!(is_table_included("public", "orders", Some(&include)));
         assert!(!is_table_included("public", "lineitem", Some(&include)));
-    }
-
-    #[test]
-    fn test_format_foreign_table_name_includes_catalog() {
-        assert_eq!(
-            format_foreign_table_name("pg", "public", "region"),
-            "pg.public.region"
-        );
     }
 
     #[tokio::test]
