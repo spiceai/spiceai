@@ -90,6 +90,38 @@ impl Display for Mode {
     }
 }
 
+/// Storage profile for file-backed accelerations.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum StorageProfile {
+    /// Detect the storage profile from the acceleration path.
+    #[default]
+    Auto,
+    /// Local SSD/NVMe-backed storage, such as EC2 instance store or Azure
+    /// temporary/NVMe local storage.
+    #[serde(alias = "ssd", alias = "nvme")]
+    LocalSsd,
+    /// Network-attached block storage, such as Amazon EBS or Azure Managed
+    /// Disks.
+    #[serde(alias = "azure_disk", alias = "managed_disk", alias = "network_disk")]
+    Ebs,
+    /// In-memory storage, such as a tmpfs or ramfs mount.
+    #[serde(alias = "ram", alias = "ramdisk", alias = "ramfs", alias = "memory")]
+    Tmpfs,
+}
+
+impl Display for StorageProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StorageProfile::Auto => write!(f, "auto"),
+            StorageProfile::LocalSsd => write!(f, "local_ssd"),
+            StorageProfile::Ebs => write!(f, "ebs"),
+            StorageProfile::Tmpfs => write!(f, "tmpfs"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "lowercase")]
@@ -335,6 +367,12 @@ pub struct Acceleration {
     #[serde(default, skip_serializing_if = "is_default_write_mode")]
     pub write_mode: WriteMode,
 
+    /// Storage profile for file-backed acceleration. `auto` detects the
+    /// profile from the resolved acceleration path; use `local_ssd`/`ssd`/`nvme`
+    /// `ebs`, or `tmpfs`/`ram`/`ramdisk`/`ramfs`/`memory` to override detection.
+    #[serde(default, skip_serializing_if = "is_default_storage_profile")]
+    pub storage_profile: StorageProfile,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
 
@@ -401,6 +439,11 @@ fn is_default_write_mode(mode: &WriteMode) -> bool {
     *mode == WriteMode::WriteThrough
 }
 
+#[expect(clippy::trivially_copy_pass_by_ref)]
+fn is_default_storage_profile(storage_profile: &StorageProfile) -> bool {
+    *storage_profile == StorageProfile::Auto
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -434,6 +477,7 @@ impl Default for Acceleration {
             primary_key: None,
             on_conflict: HashMap::default(),
             write_mode: WriteMode::default(),
+            storage_profile: StorageProfile::default(),
             metrics: None,
             partition_by: vec![],
             snapshots: SnapshotBehavior::Disabled,
@@ -569,6 +613,52 @@ mod tests {
                 accel.refresh_mode,
                 Some(expected),
                 "unexpected parse for '{yaml_value}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_deserialize_all_storage_profiles() {
+        for (yaml_value, expected) in [
+            ("auto", StorageProfile::Auto),
+            ("local_ssd", StorageProfile::LocalSsd),
+            ("ssd", StorageProfile::LocalSsd),
+            ("nvme", StorageProfile::LocalSsd),
+            ("ebs", StorageProfile::Ebs),
+            ("azure_disk", StorageProfile::Ebs),
+            ("managed_disk", StorageProfile::Ebs),
+            ("network_disk", StorageProfile::Ebs),
+            ("tmpfs", StorageProfile::Tmpfs),
+            ("ram", StorageProfile::Tmpfs),
+            ("ramdisk", StorageProfile::Tmpfs),
+            ("ramfs", StorageProfile::Tmpfs),
+            ("memory", StorageProfile::Tmpfs),
+        ] {
+            let yaml = format!("storage_profile: {yaml_value}");
+            let accel: Acceleration = yaml::from_str(&yaml)
+                .unwrap_or_else(|_| panic!("should parse storage_profile '{yaml_value}'"));
+            assert_eq!(
+                accel.storage_profile, expected,
+                "unexpected parse for '{yaml_value}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_storage_display_round_trip() {
+        for storage in [
+            StorageProfile::Auto,
+            StorageProfile::LocalSsd,
+            StorageProfile::Ebs,
+            StorageProfile::Tmpfs,
+        ] {
+            let s = storage.to_string();
+            let yaml = format!("storage_profile: {s}");
+            let accel: Acceleration = yaml::from_str(&yaml)
+                .unwrap_or_else(|_| panic!("should parse storage_profile '{s}'"));
+            assert_eq!(
+                accel.storage_profile, storage,
+                "round-trip failed for '{s}'"
             );
         }
     }

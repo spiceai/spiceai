@@ -17,8 +17,7 @@ limitations under the License.
 //! Regression bench: cross-table CDC throughput ceiling from the
 //! single-connection metastore mutex.
 //!
-//! `SqliteMetastore` (`crates/cayenne/src/metastore/sqlite.rs:38-50`) and
-//! `TursoMetastore` (`crates/cayenne/src/metastore/turso.rs`) each hold one
+//! Older versions of `SqliteMetastore` and `TursoMetastore` held one
 //! `tokio::sync::Mutex<Connection>` for the whole catalog:
 //!
 //! ```ignore
@@ -28,71 +27,53 @@ limitations under the License.
 //! }
 //! ```
 //!
-//! **Every** metastore call from **every** Cayenne table sharing one
-//! catalog acquires this same mutex — `execute`, `query`, `query_row`,
-//! `begin_transaction`, and the newer `execute_transaction_batch` (added
-//! to halve the in-checkpoint round-trips, but still funneling through
-//! the same connection). The mutex is held across each `.await` of the
+//! Every metastore call from every Cayenne table sharing one catalog
+//! acquired this same mutex. The mutex was held across each `.await` of the
 //! underlying `tokio_rusqlite` call, so concurrent CDC commits from
-//! different tables serialize on this mutex.
+//! different tables serialized on it. Under a workload with N
+//! independently-replicating tables (CH-benCH SF100 ran 14), the
+//! metastore-bound term of every commit became `N · RTT` instead of
+//! `RTT` — a 14× ceiling on aggregate throughput at the SF100 shape.
 //!
-//! Under a workload with **N** independently-replicating tables (the
-//! CH-benCH SF100 retest had 14), the metastore-bound term of every
-//! commit becomes `N · RTT` instead of `RTT` — a 14× ceiling on
-//! aggregate metastore throughput at the SF100 shape. This matches the
-//! observed behavior in the May 15 2026 retest: 6 of 14 tables
-//! accumulated hundreds of MB of un-drained WAL while the
-//! low-write-volume probe table stayed current — the probe's commit
-//! waited behind the high-volume tables on the shared mutex, and any
-//! table whose Postgres-side WAL rate exceeded
-//! `(mutex_throughput / N_tables)` fell permanently behind.
-//!
-//! The fix is a connection pool of K independent
-//! `tokio_rusqlite::Connection` instances behind a pool primitive
-//! (`bb8`, `deadpool`, or a simple `Vec<Mutex<Connection>>`). K = N
-//! lifts the ceiling entirely; K = small constant > 1 lifts it
-//! proportionally. SQLite-WAL allows concurrent readers + one writer at
-//! a time, so K writer connections do NOT serialize at the SQLite
-//! level — only the in-process Rust mutex does. Turso's MVCC supports
-//! `BEGIN CONCURRENT` so it gains even more from K > 1.
+//! The production path now uses `SqliteConnectionPool`
+//! ([`crate::metastore::sqlite::SqliteMetastore`], `metastore/sqlite.rs:45-67`):
+//! K = `min(available_parallelism, 8)` (minimum 2) independent
+//! `tokio_rusqlite::Connection` instances behind a round-robin
+//! `try_lock_owned` acquisition pattern. SQLite-WAL allows concurrent
+//! readers + one writer, so the K connections do not serialize at the
+//! SQLite level — only the in-process Rust mutex did, and that's gone.
+//! Turso's MVCC supports `BEGIN CONCURRENT` so it gains even more.
 //!
 //! ## What this bench measures
 //!
 //! Pure mutex contention pattern — no real SQLite, no on-disk work.
 //! Simulated per-call metastore work is `tokio::time::sleep(rtt)` (one
-//! RTT models the full `execute_transaction_batch` round trip after the
-//! iteration-3 fix landed in `cayenne_catalog.rs:1716`). Isolates the
-//! scheduling pattern (single mutex vs pooled connections) from
-//! SQLite-specific cost.
+//! RTT models the full `execute_transaction_batch` round trip).
 //!
 //! Two lanes per `(N_tables, RTT)` pair:
 //!
-//! - `current_single_mutex/N=...` — all N workers contend on one
+//! - `single_mutex_baseline/N=...` — all N workers contend on one
 //!   `tokio::sync::Mutex<()>`. Total wall time ≈ `N · commits · RTT`
-//!   because the mutex serializes every commit.
-//! - `achievable_per_table_pool/N=...` — each worker has its own
-//!   `tokio::sync::Mutex<()>` (modeling a per-table connection in a
-//!   pool of size K = N). Total wall time ≈ `commits · RTT` because
-//!   the N workers run in true parallel.
+//!   because the mutex serializes every commit. Mirrors the older
+//!   single-connection shape.
+//! - `per_table_pool/N=...` — current behavior: each worker has its own
+//!   `tokio::sync::Mutex<()>` (modeling a per-table connection in a pool
+//!   of size K = N). Total wall time ≈ `commits · RTT` because the N
+//!   workers run in true parallel.
 //!
 //! ## How to read
 //!
 //! `cargo bench --bench metastore_connection_contention -p cayenne`.
-//! The throughput report makes the ceiling visible:
+//! The throughput report makes the historical ceiling visible:
 //!
-//! - `current_single_mutex/N=14/rtt_10ms` throughput is ~100 commits/s
-//!   total regardless of N — that's the per-process metastore cap.
-//! - `achievable_per_table_pool/N=14/rtt_10ms` is ~1400 commits/s —
-//!   one RTT batch in parallel.
+//! - `single_mutex_baseline/N=14/rtt_10ms` throughput is ~100 commits/s
+//!   total regardless of N — what the older single-mutex code capped at.
+//! - `per_table_pool/N=14/rtt_10ms` is ~1400 commits/s — one RTT batch
+//!   in parallel, the current floor.
 //!
-//! At SF100's 14 tables, the gap is 14×. At SF1000 with more tables
-//! (or more concurrent compactions / catalog operations) the gap grows
-//! linearly. **The `current_single_mutex` lane is the metastore-bound
-//! throughput ceiling Spice's CDC pipeline cannot exceed today.**
-//!
-//! The bench also exercises two RTTs (`rtt_1ms` for local SQLite with
-//! WAL+normal-sync, `rtt_10ms` for a network metastore like Turso) so
-//! the ceiling is legible in both deployment shapes.
+//! The bench exercises two RTTs (`rtt_1ms` for local SQLite with WAL+normal-sync,
+//! `rtt_10ms` for a network metastore like Turso) so the ceiling is legible in
+//! both deployment shapes.
 
 #![allow(clippy::expect_used)]
 
@@ -193,7 +174,7 @@ fn bench_metastore_connection_contention(c: &mut Criterion) {
 
             let id = format!("N={n}/{rtt_label}");
             group.bench_with_input(
-                BenchmarkId::new("current_single_mutex", &id),
+                BenchmarkId::new("single_mutex_baseline", &id),
                 &n,
                 |b, &n| {
                     b.to_async(&rt).iter(|| async move {
@@ -202,15 +183,11 @@ fn bench_metastore_connection_contention(c: &mut Criterion) {
                 },
             );
 
-            group.bench_with_input(
-                BenchmarkId::new("achievable_per_table_pool", &id),
-                &n,
-                |b, &n| {
-                    b.to_async(&rt).iter(|| async move {
-                        run_per_table_pool(n, rtt).await;
-                    });
-                },
-            );
+            group.bench_with_input(BenchmarkId::new("per_table_pool", &id), &n, |b, &n| {
+                b.to_async(&rt).iter(|| async move {
+                    run_per_table_pool(n, rtt).await;
+                });
+            });
         }
     }
     group.finish();

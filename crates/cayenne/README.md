@@ -122,9 +122,10 @@ pub trait MetadataCatalog: Send + Sync {
     async fn get_table(&self, table_name: &str) -> CatalogResult<TableMetadata>;
     async fn drop_table(&self, table_name: &str) -> CatalogResult<bool>;
 
-    // Sequence numbers
+    // Sequence numbers (reserve reduces round-trips on serialized backends)
     async fn increment_sequence_number(&self, table_id: &str) -> CatalogResult<i64>;
     async fn get_sequence_number(&self, table_id: &str) -> CatalogResult<i64>;
+    async fn reserve_sequence_numbers(&self, table_id: &str, count: u32) -> CatalogResult<i64>;
 
     // Delete files (position- and key-based)
     async fn add_delete_file(&self, delete_file: DeleteFile) -> CatalogResult<String>;
@@ -186,7 +187,7 @@ pub trait MetadataCatalog: Send + Sync {
 - **`InlinedDataStats`** — `{ total_rows, segment_count, total_bytes }` aggregated from `cayenne_inlined_data` for memtable-pressure decisions.
 - **`PartitionMetadata`** — composite partition key, partition path, record/byte counts.
 - **`TableStatistics`** — serialized `FileStatistics` blob plus `num_rows`; populated from Vortex file footers and read by the DataFusion planner.
-- **`VortexConfig`** — Vortex-side tuning. All fields configurable per dataset via `cayenne_*` runtime parameters:
+- **`VortexConfig`** — Vortex-side tuning. All fields configurable per dataset via `cayenne_*` runtime parameters. The runtime applies refresh-mode defaults before parsing explicit params: `refresh_mode: caching`, `changes`, and `append` with `refresh_check_interval <= 5m` favor small incremental writes, while manual/cron/long-interval append plus `refresh_mode: full`, `snapshot`, `disabled`, and unspecified refresh modes favor large Vortex writes by default. Append workloads can be small or large depending on caller batch size, so tune the inline and compaction parameters explicitly if refresh cadence does not reflect write size.
 
 ```rust
 pub struct VortexConfig {
@@ -204,20 +205,22 @@ pub struct VortexConfig {
     pub write_concurrency: Option<usize>,     // None = session target_partitions; forced to 1 if sort_columns set
 
     // Compaction
-    pub compaction_trigger_files: usize,      // default 8
+    pub compaction_trigger_files: usize,      // default caching/changes/short-append=4, otherwise=8
+    pub compaction_trigger_protected_snapshots: usize, // default caching/changes/short-append=4, otherwise=8
+    pub compaction_trigger_snapshot_age_ms: u64,  // default caching/changes/short-append=60_000, otherwise=300_000; 0 disables age trigger
     pub compaction_max_levels: usize,         // default 3
     pub compaction_max_files_per_pick: usize, // default 32
-    pub compaction_background_interval_ms: u64,  // default 30_000, 0 disables background loop
+    pub compaction_background_interval_ms: u64,  // default caching/changes/short-append=10_000, otherwise=30_000; 0 disables background loop
 
     // Inline-write admission (per-call gate)
-    pub inline_max_rows: usize,               // default 1_024
-    pub inline_max_bytes: usize,              // default 1_048_576 (1 MiB serialized IPC)
-    pub inline_max_buffer_bytes: usize,       // default 4_194_304 (4 MiB pre-decode buffer)
+    pub inline_max_rows: usize,               // default caching/changes/short-append=1_024, otherwise=0
+    pub inline_max_bytes: usize,              // default caching/changes/short-append=1_048_576, otherwise=0
+    pub inline_max_buffer_bytes: usize,       // default caching/changes/short-append=4_194_304, otherwise=0
 
     // Inline-memtable flush triggers (cumulative gate)
-    pub inline_flush_max_rows: i64,           // default 10_000
-    pub inline_flush_max_segments: i64,       // default 64
-    pub inline_flush_max_bytes: i64,          // default 8_388_608 (8 MiB total IPC)
+    pub inline_flush_max_rows: i64,           // default caching/changes/short-append=2_048, otherwise=10_000
+    pub inline_flush_max_segments: i64,       // default caching/changes/short-append=16, otherwise=64
+    pub inline_flush_max_bytes: i64,          // default caching/changes/short-append=2_097_152, otherwise=8_388_608
 
     // PK conflict detection
     pub pk_conflict_detection: PkConflictDetection,  // default Auto; None opts into blind append for CDC

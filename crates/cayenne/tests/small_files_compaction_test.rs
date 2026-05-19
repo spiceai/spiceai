@@ -138,6 +138,15 @@ async fn count_vortex_files(data_path: &Path, table_id: &str, snapshot_id: &str)
     count
 }
 
+async fn count_protected_snapshots(fixture: &common::TestFixture, table_id: &str) -> usize {
+    fixture
+        .catalog
+        .get_all_snapshot_sequences(table_id)
+        .await
+        .expect("snapshot sequences should load")
+        .len()
+}
+
 /// Total row count via `SELECT COUNT(*)` for verification.
 async fn count_rows(ctx: &SessionContext, table_name: &str) -> i64 {
     let df = ctx
@@ -387,6 +396,110 @@ async fn compaction_preserves_pk_upsert_semantics(
         .expect("count column")
         .value(0);
     assert_eq!(stale_count, 0, "upsert + compaction must drop stale rows");
+
+    Ok(())
+}
+
+test_with_backends!(compaction_collapses_tiny_protected_snapshots);
+async fn compaction_collapses_tiny_protected_snapshots(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = pk_schema();
+    let config = VortexConfig {
+        target_vortex_file_size_mb: 128,
+        compaction_trigger_files: 4,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    let (table, ctx, table_id) = build_table(
+        &fixture,
+        "compaction_protected_snapshots",
+        Arc::clone(&schema),
+        Some("id"),
+        config,
+    )
+    .await;
+
+    let batch_rows = 1500_i64;
+    for batch_idx in 0..4_i64 {
+        let start = batch_idx * batch_rows;
+        common::insert_batch(&table, make_batch(&schema, start, batch_rows)).await?;
+    }
+
+    assert_eq!(
+        count_protected_snapshots(&fixture, &table_id).await,
+        4,
+        "test setup should create protected snapshots before explicit compaction"
+    );
+
+    assert!(
+        run_compaction(&table).await,
+        "protected snapshot count should trigger maintenance compaction even below the byte threshold"
+    );
+
+    assert_eq!(
+        count_protected_snapshots(&fixture, &table_id).await,
+        0,
+        "compaction should clear protected snapshot metadata"
+    );
+
+    let total = count_rows(&ctx, "compaction_protected_snapshots").await;
+    assert_eq!(total, batch_rows * 4);
+
+    Ok(())
+}
+
+test_with_backends!(current_snapshot_publish_preserves_protected_scan_listing_cache_entries);
+async fn current_snapshot_publish_preserves_protected_scan_listing_cache_entries(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = pk_schema();
+    let config = VortexConfig {
+        target_vortex_file_size_mb: 128,
+        compaction_trigger_files: 100,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    let (table, ctx, table_id) = build_table(
+        &fixture,
+        "scan_listing_cache",
+        Arc::clone(&schema),
+        Some("id"),
+        config,
+    )
+    .await;
+
+    let batch_rows = 1500_i64;
+    for batch_idx in 0..4_i64 {
+        let start = batch_idx * batch_rows;
+        common::insert_batch(&table, make_batch(&schema, start, batch_rows)).await?;
+    }
+
+    let protected_snapshot_count = count_protected_snapshots(&fixture, &table_id).await;
+    assert_eq!(protected_snapshot_count, 4);
+
+    let total = count_rows(&ctx, "scan_listing_cache").await;
+    assert_eq!(total, batch_rows * 4);
+    assert_eq!(
+        table.scan_listing_table_cache_entry_count(),
+        protected_snapshot_count + 1,
+        "the first scan should cache current plus protected snapshot listing tables"
+    );
+
+    table.publish_current_snapshot_files_changed().await;
+    assert_eq!(
+        table.scan_listing_table_cache_entry_count(),
+        protected_snapshot_count,
+        "publishing current snapshot changes should retain protected snapshot listing tables"
+    );
+
+    let total = count_rows(&ctx, "scan_listing_cache").await;
+    assert_eq!(total, batch_rows * 4);
+    assert_eq!(
+        table.scan_listing_table_cache_entry_count(),
+        protected_snapshot_count + 1,
+        "the next scan should rebuild only the current snapshot listing table"
+    );
 
     Ok(())
 }
