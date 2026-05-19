@@ -64,6 +64,7 @@ limitations under the License.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -80,6 +81,7 @@ use super::context::CayenneContext;
 use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 use super::table::{
     CayenneCdcWrite, CayenneTableProvider, ColumnStatsAccumulator, PostValidationState,
+    record_cayenne_write_phase,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -419,6 +421,7 @@ impl<'a> AppendMutationWriter<'a> {
     )> {
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let target_size_bytes = self.context.target_file_size_bytes();
+        let write_start = Instant::now();
         let (rows, writer_ops, stats_acc) = self
             .table
             .write_to_snapshot(
@@ -428,6 +431,7 @@ impl<'a> AppendMutationWriter<'a> {
                 self.task_context.session_config().target_partitions(),
             )
             .await?;
+        record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
 
         tracing::debug!(
             "Insert to deferred-validation snapshot {} completed, wrote {} rows to Vortex in {} writer operation(s)",
@@ -441,10 +445,17 @@ impl<'a> AppendMutationWriter<'a> {
             validated_keys,
         } = take_post_validation(post_validation);
 
+        let deletion_start = Instant::now();
         self.table
             .apply_on_conflict_deletions(on_conflict_deletions)
             .await?;
+        record_cayenne_write_phase(
+            self.table.table_name(),
+            "apply_on_conflict_deletions",
+            deletion_start,
+        );
 
+        let publish_start = Instant::now();
         let new_sequence = self
             .table
             .catalog()
@@ -454,6 +465,7 @@ impl<'a> AppendMutationWriter<'a> {
         self.table
             .publish_written_snapshot_with_sequence(&new_snapshot_id, new_sequence)
             .await?;
+        record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
 
         Ok((rows, stats_acc, validated_keys))
     }
@@ -539,6 +551,7 @@ impl<'a> AppendMutationWriter<'a> {
             .staging_may_have_files()
             .store(true, Ordering::Release);
 
+        let write_start = Instant::now();
         let result = match self
             .table
             .write_to_snapshot(
@@ -564,6 +577,7 @@ impl<'a> AppendMutationWriter<'a> {
                 return Err(e);
             }
         };
+        record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
 
         let staged_append = CayenneStagedAppend::from_staged_append_in(
             self.table.clone_for_write_operations(),
@@ -571,7 +585,9 @@ impl<'a> AppendMutationWriter<'a> {
             staging_snapshot_id,
             result.0,
         );
+        let publish_start = Instant::now();
         staged_append.finalize_staged_write().await?;
+        record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
 
         Ok(result)
     }
@@ -592,6 +608,7 @@ impl<'a> AppendMutationWriter<'a> {
             .staging_may_have_files()
             .store(true, Ordering::Release);
 
+        let write_start = Instant::now();
         let (rows, writer_ops, stats_acc) = match self
             .table
             .write_to_snapshot(
@@ -617,6 +634,7 @@ impl<'a> AppendMutationWriter<'a> {
                 return Err(e);
             }
         };
+        record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
 
         let staged_append = CayenneStagedAppend::from_staged_append_in(
             self.table.clone_for_write_operations(),
@@ -624,6 +642,7 @@ impl<'a> AppendMutationWriter<'a> {
             staging_snapshot_id.clone(),
             rows,
         );
+        let prepare_start = Instant::now();
         let prepared_append = match staged_append.prepare().await {
             Ok(prepared_append) => prepared_append,
             Err(e) => {
@@ -640,6 +659,7 @@ impl<'a> AppendMutationWriter<'a> {
                 return Err(e);
             }
         };
+        record_cayenne_write_phase(self.table.table_name(), "stage_wal_prepare", prepare_start);
 
         Ok((rows, writer_ops, stats_acc, prepared_append))
     }

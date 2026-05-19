@@ -17,9 +17,9 @@ limitations under the License.
 //! Regression bench: per-file serial latency of the S3 staged-file move
 //! during the CDC pipelined finalize barrier.
 //!
-//! `CayenneTableProvider::move_staging_files_s3`
-//! (`crates/cayenne/src/provider/table.rs:2122-2221`) moves files out of
-//! `_staging/<id>/` into the live snapshot directory in two phases:
+//! Older versions of `CayenneTableProvider::move_staging_files_s3` moved
+//! files out of `_staging/<id>/` into the live snapshot directory with two
+//! serial loops:
 //!
 //! ```ignore
 //! // Phase 1: copy
@@ -33,25 +33,21 @@ limitations under the License.
 //! }
 //! ```
 //!
-//! Both phases iterate **serially** with `.await` between each S3 round trip.
-//! The move runs under `apply_under_barrier`
-//! (`crates/cayenne/src/provider/staging_wal.rs:307-333`), which holds
-//! `visibility_lock` plus the `listing_fence` write guard
-//! (`table.rs:880`) across the entire move. Every concurrent scan that
-//! reaches `listing_fence.read().await` blocks until the move completes.
+//! Both phases iterated serially with `.await` between each S3 round trip.
+//! The move runs under `apply_under_barrier` which holds `visibility_lock`
+//! plus the `listing_fence` write guard across the entire move — so every
+//! concurrent scan that reaches `listing_fence.read().await` blocked until
+//! the move completed. For a CDC burst that produced `N` Vortex files, the
+//! held-fence time included `2 · N · RTT_s3` (copy RTT + delete RTT per
+//! file). On S3 with ~10–30 ms per op, a 64-file burst stalled every reader
+//! for ~1.3–3.8 s.
 //!
-//! For a CDC burst that produced `N` Vortex files, the held-fence time
-//! includes `2 · N · RTT_s3` — copy RTT plus delete RTT per file. On S3
-//! with ~10–30 ms per op, a 64-file burst stalls every reader for
-//! ~1.3–3.8 s. The same antipattern exists in:
-//!
-//! - `crates/cayenne/src/provider/table.rs:1721-1731` (`delete_prefix_with_object_store`)
-//! - `crates/cayenne/src/provider/partitioned_wal.rs:287-307` (3 S3 ops where 1 suffices)
-//!
-//! The fix is `stream::iter(...).map(...).buffer_unordered(N).try_collect()`
-//! — a small constant change that brings the fence-held time down to
-//! `RTT_s3 · (N / parallelism) + RTT_s3 · (N / parallelism)`. For
-//! `parallelism=16` and N=64 that is ~8 RTTs total instead of 128.
+//! The production path now drives both phases through
+//! `stream::iter(...).try_for_each_concurrent(OBJECT_STORE_MOVE_CONCURRENCY, ...)`
+//! ([`provider/table.rs:2551-2591`], with
+//! `OBJECT_STORE_MOVE_CONCURRENCY = 16`). The fence-held time is now
+//! `RTT_s3 · (N / parallelism) + RTT_s3 · (N / parallelism)` — for
+//! `parallelism=16` and N=64, ~8 RTTs total instead of 128.
 //!
 //! ## What this bench measures
 //!
@@ -59,12 +55,13 @@ limitations under the License.
 //! `object_store::memory::InMemory` prefixes. Per-op latency is simulated
 //! by `tokio::time::sleep(SIMULATED_S3_RTT)` immediately before each
 //! `copy` / `delete`. This isolates the scheduling pattern (serial loop
-//! vs `buffer_unordered`) from real-network jitter.
+//! vs `try_for_each_concurrent`) from real-network jitter.
 //!
-//! - `staging_move/current_serial/<N>` — mirrors the loop in
+//! - `staging_move/serial_baseline/<N>` — mirrors the older serial loop in
 //!   `move_staging_files_s3`. Time grows linearly with `N`.
-//! - `staging_move/achievable_concurrent/<N>` — `buffer_unordered(16)`
-//!   over both phases. Time grows as `N / 16` (one RTT batch + a tail).
+//! - `staging_move/concurrent/<N>` — current behavior:
+//!   `try_for_each_concurrent(16)` over both phases. Time grows as
+//!   `N / 16` (one RTT batch + a tail).
 //!
 //! Both lanes use the same store, the same byte payload, and the same
 //! source/destination paths so the only difference is dispatch pattern.
@@ -73,14 +70,13 @@ limitations under the License.
 //!
 //! After `cargo bench --bench staging_move_concurrency -p cayenne`:
 //!
-//! - Look at `staging_move/current_serial/64` vs
-//!   `staging_move/achievable_concurrent/64`. The ratio is approximately
+//! - Look at `staging_move/serial_baseline/64` vs
+//!   `staging_move/concurrent/64`. The ratio is approximately
 //!   `min(64, 16) * 2 / ceil(64 / 16) * 2` ≈ 16×. That ratio is the
-//!   reduction in fence-held time after fixing the antipattern.
-//! - The `current_serial` lane is the **regression to track**: if a
-//!   future change adds work to the per-file body, this lane will grow.
-//! - The `achievable_concurrent` lane shows where the fence-held time
-//!   *can* land with a minimal change. Use it as the floor.
+//!   reduction in fence-held time the production fix delivered.
+//! - The `serial_baseline` lane is the **regression to track**: if a
+//!   future change reintroduces a serial loop here, this gap reappears.
+//! - The `concurrent` lane is the current production floor.
 
 #![allow(clippy::expect_used)]
 
@@ -218,14 +214,14 @@ fn bench_staging_move(c: &mut Criterion) {
         // seed cost is `n` cheap `InMemory::put` calls (no simulated RTT)
         // and is identical across both lanes, so it does not skew the
         // serial-vs-concurrent ratio that this bench measures.
-        group.bench_with_input(BenchmarkId::new("current_serial", n), &n, |b, &n| {
+        group.bench_with_input(BenchmarkId::new("serial_baseline", n), &n, |b, &n| {
             b.to_async(&rt).iter(|| async move {
                 let store = seed_store(n).await;
                 serial_copy_then_delete(black_box(store), black_box(n)).await;
             });
         });
 
-        group.bench_with_input(BenchmarkId::new("achievable_concurrent", n), &n, |b, &n| {
+        group.bench_with_input(BenchmarkId::new("concurrent", n), &n, |b, &n| {
             b.to_async(&rt).iter(|| async move {
                 let store = seed_store(n).await;
                 concurrent_copy_then_delete(black_box(store), black_box(n)).await;

@@ -16,12 +16,9 @@ limitations under the License.
 
 //! Regression bench: per-upsert cost of the inline-memtable rewrite path.
 //!
-//! `CayenneTableProvider::build_inlined_data_rewrite_for_pk_keys`
-//! (`crates/cayenne/src/provider/table.rs:3917-3987`) is invoked from
-//! every upsert / on-conflict insert whose deleted-PK set is non-empty
-//! and the table has pending inline rows
-//! (`apply_on_conflict_deletions` -> rewrite branch). On each call it
-//! performs:
+//! Older versions of `CayenneTableProvider::build_inlined_data_rewrite_for_pk_keys`
+//! re-read and re-decoded the inline data on every upsert that produced
+//! deletions:
 //!
 //! ```ignore
 //! let inlined_data = self.catalog.get_inlined_data(&id).await?;          // 1 metastore RTT
@@ -38,45 +35,37 @@ limitations under the License.
 //! }
 //! ```
 //!
-//! The just-committed `read_inlined_batches` cache (keyed by an
-//! `AtomicU64` inline generation) eliminates the same IPC-decode +
-//! deletion-filter work for the **scan** path, but the upsert rewrite
-//! path bypasses the cache and pays the full cost on every commit.
-//! `commit_inlined_data_mutation` -> `build_inlined_data_rewrite_for_pk_keys`
-//! is the inner loop of an on-conflict CDC stream where every envelope
-//! upserts a single PK; at that shape the redundant decode dominates
-//! the per-upsert CPU budget.
+//! Each upsert against a table with 1 MiB of inlined data paid ~100 µs–1 ms
+//! of IPC decode plus two metastore round-trips, even though `read_inlined_batches`
+//! may have decoded the same payload milliseconds earlier on the scan path.
 //!
-//! Two consequences:
+//! The production path now uses the generation-keyed
+//! [`InlinedCache`]:
 //!
-//! 1. **Per-upsert fixed cost**: each upsert against a table with
-//!    1 MiB of inlined data pays ~100 µs–1 ms of IPC decode plus two
-//!    metastore round-trips, even though `read_inlined_batches` may
-//!    have decoded the same payload milliseconds earlier.
-//! 2. **Cache-coherence asymmetry**: writers serially invalidate the
-//!    scan cache (good), but each writer's *own* rewrite step then
-//!    re-pays the decode cost the cache was designed to amortize.
+//! ```ignore
+//! // build_inlined_data_rewrite_for_pk_keys, table.rs:4313
+//! let view = self.cached_inlined_view().await?;
+//! ```
 //!
-//! The TigerStyle remedy is to share the existing
-//! `read_inlined_batches` cache: have `build_inlined_data_rewrite_for_pk_keys`
-//! call `read_inlined_batches` and apply only the new PK filter on top,
-//! rather than re-reading and re-decoding `cayenne_inlined_data`.
+//! `cached_inlined_view` atomic-loads the inline generation and returns the
+//! pre-decoded `Arc<Vec<RecordBatch>>` whenever the generation matches —
+//! the same cache that `read_inlined_batches` populates. The two metastore
+//! round trips and the IPC decode happen only when a concurrent writer has
+//! bumped the generation.
 //!
 //! ## What this bench measures
 //!
 //! Pure CPU shape — no metastore, no Cayenne setup. Models the
-//! per-upsert decode + double-filter cost.
+//! per-upsert decode + double-filter cost under both shapes.
 //!
 //! Two lanes per inline data size:
 //!
-//! - `decode_and_filter_per_upsert/<rows>` — mirrors today's
-//!   `build_inlined_data_rewrite_for_pk_keys`: deserialize the IPC
-//!   payload, build a deletion-mask (legacy inline deletes, modelled
-//!   as empty since legacy writes are gated on a separate code path),
-//!   and apply a PK-set filter producing the rewritten batch.
-//! - `cached_filter_per_upsert/<rows>` — models the proposed share:
-//!   start from pre-decoded `Vec<RecordBatch>` (as if reusing the
-//!   scan cache), then apply only the new PK filter.
+//! - `decode_and_filter_per_upsert_baseline/<rows>` — mirrors the older
+//!   `build_inlined_data_rewrite_for_pk_keys`: deserialize the IPC payload,
+//!   build a deletion-mask, and apply a PK-set filter.
+//! - `cached_filter_per_upsert/<rows>` — current behavior: start from
+//!   pre-decoded `Vec<RecordBatch>` (reusing the scan cache), apply only
+//!   the new PK filter.
 //!
 //! Inline sizes mirror `inline_memtable_read_overhead`:
 //!
@@ -88,12 +77,10 @@ limitations under the License.
 //!
 //! `cargo bench --bench inline_upsert_rewrite_overhead -p cayenne`.
 //!
-//! - `decode_and_filter_per_upsert/1MiB` is the per-upsert CPU cost a
-//!   high-conflict CDC stream pays today. At 1000 upserts/sec this is
-//!   the latency floor below which p99 cannot go.
-//! - `cached_filter_per_upsert/1MiB` is the achievable floor if the
-//!   rewrite path reuses the scan cache. The ratio is the QPS
-//!   headroom from the sharing fix.
+//! - `decode_and_filter_per_upsert_baseline/1MiB` is the per-upsert CPU
+//!   cost a high-conflict CDC stream paid under the older code.
+//! - `cached_filter_per_upsert/1MiB` is the current floor. The ratio is
+//!   the QPS headroom the cache-sharing fix delivered.
 
 #![allow(clippy::expect_used)]
 
@@ -234,7 +221,7 @@ fn bench_inline_upsert_rewrite(c: &mut Criterion) {
         ));
 
         group.bench_with_input(
-            BenchmarkId::new("decode_and_filter_per_upsert", rows),
+            BenchmarkId::new("decode_and_filter_per_upsert_baseline", rows),
             &(blob.clone(), deleted.clone()),
             |b, (blob, deleted)| {
                 b.iter(|| decode_and_filter_per_upsert(black_box(blob.as_slice()), deleted));

@@ -4199,6 +4199,7 @@ mod tests {
                 vectors: None,
                 full_text_search: None,
                 check_availability: crate::component::dataset::CheckAvailability::Disabled,
+                on_schema_change: crate::component::dataset::OnSchemaChange::default(),
             }
         }
 
