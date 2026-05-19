@@ -89,12 +89,12 @@ use parking_lot::{Mutex as ParkingMutex, RwLock};
 use roaring::RoaringBitmap;
 use std::any::Any;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task;
 use vortex::dtype::arrow::FromArrowType;
 use vortex_datafusion::VortexFormat;
@@ -111,8 +111,168 @@ use arc_swap::ArcSwap;
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
 const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
-const PK_KEYSET_CACHE_MAX_ENTRIES: usize = 1_000_000;
+/// Byte budget for the in-memory PK keyset cache (Option A from iter 5/6).
+/// Using a byte budget instead of a hard entry count allows small-PK tables
+/// (e.g. single Int64) to cache far more rows before eviction, while still
+/// protecting memory on wide composite-PK tables. At ~40-64 bytes per entry
+/// (key bytes + `RowLocation` + `HashMap` overhead) this is ~2-4M rows for int64 PKs.
+const PK_KEYSET_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+// Approximate per-entry `HashMap` control/allocation overhead used for the
+// cache budget. The exact value is allocator-dependent, so keep this estimate
+// centralized with `approx_pk_keyset_entry_bytes`.
+const PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES: usize = 16;
 const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
+const PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT: usize = 1024;
+
+#[derive(Debug, Default)]
+struct BoundedWarningKeys {
+    seen: HashSet<String>,
+    insertion_order: VecDeque<String>,
+}
+
+impl BoundedWarningKeys {
+    fn insert_new(&mut self, key: String, limit: usize) -> bool {
+        if self.seen.contains(&key) {
+            return false;
+        }
+
+        if self.seen.len() >= limit
+            && let Some(oldest_key) = self.insertion_order.pop_front()
+        {
+            self.seen.remove(&oldest_key);
+        }
+
+        self.insertion_order.push_back(key.clone());
+        self.seen.insert(key)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotMaintenanceTrigger {
+    ProtectedSnapshotCount {
+        protected_snapshot_count: usize,
+        trigger_count: usize,
+    },
+    ProtectedSnapshotAge {
+        protected_snapshot_count: usize,
+        oldest_snapshot_age: Duration,
+        trigger_age: Duration,
+    },
+}
+
+fn should_warn_protected_snapshot_age(
+    warning_keys: &ParkingMutex<BoundedWarningKeys>,
+    snapshot_id: &str,
+    warning_kind: &'static str,
+) -> bool {
+    let key = format!("{warning_kind}:{snapshot_id}");
+    warning_keys
+        .lock()
+        .insert_new(key, PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT)
+}
+
+fn protected_snapshot_age(
+    warning_keys: &ParkingMutex<BoundedWarningKeys>,
+    snapshot_id: &str,
+    now: SystemTime,
+) -> Option<Duration> {
+    // Protected snapshot ids are generated as UUIDv7 values by
+    // `publish_written_snapshot_with_sequence`; imported or future ids that
+    // do not preserve that invariant are ignored for age-triggered maintenance
+    // and still participate in count-triggered maintenance.
+    let Ok(snapshot_uuid) = uuid::Uuid::parse_str(snapshot_id) else {
+        if should_warn_protected_snapshot_age(warning_keys, snapshot_id, "invalid_uuid") {
+            tracing::warn!(
+                snapshot_id,
+                "Cayenne protected snapshot id is not a valid UUID; ignoring it for age-based maintenance"
+            );
+        }
+        return None;
+    };
+    let Some(timestamp) = snapshot_uuid.get_timestamp() else {
+        if should_warn_protected_snapshot_age(warning_keys, snapshot_id, "missing_uuid_timestamp") {
+            tracing::warn!(
+                snapshot_id,
+                "Cayenne protected snapshot id does not contain a UUID timestamp; ignoring it for age-based maintenance"
+            );
+        }
+        return None;
+    };
+    let (seconds, nanos) = timestamp.to_unix();
+    let Some(snapshot_time) = UNIX_EPOCH.checked_add(Duration::new(seconds, nanos)) else {
+        if should_warn_protected_snapshot_age(warning_keys, snapshot_id, "timestamp_overflow") {
+            tracing::warn!(
+                snapshot_id,
+                "Cayenne protected snapshot timestamp overflowed SystemTime; ignoring it for age-based maintenance"
+            );
+        }
+        return None;
+    };
+    if let Ok(age) = now.duration_since(snapshot_time) {
+        Some(age)
+    } else {
+        if should_warn_protected_snapshot_age(warning_keys, snapshot_id, "future_timestamp") {
+            tracing::warn!(
+                snapshot_id,
+                "Cayenne protected snapshot timestamp is in the future; ignoring it for age-based maintenance"
+            );
+        }
+        None
+    }
+}
+
+fn oldest_protected_snapshot_age(
+    warning_keys: &ParkingMutex<BoundedWarningKeys>,
+    protected_snapshots: &HashMap<String, i64>,
+    now: SystemTime,
+) -> Option<Duration> {
+    protected_snapshots
+        .keys()
+        .filter_map(|snapshot_id| protected_snapshot_age(warning_keys, snapshot_id, now))
+        .max()
+}
+
+fn duration_millis_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn protected_snapshot_maintenance_trigger(
+    warning_keys: &ParkingMutex<BoundedWarningKeys>,
+    protected_snapshots: &HashMap<String, i64>,
+    trigger_count: usize,
+    trigger_age: Option<Duration>,
+    now: SystemTime,
+) -> Option<SnapshotMaintenanceTrigger> {
+    let protected_snapshot_count = protected_snapshots.len();
+    let trigger_count = trigger_count.max(1);
+    if protected_snapshot_count >= trigger_count {
+        return Some(SnapshotMaintenanceTrigger::ProtectedSnapshotCount {
+            protected_snapshot_count,
+            trigger_count,
+        });
+    }
+
+    // Age parsing only runs below the count trigger; above it, the cheaper
+    // count trigger short-circuits before scanning snapshot ids.
+    let trigger_age = trigger_age?;
+    let oldest_snapshot_age =
+        oldest_protected_snapshot_age(warning_keys, protected_snapshots, now)?;
+    if oldest_snapshot_age >= trigger_age {
+        Some(SnapshotMaintenanceTrigger::ProtectedSnapshotAge {
+            protected_snapshot_count,
+            oldest_snapshot_age,
+            trigger_age,
+        })
+    } else {
+        None
+    }
+}
+
+fn approx_pk_keyset_entry_bytes(key: &OwnedRow) -> usize {
+    key.as_ref().len()
+        + std::mem::size_of::<RowLocation>()
+        + PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES
+}
 
 #[derive(Default)]
 struct PostWriteMaintenanceState {
@@ -227,8 +387,10 @@ impl CayenneCdcWrite {
     /// Returns an error if the staged append cannot be published.
     pub async fn finish(self) -> Result<u64> {
         if let Some(prepared_append) = self.prepared_append {
+            let publish_start = Instant::now();
             prepared_append.apply_under_barrier().await?;
             let rows = prepared_append.finish().await?;
+            record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
             self.table.record_file_pk_keys(&self.validated_file_keys);
             self.table
                 .schedule_post_write_maintenance(self.stats, false);
@@ -878,6 +1040,15 @@ impl OnConflictExt for OnConflict {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct CachedTableStatistics {
+    optimizer: Option<Statistics>,
+    /// Raw blob last read from (or written to) the catalog.
+    /// Allows `persist_table_stats_locked` to attempt an in-memory merge
+    /// and avoid a catalog GET on the common steady-state path.
+    raw: Option<TableStatistics>,
+}
+
 /// Cayenne table provider that reads from Vortex virtual files.
 ///
 /// This provider manages a table composed of multiple "virtual files", where each file
@@ -921,10 +1092,16 @@ pub struct CayenneTableProvider {
     /// table. Reusing the table keeps file-statistics caches warm across scans
     /// while preserving per-session target partition and statistics settings.
     scan_listing_tables: Arc<ParkingMutex<HashMap<ScanListingTableKey, Arc<ListingTable>>>>,
-    /// Table-level Vortex statistics loaded from the metastore and maintained
-    /// after writes. This gives `DataFusion` synchronous access to Cayenne stats
-    /// without querying the async catalog from `TableProvider::statistics`.
-    table_statistics: Arc<RwLock<Option<Statistics>>>,
+    /// Table-level Vortex statistics cache loaded from the metastore and maintained
+    /// after writes. The optimizer-facing `Statistics` and raw `TableStatistics`
+    /// blob live under the same lock so clears and updates publish both views
+    /// together. This gives `DataFusion` synchronous access to Cayenne stats while
+    /// allowing `persist_table_stats` to skip a steady-state catalog read.
+    table_statistics: Arc<RwLock<CachedTableStatistics>>,
+    /// Serializes the read/merge/upsert/publish stats persistence cycle so
+    /// concurrent maintenance tasks cannot merge from the same cached base and
+    /// overwrite each other's row-count or column-stat deltas.
+    table_statistics_persistence_lock: Arc<tokio::sync::Mutex<()>>,
     /// Optional retention filters that should be applied immediately after writes.
     retention_filters: Vec<Expr>,
     /// Optional builder to construct time-based retention filter.
@@ -980,13 +1157,16 @@ pub struct CayenneTableProvider {
     /// Maps `snapshot_id` -> `minimum_sequence` (all deletes with seq <= `min_seq` don't apply).
     /// At scan time, data from these snapshots is scanned without deletion filtering.
     protected_snapshots: Arc<RwLock<HashMap<String, i64>>>,
+    /// Table-scoped warning dedupe for protected snapshot ids that cannot
+    /// provide a `UUIDv7` timestamp for age-triggered maintenance.
+    protected_snapshot_age_warning_keys: Arc<ParkingMutex<BoundedWarningKeys>>,
     /// Cached visible primary-key set for auto conflict detection.
     ///
     /// The first auto-mode insert still scans existing data to build the set;
     /// later serialized writes reuse it and publish successful write deltas.
     /// Delete paths invalidate this cache because arbitrary predicates can
     /// remove keys without telling us which keys were affected.
-    pk_keyset_cache: Arc<ParkingMutex<Option<HashMap<OwnedRow, RowLocation>>>>,
+    pk_keyset_cache: Arc<ParkingMutex<Option<CachedPkKeyset>>>,
     /// Coalesces inline-memtable checkpoint checks spawned after inline writes.
     /// The check takes `write_lock` in the background after the scheduling
     /// writer returns, so inline commits do not hold the writer lock while
@@ -1212,6 +1392,37 @@ enum RowSource {
     Inlined,
 }
 
+struct CachedPkKeyset {
+    keys: HashMap<OwnedRow, RowLocation>,
+    approx_bytes: usize,
+}
+
+impl CachedPkKeyset {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            keys: HashMap::with_capacity(capacity),
+            approx_bytes: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn insert(&mut self, key: OwnedRow, location: RowLocation) {
+        let entry_bytes = approx_pk_keyset_entry_bytes(&key);
+        match self.keys.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(location);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                self.approx_bytes = self.approx_bytes.saturating_add(entry_bytes);
+                entry.insert(location);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct InlinedDeletionMaps {
     int64_pk: HashMap<i64, i64>,
@@ -1432,7 +1643,7 @@ struct OnConflictValidationStream {
     converter: RowConverter,
     on_conflict: OnConflict,
     upsert_options: UpsertOptions,
-    existing_keys: Option<HashMap<OwnedRow, RowLocation>>,
+    existing_keys: Option<CachedPkKeyset>,
     incoming_keys: HashSet<OwnedRow>,
     kept_keys: HashSet<OwnedRow>,
     delete_specs: HashMap<i64, Vec<i64>>,
@@ -1450,7 +1661,7 @@ impl OnConflictValidationStream {
         inner: SendableRecordBatchStream,
         pk_indices: Vec<usize>,
         converter: RowConverter,
-        existing_keys: HashMap<OwnedRow, RowLocation>,
+        existing_keys: CachedPkKeyset,
         on_conflict: OnConflict,
         post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
     ) -> Self {
@@ -1497,9 +1708,17 @@ impl OnConflictValidationStream {
             converter: &self.converter,
             on_conflict: &self.on_conflict,
             upsert_options: &self.upsert_options,
-            existing_keys,
+            existing_keys: &existing_keys.keys,
             incoming_keys: &self.incoming_keys,
         };
+
+        let validation_start = Instant::now();
+        let validation_result = self.table.apply_on_conflict_to_batch(batch, &mut ctx);
+        record_cayenne_write_phase(
+            self.table.table_name(),
+            "apply_on_conflict_validation",
+            validation_start,
+        );
 
         let BatchValidationResult {
             filtered_batch,
@@ -1509,10 +1728,7 @@ impl OnConflictValidationStream {
             deleted_row_keys,
             deleted_inlined_pk_i64,
             deleted_inlined_row_keys,
-        } = self
-            .table
-            .apply_on_conflict_to_batch(batch, &mut ctx)
-            .map_err(datafusion_common::DataFusionError::from)?;
+        } = validation_result.map_err(datafusion_common::DataFusionError::from)?;
 
         for (data_file_id, rows) in batch_delete_specs {
             self.delete_specs
@@ -1567,6 +1783,13 @@ impl OnConflictValidationStream {
         self.store_existing_keyset();
         self.finalized = true;
     }
+}
+
+pub(crate) fn record_cayenne_write_phase(_table_name: &str, phase: &'static str, start: Instant) {
+    telemetry::track_cayenne_write_phase_duration(
+        start.elapsed(),
+        &[telemetry::KeyValue::new("phase", phase)],
+    );
 }
 
 impl Unpin for OnConflictValidationStream {}
@@ -2864,7 +3087,11 @@ impl CayenneTableProvider {
             listing_table: Arc::new(ArcSwap::new(listing_table)),
             listing_fence: Arc::new(tokio::sync::RwLock::new(())),
             scan_listing_tables: Arc::new(ParkingMutex::new(HashMap::new())),
-            table_statistics: Arc::new(RwLock::new(table_statistics)),
+            table_statistics: Arc::new(RwLock::new(CachedTableStatistics {
+                optimizer: table_statistics,
+                raw: None, // will be populated on first load/persist
+            })),
+            table_statistics_persistence_lock: Arc::new(tokio::sync::Mutex::new(())),
             retention_filters,
             time_retention_filter_builder,
             context,
@@ -2878,6 +3105,9 @@ impl CayenneTableProvider {
                 object_store_registered_runtime_envs,
             )),
             protected_snapshots: Arc::new(RwLock::new(protected_snapshots)),
+            protected_snapshot_age_warning_keys: Arc::new(ParkingMutex::new(
+                BoundedWarningKeys::default(),
+            )),
             pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
             inline_checkpoint_scheduled: Arc::new(AtomicBool::new(false)),
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
@@ -3056,24 +3286,26 @@ impl CayenneTableProvider {
     }
 
     /// Get the maximum delete sequence number from the cached deletions.
+    ///
+    /// Reads the index's cached `max_sequence_number` field (O(1)) instead of
+    /// walking `entries().values().max()` (O(N)). The cache is maintained by
+    /// `DeletionIndex::from_map` at construction and `DeletionIndex::extend_max`
+    /// on every insert; deletion indexes are build-once / extend-only so the
+    /// cached value never goes stale. See
+    /// `crates/cayenne/benches/get_max_delete_sequence_walk.rs` for the
+    /// before-numbers (up to ~5.7 M× speedup at 1 M cached deletions).
     fn get_max_delete_sequence(&self) -> i64 {
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk { deletion_snapshot } => deletion_snapshot
                 .load()
                 .deleted_pk
-                .entries()
-                .values()
-                .max()
-                .copied()
+                .max_sequence_number()
                 .unwrap_or(0),
             PkDeletionStrategyWithCache::RowConverterBased { deletion_snapshot } => {
                 deletion_snapshot
                     .load()
                     .deleted_row_keys
-                    .entries()
-                    .values()
-                    .max()
-                    .copied()
+                    .max_sequence_number()
                     .unwrap_or(0)
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => 0,
@@ -3297,6 +3529,7 @@ impl CayenneTableProvider {
             listing_fence: Arc::clone(&self.listing_fence),
             scan_listing_tables: Arc::clone(&self.scan_listing_tables),
             table_statistics: Arc::clone(&self.table_statistics),
+            table_statistics_persistence_lock: Arc::clone(&self.table_statistics_persistence_lock),
             context: Arc::clone(&self.context),
             retention_filters: self.retention_filters.clone(),
             time_retention_filter_builder: self.time_retention_filter_builder.clone(),
@@ -3311,6 +3544,9 @@ impl CayenneTableProvider {
             ),
             current_snapshot_id: Arc::clone(&self.current_snapshot_id),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
+            protected_snapshot_age_warning_keys: Arc::clone(
+                &self.protected_snapshot_age_warning_keys,
+            ),
             pk_keyset_cache: Arc::clone(&self.pk_keyset_cache),
             inline_checkpoint_scheduled: Arc::clone(&self.inline_checkpoint_scheduled),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
@@ -3374,8 +3610,7 @@ impl CayenneTableProvider {
         let has_pending_visibility_changes =
             self.has_pending_deletions() || self.inlined_row_count.load(Ordering::Relaxed) > 0;
 
-        let guard = self.table_statistics.read();
-        let stats = guard.as_ref()?;
+        let stats = self.table_statistics.read().optimizer.clone()?;
 
         if stats.column_statistics.len() > TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT {
             tracing::trace!(
@@ -3385,12 +3620,10 @@ impl CayenneTableProvider {
                 "Returning top-level table statistics only for wide table"
             );
             return Some(Self::top_level_statistics_only(
-                stats,
+                &stats,
                 has_pending_visibility_changes,
             ));
         }
-
-        let stats = stats.clone();
 
         if has_pending_visibility_changes {
             Some(Self::statistics_to_inexact(stats))
@@ -3441,26 +3674,24 @@ impl CayenneTableProvider {
         }
     }
 
-    fn set_cached_table_statistics(&self, stats: Option<Statistics>) {
-        let mut guard = self.table_statistics.write();
-        *guard = stats;
+    fn clear_cached_table_statistics_unlocked(&self) {
+        let mut cache = self.table_statistics.write();
+        cache.optimizer = None;
+        cache.raw = None;
     }
 
-    pub(crate) fn clear_cached_table_statistics(&self) {
-        self.set_cached_table_statistics(None);
-    }
-
-    fn take_cached_pk_keyset(&self) -> Option<HashMap<OwnedRow, RowLocation>> {
+    fn take_cached_pk_keyset(&self) -> Option<CachedPkKeyset> {
         self.pk_keyset_cache.lock().take()
     }
 
-    fn store_cached_pk_keyset(&self, keyset: HashMap<OwnedRow, RowLocation>) {
-        if keyset.len() > PK_KEYSET_CACHE_MAX_ENTRIES {
+    fn store_cached_pk_keyset(&self, keyset: CachedPkKeyset) {
+        if keyset.approx_bytes > PK_KEYSET_CACHE_MAX_BYTES {
             tracing::debug!(
                 table = self.table_metadata.table_name.as_str(),
                 key_count = keyset.len(),
-                max_key_count = PK_KEYSET_CACHE_MAX_ENTRIES,
-                "Skipping primary-key keyset cache because it exceeds the configured in-memory cap"
+                approx_bytes = keyset.approx_bytes,
+                max_bytes = PK_KEYSET_CACHE_MAX_BYTES,
+                "Skipping primary-key keyset cache because it exceeds the configured byte budget"
             );
             *self.pk_keyset_cache.lock() = None;
             return;
@@ -3483,24 +3714,31 @@ impl CayenneTableProvider {
             return;
         };
 
-        if keyset.len().saturating_add(keys.len()) > PK_KEYSET_CACHE_MAX_ENTRIES {
-            tracing::debug!(
-                table = self.table_metadata.table_name.as_str(),
-                key_count = keyset.len(),
-                incoming_key_count = keys.len(),
-                max_key_count = PK_KEYSET_CACHE_MAX_ENTRIES,
-                "Clearing primary-key keyset cache because the write would exceed the in-memory cap"
-            );
-            *guard = None;
-            return;
-        }
-
         let location = RowLocation {
             source,
             data_file_id: DEFAULT_DATA_FILE_ID,
             row_id: -1,
         };
+
+        let mut incoming_bytes = 0usize;
         for key in keys {
+            if !keyset.keys.contains_key(key) {
+                let entry_bytes = approx_pk_keyset_entry_bytes(key);
+                incoming_bytes = incoming_bytes.saturating_add(entry_bytes);
+                if keyset.approx_bytes.saturating_add(entry_bytes) > PK_KEYSET_CACHE_MAX_BYTES {
+                    tracing::debug!(
+                        table = self.table_metadata.table_name.as_str(),
+                        key_count = keyset.len(),
+                        incoming_key_count = keys.len(),
+                        current_bytes = keyset.approx_bytes,
+                        incoming_bytes,
+                        max_bytes = PK_KEYSET_CACHE_MAX_BYTES,
+                        "Clearing primary-key keyset cache because the write would exceed the byte budget"
+                    );
+                    *guard = None;
+                    return;
+                }
+            }
             keyset.insert(key.clone(), location);
         }
     }
@@ -3562,7 +3800,7 @@ impl CayenneTableProvider {
         &self,
         pk_indices: &[usize],
         converter: &RowConverter,
-    ) -> Result<HashMap<OwnedRow, RowLocation>> {
+    ) -> Result<CachedPkKeyset> {
         // Snapshot the current listing table via ArcSwap (wait-free).
         let listing_table = self.listing_table.load_full();
 
@@ -3600,7 +3838,7 @@ impl CayenneTableProvider {
             _ => None,
         };
 
-        let mut keyset = HashMap::with_capacity(1024);
+        let mut keyset = CachedPkKeyset::with_capacity(1024);
         let mut row_id_base: i64 = 0;
 
         // After projection, batch columns are at indices 0..pk_indices.len()
@@ -3683,7 +3921,7 @@ impl CayenneTableProvider {
         batches: &[RecordBatch],
         pk_indices: &[usize],
         converter: &RowConverter,
-        keyset: &mut HashMap<OwnedRow, RowLocation>,
+        keyset: &mut CachedPkKeyset,
     ) -> Result<()> {
         for batch in batches {
             let pk_columns: Vec<_> = pk_indices
@@ -3702,7 +3940,6 @@ impl CayenneTableProvider {
                         ),
                     });
                 }
-
                 keyset.insert(
                     rows.row(row_index).owned(),
                     RowLocation {
@@ -3740,7 +3977,7 @@ impl CayenneTableProvider {
         deleted_row_keys: Option<&KeyDeletionIndex>,
         min_delete_seq_threshold: Option<i64>,
         table_name: &str,
-        keyset: &mut HashMap<OwnedRow, RowLocation>,
+        keyset: &mut CachedPkKeyset,
         row_id_base: &mut i64,
     ) -> Result<()> {
         while let Some(batch) = stream.next().await {
@@ -3938,12 +4175,17 @@ impl CayenneTableProvider {
                 None
             };
 
+        let deduplicate_batch = !ctx.upsert_options.is_default();
         let mut keep_mask = Vec::with_capacity(batch.num_rows());
-        let mut kept_keys: HashSet<OwnedRow> = HashSet::with_capacity(batch.num_rows());
-        let mut row_keys: Vec<OwnedRow> = if ctx.upsert_options.is_default() {
-            Vec::new()
+        let mut kept_keys: HashSet<OwnedRow> = if deduplicate_batch {
+            HashSet::new()
         } else {
+            HashSet::with_capacity(batch.num_rows())
+        };
+        let mut row_keys: Vec<OwnedRow> = if deduplicate_batch {
             Vec::with_capacity(batch.num_rows())
+        } else {
+            Vec::new()
         };
         let mut delete_specs: HashMap<i64, Vec<i64>> = HashMap::new();
         let mut deleted_pk_i64: Vec<i64> = Vec::new();
@@ -3985,6 +4227,12 @@ impl CayenneTableProvider {
                                 }
                             }
                             PkDeletionStrategyWithCache::RowConverterBased { .. } => {
+                                // Convert the OwnedRow's byte view into a `Box<[u8]>` for the
+                                // delete-list — `deleted_row_keys` and `deleted_inlined_row_keys`
+                                // are typed `Vec<Box<[u8]>>` so they can be forwarded to the
+                                // `commit_on_conflict_deletions` catalog call without a second
+                                // re-encoding. This is one allocation per conflict row; the
+                                // arena-indexed key design discussed in iter 3 would amortize it.
                                 let row_key = key.as_ref().to_vec().into_boxed_slice();
                                 if is_inlined_conflict {
                                     deleted_inlined_row_keys.push(row_key);
@@ -4010,44 +4258,46 @@ impl CayenneTableProvider {
                 true
             };
 
-            if keep_row {
-                kept_keys.insert(key.clone());
+            if deduplicate_batch {
+                row_keys.push(key);
+            } else if keep_row {
+                kept_keys.insert(key);
             }
             keep_mask.push(keep_row);
-            if !ctx.upsert_options.is_default() {
-                row_keys.push(key);
-            }
         }
 
-        if !ctx.upsert_options.is_default() {
-            let mut seen: HashMap<OwnedRow, usize> = HashMap::new();
-            for (row_idx, key) in row_keys.iter().enumerate() {
-                if !keep_mask[row_idx] {
-                    continue;
-                }
-
-                if let Some(existing_idx) = seen.get(key) {
-                    if ctx.upsert_options.last_write_wins {
-                        keep_mask[*existing_idx] = false;
-                        seen.insert(key.clone(), row_idx);
-                    } else if ctx.upsert_options.remove_duplicates {
-                        keep_mask[row_idx] = false;
-                    } else {
-                        return Err(Error::DataValidation {
-                            table: self.table_metadata.table_name.clone(),
-                            message: "Duplicate primary key found in batch".to_string(),
-                        });
+        if deduplicate_batch {
+            {
+                let mut seen: HashMap<&[u8], usize> = HashMap::new();
+                for (row_idx, key) in row_keys.iter().enumerate() {
+                    if !keep_mask[row_idx] {
+                        continue;
                     }
-                } else {
-                    seen.insert(key.clone(), row_idx);
+
+                    let key_bytes = key.as_ref();
+                    if let Some(existing_idx) = seen.get(key_bytes) {
+                        if ctx.upsert_options.last_write_wins {
+                            keep_mask[*existing_idx] = false;
+                            seen.insert(key_bytes, row_idx);
+                        } else if ctx.upsert_options.remove_duplicates {
+                            keep_mask[row_idx] = false;
+                        } else {
+                            return Err(Error::DataValidation {
+                                table: self.table_metadata.table_name.clone(),
+                                message: "Duplicate primary key found in batch".to_string(),
+                            });
+                        }
+                    } else {
+                        seen.insert(key_bytes, row_idx);
+                    }
                 }
             }
 
             kept_keys = row_keys
-                .iter()
+                .into_iter()
                 .zip(&keep_mask)
                 .filter(|(_, keep)| **keep)
-                .map(|(key, _)| key.clone())
+                .map(|(key, _)| key)
                 .collect();
         }
 
@@ -4358,24 +4608,28 @@ impl CayenneTableProvider {
             return Ok(());
         }
 
-        // Get a fresh sequence number for this deletion operation.
-        // This ensures proper ordering: data written after this delete but before
-        // the next delete will be properly filtered.
-        let delete_sequence = self
+        // Reserve two consecutive sequence numbers in one metastore round-trip.
+        // The on-conflict path needs a delete sequence (for the DeleteFile that
+        // hides the old row) and a strictly higher insert sequence (for the
+        // replacement row's insert record so it is visible after the delete).
+        //
+        // Using `reserve_sequence_numbers(2)` instead of two separate
+        // `increment_sequence_number` calls reduces writer-lock acquisitions on
+        // the serialized SQLite/Turso metastore and is the main lever for the
+        // "metastore round-trips" concern on the hot upsert path.
+        let base = self
             .catalog
-            .increment_sequence_number(&self.table_metadata.table_id)
+            .reserve_sequence_numbers(&self.table_metadata.table_id, 2)
             .await
             .map_err(|err| CatalogError::InvalidOperationNoSource {
-                message: format!("Failed to get delete sequence number: {err}"),
+                message: format!("Failed to reserve sequence numbers for on-conflict: {err}"),
             })?;
-
-        // The insert sequence must be higher than delete sequence so the new row
-        // isn't filtered out. We use delete_sequence + 1 for the re-insertion.
-        let insert_sequence = delete_sequence + 1;
+        let delete_sequence = base;
+        let insert_sequence = base + 1;
 
         // Create a temporary metadata with the fresh delete sequence number.
         // The table_metadata's current_sequence_number is stale (set at table open time),
-        // so we must use the actual delete_sequence from increment_sequence_number().
+        // so we must use the actual delete_sequence we just reserved.
         let mut temp_metadata = self.table_metadata.clone();
         temp_metadata.current_sequence_number = delete_sequence;
         let writer = DeletionVectorWriter::new(&temp_metadata);
@@ -4416,16 +4670,11 @@ impl CayenneTableProvider {
             return Ok(());
         }
 
+        // Track new position-based deletions for the in-memory cache update
+        // below. This walks the same `results` list we'd otherwise enumerate
+        // during per-file `add_delete_file` calls.
         let mut new_deleted_rows = RoaringBitmap::new();
-        // Register new delete files
         for result in &results {
-            self.catalog
-                .add_delete_file(result.delete_file.clone())
-                .await
-                .map_err(|err| CatalogError::InvalidOperationNoSource {
-                    message: format!("Failed to register delete file: {err}"),
-                })?;
-
             if let DeletionIdentifier::PositionBased { row_ids, .. } = &result.identifiers {
                 for &row_id in row_ids {
                     if let Ok(row_id_u32) = u32::try_from(row_id) {
@@ -4435,21 +4684,26 @@ impl CayenneTableProvider {
             }
         }
 
-        // Persist insert records for reinserted PKs so sequence-based visibility survives restart.
-        // Without this, caches may allow reinserted rows in-process, but after restart the
-        // catalog reload would miss insert sequences and incorrectly hide rows as deleted.
-        if !pk_bytes_list_for_insert_records.is_empty() {
-            self.catalog
-                .add_insert_records_batch(
-                    &self.table_metadata.table_id,
-                    pk_bytes_list_for_insert_records,
-                    insert_sequence,
-                )
-                .await
-                .map_err(|err| CatalogError::InvalidOperationNoSource {
-                    message: format!("Failed to persist insert records for upserted PKs: {err}"),
-                })?;
-        }
+        // Atomically commit every delete-file row AND every insert-record row
+        // in one catalog transaction. Replaces the legacy
+        // `add_delete_file × N` + `add_insert_records_batch` sequence which
+        // left a crash window where deletion records could persist without
+        // their corresponding insert sequences — see
+        // `crates/cayenne/benches/apply_on_conflict_rpc_ceiling.rs` for the
+        // metastore call-count shape and atomicity tradeoff.
+        let delete_files: Vec<crate::metadata::DeleteFile> =
+            results.iter().map(|r| r.delete_file.clone()).collect();
+        self.catalog
+            .commit_on_conflict_deletions(
+                delete_files,
+                &self.table_metadata.table_id,
+                pk_bytes_list_for_insert_records,
+                insert_sequence,
+            )
+            .await
+            .map_err(|err| CatalogError::InvalidOperationNoSource {
+                message: format!("Failed to commit on-conflict deletions: {err}"),
+            })?;
 
         // For PK-based strategies, keep old delete files to preserve deletion history.
         // Each upsert round may affect a different subset of PKs, so removing old files
@@ -4811,7 +5065,10 @@ impl CayenneTableProvider {
 
     pub(crate) fn schedule_post_write_compaction(&self) {
         let cfg = self.context.compaction_picker_config();
-        if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files {
+        let maintenance_trigger = self.protected_snapshot_maintenance_trigger();
+        if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files
+            && maintenance_trigger.is_none()
+        {
             return;
         }
 
@@ -4966,15 +5223,24 @@ impl CayenneTableProvider {
     async fn run_one_compaction_pass(&self) -> Result<bool> {
         use super::compaction::{FileEntry, pick_candidates};
 
-        // Cheap early-out using in-memory counter. During the common
+        // Cheap early-out using in-memory counters. During the common
         // "accumulation phase" of many small appends we have not yet created
-        // enough new files in the current snapshot to possibly cross the
-        // trigger threshold. This avoids the expensive full snapshot listing
-        // (S3 LIST or local readdir of potentially thousands of files) on
-        // every post-write trigger.
+        // enough new files or protected snapshots to possibly cross a
+        // compaction threshold. This avoids the expensive full snapshot
+        // listing (S3 LIST or local readdir of potentially thousands of files)
+        // on every post-write trigger.
         let cfg = self.context.compaction_picker_config();
-        if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files {
+        let maintenance_trigger = self.protected_snapshot_maintenance_trigger();
+        if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files
+            && maintenance_trigger.is_none()
+        {
             return Ok(false);
+        }
+
+        if let Some(trigger) = maintenance_trigger {
+            self.log_snapshot_maintenance_trigger(trigger);
+            self.rewrite_current_snapshot_for_compaction().await?;
+            return Ok(true);
         }
 
         let snapshot_id = self.get_current_snapshot_id();
@@ -5065,6 +5331,44 @@ impl CayenneTableProvider {
         }
 
         Ok(files)
+    }
+
+    fn protected_snapshot_maintenance_trigger(&self) -> Option<SnapshotMaintenanceTrigger> {
+        let protected_snapshots = self.protected_snapshots.read();
+        protected_snapshot_maintenance_trigger(
+            &self.protected_snapshot_age_warning_keys,
+            &protected_snapshots,
+            self.context.compaction_trigger_protected_snapshots(),
+            self.context.compaction_trigger_snapshot_age(),
+            SystemTime::now(),
+        )
+    }
+
+    fn log_snapshot_maintenance_trigger(&self, trigger: SnapshotMaintenanceTrigger) {
+        match trigger {
+            SnapshotMaintenanceTrigger::ProtectedSnapshotCount {
+                protected_snapshot_count,
+                trigger_count,
+            } => tracing::info!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                protected_snapshot_count,
+                trigger_count,
+                "Running protected snapshot maintenance compaction because the count trigger fired"
+            ),
+            SnapshotMaintenanceTrigger::ProtectedSnapshotAge {
+                protected_snapshot_count,
+                oldest_snapshot_age,
+                trigger_age,
+            } => tracing::info!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                protected_snapshot_count,
+                oldest_snapshot_age_ms = duration_millis_saturating(oldest_snapshot_age),
+                trigger_age_ms = duration_millis_saturating(trigger_age),
+                "Running protected snapshot maintenance compaction because the age trigger fired"
+            ),
+        }
     }
 
     async fn list_snapshot_files_with_sizes_local(
@@ -5165,10 +5469,14 @@ impl CayenneTableProvider {
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 sort_columns = ?self.context.sort_columns(),
-                "Sorting compaction rewrite"
+                target_partitions = ctx.state().config().target_partitions(),
+                "Sorting compaction rewrite — individual output files will receive \
+                 hash-partitioned slices of the globally sorted stream (excellent \
+                 global ordering, good but not perfect per-file zone maps). \
+                 Parallelism is preserved."
             );
             stream = self.sort_stream(stream)?;
-            1
+            ctx.state().config().target_partitions()
         } else {
             ctx.state().config().target_partitions()
         };
@@ -5525,18 +5833,44 @@ impl CayenneTableProvider {
         guard.clone()
     }
 
+    fn invalidate_scan_listing_table_cache_for_snapshot(&self, snapshot_id: &str) {
+        let mut cache = self.scan_listing_tables.lock();
+        cache.retain(|key, _| key.snapshot_id != snapshot_id);
+        let cache_entries = cache.len();
+        drop(cache);
+        self.record_scan_listing_table_cache_entries(cache_entries);
+    }
+
+    /// Returns the number of per-scan `ListingTable` entries currently cached.
+    ///
+    /// Exposed as `#[doc(hidden)] pub` so integration tests can assert cache
+    /// invalidation behavior without reaching into private fields.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn scan_listing_table_cache_entry_count(&self) -> usize {
+        self.scan_listing_tables.lock().len()
+    }
+
     /// Update the current snapshot ID after a compaction operation.
     ///
     /// This must be called after `commit_compaction` to keep the in-memory snapshot ID
     /// in sync with the catalog.
     ///
     pub(crate) fn update_current_snapshot_id(&self, new_snapshot_id: &str) {
-        let mut guard = self.current_snapshot_id.write();
-        if guard.as_str() != new_snapshot_id {
-            self.scan_listing_tables.lock().clear();
-            self.record_scan_listing_table_cache_entries(0);
+        let previous_snapshot_id = {
+            let mut guard = self.current_snapshot_id.write();
+            if guard.as_str() == new_snapshot_id {
+                None
+            } else {
+                let previous_snapshot_id = guard.clone();
+                *guard = new_snapshot_id.to_string();
+                Some(previous_snapshot_id)
+            }
+        };
+
+        if let Some(previous_snapshot_id) = previous_snapshot_id {
+            self.invalidate_scan_listing_table_cache_for_snapshot(&previous_snapshot_id);
         }
-        *guard = new_snapshot_id.to_string();
 
         // Any snapshot rewrite (compaction, sort, etc.) means the "new files
         // since last compaction" counter should be reset. The next accumulation
@@ -5761,8 +6095,7 @@ impl CayenneTableProvider {
         );
 
         Self::invalidate_list_files_cache(self.context.runtime_env(), &snapshot_dir_url);
-        self.scan_listing_tables.lock().clear();
-        self.record_scan_listing_table_cache_entries(0);
+        self.invalidate_scan_listing_table_cache_for_snapshot(&current_snapshot);
 
         tracing::trace!(
             table = self.table_metadata.table_name.as_str(),
@@ -5772,7 +6105,8 @@ impl CayenneTableProvider {
     }
 
     /// Acquire the listing fence and publish current-snapshot file changes.
-    pub(crate) async fn publish_current_snapshot_files_changed(&self) {
+    #[doc(hidden)]
+    pub async fn publish_current_snapshot_files_changed(&self) {
         let _fence = self.listing_fence.write().await;
         self.publish_current_snapshot_files_changed_under_held_fence();
     }
@@ -5846,23 +6180,49 @@ impl CayenneTableProvider {
     /// Best-effort: logs a warning and continues if stats persistence fails,
     /// since stats are an optimization and not critical for correctness.
     pub(crate) async fn persist_table_stats(&self, accumulator: &ColumnStatsAccumulator) {
+        let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
+        self.persist_table_stats_locked(accumulator).await;
+    }
+
+    pub(crate) async fn reset_table_stats_after_overwrite(
+        &self,
+        accumulator: &ColumnStatsAccumulator,
+    ) {
+        let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
+        self.clear_cached_table_statistics_unlocked();
+        self.persist_table_stats_locked(accumulator).await;
+    }
+
+    async fn persist_table_stats_locked(&self, accumulator: &ColumnStatsAccumulator) {
         let Some((new_blob, new_rows)) = accumulator.to_file_statistics_blob_with_row_count()
         else {
             return;
         };
 
-        let existing_stats = match self
-            .catalog
-            .get_table_statistics(&self.table_metadata.table_id)
-            .await
-        {
-            Ok(stats) => stats,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to load existing table stats for {} before merge: {e}",
-                    self.table_metadata.table_name
-                );
-                None
+        // Prefer an in-memory cached raw blob (populated by previous persist or load)
+        // to avoid a catalog round-trip on every write. Only hit the catalog when
+        // the cache is cold.
+        let cached_raw = {
+            let guard = self.table_statistics.read();
+            guard.raw.clone()
+        };
+
+        let existing_stats = if let Some(raw) = cached_raw {
+            Some(raw)
+        } else {
+            match self
+                .catalog
+                .get_table_statistics(&self.table_metadata.table_id)
+                .await
+            {
+                Ok(stats) => stats,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load existing table stats for {} before merge: {e}",
+                        self.table_metadata.table_name
+                    );
+                    None
+                }
             }
         };
 
@@ -5896,10 +6256,11 @@ impl CayenneTableProvider {
             return;
         }
 
-        self.set_cached_table_statistics(Self::table_statistics_to_df(
-            &self.table_metadata.schema,
-            &stats,
-        ));
+        let df_stats = Self::table_statistics_to_df(&self.table_metadata.schema, &stats);
+        let mut cache = self.table_statistics.write();
+        cache.optimizer = df_stats;
+        // Keep the raw blob for the next persist to avoid a catalog read.
+        cache.raw = Some(stats);
     }
 
     /// Write small batches directly to the metastore, optionally atomically
@@ -7016,10 +7377,13 @@ impl CayenneTableProvider {
             protected_snapshot_count = protected_snapshots.len(),
             "Cayenne scan includes protected snapshots"
         );
-        if protected_snapshots.len() >= 4 {
+        let protected_snapshot_trigger = self.context.compaction_trigger_protected_snapshots();
+        let protected_snapshot_warn_threshold = protected_snapshot_trigger.max(1);
+        if protected_snapshots.len() >= protected_snapshot_warn_threshold {
             tracing::warn!(
                 table = %self.table_metadata.table_name,
                 protected_snapshot_count = protected_snapshots.len(),
+                protected_snapshot_warn_threshold,
                 "Cayenne scan has high protected snapshot amplification"
             );
         }
@@ -7143,20 +7507,23 @@ impl CayenneTableProvider {
         min_delete_seq_to_apply: i64,
         deletion_snapshot: &PkDeletionSnapshot,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        // Previously this rebuilt a per-snapshot `DeletionIndex` via
+        // `HashMap::collect` + bloom-filter rebuild — O(N · M) per scan
+        // where N = #protected_snapshots and M = total deletion entries.
+        // The fix shares the existing index across snapshots and pushes
+        // the per-snapshot `min_seq` filter into the probe loop, which
+        // already pays a bloom prefilter; one integer comparison per
+        // confirmed match is amortized to ~zero per row. See
+        // `crates/cayenne/benches/apply_partial_deletion_filter_per_scan.rs`
+        // for the before-numbers.
         match deletion_snapshot {
             PkDeletionSnapshot::Int64Pk {
                 deleted_pk_values, ..
             } => {
-                // Filter to only include deletions with seq > min_delete_seq_to_apply.
-                let filtered_deletions: HashMap<i64, i64> = deleted_pk_values
-                    .entries()
-                    .iter()
-                    .filter(|(_, seq)| **seq > min_delete_seq_to_apply)
-                    .map(|(&pk, &seq)| (pk, seq))
-                    .collect();
-
-                if filtered_deletions.is_empty() {
-                    // No deletions to apply, return plan as-is
+                if deleted_pk_values
+                    .max_sequence_number()
+                    .is_none_or(|max_sequence| max_sequence <= min_delete_seq_to_apply)
+                {
                     return Ok(Arc::new(CayenneAccelerationExec::new(plan)));
                 }
 
@@ -7170,35 +7537,31 @@ impl CayenneTableProvider {
                 let empty_insert_records = Arc::new(DeletionIndex::empty());
                 Ok(Arc::new(Int64PkDeletionFilterExec::new(
                     plan,
-                    Arc::new(DeletionIndex::from_map(filtered_deletions)),
+                    Arc::clone(deleted_pk_values),
                     empty_insert_records,
                     pk_column_index,
+                    Some(min_delete_seq_to_apply),
                 )))
             }
             PkDeletionSnapshot::RowConverterBased {
                 deleted_row_keys, ..
             } => {
-                // Similar logic for RowConverter-based strategy
                 if let Some(ref row_converter) = self.pk_row_converter {
-                    // Filter to only include deletions with seq > min_delete_seq_to_apply.
-                    let filtered_deletions: HashMap<Box<[u8]>, i64> = deleted_row_keys
-                        .entries()
-                        .iter()
-                        .filter(|(_, seq)| **seq > min_delete_seq_to_apply)
-                        .map(|(key, &seq)| (key.clone(), seq))
-                        .collect();
-
-                    if filtered_deletions.is_empty() {
+                    if deleted_row_keys
+                        .max_sequence_number()
+                        .is_none_or(|max_sequence| max_sequence <= min_delete_seq_to_apply)
+                    {
                         return Ok(Arc::new(CayenneAccelerationExec::new(plan)));
                     }
 
                     let empty_insert_records = Arc::new(KeyDeletionIndex::empty());
                     Ok(Arc::new(KeyBasedDeletionFilterExec::new(
                         plan,
-                        Arc::new(KeyDeletionIndex::from_map(filtered_deletions)),
+                        Arc::clone(deleted_row_keys),
                         empty_insert_records,
                         pk_indices_in_projection.to_vec(),
                         Arc::clone(row_converter),
+                        Some(min_delete_seq_to_apply),
                     )))
                 } else {
                     Ok(Arc::new(CayenneAccelerationExec::new(plan)))
@@ -7240,6 +7603,7 @@ impl CayenneTableProvider {
                         Arc::clone(deleted_pk_values),
                         empty_insert_records,
                         pk_column_index,
+                        None,
                     )));
                 }
             }
@@ -7257,6 +7621,7 @@ impl CayenneTableProvider {
                             empty_insert_records,
                             pk_indices_in_projection.to_vec(),
                             Arc::clone(row_converter),
+                            None,
                         )));
                     }
                 }
@@ -7305,6 +7670,7 @@ impl CayenneTableProvider {
                         Arc::clone(deleted_pk_values),
                         Arc::clone(insert_records),
                         pk_column_index,
+                        None,
                     )));
                 }
             }
@@ -7328,6 +7694,7 @@ impl CayenneTableProvider {
                         Arc::clone(insert_records),
                         pk_indices_in_projection.to_vec(),
                         Arc::clone(row_converter),
+                        None,
                     )));
                 }
             }
@@ -8177,6 +8544,93 @@ mod tests {
     use tempfile::TempDir;
     use test_framework::arrow_record_batch_gen::*;
 
+    fn protected_snapshot_id_at_unix_time(seconds: u64) -> String {
+        uuid::Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, seconds, 0)).to_string()
+    }
+
+    #[test]
+    fn protected_snapshot_maintenance_trigger_uses_compaction_count_threshold() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let warning_keys = ParkingMutex::new(BoundedWarningKeys::default());
+        let protected_snapshots =
+            HashMap::from([("snapshot-1".to_string(), 1), ("snapshot-2".to_string(), 2)]);
+
+        assert_eq!(
+            protected_snapshot_maintenance_trigger(
+                &warning_keys,
+                &protected_snapshots,
+                2,
+                Some(Duration::from_secs(300)),
+                now,
+            ),
+            Some(SnapshotMaintenanceTrigger::ProtectedSnapshotCount {
+                protected_snapshot_count: 2,
+                trigger_count: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn protected_snapshot_maintenance_trigger_uses_oldest_snapshot_age() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let warning_keys = ParkingMutex::new(BoundedWarningKeys::default());
+        let protected_snapshots = HashMap::from([
+            (protected_snapshot_id_at_unix_time(900), 1),
+            (protected_snapshot_id_at_unix_time(990), 2),
+        ]);
+
+        assert_eq!(
+            protected_snapshot_maintenance_trigger(
+                &warning_keys,
+                &protected_snapshots,
+                8,
+                Some(Duration::from_secs(60)),
+                now,
+            ),
+            Some(SnapshotMaintenanceTrigger::ProtectedSnapshotAge {
+                protected_snapshot_count: 2,
+                oldest_snapshot_age: Duration::from_secs(100),
+                trigger_age: Duration::from_secs(60),
+            })
+        );
+    }
+
+    #[test]
+    fn protected_snapshot_maintenance_trigger_ignores_invalid_uuid_for_age() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let warning_keys = ParkingMutex::new(BoundedWarningKeys::default());
+        let protected_snapshots = HashMap::from([("not-a-uuid".to_string(), 1)]);
+
+        assert_eq!(
+            protected_snapshot_maintenance_trigger(
+                &warning_keys,
+                &protected_snapshots,
+                8,
+                Some(Duration::from_secs(60)),
+                now,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn protected_snapshot_maintenance_trigger_ignores_future_uuid_for_age() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let warning_keys = ParkingMutex::new(BoundedWarningKeys::default());
+        let protected_snapshots = HashMap::from([(protected_snapshot_id_at_unix_time(1_100), 1)]);
+
+        assert_eq!(
+            protected_snapshot_maintenance_trigger(
+                &warning_keys,
+                &protected_snapshots,
+                8,
+                Some(Duration::from_secs(60)),
+                now,
+            ),
+            None
+        );
+    }
+
     #[test]
     fn pk_deletion_snapshot_is_stable_after_cache_publish() {
         let deletion_snapshot =
@@ -8647,7 +9101,7 @@ mod tests {
             )),
         };
 
-        let mut keyset = HashMap::new();
+        let mut keyset = CachedPkKeyset::with_capacity(0);
         let mut row_id_base: i64 = 0;
 
         CayenneTableProvider::process_stream_into_keyset(
@@ -8686,7 +9140,7 @@ mod tests {
             )),
         };
 
-        let mut keyset = HashMap::new();
+        let mut keyset = CachedPkKeyset::with_capacity(0);
         let mut row_id_base: i64 = 0;
 
         // threshold=10: only deletions with del_seq > 10 apply
@@ -8721,7 +9175,7 @@ mod tests {
 
         let strategy = PkDeletionStrategyWithCache::empty_int64_pk();
 
-        let mut keyset = HashMap::new();
+        let mut keyset = CachedPkKeyset::with_capacity(0);
         let mut row_id_base: i64 = 0;
 
         CayenneTableProvider::process_stream_into_keyset(
@@ -8903,6 +9357,38 @@ mod tests {
                 .output_partitioning()
                 .partition_count(),
             4
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_cached_table_statistics_drops_optimizer_cache() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_sorted_cayenne_table(
+            "clear_cached_stats_optimizer_test",
+            schema,
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        {
+            let mut cache = provider.table_statistics.write();
+            cache.optimizer = Some(datafusion_common::Statistics::new_unknown(
+                &provider.table_metadata.schema,
+            ));
+        }
+
+        assert!(
+            provider.table_statistics.read().optimizer.is_some(),
+            "precondition: derived Statistics cache must be seeded"
+        );
+
+        provider.clear_cached_table_statistics_unlocked();
+
+        assert!(
+            provider.table_statistics.read().optimizer.is_none(),
+            "clear must drop the derived Statistics cache"
         );
     }
 

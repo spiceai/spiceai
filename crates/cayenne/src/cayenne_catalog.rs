@@ -25,8 +25,8 @@ use super::metastore::sqlite::SqliteMetastore;
 #[cfg(feature = "turso")]
 use super::metastore::turso::TursoMetastore;
 use super::metastore::{
-    ExecuteParams, MetastoreBackend, MetastoreRow, MetastoreTransaction, MetastoreValue,
-    QueryParams, QueryRowParams,
+    ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreTransaction,
+    MetastoreValue, QueryParams, QueryRowParams,
 };
 use async_trait::async_trait;
 use datafusion_table_providers::util::on_conflict::OnConflict;
@@ -45,6 +45,26 @@ struct ExistingDeleteFileRecord {
     file_size_bytes: i64,
     source_data_file_path: Option<String>,
     sequence_number: i64,
+}
+
+fn metastore_value_at(values: &[MetastoreValue], index: usize) -> CatalogResult<&MetastoreValue> {
+    values.get(index).ok_or_else(|| CatalogError::Database {
+        message: format!("Expected metastore value at index {index}"),
+    })
+}
+
+fn existing_delete_file_record_from_values(
+    values: &[MetastoreValue],
+) -> CatalogResult<ExistingDeleteFileRecord> {
+    Ok(ExistingDeleteFileRecord {
+        delete_file_id: String::from_value(metastore_value_at(values, 0)?)?,
+        path_is_relative: bool::from_value(metastore_value_at(values, 1)?)?,
+        format: String::from_value(metastore_value_at(values, 2)?)?,
+        delete_count: i64::from_value(metastore_value_at(values, 3)?)?,
+        file_size_bytes: i64::from_value(metastore_value_at(values, 4)?)?,
+        source_data_file_path: Option::<String>::from_value(metastore_value_at(values, 5)?)?,
+        sequence_number: Option::<i64>::from_value(metastore_value_at(values, 6)?)?.unwrap_or(0),
+    })
 }
 
 /// Metastore backend enum to support different implementations.
@@ -231,6 +251,91 @@ impl CayenneCatalog {
         self.metastore.begin_transaction().await
     }
 
+    async fn existing_delete_file_record(
+        &self,
+        table_id: &str,
+        path: &str,
+    ) -> CatalogResult<Option<ExistingDeleteFileRecord>> {
+        let records = self
+            .metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT delete_file_id, path_is_relative, format, delete_count,
+                           file_size_bytes, source_data_file_path, sequence_number
+                    FROM cayenne_delete_file
+                    WHERE table_id = ?1 AND path = ?2
+                    ORDER BY delete_file_id DESC
+                    LIMIT 1
+                ",
+                    params: vec![
+                        MetastoreValue::Text(table_id.to_string()),
+                        MetastoreValue::Text(path.to_string()),
+                    ],
+                },
+                |row| {
+                    Ok(ExistingDeleteFileRecord {
+                        delete_file_id: row.get_string(0)?,
+                        path_is_relative: row.get_bool(1)?,
+                        format: row.get_string(2)?,
+                        delete_count: row.get_i64(3)?,
+                        file_size_bytes: row.get_i64(4)?,
+                        source_data_file_path: row.get_optional_string(5)?,
+                        sequence_number: row.get_optional_i64(6)?.unwrap_or(0),
+                    })
+                },
+            )
+            .await?;
+
+        Ok(records.into_iter().next())
+    }
+
+    async fn validate_existing_delete_file_if_present_in_transaction(
+        tx: &dyn MetastoreTransaction,
+        delete_file: &DeleteFile,
+    ) -> CatalogResult<()> {
+        // The failing `ON CONFLICT DO UPDATE` path uses SQLite's default ABORT
+        // conflict mode: the statement is rolled back, but the transaction stays
+        // open for this validation read. Turso is expected to preserve the same
+        // SQLite-compatible transaction behavior.
+        let count_values = tx
+            .query_row_values(QueryRowParams {
+                sql: r"
+                    SELECT COUNT(*)
+                    FROM cayenne_delete_file
+                    WHERE table_id = ?1 AND path = ?2
+                ",
+                params: vec![
+                    MetastoreValue::Text(delete_file.table_id.clone()),
+                    MetastoreValue::Text(delete_file.path.clone()),
+                ],
+            })
+            .await?;
+        let existing_count = i64::from_value(metastore_value_at(&count_values, 0)?)?;
+        if existing_count == 0 {
+            return Ok(());
+        }
+
+        let record_values = tx
+            .query_row_values(QueryRowParams {
+                sql: r"
+                    SELECT delete_file_id, path_is_relative, format, delete_count,
+                           file_size_bytes, source_data_file_path, sequence_number
+                    FROM cayenne_delete_file
+                    WHERE table_id = ?1 AND path = ?2
+                    ORDER BY delete_file_id DESC
+                    LIMIT 1
+                ",
+                params: vec![
+                    MetastoreValue::Text(delete_file.table_id.clone()),
+                    MetastoreValue::Text(delete_file.path.clone()),
+                ],
+            })
+            .await?;
+        let existing_record = existing_delete_file_record_from_values(&record_values)?;
+        validate_existing_delete_file_record(delete_file, &existing_record)
+    }
+
     /// Apply a compaction commit's catalog mutations inside the caller's
     /// `MetastoreTransaction`, without opening a new transaction.
     ///
@@ -393,7 +498,7 @@ impl CayenneCatalog {
         sequence_number: i64,
     ) -> CatalogResult<()> {
         let (sql, params) =
-            Self::build_insert_records_chunk_sql(table_id, pk_bytes_list, sequence_number);
+            Self::build_insert_records_chunk_sql(table_id, &pk_bytes_list, sequence_number);
 
         self.metastore
             .execute_helper(ExecuteParams { sql: &sql, params })
@@ -408,14 +513,14 @@ impl CayenneCatalog {
     /// Build the SQL and parameters for a single chunk of insert records.
     fn build_insert_records_chunk_sql(
         table_id: &str,
-        pk_bytes_list: Vec<Vec<u8>>,
+        pk_bytes_list: &[Vec<u8>],
         sequence_number: i64,
     ) -> (String, Vec<MetastoreValue>) {
         let mut values_parts = Vec::with_capacity(pk_bytes_list.len());
         let mut params = Vec::with_capacity(pk_bytes_list.len() * 4);
         let table_id = table_id.to_string();
 
-        for (i, pk_bytes) in pk_bytes_list.into_iter().enumerate() {
+        for (i, pk_bytes) in pk_bytes_list.iter().enumerate() {
             let base = i * 4 + 1; // SQLite params are 1-indexed
             values_parts.push(format!(
                 "(?{}, ?{}, ?{}, ?{})",
@@ -426,13 +531,77 @@ impl CayenneCatalog {
             ));
             params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
             params.push(MetastoreValue::Text(table_id.clone()));
-            params.push(MetastoreValue::Blob(pk_bytes));
+            params.push(MetastoreValue::Blob(pk_bytes.clone()));
             params.push(MetastoreValue::Integer(sequence_number));
         }
 
         let sql = format!(
             "INSERT OR REPLACE INTO cayenne_insert_record \
              (insert_record_id, table_id, pk_bytes, sequence_number) VALUES {}",
+            values_parts.join(", ")
+        );
+
+        (sql, params)
+    }
+
+    /// Build a multi-VALUES `INSERT ... ON CONFLICT(table_id, path) DO UPDATE`
+    /// for a chunk of delete-file rows. Each row uses 9 parameters; the
+    /// per-row `ON CONFLICT` clause references `excluded` (the single
+    /// conflicting row), so the idempotency check is the same as the
+    /// single-row form previously emitted in `commit_on_conflict_deletions`.
+    fn build_insert_delete_files_chunk_sql(
+        delete_files: &[DeleteFile],
+    ) -> (String, Vec<MetastoreValue>) {
+        const PARAMS_PER_ROW: usize = 9;
+        let mut values_parts = Vec::with_capacity(delete_files.len());
+        let mut params = Vec::with_capacity(delete_files.len() * PARAMS_PER_ROW);
+
+        for (i, delete_file) in delete_files.iter().enumerate() {
+            let base = i * PARAMS_PER_ROW + 1; // 1-indexed
+            values_parts.push(format!(
+                "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
+                base,
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7,
+                base + 8,
+            ));
+            params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
+            params.push(MetastoreValue::Text(delete_file.table_id.clone()));
+            params.push(MetastoreValue::Text(delete_file.path.clone()));
+            params.push(MetastoreValue::Bool(delete_file.path_is_relative));
+            params.push(MetastoreValue::Text(delete_file.format.clone()));
+            params.push(MetastoreValue::Integer(delete_file.delete_count));
+            params.push(MetastoreValue::Integer(delete_file.file_size_bytes));
+            params.push(
+                delete_file
+                    .source_data_file_path
+                    .clone()
+                    .map_or(MetastoreValue::Null, MetastoreValue::Text),
+            );
+            params.push(MetastoreValue::Integer(delete_file.sequence_number));
+        }
+
+        let sql = format!(
+            "INSERT INTO cayenne_delete_file (\
+                 delete_file_id, table_id, path, path_is_relative, \
+                 format, delete_count, file_size_bytes, source_data_file_path, sequence_number\
+             ) VALUES {} \
+             ON CONFLICT(table_id, path) DO UPDATE SET \
+                 path = CASE \
+                     WHEN cayenne_delete_file.path_is_relative = excluded.path_is_relative \
+                         AND cayenne_delete_file.format = excluded.format \
+                         AND cayenne_delete_file.delete_count = excluded.delete_count \
+                         AND cayenne_delete_file.file_size_bytes = excluded.file_size_bytes \
+                         AND cayenne_delete_file.source_data_file_path IS excluded.source_data_file_path \
+                         AND cayenne_delete_file.sequence_number = excluded.sequence_number \
+                     THEN cayenne_delete_file.path \
+                     ELSE NULL \
+                 END",
             values_parts.join(", ")
         );
 
@@ -854,38 +1023,17 @@ impl MetadataCatalog for CayenneCatalog {
             {
                 // Another concurrent operation inserted first — only treat this as idempotent
                 // when the existing row matches the incoming delete-file metadata.
-                let existing_record: ExistingDeleteFileRecord = self
-                    .metastore
-                    .query_row_helper(
-                        QueryRowParams {
-                            sql: r"
-                            SELECT delete_file_id, path_is_relative, format, delete_count,
-                                   file_size_bytes, source_data_file_path, sequence_number
-                            FROM cayenne_delete_file
-                            WHERE table_id = ?1 AND path = ?2
-                            ORDER BY delete_file_id DESC
-                            LIMIT 1
-                        ",
-                            params: vec![
-                                MetastoreValue::Text(delete_file.table_id.clone()),
-                                MetastoreValue::Text(delete_file.path.clone()),
-                            ],
-                        },
-                        |row| {
-                            Ok(ExistingDeleteFileRecord {
-                                delete_file_id: row.get_string(0)?,
-                                path_is_relative: row.get_bool(1)?,
-                                format: row.get_string(2)?,
-                                delete_count: row.get_i64(3)?,
-                                file_size_bytes: row.get_i64(4)?,
-                                source_data_file_path: row.get_optional_string(5)?,
-                                sequence_number: row.get_optional_i64(6)?.unwrap_or(0),
-                            })
-                        },
-                    )
+                let existing_record = self
+                    .existing_delete_file_record(&delete_file.table_id, &delete_file.path)
                     .await
                     .map_err(|e| CatalogError::FailedToAddDeleteFile {
                         source: Box::new(e),
+                    })?
+                    .ok_or_else(|| CatalogError::ConstraintViolation {
+                        message: format!(
+                            "Delete file path '{}' for table '{}' hit a unique constraint but the existing row could not be found",
+                            delete_file.path, delete_file.table_id
+                        ),
                     })?;
 
                 validate_existing_delete_file_record(&delete_file, &existing_record).map_err(
@@ -980,20 +1128,119 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn increment_sequence_number(&self, table_id: &str) -> CatalogResult<i64> {
-        // Atomically increment and return the new sequence number
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "UPDATE cayenne_table SET current_sequence_number = current_sequence_number + 1 WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id.to_string())],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to increment sequence number".to_string(),
-                source: Box::new(e),
-            })?;
+        self.reserve_sequence_numbers(table_id, 1).await
+    }
 
-        // Retrieve the new sequence number
-        self.get_sequence_number(table_id).await
+    async fn reserve_sequence_numbers(&self, table_id: &str, count: u32) -> CatalogResult<i64> {
+        if count == 0 {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "reserve_sequence_numbers called with count=0".to_string(),
+            });
+        }
+        let delta = i64::from(count);
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+
+        for attempt in 1..=max_attempts {
+            let tx = match self.metastore.begin_transaction().await {
+                Ok(tx) => tx,
+                Err(e) => {
+                    if retry_on_metastore_write_conflict(
+                        &e,
+                        attempt,
+                        max_attempts,
+                        "begin sequence reservation transaction",
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    return Err(CatalogError::InvalidOperation {
+                        message: format!(
+                            "Failed to begin transaction reserving {count} sequence numbers"
+                        ),
+                        source: Box::new(e),
+                    });
+                }
+            };
+
+            let row_values = match tx
+                .query_row_values(QueryRowParams {
+                    sql: "UPDATE cayenne_table SET current_sequence_number = current_sequence_number + ?2 WHERE table_id = ?1 RETURNING current_sequence_number",
+                    params: vec![
+                        MetastoreValue::Text(table_id.to_string()),
+                        MetastoreValue::Integer(delta),
+                    ],
+                })
+                .await
+            {
+                Ok(row_values) => row_values,
+                Err(e) => {
+                    if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
+                        drop(tx);
+                        sleep_before_metastore_write_retry(
+                            attempt,
+                            max_attempts,
+                            "reserve sequence number block",
+                        )
+                        .await;
+                        continue;
+                    }
+                    if is_query_returned_no_rows(&e) {
+                        return Err(CatalogError::InvalidOperationNoSource {
+                            message: format!(
+                                "Cannot reserve {count} sequence numbers for table_id '{table_id}': table row does not exist"
+                            ),
+                        });
+                    }
+                    return Err(CatalogError::InvalidOperation {
+                        message: format!("Failed to reserve {count} sequence numbers"),
+                        source: Box::new(e),
+                    });
+                }
+            };
+            let Some(new_high_value) = row_values.first() else {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: "Failed to read reserved sequence high-water mark: query returned no columns"
+                        .to_string(),
+                });
+            };
+            let new_high =
+                i64::from_value(new_high_value).map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to parse reserved sequence high-water mark".to_string(),
+                    source: Box::new(e),
+                })?;
+
+            match tx.commit().await {
+                Ok(()) => {
+                    // The reserved block is [new_high - delta + 1, new_high]
+                    return Ok(new_high - delta + 1);
+                }
+                Err(e) => {
+                    if retry_on_metastore_write_conflict(
+                        &e,
+                        attempt,
+                        max_attempts,
+                        "commit sequence reservation transaction",
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    return Err(CatalogError::InvalidOperation {
+                        message: format!(
+                            "Failed to commit reservation of {count} sequence numbers"
+                        ),
+                        source: Box::new(e),
+                    });
+                }
+            }
+        }
+
+        Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "reserve_sequence_numbers exhausted {max_attempts} retry attempts after retryable write conflicts"
+            ),
+        })
     }
 
     async fn get_sequence_number(&self, table_id: &str) -> CatalogResult<i64> {
@@ -1079,7 +1326,7 @@ impl MetadataCatalog for CayenneCatalog {
 
         for chunk in pk_bytes_list.chunks(MAX_ROWS_PER_CHUNK) {
             let (sql, params) =
-                Self::build_insert_records_chunk_sql(table_id, chunk.to_vec(), sequence_number);
+                Self::build_insert_records_chunk_sql(table_id, chunk, sequence_number);
             if let Err(e) = tx.execute(ExecuteParams { sql: &sql, params }).await {
                 // Transaction auto-rolls-back on drop.
                 return Err(CatalogError::InvalidOperation {
@@ -1909,6 +2156,199 @@ impl MetadataCatalog for CayenneCatalog {
         })
     }
 
+    async fn commit_on_conflict_deletions(
+        &self,
+        delete_files: Vec<DeleteFile>,
+        table_id: &str,
+        insert_pk_bytes_list: Vec<Vec<u8>>,
+        insert_sequence: i64,
+    ) -> CatalogResult<()> {
+        // SQLite param limit chunking (mirrors add_insert_records_batch).
+        const PARAMS_PER_ROW: usize = 4;
+        const MAX_PARAMS: usize = 32_000;
+        const MAX_ROWS_PER_CHUNK: usize = MAX_PARAMS / PARAMS_PER_ROW;
+
+        // Delete-file rows use 9 params each; keep the same budget.
+        const DELETE_FILE_PARAMS_PER_ROW: usize = 9;
+        const MAX_DELETE_FILE_ROWS_PER_CHUNK: usize = MAX_PARAMS / DELETE_FILE_PARAMS_PER_ROW;
+
+        // Atomic replacement for the legacy `add_delete_file × N` +
+        // `add_insert_records_batch` sequence in `apply_on_conflict_deletions`.
+        // See `crates/cayenne/benches/apply_on_conflict_rpc_ceiling.rs` for the
+        // before-numbers and the atomicity tradeoff.
+        // The caller now uses `reserve_sequence_numbers(2)` (one round-trip for
+        // the delete+insert pair) before entering this transaction; the txn
+        // itself only does the durable catalog writes for the DeleteFiles and
+        // InsertRecords.
+        if delete_files.is_empty() && insert_pk_bytes_list.is_empty() {
+            return Ok(());
+        }
+
+        // Validate every delete_file belongs to this table_id up front so a
+        // mismatch can't half-apply via the txn. Duplicate path metadata is
+        // checked by the INSERT/ON CONFLICT guard inside the transaction and
+        // re-read only on error to produce the descriptive validation message.
+        for delete_file in &delete_files {
+            if delete_file.table_id != table_id {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Delete-file table_id '{}' does not match commit table_id '{table_id}'",
+                        delete_file.table_id
+                    ),
+                });
+            }
+            if !insert_pk_bytes_list.is_empty() && insert_sequence <= delete_file.sequence_number {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Insert sequence {insert_sequence} must be greater than delete-file sequence {} for on-conflict replacement rows",
+                        delete_file.sequence_number
+                    ),
+                });
+            }
+        }
+
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+
+        'attempts: for attempt in 1..=max_attempts {
+            let tx = match self.metastore.begin_transaction().await {
+                Ok(tx) => tx,
+                Err(e) => {
+                    if retry_on_metastore_write_conflict(
+                        &e,
+                        attempt,
+                        max_attempts,
+                        "begin on-conflict deletion transaction",
+                    )
+                    .await
+                    {
+                        continue 'attempts;
+                    }
+                    return Err(CatalogError::InvalidOperation {
+                        message: "Failed to begin on-conflict deletion transaction".to_string(),
+                        source: Box::new(e),
+                    });
+                }
+            };
+
+            // INSERT delete_file rows in batched multi-VALUES chunks. The
+            // per-row `ON CONFLICT(table_id, path) DO UPDATE SET path = CASE
+            // ... END` clause keeps each row's idempotency check scoped to its
+            // own `excluded` values, identical to the previous one-INSERT-per-
+            // row form. A duplicate `(table_id, path)` whose metadata does not
+            // match the existing row trips the NOT NULL guard on `path`; on
+            // that error path we fall back to per-row INSERTs inside the same
+            // txn to pinpoint the offending delete file for the descriptive
+            // validation error.
+            for chunk in delete_files.chunks(MAX_DELETE_FILE_ROWS_PER_CHUNK) {
+                let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
+                let res = tx.execute(ExecuteParams { sql: &sql, params }).await;
+                if let Err(e) = res {
+                    if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
+                        drop(tx);
+                        sleep_before_metastore_write_retry(
+                            attempt,
+                            max_attempts,
+                            "insert delete file chunk inside on-conflict transaction",
+                        )
+                        .await;
+                        continue 'attempts;
+                    }
+
+                    for delete_file in chunk {
+                        let (sql, params) = Self::build_insert_delete_files_chunk_sql(
+                            std::slice::from_ref(delete_file),
+                        );
+                        let res = tx.execute(ExecuteParams { sql: &sql, params }).await;
+                        if let Err(e) = res {
+                            if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
+                                drop(tx);
+                                sleep_before_metastore_write_retry(
+                                    attempt,
+                                    max_attempts,
+                                    "insert delete file inside on-conflict transaction",
+                                )
+                                .await;
+                                continue 'attempts;
+                            }
+                            let validation_result =
+                                Self::validate_existing_delete_file_if_present_in_transaction(
+                                    tx.as_ref(),
+                                    delete_file,
+                                )
+                                .await;
+                            drop(tx);
+                            if let Err(validation_error) = validation_result {
+                                return Err(CatalogError::InvalidOperation {
+                                    message:
+                                        "Delete-file metadata conflicts with an existing row inside on-conflict transaction"
+                                            .to_string(),
+                                    source: Box::new(validation_error),
+                                });
+                            }
+                            return Err(CatalogError::InvalidOperation {
+                                message:
+                                    "Failed to insert delete file inside on-conflict transaction"
+                                        .to_string(),
+                                source: Box::new(e),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Chunked INSERTs for the insert_record rows.
+            for chunk in insert_pk_bytes_list.chunks(MAX_ROWS_PER_CHUNK) {
+                let (sql, params) =
+                    Self::build_insert_records_chunk_sql(table_id, chunk, insert_sequence);
+                if let Err(e) = tx.execute(ExecuteParams { sql: &sql, params }).await {
+                    if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
+                        drop(tx);
+                        sleep_before_metastore_write_retry(
+                            attempt,
+                            max_attempts,
+                            "insert insert-record chunk inside on-conflict transaction",
+                        )
+                        .await;
+                        continue 'attempts;
+                    }
+                    drop(tx);
+                    return Err(CatalogError::InvalidOperation {
+                        message:
+                            "Failed to insert insert-record chunk inside on-conflict transaction"
+                                .to_string(),
+                        source: Box::new(e),
+                    });
+                }
+            }
+
+            match tx.commit().await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if retry_on_metastore_write_conflict(
+                        &e,
+                        attempt,
+                        max_attempts,
+                        "commit on-conflict deletion transaction",
+                    )
+                    .await
+                    {
+                        continue 'attempts;
+                    }
+                    return Err(CatalogError::InvalidOperation {
+                        message: "Failed to commit on-conflict deletion transaction".to_string(),
+                        source: Box::new(e),
+                    });
+                }
+            }
+        }
+
+        Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "commit_on_conflict_deletions exhausted {max_attempts} retry attempts after retryable write conflicts"
+            ),
+        })
+    }
+
     async fn get_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>> {
         self.metastore
             .query_helper(
@@ -2107,8 +2547,79 @@ impl MetadataCatalog for CayenneCatalog {
 pub fn is_retryable_write_conflict(error: &CatalogError) -> bool {
     match error {
         CatalogError::Database { message } => is_retryable_write_conflict_message(message),
+        CatalogError::InvalidOperation { source, .. } => {
+            source
+                .downcast_ref::<CatalogError>()
+                .is_some_and(is_retryable_write_conflict)
+                || source
+                    .downcast_ref::<rusqlite::Error>()
+                    .is_some_and(is_retryable_sqlite_error)
+        }
+        CatalogError::Sqlite { source } => is_retryable_sqlite_error(source),
         _ => false,
     }
+}
+
+fn is_retryable_sqlite_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(err, _)
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+fn is_query_returned_no_rows(error: &CatalogError) -> bool {
+    match error {
+        CatalogError::Database { message } => message.contains("Query returned no rows"),
+        CatalogError::InvalidOperation { source, .. } => source
+            .downcast_ref::<CatalogError>()
+            .is_some_and(is_query_returned_no_rows),
+        CatalogError::Sqlite {
+            source: rusqlite::Error::QueryReturnedNoRows,
+        } => true,
+        _ => false,
+    }
+}
+
+async fn retry_on_metastore_write_conflict(
+    error: &CatalogError,
+    attempt: u32,
+    max_attempts: u32,
+    operation: &'static str,
+) -> bool {
+    if !should_retry_metastore_write_conflict(error, attempt, max_attempts) {
+        return false;
+    }
+
+    sleep_before_metastore_write_retry(attempt, max_attempts, operation).await;
+    true
+}
+
+fn should_retry_metastore_write_conflict(
+    error: &CatalogError,
+    attempt: u32,
+    max_attempts: u32,
+) -> bool {
+    attempt < max_attempts && is_retryable_write_conflict(error)
+}
+
+async fn sleep_before_metastore_write_retry(
+    attempt: u32,
+    max_attempts: u32,
+    operation: &'static str,
+) {
+    let delay = retry_backoff_delay(attempt);
+    tracing::debug!(
+        attempt,
+        max_attempts,
+        ?delay,
+        operation,
+        "Retrying metastore transaction after retryable write conflict"
+    );
+    tokio::time::sleep(delay).await;
 }
 
 fn validate_existing_delete_file_record(
@@ -2779,6 +3290,370 @@ mod tests {
         assert_eq!(delete_files.len(), 1);
         assert_eq!(delete_files[0].delete_file_id, first_id);
         assert_eq!(delete_files[0].file_size_bytes, 512);
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_on_conflict_deletions_is_idempotent_for_same_delete_file() {
+        let test_db = format!(
+            "sqlite://./.test_on_conflict_delete_file_idempotent_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table_options = CreateTableOptions {
+            table_name: "test_table_on_conflict_same_path".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id = catalog
+            .create_table(table_options)
+            .await
+            .expect("Failed to create table");
+
+        let delete_file = DeleteFile {
+            delete_file_id: String::new(),
+            table_id: table_id.clone(),
+            source_data_file_path: Some("/tmp/source.parquet".to_string()),
+            path: "/tmp/on_conflict_delete_file_same_path.parquet".to_string(),
+            path_is_relative: false,
+            format: "parquet".to_string(),
+            delete_count: 10,
+            file_size_bytes: 512,
+            deletion_type: DeletionType::default(),
+            sequence_number: 1,
+        };
+
+        catalog
+            .commit_on_conflict_deletions(vec![delete_file.clone()], &table_id, vec![vec![1_u8]], 2)
+            .await
+            .expect("initial on-conflict deletion commit should succeed");
+        catalog
+            .commit_on_conflict_deletions(vec![delete_file], &table_id, vec![vec![1_u8]], 2)
+            .await
+            .expect("replayed on-conflict deletion commit should be idempotent");
+
+        let delete_files = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("Failed to get delete files");
+        assert_eq!(delete_files.len(), 1);
+        assert_eq!(delete_files[0].file_size_bytes, 512);
+
+        let insert_records = catalog
+            .get_insert_records(&table_id)
+            .await
+            .expect("Failed to get insert records");
+        assert_eq!(insert_records.get([1_u8].as_slice()), Some(&2));
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_on_conflict_deletions_rejects_conflicting_delete_file_metadata() {
+        let test_db = format!(
+            "sqlite://./.test_on_conflict_delete_file_conflict_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table_options = CreateTableOptions {
+            table_name: "test_table_on_conflict_conflict".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id = catalog
+            .create_table(table_options)
+            .await
+            .expect("Failed to create table");
+
+        let delete_file = DeleteFile {
+            delete_file_id: String::new(),
+            table_id: table_id.clone(),
+            source_data_file_path: Some("/tmp/source.parquet".to_string()),
+            path: "/tmp/on_conflict_delete_file_conflict.parquet".to_string(),
+            path_is_relative: false,
+            format: "parquet".to_string(),
+            delete_count: 10,
+            file_size_bytes: 512,
+            deletion_type: DeletionType::default(),
+            sequence_number: 1,
+        };
+
+        catalog
+            .commit_on_conflict_deletions(vec![delete_file.clone()], &table_id, vec![vec![1_u8]], 2)
+            .await
+            .expect("initial on-conflict deletion commit should succeed");
+
+        let mut conflicting_delete_file = delete_file;
+        conflicting_delete_file.file_size_bytes = 1024;
+
+        let err = catalog
+            .commit_on_conflict_deletions(
+                vec![conflicting_delete_file],
+                &table_id,
+                vec![vec![2_u8]],
+                3,
+            )
+            .await
+            .expect_err("conflicting delete-file metadata should be rejected");
+
+        match err {
+            CatalogError::InvalidOperation { message, source } => {
+                assert!(
+                    message.contains("Delete-file metadata conflicts"),
+                    "expected descriptive on-conflict conflict message, got: {message}"
+                );
+                match source.downcast_ref::<CatalogError>() {
+                    Some(CatalogError::ConstraintViolation { message }) => {
+                        assert!(
+                            message.contains("file_size_bytes"),
+                            "expected file_size_bytes mismatch in error, got: {message}"
+                        );
+                    }
+                    Some(other) => panic!("expected nested ConstraintViolation, got: {other}"),
+                    None => panic!("expected nested CatalogError, got: {source}"),
+                }
+            }
+            other => panic!("expected InvalidOperation, got: {other}"),
+        }
+
+        let delete_files = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("Failed to get delete files");
+        assert_eq!(delete_files.len(), 1);
+        assert_eq!(delete_files[0].file_size_bytes, 512);
+
+        let insert_records = catalog
+            .get_insert_records(&table_id)
+            .await
+            .expect("Failed to get insert records");
+        assert_eq!(insert_records.get([1_u8].as_slice()), Some(&2));
+        assert!(!insert_records.contains_key([2_u8].as_slice()));
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_on_conflict_deletions_batches_multiple_delete_files() {
+        // Exercises the batched multi-VALUES INSERT path: multiple distinct
+        // delete files committed in a single transaction must all be visible
+        // afterward and produce a single row per (table_id, path).
+        let test_db = format!(
+            "sqlite://./.test_on_conflict_delete_file_batched_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table_options = CreateTableOptions {
+            table_name: "test_table_on_conflict_batched".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id = catalog
+            .create_table(table_options)
+            .await
+            .expect("Failed to create table");
+
+        let make_delete_file = |idx: usize| DeleteFile {
+            delete_file_id: String::new(),
+            table_id: table_id.clone(),
+            source_data_file_path: Some(format!("/tmp/source_{idx}.parquet")),
+            path: format!("/tmp/on_conflict_delete_file_batched_{idx}.parquet"),
+            path_is_relative: false,
+            format: "parquet".to_string(),
+            delete_count: 10,
+            file_size_bytes: 512,
+            deletion_type: DeletionType::default(),
+            sequence_number: 1,
+        };
+
+        let delete_files: Vec<DeleteFile> = (0..5).map(make_delete_file).collect();
+        let insert_pks: Vec<Vec<u8>> = (0..5_u8).map(|i| vec![i]).collect();
+
+        catalog
+            .commit_on_conflict_deletions(delete_files.clone(), &table_id, insert_pks, 2)
+            .await
+            .expect("batched on-conflict deletion commit should succeed");
+
+        let stored = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("Failed to get delete files");
+        assert_eq!(stored.len(), 5);
+        let stored_paths: std::collections::HashSet<&str> =
+            stored.iter().map(|d| d.path.as_str()).collect();
+        for expected in &delete_files {
+            assert!(
+                stored_paths.contains(expected.path.as_str()),
+                "missing delete file path: {}",
+                expected.path
+            );
+        }
+
+        // Replay should be idempotent across the whole batch.
+        catalog
+            .commit_on_conflict_deletions(delete_files, &table_id, vec![vec![0_u8]], 2)
+            .await
+            .expect("replayed batched on-conflict deletion commit should be idempotent");
+        let stored = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("Failed to get delete files after replay");
+        assert_eq!(stored.len(), 5);
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_sequence_reservations_do_not_overlap() {
+        const TASK_COUNT: usize = 16;
+        const BLOCK_SIZE: u32 = 2;
+
+        let test_db = format!(
+            "sqlite://./.test_sequence_reservation_concurrency_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("Failed to create catalog"));
+
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table_options = CreateTableOptions {
+            table_name: "test_sequence_reservation_concurrency".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id = catalog
+            .create_table(table_options)
+            .await
+            .expect("Failed to create table");
+
+        let mut tasks = Vec::with_capacity(TASK_COUNT);
+        for _ in 0..TASK_COUNT {
+            let catalog = Arc::clone(&catalog);
+            let table_id = table_id.clone();
+            tasks.push(tokio::spawn(async move {
+                catalog
+                    .reserve_sequence_numbers(&table_id, BLOCK_SIZE)
+                    .await
+                    .expect("sequence reservation should succeed")
+            }));
+        }
+
+        let block_size_usize = usize::try_from(BLOCK_SIZE).expect("BLOCK_SIZE fits in usize");
+        let mut reserved_sequences = Vec::with_capacity(TASK_COUNT * block_size_usize);
+        for task in tasks {
+            let block_start = task.await.expect("reservation task should join");
+            for offset in 0..BLOCK_SIZE {
+                reserved_sequences.push(block_start + i64::from(offset));
+            }
+        }
+
+        reserved_sequences.sort_unstable();
+        assert_eq!(reserved_sequences.first().copied(), Some(1));
+        assert_eq!(
+            reserved_sequences.last().copied(),
+            Some(
+                i64::try_from(TASK_COUNT).expect("TASK_COUNT fits in i64") * i64::from(BLOCK_SIZE)
+            )
+        );
+        for (expected, actual) in (1_i64..).zip(&reserved_sequences) {
+            assert_eq!(*actual, expected);
+        }
+
+        let final_sequence = catalog
+            .get_sequence_number(&table_id)
+            .await
+            .expect("Failed to get final sequence number");
+        assert_eq!(
+            final_sequence,
+            i64::try_from(TASK_COUNT).expect("TASK_COUNT fits in i64") * i64::from(BLOCK_SIZE)
+        );
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_reserve_sequence_numbers_missing_table_errors() {
+        let test_db = format!(
+            "sqlite://./.test_sequence_reservation_missing_table_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let err = catalog
+            .reserve_sequence_numbers("missing_table", 2)
+            .await
+            .expect_err("missing table sequence reservation should fail");
+
+        match err {
+            CatalogError::InvalidOperationNoSource { message } => assert!(
+                message.contains("table row does not exist"),
+                "expected missing-table error, got: {message}"
+            ),
+            other => panic!("expected InvalidOperationNoSource, got: {other}"),
+        }
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
