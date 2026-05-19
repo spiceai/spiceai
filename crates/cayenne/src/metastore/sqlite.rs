@@ -40,8 +40,15 @@ const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXI
 /// for N > K callers share proportionally, reducing the per-table wait from
 /// O(N·RTT) to O(⌈N/K⌉·RTT).
 ///
-/// Pool size is `min(available_parallelism, 8)` (minimum 2). Beyond 8,
-/// `SQLite`'s WAL write serialization is typically the limiting factor anyway.
+/// Pool size is `min(available_parallelism, 32)` (minimum 2). SQLite WAL mode
+/// allows many concurrent readers per database file (read-only operations
+/// don't take the WAL write lock), so a larger pool lifts the read-side
+/// concurrency ceiling for metadata-heavy workloads — e.g. 64-core deployments
+/// running concurrent scans against many tables, where every scan pays one or
+/// more metastore reads (table metadata, snapshot file lists, deletion-vector
+/// loads, stats lookups). Writes still serialize at the WAL layer regardless
+/// of pool size; this is fine because writes are O(commits-per-second) while
+/// reads are O(queries-per-second × per-query-metadata-fanout).
 struct SqliteConnectionPool {
     conns: Vec<Arc<Mutex<tokio_rusqlite::Connection>>>,
     next: AtomicUsize,
@@ -76,9 +83,9 @@ pub struct SqliteMetastore {
     /// Round-robin pool of K independent connections shared across all
     /// operations (reads, writes, and transactions).
     ///
-    /// K = `min(available_parallelism, 8)` (minimum 2). Lazily initialised on
-    /// first use. `begin_transaction` holds an [`OwnedMutexGuard`] on one pool
-    /// slot for the full transaction lifetime.
+    /// K = `min(available_parallelism, 32)` (minimum 2). Lazily initialised
+    /// on first use. `begin_transaction` holds an [`OwnedMutexGuard`] on one
+    /// pool slot for the full transaction lifetime.
     pool: OnceCell<Arc<SqliteConnectionPool>>,
 }
 
@@ -198,7 +205,7 @@ impl SqliteMetastore {
 
     /// Return the connection pool, initialising it lazily on first call.
     ///
-    /// Opens K = `min(available_parallelism, 8)` (minimum 2) connections once
+    /// Opens K = `min(available_parallelism, 32)` (minimum 2) connections once
     /// and reuses them for the lifetime of the metastore. All operations draw
     /// from the same pool; `begin_transaction` holds an [`OwnedMutexGuard`]
     /// on the acquired slot for the full transaction lifetime.
@@ -206,7 +213,7 @@ impl SqliteMetastore {
         self.pool
             .get_or_try_init(|| async {
                 let k = std::thread::available_parallelism()
-                    .map_or(4, |n| n.get().min(8))
+                    .map_or(4, |n| n.get().min(32))
                     .max(2);
                 let mut conns = Vec::with_capacity(k);
                 for _ in 0..k {

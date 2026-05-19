@@ -503,6 +503,39 @@ pub async fn cayenne_query(table: &Arc<CayenneTableProvider>, sql: &str) -> Vec<
     df.collect().await.expect("cayenne collect")
 }
 
+/// Build a long-lived [`SessionContext`] with the given Cayenne table registered
+/// as `t`. Use this once at fixture-load time and pass the resulting context
+/// into [`cayenne_query_warm`] inside `b.iter` to measure the steady-state
+/// query cost without paying per-iteration `SessionContext::new()` overhead.
+///
+/// The default [`cayenne_query`] path creates a fresh session per call, which
+/// matches one valid usage (e.g. CLI invocation) but over-estimates the
+/// per-query cost a long-running Spice runtime actually pays — Spice keeps a
+/// `SessionContext` alive across the daemon's lifetime, paying setup once at
+/// startup. Reporting both lanes makes the asymmetry quantifiable instead of
+/// hand-wavey.
+pub fn warm_session_for(table: &Arc<CayenneTableProvider>) -> datafusion::prelude::SessionContext {
+    use datafusion::datasource::TableProvider;
+    use datafusion::prelude::SessionContext;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::clone(table) as Arc<dyn TableProvider>)
+        .expect("register table");
+    ctx
+}
+
+/// Run a SQL query through Cayenne reusing the given [`SessionContext`].
+///
+/// Pair with [`warm_session_for`] to measure Cayenne under steady-state session
+/// reuse — see that function's docs for when this is the right lane to read.
+pub async fn cayenne_query_warm(
+    ctx: &datafusion::prelude::SessionContext,
+    sql: &str,
+) -> Vec<RecordBatch> {
+    let df = ctx.sql(sql).await.expect("cayenne sql");
+    df.collect().await.expect("cayenne collect")
+}
+
 /// Run a SQL query against two Cayenne tables registered as `t` and `d`.
 /// Used by the join bench so the SQL matches the DuckDB form.
 pub async fn cayenne_query_join(
