@@ -123,7 +123,7 @@ pub async fn run(
     )
     .await
     .map_err(|source| crate::Error::Sql {
-        action: "new_order: insert orders".into(),
+        action: "new_order: insert oorder".into(),
         source,
     })?;
 

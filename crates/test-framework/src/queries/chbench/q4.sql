@@ -2,7 +2,7 @@ SELECT
     o_ol_cnt,
     count(*) as order_count
 FROM
-    orders
+    oorder
 WHERE exists (SELECT *
               FROM order_line
               WHERE o_id = ol_o_id
