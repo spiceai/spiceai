@@ -14,30 +14,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Regression bench for the per-batch keep-mask allocation inside
+//! Comparison bench for the per-batch keep-mask construction inside
 //! `Int64PkDeletionFilterStream`.
 //!
 //! `crates/cayenne/src/provider/delete/filter_exec.rs:684` builds the keep
 //! mask as a `Vec<bool>` (one byte per row) and then immediately converts it
-//! to a packed [`BooleanArray`] via `BooleanArray::from(Vec<bool>)`. For the
-//! common batch size of 8 192 rows that is:
+//! to a packed [`BooleanArray`] via `BooleanArray::from(Vec<bool>)`. The
+//! intuition was that this carries an 8 KiB allocation plus a second walk to
+//! pack into a 1 KiB `BooleanBuffer`, and that a single-pass
+//! `BooleanBufferBuilder` would be faster.
 //!
-//!   - `Vec<bool>` allocation:                8 KiB (then released)
-//!   - `BooleanArray::from(Vec<bool>)`:       walks all 8 192 entries to pack
-//!     into a `BooleanBuffer` (1 KiB).
-//!   - `arrow::compute::filter_record_batch`: a second walk of the packed
-//!     buffer to apply the filter.
+//! This bench tests that hypothesis at three visibility shapes
+//! (`all_visible` / `half_visible` / `none_visible`) and 8 192-row batches.
+//! The measured result on aarch64 (Apple Silicon) is **no win**: the
+//! `BooleanBufferBuilder` lane is within ±5 % of the `Vec<bool>` lane across
+//! all three shapes. The `Vec<bool>` write-per-row is just a byte store that
+//! LLVM auto-vectorises, and Arrow's `BooleanArray::from(Vec<bool>)` packs
+//! using SIMD too; `BooleanBufferBuilder::append` pays a per-bit
+//! read-modify-write that cancels the alloc-size win at this batch size.
 //!
-//! The pattern repeats on every batch on every protected-snapshot scan and
-//! on the main scan whenever the deletion index is non-empty. With wide
-//! batches and many scans this is measurable allocator pressure plus a
-//! cache-line-unfriendly walk of the 8 KiB byte vector.
-//!
-//! The natural fix is to build the mask directly into a
-//! [`BooleanBufferBuilder`] (1 KiB packed bits, written byte-by-byte in 64-bit
-//! chunks) and call `BooleanArray::new(builder.finish(), None)`. That removes
-//! the 8 KiB allocation and the second walk while keeping identical
-//! semantics.
+//! Keep this bench as a regression guard against re-introducing the
+//! `BooleanBufferBuilder` rewrite under the assumption that it is "obviously
+//! cheaper" — and as a documented dead end for future iterations of the
+//! deletion-filter hot path.
 //!
 //! This bench measures three shapes of the keep-mask path so the win is
 //! visible per-batch and at the all-keep / mixed-keep / no-keep extremes:
@@ -95,10 +94,11 @@ fn make_batch(rows: usize) -> RecordBatch {
         Field::new("name", DataType::Utf8, false),
     ]));
     let ids: Vec<i64> = (0..rows as i64).collect();
-    let names: StringArray = (0..rows).map(|i| format!("row_{i}")).collect();
+    let names: Vec<String> = (0..rows).map(|i| format!("row_{i}")).collect();
+    let names_array = StringArray::from(names);
     RecordBatch::try_new(
         schema,
-        vec![Arc::new(Int64Array::from(ids)), Arc::new(names)],
+        vec![Arc::new(Int64Array::from(ids)), Arc::new(names_array)],
     )
     .expect("batch")
 }

@@ -580,22 +580,12 @@ impl CayenneAccelerator {
                 "cayenne_compaction_trigger_protected_snapshots",
                 config.compaction_trigger_protected_snapshots,
             );
-            // `cdc_max_coalesce_age_ms` is the supported runtime parameter name
-            // (users set it under `runtime.params` or pass it through acceleration.params).
-            // We accept the cayenne_-prefixed form for convenience when everything
-            // cayenne-related lives under the acceleration section.
             let age = parse_u64_with_hint(
-                acceleration,
-                "cdc_max_coalesce_age_ms",
-                0,
-                "; 0 leaves the configured snapshot-age trigger unchanged",
-            )
-            .max(parse_u64_with_hint(
                 acceleration,
                 "cayenne_cdc_max_coalesce_age_ms",
                 0,
                 "; 0 leaves the configured snapshot-age trigger unchanged",
-            ));
+            );
 
             if age > 0 {
                 config.compaction_trigger_snapshot_age_ms = age;
@@ -983,8 +973,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    26,
-    { S3_PARAMS_LEN + 26 },
+    25,
+    { S3_PARAMS_LEN + 25 },
 >(
     S3_PARAMETERS,
     [
@@ -2774,6 +2764,66 @@ mod tests {
             config.pk_conflict_detection,
             cayenne::metadata::PkConflictDetection::None
         );
+    }
+
+    #[tokio::test]
+    async fn test_inline_partial_override_preserves_refresh_profile_defaults() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let mut small_write_dataset =
+            DatasetBuilder::try_new("cdc_partial_override".to_string(), "cdc_partial_override")
+                .expect("dataset builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("dataset");
+        small_write_dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Changes),
+            params: [("cayenne_inline_max_rows".to_string(), "321".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+
+        let small_write_config =
+            CayenneAccelerator::get_vortex_config("cdc_partial_override", &small_write_dataset);
+
+        assert_eq!(small_write_config.inline_max_rows, 321);
+        assert_eq!(
+            small_write_config.inline_max_bytes,
+            SMALL_WRITE_INLINE_MAX_BYTES
+        );
+        assert_eq!(
+            small_write_config.inline_max_buffer_bytes,
+            SMALL_WRITE_INLINE_MAX_BUFFER_BYTES
+        );
+
+        let mut large_write_dataset =
+            DatasetBuilder::try_new("full_partial_override".to_string(), "full_partial_override")
+                .expect("dataset builder")
+                .with_app(app)
+                .with_runtime(rt)
+                .build()
+                .expect("dataset");
+        large_write_dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Full),
+            params: [("cayenne_inline_max_rows".to_string(), "321".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+
+        let large_write_config =
+            CayenneAccelerator::get_vortex_config("full_partial_override", &large_write_dataset);
+
+        assert_eq!(large_write_config.inline_max_rows, 321);
+        assert_eq!(large_write_config.inline_max_bytes, 0);
+        assert_eq!(large_write_config.inline_max_buffer_bytes, 0);
     }
 
     #[tokio::test]

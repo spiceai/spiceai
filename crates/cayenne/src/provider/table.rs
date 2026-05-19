@@ -252,6 +252,8 @@ fn protected_snapshot_maintenance_trigger(
         });
     }
 
+    // Age parsing only runs below the count trigger; above it, the cheaper
+    // count trigger short-circuits before scanning snapshot ids.
     let trigger_age = trigger_age?;
     let oldest_snapshot_age =
         oldest_protected_snapshot_age(warning_keys, protected_snapshots, now)?;
