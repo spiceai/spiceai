@@ -3506,6 +3506,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_commit_on_conflict_deletions_batches_multiple_delete_files() {
+        // Exercises the batched multi-VALUES INSERT path: multiple distinct
+        // delete files committed in a single transaction must all be visible
+        // afterward and produce a single row per (table_id, path).
+        let test_db = format!(
+            "sqlite://./.test_on_conflict_delete_file_batched_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table_options = CreateTableOptions {
+            table_name: "test_table_on_conflict_batched".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id = catalog
+            .create_table(table_options)
+            .await
+            .expect("Failed to create table");
+
+        let make_delete_file = |idx: usize| DeleteFile {
+            delete_file_id: String::new(),
+            table_id: table_id.clone(),
+            source_data_file_path: Some(format!("/tmp/source_{idx}.parquet")),
+            path: format!("/tmp/on_conflict_delete_file_batched_{idx}.parquet"),
+            path_is_relative: false,
+            format: "parquet".to_string(),
+            delete_count: 10,
+            file_size_bytes: 512,
+            deletion_type: DeletionType::default(),
+            sequence_number: 1,
+        };
+
+        let delete_files: Vec<DeleteFile> = (0..5).map(make_delete_file).collect();
+        let insert_pks: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8]).collect();
+
+        catalog
+            .commit_on_conflict_deletions(delete_files.clone(), &table_id, insert_pks, 1)
+            .await
+            .expect("batched on-conflict deletion commit should succeed");
+
+        let stored = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("Failed to get delete files");
+        assert_eq!(stored.len(), 5);
+        let stored_paths: std::collections::HashSet<&str> =
+            stored.iter().map(|d| d.path.as_str()).collect();
+        for expected in &delete_files {
+            assert!(
+                stored_paths.contains(expected.path.as_str()),
+                "missing delete file path: {}",
+                expected.path
+            );
+        }
+
+        // Replay should be idempotent across the whole batch.
+        catalog
+            .commit_on_conflict_deletions(delete_files, &table_id, vec![vec![0_u8]], 1)
+            .await
+            .expect("replayed batched on-conflict deletion commit should be idempotent");
+        let stored = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("Failed to get delete files after replay");
+        assert_eq!(stored.len(), 5);
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
     async fn test_concurrent_sequence_reservations_do_not_overlap() {
         const TASK_COUNT: usize = 16;
         const BLOCK_SIZE: u32 = 2;
