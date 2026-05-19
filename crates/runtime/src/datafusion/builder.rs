@@ -365,11 +365,17 @@ impl DataFusionBuilder {
         if let Some(target_partitions) = self.target_partitions {
             if target_partitions > 0 {
                 config = config.with_target_partitions(target_partitions);
+                tracing::info!(target_partitions, "Applied runtime.query.target_partitions");
             } else {
                 tracing::warn!(
                     "Ignoring runtime.query.target_partitions=0; value must be greater than 0"
                 );
             }
+        } else {
+            tracing::info!(
+                effective = config.options().execution.target_partitions,
+                "runtime.query.target_partitions not set; using DataFusion default"
+            );
         }
 
         let exact_join_filter_memory_limit =
