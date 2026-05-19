@@ -149,8 +149,7 @@ fn bench_target_partitions(c: &mut Criterion) {
             group.bench_with_input(BenchmarkId::new(name, rows), &rows, |b, &_rows| {
                 b.iter(|| {
                     rt.block_on(async {
-                        let batches =
-                            cayenne_query_with_partitions(&cf.table, &s, Some(n)).await;
+                        let batches = cayenne_query_with_partitions(&cf.table, &s, Some(n)).await;
                         black_box(batches);
                     });
                 });
