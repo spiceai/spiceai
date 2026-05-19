@@ -415,6 +415,16 @@ pub trait MetastoreTransaction: Send {
     /// Returns an error if the statement cannot be executed.
     async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()>;
 
+    /// Query a single row within the transaction and return its values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or returns no rows.
+    async fn query_row_values(
+        &self,
+        params: QueryRowParams<'_>,
+    ) -> CatalogResult<Vec<MetastoreValue>>;
+
     /// Execute a batch of SQL statements within the transaction.
     ///
     /// # Errors

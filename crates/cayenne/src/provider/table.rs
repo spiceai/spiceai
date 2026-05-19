@@ -118,6 +118,7 @@ const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
 /// (key bytes + `RowLocation` + `HashMap` overhead) this is ~2-4M rows for int64 PKs.
 const PK_KEYSET_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
+const PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT: usize = 1024;
 
 static PROTECTED_SNAPSHOT_AGE_WARNING_KEYS: LazyLock<ParkingMutex<HashSet<String>>> =
     LazyLock::new(|| ParkingMutex::new(HashSet::new()));
@@ -136,9 +137,17 @@ enum SnapshotMaintenanceTrigger {
 }
 
 fn should_warn_protected_snapshot_age(snapshot_id: &str, warning_kind: &'static str) -> bool {
-    PROTECTED_SNAPSHOT_AGE_WARNING_KEYS
-        .lock()
-        .insert(format!("{warning_kind}:{snapshot_id}"))
+    let key = format!("{warning_kind}:{snapshot_id}");
+    let mut warning_keys = PROTECTED_SNAPSHOT_AGE_WARNING_KEYS.lock();
+    if warning_keys.contains(&key) {
+        return false;
+    }
+
+    if warning_keys.len() >= PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT {
+        warning_keys.clear();
+    }
+
+    warning_keys.insert(key)
 }
 
 fn protected_snapshot_age(snapshot_id: &str, now: SystemTime) -> Option<Duration> {

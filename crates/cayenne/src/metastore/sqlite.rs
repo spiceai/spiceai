@@ -846,6 +846,44 @@ impl MetastoreTransaction for SqliteTransaction {
         Ok(())
     }
 
+    async fn query_row_values(
+        &self,
+        params: QueryRowParams<'_>,
+    ) -> CatalogResult<Vec<MetastoreValue>> {
+        let conn = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Transaction already completed".to_string(),
+        })?;
+        let sql = params.sql.to_string();
+        let param_values: Vec<rusqlite::types::Value> =
+            params.params.iter().map(to_sqlite_value).collect();
+
+        conn.call(move |conn| {
+            let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
+                .iter()
+                .map(|v| v as &dyn rusqlite::ToSql)
+                .collect();
+
+            conn.prepare_cached(&sql)?
+                .query_row(params_refs.as_slice(), |row| {
+                    let column_count = row.as_ref().column_count();
+                    let mut values = Vec::with_capacity(column_count);
+
+                    for i in 0..column_count {
+                        let value = row.get_ref(i)?;
+                        values.push(convert_sqlite_value(value));
+                    }
+
+                    Ok(values)
+                })
+        })
+        .await
+        .map_err(
+            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                message: format!("Failed to query row in transaction: {e}"),
+            },
+        )
+    }
+
     async fn execute_batch(&self, sql: &str) -> CatalogResult<()> {
         let conn = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
             message: "Transaction already completed".to_string(),

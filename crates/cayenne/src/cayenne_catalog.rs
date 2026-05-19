@@ -25,8 +25,8 @@ use super::metastore::sqlite::SqliteMetastore;
 #[cfg(feature = "turso")]
 use super::metastore::turso::TursoMetastore;
 use super::metastore::{
-    ExecuteParams, MetastoreBackend, MetastoreRow, MetastoreTransaction, MetastoreValue,
-    QueryParams, QueryRowParams,
+    ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreTransaction,
+    MetastoreValue, QueryParams, QueryRowParams,
 };
 use async_trait::async_trait;
 use datafusion_table_providers::util::on_conflict::OnConflict;
@@ -1022,28 +1022,127 @@ impl MetadataCatalog for CayenneCatalog {
             });
         }
         let delta = i64::from(count);
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
 
-        // Single atomic bump of the high-water mark.
-        // We then read back the *new* high water mark and compute the base of the
-        // reserved block. This keeps the SQL simple and works for both SQLite and
-        // Turso without requiring RETURNING support in the current execute path.
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "UPDATE cayenne_table SET current_sequence_number = current_sequence_number + ?2 WHERE table_id = ?1",
-                params: vec![
-                    MetastoreValue::Text(table_id.to_string()),
-                    MetastoreValue::Integer(delta),
-                ],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to reserve {count} sequence numbers"),
-                source: Box::new(e),
-            })?;
+        for attempt in 1..=max_attempts {
+            let tx = match self.metastore.begin_transaction().await {
+                Ok(tx) => tx,
+                Err(e) => {
+                    if retry_on_metastore_write_conflict(
+                        &e,
+                        attempt,
+                        max_attempts,
+                        "begin sequence reservation transaction",
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    return Err(CatalogError::InvalidOperation {
+                        message: format!(
+                            "Failed to begin transaction reserving {count} sequence numbers"
+                        ),
+                        source: Box::new(e),
+                    });
+                }
+            };
 
-        let new_high = self.get_sequence_number(table_id).await?;
-        // The reserved block is [new_high - delta + 1, new_high]
-        Ok(new_high - delta + 1)
+            if let Err(e) = tx
+                .execute(ExecuteParams {
+                    sql: "UPDATE cayenne_table SET current_sequence_number = current_sequence_number + ?2 WHERE table_id = ?1",
+                    params: vec![
+                        MetastoreValue::Text(table_id.to_string()),
+                        MetastoreValue::Integer(delta),
+                    ],
+                })
+                .await
+            {
+                if retry_on_metastore_write_conflict(
+                    &e,
+                    attempt,
+                    max_attempts,
+                    "update sequence reservation high-water mark",
+                )
+                .await
+                {
+                    drop(tx);
+                    continue;
+                }
+                return Err(CatalogError::InvalidOperation {
+                    message: format!("Failed to reserve {count} sequence numbers"),
+                    source: Box::new(e),
+                });
+            }
+
+            let row_values = match tx
+                .query_row_values(QueryRowParams {
+                    sql: "SELECT current_sequence_number FROM cayenne_table WHERE table_id = ?1",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                })
+                .await
+            {
+                Ok(row_values) => row_values,
+                Err(e) => {
+                    if retry_on_metastore_write_conflict(
+                        &e,
+                        attempt,
+                        max_attempts,
+                        "read sequence reservation high-water mark",
+                    )
+                    .await
+                    {
+                        drop(tx);
+                        continue;
+                    }
+                    return Err(CatalogError::InvalidOperation {
+                        message: "Failed to read reserved sequence high-water mark".to_string(),
+                        source: Box::new(e),
+                    });
+                }
+            };
+            let Some(new_high_value) = row_values.first() else {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: "Failed to read reserved sequence high-water mark: query returned no columns"
+                        .to_string(),
+                });
+            };
+            let new_high =
+                i64::from_value(new_high_value).map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to parse reserved sequence high-water mark".to_string(),
+                    source: Box::new(e),
+                })?;
+
+            match tx.commit().await {
+                Ok(()) => {
+                    // The reserved block is [new_high - delta + 1, new_high]
+                    return Ok(new_high - delta + 1);
+                }
+                Err(e) => {
+                    if retry_on_metastore_write_conflict(
+                        &e,
+                        attempt,
+                        max_attempts,
+                        "commit sequence reservation transaction",
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    return Err(CatalogError::InvalidOperation {
+                        message: format!(
+                            "Failed to commit reservation of {count} sequence numbers"
+                        ),
+                        source: Box::new(e),
+                    });
+                }
+            }
+        }
+
+        Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "reserve_sequence_numbers exhausted {max_attempts} retry attempts after retryable write conflicts"
+            ),
+        })
     }
 
     async fn get_sequence_number(&self, table_id: &str) -> CatalogResult<i64> {
@@ -3212,6 +3311,86 @@ mod tests {
             .expect("Failed to get insert records");
         assert_eq!(insert_records.get([1_u8].as_slice()), Some(&1));
         assert!(!insert_records.contains_key([2_u8].as_slice()));
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_sequence_reservations_do_not_overlap() {
+        const TASK_COUNT: usize = 16;
+        const BLOCK_SIZE: u32 = 2;
+
+        let test_db = format!(
+            "sqlite://./.test_sequence_reservation_concurrency_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("Failed to create catalog"));
+
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table_options = CreateTableOptions {
+            table_name: "test_sequence_reservation_concurrency".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id = catalog
+            .create_table(table_options)
+            .await
+            .expect("Failed to create table");
+
+        let mut tasks = Vec::with_capacity(TASK_COUNT);
+        for _ in 0..TASK_COUNT {
+            let catalog = Arc::clone(&catalog);
+            let table_id = table_id.clone();
+            tasks.push(tokio::spawn(async move {
+                catalog
+                    .reserve_sequence_numbers(&table_id, BLOCK_SIZE)
+                    .await
+                    .expect("sequence reservation should succeed")
+            }));
+        }
+
+        let block_size_usize = usize::try_from(BLOCK_SIZE).expect("BLOCK_SIZE fits in usize");
+        let mut reserved_sequences = Vec::with_capacity(TASK_COUNT * block_size_usize);
+        for task in tasks {
+            let block_start = task.await.expect("reservation task should join");
+            for offset in 0..BLOCK_SIZE {
+                reserved_sequences.push(block_start + i64::from(offset));
+            }
+        }
+
+        reserved_sequences.sort_unstable();
+        assert_eq!(reserved_sequences.first().copied(), Some(1));
+        assert_eq!(
+            reserved_sequences.last().copied(),
+            Some(
+                i64::try_from(TASK_COUNT).expect("TASK_COUNT fits in i64") * i64::from(BLOCK_SIZE)
+            )
+        );
+        for (expected, actual) in (1_i64..).zip(&reserved_sequences) {
+            assert_eq!(*actual, expected);
+        }
+
+        let final_sequence = catalog
+            .get_sequence_number(&table_id)
+            .await
+            .expect("Failed to get final sequence number");
+        assert_eq!(
+            final_sequence,
+            i64::try_from(TASK_COUNT).expect("TASK_COUNT fits in i64") * i64::from(BLOCK_SIZE)
+        );
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);

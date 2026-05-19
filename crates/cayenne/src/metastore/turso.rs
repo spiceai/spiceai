@@ -756,6 +756,38 @@ impl MetastoreTransaction for TursoTransaction {
         Ok(())
     }
 
+    async fn query_row_values(
+        &self,
+        params: QueryRowParams<'_>,
+    ) -> CatalogResult<Vec<MetastoreValue>> {
+        let conn = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Transaction already completed".to_string(),
+        })?;
+        let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
+
+        let mut stmt = conn
+            .prepare_cached(params.sql)
+            .await
+            .map_err(convert_turso_error)?;
+        let mut rows = stmt
+            .query(turso_params)
+            .await
+            .map_err(convert_turso_error)?;
+
+        let row = rows.next().await.map_err(convert_turso_error)?;
+        let row = row.ok_or_else(|| CatalogError::Database {
+            message: "Query returned no rows".to_string(),
+        })?;
+
+        Ok((0..row.column_count())
+            .map(|i| {
+                row.get_value(i)
+                    .map(|v| convert_turso_value(&v))
+                    .unwrap_or(MetastoreValue::Null)
+            })
+            .collect())
+    }
+
     async fn execute_batch(&self, sql: &str) -> CatalogResult<()> {
         let conn = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
             message: "Transaction already completed".to_string(),
