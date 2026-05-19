@@ -1,13 +1,6 @@
 version: v1
 kind: Spicepod
-name: postgres-cayenne[file]-cdc-tuned
-
-
-runtime:
-  params:
-    cdc_prefetch_buffer: "1024"
-    cdc_max_coalesced_envelopes: "1024"
-    cdc_max_coalesced_bytes: "268435456"  # 256 MB
+name: postgres-cayenne[file]
 
 datasets:
   # ---- TPC-C core tables (mutated by OLTP workload) ----
@@ -31,9 +24,6 @@ datasets:
       primary_key: w_id
       on_conflict:
         w_id: upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
 
   - from: postgres:district
     name: district
@@ -45,9 +35,6 @@ datasets:
       primary_key: (d_w_id, d_id)
       on_conflict:
         (d_w_id, d_id): upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
 
   - from: postgres:customer
     name: customer
@@ -59,9 +46,6 @@ datasets:
       primary_key: (c_w_id, c_d_id, c_id)
       on_conflict:
         (c_w_id, c_d_id, c_id): upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
 
   - from: postgres:new_order
     name: new_order
@@ -73,23 +57,17 @@ datasets:
       primary_key: (no_w_id, no_d_id, no_o_id)
       on_conflict:
         (no_w_id, no_d_id, no_o_id): upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
 
-  - from: postgres:orders
-    name: orders
+  - from: postgres:oorder
+    name: oorder
     params:
       <<: *postgres_params
-      pg_replication_slot: spice_orders
+      pg_replication_slot: spice_oorder
     acceleration:
       <<: *cayenne_accel
       primary_key: (o_w_id, o_d_id, o_id)
       on_conflict:
         (o_w_id, o_d_id, o_id): upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
 
   - from: postgres:order_line
     name: order_line
@@ -101,9 +79,6 @@ datasets:
       primary_key: (ol_w_id, ol_d_id, ol_o_id, ol_number)
       on_conflict:
         (ol_w_id, ol_d_id, ol_o_id, ol_number): upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
 
   - from: postgres:item
     name: item
@@ -115,9 +90,6 @@ datasets:
       primary_key: i_id
       on_conflict:
         i_id: upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
 
   - from: postgres:stock
     name: stock
@@ -129,9 +101,6 @@ datasets:
       primary_key: (s_w_id, s_i_id)
       on_conflict:
         (s_w_id, s_i_id): upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
 
   - from: postgres:region
     name: region
@@ -143,9 +112,6 @@ datasets:
       primary_key: r_regionkey
       on_conflict:
         r_regionkey: upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
 
   - from: postgres:nation
     name: nation
@@ -157,9 +123,6 @@ datasets:
       primary_key: n_nationkey
       on_conflict:
         n_nationkey: upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"
 
   - from: postgres:supplier
     name: supplier
@@ -171,6 +134,3 @@ datasets:
       primary_key: su_suppkey
       on_conflict:
         su_suppkey: upsert
-      params:
-        cayenne_write_concurrency: "4"
-        cayenne_upload_concurrency: "4"

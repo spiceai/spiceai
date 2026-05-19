@@ -14,13 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Regression bench: per-commit cost of `validate_on_conflict`'s
-//! unbounded buffering on the CDC ingestion path.
+//! Regression bench: per-commit cost of unbounded buffering on the
+//! CDC ingestion path.
 //!
-//! `CayenneTableProvider::validate_on_conflict`
-//! (`crates/cayenne/src/provider/table.rs:3491-3571`) drains the *entire*
-//! incoming CDC batch into three heap-resident structures **before any
-//! Vortex file is written**:
+//! Older versions of `CayenneTableProvider::validate_on_conflict` drained the
+//! entire incoming CDC batch into three heap-resident structures before any
+//! Vortex file was written:
 //!
 //! ```ignore
 //! while let Some(batch_result) = stream.next().await {
@@ -33,25 +32,21 @@ limitations under the License.
 //! }
 //! ```
 //!
-//! Triggered on every CDC commit when
-//! `pk_conflict_detection: Auto` (the default). The CH-benCH SF100
-//! retest reported 6 of 14 tables accumulating hundreds of MB of
-//! un-drained WAL under sustained write load — this materialization is
-//! one of the largest per-commit fixed costs, and it sits on the
-//! critical path **before** any Vortex write begins.
+//! With `cdc_max_coalesced_bytes: 256 MB` (the SF100 spicepod default), one
+//! coalesced burst allocated up to that much heap on the input decode side,
+//! plus an `OwnedRow` for every row, plus a `HashSet<OwnedRow>` entry per row.
+//! For PK-heavy tables this was a major per-commit fixed cost on the critical
+//! path before any Vortex write began.
 //!
-//! With `cdc_max_coalesced_bytes: 256 MB` (the SF100 spicepod default),
-//! one coalesced burst allocates up to that much heap on the input
-//! decode side, plus an `OwnedRow` for every row (~16-64 bytes
-//! depending on PK shape), plus a `HashSet<OwnedRow>` entry for every
-//! row. For PK-heavy tables (customer with ~500-byte rows updating per
-//! Payment, stock with ~10 updates per NewOrder) this is the
-//! commit-rate bottleneck after the metastore round trip.
-//!
-//! The TigerStyle remedy is a **bounded staging buffer**: pre-allocate
-//! a fixed cap (e.g. 64 MiB), stream batches through dedup with only a
-//! sliding window of keys, and apply backpressure to the upstream CDC
-//! source when full. Today there is no cap and no backpressure.
+//! The production path now uses [`OnConflictValidationStream`]
+//! ([`crate::provider::table::OnConflictValidationStream`], `provider/table.rs:1654+`)
+//! — a streaming wrapper that yields each validated batch downstream as it
+//! arrives. The only state retained across batches is the accumulated
+//! deletion/insert metadata (`delete_specs`, `deleted_pk_i64`, `deleted_row_keys`,
+//! `deleted_inlined_pk_i64`, `deleted_inlined_row_keys`) and `kept_keys` —
+//! all of which are needed for the post-stream `apply_on_conflict_deletions`
+//! commit. No `filtered_batches: Vec<RecordBatch>` buffer exists; batches
+//! pass through.
 //!
 //! ## What this bench measures
 //!
@@ -63,31 +58,25 @@ limitations under the License.
 //!
 //! Two lanes:
 //!
-//! - `current_unbounded_accumulation/<M>` mirrors today's
+//! - `unbounded_accumulation_baseline/<M>` mirrors the older
 //!   `validate_on_conflict`. Heap grows linearly with `M·K`.
-//! - `bounded_streaming/<M>` processes each batch in isolation, drops
-//!   `filtered_batches` after handing off, and uses a sliding `dedup_window`
-//!   of only the most recent batch's keys. Heap stays constant at `K`
-//!   entries regardless of `M`.
+//! - `bounded_streaming/<M>` — current behavior: processes each batch in
+//!   isolation, drops `filtered_batches` after handing off, and uses a
+//!   sliding `dedup_window` of only the most recent batch's keys. Heap stays
+//!   constant at `K` entries regardless of `M`.
 //!
 //! ## How to read
 //!
 //! `cargo bench --bench validate_on_conflict_buffering -p cayenne`.
 //! Compare:
 //!
-//! - `current_unbounded_accumulation/M=512` (≈ a 256 MB CDC burst at
-//!   1 KiB/row) — wall time scales linearly with `M` because each
-//!   batch adds K HashSet inserts plus a `RecordBatch` clone into the
-//!   growing Vec. The slope per batch is the per-commit overhead the
-//!   SF100 retest is paying.
-//! - `bounded_streaming/M=512` — wall time is roughly constant per
-//!   batch, scaling with total `M·K` work but with no per-batch alloc
-//!   growth. The gap visualizes the achievable per-commit cost.
+//! - `unbounded_accumulation_baseline/M=512` (≈ a 256 MB CDC burst at
+//!   1 KiB/row) — wall time scales linearly with `M`. Mirrors the
+//!   per-commit overhead the older code paid.
+//! - `bounded_streaming/M=512` — wall time is roughly constant per batch.
 //!
-//! The ratio between lanes at `M=512` is the per-commit-cost overhead
-//! that the materialization adds. At `M=512, K=1024` it is the cost
-//! difference between writing 512 batches one-at-a-time vs first
-//! collecting them all into a Vec then writing.
+//! The ratio between lanes at `M=512` is the per-commit cost the
+//! streaming wrapper saved.
 
 #![allow(clippy::expect_used)]
 
@@ -147,7 +136,7 @@ fn make_batch(batch_idx: usize) -> Batch {
 /// Mirrors `validate_on_conflict` (`table.rs:3491-3571`): drain stream
 /// into Vec<Batch>, grow HashSet<PkKey> across batches, retain
 /// everything until the caller pulls.
-fn current_unbounded_accumulation(m: usize) -> usize {
+fn unbounded_accumulation_baseline(m: usize) -> usize {
     let mut filtered_batches: Vec<Batch> = Vec::new();
     let mut incoming_keys: HashSet<PkKey> = HashSet::with_capacity(1024);
     let mut all_kept_keys: HashSet<PkKey> = HashSet::with_capacity(1024);
@@ -216,10 +205,10 @@ fn bench_validate_on_conflict_buffering(c: &mut Criterion) {
         group.throughput(Throughput::Elements(total_rows));
 
         group.bench_with_input(
-            BenchmarkId::new("current_unbounded_accumulation", m),
+            BenchmarkId::new("unbounded_accumulation_baseline", m),
             &m,
             |b, &m| {
-                b.iter(|| current_unbounded_accumulation(black_box(m)));
+                b.iter(|| unbounded_accumulation_baseline(black_box(m)));
             },
         );
 

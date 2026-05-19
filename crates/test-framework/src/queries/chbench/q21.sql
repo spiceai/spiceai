@@ -3,7 +3,7 @@ SELECT
 FROM
     supplier,
     order_line l1,
-    orders,
+    oorder,
     stock,
     nation
 WHERE

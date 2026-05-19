@@ -37,13 +37,12 @@ use datafusion::{
 };
 use datafusion_table_providers::{
     duckdb::{
-        DuckDB, DuckDBSettingsRegistry, DuckDBTableFactory, DuckDBTableProviderFactory,
-        TableDefinition, write::DuckDBTableWriter,
+        DuckDB, DuckDBTableFactory, DuckDBTableProviderFactory, TableDefinition,
+        write::DuckDBTableWriter,
     },
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
     util::{constraints::UpsertOptions, on_conflict::OnConflict},
 };
-use duckdb::AccessMode;
 use runtime_table_partition::{
     Partition,
     creator::{self, PartitionCreator, filename::parse_partition_value},
@@ -57,15 +56,13 @@ use crate::{
     component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{
         AccelerationSource, DataAccelerator, FilePathError,
-        duckdb::{
-            DuckDBAccelerator, create_table_provider, duckdb_file_path,
-            settings::OrderByNonIntegerLiteral,
-        },
+        duckdb::{DuckDBAccelerator, create_factory, create_table_provider, duckdb_file_path},
         partitioned_duckdb::{
             ExpectedAccelerationSourceSnafu, FailedToCreateConnectionPoolSnafu, FileModeOnlySnafu,
         },
+        storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
     },
-    datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_functions_for_duckdb},
+    datafusion::dialect::new_duckdb_dialect,
     make_spice_data_directory,
     parameters::ParameterSpec,
     register_data_accelerator,
@@ -98,12 +95,18 @@ impl TablesModePartitionedDuckDBAccelerator {
             .file_path(source)
             .map_err(|e| super::Error::AccelerationInitializationFailed { source: e.into() })?;
 
-        let pool_size = source
-            .acceleration()
+        let acceleration = source.acceleration();
+        let pool_size = acceleration
             .and_then(|accel| accel.params.get("connection_pool_size"))
             .and_then(|size_str| size_str.parse::<u32>().ok());
+        let storage = match acceleration {
+            Some(acceleration) => {
+                resolve_acceleration_storage_async(acceleration.storage_profile, &duckdb_path).await
+            }
+            None => ResolvedAccelerationStorage::Unknown,
+        };
 
-        get_pool(&self.duckdb_factory, &duckdb_path, pool_size)
+        get_pool(&self.duckdb_factory, &duckdb_path, pool_size, storage)
             .await
             .context(FailedToCreateConnectionPoolSnafu)
     }
@@ -448,25 +451,21 @@ impl PartitionCreator for DuckDBPartitionCreator {
     }
 }
 
-fn create_factory() -> DuckDBTableProviderFactory {
-    DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
-        .with_dialect(new_duckdb_dialect())
-        .with_settings_registry(
-            DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
-        )
-        .with_function_support(deny_spice_functions_for_duckdb().as_ref().clone())
-}
-
 async fn get_pool(
     duckdb_factory: &DuckDBTableProviderFactory,
     duckdb_path: &str,
     connection_pool_size: Option<u32>,
+    storage: ResolvedAccelerationStorage,
 ) -> Result<Arc<DuckDbConnectionPool>, datafusion_table_providers::duckdb::Error> {
-    let pool_builder = DuckDbConnectionPoolBuilder::file(duckdb_path)
-        .with_max_size(Some(connection_pool_size.unwrap_or(10)))
-        .with_min_idle(Some(
-            crate::dataaccelerator::duckdb::DEFAULT_MIN_IDLE_CONNECTIONS,
-        ));
+    let max_size = connection_pool_size
+        .unwrap_or_else(|| DuckDBAccelerator::default_connection_pool_size(storage));
+    let min_idle = DuckDBAccelerator::get_pool_min_idle(storage, max_size);
+    let mut pool_builder = DuckDbConnectionPoolBuilder::file(duckdb_path)
+        .with_max_size(Some(max_size))
+        .with_min_idle(Some(min_idle));
+    for pragma in DuckDBAccelerator::storage_setup_queries(storage) {
+        pool_builder = pool_builder.with_connection_setup_query(*pragma);
+    }
     Ok(Arc::new(
         duckdb_factory
             .get_or_init_instance_with_builder(pool_builder)
