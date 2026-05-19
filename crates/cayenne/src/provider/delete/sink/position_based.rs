@@ -506,7 +506,7 @@ impl CayenneDeletionSink {
         if !key_columns.is_empty() {
             use vortex::expr::{root, select};
             // `select` accepts Vec<&str> / Vec<Arc<str>>
-            let cols: Vec<&str> = key_columns.iter().map(|s| s.as_str()).collect();
+            let cols: Vec<&str> = key_columns.iter().map(String::as_str).collect();
             let proj = select(cols, root());
             scan_builder = scan_builder.with_projection(proj);
         }

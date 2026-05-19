@@ -1156,7 +1156,7 @@ pub struct CayenneTableProvider {
     /// At scan time, data from these snapshots is scanned without deletion filtering.
     protected_snapshots: Arc<RwLock<HashMap<String, i64>>>,
     /// Table-scoped warning dedupe for protected snapshot ids that cannot
-    /// provide a UUIDv7 timestamp for age-triggered maintenance.
+    /// provide a `UUIDv7` timestamp for age-triggered maintenance.
     protected_snapshot_age_warning_keys: Arc<ParkingMutex<BoundedWarningKeys>>,
     /// Cached visible primary-key set for auto conflict detection.
     ///

@@ -290,20 +290,6 @@ impl CayenneCatalog {
         Ok(records.into_iter().next())
     }
 
-    async fn validate_existing_delete_file_if_present(
-        &self,
-        delete_file: &DeleteFile,
-    ) -> CatalogResult<()> {
-        if let Some(existing_record) = self
-            .existing_delete_file_record(&delete_file.table_id, &delete_file.path)
-            .await?
-        {
-            validate_existing_delete_file_record(delete_file, &existing_record)?;
-        }
-
-        Ok(())
-    }
-
     async fn validate_existing_delete_file_if_present_in_transaction(
         tx: &dyn MetastoreTransaction,
         delete_file: &DeleteFile,

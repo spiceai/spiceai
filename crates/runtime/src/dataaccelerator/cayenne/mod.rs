@@ -573,8 +573,11 @@ impl CayenneAccelerator {
             );
             // Support the new friendly CDC name (both bare and cayenne_ prefixed)
             // as well as the original internal name.
-            let age = parse_u64(acceleration, "cdc_max_coalesce_age_ms", 0)
-                .max(parse_u64(acceleration, "cayenne_cdc_max_coalesce_age_ms", 0));
+            let age = parse_u64(acceleration, "cdc_max_coalesce_age_ms", 0).max(parse_u64(
+                acceleration,
+                "cayenne_cdc_max_coalesce_age_ms",
+                0,
+            ));
 
             if age > 0 {
                 config.compaction_trigger_snapshot_age_ms = age;
