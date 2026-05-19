@@ -294,6 +294,10 @@ impl CayenneCatalog {
         tx: &dyn MetastoreTransaction,
         delete_file: &DeleteFile,
     ) -> CatalogResult<()> {
+        // The failing `ON CONFLICT DO UPDATE` path uses SQLite's default ABORT
+        // conflict mode: the statement is rolled back, but the transaction stays
+        // open for this validation read. Turso is expected to preserve the same
+        // SQLite-compatible transaction behavior.
         let count_values = tx
             .query_row_values(QueryRowParams {
                 sql: r"
@@ -1094,6 +1098,53 @@ impl MetadataCatalog for CayenneCatalog {
                     });
                 }
             };
+
+            let table_count_values = match tx
+                .query_row_values(QueryRowParams {
+                    sql: "SELECT COUNT(*) FROM cayenne_table WHERE table_id = ?1",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                })
+                .await
+            {
+                Ok(row_values) => row_values,
+                Err(e) => {
+                    if retry_on_metastore_write_conflict(
+                        &e,
+                        attempt,
+                        max_attempts,
+                        "validate sequence reservation table row",
+                    )
+                    .await
+                    {
+                        drop(tx);
+                        continue;
+                    }
+                    return Err(CatalogError::InvalidOperation {
+                        message: format!(
+                            "Failed to validate table row before reserving {count} sequence numbers"
+                        ),
+                        source: Box::new(e),
+                    });
+                }
+            };
+            let Some(table_count_value) = table_count_values.first() else {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: "Failed to validate sequence reservation table row: query returned no columns"
+                        .to_string(),
+                });
+            };
+            let table_count =
+                i64::from_value(table_count_value).map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to parse sequence reservation table row count".to_string(),
+                    source: Box::new(e),
+                })?;
+            if table_count == 0 {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Cannot reserve {count} sequence numbers for table_id '{table_id}': table row does not exist"
+                    ),
+                });
+            }
 
             if let Err(e) = tx
                 .execute(ExecuteParams {

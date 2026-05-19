@@ -1164,7 +1164,7 @@ pub struct CayenneTableProvider {
     /// later serialized writes reuse it and publish successful write deltas.
     /// Delete paths invalidate this cache because arbitrary predicates can
     /// remove keys without telling us which keys were affected.
-    pk_keyset_cache: Arc<ParkingMutex<Option<HashMap<OwnedRow, RowLocation>>>>,
+    pk_keyset_cache: Arc<ParkingMutex<Option<CachedPkKeyset>>>,
     /// Coalesces inline-memtable checkpoint checks spawned after inline writes.
     /// The check takes `write_lock` in the background after the scheduling
     /// writer returns, so inline commits do not hold the writer lock while
@@ -1390,6 +1390,37 @@ enum RowSource {
     Inlined,
 }
 
+struct CachedPkKeyset {
+    keys: HashMap<OwnedRow, RowLocation>,
+    approx_bytes: usize,
+}
+
+impl CachedPkKeyset {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            keys: HashMap::with_capacity(capacity),
+            approx_bytes: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn insert(&mut self, key: OwnedRow, location: RowLocation) {
+        let entry_bytes = approx_pk_keyset_entry_bytes(&key);
+        match self.keys.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(location);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                self.approx_bytes = self.approx_bytes.saturating_add(entry_bytes);
+                entry.insert(location);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct InlinedDeletionMaps {
     int64_pk: HashMap<i64, i64>,
@@ -1610,7 +1641,7 @@ struct OnConflictValidationStream {
     converter: RowConverter,
     on_conflict: OnConflict,
     upsert_options: UpsertOptions,
-    existing_keys: Option<HashMap<OwnedRow, RowLocation>>,
+    existing_keys: Option<CachedPkKeyset>,
     incoming_keys: HashSet<OwnedRow>,
     kept_keys: HashSet<OwnedRow>,
     delete_specs: HashMap<i64, Vec<i64>>,
@@ -1628,7 +1659,7 @@ impl OnConflictValidationStream {
         inner: SendableRecordBatchStream,
         pk_indices: Vec<usize>,
         converter: RowConverter,
-        existing_keys: HashMap<OwnedRow, RowLocation>,
+        existing_keys: CachedPkKeyset,
         on_conflict: OnConflict,
         post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
     ) -> Self {
@@ -1675,7 +1706,7 @@ impl OnConflictValidationStream {
             converter: &self.converter,
             on_conflict: &self.on_conflict,
             upsert_options: &self.upsert_options,
-            existing_keys,
+            existing_keys: &existing_keys.keys,
             incoming_keys: &self.incoming_keys,
         };
 
@@ -3645,20 +3676,16 @@ impl CayenneTableProvider {
         cache.raw = None;
     }
 
-    fn take_cached_pk_keyset(&self) -> Option<HashMap<OwnedRow, RowLocation>> {
+    fn take_cached_pk_keyset(&self) -> Option<CachedPkKeyset> {
         self.pk_keyset_cache.lock().take()
     }
 
-    fn store_cached_pk_keyset(&self, keyset: HashMap<OwnedRow, RowLocation>) {
-        let approx_bytes = keyset
-            .keys()
-            .map(approx_pk_keyset_entry_bytes)
-            .sum::<usize>();
-        if approx_bytes > PK_KEYSET_CACHE_MAX_BYTES {
+    fn store_cached_pk_keyset(&self, keyset: CachedPkKeyset) {
+        if keyset.approx_bytes > PK_KEYSET_CACHE_MAX_BYTES {
             tracing::debug!(
                 table = self.table_metadata.table_name.as_str(),
                 key_count = keyset.len(),
-                approx_bytes,
+                approx_bytes = keyset.approx_bytes,
                 max_bytes = PK_KEYSET_CACHE_MAX_BYTES,
                 "Skipping primary-key keyset cache because it exceeds the configured byte budget"
             );
@@ -3683,28 +3710,31 @@ impl CayenneTableProvider {
             return;
         };
 
-        let current_bytes: usize = keyset.keys().map(approx_pk_keyset_entry_bytes).sum();
-        let incoming_bytes: usize = keys.iter().map(approx_pk_keyset_entry_bytes).sum();
-        if current_bytes.saturating_add(incoming_bytes) > PK_KEYSET_CACHE_MAX_BYTES {
-            tracing::debug!(
-                table = self.table_metadata.table_name.as_str(),
-                key_count = keyset.len(),
-                incoming_key_count = keys.len(),
-                current_bytes,
-                incoming_bytes,
-                max_bytes = PK_KEYSET_CACHE_MAX_BYTES,
-                "Clearing primary-key keyset cache because the write would exceed the byte budget"
-            );
-            *guard = None;
-            return;
-        }
-
         let location = RowLocation {
             source,
             data_file_id: DEFAULT_DATA_FILE_ID,
             row_id: -1,
         };
+
+        let mut incoming_bytes = 0usize;
         for key in keys {
+            if !keyset.keys.contains_key(key) {
+                let entry_bytes = approx_pk_keyset_entry_bytes(key);
+                incoming_bytes = incoming_bytes.saturating_add(entry_bytes);
+                if keyset.approx_bytes.saturating_add(entry_bytes) > PK_KEYSET_CACHE_MAX_BYTES {
+                    tracing::debug!(
+                        table = self.table_metadata.table_name.as_str(),
+                        key_count = keyset.len(),
+                        incoming_key_count = keys.len(),
+                        current_bytes = keyset.approx_bytes,
+                        incoming_bytes,
+                        max_bytes = PK_KEYSET_CACHE_MAX_BYTES,
+                        "Clearing primary-key keyset cache because the write would exceed the byte budget"
+                    );
+                    *guard = None;
+                    return;
+                }
+            }
             keyset.insert(key.clone(), location);
         }
     }
@@ -3766,7 +3796,7 @@ impl CayenneTableProvider {
         &self,
         pk_indices: &[usize],
         converter: &RowConverter,
-    ) -> Result<HashMap<OwnedRow, RowLocation>> {
+    ) -> Result<CachedPkKeyset> {
         // Snapshot the current listing table via ArcSwap (wait-free).
         let listing_table = self.listing_table.load_full();
 
@@ -3804,7 +3834,7 @@ impl CayenneTableProvider {
             _ => None,
         };
 
-        let mut keyset = HashMap::with_capacity(1024);
+        let mut keyset = CachedPkKeyset::with_capacity(1024);
         let mut row_id_base: i64 = 0;
 
         // After projection, batch columns are at indices 0..pk_indices.len()
@@ -3887,7 +3917,7 @@ impl CayenneTableProvider {
         batches: &[RecordBatch],
         pk_indices: &[usize],
         converter: &RowConverter,
-        keyset: &mut HashMap<OwnedRow, RowLocation>,
+        keyset: &mut CachedPkKeyset,
     ) -> Result<()> {
         for batch in batches {
             let pk_columns: Vec<_> = pk_indices
@@ -3906,7 +3936,6 @@ impl CayenneTableProvider {
                         ),
                     });
                 }
-
                 keyset.insert(
                     rows.row(row_index).owned(),
                     RowLocation {
@@ -3944,7 +3973,7 @@ impl CayenneTableProvider {
         deleted_row_keys: Option<&KeyDeletionIndex>,
         min_delete_seq_threshold: Option<i64>,
         table_name: &str,
-        keyset: &mut HashMap<OwnedRow, RowLocation>,
+        keyset: &mut CachedPkKeyset,
         row_id_base: &mut i64,
     ) -> Result<()> {
         while let Some(batch) = stream.next().await {
@@ -9068,7 +9097,7 @@ mod tests {
             )),
         };
 
-        let mut keyset = HashMap::new();
+        let mut keyset = CachedPkKeyset::with_capacity(0);
         let mut row_id_base: i64 = 0;
 
         CayenneTableProvider::process_stream_into_keyset(
@@ -9107,7 +9136,7 @@ mod tests {
             )),
         };
 
-        let mut keyset = HashMap::new();
+        let mut keyset = CachedPkKeyset::with_capacity(0);
         let mut row_id_base: i64 = 0;
 
         // threshold=10: only deletions with del_seq > 10 apply
@@ -9142,7 +9171,7 @@ mod tests {
 
         let strategy = PkDeletionStrategyWithCache::empty_int64_pk();
 
-        let mut keyset = HashMap::new();
+        let mut keyset = CachedPkKeyset::with_capacity(0);
         let mut row_id_base: i64 = 0;
 
         CayenneTableProvider::process_stream_into_keyset(

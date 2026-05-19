@@ -170,10 +170,19 @@ fn parse_usize(acceleration: &Acceleration, key: &str, default: usize) -> usize 
 }
 
 fn parse_u64(acceleration: &Acceleration, key: &str, default: u64) -> u64 {
+    parse_u64_with_hint(acceleration, key, default, "")
+}
+
+fn parse_u64_with_hint(
+    acceleration: &Acceleration,
+    key: &str,
+    default: u64,
+    semantic_hint: &str,
+) -> u64 {
     acceleration.params.get(key).map_or(default, |v| {
         v.parse::<u64>().unwrap_or_else(|_| {
             tracing::warn!(
-                "An invalid '{key}' value was provided: '{v}'. Expected an unsigned integer, defaulting to {default}. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+                "An invalid '{key}' value was provided: '{v}'. Expected an unsigned integer{semantic_hint}, defaulting to {default}. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
             );
             default
         })
@@ -571,21 +580,21 @@ impl CayenneAccelerator {
                 "cayenne_compaction_trigger_protected_snapshots",
                 config.compaction_trigger_protected_snapshots,
             );
-            // Support the new friendly CDC name (both bare and cayenne_ prefixed)
-            // as well as the original internal name.
-            let age = parse_u64(acceleration, "cdc_max_coalesce_age_ms", 0).max(parse_u64(
+            let age = parse_u64_with_hint(
                 acceleration,
                 "cayenne_cdc_max_coalesce_age_ms",
                 0,
-            ));
+                "; 0 leaves the configured snapshot-age trigger unchanged",
+            );
 
             if age > 0 {
                 config.compaction_trigger_snapshot_age_ms = age;
             } else {
-                config.compaction_trigger_snapshot_age_ms = parse_u64(
+                config.compaction_trigger_snapshot_age_ms = parse_u64_with_hint(
                     acceleration,
                     "cayenne_compaction_trigger_snapshot_age_ms",
                     config.compaction_trigger_snapshot_age_ms,
+                    "; 0 disables the age trigger",
                 );
             }
             config.compaction_max_levels = parse_usize(
@@ -645,10 +654,11 @@ impl CayenneAccelerator {
                 config.inline_flush_max_bytes,
             );
 
-            config.compaction_background_interval_ms = parse_u64(
+            config.compaction_background_interval_ms = parse_u64_with_hint(
                 acceleration,
                 "cayenne_compaction_background_interval_ms",
                 config.compaction_background_interval_ms,
+                "; 0 disables the background task",
             );
 
             tracing::debug!(
@@ -963,8 +973,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    25,
-    { S3_PARAMS_LEN + 25 },
+    26,
+    { S3_PARAMS_LEN + 26 },
 >(
     S3_PARAMETERS,
     [
@@ -1011,7 +1021,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("compaction_trigger_snapshot_age_ms")
             .description("Maximum age in milliseconds of the oldest protected snapshot before snapshot-maintenance compaction runs. Set to 0 to disable the age trigger. Default: 60000 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 300000 otherwise."),
         ParameterSpec::component("cdc_max_coalesce_age_ms")
-            .description("Convenience alias for low-write / CDC ingest tables. When set, forces the snapshot age-based compaction trigger to this value (in ms) so that small CDC batches are coalesced promptly even without a short refresh_check_interval. Overrides compaction_trigger_snapshot_age_ms when both are present."),
+            .description("Convenience Cayenne parameter for low-write / CDC ingest tables. When set to a non-zero value, forces the snapshot age-based compaction trigger to this value (in ms) so that small CDC batches are coalesced promptly even without a short refresh_check_interval. Set to 0 to leave compaction_trigger_snapshot_age_ms or the refresh-mode default in effect."),
         ParameterSpec::component("compaction_max_levels")
             .description("Maximum number of consecutive compaction passes per trigger. Bounds write amplification when promotion keeps producing new candidates. Default: 3.")
             .default("3"),
