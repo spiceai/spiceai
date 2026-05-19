@@ -192,8 +192,8 @@ pub trait MetadataCatalog: Send + Sync {
 ```rust
 pub struct VortexConfig {
     // Vortex caches and file shape
-    pub footer_cache_mb: usize,               // default 128 (currently ignored in 2.0.0-unstable)
-    pub segment_cache_mb: usize,              // default 256 (currently ignored in 2.0.0-unstable)
+    pub footer_cache_mb: usize,               // default 128
+    pub segment_cache_mb: usize,              // default 256 (currently ignored until Vortex exposes segment cache sizing)
     pub target_vortex_file_size_mb: usize,    // default 128
 
     // Encoding / sort

@@ -285,13 +285,12 @@ impl PkConflictDetection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VortexConfig {
-    /// Footer cache size in MB.
-    ///
-    /// Currently ignored in Spice.ai `2.0.0-unstable`.
+    /// Footer metadata cache size in MB.
     pub footer_cache_mb: usize,
     /// Segment cache size in MB.
     ///
-    /// Currently ignored in Spice.ai `2.0.0-unstable`.
+    /// Currently ignored because the current Vortex DataFusion API does not expose
+    /// segment cache sizing.
     pub segment_cache_mb: usize,
     /// Target size for individual Vortex files in MB. When writes exceed this size,
     /// a new Vortex file will be created in the same listing directory. This allows

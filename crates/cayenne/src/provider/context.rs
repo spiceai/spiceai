@@ -33,13 +33,13 @@ use crate::metadata::{PkConflictDetection, VortexConfig};
 ///
 /// # Sharing
 ///
-/// The internal `VortexFormat` contains footer and segment caches backed by
-/// [`moka::future::Cache`], which uses `Arc` internally. Sharing a `CayenneContext`
-/// across table providers means they all share the same caches, reducing memory
-/// usage when working with partitioned datasets.
+/// The shared `RuntimeEnv` carries the DataFusion file metadata cache used by
+/// Vortex for cached footer metadata. Sharing a `CayenneContext` across table
+/// providers means they share that runtime-level cache, reducing repeated footer
+/// reads when working with partitioned datasets.
 #[derive(Debug)]
 pub struct CayenneContext {
-    /// Vortex format with shared footer/segment caches.
+    /// Shared Vortex format for reading and writing data files.
     vortex_format: Arc<VortexFormat>,
     /// Configuration for encoding, compression, and file sizing.
     config: VortexConfig,
@@ -58,11 +58,12 @@ pub struct CayenneContext {
 impl CayenneContext {
     /// Create a new Cayenne context from configuration.
     ///
-    /// This creates a new `VortexFormat` with caches sized according to the config.
+    /// This creates a new `VortexFormat` and applies cache sizing to the shared runtime.
     /// The returned `Arc` should be shared across all table providers that should
     /// use the same caches.
     #[must_use]
     pub fn new(config: &VortexConfig, runtime_env: Arc<RuntimeEnv>) -> Arc<Self> {
+        Self::configure_runtime_caches(config, &runtime_env);
         let vortex_format = Self::create_vortex_format(config);
         Arc::new(Self {
             vortex_format,
@@ -75,7 +76,7 @@ impl CayenneContext {
 
     /// Get the Vortex file format for creating listing tables.
     ///
-    /// The format contains shared footer and segment caches.
+    /// The format uses the shared runtime cache for file metadata.
     #[must_use]
     pub fn file_format(&self) -> &Arc<VortexFormat> {
         &self.vortex_format
@@ -238,14 +239,8 @@ impl CayenneContext {
         // `session.write_options().with_strategy(...)`, not at the VortexFormat level
         let vortex_session = VortexSession::default();
 
-        // Configure VortexFormat - it creates its own VortexFileCache internally
+        // Configure VortexFormat.
         let default_config = VortexConfig::default();
-        if config.footer_cache_mb != default_config.footer_cache_mb {
-            tracing::warn!(
-                footer_cache_mb = config.footer_cache_mb,
-                "Vortex config `footer_cache_mb` is currently ignored in Spice.ai 2.0.0-unstable"
-            );
-        }
         if config.segment_cache_mb != default_config.segment_cache_mb {
             tracing::warn!(
                 segment_cache_mb = config.segment_cache_mb,
@@ -261,6 +256,14 @@ impl CayenneContext {
 
         Arc::new(VortexFormat::new_with_options(vortex_session, vortex_opts))
     }
+
+    fn configure_runtime_caches(config: &VortexConfig, runtime_env: &RuntimeEnv) {
+        let footer_cache_bytes = config.footer_cache_mb.saturating_mul(1024 * 1024);
+        runtime_env
+            .cache_manager
+            .get_file_metadata_cache()
+            .update_cache_limit(footer_cache_bytes);
+    }
 }
 
 #[cfg(test)]
@@ -273,5 +276,23 @@ mod tests {
         let context = CayenneContext::new(&VortexConfig::default(), runtime_env);
 
         assert!(context.file_format().options().projection_pushdown);
+    }
+
+    #[test]
+    fn cayenne_applies_footer_cache_size_to_runtime_metadata_cache() {
+        let runtime_env = Arc::new(RuntimeEnv::default());
+        let config = VortexConfig {
+            footer_cache_mb: 8,
+            ..VortexConfig::default()
+        };
+        let context = CayenneContext::new(&config, runtime_env);
+
+        assert_eq!(
+            context
+                .runtime_env()
+                .cache_manager
+                .get_metadata_cache_limit(),
+            8 * 1024 * 1024
+        );
     }
 }
