@@ -431,28 +431,29 @@ impl CayenneAccelerator {
                 .params
                 .contains_key("cayenne_target_file_size_mb");
 
-            if !is_s3 && !user_set_file_size {
-                if let Ok(data_dir) = CayenneAccelerator::new().cayenne_data_dir(source) {
-                    let storage =
-                        resolve_acceleration_storage_async(acceleration.storage_profile, &data_dir)
-                            .await;
-                    let storage_default = match storage {
-                        ResolvedAccelerationStorage::Ebs => Some(256_usize),
-                        ResolvedAccelerationStorage::Tmpfs => Some(64_usize),
-                        ResolvedAccelerationStorage::LocalSsd
-                        | ResolvedAccelerationStorage::Unknown => None,
-                    };
-                    if let Some(size_mb) = storage_default {
-                        tracing::debug!(
-                            target: "spiced::acceleration::cayenne",
-                            table = %table_name,
-                            configured = %acceleration.storage_profile,
-                            resolved = ?storage,
-                            target_file_size_mb = size_mb,
-                            "Applying storage-aware default cayenne_target_file_size_mb"
-                        );
-                        config.target_vortex_file_size_mb = size_mb;
-                    }
+            if !is_s3
+                && !user_set_file_size
+                && let Ok(data_dir) = CayenneAccelerator::new().cayenne_data_dir(source)
+            {
+                let storage =
+                    resolve_acceleration_storage_async(acceleration.storage_profile, &data_dir)
+                        .await;
+                let storage_default = match storage {
+                    ResolvedAccelerationStorage::Ebs => Some(256_usize),
+                    ResolvedAccelerationStorage::Tmpfs => Some(64_usize),
+                    ResolvedAccelerationStorage::LocalSsd
+                    | ResolvedAccelerationStorage::Unknown => None,
+                };
+                if let Some(size_mb) = storage_default {
+                    tracing::debug!(
+                        target: "spiced::acceleration::cayenne",
+                        table = %table_name,
+                        configured = %acceleration.storage_profile,
+                        resolved = ?storage,
+                        target_file_size_mb = size_mb,
+                        "Applying storage-aware default cayenne_target_file_size_mb"
+                    );
+                    config.target_vortex_file_size_mb = size_mb;
                 }
             }
         }

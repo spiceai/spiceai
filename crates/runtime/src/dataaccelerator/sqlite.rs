@@ -163,7 +163,7 @@ impl SqliteAccelerator {
         Ok(Duration::from_millis(5000))
     }
 
-    /// Returns the effective busy_timeout, applying storage-profile defaults
+    /// Returns the effective `busy_timeout`, applying storage-profile defaults
     /// when the user did not explicitly set `busy_timeout`.
     ///
     /// For network-attached storage (`Ebs`), fsync latency spikes are more
@@ -260,7 +260,7 @@ impl SqliteAccelerator {
     }
 }
 
-/// Execute a sequence of PRAGMA statements against the shared SQLite
+/// Execute a sequence of PRAGMA statements against the shared `SQLite`
 /// connection backing the pool. Failures are logged and propagated so that
 /// pool creation surfaces misconfiguration rather than silently dropping the
 /// pragma.

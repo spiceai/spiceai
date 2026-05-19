@@ -272,8 +272,8 @@ impl DuckDBAccelerator {
         Self::default_connection_pool_size(storage).min(max_size)
     }
 
-    /// Storage-profile-specific DuckDB pragmas applied to every connection in
-    /// the pool. These tune DuckDB's I/O behavior to match the underlying
+    /// Storage-profile-specific `DuckDB` pragmas applied to every connection in
+    /// the pool. These tune `DuckDB`'s I/O behavior to match the underlying
     /// medium's latency and durability profile.
     pub(crate) fn storage_setup_queries(
         storage: ResolvedAccelerationStorage,
