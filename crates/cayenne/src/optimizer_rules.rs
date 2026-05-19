@@ -414,30 +414,39 @@ fn try_rewrite_large_same_source_join(
     };
     let optimizer_config = cayenne_optimizer_config(config);
     let row_count_threshold = optimizer_config.sort_merge_min_rows;
-    if build_row_count <= row_count_threshold {
-        return Ok(None);
-    }
+    let row_gate_passes = build_row_count > row_count_threshold;
 
     let memory_gate_bytes = sort_merge_memory_gate_bytes(&optimizer_config);
-    let mut estimated_build_bytes = None;
-    if let Some(gate_bytes) = memory_gate_bytes {
-        let Some(estimated_bytes) =
-            build_side_memory_estimate(hash_join.left().as_ref(), build_row_count)
-        else {
-            return Ok(None);
-        };
-        if estimated_bytes <= gate_bytes {
-            tracing::debug!(
-                join_type = ?hash_join.join_type(),
-                build_row_count,
-                row_count_threshold,
-                estimated_build_bytes = estimated_bytes,
-                memory_gate_bytes = gate_bytes,
-                "Keeping same-source Cayenne HashJoinExec because estimated build side fits within memory gate"
-            );
-            return Ok(None);
-        }
-        estimated_build_bytes = Some(estimated_bytes);
+    let estimated_build_bytes = if memory_gate_bytes.is_some() {
+        build_side_memory_estimate(hash_join.left().as_ref(), build_row_count)
+    } else {
+        None
+    };
+    let byte_gate_passes = match (memory_gate_bytes, estimated_build_bytes) {
+        (Some(gate_bytes), Some(bytes)) => bytes > gate_bytes,
+        _ => false,
+    };
+
+    // Rewrite when either gate fires. The row gate alone catches large-cardinality
+    // builds even when the byte estimate is unavailable; the byte gate alone
+    // catches wide-row builds (e.g. q21 self-joins over `stock` at SF1) where the
+    // row count is well below the row threshold but the materialised hash table
+    // would still exhaust the memory pool. Both gates failing => the hash join is
+    // expected to be the faster plan; preserve DataFusion's default.
+    //
+    // When the memory gate is configured but the build-side bytes can't be
+    // estimated (no stats yet on a freshly-loaded snapshot, etc.), fall back to
+    // the row gate alone — the same conservative behaviour the prior version had.
+    if !row_gate_passes && !byte_gate_passes {
+        tracing::debug!(
+            join_type = ?hash_join.join_type(),
+            build_row_count,
+            row_count_threshold,
+            estimated_build_bytes,
+            memory_gate_bytes,
+            "Keeping same-source Cayenne HashJoinExec because neither row nor byte gate fires"
+        );
+        return Ok(None);
     }
 
     let sort_options = vec![SortOptions::default(); hash_join.on().len()];
