@@ -1085,6 +1085,54 @@ mod tests {
     }
 
     #[test]
+    fn test_target_partitions_wires_through_to_session_config() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle.clone(),
+        )
+        .target_partitions(Some(4))
+        .build();
+
+        assert_eq!(
+            df.ctx
+                .state()
+                .config()
+                .options()
+                .execution
+                .target_partitions,
+            4,
+            "target_partitions wired through DataFusionBuilder should be visible on the session config"
+        );
+
+        // Sanity check the inverse — None leaves DataFusion's default in place.
+        let df_default = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .target_partitions(None)
+        .build();
+        assert_ne!(
+            df_default
+                .ctx
+                .state()
+                .config()
+                .options()
+                .execution
+                .target_partitions,
+            4,
+            "Without an override target_partitions should fall back to DataFusion's default"
+        );
+    }
+
+    #[test]
     #[cfg(not(windows))]
     fn test_cayenne_provider_predicate_detects_poly_accelerator_metadata() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
