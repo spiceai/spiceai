@@ -240,6 +240,25 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get the current sequence number for a table.
     async fn get_sequence_number(&self, table_id: &str) -> CatalogResult<i64>;
 
+    /// Reserve `count` consecutive sequence numbers for this table in one atomic
+    /// operation and return the *first* number of the reserved block.
+    /// `count` must be at least 1.
+    ///
+    /// The caller may then use `[result, result + count)` locally (e.g. `result`,
+    /// `result+1`) without any further catalog round-trips. This is the
+    /// recommended way for writers that need more than one sequence number for a
+    /// logical operation (most notably the on-conflict/upsert path, which needs a
+    /// delete sequence and a higher insert sequence for the replacement rows).
+    ///
+    /// On serialized backends such as the embedded `SQLite` metastore, this
+    /// significantly reduces writer-lock acquisitions and RPC latency compared
+    /// with calling `increment_sequence_number` multiple times.
+    ///
+    /// The returned value is guaranteed to be unique and strictly increasing
+    /// across all calls for the table (modulo crashes that lose in-flight
+    /// reservations — gaps are acceptable for the sequence ordering contract).
+    async fn reserve_sequence_numbers(&self, table_id: &str, count: u32) -> CatalogResult<i64>;
+
     /// Add a delete file (deletion vector) for a data file.
     ///
     /// Tracks a deletion vector file that marks rows as deleted in a specific
@@ -290,6 +309,41 @@ pub trait MetadataCatalog: Send + Sync {
         table_id: &str,
         pk_bytes_list: Vec<Vec<u8>>,
         sequence_number: i64,
+    ) -> CatalogResult<()>;
+
+    /// Atomically commit the catalog side of an on-conflict (upsert)
+    /// deletion.
+    ///
+    /// Implementations MUST commit every delete-file row and every
+    /// insert-record row in one durable transaction. The caller allocates
+    /// the needed sequence numbers (via `reserve_sequence_numbers` or
+    /// `increment_sequence_number`) before this call, so a failed transaction
+    /// may leave a sequence-number gap, but it must not leave a partially
+    /// committed delete-file / insert-record pair. A non-atomic implementation
+    /// reintroduces the crash window this method exists to close.
+    /// When insert records are provided, `insert_sequence` must be greater than
+    /// each delete file's sequence number so replacement rows remain visible.
+    ///
+    /// This replaces the legacy 3-call sequence on the on-conflict path
+    /// (`add_delete_file` per file → `add_insert_records_batch`), which
+    /// left a crash window where the catalog could persist deletion
+    /// records without their corresponding insert sequences. After
+    /// restart, the new row (already in the data files) would then be
+    /// permanently hidden by the deletion filter — see
+    /// [`crate::provider::table::CayenneTableProvider::apply_on_conflict_deletions`]
+    /// for the original sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be opened, any insert
+    /// fails, or the commit fails. Failures roll back the entire txn —
+    /// the catalog is unchanged.
+    async fn commit_on_conflict_deletions(
+        &self,
+        delete_files: Vec<DeleteFile>,
+        table_id: &str,
+        insert_pk_bytes_list: Vec<Vec<u8>>,
+        insert_sequence: i64,
     ) -> CatalogResult<()>;
 
     /// Get all insert records for a table.

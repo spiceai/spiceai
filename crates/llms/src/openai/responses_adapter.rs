@@ -258,10 +258,10 @@ fn input_item_from_chat_tool_call(
     match tool_call {
         ChatCompletionMessageToolCalls::Function(function_call) => {
             Ok(InputItem::Item(Item::FunctionCall(FunctionToolCall {
-                call_id: function_call.id.clone(),
+                call_id: function_call.id,
                 name: function_call.function.name,
                 arguments: function_call.function.arguments,
-                id: Some(function_call.id),
+                id: None,
                 status: Some(OutputStatus::Completed),
             })))
         }
@@ -1057,12 +1057,111 @@ mod tests {
             panic!("chat messages should map to response input items");
         };
 
-        assert!(matches!(items[0], InputItem::Item(Item::FunctionCall(_))));
-        assert!(matches!(
-            items[1],
-            InputItem::Item(Item::FunctionCallOutput(_))
-        ));
+        let InputItem::Item(Item::FunctionCall(ref fc)) = items[0] else {
+            panic!("first item should be a FunctionCall");
+        };
+        // id must be None: the Chat Completions tool call ID (e.g. 53-char fc_-prefixed string)
+        // exceeds OpenAI's item id length constraint and is rejected if forwarded as the item id.
+        // call_id is sufficient to link the call to its output.
+        assert_eq!(
+            fc.id, None,
+            "FunctionToolCall item id must be None when converting from Chat Completions history"
+        );
+        assert_eq!(fc.call_id, "call_123");
+
+        let InputItem::Item(Item::FunctionCallOutput(ref fco)) = items[1] else {
+            panic!("second item should be a FunctionCallOutput");
+        };
+        assert_eq!(fco.id, None);
+        assert_eq!(fco.call_id, "call_123");
+
         assert!(matches!(items[2], InputItem::EasyMessage(_)));
+    }
+
+    #[test]
+    #[expect(deprecated)]
+    fn multiple_tool_calls_in_one_turn_all_get_id_none() {
+        let req = CreateChatCompletionRequest {
+            model: "public-model".to_string(),
+            messages: vec![ChatCompletionRequestMessage::Assistant(
+                ChatCompletionRequestAssistantMessage {
+                    content: None,
+                    refusal: None,
+                    name: None,
+                    audio: None,
+                    tool_calls: Some(vec![
+                        ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+                            id: "fc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                                .to_string(),
+                            function: FunctionCall {
+                                name: "tool_a".to_string(),
+                                arguments: "{}".to_string(),
+                            },
+                        }),
+                        ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+                            id: "fc_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                                .to_string(),
+                            function: FunctionCall {
+                                name: "tool_b".to_string(),
+                                arguments: "{}".to_string(),
+                            },
+                        }),
+                    ]),
+                    function_call: None,
+                },
+            )],
+            ..Default::default()
+        };
+
+        let response_req = responses_request_from_chat_completion_request(req, "backend-model")
+            .expect("request should map to Responses API");
+        let InputParam::Items(items) = response_req.input else {
+            panic!("chat messages should map to response input items");
+        };
+
+        assert_eq!(items.len(), 2);
+        for item in &items {
+            let InputItem::Item(Item::FunctionCall(fc)) = item else {
+                panic!("expected FunctionCall item");
+            };
+            assert_eq!(fc.id, None, "every tool call item must have id: None");
+        }
+        let InputItem::Item(Item::FunctionCall(ref fc_a)) = items[0] else {
+            unreachable!()
+        };
+        let InputItem::Item(Item::FunctionCall(ref fc_b)) = items[1] else {
+            unreachable!()
+        };
+        assert_eq!(
+            fc_a.call_id,
+            "fc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            fc_b.call_id,
+            "fc_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+    }
+
+    #[test]
+    fn tool_call_history_id_not_forwarded_as_item_id() {
+        // Regression: OpenAI Responses API rejects item ids that exceed ~40 chars or use the
+        // fc_-prefixed format from Chat Completions. Setting id: None avoids the rejection.
+        let long_id = "fc_0bfce048f8124bc5006a068df33b348195ab7d85a4ab36380d".to_string();
+
+        let tool_call = ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+            id: long_id.clone(),
+            function: FunctionCall {
+                name: "lookup".to_string(),
+                arguments: "{}".to_string(),
+            },
+        });
+
+        let item = input_item_from_chat_tool_call(tool_call).expect("should convert");
+        let InputItem::Item(Item::FunctionCall(fc)) = item else {
+            panic!("expected FunctionCall item");
+        };
+        assert_eq!(fc.id, None);
+        assert_eq!(fc.call_id, long_id);
     }
 
     #[tokio::test]

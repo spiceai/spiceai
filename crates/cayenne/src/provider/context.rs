@@ -186,10 +186,28 @@ impl CayenneContext {
         )
     }
 
+    /// Protected snapshot count that should trigger maintenance compaction.
+    #[must_use]
+    pub(crate) fn compaction_trigger_protected_snapshots(&self) -> usize {
+        self.config.compaction_trigger_protected_snapshots.max(1)
+    }
+
     /// Maximum number of consecutive compaction passes per trigger.
     #[must_use]
     pub(crate) fn compaction_max_levels(&self) -> usize {
         self.config.compaction_max_levels.max(1)
+    }
+
+    /// Protected snapshot age that should trigger maintenance compaction.
+    #[must_use]
+    pub(crate) fn compaction_trigger_snapshot_age(&self) -> Option<std::time::Duration> {
+        if self.config.compaction_trigger_snapshot_age_ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(
+                self.config.compaction_trigger_snapshot_age_ms,
+            ))
+        }
     }
 
     /// Background compaction interval. Returns `None` when disabled (interval = 0).
