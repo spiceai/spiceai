@@ -1134,10 +1134,10 @@ mod tests {
         let state = df.ctx.state();
 
         assert!(
-            state
+            !state
                 .optimizers()
                 .iter()
-                .all(|rule| rule.name() != "cayenne_propagate_filter_across_equi_join_keys"),
+                .any(|r| r.name() == "cayenne_propagate_filter_across_equi_join_keys"),
             "Cayenne logical filter propagation should be disabled by default"
         );
     }
