@@ -32,6 +32,7 @@ mod persistent;
 
 pub use convert::exprs::DefaultExpressionConvertor;
 pub use convert::exprs::ExpressionConvertor;
+pub use convert::exprs::ProcessedProjection;
 pub use persistent::*;
 
 /// Extension trait to convert our [`Precision`](vortex::stats::Precision) to Datafusion's [`Precision`](datafusion_common::stats::Precision)

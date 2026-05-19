@@ -43,7 +43,9 @@ use crate::convert::FromDataFusion;
 
 /// Result of splitting a projection into Vortex expressions and leftover `DataFusion` projections.
 pub struct ProcessedProjection {
+    /// Projection expression evaluated by the Vortex scan.
     pub scan_projection: Expression,
+    /// Projection expressions evaluated by DataFusion after the scan.
     pub leftover_projection: ProjectionExprs,
 }
 
