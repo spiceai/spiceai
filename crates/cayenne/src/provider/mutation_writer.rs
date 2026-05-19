@@ -227,10 +227,14 @@ impl<'a> AppendMutationWriter<'a> {
         let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
         let mut prepared_stream = prepared.stream;
 
+        // Retention used to block the pipelined path because it ran inline
+        // under `write_lock`. Now that retention is scheduled via
+        // `PostWriteMaintenance`, the pipelined path can run for retention-
+        // configured tables — the bg scheduler picks up the retention request
+        // after publish (see `CayenneStagedAppend::finish`).
         let can_stage_for_pipeline = !pending_pk_deletions
             && !may_have_on_conflict_deletions
-            && self.table.metadata().partition_column.is_none()
-            && !self.table.has_retention_delete_filters();
+            && self.table.metadata().partition_column.is_none();
 
         if !can_stage_for_pipeline {
             let _write_guard = write_guard;

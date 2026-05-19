@@ -394,12 +394,17 @@ impl CayenneCdcWrite {
             prepared_append.apply_under_barrier().await?;
             let rows = prepared_append.finish().await?;
             record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
-            self.table.record_file_pk_keys(&self.validated_file_keys);
-            self.table.schedule_post_write_maintenance(
-                self.stats,
-                false,
-                self.table.has_retention_delete_filters(),
-            );
+            let retention_requested = self.table.has_retention_delete_filters();
+            if retention_requested {
+                // Match the non-pipelined path: retention's delete outcome is
+                // not yet known, so clear conservatively. See the comment in
+                // `AppendMutationWriter::write_prepared_stream`.
+                self.table.clear_cached_pk_keyset();
+            } else {
+                self.table.record_file_pk_keys(&self.validated_file_keys);
+            }
+            self.table
+                .schedule_post_write_maintenance(self.stats, false, retention_requested);
             Ok(rows)
         } else {
             Ok(self.rows)
