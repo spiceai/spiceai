@@ -2429,7 +2429,8 @@ impl CayenneTableProvider {
     /// Clear the staging directory, removing any leftover files.
     ///
     /// Called at the start of each staged append to guarantee a clean slate.
-    /// If the directory does not exist it is created.
+    /// If the directory does not exist it is treated as already clean; the next
+    /// staged append recreates its isolated child directory.
     ///
     /// # Errors
     ///
@@ -2466,7 +2467,8 @@ impl CayenneTableProvider {
                 self.delete_prefix_with_object_store(&prefix).await?;
             }
         } else {
-            // Local FS: remove and recreate the directory
+            // Local FS: removing the directory is enough; absence is the clean
+            // state and avoids provider-open races between remove/create cycles.
             let staging_dir = Self::snapshot_dir_path(
                 &self.table_metadata.path,
                 &self.table_metadata.table_id,
@@ -2477,7 +2479,6 @@ impl CayenneTableProvider {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
-            tokio::fs::create_dir_all(&staging_dir).await?;
         }
 
         // Staging is now known to be empty.

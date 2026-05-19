@@ -383,7 +383,8 @@ impl OptimizerRule for CayenneInListToRangeRewrite {
         let rewritten = original
             .clone()
             .transform_up(|expr| {
-                let after = crate::provider::table::rewrite_consecutive_inlist_to_range(expr.clone());
+                let after =
+                    crate::provider::table::rewrite_consecutive_inlist_to_range(expr.clone());
                 if after == expr {
                     Ok(Transformed::no(expr))
                 } else {
