@@ -96,7 +96,6 @@ pub(crate) fn create_factory() -> DuckDBTableProviderFactory {
         .with_function_support(deny_spice_functions_for_duckdb().as_ref().clone())
 }
 
-pub(crate) const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
 pub(crate) const DEFAULT_CONNECTION_POOL_SIZE: u32 = 10;
 pub(crate) const DEFAULT_EBS_CONNECTION_POOL_SIZE: u32 = 4;
 pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
