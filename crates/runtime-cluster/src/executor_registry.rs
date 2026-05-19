@@ -432,8 +432,14 @@ impl ExecutorRegistry {
         table: &TableReference,
         schema: &SchemaRef,
     ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
-        let connections = self.connections.blocking_read();
-        let flight_sql_clients = self.flight_sql_clients.blocking_read();
+        let Ok(connections) = self.connections.try_read() else {
+            tracing::warn!("Failed to acquire read lock on connections");
+            return Vec::new();
+        };
+        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
+            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
+            return Vec::new();
+        };
         let executors = ready_executors(&connections, &flight_sql_clients);
         get_partitions_from_store(
             &self.accelerations_partition_store,
@@ -607,8 +613,14 @@ impl TablePartitionProvider for FederatedPartitionProvider {
         table: &TableReference,
         schema: &SchemaRef,
     ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
-        let connections = self.connections.blocking_read();
-        let flight_sql_clients = self.flight_sql_clients.blocking_read();
+        let Ok(connections) = self.connections.try_read() else {
+            tracing::warn!("Failed to acquire read lock on connections");
+            return Vec::new();
+        };
+        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
+            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
+            return Vec::new();
+        };
 
         let executors = ready_executors(&connections, &flight_sql_clients);
 
