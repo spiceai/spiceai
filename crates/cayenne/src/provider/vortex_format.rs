@@ -90,29 +90,22 @@ impl VortexAccessPlanProvider for PositionDeletionAccessPlanProvider {
     }
 }
 
-
 fn adjust_num_rows_for_deletions(
     num_rows: Precision<usize>,
     deletion_vector: &PositionDeletionVector,
 ) -> Precision<usize> {
     match num_rows {
-        Precision::Exact(row_count) => {
-            Precision::Exact(row_count.saturating_sub(deleted_rows_within_file(
-                deletion_vector,
-                row_count,
-            )))
-        }
-        Precision::Inexact(row_count) => Precision::Inexact(row_count.saturating_sub(
-            usize::try_from(deletion_vector.len()).unwrap_or(usize::MAX),
-        )),
+        Precision::Exact(row_count) => Precision::Exact(
+            row_count.saturating_sub(deleted_rows_within_file(deletion_vector, row_count)),
+        ),
+        Precision::Inexact(row_count) => Precision::Inexact(
+            row_count.saturating_sub(usize::try_from(deletion_vector.len()).unwrap_or(usize::MAX)),
+        ),
         Precision::Absent => Precision::Absent,
     }
 }
 
-fn deleted_rows_within_file(
-    deletion_vector: &PositionDeletionVector,
-    row_count: usize,
-) -> usize {
+fn deleted_rows_within_file(deletion_vector: &PositionDeletionVector, row_count: usize) -> usize {
     deletion_vector
         .iter()
         .take_while(|row_id| usize::try_from(*row_id).is_ok_and(|row_id| row_id < row_count))

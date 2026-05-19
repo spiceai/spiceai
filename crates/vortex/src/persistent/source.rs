@@ -51,8 +51,8 @@ pub struct VortexSource {
     pub(crate) session: VortexSession,
     pub(crate) table_schema: TableSchema,
     pub(crate) projection: ProjectionExprs,
-    /// Combined predicate expression containing all filters from DataFusion query planning.
-    /// Used with FilePruner to skip files based on statistics and partition values.
+    /// Combined predicate expression containing all filters from `DataFusion` query planning.
+    /// Used with `FilePruner` to skip files based on statistics and partition values.
     pub(crate) full_predicate: Option<PhysicalExprRef>,
     /// Subset of predicates that can be pushed down into Vortex scan operations.
     /// These are expressions that Vortex can efficiently evaluate during scanning.
@@ -75,10 +75,11 @@ pub struct VortexSource {
 }
 
 impl VortexSource {
-    /// Creates a new VortexSource with default configuration and a provided [`VortexSession`].
+    /// Creates a new `VortexSource` with default configuration and a provided [`VortexSession`].
     /// Meant to be use with a [`FileScanConfig`] to scan a file with the provided schema.
     ///
     /// Can be configured using the provided methods.
+    #[must_use] 
     pub fn new(table_schema: TableSchema, session: VortexSession) -> Self {
         let full_schema = table_schema.table_schema();
         let indices = (0..full_schema.fields().len()).collect::<Vec<_>>();
@@ -104,6 +105,7 @@ impl VortexSource {
     }
 
     /// Enable or disable expression pushdown into the underlying Vortex scan.
+    #[must_use] 
     pub fn with_projection_pushdown(mut self, enabled: bool) -> Self {
         self.options.projection_pushdown = enabled;
         self
@@ -130,6 +132,7 @@ impl VortexSource {
     }
 
     /// Returns the [`MetricsRegistry`] attached to this source.
+    #[must_use] 
     pub fn metrics_registry(&self) -> &Arc<dyn MetricsRegistry> {
         &self.vx_metrics_registry
     }
@@ -149,17 +152,20 @@ impl VortexSource {
     }
 
     /// Set the underlying scan concurrency. This limit is used per Vortex scan operations.
+    #[must_use] 
     pub fn with_scan_concurrency(mut self, scan_concurrency: usize) -> Self {
         self.options.scan_concurrency = Some(scan_concurrency);
         self
     }
 
     /// Returns the table options for this source.
+    #[must_use] 
     pub fn options(&self) -> &VortexTableOptions {
         &self.options
     }
 
     /// Set the table options for this source.
+    #[must_use] 
     pub fn with_options(mut self, opts: VortexTableOptions) -> Self {
         self.options = opts;
         self
@@ -245,7 +251,7 @@ impl FileSource for VortexSource {
             DisplayFormatType::TreeRender => {
                 if let Some(ref predicate) = self.vortex_predicate {
                     writeln!(f, "predicate={}", fmt_sql(predicate.as_ref()))?;
-                };
+                }
             }
         }
         Ok(())

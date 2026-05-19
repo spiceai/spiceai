@@ -205,16 +205,12 @@ impl FromDataFusion<ScalarValue> for Scalar {
                 Scalar::null(DType::Primitive(PType::U64, Nullability::Nullable))
             }),
             ScalarValue::Utf8(s) | ScalarValue::Utf8View(s) | ScalarValue::LargeUtf8(s) => s
-                .as_ref()
-                .map(|s| Scalar::from(s.as_str()))
-                .unwrap_or_else(|| Scalar::null(DType::Utf8(Nullability::Nullable))),
+                .as_ref().map_or_else(|| Scalar::null(DType::Utf8(Nullability::Nullable)), |s| Scalar::from(s.as_str())),
             ScalarValue::Binary(b)
             | ScalarValue::BinaryView(b)
             | ScalarValue::LargeBinary(b)
             | ScalarValue::FixedSizeBinary(_, b) => b
-                .as_ref()
-                .map(|b| Scalar::binary(ByteBuffer::from(b.clone()), Nullability::Nullable))
-                .unwrap_or_else(|| Scalar::null(DType::Binary(Nullability::Nullable))),
+                .as_ref().map_or_else(|| Scalar::null(DType::Binary(Nullability::Nullable)), |b| Scalar::binary(ByteBuffer::from(b.clone()), Nullability::Nullable)),
             ScalarValue::Date32(v)
             | ScalarValue::Time32Second(v)
             | ScalarValue::Time32Millisecond(v) => {

@@ -51,31 +51,17 @@ where
 #[cfg(test)]
 mod common_tests {
     use std::sync::Arc;
-    use std::sync::LazyLock;
 
-    use datafusion::arrow::array::RecordBatch;
     use datafusion::datasource::provider::DefaultTableFactory;
     use datafusion::execution::SessionStateBuilder;
     use datafusion::prelude::SessionContext;
-    use datafusion_catalog::TableProvider;
-    use datafusion_common::DFSchema;
     use datafusion_common::GetExt;
-    use datafusion_expr::CreateExternalTable;
     use object_store::ObjectStore;
     use object_store::memory::InMemory;
     use url::Url;
-    use vortex::VortexSessionDefault;
-    use vortex::array::ArrayRef;
-    use vortex::array::arrow::FromArrowArray;
-    use vortex::file::WriteOptionsSessionExt;
-    use vortex::io::VortexWrite;
-    use vortex::io::object_store::ObjectStoreWrite;
-    use vortex::session::VortexSession;
 
     use crate::VortexFormatFactory;
     use crate::VortexTableOptions;
-
-    static VX_SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::default);
 
     pub struct TestSessionContext {
         pub store: Arc<dyn ObjectStore>,
@@ -113,48 +99,6 @@ mod common_tests {
                 SessionContext::new_with_state(session_state_builder.build()).enable_url_table();
 
             Self { store, session }
-        }
-
-        // Write arrow data into a vortex file.
-        pub async fn write_arrow_batch<P>(&self, path: P, batch: &RecordBatch) -> anyhow::Result<()>
-        where
-            P: Into<object_store::path::Path>,
-        {
-            let array = ArrayRef::from_arrow(batch, false)?;
-            let mut write = ObjectStoreWrite::new(self.store.clone(), &path.into()).await?;
-            VX_SESSION
-                .write_options()
-                .write(&mut write, array.to_array_stream())
-                .await?;
-            write.shutdown().await?;
-
-            Ok(())
-        }
-
-        /// Creates a ListingTable provider targeted at the provided path
-        pub async fn table_provider<S>(
-            &self,
-            name: &str,
-            location: impl Into<String>,
-            schema: S,
-        ) -> anyhow::Result<Arc<dyn TableProvider>>
-        where
-            DFSchema: TryFrom<S>,
-            anyhow::Error: From<<S as TryInto<DFSchema>>::Error>,
-        {
-            let factory = self.session.table_factory("VORTEX").unwrap();
-
-            let cmd = CreateExternalTable::builder(
-                name,
-                location.into(),
-                "vortex",
-                DFSchema::try_from(schema)?.into(),
-            )
-            .build();
-
-            let table = factory.create(&self.session.state(), &cmd).await?;
-
-            Ok(table)
         }
     }
 }

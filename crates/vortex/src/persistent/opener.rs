@@ -70,10 +70,10 @@ pub(crate) struct VortexOpener {
     /// all fields in the final scan result not including the partition columns.
     pub projection: ProjectionExprs,
     /// Filter expression optimized for pushdown into Vortex scan operations.
-    /// This may be a subset of file_pruning_predicate containing only expressions
+    /// This may be a subset of `file_pruning_predicate` containing only expressions
     /// that Vortex can efficiently evaluate.
     pub filter: Option<PhysicalExprRef>,
-    /// Filter expression used by DataFusion's FilePruner to eliminate files based on
+    /// Filter expression used by `DataFusion`'s `FilePruner` to eliminate files based on
     /// statistics and partition values without opening them.
     pub file_pruning_predicate: Option<PhysicalExprRef>,
     pub expr_adapter_factory: Arc<dyn PhysicalExprAdapterFactory>,
@@ -88,7 +88,7 @@ pub(crate) struct VortexOpener {
     pub metrics_registry: Arc<dyn MetricsRegistry>,
     /// A shared cache of file readers.
     ///
-    /// To save on the overhead of reparsing FlatBuffers and rebuilding the layout tree, we cache
+    /// To save on the overhead of reparsing `FlatBuffers` and rebuilding the layout tree, we cache
     /// a file reader the first time we read a file.
     pub layout_readers: Arc<DashMap<Path, Weak<dyn LayoutReader>>>,
     /// Shared full-file natural split ranges keyed by file path.
@@ -140,7 +140,7 @@ impl FileOpener for VortexOpener {
         let projection_pushdown = self.projection_pushdown;
 
         // Replace column access for partition columns with literals
-        #[allow(clippy::disallowed_types)]
+        #[expect(clippy::disallowed_types)]
         let literal_value_cols = self
             .table_schema
             .table_partition_cols()
@@ -195,9 +195,8 @@ impl FileOpener for VortexOpener {
                 .with_labels(labels);
 
             if let Some(segment_cache) = segment_cache {
-                open_opts = open_opts.with_segment_cache(
-                    segment_cache.for_path(file.object_meta.location.clone()),
-                );
+                open_opts = open_opts
+                    .with_segment_cache(segment_cache.for_path(file.object_meta.location.clone()));
             }
 
             if let Some(file_metadata_cache) = file_metadata_cache
@@ -360,14 +359,14 @@ impl FileOpener for VortexOpener {
 
                     if !unpushed.is_empty() {
                         return Some(Err(exec_datafusion_err!(
-                            r#"VortexSource accepted but failed to push {} filters.
+                            r"VortexSource accepted but failed to push {} filters.
                             This should never happen if you have a properly configured
                             PhysicalExprAdapterFactory configured on the source.
 
                             Failed filters:
 
                             {unpushed:#?}
-                            "#,
+                            ",
                             unpushed.len()
                         )));
                     }
@@ -479,7 +478,7 @@ fn compute_natural_split_ranges(layout_reader: &dyn LayoutReader) -> DFResult<Ar
     Ok(split_points.into())
 }
 
-/// Translate a DataFusion byte range to the contiguous natural split ranges it owns.
+/// Translate a `DataFusion` byte range to the contiguous natural split ranges it owns.
 fn split_aligned_row_range(
     byte_range: Range<u64>,
     total_size: u64,

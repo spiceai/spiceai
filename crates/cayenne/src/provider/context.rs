@@ -246,16 +246,17 @@ impl CayenneContext {
                 "Vortex config `footer_cache_mb` is currently ignored in Spice.ai 2.0.0-unstable"
             );
         }
-        let segment_cache_size_bytes = config
-            .segment_cache_mb
-            .checked_mul(1024 * 1024)
-            .or_else(|| {
-                tracing::warn!(
-                    segment_cache_mb = config.segment_cache_mb,
-                    "Vortex config `segment_cache_mb` is too large; disabling segment cache"
-                );
-                None
-            });
+        let segment_cache_size_bytes =
+            config
+                .segment_cache_mb
+                .checked_mul(1024 * 1024)
+                .or_else(|| {
+                    tracing::warn!(
+                        segment_cache_mb = config.segment_cache_mb,
+                        "Vortex config `segment_cache_mb` is too large; disabling segment cache"
+                    );
+                    None
+                });
 
         let vortex_opts = VortexTableOptions {
             target_file_size_mb: config.target_vortex_file_size_mb,

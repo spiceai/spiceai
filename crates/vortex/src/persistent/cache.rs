@@ -5,13 +5,13 @@ use datafusion_execution::cache::cache_manager::FileMetadata;
 use vortex::file::Footer;
 use vortex::file::VortexFile;
 
-/// Cached Vortex file metadata for use with DataFusion's [`FileMetadataCache`].
+/// Cached Vortex file metadata for use with `DataFusion`'s [`FileMetadataCache`].
 pub struct CachedVortexMetadata {
     footer: Footer,
 }
 
 impl CachedVortexMetadata {
-    /// Create a new cached metadata entry from a VortexFile.
+    /// Create a new cached metadata entry from a `VortexFile`.
     pub fn new(vortex_file: &VortexFile) -> Self {
         let footer = vortex_file.footer();
         Self {
@@ -38,7 +38,7 @@ impl FileMetadata for CachedVortexMetadata {
             .unwrap_or(1024 * 64)
     }
 
-    #[allow(clippy::disallowed_types)]
+    #[expect(clippy::disallowed_types)]
     fn extra_info(&self) -> std::collections::HashMap<String, String> {
         Default::default()
     }

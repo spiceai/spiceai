@@ -8,16 +8,16 @@ use datafusion_common::Result as DFResult;
 use datafusion_common::exec_datafusion_err;
 use vortex::dtype::DType;
 
-/// Calculate the physical Arrow schema for a Vortex file given its DType and the expected logical schema.
+/// Calculate the physical Arrow schema for a Vortex file given its `DType` and the expected logical schema.
 ///
-/// Some Arrow types don't roundtrip cleanly through Vortex's DType system:
+/// Some Arrow types don't roundtrip cleanly through Vortex's `DType` system:
 /// - Dictionary types lose their encoding (become the value type)
-/// - Utf8/LargeUtf8 become Utf8View
-/// - Binary/LargeBinary become BinaryView
-/// - RunEndEncoded loses its encoding
+/// - Utf8/LargeUtf8 become `Utf8View`
+/// - Binary/LargeBinary become `BinaryView`
+/// - `RunEndEncoded` loses its encoding
 /// - Lists are even more complex, with various sizes and physical layouts that are lost
 ///
-/// For these types, we use the logical schema's type instead of the DType's natural Arrow
+/// For these types, we use the logical schema's type instead of the `DType`'s natural Arrow
 /// conversion, since Vortex's Arrow executor can produce these types when requested.
 pub fn calculate_physical_schema(
     dtype: &DType,
@@ -58,7 +58,7 @@ pub fn calculate_physical_schema(
 }
 
 /// Calculate the physical Arrow type for a field, preferring the logical type when the
-/// DType doesn't roundtrip cleanly.
+/// `DType` doesn't roundtrip cleanly.
 fn calculate_physical_field_type(dtype: &DType, logical_type: &DataType) -> DFResult<DataType> {
     // Check if the logical type is one that doesn't roundtrip through DType
     Ok(match logical_type {

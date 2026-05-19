@@ -75,7 +75,7 @@ use crate::convert::TryToDataFusion;
 const DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES: usize = MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE;
 const DEFAULT_TARGET_FILE_SIZE_MB: usize = 128;
 
-/// Vortex implementation of a DataFusion [`FileFormat`].
+/// Vortex implementation of a `DataFusion` [`FileFormat`].
 pub struct VortexFormat {
     session: VortexSession,
     opts: VortexTableOptions,
@@ -152,6 +152,7 @@ impl VortexFormatFactory {
         clippy::new_without_default,
         reason = "FormatFactory defines `default` method, so having `Default` implementation is confusing"
     )]
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             session: VortexSession::default(),
@@ -162,6 +163,7 @@ impl VortexFormatFactory {
     /// Creates a new instance with customized session and default options for all [`VortexFormat`] instances created from this factory.
     ///
     /// The options can be overridden by table-level configuration pass in [`FileFormatFactory::create`].
+    #[must_use] 
     pub fn new_with_options(session: VortexSession, options: VortexTableOptions) -> Self {
         Self {
             session,
@@ -177,6 +179,7 @@ impl VortexFormatFactory {
     ///
     /// let factory = VortexFormatFactory::new().with_options(VortexTableOptions::default());
     /// ```
+    #[must_use] 
     pub fn with_options(mut self, options: VortexTableOptions) -> Self {
         self.options = Some(options);
         self
@@ -216,11 +219,13 @@ impl FileFormatFactory for VortexFormatFactory {
 
 impl VortexFormat {
     /// Create a new instance with default options.
+    #[must_use] 
     pub fn new(session: VortexSession) -> Self {
         Self::new_with_options(session, VortexTableOptions::default())
     }
 
     /// Creates a new instance with configured by a [`VortexTableOptions`].
+    #[must_use] 
     pub fn new_with_options(session: VortexSession, opts: VortexTableOptions) -> Self {
         let segment_cache = opts
             .segment_cache_size_bytes
@@ -237,6 +242,7 @@ impl VortexFormat {
     }
 
     /// Return the format specific configuration
+    #[must_use] 
     pub fn options(&self) -> &VortexTableOptions {
         &self.opts
     }
@@ -403,39 +409,36 @@ impl FileFormat for VortexFormat {
                     })
             });
 
-            let (dtype, file_stats, row_count) = match cached_metadata {
-                Some(metadata) => metadata,
-                None => {
-                    // Not cached - open the file
-                    let reader = Arc::new(ObjectStoreReadAt::new(
-                        store,
-                        object.location.clone(),
-                        session.handle(),
-                    ));
+            let (dtype, file_stats, row_count) = if let Some(metadata) = cached_metadata { metadata } else {
+                // Not cached - open the file
+                let reader = Arc::new(ObjectStoreReadAt::new(
+                    store,
+                    object.location.clone(),
+                    session.handle(),
+                ));
 
-                    let vxf = session
-                        .open_options()
-                        .with_initial_read_size(opts.footer_initial_read_size_bytes)
-                        .with_file_size(object.size)
-                        .open_read(reader)
-                        .await
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!(
-                                "Failed to open Vortex file {}: {e}",
-                                object.location
-                            ))
-                        })?;
+                let vxf = session
+                    .open_options()
+                    .with_initial_read_size(opts.footer_initial_read_size_bytes)
+                    .with_file_size(object.size)
+                    .open_read(reader)
+                    .await
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Failed to open Vortex file {}: {e}",
+                            object.location
+                        ))
+                    })?;
 
-                    // Cache the metadata
-                    let cached = Arc::new(CachedVortexMetadata::new(&vxf));
-                    file_metadata_cache.put(&object, cached);
+                // Cache the metadata
+                let cached = Arc::new(CachedVortexMetadata::new(&vxf));
+                file_metadata_cache.put(&object, cached);
 
-                    (
-                        vxf.dtype().clone(),
-                        vxf.file_stats().cloned(),
-                        vxf.row_count(),
-                    )
-                }
+                (
+                    vxf.dtype().clone(),
+                    vxf.file_stats().cloned(),
+                    vxf.row_count(),
+                )
             };
 
             let struct_dtype = dtype
@@ -459,7 +462,7 @@ impl FileFormat for VortexFormat {
             let mut sum_of_column_byte_sizes = stats::Precision::exact(0_usize);
             let mut column_statistics = Vec::with_capacity(table_schema.fields().len());
 
-            for field in table_schema.fields().iter() {
+            for field in table_schema.fields() {
                 // If the column does not exist, continue. This can happen if the schema has evolved
                 // but we have not yet updated the Vortex file.
                 let Some(col_idx) = struct_dtype.find(field.name()) else {
@@ -533,7 +536,7 @@ impl FileFormat for VortexFormat {
                         .unwrap_or(Precision::Absent),
                     // TODO(connor): Is this correct?
                     byte_size: column_size.to_df(),
-                })
+                });
             }
 
             let total_byte_size = sum_of_column_byte_sizes.to_df();
