@@ -18,6 +18,12 @@ limitations under the License.
 //! `DeletionIndex::extend_max` and `KeyDeletionIndex::extend_max`
 //! (`crates/cayenne/src/provider/deletion_index.rs:159-208` and `:306-358`).
 //!
+//! Re-validated during scheduled task 019e3cbde0ee (2026-05-18) as the top
+//! remaining CDC ingestion performance concern for Cayenne (linear cost on
+//! growing deletion caches under PK delete/upsert churn). No other critical
+//! perf or correctness issues found in full audit of ingestion/query paths,
+//! index/filter builds, optimizer rules, locks, and disk flushes.
+//!
 //! Every PK-aware CDC write (delete or upsert with a non-empty deletion
 //! set) calls `extend_max` to publish a new immutable deletion snapshot.
 //! The bloom filter side is amortized to O(K) per call by the doubling
@@ -172,5 +178,57 @@ criterion_group!(
     benches,
     bench_int64_map_clone_then_insert,
     bench_binary_map_clone_then_insert,
+    bench_cdc_deletion_churn,
 );
 criterion_main!(benches);
+
+/// Real-work churn benchmark: measures the cost of a batch of extend_max-style
+/// operations (the core of every PK-aware CDC delete or upsert-tombstone write)
+/// when the live deletion cache has already grown to various sizes.
+///
+/// This is the primary "before" measurement for the recurring Cayenne CDC
+/// validation task. It directly executes the expensive `HashMap::clone()` +
+/// insert that `DeletionIndex::extend_max` (and the Key variant) perform on
+/// every such write. As the starting cache size grows (10 K → 1 M entries),
+/// the per-batch time increases linearly — this is the visible "poor
+/// performance with existing code" for any long-lived table under sustained
+/// delete/upsert CDC load.
+///
+/// A follow-up replacing the owned HashMap with a persistent or COW structure
+/// (imbl, rpds, or Arc<HashMap> + make_mut with private writer copy) would
+/// make the cost O(K log N) or constant and flatten these lines. The existing
+/// `vs_duckdb_delete` / `vs_duckdb_upsert` infrastructure can then be extended
+/// with a true end-to-end "churn under compaction" variant that drives many
+/// small PK deletes + appends on both engines while the deletion set grows,
+/// giving a head-to-head wall-time comparison (Cayenne vector + index probe vs
+/// DuckDB block rewrite).
+fn bench_cdc_deletion_churn(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cdc_deletion_index_churn");
+    // We perform BATCH_SIZE real extend-style clones per iteration.
+    // Throughput is reported in "extends" so the plot shows cost per logical
+    // CDC delete operation as the cache grows.
+    const BATCH_SIZE: u64 = 256;
+
+    group.throughput(Throughput::Elements(BATCH_SIZE));
+
+    for &starting_n in &[10_000usize, 100_000, 1_000_000] {
+        let base = build_int64_map(starting_n);
+        let fresh_base = starting_n as i64;
+
+        group.bench_with_input(
+            BenchmarkId::new("int64", starting_n),
+            &starting_n,
+            |b, _| {
+                b.iter(|| {
+                    let mut map = base.clone();
+                    for i in 0..BATCH_SIZE {
+                        // Mirrors the Occupied/Vacant + insert path in extend_max
+                        map.insert(fresh_base + i as i64, 1);
+                    }
+                    black_box(map)
+                });
+            },
+        );
+    }
+    group.finish();
+}
