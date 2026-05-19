@@ -3286,24 +3286,26 @@ impl CayenneTableProvider {
     }
 
     /// Get the maximum delete sequence number from the cached deletions.
+    ///
+    /// Reads the index's cached `max_sequence_number` field (O(1)) instead of
+    /// walking `entries().values().max()` (O(N)). The cache is maintained by
+    /// `DeletionIndex::from_map` at construction and `DeletionIndex::extend_max`
+    /// on every insert; deletion indexes are build-once / extend-only so the
+    /// cached value never goes stale. See
+    /// `crates/cayenne/benches/get_max_delete_sequence_walk.rs` for the
+    /// before-numbers (up to ~5.7 M× speedup at 1 M cached deletions).
     fn get_max_delete_sequence(&self) -> i64 {
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk { deletion_snapshot } => deletion_snapshot
                 .load()
                 .deleted_pk
-                .entries()
-                .values()
-                .max()
-                .copied()
+                .max_sequence_number()
                 .unwrap_or(0),
             PkDeletionStrategyWithCache::RowConverterBased { deletion_snapshot } => {
                 deletion_snapshot
                     .load()
                     .deleted_row_keys
-                    .entries()
-                    .values()
-                    .max()
-                    .copied()
+                    .max_sequence_number()
                     .unwrap_or(0)
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => 0,
