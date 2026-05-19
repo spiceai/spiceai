@@ -116,14 +116,7 @@ mod tests {
             .collect()
             .await?;
 
-        assert_snapshot!(pretty_format_batches(&result)?, @r"
-        +---+------+-----+
-        | a | five | six |
-        +---+------+-----+
-        | 3 | 8    | 9   |
-        | 4 | 9    | 10  |
-        +---+------+-----+
-        ");
+        assert_snapshot!("addition_pushdown_result", pretty_format_batches(&result)?);
 
         Ok(())
     }
@@ -172,34 +165,16 @@ mod tests {
             .create_physical_plan(df.logical_plan())
             .await?;
 
-        insta::assert_snapshot!(DisplayableExecutionPlan::new(physical_plan.as_ref())
-                .tree_render().to_string(), @r"
-        ┌───────────────────────────┐
-        │  SortPreservingMergeExec  │
-        │    --------------------   │
-        │     c1 ASC NULLS LAST     │
-        │                           │
-        │          limit: 3         │
-        └─────────────┬─────────────┘
-        ┌─────────────┴─────────────┐
-        │       DataSourceExec      │
-        │    --------------------   │
-        │          files: 3         │
-        │       format: vortex      │
-        └───────────────────────────┘
-        ");
+        assert_snapshot!(
+            "create_table_ordered_by_plan",
+            DisplayableExecutionPlan::new(physical_plan.as_ref())
+                .tree_render()
+                .to_string()
+        );
 
         let r = df.collect().await?;
 
-        insta::assert_snapshot!(pretty_format_batches(&r)?.to_string(), @r"
-        +---------+------+
-        | c1      | c2   |
-        +---------+------+
-        | air     | 5    |
-        | alabama | 2000 |
-        | balloon | 42   |
-        +---------+------+
-        ");
+        assert_snapshot!("create_table_ordered_by_result", pretty_format_batches(&r)?);
 
         Ok(())
     }
@@ -262,14 +237,7 @@ mod tests {
             .await?;
         // [query]
 
-        assert_snapshot!(pretty_format_batches(&result)?, @r"
-        +---------+-----+
-        | name    | age |
-        +---------+-----+
-        | Alice   | 30  |
-        | Charlie | 35  |
-        +---------+-----+
-        ");
+        assert_snapshot!("doc_example_result", pretty_format_batches(&result)?);
 
         Ok(())
     }
