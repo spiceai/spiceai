@@ -265,3 +265,12 @@ required-features = ["duckdb-bench"]
 harness = false
 name = "pk_lookup_session_cache_warmup"
 required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "pk_in_list_vs_range_rewrite"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "get_max_delete_sequence_walk"
