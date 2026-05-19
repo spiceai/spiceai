@@ -20,7 +20,7 @@ use crate::{
     component::{
         dataset::{
             Dataset,
-            acceleration::{Acceleration, Engine, Mode, RefreshMode, StorageProfile},
+            acceleration::{Acceleration, Engine, Mode, RefreshMode},
         },
         view::View,
     },
@@ -80,8 +80,8 @@ use std::{
 
 pub(crate) mod settings;
 
-pub(crate) const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
-pub(crate) const DEFAULT_EBS_MIN_IDLE_CONNECTIONS: u32 = 4;
+pub(crate) const DEFAULT_CONNECTION_POOL_SIZE: u32 = 10;
+pub(crate) const DEFAULT_EBS_CONNECTION_POOL_SIZE: u32 = 4;
 pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
 pub(crate) const SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY: &str =
     "spice.optimizer.duckdb_aggregate_pushdown";
@@ -261,10 +261,10 @@ impl DuckDBAccelerator {
 
     pub(crate) fn default_connection_pool_size(storage: ResolvedAccelerationStorage) -> u32 {
         match storage {
-            ResolvedAccelerationStorage::Ebs => DEFAULT_EBS_MIN_IDLE_CONNECTIONS,
+            ResolvedAccelerationStorage::Ebs => DEFAULT_EBS_CONNECTION_POOL_SIZE,
             ResolvedAccelerationStorage::LocalSsd
             | ResolvedAccelerationStorage::Tmpfs
-            | ResolvedAccelerationStorage::Unknown => DEFAULT_MIN_IDLE_CONNECTIONS,
+            | ResolvedAccelerationStorage::Unknown => DEFAULT_CONNECTION_POOL_SIZE,
         }
     }
 

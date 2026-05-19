@@ -369,7 +369,7 @@ pub struct Acceleration {
 
     /// Storage profile for file-backed acceleration. `auto` detects the
     /// profile from the resolved acceleration path; use `local_ssd`/`ssd`/`nvme`
-    /// or `ebs` to override detection.
+    /// `ebs`, or `tmpfs`/`ram`/`ramdisk`/`ramfs`/`memory` to override detection.
     #[serde(default, skip_serializing_if = "is_default_storage_profile")]
     pub storage_profile: StorageProfile,
 
@@ -618,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_all_storage_modes() {
+    fn test_deserialize_all_storage_profiles() {
         for (yaml_value, expected) in [
             ("auto", StorageProfile::Auto),
             ("local_ssd", StorageProfile::LocalSsd),

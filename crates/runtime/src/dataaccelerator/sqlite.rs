@@ -276,7 +276,14 @@ async fn apply_sqlite_pragmas(
                 "SQLite connection does not expose async interface".into()
             })?;
     for pragma in pragmas {
-        async_conn.execute(pragma, &[]).await?;
+        if let Err(err) = async_conn.execute(pragma, &[]).await {
+            tracing::warn!(
+                pragma,
+                error = %err,
+                "Failed to apply SQLite storage-profile pragma"
+            );
+            return Err(err);
+        }
     }
     Ok(())
 }

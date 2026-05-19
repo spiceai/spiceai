@@ -54,7 +54,9 @@ use super::{
 };
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode};
 use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
-use crate::dataaccelerator::storage::{ResolvedAccelerationStorage, resolve_acceleration_storage};
+use crate::dataaccelerator::storage::{
+    ResolvedAccelerationStorage, resolve_acceleration_storage_async,
+};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
@@ -404,7 +406,7 @@ impl CayenneAccelerator {
     /// Parse Vortex encoding configuration from acceleration parameters.
     /// This allows fine-grained control over which SIMD-optimized encodings to use.
     ///
-    fn get_vortex_config(
+    async fn get_vortex_config(
         table_name: &str,
         source: &dyn AccelerationSource,
     ) -> cayenne::metadata::VortexConfig {
@@ -431,10 +433,9 @@ impl CayenneAccelerator {
 
             if !is_s3 && !user_set_file_size {
                 if let Ok(data_dir) = CayenneAccelerator::new().cayenne_data_dir(source) {
-                    let storage = resolve_acceleration_storage(
-                        acceleration.storage_profile,
-                        std::path::Path::new(&data_dir),
-                    );
+                    let storage =
+                        resolve_acceleration_storage_async(acceleration.storage_profile, &data_dir)
+                            .await;
                     let storage_default = match storage {
                         ResolvedAccelerationStorage::Ebs => Some(256_usize),
                         ResolvedAccelerationStorage::Tmpfs => Some(64_usize),
@@ -793,7 +794,7 @@ impl CayenneAccelerator {
 
         // Check if using S3 Express One Zone storage
         let is_s3_express = s3::is_s3_express_data_path(source);
-        let vortex_config = Self::get_vortex_config(table_name, source);
+        let vortex_config = Self::get_vortex_config(table_name, source).await;
 
         // Build S3 object store if using S3 Express One Zone storage
         let object_store =
@@ -1530,7 +1531,7 @@ impl DataAccelerator for CayenneAccelerator {
             // Create partition creator
             let unsupported_type_action = Self::get_unsupported_type_action(source);
             let is_s3_express = s3::is_s3_express_data_path(source);
-            let vortex_config = Self::get_vortex_config(&table_name, source);
+            let vortex_config = Self::get_vortex_config(&table_name, source).await;
 
             // Log S3 Express configuration for partitioned tables
             if is_s3_express {
@@ -2499,8 +2500,8 @@ mod tests {
             ..Default::default()
         });
 
-        let hot = CayenneAccelerator::get_vortex_config("hot", &hot_dataset);
-        let quiet = CayenneAccelerator::get_vortex_config("quiet", &quiet_dataset);
+        let hot = CayenneAccelerator::get_vortex_config("hot", &hot_dataset).await;
+        let quiet = CayenneAccelerator::get_vortex_config("quiet", &quiet_dataset).await;
 
         assert_eq!(hot.write_concurrency, Some(16));
         assert_eq!(quiet.write_concurrency, Some(2));
@@ -2549,7 +2550,7 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset);
+        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset).await;
 
         assert_eq!(config.inline_max_rows, 0);
         assert_eq!(config.inline_max_bytes, 262_144);
