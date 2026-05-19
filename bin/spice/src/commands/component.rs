@@ -158,9 +158,13 @@ EXAMPLES
   # Add a SQL view
   spice view add recent_orders --sql "select * from orders limit 100"
 
-  # Add an MCP-backed tool with a secret-bound token
-  spice tool add lookup --from mcp:server \
-      --env TOKEN='${ secrets:TOKEN }'
+  # Add an HTTP MCP-backed tool with a secret-bound bearer token
+  spice tool add lookup --from mcp:https://example.com/v1/mcp \
+      --param mcp_auth_token='${ secrets:TOKEN }'
+
+  # Or pass custom HTTP headers using the same format as HTTP datasets
+  spice tool add lookup --from mcp:https://example.com/v1/mcp \
+      --param mcp_headers='X-API-Key: ${ secrets:API_KEY }'
 
   # Reference an external component definition file
   spice model add --ref models/llm.yaml
