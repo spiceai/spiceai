@@ -116,9 +116,9 @@ pub async fn run(
     let o_id = d_next_o_id;
     let now = SystemTime::now();
 
-    // 4. INSERT orders
+    // 4. INSERT oorder
     tx.execute(
-        &stmts.insert_orders,
+        &stmts.insert_oorder,
         &[&o_id, &d_id, &w_id, &c_id, &now, &ol_cnt, &all_local],
     )
     .await

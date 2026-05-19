@@ -28,7 +28,7 @@ pub struct NewOrderStmts {
     pub select_customer_warehouse: Statement,
     pub select_district: Statement,
     pub update_district: Statement,
-    pub insert_orders: Statement,
+    pub insert_oorder: Statement,
     pub insert_new_order: Statement,
     pub select_item: Statement,
     /// One prepared statement per district (`s_dist_01` through `s_dist_10`).
@@ -107,14 +107,14 @@ impl PreparedStatements {
                 source,
             })?;
 
-        let insert_orders = client
+        let insert_oorder = client
             .prepare(
                 "INSERT INTO oorder (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_ol_cnt, o_all_local) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7)",
             )
             .await
             .map_err(|source| crate::Error::Sql {
-                action: "prepare new_order: insert_orders".into(),
+                action: "prepare new_order: insert_oorder".into(),
                 source,
             })?;
 
@@ -182,7 +182,7 @@ impl PreparedStatements {
             select_customer_warehouse,
             select_district,
             update_district,
-            insert_orders,
+            insert_oorder,
             insert_new_order,
             select_item,
             select_stock,
