@@ -241,4 +241,50 @@ mod tests {
 
         Ok(())
     }
+
+    /// Regression test for spiceai/vortex#51: casts of `DECIMAL` columns to
+    /// primitive floating-point arrays must apply the decimal scale and
+    /// preserve validity through our vendored DataFusion adapter.
+    #[tokio::test]
+    async fn test_decimal_to_float_cast_applies_scale() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE amounts \
+                    (amount DECIMAL(15, 2)) \
+                STORED AS vortex \
+                LOCATION '/decimal_cast/'",
+            )
+            .await?;
+
+        ctx.session
+            .sql(
+                "INSERT INTO amounts VALUES \
+                    (CAST(1.23 AS DECIMAL(15, 2))), \
+                    (CAST(-4.56 AS DECIMAL(15, 2))), \
+                    (NULL), \
+                    (CAST(100.00 AS DECIMAL(15, 2)))",
+            )
+            .await?
+            .collect()
+            .await?;
+
+        let result = ctx
+            .session
+            .sql(
+                "SELECT CAST(amount AS DOUBLE) AS amount_f64 \
+                 FROM amounts ORDER BY amount NULLS LAST",
+            )
+            .await?
+            .collect()
+            .await?;
+
+        assert_snapshot!(
+            "decimal_to_float_cast_result",
+            pretty_format_batches(&result)?
+        );
+
+        Ok(())
+    }
 }
