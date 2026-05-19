@@ -7808,38 +7808,22 @@ fn rewrite_consecutive_inlist_to_range(expr: Expr) -> Expr {
     if in_list.negated || in_list.list.len() < 2 {
         return expr;
     }
-    let mut values: Vec<i64> = Vec::with_capacity(in_list.list.len());
+    let original_len = in_list.list.len();
+    let mut values: Vec<i64> = Vec::with_capacity(original_len);
     for item in &in_list.list {
-        let raw = match item {
-            Expr::Literal(s, _) => s,
-            Expr::Cast(c) | Expr::TryCast(c) => {
-                if let Expr::Literal(s, _) = &*c.expr {
-                    s
-                } else {
-                    return expr;
-                }
-            }
-            _ => return expr,
+        let Some(v) = extract_integer_literal(item) else {
+            return expr;
         };
-        match raw {
-            ScalarValue::Int64(Some(v)) => values.push(*v),
-            ScalarValue::Int32(Some(v)) => values.push(i64::from(*v)),
-            ScalarValue::Int16(Some(v)) => values.push(i64::from(*v)),
-            ScalarValue::Int8(Some(v)) => values.push(i64::from(*v)),
-            _ => return expr,
-        }
+        values.push(v);
     }
     values.sort_unstable();
     values.dedup();
-    if values.len() != in_list.list.len() {
+    if values.len() != original_len {
         return expr;
     }
-    let Some(&min) = values.first() else {
-        return expr;
-    };
-    let Some(&max) = values.last() else {
-        return expr;
-    };
+    // Safe: sorted+deduped+len>=2 guarantees both ends exist.
+    let min = values[0];
+    let max = values[values.len() - 1];
     let Some(span) = max.checked_sub(min).and_then(|d| d.checked_add(1)) else {
         return expr;
     };
@@ -7850,6 +7834,35 @@ fn rewrite_consecutive_inlist_to_range(expr: Expr) -> Expr {
     let lit_min = Expr::Literal(ScalarValue::Int64(Some(min)), None);
     let lit_max = Expr::Literal(ScalarValue::Int64(Some(max)), None);
     col_expr.clone().gt_eq(lit_min).and(col_expr.lt_eq(lit_max))
+}
+
+/// Returns `Some(v)` if `expr` is an integer-typed literal (possibly wrapped
+/// in a `Cast`/`TryCast`). `i8`/`i16`/`i32` widen to `i64`. Any other shape
+/// returns `None`.
+fn extract_integer_literal(expr: &Expr) -> Option<i64> {
+    let raw = match expr {
+        Expr::Literal(s, _) => s,
+        Expr::Cast(c) | Expr::TryCast(_) => {
+            let inner = match expr {
+                Expr::Cast(c) => &c.expr,
+                Expr::TryCast(c) => &c.expr,
+                _ => unreachable!(),
+            };
+            if let Expr::Literal(s, _) = &**inner {
+                s
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    match raw {
+        ScalarValue::Int64(Some(v)) => Some(*v),
+        ScalarValue::Int32(Some(v)) => Some(i64::from(*v)),
+        ScalarValue::Int16(Some(v)) => Some(i64::from(*v)),
+        ScalarValue::Int8(Some(v)) => Some(i64::from(*v)),
+        _ => None,
+    }
 }
 
 #[async_trait]
