@@ -5185,7 +5185,8 @@ impl CayenneTableProvider {
         });
     }
 
-    /// Synchronously drain any pending post-write maintenance.
+    /// Synchronously drain any pending post-write maintenance, including any
+    /// iteration the background loop is currently executing.
     ///
     /// Public for two callers:
     ///   1. Tests that assert on the post-retention state (where retention is
@@ -5194,17 +5195,27 @@ impl CayenneTableProvider {
     ///   2. Coordinated shutdown — callers that want to make sure no scheduled
     ///      retention is lost when the table is dropped.
     ///
-    /// Runs whatever the background loop would have run, then returns.
+    /// Loops until both (a) the queued maintenance state is empty AND (b) the
+    /// background loop is not active (so no iteration is mid-flight). Within
+    /// each pass, queued state is drained synchronously; if the background
+    /// loop is still active afterward, the caller yields briefly and re-checks.
     pub async fn flush_pending_maintenance(&self) {
         loop {
             let state = {
                 let mut guard = self.post_write_maintenance.state.lock();
                 std::mem::take(&mut *guard)
             };
-            if state.is_empty() {
+            if !state.is_empty() {
+                self.run_maintenance_state(state).await;
+                continue;
+            }
+            if !self.post_write_maintenance.scheduled.load(Ordering::Acquire) {
                 return;
             }
-            self.run_maintenance_state(state).await;
+            // The background loop has the state lock and is mid-iteration.
+            // Wait briefly and re-check; we cannot drain its work from here,
+            // but we can spin until it finishes its current pass.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     }
 
@@ -5748,6 +5759,16 @@ impl CayenneTableProvider {
         Ok(Arc::new(filter_exec))
     }
 
+    /// Apply retention filters by running the configured delete sink against
+    /// the current table state.
+    ///
+    /// The sole caller is the post-write maintenance loop (see
+    /// [`Self::run_maintenance_state`]), which runs outside any writer's
+    /// `write_lock`. The deletion sink is built with
+    /// `Some(Arc::clone(&self.write_lock))` so the sink itself serializes
+    /// against concurrent inserts / listing refreshes for the duration of the
+    /// scan — same exclusion guarantee the inline-retention path used to
+    /// provide, just held inside the sink rather than the writer.
     pub(crate) async fn apply_retention_filters(&self) -> CatalogResult<u64> {
         use data_components::delete::DeletionSink;
 
@@ -5767,7 +5788,7 @@ impl CayenneTableProvider {
             self.pk_column_indices.clone(),
             Vec::new(), // Retention filters don't need to scan protected snapshots
             Arc::clone(self.context.runtime_env()),
-            None, // Already under write_lock from write_all_append
+            Some(Arc::clone(&self.write_lock)),
         );
 
         let deleted_count =

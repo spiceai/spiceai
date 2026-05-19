@@ -672,7 +672,6 @@ impl<'a> AppendMutationWriter<'a> {
 
         Ok((rows, writer_ops, stats_acc, prepared_append))
     }
-
 }
 
 #[cfg(test)]
@@ -750,5 +749,4 @@ mod tests {
 
         assert!(!buffer.should_continue_buffering());
     }
-
 }
