@@ -388,7 +388,7 @@ async fn test_distributed_acceleration_order_by_limit_pushdown() -> Result<(), a
                 .with_dataset(make_memory_accelerated_dataset(
                     format!("file://{}", csv_path.display()),
                     "test_data",
-                    4,
+                    3,
                     "id",
                 ))
                 .with_runtime(SpicepodRuntime {
@@ -490,7 +490,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
                 .with_dataset(make_memory_accelerated_dataset(
                     format!("file://{}", csv_path.display()),
                     "test_data",
-                    4,
+                    3,
                     "id",
                 ))
                 .with_runtime(SpicepodRuntime {
