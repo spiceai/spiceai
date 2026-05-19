@@ -28,11 +28,12 @@ use std::sync::{Arc, RwLock};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::sql::sqlparser::ast::Expr as SqlParserExpr;
 use datafusion::sql::{ResolvedTableReference, TableReference};
-use spicepod::acceleration::{self, Acceleration};
+use serde::{Deserialize, Serialize};
+use spicepod::acceleration::{self, Acceleration, Mode, RefreshMode};
 use spicepod::component::dataset::TimeFormat as SpicepodTimeFormat;
 
 /// Dataset-level options extracted from `CREATE TABLE ... WITH ("dataset.*")` clauses.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DatasetOptions {
     /// The column to use as the time column for append-mode refreshes.
     pub time_column: Option<String>,
@@ -40,18 +41,77 @@ pub struct DatasetOptions {
     pub time_format: Option<SpicepodTimeFormat>,
 }
 
+/// The subset of [`Acceleration`] fields expressible via `CREATE TABLE ... WITH (acceleration.*)`.
+///
+/// With acceleration only accepts a subset of [`Acceleration`]. [`DdlAccelerationOptions`] must
+///  implement [`Eq`] so that we can store in object store.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DdlAccelerationOptions {
+    pub enabled: bool,
+    pub engine: Option<String>,
+    pub mode: Mode,
+    pub refresh_mode: Option<RefreshMode>,
+    pub refresh_check_interval: Option<String>,
+    pub refresh_sql: Option<String>,
+    pub refresh_data_window: Option<String>,
+    pub refresh_append_overlap: Option<String>,
+    pub retention_period: Option<String>,
+    pub retention_check_interval: Option<String>,
+    pub retention_check_enabled: bool,
+}
+
+impl From<DdlAccelerationOptions> for Acceleration {
+    fn from(opts: DdlAccelerationOptions) -> Self {
+        Acceleration {
+            enabled: opts.enabled,
+            engine: opts.engine,
+            mode: opts.mode,
+            refresh_mode: opts.refresh_mode,
+            refresh_check_interval: opts.refresh_check_interval,
+            refresh_sql: opts.refresh_sql,
+            refresh_data_window: opts.refresh_data_window,
+            refresh_append_overlap: opts.refresh_append_overlap,
+            retention_period: opts.retention_period,
+            retention_check_interval: opts.retention_check_interval,
+            retention_check_enabled: opts.retention_check_enabled,
+            ..Acceleration::default()
+        }
+    }
+}
+
+impl From<&Acceleration> for DdlAccelerationOptions {
+    fn from(a: &Acceleration) -> Self {
+        DdlAccelerationOptions {
+            enabled: a.enabled,
+            engine: a.engine.clone(),
+            mode: a.mode.clone(),
+            refresh_mode: a.refresh_mode.clone(),
+            refresh_check_interval: a.refresh_check_interval.clone(),
+            refresh_sql: a.refresh_sql.clone(),
+            refresh_data_window: a.refresh_data_window.clone(),
+            refresh_append_overlap: a.refresh_append_overlap.clone(),
+            retention_period: a.retention_period.clone(),
+            retention_check_interval: a.retention_check_interval.clone(),
+            retention_check_enabled: a.retention_check_enabled,
+        }
+    }
+}
+
 /// Extensions extracted from a `CREATE TABLE` statement.
 ///
 /// Bundles `WITH (...)` options (`acceleration.*` and `dataset.*`) and
 /// `PARTITION BY` expressions extracted during SQL pre-processing.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateTableStatementExtension {
     /// Acceleration options, if any `acceleration.*` keys were present in `WITH (...)`.
-    pub acceleration: Option<Acceleration>,
+    pub acceleration: Option<DdlAccelerationOptions>,
     /// Dataset-level options, if any `dataset.*` keys were present in `WITH (...)`.
     pub dataset: DatasetOptions,
     /// Partitioning expression from a `PARTITION BY` clause.
     /// The raw SQL expression as parsed by sqlparser.
+    /// Not serialized — the full SQL (including `PARTITION BY`) is preserved in
+    /// [`DdlStatement::CreateTable::sql`] and re-parsed on replay.
+    #[serde(skip, default)]
     pub partition_by: Option<Box<SqlParserExpr>>,
 }
 
@@ -153,8 +213,10 @@ pub fn parse_ddl_table_options(
 ///
 /// Returns an error if an unknown `acceleration.*` key is encountered or a value
 /// cannot be parsed.
-pub fn parse_acceleration_options(options: &[(String, String)]) -> DFResult<Acceleration> {
-    let mut accel = Acceleration::default();
+pub fn parse_acceleration_options(
+    options: &[(String, String)],
+) -> DFResult<DdlAccelerationOptions> {
+    let mut accel = DdlAccelerationOptions::default();
 
     for (key, value) in options {
         let field = key.strip_prefix("acceleration.").ok_or_else(|| {

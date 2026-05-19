@@ -47,10 +47,11 @@ pub mod helpers;
 
 pub use analyzer::{DdlAnalyzerRule, DdlExtensionNode, DdlExtensionPlanner, DdlNodeOp};
 pub use arrow_type::arrow_datatype_to_sql;
-pub use ddl_log::{DdlLog, Error as DdlLogError, InMemoryDdlLog};
+pub use ddl_log::{DdlLog, DdlStatement, Error as DdlLogError, InMemoryDdlLog};
 pub use extension_store::{
-    CreateTableStatementExtension, DatasetOptions, DdlExtensionStore, SharedDdlExtensionStore,
-    new_shared_store, parse_acceleration_options, parse_dataset_options, parse_ddl_table_options,
+    CreateTableStatementExtension, DatasetOptions, DdlAccelerationOptions, DdlExtensionStore,
+    SharedDdlExtensionStore, new_shared_store, parse_acceleration_options, parse_dataset_options,
+    parse_ddl_table_options,
 };
 pub use handler::{CatalogDdlHandler, CreateSchemaParams, CreateTableParams, DropTableParams};
 pub use helpers::{

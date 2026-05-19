@@ -299,7 +299,12 @@ impl ExecutionPlan for IcebergCreateSchemaExec {
                     if_not_exists,
                 );
                 registry
-                    .append_ddl(forward_sql.clone())
+                    .ddl_log()
+                    .append(DdlStatement::CreateSchema(DdlCreateSchemaParams {
+                        catalog_name: df_catalog_name.clone(),
+                        schema_name: df_schema_name.clone(),
+                        if_not_exists,
+                    }))
                     .await
                     .map_err(|e| {
                         DataFusionError::Execution(format!(
@@ -991,8 +996,30 @@ async fn synchronize_distributed_write_through_registration(
             dataset_options,
             partition_expr_sql,
         )?;
+        let ddl_extension = datafusion_ddl::CreateTableStatementExtension {
+            acceleration: Some(datafusion_ddl::DdlAccelerationOptions::from(acceleration)),
+            dataset: datafusion_ddl::DatasetOptions {
+                time_column: dataset_options.time_column.clone(),
+                time_format: dataset_options.time_format.clone(),
+            },
+            partition_by: None,
+        };
         registry
-            .append_ddl(forward_sql.clone())
+            .ddl_log()
+            .append(DdlStatement::CreateTable {
+                params: Box::new(DdlCreateTableParams {
+                    catalog_name: catalog_name.to_string(),
+                    schema_name: schema_name.to_string(),
+                    table_name: table_name.to_string(),
+                    arrow_schema: Arc::new(arrow_schema.clone()),
+                    primary_key: Vec::new(),
+                    extension: ddl_extension,
+                    if_not_exists: true,
+                    or_replace: false,
+                    like_source_table: None,
+                }),
+                sql: forward_sql.clone(),
+            })
             .await
             .map_err(|e| {
                 DataFusionError::Execution(format!("Failed to append DDL to cluster log: {e}"))
@@ -1111,7 +1138,11 @@ fn build_forwarded_create_sql(
     Ok(sql)
 }
 
+use datafusion_ddl::DdlStatement;
 use datafusion_ddl::arrow_datatype_to_sql;
+use datafusion_ddl::handler::{
+    CreateSchemaParams as DdlCreateSchemaParams, CreateTableParams as DdlCreateTableParams,
+};
 
 fn render_refresh_mode(mode: &spicepod::acceleration::RefreshMode) -> &'static str {
     match mode {

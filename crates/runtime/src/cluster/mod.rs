@@ -889,21 +889,72 @@ pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()
     Ok(())
 }
 
+/// Bootstrap `cluster.json` and replay any DDL statements already in the log.
+///
+/// Must be called before the scheduler server is bound so that `cluster.json`
+/// exists before any executor can connect and call `GetAppDefinition`, and
+/// before partition metadata seeding runs.
+///
+/// For a joining scheduler (cluster.json already exists), replays the DDL log
+/// so this scheduler's DataFusion context has all DDL-created tables/schemas,
+/// with a single catchup pass to cover any DDL appended during replay.
+async fn bootstrap_and_replay_ddl(rt: &Arc<Runtime>) -> crate::Result<()> {
+    let Some(cluster_state) = rt.cluster_state() else {
+        return Ok(());
+    };
+
+    cluster_state
+        .bootstrap()
+        .await
+        .map_err(|e| crate::Error::FailedToStartClusterScheduler {
+            source: Box::new(e),
+        })?;
+
+    let initial_ddl_statements = match cluster_state.read().await {
+        Ok(state) if !state.ddl_log.is_empty() => {
+            tracing::info!(
+                "Replaying {} DDL statement(s) from cluster state",
+                state.ddl_log.len()
+            );
+            let sqls: Vec<String> = state.ddl_log.iter().map(|s| s.to_sql()).collect();
+            replay_ddl_statements(rt, &sqls).await
+        }
+        Ok(_) => 0,
+        Err(e) => {
+            tracing::warn!("Failed to read cluster state for DDL replay: {e}");
+            return Ok(());
+        }
+    };
+
+    // Single catchup pass: cover any DDL appended by another scheduler
+    // while we were replaying.
+    match cluster_state.read().await {
+        Ok(state) if state.ddl_log.len() > initial_ddl_statements => {
+            let catchup: Vec<String> = state.ddl_log[initial_ddl_statements..]
+                .iter()
+                .map(|s| s.to_sql())
+                .collect();
+            tracing::info!(
+                "Replaying {} DDL catch-up statement(s) from cluster state",
+                catchup.len()
+            );
+            replay_ddl_statements(rt, &catchup).await;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!("Failed to read cluster state for DDL catch-up: {e}");
+        }
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn initialize_cluster_scheduler_future(
     rt: &Arc<Runtime>,
     scheduler_executor_registry: Arc<ExecutorRegistry>,
     scheduler_peers: Arc<RwLock<SchedulerPeers>>,
 ) -> crate::Result<Option<Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'static>>>> {
-    // Bootstrap `cluster.json` before binding the scheduler server so it exists
-    // before any executor can connect and call `GetAppDefinition`, and before
-    // partition metadata seeding runs.
-    if let Some(cluster_state) = rt.cluster_state() {
-        cluster_state.bootstrap().await.map_err(|e| {
-            crate::Error::FailedToStartClusterScheduler {
-                source: Box::new(e),
-            }
-        })?;
-    }
+    bootstrap_and_replay_ddl(rt).await?;
     initialize_cluster_scheduler(rt).await?;
     // Start internal cluster server for scheduler on separate port
     let internal_server_shutdown = CancellationToken::new();
@@ -1535,7 +1586,8 @@ pub async fn initialize_cluster_executor(
                 "Replaying {} DDL statement(s) from scheduler (version {ddl_version})",
                 ddl_statements.len(),
             );
-            replay_ddl_statements(&rt, &ddl_statements).await;
+            let sqls = deserialize_ddl_statements_to_sql(&ddl_statements);
+            replay_ddl_statements(&rt, &sqls).await;
         }
 
         // Catch up any DDL created between GetAppDefinition and now (TOCTOU window).
@@ -1553,7 +1605,8 @@ pub async fn initialize_cluster_executor(
                         "Replaying {} DDL catch-up statement(s) from scheduler",
                         catchup.len()
                     );
-                    replay_ddl_statements(&rt, &catchup).await;
+                    let sqls = deserialize_ddl_statements_to_sql(&catchup);
+                    replay_ddl_statements(&rt, &sqls).await;
                 }
             }
             Err(e) => {
@@ -2023,6 +2076,28 @@ async fn replay_ddl_statements(rt: &Runtime, statements: &[String]) -> usize {
         }
     }
     statements.len()
+}
+
+/// Deserializes a slice of JSON-encoded [`DdlStatement`] strings (as received
+/// over gRPC) into SQL strings for replay. Strings that fail to deserialize
+/// are warned and skipped.
+///
+/// [`DdlStatement`]: datafusion_ddl::DdlStatement
+fn deserialize_ddl_statements_to_sql(json_stmts: &[String]) -> Vec<String> {
+    json_stmts
+        .iter()
+        .filter_map(
+            |s| match serde_json::from_str::<datafusion_ddl::DdlStatement>(s) {
+                Ok(stmt) => Some(stmt.to_sql()),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to deserialize DDL statement from scheduler: {e}; raw={s}"
+                    );
+                    None
+                }
+            },
+        )
+        .collect()
 }
 
 /// For each registered dataset on the cluster executor, asks its data

@@ -20,12 +20,64 @@ limitations under the License.
 //! `cluster.json` document via [`ClusterStateStore`]. Safe for
 //! multi-scheduler clusters — concurrent appends are serialised by
 //! the OCC retry loop.
+//!
+//! Deduplication: [`append`](OccDdlLog::append) checks whether the statement
+//! is already present before pushing. If it is, the OCC write is skipped.
 
 use async_trait::async_trait;
+use datafusion_ddl::DdlStatement;
 use datafusion_ddl::ddl_log::{DdlLog, Error as DdlLogError, Result as DdlLogResult};
 use std::sync::Arc;
 
 use crate::cluster_state::{ClusterStateStore, MutationOutcome};
+
+/// Returns `true` when appending `stmt` would be a no-op given the current log.
+///
+/// The rules are object-aware:
+/// - For `CreateTable` / `DropTable`: find the *last* entry that references the
+///   same `(catalog, schema, table)` triple.  If it equals `stmt`, the statement
+///   is redundant.  A `CreateTable` that follows a `DropTable` (or vice-versa)
+///   is therefore *not* considered redundant, which correctly handles
+///   create → drop → create sequences.
+/// - For `CreateSchema`: no `DropSchema` variant exists, so any existing
+///   identical `CreateSchema` for the same schema is redundant.
+fn is_redundant(log: &[DdlStatement], stmt: &DdlStatement) -> bool {
+    match stmt {
+        DdlStatement::CreateTable { params, .. } => log
+            .iter()
+            .rev()
+            .find(|s| {
+                same_table(
+                    s,
+                    &params.catalog_name,
+                    &params.schema_name,
+                    &params.table_name,
+                )
+            })
+            .map_or(false, |last| last == stmt),
+        DdlStatement::DropTable(p) => log
+            .iter()
+            .rev()
+            .find(|s| same_table(s, &p.catalog_name, &p.schema_name, &p.table_name))
+            .map_or(false, |last| last == stmt),
+        DdlStatement::CreateSchema(_) => log.contains(stmt),
+    }
+}
+
+/// Returns `true` if `stmt` references the given `(catalog, schema, table)`.
+fn same_table(stmt: &DdlStatement, catalog: &str, schema: &str, table: &str) -> bool {
+    match stmt {
+        DdlStatement::CreateTable { params, .. } => {
+            params.catalog_name == catalog
+                && params.schema_name == schema
+                && params.table_name == table
+        }
+        DdlStatement::DropTable(p) => {
+            p.catalog_name == catalog && p.schema_name == schema && p.table_name == table
+        }
+        DdlStatement::CreateSchema(_) => false,
+    }
+}
 
 /// A [`DdlLog`] that stores statements in the OCC-protected
 /// `cluster.json` document shared by all schedulers.
@@ -43,22 +95,25 @@ impl OccDdlLog {
 
 #[async_trait]
 impl DdlLog for OccDdlLog {
-    async fn append(&self, sql: String) -> DdlLogResult<()> {
-        let value = sql.clone();
+    async fn append(&self, stmt: DdlStatement) -> DdlLogResult<()> {
+        let value = stmt.clone();
         self.cluster_state
             .mutate(move |state| {
+                if is_redundant(&state.ddl_log, &value) {
+                    return MutationOutcome::NoChange;
+                }
                 state.ddl_log.push(value.clone());
                 MutationOutcome::Apply
             })
             .await
             .map_err(|e| DdlLogError::AppendFailed {
                 source: Box::new(e),
-                statement: sql.clone(),
+                stmt,
             })?;
         Ok(())
     }
 
-    async fn snapshot(&self) -> DdlLogResult<(Vec<String>, u64)> {
+    async fn snapshot(&self) -> DdlLogResult<(Vec<DdlStatement>, u64)> {
         let state = self
             .cluster_state
             .read()
@@ -70,7 +125,7 @@ impl DdlLog for OccDdlLog {
         Ok((state.ddl_log.clone(), version))
     }
 
-    async fn statements_since(&self, since_version: u64) -> DdlLogResult<Vec<String>> {
+    async fn statements_since(&self, since_version: u64) -> DdlLogResult<Vec<DdlStatement>> {
         let state = self
             .cluster_state
             .read()
@@ -93,6 +148,8 @@ mod tests {
     use object_store::ObjectStore;
     use object_store::memory::InMemory;
 
+    use datafusion_ddl::handler::CreateSchemaParams;
+
     use super::*;
 
     async fn make_occ_log() -> OccDdlLog {
@@ -100,6 +157,14 @@ mod tests {
         let cs = Arc::new(ClusterStateStore::new(store, ""));
         cs.bootstrap().await.expect("bootstrap");
         OccDdlLog::new(cs)
+    }
+
+    fn schema_stmt(catalog: &str, schema: &str) -> DdlStatement {
+        DdlStatement::CreateSchema(CreateSchemaParams {
+            catalog_name: catalog.to_string(),
+            schema_name: schema.to_string(),
+            if_not_exists: true,
+        })
     }
 
     #[tokio::test]
@@ -114,45 +179,112 @@ mod tests {
     #[tokio::test]
     async fn append_and_snapshot() {
         let log = make_occ_log().await;
-        log.append("CREATE SCHEMA IF NOT EXISTS \"cat\".\"s1\"".to_string())
-            .await
-            .expect("append");
-        log.append(
-            "CREATE TABLE IF NOT EXISTS \"cat\".\"s1\".\"t1\" (id BIGINT NOT NULL)".to_string(),
-        )
+        log.append(schema_stmt("cat", "s1")).await.expect("append");
+        log.append(DdlStatement::DropTable(
+            datafusion_ddl::handler::DropTableParams {
+                catalog_name: "cat".to_string(),
+                schema_name: "s1".to_string(),
+                table_name: "t1".to_string(),
+                if_exists: true,
+            },
+        ))
         .await
         .expect("append");
 
         let (stmts, version) = log.snapshot().await.expect("snapshot");
         assert_eq!(version, 2);
         assert_eq!(stmts.len(), 2);
-        assert!(stmts[0].contains("CREATE SCHEMA"));
-        assert!(stmts[1].contains("CREATE TABLE"));
+        assert!(matches!(stmts[0], DdlStatement::CreateSchema(_)));
+        assert!(matches!(stmts[1], DdlStatement::DropTable(_)));
     }
 
     #[tokio::test]
     async fn statements_since() {
         let log = make_occ_log().await;
-        log.append("stmt0".to_string()).await.expect("append");
-        log.append("stmt1".to_string()).await.expect("append");
-        log.append("stmt2".to_string()).await.expect("append");
+        for name in ["s0", "s1", "s2"] {
+            log.append(schema_stmt("cat", name)).await.expect("append");
+        }
 
-        assert_eq!(
-            log.statements_since(0).await.expect("since"),
-            vec!["stmt0", "stmt1", "stmt2"]
-        );
-        assert_eq!(
-            log.statements_since(1).await.expect("since"),
-            vec!["stmt1", "stmt2"]
-        );
-        assert_eq!(log.statements_since(2).await.expect("since"), vec!["stmt2"]);
+        assert_eq!(log.statements_since(0).await.expect("since").len(), 3);
+        assert_eq!(log.statements_since(1).await.expect("since").len(), 2);
+        assert_eq!(log.statements_since(2).await.expect("since").len(), 1);
         assert!(log.statements_since(3).await.expect("since").is_empty());
         assert!(log.statements_since(100).await.expect("since").is_empty());
     }
 
     #[tokio::test]
+    async fn deduplication_prevents_double_append() {
+        let log = make_occ_log().await;
+        log.append(schema_stmt("cat", "s1"))
+            .await
+            .expect("first append");
+        log.append(schema_stmt("cat", "s1"))
+            .await
+            .expect("second append (dedup)");
+
+        let (stmts, version) = log.snapshot().await.expect("snapshot");
+        assert_eq!(version, 1, "duplicate should not increase version");
+        assert_eq!(stmts.len(), 1);
+    }
+
+    fn drop_stmt(catalog: &str, schema: &str, table: &str) -> DdlStatement {
+        DdlStatement::DropTable(datafusion_ddl::handler::DropTableParams {
+            catalog_name: catalog.to_string(),
+            schema_name: schema.to_string(),
+            table_name: table.to_string(),
+            if_exists: true,
+        })
+    }
+
+    fn create_table_stmt(catalog: &str, schema: &str, table: &str) -> DdlStatement {
+        use arrow::datatypes::Schema;
+        use std::sync::Arc;
+        DdlStatement::CreateTable {
+            params: Box::new(datafusion_ddl::handler::CreateTableParams {
+                catalog_name: catalog.to_string(),
+                schema_name: schema.to_string(),
+                table_name: table.to_string(),
+                arrow_schema: Arc::new(Schema::empty()),
+                primary_key: vec![],
+                extension: datafusion_ddl::CreateTableStatementExtension::default(),
+                if_not_exists: true,
+                or_replace: false,
+                like_source_table: None,
+            }),
+            sql: format!("CREATE TABLE IF NOT EXISTS \"{catalog}\".\"{schema}\".\"{table}\" ()"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_drop_create_not_deduplicated() {
+        let log = make_occ_log().await;
+        let ct = create_table_stmt("cat", "s1", "t1");
+        let dt = drop_stmt("cat", "s1", "t1");
+
+        log.append(ct.clone()).await.expect("create");
+        log.append(dt.clone()).await.expect("drop");
+        // Second create must NOT be deduplicated — the last op was a drop.
+        log.append(ct.clone()).await.expect("re-create");
+
+        let (stmts, version) = log.snapshot().await.expect("snapshot");
+        assert_eq!(version, 3, "create/drop/create should each be recorded");
+        assert_eq!(stmts.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn duplicate_create_table_is_deduplicated() {
+        let log = make_occ_log().await;
+        let ct = create_table_stmt("cat", "s1", "t1");
+        log.append(ct.clone()).await.expect("first create");
+        log.append(ct.clone()).await.expect("second create (dedup)");
+
+        let (stmts, version) = log.snapshot().await.expect("snapshot");
+        assert_eq!(version, 1, "identical create should not be duplicated");
+        assert_eq!(stmts.len(), 1);
+    }
+
+    #[tokio::test]
     async fn two_writers_both_visible() {
-        // Simulates two schedulers appending to the same store.
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let cs = Arc::new(ClusterStateStore::new(store, ""));
         cs.bootstrap().await.expect("bootstrap");
@@ -161,19 +293,18 @@ mod tests {
         let log_b = OccDdlLog::new(cs);
 
         log_a
-            .append("CREATE SCHEMA a".to_string())
+            .append(schema_stmt("cat", "a"))
             .await
             .expect("a append");
         log_b
-            .append("CREATE SCHEMA b".to_string())
+            .append(schema_stmt("cat", "b"))
             .await
             .expect("b append");
 
-        // Both writers see both statements.
         let (stmts, version) = log_a.snapshot().await.expect("snapshot");
         assert_eq!(version, 2);
         assert_eq!(stmts.len(), 2);
-        assert!(stmts.contains(&"CREATE SCHEMA a".to_string()));
-        assert!(stmts.contains(&"CREATE SCHEMA b".to_string()));
+        assert!(stmts.contains(&schema_stmt("cat", "a")));
+        assert!(stmts.contains(&schema_stmt("cat", "b")));
     }
 }

@@ -317,11 +317,16 @@ impl ClusterService for ClusterServiceImpl {
         };
 
         // Snapshot the DDL log so the executor can replay DDL-created tables/schemas.
-        let (ddl_statements, ddl_version) = self
+        let (ddl_stmts, ddl_version) = self
             .executor_registry
             .ddl_snapshot()
             .await
             .map_err(|e| Status::internal(format!("Failed to snapshot DDL log: {e}")))?;
+
+        let ddl_statements: Vec<String> = ddl_stmts
+            .iter()
+            .map(|s| serde_json::to_string(s).unwrap_or_default())
+            .collect();
 
         Ok(Response::new(GetAppDefinitionResponse {
             app_json,
@@ -755,11 +760,16 @@ impl ClusterService for ClusterServiceImpl {
             request.since_version
         );
 
-        let ddl_statements = self
+        let ddl_stmts = self
             .executor_registry
             .ddl_statements_since(request.since_version)
             .await
             .map_err(|e| Status::internal(format!("Failed to read DDL catch-up: {e}")))?;
+
+        let ddl_statements: Vec<String> = ddl_stmts
+            .iter()
+            .map(|s| serde_json::to_string(s).unwrap_or_default())
+            .collect();
 
         Ok(Response::new(GetDdlCatchupResponse { ddl_statements }))
     }

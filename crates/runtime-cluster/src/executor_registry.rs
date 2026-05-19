@@ -26,6 +26,7 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
 use datafusion::{catalog::TableProvider, sql::TableReference};
+use datafusion_ddl::DdlStatement;
 use datafusion_ddl::ddl_log::{self, DdlLog};
 use datafusion_expr::{Expr, TableScan};
 use flight_client::cookie::CookieStore;
@@ -175,7 +176,7 @@ impl ExecutorRegistry {
         Arc::clone(&self.federated_partition_store)
     }
 
-    /// Appends a DDL SQL statement to the cluster DDL log.
+    /// Appends a DDL statement to the cluster DDL log.
     ///
     /// Must be called **before** forwarding to executors so that a concurrent
     /// `GetAppDefinition` will include the statement in its snapshot.
@@ -183,8 +184,8 @@ impl ExecutorRegistry {
     /// # Errors
     ///
     /// Returns [`ddl_log::Error`] if the underlying persistence fails.
-    pub async fn append_ddl(&self, sql: String) -> ddl_log::Result<()> {
-        self.ddl_log.append(sql).await
+    pub fn ddl_log(&self) -> Arc<dyn DdlLog> {
+        Arc::clone(&self.ddl_log)
     }
 
     /// Returns a snapshot of all DDL statements and the current version.
@@ -192,7 +193,7 @@ impl ExecutorRegistry {
     /// # Errors
     ///
     /// Returns [`ddl_log::Error`] if the underlying read fails.
-    pub async fn ddl_snapshot(&self) -> ddl_log::Result<(Vec<String>, u64)> {
+    pub async fn ddl_snapshot(&self) -> ddl_log::Result<(Vec<DdlStatement>, u64)> {
         self.ddl_log.snapshot().await
     }
 
@@ -201,7 +202,10 @@ impl ExecutorRegistry {
     /// # Errors
     ///
     /// Returns [`ddl_log::Error`] if the underlying read fails.
-    pub async fn ddl_statements_since(&self, since_version: u64) -> ddl_log::Result<Vec<String>> {
+    pub async fn ddl_statements_since(
+        &self,
+        since_version: u64,
+    ) -> ddl_log::Result<Vec<DdlStatement>> {
         self.ddl_log.statements_since(since_version).await
     }
 
@@ -745,6 +749,14 @@ mod tests {
         assert_eq!(executors, vec!["executor-1"]);
     }
 
+    fn schema_stmt(catalog: &str, schema: &str) -> DdlStatement {
+        DdlStatement::CreateSchema(datafusion_ddl::handler::CreateSchemaParams {
+            catalog_name: catalog.to_string(),
+            schema_name: schema.to_string(),
+            if_not_exists: true,
+        })
+    }
+
     #[tokio::test]
     async fn test_ddl_log_empty() {
         let registry = make_registry().await;
@@ -765,50 +777,60 @@ mod tests {
         let registry = make_registry().await;
 
         registry
-            .append_ddl("CREATE SCHEMA IF NOT EXISTS \"cat\".\"s1\"".to_string())
+            .ddl_log()
+            .append(schema_stmt("cat", "s1"))
             .await
             .expect("append");
         registry
-            .append_ddl(
-                "CREATE TABLE IF NOT EXISTS \"cat\".\"s1\".\"t1\" (id BIGINT NOT NULL)".to_string(),
-            )
+            .ddl_log()
+            .append(DdlStatement::DropTable(
+                datafusion_ddl::handler::DropTableParams {
+                    catalog_name: "cat".to_string(),
+                    schema_name: "s1".to_string(),
+                    table_name: "t1".to_string(),
+                    if_exists: true,
+                },
+            ))
             .await
             .expect("append");
 
         let (stmts, version) = registry.ddl_snapshot().await.expect("snapshot");
         assert_eq!(version, 2);
         assert_eq!(stmts.len(), 2);
-        assert!(stmts[0].contains("CREATE SCHEMA"));
-        assert!(stmts[1].contains("CREATE TABLE"));
+        assert!(matches!(stmts[0], DdlStatement::CreateSchema(_)));
+        assert!(matches!(stmts[1], DdlStatement::DropTable(_)));
     }
 
     #[tokio::test]
     async fn test_ddl_log_statements_since() {
         let registry = make_registry().await;
         registry
-            .append_ddl("stmt0".to_string())
+            .ddl_log()
+            .append(schema_stmt("cat", "s0"))
             .await
             .expect("append");
         registry
-            .append_ddl("stmt1".to_string())
+            .ddl_log()
+            .append(schema_stmt("cat", "s1"))
             .await
             .expect("append");
         registry
-            .append_ddl("stmt2".to_string())
+            .ddl_log()
+            .append(schema_stmt("cat", "s2"))
             .await
             .expect("append");
 
         assert_eq!(
-            registry.ddl_statements_since(0).await.expect("since"),
-            vec!["stmt0", "stmt1", "stmt2"]
+            registry.ddl_statements_since(0).await.expect("since").len(),
+            3
         );
         assert_eq!(
-            registry.ddl_statements_since(1).await.expect("since"),
-            vec!["stmt1", "stmt2"]
+            registry.ddl_statements_since(1).await.expect("since").len(),
+            2
         );
         assert_eq!(
-            registry.ddl_statements_since(2).await.expect("since"),
-            vec!["stmt2"]
+            registry.ddl_statements_since(2).await.expect("since").len(),
+            1
         );
         assert!(
             registry

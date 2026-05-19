@@ -43,7 +43,9 @@ use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion_ddl::DdlStatement;
 use datafusion_ddl::arrow_datatype_to_sql;
+use datafusion_ddl::handler::CreateTableParams as DdlCreateTableParams;
 use futures::StreamExt;
 
 // Re-export single-node merge exec (no broadcast needed for local merge).
@@ -358,7 +360,21 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
                 );
 
                 executor_registry
-                    .append_ddl(ddl_sql.clone())
+                    .ddl_log()
+                    .append(DdlStatement::CreateTable {
+                        params: Box::new(DdlCreateTableParams {
+                            catalog_name: catalog_name.clone(),
+                            schema_name: schema_name.clone(),
+                            table_name: table_name.clone(),
+                            arrow_schema: Arc::clone(&arrow_schema_fwd),
+                            primary_key: primary_key_fwd.clone(),
+                            extension: datafusion_ddl::CreateTableStatementExtension::default(),
+                            if_not_exists,
+                            or_replace: false,
+                            like_source_table: like_source_table.clone(),
+                        }),
+                        sql: ddl_sql.clone(),
+                    })
                     .await
                     .map_err(|e| {
                         DataFusionError::Execution(format!(
@@ -564,7 +580,12 @@ impl ExecutionPlan for DistributedCayenneDropTableExec {
                      \"{catalog_name}\".\"{schema_name}\".\"{table_name}\""
                 );
                 executor_registry
-                    .append_ddl(ddl_sql.clone())
+                    .ddl_log()
+                    .drop_table(
+                        catalog_name.clone(),
+                        schema_name.clone(),
+                        table_name.clone(),
+                    )
                     .await
                     .map_err(|e| {
                         DataFusionError::Execution(format!(
@@ -700,7 +721,8 @@ impl ExecutionPlan for DistributedCayenneCreateSchemaExec {
                 let ddl_sql =
                     format!("CREATE SCHEMA IF NOT EXISTS \"{catalog_name}\".\"{schema_name}\"");
                 executor_registry
-                    .append_ddl(ddl_sql.clone())
+                    .ddl_log()
+                    .create_schema(catalog_name.clone(), schema_name.clone())
                     .await
                     .map_err(|e| {
                         DataFusionError::Execution(format!(

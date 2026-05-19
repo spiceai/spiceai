@@ -30,7 +30,7 @@ use crate::param::Params;
 use crate::semantic::Column;
 use crate::vector::VectorStore;
 
-#[derive(Debug, Clone, Serialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TimeFormat {

@@ -5713,8 +5713,11 @@ name = "datafusion-ddl"
 version = "2.0.0-unstable"
 dependencies = [
  "arrow",
+ "arrow-schema",
  "async-trait",
  "datafusion",
+ "serde",
+ "serde_json",
  "snafu",
  "spicepod",
  "tokio",

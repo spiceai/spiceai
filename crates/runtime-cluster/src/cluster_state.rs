@@ -40,6 +40,7 @@ use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use uuid::Uuid;
 
 use crate::metadata::TablePartitionMetadata;
+use datafusion_ddl::DdlStatement;
 
 /// Current schema version for `cluster.json`. Bump if the on-disk shape
 /// changes; readers reject unknown versions.
@@ -75,14 +76,14 @@ pub struct ClusterState {
     #[serde(default)]
     pub catalog: HashMap<NormalizedTableName, TablePartitionMetadata>,
 
-    /// Append-only log of DDL SQL statements applied to the cluster.
+    /// Append-only log of DDL statements applied to the cluster.
     ///
     /// Used to replay DDL on executors that join after the statements were
     /// originally executed. Each statement is stored in executor-compatible
     /// form (e.g. `IF NOT EXISTS`/`IF EXISTS`). The version is the count
     /// of statements in the log.
     #[serde(default)]
-    pub ddl_log: Vec<String>,
+    pub ddl_log: Vec<DdlStatement>,
 }
 
 impl ClusterState {

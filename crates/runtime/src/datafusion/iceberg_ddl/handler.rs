@@ -92,7 +92,7 @@ impl CatalogDdlHandler for IcebergDdlHandler {
             })?;
         let namespace = iceberg::NamespaceIdent::new(params.schema_name.clone());
         let dataset_options = params.extension.dataset.clone();
-        let acceleration = params.extension.acceleration.clone();
+        let acceleration = params.extension.acceleration.clone().map(Into::into);
         let partition_expr_sql = params.extension.partition_by.map(|e| e.to_string());
 
         Ok(Arc::new(IcebergCreateTableExec::new(

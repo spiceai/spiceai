@@ -30,6 +30,7 @@ use datafusion::error::Result as DFResult;
 use datafusion::execution::SessionState;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::TableReference;
+use serde::{Deserialize, Serialize};
 
 use crate::CreateTableStatementExtension;
 
@@ -39,11 +40,12 @@ use crate::CreateTableStatementExtension;
 ///
 /// Populated by [`DdlAnalyzerRule`] from the intercepted `CREATE TABLE` logical
 /// plan and the [`crate::DdlExtensionStore`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateTableParams {
     pub catalog_name: String,
     pub schema_name: String,
     pub table_name: String,
+    #[serde(with = "schema_serde")]
     pub arrow_schema: Arc<Schema>,
     pub primary_key: Vec<String>,
     /// DDL extensions extracted from `WITH (...)` and `PARTITION BY` clauses.
@@ -53,11 +55,12 @@ pub struct CreateTableParams {
     pub or_replace: bool,
     /// Source table for `CREATE TABLE ... (LIKE ...)`.
     /// `None` for plain `CREATE TABLE`.
+    #[serde(with = "opt_table_reference_serde", default)]
     pub like_source_table: Option<TableReference>,
 }
 
 /// Parameters for [`CatalogDdlHandler::drop_table_exec`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DropTableParams {
     pub catalog_name: String,
     pub schema_name: String,
@@ -66,11 +69,47 @@ pub struct DropTableParams {
 }
 
 /// Parameters for [`CatalogDdlHandler::create_schema_exec`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateSchemaParams {
     pub catalog_name: String,
     pub schema_name: String,
     pub if_not_exists: bool,
+}
+
+// ── Custom serde modules ──────────────────────────────────────────────────────
+
+mod schema_serde {
+    use std::sync::Arc;
+
+    use arrow::datatypes::Schema;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(schema: &Arc<Schema>, s: S) -> Result<S::Ok, S::Error> {
+        let v = serde_json::to_value(schema.as_ref()).map_err(serde::ser::Error::custom)?;
+        v.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<Schema>, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        let schema: Schema = serde_json::from_value(v).map_err(serde::de::Error::custom)?;
+        Ok(Arc::new(schema))
+    }
+}
+
+mod opt_table_reference_serde {
+    use datafusion::sql::TableReference;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(opt: &Option<TableReference>, s: S) -> Result<S::Ok, S::Error> {
+        opt.as_ref().map(|r| r.to_string()).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<TableReference>, D::Error> {
+        let opt: Option<String> = Option::deserialize(d)?;
+        Ok(opt.map(|s| TableReference::parse_str(&s)))
+    }
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────────────

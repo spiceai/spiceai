@@ -10,8 +10,11 @@ version.workspace = true
 
 [dependencies]
 arrow.workspace = true
+arrow-schema = { workspace = true, features = ["serde"] }
 async-trait.workspace = true
 datafusion.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tokio = { workspace = true, features = ["sync"] }
