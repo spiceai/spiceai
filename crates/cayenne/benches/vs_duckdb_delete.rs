@@ -158,7 +158,7 @@ fn bench_delete(c: &mut Criterion) {
                 let _ = cayenne_delete_range(&fixture, lo, hi).await;
                 fixture
             }));
-            cayenne_fixtures.push((lane.lane(), fixture));
+            cayenne_fixtures.push((lane, lane.lane(), fixture));
         }
 
         let duckdb_fixture = Arc::new({
@@ -170,16 +170,17 @@ fn bench_delete(c: &mut Criterion) {
         rt.block_on(capture_comparison_plans(
             &format!("delete/{rows}/scan_after_delete"),
             &cayenne_fixtures
-                .first()
+                .iter()
+                .find(|(lane, _, _)| *lane == Metastore::Sqlite)
                 .expect("sqlite cayenne lane should exist")
-                .1
+                .2
                 .table,
             &duckdb_fixture.conn,
             "SELECT SUM(value) FROM t",
             "SELECT SUM(value) FROM del_bench",
         ));
 
-        for (lane_label, cayenne_fixture) in &cayenne_fixtures {
+        for (_, lane_label, cayenne_fixture) in &cayenne_fixtures {
             let fixture = Arc::clone(cayenne_fixture);
             group.bench_with_input(
                 BenchmarkId::new(format!("{lane_label}/scan_after_delete"), rows),
