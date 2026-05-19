@@ -36,10 +36,9 @@ use datafusion::{
     sql::unparser::expr_to_sql,
 };
 use datafusion_table_providers::{
-    duckdb::{DuckDBSettingsRegistry, DuckDBTableProviderFactory},
+    duckdb::DuckDBTableProviderFactory,
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
 };
-use duckdb::AccessMode;
 use runtime_table_partition::{
     Partition,
     creator::{
@@ -54,7 +53,7 @@ use tokio::{fs::create_dir_all, sync::Mutex};
 
 use super::{
     AccelerationSource, BootstrapStatus, DataAccelerator,
-    duckdb::{DuckDBAccelerator, create_table_provider, settings::OrderByNonIntegerLiteral},
+    duckdb::{DuckDBAccelerator, create_factory, create_table_provider},
 };
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
@@ -494,15 +493,6 @@ impl PartitionCreator for DuckDBPartitionCreator {
             })
             .collect())
     }
-}
-
-fn create_factory() -> DuckDBTableProviderFactory {
-    DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
-        .with_dialect(new_duckdb_dialect())
-        .with_settings_registry(
-            DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
-        )
-        .with_function_support(deny_spice_functions_for_duckdb().as_ref().clone())
 }
 
 async fn get_pool(
