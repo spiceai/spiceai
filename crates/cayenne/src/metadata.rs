@@ -288,10 +288,9 @@ pub struct VortexConfig {
     /// Runtime-global footer metadata cache size in MB, when explicitly configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub footer_cache_mb: Option<usize>,
-    /// Segment cache size in MB.
+    /// Shared Vortex segment cache capacity in MB.
     ///
-    /// Currently ignored because the current Vortex `DataFusion` API does not expose
-    /// segment cache sizing.
+    /// Passed through to `vortex-datafusion` as the per-format segment cache size.
     pub segment_cache_mb: usize,
     /// Target size for individual Vortex files in MB. When writes exceed this size,
     /// a new Vortex file will be created in the same listing directory. This allows

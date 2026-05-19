@@ -193,7 +193,7 @@ pub trait MetadataCatalog: Send + Sync {
 pub struct VortexConfig {
     // Vortex caches and file shape
     pub footer_cache_mb: Option<usize>,       // None unless runtime.params.cayenne_footer_cache_mb is set
-    pub segment_cache_mb: usize,              // default 256 (currently ignored until Vortex exposes segment cache sizing)
+    pub segment_cache_mb: usize,              // default 256; configures the shared Vortex segment cache capacity
     pub target_vortex_file_size_mb: usize,    // default 256
 
     // Encoding / sort

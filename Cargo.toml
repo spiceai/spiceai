@@ -90,6 +90,7 @@ edition = "2024"
 exclude = [".github/"]
 homepage = "https://spice.ai"
 license-file = "LICENSE"
+publish = false
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.94.1"
 version = "2.0.0-unstable"
