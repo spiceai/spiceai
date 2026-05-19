@@ -4175,31 +4175,22 @@ mod tests {
         use tempfile::TempDir;
 
         async fn create_test_dataset(time_column: Option<String>) -> Dataset {
-            let runtime = crate::Runtime::builder().build().await;
-            Dataset {
-                from: "test".to_string(),
-                name: TableReference::bare("test_dataset"),
-                access: AccessMode::Read,
-                params: HashMap::new(),
-                metadata: HashMap::new(),
-                columns: vec![],
-                has_metadata_table: false,
-                replication: None,
-                time_column,
-                time_format: None,
-                time_partition_column: None,
-                time_partition_format: None,
-                acceleration: None,
-                embeddings: vec![],
-                app: Arc::new(app::App::default()),
-                unsupported_type_action: None,
-                ready_state: ReadyState::OnRegistration,
-                metrics: Metrics::default(),
-                runtime: Arc::new(runtime),
-                vectors: None,
-                full_text_search: None,
-                check_availability: crate::component::dataset::CheckAvailability::Disabled,
+            let runtime = Arc::new(crate::Runtime::builder().build().await);
+            let mut dataset_builder = crate::component::dataset::builder::DatasetBuilder::try_new(
+                "test".to_string(),
+                "test_dataset",
+            )
+            .expect("dataset builder should construct a valid test dataset")
+            .with_app(Arc::new(app::App::default()))
+            .with_runtime(runtime);
+
+            if let Some(time_column) = time_column {
+                dataset_builder = dataset_builder.with_time_column(time_column);
             }
+
+            dataset_builder
+                .build()
+                .expect("dataset builder should build a valid test dataset")
         }
 
         fn create_snapshots_behavior(
