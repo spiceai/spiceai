@@ -1132,12 +1132,12 @@ mod tests {
         .build();
 
         let state = df.ctx.state();
-        let rule_names: Vec<&str> = state.optimizers().iter().map(|r| r.name()).collect();
 
         assert!(
-            !rule_names
+            !state
+                .optimizers()
                 .iter()
-                .any(|name| *name == "cayenne_propagate_filter_across_equi_join_keys"),
+                .any(|r| r.name() == "cayenne_propagate_filter_across_equi_join_keys"),
             "Cayenne logical filter propagation should be disabled by default"
         );
     }

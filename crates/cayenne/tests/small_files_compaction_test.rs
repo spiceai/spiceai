@@ -408,6 +408,7 @@ async fn compaction_collapses_tiny_protected_snapshots(
     let config = VortexConfig {
         target_vortex_file_size_mb: 128,
         compaction_trigger_files: 4,
+        compaction_trigger_protected_snapshots: 4,
         compaction_background_interval_ms: 0,
         ..Default::default()
     };
