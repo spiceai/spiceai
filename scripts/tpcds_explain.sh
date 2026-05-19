@@ -68,13 +68,23 @@ else
   echo "All ${#TPCDS_TABLES[@]} TPC-DS Parquet files already present in $DATA_DIR/, skipping generation."
 fi
 
-# -- 2. start spiced ----------------------------------------------------------
+# -- 2. stage spicepod + start spiced -----------------------------------------
+# spiced expects the spicepod file to be named exactly spicepod.yaml. Stage the
+# selected pod into a temp dir under that name and point spiced at the dir.
 mkdir -p "$OUT_DIR"
-spiced_log="$OUT_DIR/spiced.log"
-echo "Starting spiced with $SPICEPOD; logs -> $spiced_log"
-spiced --http "$HTTP_BIND" "$SPICEPOD" >"$spiced_log" 2>&1 &
+# Resolve paths to absolute form because spiced runs from the staged dir.
+OUT_DIR_ABS="$(cd "$OUT_DIR" && pwd)"
+DATA_DIR_ABS="$(cd "$DATA_DIR" && pwd)"
+stage_dir=$(mktemp -d -t tpcds_explain_pod.XXXXXX)
+trap 'echo "Cleaning $stage_dir"; rm -rf "$stage_dir"; [[ -n "${SPICED_PID:-}" ]] && { echo "Stopping spiced (pid=$SPICED_PID)"; kill "$SPICED_PID" 2>/dev/null || true; wait "$SPICED_PID" 2>/dev/null || true; }' EXIT
+cp "$SPICEPOD" "$stage_dir/spicepod.yaml"
+# Make data/ resolvable from the staged dir.
+ln -s "$DATA_DIR_ABS" "$stage_dir/data"
+
+spiced_log="$OUT_DIR_ABS/spiced.log"
+echo "Starting spiced with $SPICEPOD (staged at $stage_dir); logs -> $spiced_log"
+( cd "$stage_dir" && spiced --http "$HTTP_BIND" . >"$spiced_log" 2>&1 ) &
 SPICED_PID=$!
-trap 'echo "Stopping spiced (pid=$SPICED_PID)"; kill "$SPICED_PID" 2>/dev/null || true; wait "$SPICED_PID" 2>/dev/null || true' EXIT
 
 # -- 3. wait for readiness ----------------------------------------------------
 ready_url="http://${HTTP_BIND}/v1/ready"
