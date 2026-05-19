@@ -58,6 +58,7 @@ pub mod turso;
 
 pub(crate) mod snapshots;
 pub mod spice_sys;
+pub(crate) mod storage;
 pub mod swappable;
 pub mod upsert_dedup;
 

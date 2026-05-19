@@ -435,6 +435,9 @@ pub struct HtapDispatchArgs {
     pub duration: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ready_wait: Option<u64>,
+    /// Override the number of OLTP terminals (default: `scale_factor` * 10).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminals: Option<usize>,
 }
 
 fn default_queryset() -> String {
@@ -629,6 +632,7 @@ tests:
     spicepod_path: accelerated/postgres-cayenne[file].yaml
     runner_type: spiceai-dev-runners
     scale_factor: 1
+    terminals: 100
     duration: 300
     ready_wait: 60
 ";
@@ -645,6 +649,7 @@ tests:
             RunnerType::Dev
         ));
         assert_eq!(test_file.tests.htap[0].scale_factor, Some(1.0));
+        assert_eq!(test_file.tests.htap[0].terminals, Some(100));
         assert_eq!(test_file.tests.htap[0].duration, Some(300));
         assert_eq!(test_file.tests.htap[0].ready_wait, Some(60));
 
@@ -652,5 +657,31 @@ tests:
         let serialized =
             serde_json::to_value(&test_file.tests.htap[0]).expect("Failed to serialize");
         assert_eq!(serialized["scale_factor"], 1);
+        assert_eq!(serialized["terminals"], 100);
+    }
+
+    #[test]
+    fn test_htap_section_deserialization_without_terminals() {
+        let yaml = "
+tests:
+  htap:
+    spicepod_path: accelerated/postgres-arrow.yaml
+    runner_type: spiceai-dev-runners
+    scale_factor: 10
+    duration: 600
+    ready_wait: 120
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert_eq!(test_file.tests.htap[0].terminals, None);
+
+        // Verify terminals is omitted from serialized output when None
+        let serialized =
+            serde_json::to_value(&test_file.tests.htap[0]).expect("Failed to serialize");
+        assert!(
+            serialized.get("terminals").is_none(),
+            "terminals should be omitted when None"
+        );
     }
 }

@@ -44,6 +44,21 @@ const DEFAULT_OU: &str = "unknown";
 
 /// Arguments for the `cluster` command.
 #[derive(Args, Debug)]
+#[command(
+    about = "Cluster mode utilities for the Spice runtime",
+    long_about = r#"Utilities for running Spice in clustered mode.
+
+Currently provides TLS Public Key Infrastructure (PKI) helpers used to issue
+development certificates for clustered runtimes that enforce mutual TLS
+between nodes.
+
+EXAMPLES
+  spice cluster tls init                    # Generate a development CA at ~/.spice/pki/
+  spice cluster tls add node-1              # Issue a client cert for node-1
+  spice cluster tls add node-1 --host 10.0.0.5
+
+Docs: https://spiceai.org/docs"#
+)]
 pub struct ClusterArgs {
     #[command(subcommand)]
     pub command: ClusterCommands,

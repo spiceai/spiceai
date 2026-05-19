@@ -18,6 +18,7 @@ limitations under the License.
 
 pub const LEGACY_DATA_ENDPOINT: &str = "https://data.spiceai.io";
 pub const LEGACY_FLIGHT_HOST: &str = "flight.spiceai.io";
+pub const DATA_REGION_SUFFIX: &str = "-prod-aws-data";
 pub const DATA_HOST_SUFFIX: &str = "-prod-aws-data.spiceai.io";
 pub const FLIGHT_HOST_SUFFIX: &str = "-prod-aws-flight.spiceai.io";
 
@@ -29,6 +30,28 @@ pub fn data_endpoint(region: &str) -> String {
 #[must_use]
 pub fn flight_endpoint(region: &str) -> String {
     format!("https://{region}{FLIGHT_HOST_SUFFIX}")
+}
+
+#[must_use]
+pub fn normalize_data_region(region: &str) -> Option<String> {
+    if !is_valid_region(region) {
+        return None;
+    }
+
+    if let Some(endpoint_region) = region.strip_suffix(DATA_REGION_SUFFIX) {
+        if endpoint_region.is_empty() || !is_valid_region(endpoint_region) {
+            return None;
+        }
+        return Some(endpoint_region.to_string());
+    }
+
+    Some(region.to_string())
+}
+
+#[must_use]
+pub fn data_region_name(region: &str) -> Option<String> {
+    normalize_data_region(region)
+        .map(|endpoint_region| format!("{endpoint_region}{DATA_REGION_SUFFIX}"))
 }
 
 #[must_use]
@@ -85,6 +108,32 @@ mod tests {
             data_endpoint("us-east-1"),
             "https://us-east-1-prod-aws-data.spiceai.io"
         );
+    }
+
+    #[test]
+    fn normalizes_data_region_names() {
+        assert_eq!(
+            normalize_data_region("us-east-1-prod-aws-data"),
+            Some("us-east-1".to_string())
+        );
+        assert_eq!(
+            normalize_data_region("us-east-1"),
+            Some("us-east-1".to_string())
+        );
+        assert_eq!(normalize_data_region("bad_region"), None);
+    }
+
+    #[test]
+    fn builds_data_region_names() {
+        assert_eq!(
+            data_region_name("us-east-1"),
+            Some("us-east-1-prod-aws-data".to_string())
+        );
+        assert_eq!(
+            data_region_name("us-east-1-prod-aws-data"),
+            Some("us-east-1-prod-aws-data".to_string())
+        );
+        assert_eq!(data_region_name("bad_region"), None);
     }
 
     #[test]

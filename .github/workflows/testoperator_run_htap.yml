@@ -9,7 +9,7 @@ on:
         required: false
         type: string
       spicepod_path:
-        description: 'The spicepod file to test with (relative to test/spicepods/chbench/sf{scale_factor}/)'
+        description: 'The spicepod file to test with (relative to test/spicepods/chbench/)'
         required: true
         type: string
       scale_factor:
@@ -17,6 +17,10 @@ on:
         required: false
         type: string
         default: '1'
+      terminals:
+        description: 'Override OLTP terminal count (default: scale_factor * 10)'
+        required: false
+        type: string
       duration:
         description: 'Duration of the HTAP workload in seconds'
         required: false
@@ -49,7 +53,7 @@ jobs:
       - name: Set spicepod path
         id: set_spicepod_path
         run: |
-          SPICEPOD_PATH="./test/spicepods/chbench/sf${{ github.event.inputs.scale_factor }}/${{ github.event.inputs.spicepod_path }}"
+          SPICEPOD_PATH="./test/spicepods/chbench/${{ github.event.inputs.spicepod_path }}"
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
 
       - name: Validate spicepod file exists
@@ -89,6 +93,7 @@ jobs:
             -p '${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}' \
             --query-set chbench \
             --scale-factor ${{ github.event.inputs.scale_factor }} \
+            ${{ github.event.inputs.terminals && format('--terminals {0}', github.event.inputs.terminals) || '' }} \
             --duration ${{ github.event.inputs.duration }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \

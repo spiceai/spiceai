@@ -446,11 +446,14 @@ impl CayenneDeletionSink {
     /// dramatically faster when the number of matched keys (N) is large, because the
     /// filter-based path evaluates O(N) comparisons per chunk.
     ///
-    /// The scan reads **all columns** (no projection) because Vortex's `with_projection`
-    /// API takes a single `Expression` and may not support mixed `data+row_idx` projections.
-    /// File-local row positions are tracked with a manual row counter, and positions that are
-    /// already deleted (from the position-based cache) are skipped so this method returns only
-    /// candidates for NEW deletions.
+    /// The scan projects *only* the key columns needed for the probe (using
+    /// `vortex::expr::select`). File-local row positions are tracked with a manual
+    /// row counter (`row_position`), and positions that are already deleted (from the
+    /// position-based cache) are skipped so this method returns only candidates for
+    /// NEW deletions.
+    ///
+    /// This projection is critical for wide tables — without it every MERGE key-probe
+    /// would read every column of every file.
     ///
     /// # Returns
     ///
@@ -490,12 +493,23 @@ impl CayenneDeletionSink {
                 source: Box::new(e),
             })?;
 
-        // Scan without projection or filter — read all data.
-        let scan_builder = vxf.scan().map_err(|e| Error::Vortex {
+        // Project *only* the key columns required for the HashSet probe.
+        // We maintain our own row_position counter, so we do not need the
+        // Vortex row_idx column. This is the fix for the wide-table regression
+        // (see bench `wide_table_key_probe_scan`).
+        let mut scan_builder = vxf.scan().map_err(|e| Error::Vortex {
             operation: "build vortex scan for key-match",
             table: table_name.clone(),
             source: Box::new(e),
         })?;
+
+        if !key_columns.is_empty() {
+            use vortex::expr::{root, select};
+            // `select` accepts Vec<&str> / Vec<Arc<str>>
+            let cols: Vec<&str> = key_columns.iter().map(String::as_str).collect();
+            let proj = select(cols, root());
+            scan_builder = scan_builder.with_projection(proj);
+        }
 
         let mut stream = scan_builder.into_stream().map_err(|e| Error::Vortex {
             operation: "start vortex scan stream for key-match",

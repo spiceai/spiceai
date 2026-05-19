@@ -20,13 +20,16 @@ limitations under the License.
 //! constructor logic (base URL selection, token resolution) and converts errors
 //! into the CLI error type.
 
+use std::collections::BTreeMap;
+
 use crate::error::{InvalidArgumentSnafu, InvalidResponseSnafu, Result};
 
 pub use spice_cloud_client::CloudClient as InnerCloudClient;
 use spice_cloud_client::types::{
-    ApiKeysResponse, App, AuthContext, AuthExchangeResponse, ContainerImagesResponse,
-    CreateAppRequest, CreateDeploymentRequest, Deployment, LogsResponse, MetricsResponse,
-    RegenerateApiKeyResponse, RegionsResponse, Secret, UpdateAppRequest,
+    ApiKeysResponse, App, AppExecutor, AppKind, AppResourceLimits, AppResources, AuthContext,
+    AuthExchangeResponse, ContainerImagesResponse, CreateAppRequest, CreateDeploymentRequest,
+    Deployment, LogsResponse, MetricsResponse, RegenerateApiKeyResponse, RegionsResponse, Secret,
+    UpdateAppRequest, UpdateChannel,
 };
 
 const DEV_CLOUD_API_BASE_URL: &str = "https://dev-api.spice.ai";
@@ -38,6 +41,23 @@ const CLOUD_API_BASE_URL: &str = "https://api.spice.ai";
 /// authentication token from the CLI environment.
 pub struct CloudClient {
     inner: InnerCloudClient,
+}
+
+#[derive(Default)]
+pub struct UpdateAppParams<'a> {
+    pub description: Option<&'a str>,
+    pub visibility: Option<&'a str>,
+    pub replicas: Option<i32>,
+    pub image_tag: Option<&'a str>,
+    pub region: Option<&'a str>,
+    pub cpu: Option<i32>,
+    pub memory: Option<NumBytes>,
+    pub storage_size_gb: Option<f64>,
+    pub executor_replicas: Option<i32>,
+    pub executor_cpu: Option<i32>,
+    pub executor_memory: Option<NumBytes>,
+    pub spicepod: Option<String>,
+    pub channel: Option<UpdateChannel>,
 }
 
 impl CloudClient {
@@ -156,42 +176,61 @@ impl CloudClient {
         self.inner.get_app_by_id(app_id).await.map_err(into_cli)
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub async fn create_app(
         &self,
         name: &str,
+        region: &str,
+        kind: AppKind,
         description: Option<&str>,
         visibility: &str,
+        replicas: Option<i32>,
+        cpu: Option<i32>,
+        memory: Option<NumBytes>,
+        storage_size_gb: Option<f64>,
+        executor_replicas: Option<i32>,
+        executor_cpu: Option<i32>,
+        executor_memory: Option<NumBytes>,
     ) -> Result<App> {
-        let request = CreateAppRequest {
-            name: name.to_string(),
-            description: description.map(String::from),
-            visibility: visibility.to_string(),
-            cname: None,
-            tags: None,
-            replicas: None,
-            resources: None,
-            executor: None,
-        };
+        let request = build_create_app_request(
+            name,
+            region,
+            kind,
+            description,
+            visibility,
+            replicas,
+            cpu,
+            memory,
+            storage_size_gb,
+            executor_replicas,
+            executor_cpu,
+            executor_memory,
+        );
         self.inner.create_app(&request).await.map_err(into_cli)
     }
 
-    pub async fn update_app(
-        &self,
-        org_app: &str,
-        description: Option<&str>,
-        visibility: Option<&str>,
-        replicas: Option<i32>,
-        image_tag: Option<&str>,
-        region: Option<&str>,
-    ) -> Result<App> {
+    pub async fn update_app(&self, org_app: &str, params: UpdateAppParams<'_>) -> Result<App> {
         let app = self.get_app(org_app).await?;
+        let resources = build_resources(params.cpu, params.memory);
+        // Create and update both send storage size at the app level. The executor field remains
+        // in the wire type for API compatibility, but the CLI does not set it.
+        let executor = build_executor(
+            params.executor_replicas,
+            params.executor_cpu,
+            params.executor_memory,
+        );
+
         let request = UpdateAppRequest {
-            description: description.map(String::from),
-            visibility: visibility.map(String::from),
-            replicas,
-            image_tag: image_tag.map(String::from),
-            region: region.map(String::from),
-            ..Default::default()
+            description: params.description.map(String::from),
+            visibility: params.visibility.map(String::from),
+            replicas: params.replicas,
+            image_tag: params.image_tag.map(String::from),
+            update_channel: params.channel.map(|channel| channel.to_string()),
+            region: params.region.map(String::from),
+            resources,
+            executor,
+            storage_size_gb: params.storage_size_gb,
+            spicepod: params.spicepod,
         };
         self.inner
             .update_app(app.id, &request)
@@ -405,6 +444,85 @@ pub fn parse_org_app(org_app: &str) -> (String, String) {
     }
 }
 
+use super::bytes::NumBytes;
+
+#[expect(clippy::too_many_arguments)]
+fn build_create_app_request(
+    name: &str,
+    region: &str,
+    kind: AppKind,
+    description: Option<&str>,
+    visibility: &str,
+    replicas: Option<i32>,
+    cpu: Option<i32>,
+    memory: Option<NumBytes>,
+    storage_size_gb: Option<f64>,
+    executor_replicas: Option<i32>,
+    executor_cpu: Option<i32>,
+    executor_memory: Option<NumBytes>,
+) -> CreateAppRequest {
+    let resources = build_resources(cpu, memory);
+    let executor = build_executor(executor_replicas, executor_cpu, executor_memory);
+
+    let (tags, replicas) = match kind {
+        AppKind::Cluster => {
+            let mut tags = BTreeMap::new();
+            tags.insert("kind".to_string(), "cluster".to_string());
+            (Some(tags), Some(1))
+        }
+        AppKind::Set => (None, replicas),
+    };
+
+    CreateAppRequest {
+        name: name.to_string(),
+        description: description.map(String::from),
+        visibility: visibility.to_string(),
+        // The Cloud create-app endpoint currently accepts the target deployment region
+        // in the legacy `cname` request field; update-app uses the newer `region` field.
+        cname: Some(region.to_string()),
+        tags,
+        replicas,
+        resources,
+        executor,
+        storage_size_gb,
+    }
+}
+
+/// Build an [`AppResources`] from optional CPU (vCPUs) and a parsed [`NumBytes`] memory value.
+///
+/// Returns `None` if neither is provided.
+fn build_resources(cpu: Option<i32>, memory: Option<NumBytes>) -> Option<AppResources> {
+    if cpu.is_none() && memory.is_none() {
+        return None;
+    }
+    Some(AppResources {
+        limits: AppResourceLimits {
+            cpu: cpu.map(|v| v.to_string()),
+            memory: memory.map(NumBytes::to_resource_string),
+            ephemeral_storage: None,
+        },
+        requests: None,
+    })
+}
+
+/// Build an [`AppExecutor`] from optional executor params.
+///
+/// Returns `None` if no executor-related fields are provided.
+fn build_executor(
+    replicas: Option<i32>,
+    cpu: Option<i32>,
+    memory: Option<NumBytes>,
+) -> Option<AppExecutor> {
+    if replicas.is_none() && cpu.is_none() && memory.is_none() {
+        return None;
+    }
+    Some(AppExecutor {
+        replicas,
+        resources: build_resources(cpu, memory),
+        storage_size_gb: None,
+    })
+}
+
 /// Convert a [`spice_cloud_client::error::Error`] into the CLI error type.
 fn into_cli(e: spice_cloud_client::error::Error) -> crate::error::Error {
     use spice_cloud_client::error::Error as CloudError;
@@ -415,6 +533,8 @@ fn into_cli(e: spice_cloud_client::error::Error) -> crate::error::Error {
         CloudError::Forbidden { message } => crate::error::Error::InvalidArgument {
             message: format!("Forbidden: {message}"),
         },
+        CloudError::AuthorizationDenied => crate::error::Error::DeviceAuthorizationDenied,
+        CloudError::InvalidResponse { message } => crate::error::Error::InvalidResponse { message },
         CloudError::NotFound { message } => crate::error::Error::InvalidResponse {
             message: format!("Not found: {message}"),
         },
@@ -428,5 +548,71 @@ fn into_cli(e: spice_cloud_client::error::Error) -> crate::error::Error {
         CloudError::JsonParse { source } => crate::error::Error::InvalidResponse {
             message: format!("Failed to parse response: {source}"),
         },
+    }
+}
+
+pub fn is_device_authorization_denied_error(error: &crate::error::Error) -> bool {
+    matches!(error, crate::error::Error::DeviceAuthorizationDenied)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_resources_does_not_default_memory() {
+        let resources = build_resources(Some(4), None).expect("cpu should create resources");
+
+        assert_eq!(resources.limits.cpu.as_deref(), Some("4"));
+        assert!(resources.limits.memory.is_none());
+    }
+
+    #[test]
+    fn build_resources_preserves_memory_unit() {
+        let memory = NumBytes::parse("3500Mi").expect("memory should parse");
+
+        let resources =
+            build_resources(None, Some(memory)).expect("memory should create resources");
+
+        assert_eq!(resources.limits.memory.as_deref(), Some("3500Mi"));
+    }
+
+    #[test]
+    fn build_executor_does_not_default_executor_memory() {
+        let executor =
+            build_executor(None, Some(2), None).expect("executor cpu should create executor");
+
+        let resources = executor.resources.expect("executor resources should exist");
+        assert_eq!(resources.limits.cpu.as_deref(), Some("2"));
+        assert!(resources.limits.memory.is_none());
+    }
+
+    #[test]
+    fn create_app_request_sends_region_as_cname() {
+        let request = build_create_app_request(
+            "app",
+            "us-east-1-prod-aws-data",
+            AppKind::Set,
+            None,
+            "private",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let value = serde_json::to_value(request).expect("create app request should serialize");
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "name": "app",
+                "visibility": "private",
+                "cname": "us-east-1-prod-aws-data"
+            })
+        );
     }
 }
