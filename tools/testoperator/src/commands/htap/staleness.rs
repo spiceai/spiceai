@@ -58,11 +58,15 @@ impl StalenessReport {
     /// Print a human-readable data freshness summary and record OTEL metrics.
     pub fn emit(&self) {
         println!("\nData Freshness");
+        println!(
+            "  {:<14} {:>10} {:>10} {:>10} {:>10}",
+            "dataset", "p50_ms", "p99_ms", "max_ms", "samples"
+        );
         for table in &self.probe_tables {
             if let Some(stats) = self.tables.get(table.as_str()) {
                 println!(
-                    "  {:<14} P50={:>5}ms  P99={:>5}ms  max={:>5}ms  ({} samples)",
-                    format!("{table}:"),
+                    "  {:<14} {:>10} {:>10} {:>10} {:>10}",
+                    table,
                     stats.p50.as_millis(),
                     stats.p99.as_millis(),
                     stats.max.as_millis(),
@@ -74,7 +78,6 @@ impl StalenessReport {
                     .record(p99_ms, &[KeyValue::new("dataset", table.clone())]);
             }
         }
-        println!("  ─────────────────");
         println!("  worst P99:     {}ms", self.worst_p99.as_millis());
         #[expect(clippy::cast_precision_loss)]
         let worst_ms = self.worst_p99.as_millis() as f64;
