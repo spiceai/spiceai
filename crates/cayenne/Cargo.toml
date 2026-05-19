@@ -251,3 +251,7 @@ name = "int64_pk_filter_keep_mask_alloc"
 [[bench]]
 harness = false
 name = "position_delete_redundant_walks"
+
+[[bench]]
+harness = false
+name = "apply_partial_filter_empty_alloc"

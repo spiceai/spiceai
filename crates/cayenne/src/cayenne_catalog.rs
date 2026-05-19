@@ -1163,55 +1163,9 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             };
 
-            let table_count_values = match tx
+            let row_values = match tx
                 .query_row_values(QueryRowParams {
-                    sql: "SELECT COUNT(*) FROM cayenne_table WHERE table_id = ?1",
-                    params: vec![MetastoreValue::Text(table_id.to_string())],
-                })
-                .await
-            {
-                Ok(row_values) => row_values,
-                Err(e) => {
-                    if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
-                        drop(tx);
-                        sleep_before_metastore_write_retry(
-                            attempt,
-                            max_attempts,
-                            "validate sequence reservation table row",
-                        )
-                        .await;
-                        continue;
-                    }
-                    return Err(CatalogError::InvalidOperation {
-                        message: format!(
-                            "Failed to validate table row before reserving {count} sequence numbers"
-                        ),
-                        source: Box::new(e),
-                    });
-                }
-            };
-            let Some(table_count_value) = table_count_values.first() else {
-                return Err(CatalogError::InvalidOperationNoSource {
-                    message: "Failed to validate sequence reservation table row: query returned no columns"
-                        .to_string(),
-                });
-            };
-            let table_count =
-                i64::from_value(table_count_value).map_err(|e| CatalogError::InvalidOperation {
-                    message: "Failed to parse sequence reservation table row count".to_string(),
-                    source: Box::new(e),
-                })?;
-            if table_count == 0 {
-                return Err(CatalogError::InvalidOperationNoSource {
-                    message: format!(
-                        "Cannot reserve {count} sequence numbers for table_id '{table_id}': table row does not exist"
-                    ),
-                });
-            }
-
-            if let Err(e) = tx
-                .execute(ExecuteParams {
-                    sql: "UPDATE cayenne_table SET current_sequence_number = current_sequence_number + ?2 WHERE table_id = ?1",
+                    sql: "UPDATE cayenne_table SET current_sequence_number = current_sequence_number + ?2 WHERE table_id = ?1 RETURNING current_sequence_number",
                     params: vec![
                         MetastoreValue::Text(table_id.to_string()),
                         MetastoreValue::Integer(delta),
@@ -1219,29 +1173,6 @@ impl MetadataCatalog for CayenneCatalog {
                 })
                 .await
             {
-                if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
-                    drop(tx);
-                    sleep_before_metastore_write_retry(
-                        attempt,
-                        max_attempts,
-                        "update sequence reservation high-water mark",
-                    )
-                    .await;
-                    continue;
-                }
-                return Err(CatalogError::InvalidOperation {
-                    message: format!("Failed to reserve {count} sequence numbers"),
-                    source: Box::new(e),
-                });
-            }
-
-            let row_values = match tx
-                .query_row_values(QueryRowParams {
-                    sql: "SELECT current_sequence_number FROM cayenne_table WHERE table_id = ?1",
-                    params: vec![MetastoreValue::Text(table_id.to_string())],
-                })
-                .await
-            {
                 Ok(row_values) => row_values,
                 Err(e) => {
                     if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
@@ -1249,13 +1180,20 @@ impl MetadataCatalog for CayenneCatalog {
                         sleep_before_metastore_write_retry(
                             attempt,
                             max_attempts,
-                            "read sequence reservation high-water mark",
+                            "reserve sequence number block",
                         )
                         .await;
                         continue;
                     }
+                    if is_query_returned_no_rows(&e) {
+                        return Err(CatalogError::InvalidOperationNoSource {
+                            message: format!(
+                                "Cannot reserve {count} sequence numbers for table_id '{table_id}': table row does not exist"
+                            ),
+                        });
+                    }
                     return Err(CatalogError::InvalidOperation {
-                        message: "Failed to read reserved sequence high-water mark".to_string(),
+                        message: format!("Failed to reserve {count} sequence numbers"),
                         source: Box::new(e),
                     });
                 }
@@ -2609,12 +2547,39 @@ impl MetadataCatalog for CayenneCatalog {
 pub fn is_retryable_write_conflict(error: &CatalogError) -> bool {
     match error {
         CatalogError::Database { message } => is_retryable_write_conflict_message(message),
+        CatalogError::InvalidOperation { source, .. } => {
+            source
+                .downcast_ref::<CatalogError>()
+                .is_some_and(is_retryable_write_conflict)
+                || source
+                    .downcast_ref::<rusqlite::Error>()
+                    .is_some_and(is_retryable_sqlite_error)
+        }
+        CatalogError::Sqlite { source } => is_retryable_sqlite_error(source),
+        _ => false,
+    }
+}
+
+fn is_retryable_sqlite_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(err, _)
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+fn is_query_returned_no_rows(error: &CatalogError) -> bool {
+    match error {
+        CatalogError::Database { message } => message.contains("Query returned no rows"),
+        CatalogError::InvalidOperation { source, .. } => source
+            .downcast_ref::<CatalogError>()
+            .is_some_and(is_query_returned_no_rows),
         CatalogError::Sqlite {
-            source: rusqlite::Error::SqliteFailure(err, _),
-        } => matches!(
-            err.code,
-            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-        ),
+            source: rusqlite::Error::QueryReturnedNoRows,
+        } => true,
         _ => false,
     }
 }
@@ -3660,6 +3625,35 @@ mod tests {
             final_sequence,
             i64::try_from(TASK_COUNT).expect("TASK_COUNT fits in i64") * i64::from(BLOCK_SIZE)
         );
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_reserve_sequence_numbers_missing_table_errors() {
+        let test_db = format!(
+            "sqlite://./.test_sequence_reservation_missing_table_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let err = catalog
+            .reserve_sequence_numbers("missing_table", 2)
+            .await
+            .expect_err("missing table sequence reservation should fail");
+
+        match err {
+            CatalogError::InvalidOperationNoSource { message } => assert!(
+                message.contains("table row does not exist"),
+                "expected missing-table error, got: {message}"
+            ),
+            other => panic!("expected InvalidOperationNoSource, got: {other}"),
+        }
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
