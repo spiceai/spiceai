@@ -543,6 +543,70 @@ impl CayenneCatalog {
 
         (sql, params)
     }
+
+    /// Build a multi-VALUES `INSERT ... ON CONFLICT(table_id, path) DO UPDATE`
+    /// for a chunk of delete-file rows. Each row uses 9 parameters; the
+    /// per-row `ON CONFLICT` clause references `excluded` (the single
+    /// conflicting row), so the idempotency check is the same as the
+    /// single-row form previously emitted in `commit_on_conflict_deletions`.
+    fn build_insert_delete_files_chunk_sql(
+        delete_files: &[DeleteFile],
+    ) -> (String, Vec<MetastoreValue>) {
+        const PARAMS_PER_ROW: usize = 9;
+        let mut values_parts = Vec::with_capacity(delete_files.len());
+        let mut params = Vec::with_capacity(delete_files.len() * PARAMS_PER_ROW);
+
+        for (i, delete_file) in delete_files.iter().enumerate() {
+            let base = i * PARAMS_PER_ROW + 1; // 1-indexed
+            values_parts.push(format!(
+                "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
+                base,
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7,
+                base + 8,
+            ));
+            params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
+            params.push(MetastoreValue::Text(delete_file.table_id.clone()));
+            params.push(MetastoreValue::Text(delete_file.path.clone()));
+            params.push(MetastoreValue::Bool(delete_file.path_is_relative));
+            params.push(MetastoreValue::Text(delete_file.format.clone()));
+            params.push(MetastoreValue::Integer(delete_file.delete_count));
+            params.push(MetastoreValue::Integer(delete_file.file_size_bytes));
+            params.push(
+                delete_file
+                    .source_data_file_path
+                    .clone()
+                    .map_or(MetastoreValue::Null, MetastoreValue::Text),
+            );
+            params.push(MetastoreValue::Integer(delete_file.sequence_number));
+        }
+
+        let sql = format!(
+            "INSERT INTO cayenne_delete_file (\
+                 delete_file_id, table_id, path, path_is_relative, \
+                 format, delete_count, file_size_bytes, source_data_file_path, sequence_number\
+             ) VALUES {} \
+             ON CONFLICT(table_id, path) DO UPDATE SET \
+                 path = CASE \
+                     WHEN cayenne_delete_file.path_is_relative = excluded.path_is_relative \
+                         AND cayenne_delete_file.format = excluded.format \
+                         AND cayenne_delete_file.delete_count = excluded.delete_count \
+                         AND cayenne_delete_file.file_size_bytes = excluded.file_size_bytes \
+                         AND cayenne_delete_file.source_data_file_path IS excluded.source_data_file_path \
+                         AND cayenne_delete_file.sequence_number = excluded.sequence_number \
+                     THEN cayenne_delete_file.path \
+                     ELSE NULL \
+                 END",
+            values_parts.join(", ")
+        );
+
+        (sql, params)
+    }
 }
 
 #[async_trait]
@@ -2169,6 +2233,10 @@ impl MetadataCatalog for CayenneCatalog {
         const MAX_PARAMS: usize = 32_000;
         const MAX_ROWS_PER_CHUNK: usize = MAX_PARAMS / PARAMS_PER_ROW;
 
+        // Delete-file rows use 9 params each; keep the same budget.
+        const DELETE_FILE_PARAMS_PER_ROW: usize = 9;
+        const MAX_DELETE_FILE_ROWS_PER_CHUNK: usize = MAX_PARAMS / DELETE_FILE_PARAMS_PER_ROW;
+
         // Atomic replacement for the legacy `add_delete_file × N` +
         // `add_insert_records_batch` sequence in `apply_on_conflict_deletions`.
         // See `crates/cayenne/benches/apply_on_conflict_rpc_ceiling.rs` for the
@@ -2219,82 +2287,102 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             };
 
-            // INSERT every delete_file row inside the txn. A duplicate
-            // (table_id, path) is idempotent only when the existing row's
-            // metadata exactly matches the incoming delete file; conflicting
-            // metadata trips the NOT NULL guard, then the error path below
-            // maps that SQL constraint failure back through the same
-            // descriptive validator used by add_delete_file.
-            for delete_file in &delete_files {
-                let delete_file_id = uuid::Uuid::now_v7().to_string();
-                let res = tx
-                    .execute(ExecuteParams {
-                        sql: r"
-                        INSERT INTO cayenne_delete_file (
-                            delete_file_id, table_id, path, path_is_relative,
-                            format, delete_count, file_size_bytes, source_data_file_path, sequence_number
-                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                        ON CONFLICT(table_id, path) DO UPDATE SET
-                            path = CASE
-                                WHEN cayenne_delete_file.path_is_relative = excluded.path_is_relative
-                                    AND cayenne_delete_file.format = excluded.format
-                                    AND cayenne_delete_file.delete_count = excluded.delete_count
-                                    AND cayenne_delete_file.file_size_bytes = excluded.file_size_bytes
-                                    AND cayenne_delete_file.source_data_file_path IS excluded.source_data_file_path
-                                    AND cayenne_delete_file.sequence_number = excluded.sequence_number
-                                THEN cayenne_delete_file.path
-                                ELSE NULL
-                            END
-                    ",
-                        params: vec![
-                            MetastoreValue::Text(delete_file_id),
-                            MetastoreValue::Text(delete_file.table_id.clone()),
-                            MetastoreValue::Text(delete_file.path.clone()),
-                            MetastoreValue::Bool(delete_file.path_is_relative),
-                            MetastoreValue::Text(delete_file.format.clone()),
-                            MetastoreValue::Integer(delete_file.delete_count),
-                            MetastoreValue::Integer(delete_file.file_size_bytes),
-                            delete_file
-                                .source_data_file_path
-                                .clone()
-                                .map_or(MetastoreValue::Null, MetastoreValue::Text),
-                            MetastoreValue::Integer(delete_file.sequence_number),
-                        ],
-                    })
-                    .await;
+            // INSERT delete_file rows in batched multi-VALUES chunks. The
+            // per-row `ON CONFLICT(table_id, path) DO UPDATE SET path = CASE
+            // ... END` clause keeps each row's idempotency check scoped to its
+            // own `excluded` values, identical to the previous one-INSERT-per-
+            // row form. A duplicate `(table_id, path)` whose metadata does not
+            // match the existing row trips the NOT NULL guard on `path`; on
+            // that error path we fall back to per-row INSERTs inside the same
+            // txn to pinpoint the offending delete file for the descriptive
+            // validation error.
+            let mut batched_failure: Option<(usize, CatalogError)> = None;
+            'chunks: for (chunk_idx, chunk) in delete_files
+                .chunks(MAX_DELETE_FILE_ROWS_PER_CHUNK)
+                .enumerate()
+            {
+                let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
+                let res = tx.execute(ExecuteParams { sql: &sql, params }).await;
                 if let Err(e) = res {
                     if retry_on_metastore_write_conflict(
                         &e,
                         attempt,
                         max_attempts,
-                        "insert delete file inside on-conflict transaction",
+                        "insert delete file chunk inside on-conflict transaction",
                     )
                     .await
                     {
                         drop(tx);
                         continue 'attempts;
                     }
-                    let validation_result =
-                        Self::validate_existing_delete_file_if_present_in_transaction(
-                            tx.as_ref(),
+                    // Non-retryable error from the batched INSERT. Remember
+                    // the chunk and the original error, then break so the
+                    // row-by-row fallback can pinpoint the offending delete
+                    // file for the descriptive validation message.
+                    batched_failure = Some((chunk_idx, e));
+                    break 'chunks;
+                }
+            }
+
+            if let Some((chunk_idx, batched_err)) = batched_failure {
+                let chunk_start = chunk_idx * MAX_DELETE_FILE_ROWS_PER_CHUNK;
+                let chunk_end = (chunk_start + MAX_DELETE_FILE_ROWS_PER_CHUNK)
+                    .min(delete_files.len());
+                let chunk = &delete_files[chunk_start..chunk_end];
+                for delete_file in chunk {
+                    let (sql, params) =
+                        Self::build_insert_delete_files_chunk_sql(std::slice::from_ref(
                             delete_file,
+                        ));
+                    let res = tx.execute(ExecuteParams { sql: &sql, params }).await;
+                    if let Err(e) = res {
+                        if retry_on_metastore_write_conflict(
+                            &e,
+                            attempt,
+                            max_attempts,
+                            "insert delete file inside on-conflict transaction",
                         )
-                        .await;
-                    drop(tx);
-                    if let Err(validation_error) = validation_result {
+                        .await
+                        {
+                            drop(tx);
+                            continue 'attempts;
+                        }
+                        let validation_result =
+                            Self::validate_existing_delete_file_if_present_in_transaction(
+                                tx.as_ref(),
+                                delete_file,
+                            )
+                            .await;
+                        drop(tx);
+                        if let Err(validation_error) = validation_result {
+                            return Err(CatalogError::InvalidOperation {
+                                message:
+                                    "Delete-file metadata conflicts with an existing row inside on-conflict transaction"
+                                        .to_string(),
+                                source: Box::new(validation_error),
+                            });
+                        }
                         return Err(CatalogError::InvalidOperation {
                             message:
-                                "Delete-file metadata conflicts with an existing row inside on-conflict transaction"
+                                "Failed to insert delete file inside on-conflict transaction"
                                     .to_string(),
-                            source: Box::new(validation_error),
+                            source: Box::new(e),
                         });
                     }
-                    return Err(CatalogError::InvalidOperation {
-                        message: "Failed to insert delete file inside on-conflict transaction"
-                            .to_string(),
-                        source: Box::new(e),
-                    });
                 }
+                // Per-row replay of the failing chunk succeeded, but earlier
+                // chunks already applied batched are already in the txn —
+                // committing now would persist a state the batched INSERT
+                // rejected. Surface the original batched error rather than
+                // silently committing an inconsistent prefix.
+                drop(tx);
+                return Err(CatalogError::InvalidOperation {
+                    message:
+                        "Batched delete-file INSERT failed but per-row replay succeeded; \
+                         aborting transaction to avoid inconsistent commit"
+                            .to_string(),
+                    source: Box::new(batched_err),
+                });
             }
 
             // Chunked INSERTs for the insert_record rows.
