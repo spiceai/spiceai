@@ -161,7 +161,7 @@ const WAREHOUSE_TABLES: &[(&str, &str, &str)] = &[
         "h_c_id, h_c_d_id, h_d_id, h_w_id, h_date, h_amount, h_data",
     ),
     (
-        "orders",
+        "oorder",
         "o_w_id",
         "o_id, o_d_id, o_c_id, o_entry_d, o_carrier_id, o_ol_cnt, o_all_local",
     ),
@@ -565,7 +565,7 @@ async fn load_orders(
     d_id: i32,
 ) -> Result<Vec<i32>> {
     let mut sink = BatchSink::new(
-        "INSERT INTO orders (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_carrier_id, o_ol_cnt, o_all_local) VALUES",
+        "INSERT INTO oorder (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_carrier_id, o_ol_cnt, o_all_local) VALUES",
     );
     let mut row = String::new();
 
@@ -597,9 +597,9 @@ async fn load_orders(
             sql_opt_i32(o_carrier_id),
         );
         sink.write_row(&row);
-        sink.maybe_flush(client, "orders").await?;
+        sink.maybe_flush(client, "oorder").await?;
     }
-    sink.flush(client, "orders").await?;
+    sink.flush(client, "oorder").await?;
 
     Ok(ol_cnts)
 }
