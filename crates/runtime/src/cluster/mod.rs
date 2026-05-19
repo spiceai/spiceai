@@ -916,8 +916,7 @@ async fn bootstrap_and_replay_ddl(rt: &Arc<Runtime>) -> crate::Result<()> {
                 "Replaying {} DDL statement(s) from cluster state",
                 state.ddl_log.len()
             );
-            let sqls: Vec<String> = state.ddl_log.iter().map(|s| s.to_sql()).collect();
-            replay_ddl_statements(rt, &sqls).await
+            replay_ddl_statements(rt, &state.ddl_log).await
         }
         Ok(_) => 0,
         Err(e) => {
@@ -930,15 +929,12 @@ async fn bootstrap_and_replay_ddl(rt: &Arc<Runtime>) -> crate::Result<()> {
     // while we were replaying.
     match cluster_state.read().await {
         Ok(state) if state.ddl_log.len() > initial_ddl_statements => {
-            let catchup: Vec<String> = state.ddl_log[initial_ddl_statements..]
-                .iter()
-                .map(|s| s.to_sql())
-                .collect();
+            let catchup = &state.ddl_log[initial_ddl_statements..];
             tracing::info!(
                 "Replaying {} DDL catch-up statement(s) from cluster state",
                 catchup.len()
             );
-            replay_ddl_statements(rt, &catchup).await;
+            replay_ddl_statements(rt, catchup).await;
         }
         Ok(_) => {}
         Err(e) => {
@@ -1586,8 +1582,8 @@ pub async fn initialize_cluster_executor(
                 "Replaying {} DDL statement(s) from scheduler (version {ddl_version})",
                 ddl_statements.len(),
             );
-            let sqls = deserialize_ddl_statements_to_sql(&ddl_statements);
-            replay_ddl_statements(&rt, &sqls).await;
+            let stmts = deserialize_ddl_statements(&ddl_statements);
+            replay_ddl_statements(&rt, &stmts).await;
         }
 
         // Catch up any DDL created between GetAppDefinition and now (TOCTOU window).
@@ -1605,8 +1601,8 @@ pub async fn initialize_cluster_executor(
                         "Replaying {} DDL catch-up statement(s) from scheduler",
                         catchup.len()
                     );
-                    let sqls = deserialize_ddl_statements_to_sql(&catchup);
-                    replay_ddl_statements(&rt, &sqls).await;
+                    let stmts = deserialize_ddl_statements(&catchup);
+                    replay_ddl_statements(&rt, &stmts).await;
                 }
             }
             Err(e) => {
@@ -2052,11 +2048,15 @@ async fn executor_bind_app(
 /// "failed to resolve schema" or "Registering new schemas is not supported".
 ///
 /// Returns the number of successfully replayed statements.
-async fn replay_ddl_statements(rt: &Runtime, statements: &[String]) -> usize {
+async fn replay_ddl_statements(
+    rt: &Runtime,
+    statements: &[datafusion_ddl::DdlStatement],
+) -> usize {
     use futures::TryStreamExt as _;
     let df = rt.datafusion();
-    for (i, sql) in statements.iter().enumerate() {
-        let error: Option<String> = match df.query_builder(sql).build().run().await {
+    for (i, stmt) in statements.iter().enumerate() {
+        let sql = stmt.to_sql();
+        let error: Option<String> = match df.query_builder(&sql).build().run().await {
             Err(e) => Some(e.to_string()),
             Ok(query_result) => query_result
                 .data
@@ -2079,16 +2079,14 @@ async fn replay_ddl_statements(rt: &Runtime, statements: &[String]) -> usize {
 }
 
 /// Deserializes a slice of JSON-encoded [`DdlStatement`] strings (as received
-/// over gRPC) into SQL strings for replay. Strings that fail to deserialize
-/// are warned and skipped.
-///
-/// [`DdlStatement`]: datafusion_ddl::DdlStatement
-fn deserialize_ddl_statements_to_sql(json_stmts: &[String]) -> Vec<String> {
+/// over gRPC) into structured [`DdlStatement`] values for replay.
+/// Strings that fail to deserialize are warned about and skipped.
+fn deserialize_ddl_statements(json_stmts: &[String]) -> Vec<datafusion_ddl::DdlStatement> {
     json_stmts
         .iter()
         .filter_map(
             |s| match serde_json::from_str::<datafusion_ddl::DdlStatement>(s) {
-                Ok(stmt) => Some(stmt.to_sql()),
+                Ok(stmt) => Some(stmt),
                 Err(e) => {
                     tracing::warn!(
                         "Failed to deserialize DDL statement from scheduler: {e}; raw={s}"

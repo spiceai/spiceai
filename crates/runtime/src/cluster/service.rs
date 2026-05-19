@@ -325,8 +325,11 @@ impl ClusterService for ClusterServiceImpl {
 
         let ddl_statements: Vec<String> = ddl_stmts
             .iter()
-            .map(|s| serde_json::to_string(s).unwrap_or_default())
-            .collect();
+            .map(|s| {
+                serde_json::to_string(s)
+                    .map_err(|e| Status::internal(format!("Failed to serialize DDL statement: {e}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Response::new(GetAppDefinitionResponse {
             app_json,
@@ -768,8 +771,11 @@ impl ClusterService for ClusterServiceImpl {
 
         let ddl_statements: Vec<String> = ddl_stmts
             .iter()
-            .map(|s| serde_json::to_string(s).unwrap_or_default())
-            .collect();
+            .map(|s| {
+                serde_json::to_string(s)
+                    .map_err(|e| Status::internal(format!("Failed to serialize DDL statement: {e}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Response::new(GetDdlCatchupResponse { ddl_statements }))
     }
