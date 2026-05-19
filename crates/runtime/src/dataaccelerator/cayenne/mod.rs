@@ -571,11 +571,20 @@ impl CayenneAccelerator {
                 "cayenne_compaction_trigger_protected_snapshots",
                 config.compaction_trigger_protected_snapshots,
             );
-            config.compaction_trigger_snapshot_age_ms = parse_u64(
-                acceleration,
-                "cayenne_compaction_trigger_snapshot_age_ms",
-                config.compaction_trigger_snapshot_age_ms,
-            );
+            // Support the new friendly CDC name (both bare and cayenne_ prefixed)
+            // as well as the original internal name.
+            let age = parse_u64(acceleration, "cdc_max_coalesce_age_ms", 0)
+                .max(parse_u64(acceleration, "cayenne_cdc_max_coalesce_age_ms", 0));
+
+            if age > 0 {
+                config.compaction_trigger_snapshot_age_ms = age;
+            } else {
+                config.compaction_trigger_snapshot_age_ms = parse_u64(
+                    acceleration,
+                    "cayenne_compaction_trigger_snapshot_age_ms",
+                    config.compaction_trigger_snapshot_age_ms,
+                );
+            }
             config.compaction_max_levels = parse_usize(
                 acceleration,
                 "cayenne_compaction_max_levels",
@@ -998,6 +1007,8 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Number of protected snapshots before snapshot-maintenance compaction runs. This is separate from compaction_trigger_files so small-file tuning does not silently change scan amplification behavior. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise."),
         ParameterSpec::component("compaction_trigger_snapshot_age_ms")
             .description("Maximum age in milliseconds of the oldest protected snapshot before snapshot-maintenance compaction runs. Set to 0 to disable the age trigger. Default: 60000 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 300000 otherwise."),
+        ParameterSpec::component("cdc_max_coalesce_age_ms")
+            .description("Convenience alias for low-write / CDC ingest tables. When set, forces the snapshot age-based compaction trigger to this value (in ms) so that small CDC batches are coalesced promptly even without a short refresh_check_interval. Overrides compaction_trigger_snapshot_age_ms when both are present."),
         ParameterSpec::component("compaction_max_levels")
             .description("Maximum number of consecutive compaction passes per trigger. Bounds write amplification when promotion keeps producing new candidates. Default: 3.")
             .default("3"),

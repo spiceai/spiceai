@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Regression bench: per-CDC-commit cost of rebuilding the existing-PK keyset
 //! from scratch when the in-memory cache is exceeded by the byte-budget cap
-//! [`PK_KEYSET_CACHE_MAX_BYTES`] (256 MiB).
+//! `PK_KEYSET_CACHE_MAX_BYTES` (256 MiB).
 //!
 //! `CayenneTableProvider::prepare_stream_for_insert`
 //! (`crates/cayenne/src/provider/table.rs:3935`) calls `take_cached_pk_keyset`,
@@ -184,7 +184,7 @@ fn build_warm_keyset(total_rows: usize) -> HashMap<Box<[u8]>, RowLocation> {
 /// `process_stream_into_keyset` for `(1 + snapshot_count)` snapshots, each
 /// of size `rows_per_snapshot`. For each row: one `Box<[u8]>` alloc + one
 /// `HashMap::insert`. Models the production path when the keyset cache is
-/// disabled (table size > `PK_KEYSET_CACHE_MAX_ENTRIES`).
+/// disabled by the `PK_KEYSET_CACHE_MAX_BYTES` byte budget.
 fn run_full_rebuild(rows_per_snapshot: usize, snapshot_count: usize) -> usize {
     let total_snapshots = snapshot_count + 1;
     let mut keyset: HashMap<Box<[u8]>, RowLocation> = HashMap::with_capacity(rows_per_snapshot);

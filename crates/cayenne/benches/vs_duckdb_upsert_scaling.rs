@@ -9,14 +9,12 @@
 //! PK upsert scaling: Cayenne vs DuckDB across preloaded table sizes.
 //!
 //! Companion to `vs_duckdb_upsert.rs` (which fixes `TABLE_ROWS = 10_000`).
-//! This bench sweeps `TABLE_ROWS` through `{10_000, 100_000, 1_000_000}`
+//! This bench sweeps `TABLE_ROWS` through `{10_000, 100_000, 3_000_000}`
 //! with a fixed 100 % conflict rate so every incoming row hits the
-//! existing keyspace. The intent is to make the keyset-cap regression
-//! flagged in `load_existing_keyset_cap_disabled.rs` visible *against
-//! DuckDB*: at `TABLE_ROWS > PK_KEYSET_CACHE_MAX_ENTRIES`
-//! (`crates/cayenne/src/provider/table.rs:114`, currently `1_000_000`)
-//! Cayenne's keyset cache is silently disabled, forcing every CDC
-//! commit to cold-start the keyset scan — while DuckDB's PK btree gives
+//! existing keyspace. The intent is to make the byte-budget keyset cap
+//! behavior visible *against DuckDB*: Cayenne should stay flatter while the
+//! keyset fits the `PK_KEYSET_CACHE_MAX_BYTES` budget, then grow once the cap
+//! disables caching for larger or wider keysets. DuckDB's PK btree gives
 //! O(log N) per-row lookup that is roughly flat in N.
 //!
 //! ## What this bench measures
@@ -26,7 +24,8 @@
 //! Every iteration re-loads (`iter_batched` + `PerIteration`) so the
 //! upsert sees a clean keyset cache the first time the
 //! `OnConflictValidationStream` runs — modelling the steady-state CDC
-//! commit where the cache was just dropped on the prior write.
+//! commit where the cache was just dropped on the prior write for cap-disabled
+//! keysets.
 //!
 //! Three lanes per N:
 //! - `cayenne_sqlite/N=...`
@@ -35,9 +34,8 @@
 //!
 //! Expected shape:
 //! - DuckDB stays roughly flat (`O(INCOMING_ROWS · log N)`).
-//! - Cayenne grows linearly with `N` for `N > 1_000_000` because the
-//!   keyset cache is no-op'd by `store_cached_pk_keyset`
-//!   (`provider/table.rs:3534-3543`).
+//! - Cayenne stays flatter while the keyset fits the byte budget, then grows
+//!   linearly with `N` after `store_cached_pk_keyset` drops the cache.
 //!
 //! ## How to read
 //!
@@ -47,10 +45,10 @@
 //!
 //! - `cayenne_sqlite/N=10000` and `duckdb/N=10000` reproduce the
 //!   `vs_duckdb_upsert/conflict_100pct` numbers (sanity).
-//! - The ratio `cayenne_sqlite/N=1000000` / `cayenne_sqlite/N=10000`
+//! - The ratio `cayenne_sqlite/N=3000000` / `cayenne_sqlite/N=10000`
 //!   shows the cap-trigger amplification — the same upsert against a
-//!   100× bigger preload.
-//! - The ratio `cayenne_sqlite/N=1000000` / `duckdb/N=1000000` is the
+//!   300× bigger preload.
+//! - The ratio `cayenne_sqlite/N=3000000` / `duckdb/N=3000000` is the
 //!   Cayenne-vs-DuckDB gap at the operational scale that the May 18
 //!   SF100 retest hit.
 
@@ -74,10 +72,9 @@ use common::{
     write_parquet,
 };
 
-/// Preloaded table sizes. The middle and top values straddle
-/// `PK_KEYSET_CACHE_MAX_ENTRIES = 1_000_000` so the cap-trigger boundary
-/// is empirically visible in the report.
-const TABLE_ROW_COUNTS: &[usize] = &[10_000, 100_000, 1_000_000];
+/// Preloaded table sizes. The top value is large enough to make byte-budget
+/// cap behavior empirically visible in the report for common PK widths.
+const TABLE_ROW_COUNTS: &[usize] = &[10_000, 100_000, 3_000_000];
 
 /// Fixed incoming-batch size. Matches `vs_duckdb_upsert.rs` so the
 /// `N=10000` data points are directly comparable to the conflict_100pct

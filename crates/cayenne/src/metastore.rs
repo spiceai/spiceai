@@ -407,7 +407,7 @@ impl<T: MetastoreGetValue> MetastoreGetValue for Option<T> {
 /// The transaction must be explicitly committed via `commit()`, otherwise it will
 /// automatically rollback when dropped.
 #[async_trait]
-pub trait MetastoreTransaction: Send {
+pub trait MetastoreTransaction: Send + Sync {
     /// Execute a SQL statement that modifies data within the transaction.
     ///
     /// # Errors

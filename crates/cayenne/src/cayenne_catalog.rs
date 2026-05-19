@@ -47,6 +47,26 @@ struct ExistingDeleteFileRecord {
     sequence_number: i64,
 }
 
+fn metastore_value_at(values: &[MetastoreValue], index: usize) -> CatalogResult<&MetastoreValue> {
+    values.get(index).ok_or_else(|| CatalogError::Database {
+        message: format!("Expected metastore value at index {index}"),
+    })
+}
+
+fn existing_delete_file_record_from_values(
+    values: &[MetastoreValue],
+) -> CatalogResult<ExistingDeleteFileRecord> {
+    Ok(ExistingDeleteFileRecord {
+        delete_file_id: String::from_value(metastore_value_at(values, 0)?)?,
+        path_is_relative: bool::from_value(metastore_value_at(values, 1)?)?,
+        format: String::from_value(metastore_value_at(values, 2)?)?,
+        delete_count: i64::from_value(metastore_value_at(values, 3)?)?,
+        file_size_bytes: i64::from_value(metastore_value_at(values, 4)?)?,
+        source_data_file_path: Option::<String>::from_value(metastore_value_at(values, 5)?)?,
+        sequence_number: Option::<i64>::from_value(metastore_value_at(values, 6)?)?.unwrap_or(0),
+    })
+}
+
 /// Metastore backend enum to support different implementations.
 #[derive(Debug)]
 pub(crate) enum MetastoreImpl {
@@ -282,6 +302,48 @@ impl CayenneCatalog {
         }
 
         Ok(())
+    }
+
+    async fn validate_existing_delete_file_if_present_in_transaction(
+        tx: &dyn MetastoreTransaction,
+        delete_file: &DeleteFile,
+    ) -> CatalogResult<()> {
+        let count_values = tx
+            .query_row_values(QueryRowParams {
+                sql: r"
+                    SELECT COUNT(*)
+                    FROM cayenne_delete_file
+                    WHERE table_id = ?1 AND path = ?2
+                ",
+                params: vec![
+                    MetastoreValue::Text(delete_file.table_id.clone()),
+                    MetastoreValue::Text(delete_file.path.clone()),
+                ],
+            })
+            .await?;
+        let existing_count = i64::from_value(metastore_value_at(&count_values, 0)?)?;
+        if existing_count == 0 {
+            return Ok(());
+        }
+
+        let record_values = tx
+            .query_row_values(QueryRowParams {
+                sql: r"
+                    SELECT delete_file_id, path_is_relative, format, delete_count,
+                           file_size_bytes, source_data_file_path, sequence_number
+                    FROM cayenne_delete_file
+                    WHERE table_id = ?1 AND path = ?2
+                    ORDER BY delete_file_id DESC
+                    LIMIT 1
+                ",
+                params: vec![
+                    MetastoreValue::Text(delete_file.table_id.clone()),
+                    MetastoreValue::Text(delete_file.path.clone()),
+                ],
+            })
+            .await?;
+        let existing_record = existing_delete_file_record_from_values(&record_values)?;
+        validate_existing_delete_file_record(delete_file, &existing_record)
     }
 
     /// Apply a compaction commit's catalog mutations inside the caller's
@@ -2175,11 +2237,14 @@ impl MetadataCatalog for CayenneCatalog {
                         drop(tx);
                         continue 'attempts;
                     }
+                    let validation_result =
+                        Self::validate_existing_delete_file_if_present_in_transaction(
+                            tx.as_ref(),
+                            delete_file,
+                        )
+                        .await;
                     drop(tx);
-                    if let Err(validation_error) = self
-                        .validate_existing_delete_file_if_present(delete_file)
-                        .await
-                    {
+                    if let Err(validation_error) = validation_result {
                         return Err(CatalogError::InvalidOperation {
                             message:
                                 "Delete-file metadata conflicts with an existing row inside on-conflict transaction"

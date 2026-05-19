@@ -89,10 +89,10 @@ use parking_lot::{Mutex as ParkingMutex, RwLock};
 use roaring::RoaringBitmap;
 use std::any::Any;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task;
@@ -117,11 +117,32 @@ const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
 /// protecting memory on wide composite-PK tables. At ~40-64 bytes per entry
 /// (key bytes + `RowLocation` + `HashMap` overhead) this is ~2-4M rows for int64 PKs.
 const PK_KEYSET_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+const PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES: usize = 16;
 const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
 const PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT: usize = 1024;
 
-static PROTECTED_SNAPSHOT_AGE_WARNING_KEYS: LazyLock<ParkingMutex<HashSet<String>>> =
-    LazyLock::new(|| ParkingMutex::new(HashSet::new()));
+#[derive(Debug, Default)]
+struct BoundedWarningKeys {
+    seen: HashSet<String>,
+    insertion_order: VecDeque<String>,
+}
+
+impl BoundedWarningKeys {
+    fn insert_new(&mut self, key: String, limit: usize) -> bool {
+        if self.seen.contains(&key) {
+            return false;
+        }
+
+        if self.seen.len() >= limit
+            && let Some(oldest_key) = self.insertion_order.pop_front()
+        {
+            self.seen.remove(&oldest_key);
+        }
+
+        self.insertion_order.push_back(key.clone());
+        self.seen.insert(key)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotMaintenanceTrigger {
@@ -136,23 +157,28 @@ enum SnapshotMaintenanceTrigger {
     },
 }
 
-fn should_warn_protected_snapshot_age(snapshot_id: &str, warning_kind: &'static str) -> bool {
+fn should_warn_protected_snapshot_age(
+    warning_keys: &ParkingMutex<BoundedWarningKeys>,
+    snapshot_id: &str,
+    warning_kind: &'static str,
+) -> bool {
     let key = format!("{warning_kind}:{snapshot_id}");
-    let mut warning_keys = PROTECTED_SNAPSHOT_AGE_WARNING_KEYS.lock();
-    if warning_keys.contains(&key) {
-        return false;
-    }
-
-    if warning_keys.len() >= PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT {
-        warning_keys.clear();
-    }
-
-    warning_keys.insert(key)
+    warning_keys
+        .lock()
+        .insert_new(key, PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT)
 }
 
-fn protected_snapshot_age(snapshot_id: &str, now: SystemTime) -> Option<Duration> {
+fn protected_snapshot_age(
+    warning_keys: &ParkingMutex<BoundedWarningKeys>,
+    snapshot_id: &str,
+    now: SystemTime,
+) -> Option<Duration> {
+    // Protected snapshot ids are generated as UUIDv7 values by
+    // `publish_written_snapshot_with_sequence`; imported or future ids that
+    // do not preserve that invariant are ignored for age-triggered maintenance
+    // and still participate in count-triggered maintenance.
     let Ok(snapshot_uuid) = uuid::Uuid::parse_str(snapshot_id) else {
-        if should_warn_protected_snapshot_age(snapshot_id, "invalid_uuid") {
+        if should_warn_protected_snapshot_age(warning_keys, snapshot_id, "invalid_uuid") {
             tracing::warn!(
                 snapshot_id,
                 "Cayenne protected snapshot id is not a valid UUID; ignoring it for age-based maintenance"
@@ -161,7 +187,7 @@ fn protected_snapshot_age(snapshot_id: &str, now: SystemTime) -> Option<Duration
         return None;
     };
     let Some(timestamp) = snapshot_uuid.get_timestamp() else {
-        if should_warn_protected_snapshot_age(snapshot_id, "missing_uuid_timestamp") {
+        if should_warn_protected_snapshot_age(warning_keys, snapshot_id, "missing_uuid_timestamp") {
             tracing::warn!(
                 snapshot_id,
                 "Cayenne protected snapshot id does not contain a UUID timestamp; ignoring it for age-based maintenance"
@@ -171,7 +197,7 @@ fn protected_snapshot_age(snapshot_id: &str, now: SystemTime) -> Option<Duration
     };
     let (seconds, nanos) = timestamp.to_unix();
     let Some(snapshot_time) = UNIX_EPOCH.checked_add(Duration::new(seconds, nanos)) else {
-        if should_warn_protected_snapshot_age(snapshot_id, "timestamp_overflow") {
+        if should_warn_protected_snapshot_age(warning_keys, snapshot_id, "timestamp_overflow") {
             tracing::warn!(
                 snapshot_id,
                 "Cayenne protected snapshot timestamp overflowed SystemTime; ignoring it for age-based maintenance"
@@ -182,7 +208,7 @@ fn protected_snapshot_age(snapshot_id: &str, now: SystemTime) -> Option<Duration
     if let Ok(age) = now.duration_since(snapshot_time) {
         Some(age)
     } else {
-        if should_warn_protected_snapshot_age(snapshot_id, "future_timestamp") {
+        if should_warn_protected_snapshot_age(warning_keys, snapshot_id, "future_timestamp") {
             tracing::warn!(
                 snapshot_id,
                 "Cayenne protected snapshot timestamp is in the future; ignoring it for age-based maintenance"
@@ -193,12 +219,13 @@ fn protected_snapshot_age(snapshot_id: &str, now: SystemTime) -> Option<Duration
 }
 
 fn oldest_protected_snapshot_age(
+    warning_keys: &ParkingMutex<BoundedWarningKeys>,
     protected_snapshots: &HashMap<String, i64>,
     now: SystemTime,
 ) -> Option<Duration> {
     protected_snapshots
         .keys()
-        .filter_map(|snapshot_id| protected_snapshot_age(snapshot_id, now))
+        .filter_map(|snapshot_id| protected_snapshot_age(warning_keys, snapshot_id, now))
         .max()
 }
 
@@ -207,6 +234,7 @@ fn duration_millis_saturating(duration: Duration) -> u64 {
 }
 
 fn protected_snapshot_maintenance_trigger(
+    warning_keys: &ParkingMutex<BoundedWarningKeys>,
     protected_snapshots: &HashMap<String, i64>,
     trigger_count: usize,
     trigger_age: Option<Duration>,
@@ -222,7 +250,8 @@ fn protected_snapshot_maintenance_trigger(
     }
 
     let trigger_age = trigger_age?;
-    let oldest_snapshot_age = oldest_protected_snapshot_age(protected_snapshots, now)?;
+    let oldest_snapshot_age =
+        oldest_protected_snapshot_age(warning_keys, protected_snapshots, now)?;
     if oldest_snapshot_age >= trigger_age {
         Some(SnapshotMaintenanceTrigger::ProtectedSnapshotAge {
             protected_snapshot_count,
@@ -232,6 +261,12 @@ fn protected_snapshot_maintenance_trigger(
     } else {
         None
     }
+}
+
+fn approx_pk_keyset_entry_bytes(key: &OwnedRow) -> usize {
+    key.as_ref().len()
+        + std::mem::size_of::<RowLocation>()
+        + PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES
 }
 
 #[derive(Default)]
@@ -1003,6 +1038,10 @@ impl OnConflictExt for OnConflict {
 #[derive(Debug, Clone, Default)]
 struct CachedTableStatistics {
     optimizer: Option<Statistics>,
+    /// Raw blob last read from (or written to) the catalog.
+    /// Allows `persist_table_stats_locked` to attempt an in-memory merge
+    /// and avoid a catalog GET on the common steady-state path.
+    raw: Option<TableStatistics>,
 }
 
 /// Cayenne table provider that reads from Vortex virtual files.
@@ -1113,6 +1152,9 @@ pub struct CayenneTableProvider {
     /// Maps `snapshot_id` -> `minimum_sequence` (all deletes with seq <= `min_seq` don't apply).
     /// At scan time, data from these snapshots is scanned without deletion filtering.
     protected_snapshots: Arc<RwLock<HashMap<String, i64>>>,
+    /// Table-scoped warning dedupe for protected snapshot ids that cannot
+    /// provide a UUIDv7 timestamp for age-triggered maintenance.
+    protected_snapshot_age_warning_keys: Arc<ParkingMutex<BoundedWarningKeys>>,
     /// Cached visible primary-key set for auto conflict detection.
     ///
     /// The first auto-mode insert still scans existing data to build the set;
@@ -3026,6 +3068,9 @@ impl CayenneTableProvider {
                 object_store_registered_runtime_envs,
             )),
             protected_snapshots: Arc::new(RwLock::new(protected_snapshots)),
+            protected_snapshot_age_warning_keys: Arc::new(ParkingMutex::new(
+                BoundedWarningKeys::default(),
+            )),
             pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
             inline_checkpoint_scheduled: Arc::new(AtomicBool::new(false)),
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
@@ -3460,6 +3505,9 @@ impl CayenneTableProvider {
             ),
             current_snapshot_id: Arc::clone(&self.current_snapshot_id),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
+            protected_snapshot_age_warning_keys: Arc::clone(
+                &self.protected_snapshot_age_warning_keys,
+            ),
             pk_keyset_cache: Arc::clone(&self.pk_keyset_cache),
             inline_checkpoint_scheduled: Arc::clone(&self.inline_checkpoint_scheduled),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
@@ -3599,7 +3647,7 @@ impl CayenneTableProvider {
     fn store_cached_pk_keyset(&self, keyset: HashMap<OwnedRow, RowLocation>) {
         let approx_bytes = keyset
             .keys()
-            .map(|k| k.as_ref().len() + std::mem::size_of::<RowLocation>() + 16)
+            .map(approx_pk_keyset_entry_bytes)
             .sum::<usize>();
         if approx_bytes > PK_KEYSET_CACHE_MAX_BYTES {
             tracing::debug!(
@@ -3630,14 +3678,8 @@ impl CayenneTableProvider {
             return;
         };
 
-        let current_bytes: usize = keyset
-            .keys()
-            .map(|k| k.as_ref().len() + std::mem::size_of::<RowLocation>() + 16)
-            .sum();
-        let incoming_bytes: usize = keys
-            .iter()
-            .map(|k| k.as_ref().len() + std::mem::size_of::<RowLocation>() + 16)
-            .sum();
+        let current_bytes: usize = keyset.keys().map(approx_pk_keyset_entry_bytes).sum();
+        let incoming_bytes: usize = keys.iter().map(approx_pk_keyset_entry_bytes).sum();
         if current_bytes.saturating_add(incoming_bytes) > PK_KEYSET_CACHE_MAX_BYTES {
             tracing::debug!(
                 table = self.table_metadata.table_name.as_str(),
@@ -5256,6 +5298,7 @@ impl CayenneTableProvider {
     fn protected_snapshot_maintenance_trigger(&self) -> Option<SnapshotMaintenanceTrigger> {
         let protected_snapshots = self.protected_snapshots.read();
         protected_snapshot_maintenance_trigger(
+            &self.protected_snapshot_age_warning_keys,
             &protected_snapshots,
             self.context.compaction_trigger_protected_snapshots(),
             self.context.compaction_trigger_snapshot_age(),
@@ -5388,10 +5431,14 @@ impl CayenneTableProvider {
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 sort_columns = ?self.context.sort_columns(),
-                "Sorting compaction rewrite"
+                target_partitions = ctx.state().config().target_partitions(),
+                "Sorting compaction rewrite — individual output files will receive \
+                 hash-partitioned slices of the globally sorted stream (excellent \
+                 global ordering, good but not perfect per-file zone maps). \
+                 Parallelism is preserved."
             );
             stream = self.sort_stream(stream)?;
-            1
+            ctx.state().config().target_partitions()
         } else {
             ctx.state().config().target_partitions()
         };
@@ -8451,11 +8498,13 @@ mod tests {
     #[test]
     fn protected_snapshot_maintenance_trigger_uses_compaction_count_threshold() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let warning_keys = ParkingMutex::new(BoundedWarningKeys::default());
         let protected_snapshots =
             HashMap::from([("snapshot-1".to_string(), 1), ("snapshot-2".to_string(), 2)]);
 
         assert_eq!(
             protected_snapshot_maintenance_trigger(
+                &warning_keys,
                 &protected_snapshots,
                 2,
                 Some(Duration::from_secs(300)),
@@ -8471,6 +8520,7 @@ mod tests {
     #[test]
     fn protected_snapshot_maintenance_trigger_uses_oldest_snapshot_age() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let warning_keys = ParkingMutex::new(BoundedWarningKeys::default());
         let protected_snapshots = HashMap::from([
             (protected_snapshot_id_at_unix_time(900), 1),
             (protected_snapshot_id_at_unix_time(990), 2),
@@ -8478,6 +8528,7 @@ mod tests {
 
         assert_eq!(
             protected_snapshot_maintenance_trigger(
+                &warning_keys,
                 &protected_snapshots,
                 8,
                 Some(Duration::from_secs(60)),
@@ -8494,10 +8545,12 @@ mod tests {
     #[test]
     fn protected_snapshot_maintenance_trigger_ignores_invalid_uuid_for_age() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let warning_keys = ParkingMutex::new(BoundedWarningKeys::default());
         let protected_snapshots = HashMap::from([("not-a-uuid".to_string(), 1)]);
 
         assert_eq!(
             protected_snapshot_maintenance_trigger(
+                &warning_keys,
                 &protected_snapshots,
                 8,
                 Some(Duration::from_secs(60)),
@@ -8510,10 +8563,12 @@ mod tests {
     #[test]
     fn protected_snapshot_maintenance_trigger_ignores_future_uuid_for_age() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let warning_keys = ParkingMutex::new(BoundedWarningKeys::default());
         let protected_snapshots = HashMap::from([(protected_snapshot_id_at_unix_time(1_100), 1)]);
 
         assert_eq!(
             protected_snapshot_maintenance_trigger(
+                &warning_keys,
                 &protected_snapshots,
                 8,
                 Some(Duration::from_secs(60)),
