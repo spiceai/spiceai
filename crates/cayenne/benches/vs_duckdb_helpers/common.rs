@@ -451,6 +451,38 @@ pub async fn cayenne_insert(table: &Arc<CayenneTableProvider>, batch: RecordBatc
         .map_or(0, |rows| rows.value(0))
 }
 
+/// Drive Cayenne's pipelined CDC append path end-to-end for a single batch.
+///
+/// Calls [`CayenneTableProvider::write_cdc_append_stream`] (the entry point
+/// used by `refresh_mode: changes` in spiced's accelerated_table refresh
+/// loop) and then awaits `finish()` so the rows are fully visible — this is
+/// the apples-to-apples comparison against DuckDB's INSERT path, which has
+/// no staged/visibility split.
+///
+/// Returns the number of rows acknowledged by the CDC write.
+pub async fn cayenne_cdc_write(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> u64 {
+    use datafusion::error::DataFusionError;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion::prelude::SessionContext;
+
+    let schema = batch.schema();
+    let stream = Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        futures::stream::iter(vec![Ok::<_, DataFusionError>(batch)]),
+    ));
+    let ctx = SessionContext::new();
+    let cdc_write = table
+        .write_cdc_append_stream(stream, &ctx.task_ctx())
+        .await
+        .expect("cayenne cdc write stage A");
+    let rows = cdc_write.rows();
+    cdc_write
+        .finish()
+        .await
+        .expect("cayenne cdc write stage B finish");
+    rows
+}
+
 /// Insert from a parquet file through Cayenne via DataFusion's parquet
 /// reader. Mirrors spiced's `file:` connector → accelerator ingestion path
 /// and gives parity with `duckdb_insert_parquet` (both engines now consume

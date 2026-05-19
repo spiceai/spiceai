@@ -51,7 +51,7 @@ use tokio::runtime::Runtime;
 use tokio::task::JoinSet;
 
 use common::{
-    CayenneFixture, cayenne_insert, cayenne_query_warm, duckdb_insert_parquet,
+    CayenneFixture, cayenne_cdc_write, cayenne_insert, cayenne_query_warm, duckdb_insert_parquet,
     duckdb_insert_rows, make_batch, schema, setup_cayenne, setup_duckdb, warm_session_for,
     write_parquet,
 };
@@ -245,10 +245,16 @@ struct DuckDbBgWriter {
 }
 
 impl DuckDbBgWriter {
-    fn spawn(db_path: &std::path::Path, counter: Arc<AtomicUsize>, writer_id: i64) -> Self {
+    fn spawn(
+        db_path: &std::path::Path,
+        table_name: &str,
+        counter: Arc<AtomicUsize>,
+        writer_id: i64,
+    ) -> Self {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
         let db_path = db_path.to_path_buf();
+        let table_name = table_name.to_string();
         let handle = std::thread::spawn(move || {
             let conn = Connection::open(&db_path).expect("bg duckdb open");
             let id_stride = (WRITE_BATCH_ROWS as i64) * 1024 * 1024;
@@ -257,7 +263,7 @@ impl DuckDbBgWriter {
             while !stop_clone.load(Ordering::Relaxed) {
                 let batch = make_batch(schema(), cursor, WRITE_BATCH_ROWS);
                 cursor += WRITE_BATCH_ROWS as i64;
-                duckdb_insert_rows(&conn, "scaling_write", &batch);
+                duckdb_insert_rows(&conn, &table_name, &batch);
                 written += 1;
                 counter.fetch_add(1, Ordering::Relaxed);
             }
@@ -335,6 +341,7 @@ fn bench_write_scaling(c: &mut Criterion) {
             .map(|i| {
                 DuckDbBgWriter::spawn(
                     &duckdb_db_path,
+                    "scaling_write",
                     Arc::clone(&duckdb_counter),
                     i as i64,
                 )
@@ -363,5 +370,147 @@ fn bench_write_scaling(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_read_scaling, bench_write_scaling);
+// ---------------------------------------------------------------------------
+// vs_duckdb_scaling_cdc — sustained CDC pipelined writes
+// ---------------------------------------------------------------------------
+
+/// Sustained-throughput Cayenne CDC writer. Same shape as `CayenneBgWriter`
+/// but pumps `write_cdc_append_stream` + `finish()` (the production CDC
+/// pipelined path used by `refresh_mode: changes`) instead of the generic
+/// `insert_into`. Lets us see whether the Stage-A / Stage-B split actually
+/// translates into higher sustained throughput vs the regular write path.
+struct CayenneCdcBgWriter {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<tokio::task::JoinHandle<u64>>,
+    rt_handle: tokio::runtime::Handle,
+}
+
+impl CayenneCdcBgWriter {
+    fn spawn(
+        rt: &Runtime,
+        fixture: &CayenneFixture,
+        counter: Arc<AtomicUsize>,
+        writer_id: i64,
+    ) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let table = Arc::clone(&fixture.table);
+        let handle = rt.spawn(async move {
+            let mut written = 0u64;
+            let id_stride = (WRITE_BATCH_ROWS as i64) * 1024 * 1024;
+            let mut cursor = writer_id * id_stride;
+            while !stop_clone.load(Ordering::Relaxed) {
+                let batch = make_batch(schema(), cursor, WRITE_BATCH_ROWS);
+                cursor += WRITE_BATCH_ROWS as i64;
+                if cayenne_cdc_write(&table, batch).await > 0 {
+                    written += 1;
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            written
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+            rt_handle: rt.handle().clone(),
+        }
+    }
+}
+
+impl Drop for CayenneCdcBgWriter {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = self.rt_handle.block_on(handle);
+        }
+    }
+}
+
+fn bench_cdc_scaling(c: &mut Criterion) {
+    let rt = Runtime::new().expect("runtime");
+    let mut group = c.benchmark_group("vs_duckdb_scaling_cdc");
+    group.sample_size(10);
+
+    for &concurrency in CONCURRENCIES {
+        group.throughput(Throughput::Elements(
+            (concurrency as u64) * (WRITE_BATCH_ROWS as u64),
+        ));
+
+        // --- Cayenne CDC pipelined lane ---
+        let cayenne_fixture = rt.block_on(setup_cayenne("scaling_cdc"));
+        let cayenne_counter = Arc::new(AtomicUsize::new(0));
+        let mut cayenne_writers: Vec<CayenneCdcBgWriter> = (0..concurrency)
+            .map(|i| {
+                CayenneCdcBgWriter::spawn(
+                    &rt,
+                    &cayenne_fixture,
+                    Arc::clone(&cayenne_counter),
+                    i as i64,
+                )
+            })
+            .collect();
+
+        group.bench_with_input(
+            BenchmarkId::new("cayenne_cdc", concurrency),
+            &concurrency,
+            |b, &_n| {
+                b.iter(|| {
+                    let start = cayenne_counter.load(Ordering::Relaxed);
+                    let target = start + concurrency;
+                    while cayenne_counter.load(Ordering::Relaxed) < target {
+                        std::hint::spin_loop();
+                    }
+                    black_box(());
+                });
+            },
+        );
+
+        cayenne_writers.drain(..);
+        drop(cayenne_fixture);
+
+        // --- DuckDB INSERT lane (closest analog — DuckDB has no CDC pipelined
+        //     equivalent; the comparison answers "if you ran CDC on DuckDB by
+        //     just doing inserts, how fast would it be?") ---
+        let duckdb_fixture = setup_duckdb("scaling_cdc");
+        let duckdb_counter = Arc::new(AtomicUsize::new(0));
+        let duckdb_db_path = duckdb_fixture.db_path();
+        let mut duckdb_writers: Vec<DuckDbBgWriter> = (0..concurrency)
+            .map(|i| {
+                DuckDbBgWriter::spawn(
+                    &duckdb_db_path,
+                    "scaling_cdc",
+                    Arc::clone(&duckdb_counter),
+                    i as i64,
+                )
+            })
+            .collect();
+
+        group.bench_with_input(
+            BenchmarkId::new("duckdb", concurrency),
+            &concurrency,
+            |b, &_n| {
+                b.iter(|| {
+                    let start = duckdb_counter.load(Ordering::Relaxed);
+                    let target = start + concurrency;
+                    while duckdb_counter.load(Ordering::Relaxed) < target {
+                        std::hint::spin_loop();
+                    }
+                    black_box(());
+                });
+            },
+        );
+
+        duckdb_writers.drain(..);
+        drop(duckdb_fixture);
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_read_scaling,
+    bench_write_scaling,
+    bench_cdc_scaling
+);
 criterion_main!(benches);
