@@ -580,12 +580,10 @@ impl CayenneAccelerator {
                 "cayenne_compaction_trigger_protected_snapshots",
                 config.compaction_trigger_protected_snapshots,
             );
-            let age = parse_u64_with_hint(
-                acceleration,
-                "cayenne_cdc_max_coalesce_age_ms",
-                0,
-                "; 0 leaves the configured snapshot-age trigger unchanged",
-            );
+            let age = crate::accelerated_table::refresh_task::changes::cdc_config_from_params(
+                &source.app().runtime.params,
+            )
+            .max_coalesce_age_ms;
 
             if age > 0 {
                 config.compaction_trigger_snapshot_age_ms = age;
