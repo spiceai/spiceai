@@ -7842,18 +7842,14 @@ fn rewrite_consecutive_inlist_to_range(expr: Expr) -> Expr {
 fn extract_integer_literal(expr: &Expr) -> Option<i64> {
     let raw = match expr {
         Expr::Literal(s, _) => s,
-        Expr::Cast(c) | Expr::TryCast(_) => {
-            let inner = match expr {
-                Expr::Cast(c) => &c.expr,
-                Expr::TryCast(c) => &c.expr,
-                _ => unreachable!(),
-            };
-            if let Expr::Literal(s, _) = &**inner {
-                s
-            } else {
-                return None;
-            }
-        }
+        Expr::Cast(c) => match &*c.expr {
+            Expr::Literal(s, _) => s,
+            _ => return None,
+        },
+        Expr::TryCast(c) => match &*c.expr {
+            Expr::Literal(s, _) => s,
+            _ => return None,
+        },
         _ => return None,
     };
     match raw {
