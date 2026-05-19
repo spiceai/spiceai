@@ -88,6 +88,7 @@ impl CatalogConnector for PostgresCatalog {
         let table_factory = Arc::new(PostgresTableFactory::new(Arc::clone(&pool)));
 
         let catalog_provider = Arc::new(PostgresCatalogProvider::new(
+            catalog.name.clone(),
             pool,
             table_factory,
             catalog.include.clone(),
