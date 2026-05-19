@@ -21,7 +21,7 @@ use spice_cloud_client::{
     CloudClient,
     types::{
         AppExecutor, AppResourceLimits, AppResourceRequests, AppResources, CreateAppRequest,
-        CreateDeploymentRequest, UpdateAppRequest,
+        CreateDeploymentRequest, UpdateAppRequest, UpdateChannel,
     },
 };
 
@@ -90,7 +90,7 @@ fn default_resources() -> AppResources {
     AppResources {
         limits: AppResourceLimits {
             cpu: None,
-            memory: "16Gi".to_string(),
+            memory: Some("16Gi".to_string()),
             ephemeral_storage: None,
         },
         requests: Some(AppResourceRequests {
@@ -113,9 +113,7 @@ fn resources_over(
     memory_request: Option<&str>,
     ephemeral_storage_limit: Option<&str>,
 ) -> AppResources {
-    let memory_limit_val = memory_limit
-        .map(ToString::to_string)
-        .unwrap_or(base.limits.memory);
+    let memory_limit_val = memory_limit.map(ToString::to_string).or(base.limits.memory);
     let cpu_limit_val = cpu_limit.map(ToString::to_string).or(base.limits.cpu);
     let cpu_request_val = cpu_request
         .map(ToString::to_string)
@@ -193,6 +191,7 @@ pub(crate) async fn ensure_spice_cloud_app(
             replicas: config.app_replicas,
             resources: Some(resources),
             executor,
+            storage_size_gb: None,
         })
         .await;
 
@@ -311,7 +310,7 @@ pub(crate) async fn apply_spicepod_to_app(
 pub(crate) async fn create_deployment(
     cloud: &CloudClient,
     app_id: i64,
-    channel: Option<&str>,
+    channel: Option<&UpdateChannel>,
 ) -> anyhow::Result<()> {
     let created = cloud
         .create_deployment(
@@ -323,7 +322,7 @@ pub(crate) async fn create_deployment(
                 branch: None,
                 commit_sha: None,
                 commit_message: None,
-                channel: channel.map(String::from),
+                channel: channel.map(ToString::to_string),
                 debug: false,
             },
         )

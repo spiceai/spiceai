@@ -22,6 +22,15 @@
 //!
 //! Conflict fractions covered: 0 % (pure insert into a PK'd table), 50 %, and
 //! 100 % (every incoming row replaces an existing one).
+//!
+//! ## Iter 9 extension (parameterized large-N for keyset-cap validation)
+//! Add a `bench_upsert_keyset_cap` (or rename) that runs only under `#[cfg(feature="duckdb-bench")]`
+//! with TABLE_ROWS in {10_000, 100_000, 1_000_000, 3_000_000}, conflict_pct=100% fixed,
+//! sample_size(10), and throughput by elements. Expect DuckDB wall time ~flat (PK index O(log N));
+//! Cayenne time stays flat for tables that fit under the byte-budget cap
+//! (`PK_KEYSET_CACHE_MAX_BYTES = 256 MiB`, ~4 M narrow-PK rows) and grows with N
+//! once the budget is exceeded and `load_existing_keyset` must rebuild from scratch on every commit.
+//! Fixture materialization cost (~30 s+ per 1M+ variant) is why this is *not* in default CI suite.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::cast_possible_wrap)]

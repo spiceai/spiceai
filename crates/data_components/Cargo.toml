@@ -88,6 +88,7 @@ rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex.workspace = true
 reqwest.workspace = true
 runtime-rate-control = { path = "../runtime-rate-control" }
+runtime-request-context = { path = "../runtime-request-context" }
 rusqlite = { workspace = true, optional = true }
 elasticsearch = { path = "../elasticsearch", optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }

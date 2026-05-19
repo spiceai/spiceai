@@ -186,6 +186,12 @@ impl PreparedOverwrite {
     pub async fn finish(self) -> Result<u64> {
         self.table.update_current_snapshot_id(&self.new_snapshot_id);
         self.table.clear_all_deletion_caches();
+        // commit_overwrite_in_txn DELETEs cayenne_inlined_data /
+        // cayenne_inlined_delete for this table atomically with the snapshot
+        // flip, but doesn't go through the inline-mutation path that bumps
+        // `inlined_generation`. Bump it here so scans don't return stale
+        // pre-overwrite inline batches alongside the new snapshot.
+        self.table.invalidate_inlined_cache();
 
         self.table
             .update_listing_table_for_snapshot(&self.new_snapshot_id)
@@ -199,8 +205,9 @@ impl PreparedOverwrite {
         // leaves the cache empty rather than stale; `persist_table_stats`
         // repopulates it when the accumulator has rows. The catalog row was
         // already cleared atomically with the snapshot pointer flip.
-        self.table.clear_cached_table_statistics();
-        self.table.persist_table_stats(&self.write_stats_acc).await;
+        self.table
+            .reset_table_stats_after_overwrite(&self.write_stats_acc)
+            .await;
 
         // Drop the write guard last so all visibility-related updates happen
         // under exclusive table access.

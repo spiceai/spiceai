@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q11"
+---
++------------------+---------------------+--------------------+--------------------------------------+
+| customer_id      | customer_first_name | customer_last_name | customer_email_address               |
++------------------+---------------------+--------------------+--------------------------------------+
+| AAAAAAAAAAAADAAA | Kathryn             | Thompson           | Kathryn.Thompson@RyqxIdl3ermT.com    |
+| AAAAAAAAAAAAFAAA | Regina              | Davis              |                                      |
+| AAAAAAAAAAAAGBAA | William             | Anderson           | William.Anderson@YME7GD64C.com       |
+| AAAAAAAAAAAAHBAA | Shirlene            | Wortham            | Shirlene.Wortham@aXPsf7XlE4uQdBn.com |
+| AAAAAAAAAAAAIAAA | Theresa             | Clancy             | Theresa.Clancy@iHQA6GTzOHzcz.org     |
+| AAAAAAAAAAABCAAA | Edgar               | Clark              | Edgar.Clark@3bA4xzFjUAeGPC.org       |
+| AAAAAAAAAAABHBAA | Bennie              | Brown              | Bennie.Brown@IoKMzKucY8TdIBmz.edu    |
+| AAAAAAAAAAABNAAA | Andre               | Fields             | Andre.Fields@Y7ebf.edu               |
+| AAAAAAAAAAACJAAA | Deborah             | Doyle              | Deborah.Doyle@M9.edu                 |
+| AAAAAAAAAAACNBAA | David               | Sisson             | David.Sisson@0aPYdbTP.org            |
++------------------+---------------------+--------------------+--------------------------------------+

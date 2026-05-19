@@ -72,6 +72,53 @@ mod version {
             .success()
             .stdout(predicate::str::contains("Spice.ai CLI"));
     }
+
+    #[test]
+    fn test_machine_version_outputs_json() {
+        let mut cmd = spice_cmd();
+        let output = cmd
+            .arg("--machine")
+            .arg("version")
+            .arg("--cli-only")
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+
+        assert!(
+            output.stderr.is_empty(),
+            "machine version should not write human logs to stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("machine version output should be valid JSON");
+        assert!(json.get("cli").is_some(), "JSON should include cli version");
+    }
+
+    #[test]
+    fn test_machine_errors_are_json() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let missing = temp_dir.path().join("missing-spicepod.yaml");
+        let mut cmd = spice_cmd();
+        let output = cmd
+            .arg("--machine")
+            .arg("validate")
+            .arg(&missing)
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+
+        assert!(
+            output.stdout.is_empty(),
+            "machine errors should not write to stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stderr)
+            .expect("machine error output should be valid JSON");
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["error"]["code"], "invalid_argument");
+    }
 }
 
 // ============================================================================
@@ -175,7 +222,7 @@ mod dataset {
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Dataset"));
+            .stdout(predicate::str::contains("dataset entries"));
     }
 
     #[test]
@@ -186,7 +233,7 @@ mod dataset {
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Configure"));
+            .stdout(predicate::str::contains("Create or update a dataset"));
     }
 }
 
@@ -292,7 +339,8 @@ mod sql {
             .assert()
             .success()
             .stdout(predicate::str::contains("SQL"))
-            .stdout(predicate::str::contains("query"));
+            .stdout(predicate::str::contains("query"))
+            .stdout(predicate::str::contains("--query"));
     }
 
     #[test]
@@ -401,6 +449,146 @@ mod catalogs {
 }
 
 // ============================================================================
+// Manifest Editing Command Tests
+// ============================================================================
+
+mod manifest_editing {
+    use super::*;
+
+    fn write_base_yml(temp_dir: &TempDir) -> std::path::PathBuf {
+        let manifest_path = temp_dir.path().join("spicepod.yml");
+        fs::write(
+            &manifest_path,
+            "version: v2\nkind: Spicepod\nname: app\nmodels: []\nembeddings: []\nworkers: []\n",
+        )
+        .expect("base spicepod.yml should be written");
+        manifest_path
+    }
+
+    #[test]
+    fn test_manifest_command_help() {
+        let mut model_help = spice_cmd();
+        model_help
+            .arg("model")
+            .arg("--help")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("component entry"));
+
+        let mut model_add_help = spice_cmd();
+        model_add_help
+            .arg("model")
+            .arg("add")
+            .arg("--help")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Component name"));
+
+        let mut runtime_help = spice_cmd();
+        runtime_help
+            .arg("runtime")
+            .arg("configure")
+            .arg("--help")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Set a schema field"));
+    }
+
+    #[test]
+    fn test_model_add_and_configure_preserves_yml_manifest() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manifest_path = write_base_yml(&temp_dir);
+
+        let mut add_cmd = spice_cmd();
+        add_cmd
+            .current_dir(temp_dir.path())
+            .arg("model")
+            .arg("add")
+            .arg("llm")
+            .arg("--from")
+            .arg("openai:gpt-4o-mini")
+            .arg("--param")
+            .arg("temperature=0.2")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Updated"));
+
+        let mut configure_cmd = spice_cmd();
+        configure_cmd
+            .current_dir(temp_dir.path())
+            .arg("model")
+            .arg("configure")
+            .arg("llm")
+            .arg("--set")
+            .arg("datasets=yaml:[documents]")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Updated"));
+
+        let updated_manifest =
+            fs::read_to_string(&manifest_path).expect("updated spicepod.yml should be readable");
+        assert!(updated_manifest.contains("models:"));
+        assert!(updated_manifest.contains("name: llm"));
+        assert!(updated_manifest.contains("openai:gpt-4o-mini"));
+        assert!(updated_manifest.contains("temperature: \"0.2\""));
+        assert!(updated_manifest.contains("datasets:"));
+        assert!(updated_manifest.contains("- documents"));
+        assert!(
+            !temp_dir.path().join("spicepod.yaml").exists(),
+            "manifest edits should preserve an existing spicepod.yml"
+        );
+    }
+
+    #[test]
+    fn test_runtime_configure_sets_nested_fields() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manifest_path = write_base_yml(&temp_dir);
+
+        let mut cmd = spice_cmd();
+        cmd.current_dir(temp_dir.path())
+            .arg("runtime")
+            .arg("configure")
+            .arg("--set")
+            .arg("functions.enabled=yaml:true")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Updated"));
+
+        let updated_manifest =
+            fs::read_to_string(&manifest_path).expect("updated spicepod.yml should be readable");
+        assert!(updated_manifest.contains("runtime:"));
+        assert!(updated_manifest.contains("functions:"));
+        assert!(updated_manifest.contains("enabled: true"));
+    }
+
+    #[test]
+    fn test_catalog_add_from_flags() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manifest_path = write_base_yml(&temp_dir);
+
+        let mut cmd = spice_cmd();
+        cmd.current_dir(temp_dir.path())
+            .arg("catalog")
+            .arg("add")
+            .arg("glue")
+            .arg("--from")
+            .arg("glue")
+            .arg("--param")
+            .arg("glue_region=us-east-1")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Updated"));
+
+        let updated_manifest =
+            fs::read_to_string(&manifest_path).expect("updated spicepod.yml should be readable");
+        assert!(updated_manifest.contains("catalogs:"));
+        assert!(updated_manifest.contains("name: glue"));
+        assert!(updated_manifest.contains("from: glue"));
+        assert!(updated_manifest.contains("glue_region: us-east-1"));
+    }
+}
+
+// ============================================================================
 // Pods Command Tests
 // ============================================================================
 
@@ -466,6 +654,69 @@ mod add {
         let mut cmd = spice_cmd();
         cmd.arg("add").assert().failure();
     }
+
+    #[test]
+    fn test_add_local_yml_pod_updates_existing_yml_manifest() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let app_manifest = temp_dir.path().join("spicepod.yml");
+        fs::write(
+            &app_manifest,
+            "version: v2\nkind: Spicepod\nname: app\nmodels: []\nembeddings: []\nworkers: []\n",
+        )
+        .expect("Failed to write app spicepod.yml");
+
+        let local_pod_dir = temp_dir.path().join("localpod");
+        fs::create_dir_all(&local_pod_dir).expect("Failed to create local pod dir");
+        fs::write(
+            local_pod_dir.join("spicepod.yml"),
+            "version: v2\nkind: Spicepod\nname: localpod\n",
+        )
+        .expect("Failed to write local pod spicepod.yml");
+
+        let mut cmd = spice_cmd();
+        cmd.current_dir(temp_dir.path())
+            .arg("add")
+            .arg(&local_pod_dir)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("added spicepods/localpod"));
+
+        let updated_manifest =
+            fs::read_to_string(&app_manifest).expect("Failed to read updated spicepod.yml");
+        assert!(
+            updated_manifest.contains("models:"),
+            "models should be preserved"
+        );
+        assert!(
+            updated_manifest.contains("embeddings:"),
+            "embeddings should be preserved"
+        );
+        assert!(
+            updated_manifest.contains("workers:"),
+            "workers should be preserved"
+        );
+        assert!(
+            updated_manifest.contains("dependencies:"),
+            "dependencies should be added"
+        );
+        assert!(
+            updated_manifest.contains("- spicepods/localpod"),
+            "dependency should reference the installed path"
+        );
+        assert!(
+            !temp_dir.path().join("spicepod.yaml").exists(),
+            "spice add should edit the existing .yml manifest"
+        );
+        assert!(
+            temp_dir
+                .path()
+                .join("spicepods")
+                .join("localpod")
+                .join("spicepod.yaml")
+                .exists(),
+            "local yml dependency should be normalized to spicepod.yaml"
+        );
+    }
 }
 
 // ============================================================================
@@ -482,7 +733,9 @@ mod connect {
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Connect"))
+            .stdout(predicate::str::contains(
+                "Spicepod hosted on Spice.ai Cloud",
+            ))
             .stdout(predicate::str::contains("Spice.ai Cloud"));
     }
 }
@@ -530,7 +783,7 @@ mod search {
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Search"))
+            .stdout(predicate::str::contains("vector or hybrid search"))
             .stdout(predicate::str::contains("embeddings"));
     }
 
@@ -589,7 +842,7 @@ mod nsql {
             .assert()
             .success()
             .stdout(predicate::str::contains("SQL"))
-            .stdout(predicate::str::contains("natural language"));
+            .stdout(predicate::str::contains("natural-language"));
     }
 }
 
@@ -613,21 +866,21 @@ mod query {
 }
 
 // ============================================================================
-// Eval Command Tests
+// Completions Command Tests
 // ============================================================================
 
-mod eval {
+mod completions {
     use super::*;
 
     #[test]
-    fn test_eval_help() {
+    fn test_completions_help() {
         let mut cmd = spice_cmd();
-        cmd.arg("eval")
+        cmd.arg("completions")
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains("eval"))
-            .stdout(predicate::str::contains("model"));
+            .stdout(predicate::str::contains("completion scripts"))
+            .stdout(predicate::str::contains("zsh"));
     }
 }
 
@@ -663,7 +916,7 @@ mod cluster {
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Cluster"));
+            .stdout(predicate::str::contains("clustered mode"));
     }
 
     #[test]
@@ -1030,14 +1283,18 @@ mod mode_tests {
             .assert()
             .success()
             .stdout(predicate::str::contains("--cloud"))
-            .stdout(predicate::str::contains("Use cloud instance"));
+            .stdout(predicate::str::contains("Target Spice.ai Cloud"));
     }
 
     #[test]
     fn test_cloud_mode_with_status() {
         // Cloud mode status should fail without proper connection (no API key)
         let mut cmd = spice_cmd();
-        cmd.arg("--cloud").arg("status").assert().failure();
+        cmd.arg("--cloud")
+            .arg("us-east-1")
+            .arg("status")
+            .assert()
+            .failure();
     }
 
     #[test]
@@ -1046,6 +1303,7 @@ mod mode_tests {
         // but the command structure should be valid
         let mut cmd = spice_cmd();
         cmd.arg("--cloud")
+            .arg("us-east-1")
             .arg("--api-key")
             .arg("invalid-api-key")
             .arg("status")
@@ -1069,6 +1327,7 @@ mod mode_tests {
         // Cloud mode with datasets command
         let mut cmd = spice_cmd();
         cmd.arg("--cloud")
+            .arg("us-east-1")
             .arg("datasets")
             .arg("--help")
             .assert()
@@ -1080,6 +1339,7 @@ mod mode_tests {
         // Cloud mode with models command
         let mut cmd = spice_cmd();
         cmd.arg("--cloud")
+            .arg("us-east-1")
             .arg("models")
             .arg("--help")
             .assert()
@@ -1091,6 +1351,7 @@ mod mode_tests {
         // Cloud mode with search command
         let mut cmd = spice_cmd();
         cmd.arg("--cloud")
+            .arg("us-east-1")
             .arg("search")
             .arg("--help")
             .assert()
@@ -1102,6 +1363,7 @@ mod mode_tests {
         // Cloud mode with sql command
         let mut cmd = spice_cmd();
         cmd.arg("--cloud")
+            .arg("us-east-1")
             .arg("sql")
             .arg("--help")
             .assert()
@@ -1120,9 +1382,10 @@ mod mode_tests {
         // Some commands don't support cloud mode and should indicate this
         let mut cmd = spice_cmd();
         cmd.arg("--cloud")
+            .arg("us-east-1")
             .arg("datasets")
             .assert()
-            .success() // Currently exits 0 but prints error message
+            .success()
             .stdout(predicate::str::contains("does not support"));
     }
 
@@ -1144,6 +1407,7 @@ mod mode_tests {
         cmd.arg("--http-endpoint")
             .arg("http://custom:8080")
             .arg("--cloud")
+            .arg("us-east-1")
             .arg("--help")
             .assert()
             .success();
@@ -1164,6 +1428,7 @@ mod mode_tests {
         for command in &["status", "datasets", "models", "sql", "search"] {
             let mut cmd = spice_cmd();
             cmd.arg("--cloud")
+                .arg("us-east-1")
                 .arg(command)
                 .arg("--help")
                 .assert()

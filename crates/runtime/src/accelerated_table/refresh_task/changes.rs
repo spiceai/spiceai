@@ -109,7 +109,7 @@ struct ApplyContext<'a> {
     write_session_state: &'a SessionState,
     commit_timeout: Duration,
     pending_finalize: &'a mut Option<PendingApplyFinalize>,
-    pending_commit: &'a mut Option<tokio::task::JoinHandle<()>>,
+    pending_commit: &'a mut Option<tokio::task::JoinHandle<Result<(), String>>>,
 }
 
 struct WriteChangeOutcome {
@@ -184,6 +184,9 @@ pub struct CdcConfig {
     /// exceed this on its own; otherwise the next envelope is carried into the
     /// next burst before we allocate a concatenated batch.
     pub max_coalesced_bytes: usize,
+    /// Maximum CDC coalesce age in milliseconds. A value of 0 leaves
+    /// accelerator-specific age defaults unchanged.
+    pub max_coalesce_age_ms: u64,
     /// Maximum time to wait for the previous source-side commit before
     /// surfacing ingestion as stalled.
     pub commit_timeout: Duration,
@@ -195,6 +198,7 @@ const CDC_MAX_COALESCED_ENVELOPES_DEFAULT: usize = 256;
 const CDC_MAX_COALESCED_ENVELOPES_MAX: usize = 4096;
 const CDC_MAX_COALESCED_BYTES_DEFAULT: usize = 128 * 1024 * 1024;
 const CDC_MAX_COALESCED_BYTES_MAX: usize = 1024 * 1024 * 1024;
+const CDC_MAX_COALESCE_AGE_MS_DEFAULT: u64 = 0;
 const CDC_COMMIT_TIMEOUT_MS_DEFAULT: usize = 30_000;
 const CDC_COMMIT_TIMEOUT_MS_MAX: usize = 3_600_000;
 
@@ -204,6 +208,7 @@ impl Default for CdcConfig {
             prefetch_buffer: CDC_PREFETCH_BUFFER_DEFAULT,
             max_coalesced_envelopes: CDC_MAX_COALESCED_ENVELOPES_DEFAULT,
             max_coalesced_bytes: CDC_MAX_COALESCED_BYTES_DEFAULT,
+            max_coalesce_age_ms: CDC_MAX_COALESCE_AGE_MS_DEFAULT,
             commit_timeout: Duration::from_millis(CDC_COMMIT_TIMEOUT_MS_DEFAULT as u64),
         }
     }
@@ -253,6 +258,10 @@ fn cdc_config() -> CdcConfig {
             CDC_MAX_COALESCED_BYTES_DEFAULT,
             CDC_MAX_COALESCED_BYTES_MAX,
         ),
+        max_coalesce_age_ms: parse_env_u64(
+            "SPICE_CDC_MAX_COALESCE_AGE_MS",
+            CDC_MAX_COALESCE_AGE_MS_DEFAULT,
+        ),
         commit_timeout: Duration::from_millis(parse_env_usize(
             "SPICE_CDC_COMMIT_TIMEOUT_MS",
             CDC_COMMIT_TIMEOUT_MS_DEFAULT,
@@ -289,9 +298,31 @@ fn resolve_cdc_param(
     parse_env_usize(env_var, default, max)
 }
 
+/// Resolve a millisecond CDC tunable from `runtime.params`, falling back to the
+/// matching env var and then `default` when the param is missing or unparseable.
+fn resolve_cdc_param_u64(
+    params: &std::collections::HashMap<String, String>,
+    key: &'static str,
+    env_var: &'static str,
+    default: u64,
+) -> u64 {
+    if let Some(raw) = params.get(key) {
+        match raw.trim().parse::<u64>() {
+            Ok(n) => return n,
+            Err(e) => {
+                tracing::warn!(
+                    "runtime.params.{key}={raw:?} is not a valid u64 ({e}); falling back to {env_var}/default"
+                );
+            }
+        }
+    }
+    parse_env_u64(env_var, default)
+}
+
 /// Build a [`CdcConfig`] from the spicepod `runtime.params` map, reading
 /// the `cdc_prefetch_buffer`, `cdc_max_coalesced_envelopes`,
-/// `cdc_max_coalesced_bytes`, and `cdc_commit_timeout_ms` keys.
+/// `cdc_max_coalesced_bytes`, `cdc_max_coalesce_age_ms`, and
+/// `cdc_commit_timeout_ms` keys.
 /// Missing/unparseable/out-of-range params fall back to the corresponding
 /// `SPICE_CDC_*` env var, then defaults.
 #[must_use]
@@ -318,6 +349,12 @@ pub fn cdc_config_from_params(params: &std::collections::HashMap<String, String>
             CDC_MAX_COALESCED_BYTES_DEFAULT,
             CDC_MAX_COALESCED_BYTES_MAX,
         ),
+        max_coalesce_age_ms: resolve_cdc_param_u64(
+            params,
+            "cdc_max_coalesce_age_ms",
+            "SPICE_CDC_MAX_COALESCE_AGE_MS",
+            CDC_MAX_COALESCE_AGE_MS_DEFAULT,
+        ),
         commit_timeout: Duration::from_millis(resolve_cdc_param(
             params,
             "cdc_commit_timeout_ms",
@@ -343,6 +380,21 @@ fn parse_env_usize(var: &'static str, default: usize, max: usize) -> usize {
             Err(e) => {
                 tracing::warn!(
                     "{var}={raw:?} failed to parse as usize ({e}); using default {default}"
+                );
+                default
+            }
+        },
+    }
+}
+
+fn parse_env_u64(var: &'static str, default: u64) -> u64 {
+    match std::env::var(var) {
+        Err(_) => default,
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(
+                    "{var}={raw:?} failed to parse as u64 ({e}); using default {default}"
                 );
                 default
             }
@@ -418,8 +470,10 @@ impl RefreshTask {
         // apply once the accelerator write has succeeded. Before publishing a
         // new commit task we drain the previous one with `commit_timeout`, so
         // commit(N) overlaps apply(N+1) without accumulating an unbounded chain
-        // of tasks if the source-side commit path stalls.
-        let mut pending_commit: Option<tokio::task::JoinHandle<()>> = None;
+        // of tasks if the source-side commit path stalls. Commit task errors
+        // are returned through `join_pending_commit` so source offsets cannot
+        // silently stop advancing.
+        let mut pending_commit: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
         let mut pending_finalize: Option<PendingApplyFinalize> = None;
         let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
         let write_ctx = SessionContext::new();
@@ -1337,7 +1391,7 @@ async fn join_pending_finalize(
 /// would leave the dataset healthy while source-side offsets stop advancing)
 /// but treats cancellation during shutdown as expected.
 async fn join_pending_commit(
-    mut handle: tokio::task::JoinHandle<()>,
+    mut handle: tokio::task::JoinHandle<Result<(), String>>,
     dataset_name: &TableReference,
     is_shutdown: bool,
     commit_timeout: Duration,
@@ -1361,7 +1415,8 @@ async fn join_pending_commit(
                     tracing::error!("{error_message}");
                     Some(error_message)
                 }
-                Ok(()) => None,
+                Ok(Ok(())) => None,
+                Ok(Err(error_message)) => Some(error_message),
             }
         }
         () = tokio::time::sleep(commit_timeout) => {
@@ -1388,7 +1443,7 @@ fn spawn_ordered_commit_task(
     committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
     runtime_status: Arc<status::RuntimeStatus>,
     commit_dataset: TableReference,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
         // Safe catch-up mode: this task is spawned only after the accelerator
         // write returns successfully. For Cayenne staged appends, that return
@@ -1401,9 +1456,13 @@ fn spawn_ordered_commit_task(
             if let Err(e) = committer.commit().await
                 && !runtime_status.is_shutdown()
             {
-                tracing::error!("Failed to commit CDC change envelope for {commit_dataset}: {e}");
+                let error_message =
+                    format!("Failed to commit CDC change envelope for {commit_dataset}: {e}");
+                tracing::error!("{error_message}");
+                return Err(error_message);
             }
         }
+        Ok(())
     })
 }
 
@@ -1783,6 +1842,16 @@ mod tests {
     use datafusion::datasource::TableProvider;
 
     use std::sync::Arc;
+
+    #[test]
+    fn cdc_config_from_params_resolves_max_coalesce_age_ms() {
+        let config = cdc_config_from_params(&std::collections::HashMap::from([(
+            "cdc_max_coalesce_age_ms".to_string(),
+            "90000".to_string(),
+        )]));
+
+        assert_eq!(config.max_coalesce_age_ms, 90_000);
+    }
 
     fn create_test_data_schema() -> Schema {
         Schema::new(vec![
@@ -2976,7 +3045,7 @@ mod tests {
     #[tokio::test]
     async fn test_join_pending_commit_ignores_cancel_during_shutdown() {
         let dataset_name = TableReference::bare("test");
-        let handle = tokio::spawn(std::future::pending::<()>());
+        let handle = tokio::spawn(std::future::pending::<Result<(), String>>());
         handle.abort();
 
         let result = join_pending_commit(handle, &dataset_name, true, Duration::from_secs(5)).await;

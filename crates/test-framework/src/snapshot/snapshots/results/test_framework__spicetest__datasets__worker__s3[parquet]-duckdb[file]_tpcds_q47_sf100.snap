@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q47"
+---
++------------+-------------------+--------------+----------------+--------+-------------------+-----------+-----------+-----------+
+| i_category | i_brand           | s_store_name | s_company_name | d_year | avg_monthly_sales | sum_sales | psum      | nsum      |
++------------+-------------------+--------------+----------------+--------+-------------------+-----------+-----------+-----------+
+| Children   | importoexporti #2 | bar          | Unknown        | 2001   | 578177.005        | 305442.31 | 376300.71 | 339070.99 |
+| Children   | exportiexporti #2 | eing         | Unknown        | 2001   | 565946.7858333334 | 293446.12 | 359156.61 | 319131.35 |
+| Children   | importoexporti #2 | able         | Unknown        | 2001   | 579741.4158333334 | 308524.67 | 381218.20 | 328199.08 |
+| Men        | amalgimporto #2   | bar          | Unknown        | 2001   | 571837.5816666667 | 301201.15 | 368371.44 | 332784.27 |
+| Women      | exportiamalg #2   | bar          | Unknown        | 2001   | 568817.5475       | 299151.62 | 357495.84 | 322972.37 |
+| Men        | importoimporto #2 | bar          | Unknown        | 2001   | 568587.79         | 299138.92 | 372390.08 | 330915.28 |
+| Children   | exportiexporti #2 | bar          | Unknown        | 2001   | 564375.6383333333 | 295607.65 | 360757.08 | 323364.94 |
+| Children   | importoexporti #2 | ese          | Unknown        | 2001   | 580445.24         | 311793.24 | 369821.33 | 327617.13 |
+| Children   | importoexporti #2 | eing         | Unknown        | 2001   | 579077.5975       | 311481.31 | 354431.73 | 332396.51 |
+| Shoes      | amalgedu pack #2  | ese          | Unknown        | 2001   | 569104.9275       | 301533.97 | 363760.37 | 332648.55 |
++------------+-------------------+--------------+----------------+--------+-------------------+-----------+-----------+-----------+

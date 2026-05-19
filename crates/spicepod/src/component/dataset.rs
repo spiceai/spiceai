@@ -89,6 +89,34 @@ pub enum UnsupportedTypeAction {
     String,
 }
 
+/// Policy for handling source schema changes after the dataset is registered.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OnSchemaChange {
+    /// Block schema changes from being applied automatically. The dataset stays healthy and
+    /// continues serving queries using the registered schema.
+    #[default]
+    Block,
+    /// Fail when the projected source schema diverges from the registered dataset schema.
+    Fail,
+    /// Add new source columns to the registered schema; reject removals and incompatible changes.
+    AppendNewColumns,
+    /// Keep the registered dataset schema synchronized with the projected source schema.
+    SyncAllColumns,
+}
+
+impl std::fmt::Display for OnSchemaChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OnSchemaChange::Block => write!(f, "block"),
+            OnSchemaChange::Fail => write!(f, "fail"),
+            OnSchemaChange::AppendNewColumns => write!(f, "append_new_columns"),
+            OnSchemaChange::SyncAllColumns => write!(f, "sync_all_columns"),
+        }
+    }
+}
+
 /// Controls when the dataset is marked ready for queries.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -173,6 +201,14 @@ pub struct Dataset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
 
+    /// Controls how the runtime handles source schema changes after the dataset is registered.
+    ///
+    /// Options: `block` / `fail` / `append_new_columns` / `sync_all_columns`.
+    ///
+    /// `block` (default) keeps the dataset healthy and queryable using the registered schema.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub on_schema_change: OnSchemaChange,
+
     #[serde(default, skip_serializing_if = "is_default")]
     pub ready_state: ReadyState,
 
@@ -222,6 +258,7 @@ impl Dataset {
             embeddings: Vec::default(),
             depends_on: Vec::default(),
             unsupported_type_action: None,
+            on_schema_change: OnSchemaChange::default(),
             ready_state: ReadyState::default(),
             metrics: None,
             vectors: None,
@@ -311,6 +348,7 @@ impl WithDependsOn<Dataset> for Dataset {
             embeddings: self.embeddings.clone(),
             depends_on: depends_on.to_vec(),
             unsupported_type_action: self.unsupported_type_action,
+            on_schema_change: self.on_schema_change,
             ready_state: self.ready_state,
             metrics: self.metrics.clone(),
             vectors: self.vectors.clone(),
@@ -385,6 +423,8 @@ struct DatasetDeserializer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     unsupported_type_action: Option<UnsupportedTypeAction>,
     #[serde(default, skip_serializing_if = "is_default")]
+    on_schema_change: OnSchemaChange,
+    #[serde(default, skip_serializing_if = "is_default")]
     ready_state: ReadyState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     metrics: Option<Metrics>,
@@ -442,6 +482,7 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             embeddings: deserializer.embeddings,
             depends_on: deserializer.depends_on,
             unsupported_type_action,
+            on_schema_change: deserializer.on_schema_change,
             ready_state: deserializer.ready_state,
             metrics: deserializer.metrics,
             vectors: deserializer.vectors,
@@ -570,6 +611,40 @@ mod tests {
         ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.time_format, Some(TimeFormat::ISO8601));
+    }
+
+    #[test]
+    fn test_deserialize_default_on_schema_change() {
+        let yaml = r"
+            name: test
+            from: test
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.on_schema_change, OnSchemaChange::Block);
+    }
+
+    #[test]
+    fn test_deserialize_all_on_schema_change_modes() {
+        for (yaml_value, expected) in [
+            ("block", OnSchemaChange::Block),
+            ("fail", OnSchemaChange::Fail),
+            ("append_new_columns", OnSchemaChange::AppendNewColumns),
+            ("sync_all_columns", OnSchemaChange::SyncAllColumns),
+        ] {
+            let yaml = format!(
+                r"
+                    name: test
+                    from: test
+                    on_schema_change: {yaml_value}
+                "
+            );
+            let dataset: Dataset = yaml::from_str(&yaml)
+                .unwrap_or_else(|_| panic!("should parse on_schema_change '{yaml_value}'"));
+            assert_eq!(
+                dataset.on_schema_change, expected,
+                "unexpected parse for '{yaml_value}'"
+            );
+        }
     }
 
     #[test]
