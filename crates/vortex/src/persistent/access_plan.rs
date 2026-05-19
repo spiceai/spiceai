@@ -12,7 +12,7 @@ use vortex::scan::Selection;
 
 /// Custom Vortex-specific information that can be provided by external indexes or other sources.
 ///
-/// This is intended as a low-level interface for users building their own data systems, see the [advanced index] example from the DataFusion repo for a similar usage with Parquet.
+/// This is intended as a low-level interface for users building their own data systems, see the [advanced index] example from the `DataFusion` repo for a similar usage with Parquet.
 ///
 /// [advanced index]: https://github.com/apache/datafusion/blob/47df535d2cd5aac5ad5a92bdc837f38e05ea0f0f/datafusion-examples/examples/data_io/parquet_advanced_index.rs
 #[derive(Default)]
@@ -25,7 +25,7 @@ pub struct VortexAccessPlan {
 /// This is intended for systems that maintain external indexes, deletion vectors,
 /// or other file-level metadata outside the Vortex file footer. Implementations
 /// can attach a [`VortexAccessPlan`] to each [`PartitionedFile`] before the scan
-/// is built and can adjust the footer-derived [`Statistics`] so DataFusion does
+/// is built and can adjust the footer-derived [`Statistics`] so `DataFusion` does
 /// not apply optimizations using stale metadata.
 pub trait VortexAccessPlanProvider: Debug + Send + Sync + 'static {
     /// Returns the access plan to attach to a file, if any.
@@ -43,6 +43,7 @@ pub trait VortexAccessPlanProvider: Debug + Send + Sync + 'static {
 
 impl VortexAccessPlan {
     /// Sets a [`Selection`] for this plan.
+    #[must_use]
     pub fn with_selection(mut self, selection: Selection) -> Self {
         self.selection = Some(selection);
         self
