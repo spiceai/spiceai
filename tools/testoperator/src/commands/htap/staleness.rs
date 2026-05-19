@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Staleness gap measurement for HTAP benchmarks.
 //!
-//! Probes TPC-C tables every 1s by comparing `MAX(_bench_ts)` between the
+//! Probes TPC-C tables every 5s by comparing `MAX(_bench_ts)` between the
 //! source and the Spice accelerated copy. The gap is the replication
 //! staleness — how far behind Spice is from the source at any given moment.
 //!
@@ -58,11 +58,15 @@ impl StalenessReport {
     /// Print a human-readable data freshness summary and record OTEL metrics.
     pub fn emit(&self) {
         println!("\nData Freshness");
+        println!(
+            "  {:<14} {:>10} {:>10} {:>10} {:>10}",
+            "dataset", "p50_ms", "p99_ms", "max_ms", "samples"
+        );
         for table in &self.probe_tables {
             if let Some(stats) = self.tables.get(table.as_str()) {
                 println!(
-                    "  {:<14} P50={:>5}ms  P99={:>5}ms  max={:>5}ms  ({} samples)",
-                    format!("{table}:"),
+                    "  {:<14} {:>10} {:>10} {:>10} {:>10}",
+                    table,
                     stats.p50.as_millis(),
                     stats.p99.as_millis(),
                     stats.max.as_millis(),
@@ -74,7 +78,6 @@ impl StalenessReport {
                     .record(p99_ms, &[KeyValue::new("dataset", table.clone())]);
             }
         }
-        println!("  ─────────────────");
         println!("  worst P99:     {}ms", self.worst_p99.as_millis());
         #[expect(clippy::cast_precision_loss)]
         let worst_ms = self.worst_p99.as_millis() as f64;
@@ -99,7 +102,7 @@ async fn run_staleness_probe(
     spice_client: spiceai::Client,
     cancel: CancellationToken,
 ) -> anyhow::Result<StalenessReport> {
-    let poll_interval = Duration::from_secs(1);
+    let poll_interval = Duration::from_secs(5);
     let probe_tables = driver.probe_tables();
 
     // Per-table gap samples (microseconds).

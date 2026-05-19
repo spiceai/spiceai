@@ -3,7 +3,7 @@ SELECT
     sum(ol_amount) AS revenue
 FROM
     customer, 
-    orders,
+    oorder,
     order_line,
     stock,
     supplier,

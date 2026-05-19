@@ -7,7 +7,7 @@ SELECT
 FROM
     customer,
     new_order,
-    orders,
+    oorder,
     order_line
 WHERE c_state LIKE 'A%'
   AND c_id = o_c_id
