@@ -615,7 +615,10 @@ impl FileFormat for VortexFormat {
                     sum_value: Precision::Absent,
                     distinct_count: stats_set
                         .get_as::<bool>(Stat::IsConstant, &DType::Bool(Nullability::NonNullable))
-                        .and_then(|is_constant| is_constant.as_exact().map(|_| Precision::Exact(1)))
+                        .and_then(|is_constant| match is_constant.as_exact() {
+                            Some(true) => Some(Precision::Exact(1)),
+                            Some(false) | None => None,
+                        })
                         .unwrap_or(Precision::Absent),
                     // TODO(connor): Is this correct?
                     byte_size: column_size.to_df(),

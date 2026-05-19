@@ -710,9 +710,9 @@ mod tests {
     #[case::and(DFOperator::And, Operator::And)]
     #[case::or(DFOperator::Or, Operator::Or)]
     #[case::plus(DFOperator::Plus, Operator::Add)]
-    #[case::plus(DFOperator::Minus, Operator::Sub)]
-    #[case::plus(DFOperator::Multiply, Operator::Mul)]
-    #[case::plus(DFOperator::Divide, Operator::Div)]
+    #[case::minus(DFOperator::Minus, Operator::Sub)]
+    #[case::multiply(DFOperator::Multiply, Operator::Mul)]
+    #[case::divide(DFOperator::Divide, Operator::Div)]
     fn test_operator_conversion_supported(
         #[case] df_op: DFOperator,
         #[case] expected_vortex_op: Operator,
