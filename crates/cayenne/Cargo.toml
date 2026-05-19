@@ -274,3 +274,7 @@ required-features = ["duckdb-bench"]
 [[bench]]
 harness = false
 name = "get_max_delete_sequence_walk"
+
+[[bench]]
+harness = false
+name = "apply_on_conflict_keys_double_clone"
