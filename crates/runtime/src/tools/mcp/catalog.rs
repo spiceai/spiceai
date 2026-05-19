@@ -26,8 +26,12 @@ use rmcp::{
     },
     serve_client,
     service::{RunningService, ServiceError},
-    transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess},
+    transport::{
+        ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess,
+        streamable_http_client::StreamableHttpClientTransportConfig,
+    },
 };
+use secrecy::ExposeSecret;
 use snafu::ResultExt;
 use std::{
     sync::{Arc, LazyLock},
@@ -189,7 +193,11 @@ impl McpToolCatalog {
                     .context(UnderlyingTransportSnafu)?,
                 ))
             }
-            MCPConfig::StreamableHttp { url } => {
+            MCPConfig::StreamableHttp {
+                url,
+                auth_token,
+                headers,
+            } => {
                 // Security: Validate URL scheme (only https allowed, http for localhost testing)
                 if url.scheme() != "https" && url.scheme() != "http" {
                     return Err(Error::CouldNotConstructTool {
@@ -211,7 +219,13 @@ impl McpToolCatalog {
                     );
                 }
 
-                let transport = StreamableHttpClientTransport::from_uri(url.to_string());
+                let mut transport_config =
+                    StreamableHttpClientTransportConfig::with_uri(url.to_string())
+                        .custom_headers(headers.clone());
+                if let Some(auth_token) = auth_token {
+                    transport_config = transport_config.auth_header(auth_token.expose_secret());
+                }
+                let transport = StreamableHttpClientTransport::from_config(transport_config);
 
                 let client_info = InitializeRequestParams::new(
                     ClientCapabilities::default(),
