@@ -472,6 +472,8 @@ impl CayenneCatalog {
     ) -> CatalogResult<TableMetadata> {
         match self.get_table(table_name).await {
             Ok(stored_metadata) => {
+                log_runtime_footer_cache_drift(table_name, &stored_metadata, options);
+
                 if configuration_matches(&stored_metadata, options) {
                     return Ok(stored_metadata);
                 }
@@ -2728,11 +2730,8 @@ async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResul
 /// Checks if the existing stored configuration matches the new [`CreateTableOptions`].
 ///
 /// Returns `true` if the configuration matches (no recreation needed).
-/// Only compares data-affecting fields by default; runtime tuning parameters like
-/// write/upload concurrency are excluded since they don't affect data correctness.
-/// When a runtime-global footer cache value is explicitly configured, compare it
-/// to any value stored in the metastore so configuration drift is surfaced during
-/// dataset registration.
+/// Only compares data-affecting fields; runtime tuning parameters like cache sizes
+/// and write/upload concurrency are excluded since they don't affect data correctness.
 fn configuration_matches(stored: &TableMetadata, options: &CreateTableOptions) -> bool {
     // Compare primary keys
     if stored.primary_key != options.primary_key {
@@ -2763,13 +2762,6 @@ fn configuration_matches(stored: &TableMetadata, options: &CreateTableOptions) -
     if stored.vortex_config.compression_strategy != options.vortex_config.compression_strategy {
         return false;
     }
-    if let (Some(stored_footer_cache_mb), Some(configured_footer_cache_mb)) = (
-        stored.vortex_config.footer_cache_mb,
-        options.vortex_config.footer_cache_mb,
-    ) && stored_footer_cache_mb != configured_footer_cache_mb
-    {
-        return false;
-    }
 
     // Compare base path (path change means data is in a different location)
     if stored.path != options.base_path {
@@ -2794,6 +2786,25 @@ fn validate_create_table_options(options: &CreateTableOptions) -> CatalogResult<
     }
 
     Ok(())
+}
+
+fn log_runtime_footer_cache_drift(
+    table_name: &str,
+    stored: &TableMetadata,
+    options: &CreateTableOptions,
+) {
+    if let (Some(stored_footer_cache_mb), Some(configured_footer_cache_mb)) = (
+        stored.vortex_config.footer_cache_mb,
+        options.vortex_config.footer_cache_mb,
+    ) && stored_footer_cache_mb != configured_footer_cache_mb
+    {
+        tracing::warn!(
+            table = table_name,
+            stored_footer_cache_mb,
+            configured_footer_cache_mb,
+            "Cayenne table was registered with a different runtime.params.cayenne_footer_cache_mb than the value stored in the metastore; using the current runtime value"
+        );
+    }
 }
 
 /// Logs a warning describing exactly which configuration fields differ between the
@@ -2847,16 +2858,6 @@ fn log_configuration_differences(
         differences.push(format!(
             "compression_strategy: {:?} -> {:?}",
             stored.vortex_config.compression_strategy, options.vortex_config.compression_strategy
-        ));
-    }
-
-    if let (Some(stored_footer_cache_mb), Some(configured_footer_cache_mb)) = (
-        stored.vortex_config.footer_cache_mb,
-        options.vortex_config.footer_cache_mb,
-    ) && stored_footer_cache_mb != configured_footer_cache_mb
-    {
-        differences.push(format!(
-            "footer_cache_mb: {stored_footer_cache_mb} -> {configured_footer_cache_mb}"
         ));
     }
 
@@ -5324,7 +5325,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_validate_existing_table_configuration_checks_configured_footer_cache() {
+    async fn test_validate_existing_table_configuration_allows_configured_footer_cache_drift() {
         let test_db = format!(
             "sqlite://./.test_footer_cache_validate_{}.db",
             uuid::Uuid::now_v7()
@@ -5371,8 +5372,8 @@ mod tests {
             .validate_existing_table_configuration("footer_cache_validate_table", &changed_options)
             .await;
         assert!(
-            matches!(&result, Err(CatalogError::ChangedConfiguration { .. })),
-            "Expected ChangedConfiguration error from footer cache validation, got: {result:?}"
+            result.is_ok(),
+            "Expected Ok for footer cache runtime tuning drift, got: {result:?}"
         );
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);

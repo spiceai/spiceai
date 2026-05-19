@@ -33,7 +33,7 @@ use crate::metadata::{PkConflictDetection, VortexConfig};
 ///
 /// # Sharing
 ///
-/// The shared `RuntimeEnv` carries the DataFusion file metadata cache used by
+/// The shared `RuntimeEnv` carries the `DataFusion` file metadata cache used by
 /// Vortex for cached footer metadata. Sharing a `CayenneContext` across table
 /// providers means they share that runtime-level cache, reducing repeated footer
 /// reads when working with partitioned datasets.

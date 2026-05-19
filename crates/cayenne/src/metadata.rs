@@ -290,7 +290,7 @@ pub struct VortexConfig {
     pub footer_cache_mb: Option<usize>,
     /// Segment cache size in MB.
     ///
-    /// Currently ignored because the current Vortex DataFusion API does not expose
+    /// Currently ignored because the current Vortex `DataFusion` API does not expose
     /// segment cache sizing.
     pub segment_cache_mb: usize,
     /// Target size for individual Vortex files in MB. When writes exceed this size,

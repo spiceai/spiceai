@@ -261,8 +261,10 @@ impl CayenneCatalogProvider {
     }
 
     fn vortex_config_from_config(provider_config: &CayenneCatalogProviderConfig) -> VortexConfig {
-        let mut config = VortexConfig::default();
-        config.footer_cache_mb = provider_config.footer_cache_mb;
+        let mut config = VortexConfig {
+            footer_cache_mb: provider_config.footer_cache_mb,
+            ..Default::default()
+        };
         if let Some(v) = provider_config.segment_cache_mb {
             config.segment_cache_mb = v;
         }
