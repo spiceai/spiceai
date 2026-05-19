@@ -3,6 +3,25 @@
 
 //! Connectors to enable [DataFusion](https://docs.rs/datafusion/latest/datafusion/) to read [`Vortex`](https://docs.rs/crate/vortex/latest) data.
 #![deny(missing_docs)]
+#![cfg_attr(
+    test,
+    expect(
+        clippy::cast_possible_wrap,
+        clippy::clone_on_ref_ptr,
+        clippy::default_trait_access,
+        clippy::doc_markdown,
+        clippy::explicit_into_iter_loop,
+        clippy::ignored_unit_patterns,
+        clippy::items_after_statements,
+        clippy::manual_let_else,
+        clippy::needless_raw_string_hashes,
+        clippy::redundant_closure_for_method_calls,
+        clippy::uninlined_format_args,
+        clippy::unreadable_literal,
+        clippy::unwrap_used,
+        reason = "vendored upstream tests intentionally keep upstream fixture style"
+    )
+)]
 use std::fmt::Debug;
 
 use datafusion_common::stats::Precision as DFPrecision;
