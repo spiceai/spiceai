@@ -41,17 +41,17 @@ use vortex::scalar_fn::fns::operators::Operator;
 
 use crate::convert::FromDataFusion;
 
-/// Result of splitting a projection into Vortex expressions and leftover `DataFusion` projections.
+/// Result of splitting a projection into Vortex expressions and leftover DataFusion projections.
 pub struct ProcessedProjection {
     pub scan_projection: Expression,
     pub leftover_projection: ProjectionExprs,
 }
 
-/// Tries to convert the expressions into a vortex conjunction. Will return Ok(None) iff the input conjunction is empty.
+/// Tries to convert the expressions into a vortex conjunction. Will return `None` iff the input conjunction is empty.
 pub(crate) fn make_vortex_predicate(
     expr_convertor: &dyn ExpressionConvertor,
     predicate: &[Arc<dyn PhysicalExpr>],
-) -> DFResult<Option<Expression>> {
+) -> Option<Expression> {
     let exprs: Vec<_> = predicate
         .iter()
         .filter_map(|e| {
@@ -60,19 +60,27 @@ pub(crate) fn make_vortex_predicate(
         })
         .collect();
 
-    Ok(and_collect(exprs))
+    and_collect(exprs)
 }
 
-/// Trait for converting `DataFusion` expressions to Vortex ones.
+/// Trait for converting DataFusion expressions to Vortex ones.
 pub trait ExpressionConvertor: Send + Sync {
     /// Can an expression be pushed down given a specific schema
     fn can_be_pushed_down(&self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool;
 
-    /// Try and convert a `DataFusion` [`PhysicalExpr`] into a Vortex [`Expression`].
+    /// Try and convert a DataFusion [`PhysicalExpr`] into a Vortex [`Expression`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the expression cannot be represented as a Vortex expression.
     fn convert(&self, expr: &dyn PhysicalExpr) -> DFResult<Expression>;
 
     /// Split a projection into Vortex expressions that can be pushed down and leftover
-    /// `DataFusion` projections that need to be evaluated after the scan.
+    /// DataFusion projections that need to be evaluated after the scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the projected expressions cannot be converted or mapped to the schemas.
     fn split_projection(
         &self,
         source_projection: ProjectionExprs,
@@ -82,6 +90,10 @@ pub trait ExpressionConvertor: Send + Sync {
 
     /// Create a projection that reads only the required columns without pushing down
     /// any expressions. All projection logic is applied after the scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the projection cannot be mapped to the input schema.
     fn no_pushdown_projection(
         &self,
         source_projection: ProjectionExprs,
@@ -112,7 +124,7 @@ pub trait ExpressionConvertor: Send + Sync {
 pub struct DefaultExpressionConvertor {}
 
 impl DefaultExpressionConvertor {
-    /// Attempts to convert a `DataFusion` `ScalarFunctionExpr` to a Vortex expression.
+    /// Attempts to convert a DataFusion ScalarFunctionExpr to a Vortex expression.
     fn try_convert_scalar_function(&self, scalar_fn: &ScalarFunctionExpr) -> DFResult<Expression> {
         if let Some(get_field_fn) = ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn)
         {
@@ -191,7 +203,7 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
         if let Some(binary_expr) = df.as_any().downcast_ref::<df_expr::BinaryExpr>() {
             let left = self.convert(binary_expr.left().as_ref())?;
             let right = self.convert(binary_expr.right().as_ref())?;
-            let operator = try_operator_from_df(binary_expr.op())?;
+            let operator = try_operator_from_df(*binary_expr.op())?;
 
             return Ok(Binary.new_expr(operator, [left, right]));
         }
@@ -361,7 +373,7 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
     }
 }
 
-fn try_operator_from_df(value: &DFOperator) -> DFResult<Operator> {
+fn try_operator_from_df(value: DFOperator) -> DFResult<Operator> {
     match value {
         DFOperator::Eq => Ok(Operator::Eq),
         DFOperator::NotEq => Ok(Operator::NotEq),
@@ -464,8 +476,8 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
     }
 }
 
-/// Checks if an expression type is one that `convert()` can handle.
-/// This is less restrictive than `can_be_pushed_down` since it only checks
+/// Checks if an expression type is one that convert() can handle.
+/// This is less restrictive than can_be_pushed_down since it only checks
 /// expression types, not data type support.
 fn is_convertible_expr(df_expr: &Arc<dyn PhysicalExpr>) -> bool {
     let expr = df_expr.as_any();
@@ -490,7 +502,7 @@ fn is_convertible_expr(df_expr: &Arc<dyn PhysicalExpr>) -> bool {
 }
 
 fn can_binary_be_pushed_down(binary: &df_expr::BinaryExpr, schema: &Schema) -> bool {
-    let is_op_supported = try_operator_from_df(binary.op()).is_ok();
+    let is_op_supported = try_operator_from_df(*binary.op()).is_ok();
     is_op_supported
         && can_be_pushed_down_impl(binary.left(), schema)
         && can_be_pushed_down_impl(binary.right(), schema)
@@ -543,7 +555,7 @@ fn can_case_be_pushed_down(case_expr: &df_expr::CaseExpr, schema: &Schema) -> bo
 }
 
 fn supported_data_types(dt: &DataType) -> bool {
-    use DataType::{Dictionary, Boolean, Utf8, LargeUtf8, Utf8View, Binary, LargeBinary, BinaryView, Date32, Date64, Timestamp, Time32, Time64};
+    use DataType::*;
 
     // For dictionary types, check if the value type is supported.
     if let Dictionary(_, value_type) = dt {
@@ -576,7 +588,7 @@ fn supported_data_types(dt: &DataType) -> bool {
 }
 
 /// Checks if a scalar function can be pushed down.
-/// Currently only `GetFieldFunc` is supported, and its arguments must also be pushable.
+/// Currently only GetFieldFunc is supported, and its arguments must also be pushable.
 fn can_scalar_fn_be_pushed_down(scalar_fn: &ScalarFunctionExpr, schema: &Schema) -> bool {
     ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn).is_some()
         && scalar_fn
@@ -637,7 +649,7 @@ mod tests {
     #[test]
     fn test_make_vortex_predicate_empty() {
         let expr_convertor = DefaultExpressionConvertor::default();
-        let result = make_vortex_predicate(&expr_convertor, &[]).unwrap();
+        let result = make_vortex_predicate(&expr_convertor, &[]);
         assert!(result.is_none());
     }
 
@@ -645,7 +657,7 @@ mod tests {
     fn test_make_vortex_predicate_single() {
         let expr_convertor = DefaultExpressionConvertor::default();
         let col_expr = Arc::new(df_expr::Column::new("test", 0)) as Arc<dyn PhysicalExpr>;
-        let result = make_vortex_predicate(&expr_convertor, &[col_expr]).unwrap();
+        let result = make_vortex_predicate(&expr_convertor, &[col_expr]);
         assert!(result.is_some());
     }
 
@@ -654,7 +666,7 @@ mod tests {
         let expr_convertor = DefaultExpressionConvertor::default();
         let col1 = Arc::new(df_expr::Column::new("col1", 0)) as Arc<dyn PhysicalExpr>;
         let col2 = Arc::new(df_expr::Column::new("col2", 1)) as Arc<dyn PhysicalExpr>;
-        let result = make_vortex_predicate(&expr_convertor, &[col1, col2]).unwrap();
+        let result = make_vortex_predicate(&expr_convertor, &[col1, col2]);
         assert!(result.is_some());
         // Result should be an AND expression combining the two columns
     }
@@ -676,7 +688,7 @@ mod tests {
         #[case] df_op: DFOperator,
         #[case] expected_vortex_op: Operator,
     ) {
-        let result = try_operator_from_df(&df_op).unwrap();
+        let result = try_operator_from_df(df_op).expect("supported operator converts");
         assert_eq!(result, expected_vortex_op);
     }
 
@@ -686,7 +698,7 @@ mod tests {
     #[case::regex_match(DFOperator::RegexMatch)]
     #[case::like_match(DFOperator::LikeMatch)]
     fn test_operator_conversion_unsupported(#[case] df_op: DFOperator) {
-        let result = try_operator_from_df(&df_op);
+        let result = try_operator_from_df(df_op);
         assert!(result.is_err());
         assert!(
             result
