@@ -55,6 +55,9 @@ use super::{
 };
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
+use crate::dataaccelerator::storage::{
+    ResolvedAccelerationStorage, resolve_acceleration_storage_async,
+};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
@@ -466,11 +469,57 @@ impl CayenneAccelerator {
     /// Parse Vortex encoding configuration from acceleration parameters.
     /// This allows fine-grained control over which SIMD-optimized encodings to use.
     ///
-    fn get_vortex_config(
+    async fn get_vortex_config(
         table_name: &str,
         source: &dyn AccelerationSource,
     ) -> cayenne::metadata::VortexConfig {
         let mut config = cayenne::metadata::VortexConfig::default();
+
+        // Storage-aware default for target Vortex file size on local disk.
+        // Smaller files reduce write amplification on EBS-class network
+        // storage; larger files improve scan throughput on tmpfs / RAM-backed
+        // mounts. Skip for S3 (cayenne_file_path/s3:// or s3_zone_ids) where
+        // we always use the engine default; the network-attached object
+        // store doesn't benefit from local mount classification.
+        if let Some(acceleration) = source.acceleration() {
+            let is_s3 = acceleration
+                .params
+                .get("cayenne_s3_zone_ids")
+                .is_some_and(|v| !v.trim().is_empty())
+                || acceleration
+                    .params
+                    .get("cayenne_file_path")
+                    .is_some_and(|p| p.starts_with("s3://"));
+            let user_set_file_size = acceleration
+                .params
+                .contains_key("cayenne_target_file_size_mb");
+
+            if !is_s3
+                && !user_set_file_size
+                && let Ok(data_dir) = CayenneAccelerator::new().cayenne_data_dir(source)
+            {
+                let storage =
+                    resolve_acceleration_storage_async(acceleration.storage_profile, &data_dir)
+                        .await;
+                let storage_default = match storage {
+                    ResolvedAccelerationStorage::Ebs => Some(256_usize),
+                    ResolvedAccelerationStorage::Tmpfs => Some(64_usize),
+                    ResolvedAccelerationStorage::LocalSsd
+                    | ResolvedAccelerationStorage::Unknown => None,
+                };
+                if let Some(size_mb) = storage_default {
+                    tracing::debug!(
+                        target: "spiced::acceleration::cayenne",
+                        table = %table_name,
+                        configured = %acceleration.storage_profile,
+                        resolved = ?storage,
+                        target_file_size_mb = size_mb,
+                        "Applying storage-aware default cayenne_target_file_size_mb"
+                    );
+                    config.target_vortex_file_size_mb = size_mb;
+                }
+            }
+        }
 
         if let Some(acceleration) = source.acceleration() {
             apply_refresh_mode_defaults(&mut config, acceleration);
@@ -823,7 +872,7 @@ impl CayenneAccelerator {
 
         // Check if using S3 Express One Zone storage
         let is_s3_express = s3::is_s3_express_data_path(source);
-        let vortex_config = Self::get_vortex_config(table_name, source);
+        let vortex_config = Self::get_vortex_config(table_name, source).await;
 
         // Build S3 object store if using S3 Express One Zone storage
         let object_store =
@@ -1556,7 +1605,7 @@ impl DataAccelerator for CayenneAccelerator {
             // Create partition creator
             let unsupported_type_action = Self::get_unsupported_type_action(source);
             let is_s3_express = s3::is_s3_express_data_path(source);
-            let vortex_config = Self::get_vortex_config(&table_name, source);
+            let vortex_config = Self::get_vortex_config(&table_name, source).await;
 
             // Log S3 Express configuration for partitioned tables
             if is_s3_express {
@@ -2525,8 +2574,8 @@ mod tests {
             ..Default::default()
         });
 
-        let hot = CayenneAccelerator::get_vortex_config("hot", &hot_dataset);
-        let quiet = CayenneAccelerator::get_vortex_config("quiet", &quiet_dataset);
+        let hot = CayenneAccelerator::get_vortex_config("hot", &hot_dataset).await;
+        let quiet = CayenneAccelerator::get_vortex_config("quiet", &quiet_dataset).await;
 
         assert_eq!(hot.write_concurrency, Some(16));
         assert_eq!(quiet.write_concurrency, Some(2));
@@ -2746,7 +2795,7 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset);
+        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset).await;
 
         assert_eq!(config.inline_max_rows, 123);
         assert_eq!(config.inline_max_bytes, 262_144);

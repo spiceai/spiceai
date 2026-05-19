@@ -59,6 +59,7 @@ use crate::{
     dataaccelerator::{
         FilePathError,
         snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
+        storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
     },
     datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
@@ -324,22 +325,80 @@ impl TursoAccelerator {
 
         let mut pools = self.pools.lock().await;
         if let Some(pool) = pools.get(&turso_file) {
-            Ok(Arc::clone(pool))
-        } else {
-            let pool = Arc::new(
-                TursoConnectionPool::new_with_timestamp_format(&turso_file, timestamp_format)
-                    .await
-                    .map_err(|e| match e {
-                        data_components::turso::Error::TursoDatabaseError { source } => {
-                            Error::TursoDatabaseError { source }
-                        }
-                        _ => Error::AccelerationCreationFailed {
-                            source: Box::new(e),
-                        },
-                    })?,
+            return Ok(Arc::clone(pool));
+        }
+
+        // Resolve storage profile so we can tune per-storage pragmas. Skip
+        // detection for in-memory databases; they have no on-disk footprint.
+        let storage = if source.is_file_accelerated() {
+            let configured = source
+                .acceleration()
+                .map(|a| a.storage_profile)
+                .unwrap_or_default();
+            let resolved = resolve_acceleration_storage_async(configured, &turso_file).await;
+            tracing::debug!(
+                target: "spiced::acceleration::turso",
+                configured = %configured,
+                resolved = ?resolved,
+                file = %turso_file,
+                "Resolved acceleration storage profile for Turso pool"
             );
-            pools.insert(turso_file, Arc::clone(&pool));
-            Ok(pool)
+            resolved
+        } else {
+            ResolvedAccelerationStorage::Unknown
+        };
+
+        let pool = Arc::new(
+            TursoConnectionPool::new_with_timestamp_format(&turso_file, timestamp_format)
+                .await
+                .map_err(|e| match e {
+                    data_components::turso::Error::TursoDatabaseError { source } => {
+                        Error::TursoDatabaseError { source }
+                    }
+                    _ => Error::AccelerationCreationFailed {
+                        source: Box::new(e),
+                    },
+                })?,
+        );
+
+        // Apply storage-aware pragmas after the pool's own MVCC initialization.
+        let pragmas = Self::storage_setup_pragmas(storage);
+        if !pragmas.is_empty() {
+            let conn = pool.connect().await.map_err(|e| match e {
+                data_components::turso::Error::TursoDatabaseError { source } => {
+                    Error::TursoDatabaseError { source }
+                }
+                _ => Error::AccelerationCreationFailed {
+                    source: Box::new(e),
+                },
+            })?;
+            for (name, value) in pragmas {
+                conn.pragma_update(name, value)
+                    .await
+                    .context(TursoDatabaseSnafu)?;
+            }
+        }
+
+        pools.insert(turso_file, Arc::clone(&pool));
+        Ok(pool)
+    }
+
+    /// Per-storage SQLite/Turso pragma overrides applied after pool creation.
+    ///
+    /// On EBS-class network-attached storage we bump the page cache and enable
+    /// mmap to absorb random I/O latency. Local SSD, tmpfs, and unknown
+    /// storage keep the engine defaults.
+    fn storage_setup_pragmas(
+        storage: ResolvedAccelerationStorage,
+    ) -> &'static [(&'static str, &'static str)] {
+        match storage {
+            // 200_000 KiB is about a 200 MiB page cache, plus a 256 MiB mmap window.
+            ResolvedAccelerationStorage::Ebs => {
+                &[("cache_size", "-200000"), ("mmap_size", "268435456")]
+            }
+            ResolvedAccelerationStorage::LocalSsd
+            | ResolvedAccelerationStorage::Tmpfs
+            | ResolvedAccelerationStorage::Unknown => &[],
         }
     }
 }
