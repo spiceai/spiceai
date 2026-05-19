@@ -393,15 +393,20 @@ impl<'a> AppendMutationWriter<'a> {
             (rows, stats_acc, validated_keys)
         };
 
-        let retention_deleted_rows = self.apply_retention_if_configured().await?;
+        let retention_requested = self.table.has_retention_delete_filters();
 
         self.table.schedule_post_write_maintenance(
             Some(write_stats_acc),
-            needs_new_snapshot
-                || should_refresh_listing_table_after_post_write(retention_deleted_rows),
+            needs_new_snapshot,
+            retention_requested,
         );
 
-        if retention_deleted_rows > 0 {
+        if retention_requested {
+            // Retention runs asynchronously after this write returns; its delete
+            // outcome is not yet known. Clearing the cache is the conservative
+            // path — any subsequent insert pays one fresh disk-scan to rebuild
+            // (vs the existing pre-fix logic, which read the inline delete
+            // count and cleared only when retention had actually deleted rows).
             self.table.clear_cached_pk_keyset();
         } else {
             self.table.record_file_pk_keys(&validated_keys);
@@ -515,7 +520,7 @@ impl<'a> AppendMutationWriter<'a> {
                 }
 
                 self.table
-                    .schedule_post_write_maintenance(Some(Arc::new(stats_acc)), false);
+                    .schedule_post_write_maintenance(Some(Arc::new(stats_acc)), false, false);
 
                 self.table
                     .schedule_inline_checkpoint_if_memtable_pressure_exceeded();
@@ -664,30 +669,6 @@ impl<'a> AppendMutationWriter<'a> {
         Ok((rows, writer_ops, stats_acc, prepared_append))
     }
 
-    async fn apply_retention_if_configured(&self) -> Result<u64> {
-        if !self.table.has_retention_delete_filters() {
-            return Ok(0);
-        }
-
-        let deleted = self.table.apply_retention_filters().await?;
-        if deleted > 0 {
-            tracing::info!(
-                "Retention filters deleted {} row(s) for table {}",
-                deleted,
-                self.table.table_name()
-            );
-        } else {
-            tracing::debug!(
-                "Retention filters found no rows to delete for table {}",
-                self.table.table_name()
-            );
-        }
-        Ok(deleted)
-    }
-}
-
-fn should_refresh_listing_table_after_post_write(retention_deleted_rows: u64) -> bool {
-    retention_deleted_rows > 0
 }
 
 #[cfg(test)]
@@ -766,9 +747,4 @@ mod tests {
         assert!(!buffer.should_continue_buffering());
     }
 
-    #[test]
-    fn refresh_listing_table_only_when_post_write_steps_changed_files() {
-        assert!(!should_refresh_listing_table_after_post_write(0));
-        assert!(should_refresh_listing_table_after_post_write(1));
-    }
 }

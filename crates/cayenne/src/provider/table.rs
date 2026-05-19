@@ -278,11 +278,14 @@ fn approx_pk_keyset_entry_bytes(key: &OwnedRow) -> usize {
 struct PostWriteMaintenanceState {
     stats: Option<Arc<ColumnStatsAccumulator>>,
     refresh_listing: bool,
+    /// Set when the writer wants retention filters applied. Coalesces — multiple
+    /// writes scheduling retention collapse to one scan per debounce window.
+    retention_requested: bool,
 }
 
 impl PostWriteMaintenanceState {
     fn is_empty(&self) -> bool {
-        self.stats.is_none() && !self.refresh_listing
+        self.stats.is_none() && !self.refresh_listing && !self.retention_requested
     }
 }
 
@@ -392,8 +395,11 @@ impl CayenneCdcWrite {
             let rows = prepared_append.finish().await?;
             record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
             self.table.record_file_pk_keys(&self.validated_file_keys);
-            self.table
-                .schedule_post_write_maintenance(self.stats, false);
+            self.table.schedule_post_write_maintenance(
+                self.stats,
+                false,
+                self.table.has_retention_delete_filters(),
+            );
             Ok(rows)
         } else {
             Ok(self.rows)
@@ -5141,8 +5147,9 @@ impl CayenneTableProvider {
         &self,
         stats: Option<Arc<ColumnStatsAccumulator>>,
         refresh_listing: bool,
+        retention_requested: bool,
     ) {
-        if stats.is_none() && !refresh_listing {
+        if stats.is_none() && !refresh_listing && !retention_requested {
             return;
         }
 
@@ -5156,6 +5163,7 @@ impl CayenneTableProvider {
                 }
             }
             maintenance_state.refresh_listing |= refresh_listing;
+            maintenance_state.retention_requested |= retention_requested;
         }
 
         if self
@@ -5172,6 +5180,83 @@ impl CayenneTableProvider {
         });
     }
 
+    /// Synchronously drain any pending post-write maintenance.
+    ///
+    /// Public for two callers:
+    ///   1. Tests that assert on the post-retention state (where retention is
+    ///      scheduled asynchronously via [`Self::schedule_post_write_maintenance`]
+    ///      and runs after a 100 ms debounce by default).
+    ///   2. Coordinated shutdown — callers that want to make sure no scheduled
+    ///      retention is lost when the table is dropped.
+    ///
+    /// Runs whatever the background loop would have run, then returns.
+    pub async fn flush_pending_maintenance(&self) {
+        loop {
+            let state = {
+                let mut guard = self.post_write_maintenance.state.lock();
+                std::mem::take(&mut *guard)
+            };
+            if state.is_empty() {
+                return;
+            }
+            self.run_maintenance_state(state).await;
+        }
+    }
+
+    /// Apply one snapshot of accumulated maintenance state.
+    ///
+    /// Extracted from [`Self::run_post_write_maintenance_loop`] so
+    /// [`Self::flush_pending_maintenance`] can reuse the same work.
+    async fn run_maintenance_state(&self, state: PostWriteMaintenanceState) {
+        if state.refresh_listing
+            && let Err(e) = self.refresh_listing_table().await
+        {
+            tracing::warn!(
+                table = self.table_metadata.table_name.as_str(),
+                "Post-write listing refresh failed: {e}"
+            );
+        }
+
+        let had_stats = state.stats.is_some();
+        if let Some(stats) = state.stats {
+            self.persist_table_stats(&stats).await;
+        }
+
+        let mut retention_deleted = 0_u64;
+        if state.retention_requested {
+            match self.apply_retention_filters().await {
+                Ok(deleted) => {
+                    retention_deleted = deleted;
+                    if deleted > 0 {
+                        tracing::info!(
+                            table = self.table_metadata.table_name.as_str(),
+                            "Background retention deleted {deleted} row(s)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        table = self.table_metadata.table_name.as_str(),
+                        "Background retention scan failed: {e}"
+                    );
+                }
+            }
+        }
+
+        if retention_deleted > 0
+            && let Err(e) = self.refresh_listing_table().await
+        {
+            tracing::warn!(
+                table = self.table_metadata.table_name.as_str(),
+                "Listing refresh after retention failed: {e}"
+            );
+        }
+
+        if state.refresh_listing || had_stats || retention_deleted > 0 {
+            self.schedule_post_write_compaction();
+        }
+    }
+
     async fn run_post_write_maintenance_loop(self) {
         loop {
             tokio::time::sleep(POST_WRITE_MAINTENANCE_DEBOUNCE).await;
@@ -5181,23 +5266,7 @@ impl CayenneTableProvider {
                 std::mem::take(&mut *guard)
             };
 
-            if state.refresh_listing
-                && let Err(e) = self.refresh_listing_table().await
-            {
-                tracing::warn!(
-                    table = self.table_metadata.table_name.as_str(),
-                    "Post-write listing refresh failed: {e}"
-                );
-            }
-
-            let had_stats = state.stats.is_some();
-            if let Some(stats) = state.stats {
-                self.persist_table_stats(&stats).await;
-            }
-
-            if state.refresh_listing || had_stats {
-                self.schedule_post_write_compaction();
-            }
+            self.run_maintenance_state(state).await;
 
             self.post_write_maintenance
                 .scheduled
