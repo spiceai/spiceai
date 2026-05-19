@@ -38,7 +38,10 @@ use cayenne::optimizer_rules::{
     CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneOptimizerConfig,
 };
 #[cfg(not(windows))]
-use cayenne::{CayenneTableProvider, logical_optimizer::CayennePropagateFilterAcrossEquiJoinKeys};
+use cayenne::{
+    CayenneTableProvider,
+    logical_optimizer::{CayenneInListToRangeRewrite, CayennePropagateFilterAcrossEquiJoinKeys},
+};
 #[cfg(not(windows))]
 use data_components::poly::PolyTableProvider;
 #[cfg(not(windows))]
@@ -668,30 +671,42 @@ fn with_cayenne_logical_optimizer(mut state: SessionStateBuilder) -> SessionStat
 
 #[cfg(not(windows))]
 fn insert_cayenne_logical_optimizer_rule(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
-    if rules
+    if !rules
         .iter()
         .any(|rule| rule.name() == "cayenne_propagate_filter_across_equi_join_keys")
     {
-        return;
+        let insert_at = rules
+            .iter()
+            .position(|rule| rule.name() == "decorrelate_predicate_subquery")
+            .unwrap_or_else(|| {
+                rules
+                    .iter()
+                    .position(|rule| rule.name() == "push_down_filter")
+                    .unwrap_or(rules.len())
+            });
+        rules.insert(
+            insert_at,
+            Arc::new(
+                CayennePropagateFilterAcrossEquiJoinKeys::new_with_table_provider_predicate(
+                    is_cayenne_accelerated_table_provider,
+                ),
+            ),
+        );
     }
 
-    let insert_at = rules
+    // Run the IN-list → BETWEEN rewrite ahead of `simplify_expressions` so the
+    // downstream simplifier can fold the resulting `Expr::Between` the same way
+    // it folds a SQL-parsed BETWEEN.
+    if !rules
         .iter()
-        .position(|rule| rule.name() == "decorrelate_predicate_subquery")
-        .unwrap_or_else(|| {
-            rules
-                .iter()
-                .position(|rule| rule.name() == "push_down_filter")
-                .unwrap_or(rules.len())
-        });
-    rules.insert(
-        insert_at,
-        Arc::new(
-            CayennePropagateFilterAcrossEquiJoinKeys::new_with_table_provider_predicate(
-                is_cayenne_accelerated_table_provider,
-            ),
-        ),
-    );
+        .any(|rule| rule.name() == "cayenne_inlist_to_range_rewrite")
+    {
+        let insert_at = rules
+            .iter()
+            .position(|rule| rule.name() == "simplify_expressions")
+            .unwrap_or(rules.len());
+        rules.insert(insert_at, Arc::new(CayenneInListToRangeRewrite::new()));
+    }
 }
 
 #[cfg(not(windows))]

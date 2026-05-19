@@ -340,6 +340,65 @@ impl SideAnalysis {
     }
 }
 
+/// Logical optimizer rule that rewrites `column IN (k, k+1, …, k+N-1)` to
+/// `column BETWEEN k AND k+N-1` when the list contents are integer literals
+/// sorted unique and consecutive. BETWEEN is ~50 % faster than IN-list at
+/// per-row predicate evaluation. Running this as a logical-plan rule (rather
+/// than in `TableProvider::scan`) lets DataFusion's downstream simplification
+/// passes treat the result identically to a SQL-parsed `BETWEEN`. See bench
+/// `pk_in_list_vs_range_rewrite`.
+#[derive(Debug, Default)]
+pub struct CayenneInListToRangeRewrite;
+
+impl CayenneInListToRangeRewrite {
+    /// Create a new instance of the rule.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl OptimizerRule for CayenneInListToRangeRewrite {
+    fn name(&self) -> &'static str {
+        "cayenne_inlist_to_range_rewrite"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::BottomUp)
+    }
+
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>, DataFusionError> {
+        let LogicalPlan::Filter(filter) = plan else {
+            return Ok(Transformed::no(plan));
+        };
+        let original = filter.predicate.clone();
+        let rewritten = original
+            .clone()
+            .transform_up(|expr| {
+                let after = crate::provider::table::rewrite_consecutive_inlist_to_range(expr.clone());
+                if after == expr {
+                    Ok(Transformed::no(expr))
+                } else {
+                    Ok(Transformed::yes(after))
+                }
+            })?
+            .data;
+        if rewritten == original {
+            return Ok(Transformed::no(LogicalPlan::Filter(filter)));
+        }
+        let new_filter = Filter::try_new(rewritten, filter.input)?;
+        Ok(Transformed::yes(LogicalPlan::Filter(new_filter)))
+    }
+}
+
 fn column_expr(column: &Column) -> Expr {
     Expr::Column(column.clone())
 }

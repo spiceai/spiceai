@@ -7796,12 +7796,12 @@ fn is_literal_like(expr: &Expr) -> bool {
 }
 
 /// If `expr` is an `InList` of integer literals over consecutive values, rewrite
-/// to `col >= min AND col <= max`. BETWEEN is ~50 % faster than IN-list at the
+/// to `col BETWEEN min AND max`. BETWEEN is ~50 % faster than IN-list at the
 /// per-row predicate evaluation level (two `i64` comparisons vs an N-element
 /// `HashSet` membership probe) and is semantically equivalent. See
 /// `pk_in_list_vs_range_rewrite` bench. Non-rewritable inputs (negated list,
 /// non-integer literals, sparse values, single element) are returned unchanged.
-fn rewrite_consecutive_inlist_to_range(expr: Expr) -> Expr {
+pub(crate) fn rewrite_consecutive_inlist_to_range(expr: Expr) -> Expr {
     let Expr::InList(in_list) = &expr else {
         return expr;
     };
