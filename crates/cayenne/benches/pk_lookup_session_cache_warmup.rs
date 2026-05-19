@@ -88,10 +88,7 @@ async fn load_cayenne(rows: usize) -> CayenneFixture {
 
 /// Build a fresh `SessionContext` and run one query — the **cold-cache**
 /// path the existing `common::cayenne_query` takes.
-async fn cold_session_query(
-    table: &Arc<CayenneTableProvider>,
-    sql: &str,
-) -> Vec<RecordBatch> {
+async fn cold_session_query(table: &Arc<CayenneTableProvider>, sql: &str) -> Vec<RecordBatch> {
     let ctx = SessionContext::new();
     ctx.register_table("t", Arc::clone(table) as Arc<dyn TableProvider>)
         .expect("register table");

@@ -110,27 +110,21 @@ fn bench_in_list_vs_range(c: &mut Criterion) {
         // Consecutive IN-list: matches BETWEEN exactly. The rewrite candidate.
         let consecutive_keys: Vec<String> = (lo..=hi_inclusive).map(|i| i.to_string()).collect();
         let consecutive_in_list = consecutive_keys.join(",");
-        let consecutive_sql = format!(
-            "SELECT SUM(value) FROM t WHERE id IN ({consecutive_in_list})"
-        );
+        let consecutive_sql =
+            format!("SELECT SUM(value) FROM t WHERE id IN ({consecutive_in_list})");
 
         // Equivalent range — the post-rewrite shape.
-        let range_sql = format!(
-            "SELECT SUM(value) FROM t WHERE id BETWEEN {lo} AND {hi_inclusive}"
-        );
+        let range_sql =
+            format!("SELECT SUM(value) FROM t WHERE id BETWEEN {lo} AND {hi_inclusive}");
 
         // Sparse IN-list with the same 32 keys spread over a wide range.
         // Same result-row count is not the goal here — what matters is the
         // per-row evaluation cost shape. We use one key from each of 32
         // chunks across the table's id space so the pruner cannot collapse.
         let stride = (rows as i64 / KEY_BATCH).max(1);
-        let sparse_keys: Vec<String> = (0..KEY_BATCH)
-            .map(|i| (i * stride).to_string())
-            .collect();
+        let sparse_keys: Vec<String> = (0..KEY_BATCH).map(|i| (i * stride).to_string()).collect();
         let sparse_in_list = sparse_keys.join(",");
-        let sparse_sql = format!(
-            "SELECT SUM(value) FROM t WHERE id IN ({sparse_in_list})"
-        );
+        let sparse_sql = format!("SELECT SUM(value) FROM t WHERE id IN ({sparse_in_list})");
 
         let cf = Arc::clone(&fixture);
         let s = consecutive_sql.clone();

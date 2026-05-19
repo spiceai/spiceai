@@ -2603,7 +2603,7 @@ mod tests {
                 ..Default::default()
             });
 
-            let config = CayenneAccelerator::get_vortex_config(table_name, &dataset);
+            let config = CayenneAccelerator::get_vortex_config(table_name, &dataset).await;
 
             assert_eq!(
                 config.compaction_trigger_files,
@@ -2655,7 +2655,7 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("append_hot", &dataset);
+        let config = CayenneAccelerator::get_vortex_config("append_hot", &dataset).await;
 
         assert_eq!(
             config.compaction_trigger_files,
@@ -2696,7 +2696,7 @@ mod tests {
                 ..Default::default()
             });
 
-            let config = CayenneAccelerator::get_vortex_config(table_name, &dataset);
+            let config = CayenneAccelerator::get_vortex_config(table_name, &dataset).await;
 
             assert_eq!(config.inline_max_rows, 0);
             assert_eq!(config.inline_max_bytes, 0);
@@ -2732,7 +2732,7 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("append_batch_load", &dataset);
+        let config = CayenneAccelerator::get_vortex_config("append_batch_load", &dataset).await;
 
         assert_eq!(config.inline_max_rows, 0);
         assert_eq!(config.inline_max_bytes, 0);
@@ -2832,7 +2832,8 @@ mod tests {
         });
 
         let small_write_config =
-            CayenneAccelerator::get_vortex_config("cdc_partial_override", &small_write_dataset);
+            CayenneAccelerator::get_vortex_config("cdc_partial_override", &small_write_dataset)
+                .await;
 
         assert_eq!(small_write_config.inline_max_rows, 321);
         assert_eq!(
@@ -2862,7 +2863,8 @@ mod tests {
         });
 
         let large_write_config =
-            CayenneAccelerator::get_vortex_config("full_partial_override", &large_write_dataset);
+            CayenneAccelerator::get_vortex_config("full_partial_override", &large_write_dataset)
+                .await;
 
         assert_eq!(large_write_config.inline_max_rows, 321);
         assert_eq!(large_write_config.inline_max_bytes, 0);
@@ -2911,7 +2913,7 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("compact", &dataset);
+        let config = CayenneAccelerator::get_vortex_config("compact", &dataset).await;
 
         assert_eq!(config.compaction_trigger_files, 12);
         assert_eq!(config.compaction_trigger_protected_snapshots, 9);
