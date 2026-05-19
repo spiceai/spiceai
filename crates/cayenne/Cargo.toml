@@ -260,3 +260,8 @@ name = "apply_partial_filter_empty_alloc"
 harness = false
 name = "pk_lookup_file_group_fanout"
 required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "pk_lookup_session_cache_warmup"
+required-features = ["duckdb-bench"]
