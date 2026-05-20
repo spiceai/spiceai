@@ -46,6 +46,30 @@ use std::clone::Clone;
 use std::fmt;
 use std::sync::Arc;
 
+/// Returns `true` if casting from `from` to `to` is guaranteed to preserve ordering.
+///
+/// This mirrors the logic in DataFusion's `CastExpr::get_properties()` which treats
+/// temporal→temporal and numeric→numeric casts as order-preserving. These casts are
+/// monotonic transformations (scaling by a positive constant or lossless widening),
+/// so sorted input produces sorted output.
+fn is_order_preserving_cast(from: &DataType, to: &DataType) -> bool {
+    if from == to {
+        return true;
+    }
+    // Temporal → temporal: timestamp unit conversions (µs↔ns↔ms↔s), Date32↔Date64, etc.
+    // All are monotonic (multiply/divide by positive constant).
+    if from.is_temporal() && to.is_temporal() {
+        return true;
+    }
+    // Numeric → numeric: integer widening (Int8→Int16→Int32→Int64), unsigned widening,
+    // Float32→Float64, integer→float where exactly representable.
+    // All preserve ordering (value-preserving or monotonic widening).
+    if from.is_numeric() && to.is_numeric() {
+        return true;
+    }
+    false
+}
+
 pub struct SchemaCastScanExec {
     input: Arc<dyn ExecutionPlan>,
     /// The target schema requested by the caller
@@ -104,7 +128,10 @@ impl SchemaCastScanExec {
                     }
                     let col_name = input_schema.field(input_idx).name();
                     let (output_idx, output_field) = output_schema.column_with_name(col_name)?;
-                    if input_schema.field(input_idx).data_type() != output_field.data_type() {
+                    if !is_order_preserving_cast(
+                        input_schema.field(input_idx).data_type(),
+                        output_field.data_type(),
+                    ) {
                         return None;
                     }
                     Some(PhysicalSortExpr {
@@ -192,7 +219,15 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true; self.children().len()]
+        let input_schema = self.input.schema();
+        let any_non_monotonic = self.output_schema.fields().iter().any(|output_field| {
+            input_schema
+                .field_with_name(output_field.name())
+                .is_ok_and(|input_field| {
+                    !is_order_preserving_cast(input_field.data_type(), output_field.data_type())
+                })
+        });
+        vec![!any_non_monotonic; self.children().len()]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
