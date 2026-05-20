@@ -40,15 +40,18 @@ const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXI
 /// for N > K callers share proportionally, reducing the per-table wait from
 /// O(N·RTT) to O(⌈N/K⌉·RTT).
 ///
-/// Pool size is `min(available_parallelism, 32)` (minimum 2). SQLite WAL mode
-/// allows many concurrent readers per database file (read-only operations
-/// don't take the WAL write lock), so a larger pool lifts the read-side
-/// concurrency ceiling for metadata-heavy workloads — e.g. 64-core deployments
-/// running concurrent scans against many tables, where every scan pays one or
-/// more metastore reads (table metadata, snapshot file lists, deletion-vector
-/// loads, stats lookups). Writes still serialize at the WAL layer regardless
-/// of pool size; this is fine because writes are O(commits-per-second) while
-/// reads are O(queries-per-second × per-query-metadata-fanout).
+/// Pool size is `min(available_parallelism, 32)` (minimum 2). If
+/// `available_parallelism()` fails (rare — e.g. seccomp-restricted
+/// environments), K falls back to 4. SQLite WAL mode allows many
+/// concurrent readers per database file (read-only operations don't take
+/// the WAL write lock), so a larger pool lifts the read-side concurrency
+/// ceiling for metadata-heavy workloads — e.g. 64-core deployments running
+/// concurrent scans against many tables, where every scan pays one or more
+/// metastore reads (table metadata, snapshot file lists, deletion-vector
+/// loads, stats lookups). Writes still serialize at the WAL layer
+/// regardless of pool size; this is fine because writes are
+/// O(commits-per-second) while reads are
+/// O(queries-per-second × per-query-metadata-fanout).
 struct SqliteConnectionPool {
     conns: Vec<Arc<Mutex<tokio_rusqlite::Connection>>>,
     next: AtomicUsize,
@@ -83,9 +86,12 @@ pub struct SqliteMetastore {
     /// Round-robin pool of K independent connections shared across all
     /// operations (reads, writes, and transactions).
     ///
-    /// K = `min(available_parallelism, 32)` (minimum 2). Lazily initialised
-    /// on first use. `begin_transaction` holds an [`OwnedMutexGuard`] on one
-    /// pool slot for the full transaction lifetime.
+    /// K = `min(available_parallelism, 32)` (or 4 if
+    /// `available_parallelism()` fails, with a minimum of 2 — see the
+    /// [`SqliteConnectionPool`] doc comment for the rationale). Lazily
+    /// initialised on first use. `begin_transaction` holds an
+    /// [`OwnedMutexGuard`] on one pool slot for the full transaction
+    /// lifetime.
     pool: OnceCell<Arc<SqliteConnectionPool>>,
 }
 
