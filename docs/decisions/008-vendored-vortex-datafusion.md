@@ -24,20 +24,20 @@ Related decisions:
 
 1. **Only upstream**: contribute all Cayenne-required changes to upstream `vortex-datafusion` and wait to consume them after release. This keeps long-term ownership clean, but blocks Cayenne on external review/release timing and on upstream's DataFusion target matching Spice's fork.
 2. **Fork the Vortex repository**: keep `vortex-datafusion` in a Spice fork and point Cargo at the forked crate. This makes upstream comparison easier than vendoring, but still couples every Spice-specific iteration to a separate repository and keeps the integration boundary outside the Spice workspace.
-3. **Vendor the crate internally**: copy `vortex-datafusion` into the Spice workspace and make Cayenne depend on the local package. This gives Cayenne immediate control over DataFusion compatibility, deletion semantics, and performance work, at the cost of owning the downstream merge burden.
+3. **Vendor the crate internally**: copy `vortex-datafusion` into the Spice workspace and make Cayenne depend on the local package. This gives Cayenne immediate control over DataFusion compatibility, deletion semantics, and performance work. This option intentionally makes the adapter a Spice-owned implementation rather than a long-term mirror of upstream `vortex-datafusion`.
 
 ## Design Principles
 
 * **Data correctness is non-negotiable**: Cayenne queries must return exact results even when files have external position deletes. Statistics, predicate pushdown, and projection handling must preserve SQL semantics.
 * **Developer experience first**: Cayenne users should not need to configure or wire deletion handling, segment caching, or footer caching. The vendored adapter exposes Spice-shaped defaults.
 * **Spice-aligned engineering rules**: Vendored code follows Spice's error handling, logging, async, and lint policies even when upstream code does not.
-* **Minimize divergence**: Keep the crate close enough to upstream that future upstreaming or migration is feasible.
+* **Own the specialization**: Cayenne's DataFusion integration is specialized enough that Spice should own its Vortex adapter long term. Upstream Vortex remains the storage-format dependency, but the DataFusion adapter is expected to evolve for Spice's correctness, runtime, and performance requirements rather than stay aligned with upstream `vortex-datafusion`.
 * **Extensibility**: Cayenne integrates through public traits (`VortexAccessPlanProvider`, `ExpressionConvertor`) rather than ad-hoc patches.
 * **Industry standards**: Continue to use DataFusion's `FileFormat` / `FileSource` / `FileOpener` extension points and Vortex's public scan/session APIs.
 
 ## Decision
 
-Vendor `vortex-datafusion` into the Spice workspace as the [`crates/vortex`](../../crates/vortex) crate (package name `vortex-datafusion`). Cayenne and the Spice runtime depend on this vendored crate instead of upstream `vortex-datafusion`. The vendored crate remains tracked against the Spice Vortex fork and the Spice DataFusion fork.
+Vendor `vortex-datafusion` into the Spice workspace as the [`crates/vortex`](../../crates/vortex) crate (package name `vortex-datafusion`). Cayenne and the Spice runtime depend on this vendored crate instead of upstream `vortex-datafusion`. The vendored crate remains tracked against the Spice Vortex fork and the Spice DataFusion fork, but there is no intention to keep the adapter aligned with upstream `vortex-datafusion` long term.
 
 The vendored crate carries the following Spice-specific behavior on top of the upstream baseline:
 
@@ -106,14 +106,14 @@ These are surfaced through Cayenne's accelerator configuration (e.g. `cayenne_fo
 ### Negative / Costs
 
 * Spice now owns a non-trivial DataFusion file-format adapter and must keep it building against an evolving Vortex and an evolving DataFusion fork.
-* Divergence from upstream `vortex-datafusion` will accrue over time, which makes future upstreaming (or replacement with an upstream adapter) more expensive.
+* Divergence from upstream `vortex-datafusion` will accrue over time. This is intentional: Spice's adapter is expected to become its own version because Cayenne needs specialized correctness hooks, runtime behavior, and performance controls.
 * Vendoring makes merging upstream Vortex changes back down into Spice harder than tracking a fork or consuming the upstream crate directly, because each upstream update must be reconciled against local workspace changes.
-* Bug fixes and features from upstream `vortex-datafusion` must be manually evaluated and ported.
+* Bug fixes and features from upstream `vortex-datafusion` must be manually evaluated and ported when they are relevant to Spice's adapter.
 
 ### Risks and Mitigations
 
 * **Risk**: Internal divergence makes it harder to track upstream Vortex correctness fixes.
-  * **Mitigation**: Keep module structure aligned with upstream; prefer trait-based extension over invasive edits; review Vortex/DataFusion bumps explicitly when upgrading.
+  * **Mitigation**: Treat upstream fixes as deliberate ports rather than automatic merges; review Vortex/DataFusion bumps explicitly and add regression tests for correctness fixes that matter to Cayenne.
 * **Risk**: A future Vortex/DataFusion upgrade breaks vendored behavior silently.
   * **Mitigation**: Snapshot tests, dynamic-filter and pushdown unit tests, and Cayenne TPC benchmarks (`testoperator run bench`) guard the integration.
 * **Risk**: Wrapper/decorator traits added in either DataFusion or Vortex acquire defaulted no-op behavior that silently breaks vendored hooks.
@@ -121,13 +121,13 @@ These are surfaced through Cayenne's accelerator configuration (e.g. `cayenne_fo
 
 ## Exit Criteria
 
-The vendored crate should be re-evaluated when **all** of the following hold:
+The vendored crate is expected to remain Spice-owned. It should be re-evaluated only if Cayenne's specialization no longer requires a dedicated adapter and **all** of the following hold:
 
 1. Upstream `vortex-datafusion` (or its successor) exposes equivalent extension points for per-file access plans and footer-statistics adjustment.
 2. Upstream's DataFusion target matches the Spice DataFusion fork closely enough that Cayenne can adopt the upstream adapter without reintroducing the data-correctness gaps above.
 3. Upstream's pushdown, schema-adaptation, and dynamic-filter handling either match Cayenne's behavior or are made pluggable.
 
-When those conditions are met, the vendored crate can be replaced with a thin Cayenne-side adapter over upstream `vortex-datafusion`, and this DR superseded.
+When those conditions are met, the vendored crate can be reconsidered. The default path is still to keep a Spice-owned adapter unless upstream can preserve the Cayenne-specific correctness and runtime behavior without carrying Spice-only patches.
 
 ## References
 
