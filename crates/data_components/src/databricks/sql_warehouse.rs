@@ -56,6 +56,7 @@ use util::{
     format_datafusion_error,
 };
 
+use crate::COMMENT_METADATA_KEY;
 #[cfg(test)]
 use crate::resilient_http::configure_client_builder;
 use crate::resilient_http::{
@@ -898,7 +899,7 @@ impl SqlWarehouseApi {
         let escaped_schema = table_schema.replace('\'', "''");
         let escaped_catalog = table_catalog.replace('\'', "''");
         let sql = format!(
-            "SELECT column_name, {data_type_column}, is_nullable FROM information_schema.columns WHERE table_name = '{escaped_table}' AND table_schema = '{escaped_schema}' AND table_catalog = '{escaped_catalog}'"
+            "SELECT c.column_name, c.{data_type_column}, c.is_nullable, c.comment, t.comment FROM information_schema.columns c LEFT JOIN information_schema.tables t ON c.table_catalog = t.table_catalog AND c.table_schema = t.table_schema AND c.table_name = t.table_name WHERE c.table_name = '{escaped_table}' AND c.table_schema = '{escaped_schema}' AND c.table_catalog = '{escaped_catalog}' ORDER BY c.ordinal_position"
         );
         // Databricks SQL Statements API max wait_timeout is 50s.
         // https://docs.databricks.com/api/workspace/statementexecution/executestatement
@@ -1530,6 +1531,7 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
     }
 
     let mut fields = Vec::new();
+    let mut schema_metadata = HashMap::new();
 
     for (i, row) in data_array.iter().enumerate() {
         let row_array = row
@@ -1579,7 +1581,16 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
                 reason: format!("data_array[{i}][2] (is_nullable) is not a string"),
             })?;
 
-        let field: Field = Field::new(col_name, data_type, nullable);
+        if let Some(table_comment) = optional_string(row_array.get(4)) {
+            schema_metadata
+                .entry(COMMENT_METADATA_KEY.to_string())
+                .or_insert_with(|| table_comment.to_string());
+        }
+
+        let field = field_with_optional_comment(
+            Field::new(col_name, data_type, nullable),
+            optional_string(row_array.get(3)),
+        );
 
         fields.push(field);
     }
@@ -1590,7 +1601,7 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
         });
     }
 
-    Ok(Arc::new(Schema::new(fields)))
+    Ok(Arc::new(Schema::new_with_metadata(fields, schema_metadata)))
 }
 
 /// Parses a schema from a `DESCRIBE TABLE` response.
@@ -1666,7 +1677,10 @@ fn schema_from_describe_json(json_value: &Value, dataset_name: &str) -> Result<S
             .map_err(|reason| Error::ParseError { reason })?;
 
         // DESCRIBE TABLE does not report nullability; default to nullable.
-        fields.push(Field::new(col_name, data_type, true));
+        fields.push(field_with_optional_comment(
+            Field::new(col_name, data_type, true),
+            optional_string(row_array.get(2)),
+        ));
     }
 
     if fields.is_empty() {
@@ -1676,6 +1690,24 @@ fn schema_from_describe_json(json_value: &Value, dataset_name: &str) -> Result<S
     }
 
     Ok(Arc::new(Schema::new(fields)))
+}
+
+fn optional_string(value: Option<&Value>) -> Option<&str> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn field_with_optional_comment(field: Field, comment: Option<&str>) -> Field {
+    let Some(comment) = comment else {
+        return field;
+    };
+
+    field.with_metadata(HashMap::from([(
+        COMMENT_METADATA_KEY.to_string(),
+        comment.to_string(),
+    )]))
 }
 
 struct SqlWarehouseConnection {
@@ -1904,6 +1936,54 @@ mod tests {
         assert_eq!(schema.field(2).name(), "amount");
         assert_eq!(schema.field(2).data_type(), &DataType::Float64);
         assert!(!schema.field(2).is_nullable());
+    }
+
+    #[test]
+    fn test_schema_from_json_preserves_comment_metadata() {
+        let response = make_schema_response(&json!([
+            ["id", "int", "NO", "stable identifier", "customer dimension"],
+            [
+                "name",
+                "string",
+                "YES",
+                "display name",
+                "customer dimension"
+            ],
+            ["amount", "double", "NO", "", "customer dimension"]
+        ]));
+
+        let schema = schema_from_json(&response, "test_table").expect("should parse schema");
+
+        assert_eq!(
+            schema
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .map(String::as_str),
+            Some("customer dimension")
+        );
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .map(String::as_str),
+            Some("stable identifier")
+        );
+        assert_eq!(
+            schema
+                .field(1)
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .map(String::as_str),
+            Some("display name")
+        );
+        assert!(
+            schema
+                .field(2)
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .is_none()
+        );
     }
 
     #[test]
@@ -4349,6 +4429,14 @@ mod tests {
 
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .map(String::as_str),
+            Some("primary key")
+        );
         assert!(
             schema.field(0).is_nullable(),
             "DESCRIBE TABLE defaults to nullable"
@@ -4356,10 +4444,25 @@ mod tests {
 
         assert_eq!(schema.field(1).name(), "name");
         assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(
+            schema
+                .field(1)
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .map(String::as_str),
+            Some("user name")
+        );
         assert!(schema.field(1).is_nullable());
 
         assert_eq!(schema.field(2).name(), "amount");
         assert_eq!(schema.field(2).data_type(), &DataType::Float64);
+        assert!(
+            schema
+                .field(2)
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .is_none()
+        );
     }
 
     /// DESCRIBE TABLE with metadata rows (partition info) after a blank separator.

@@ -20,7 +20,9 @@ limitations under the License.
 //! and provides schema/table discovery using the ADBC metadata API.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
-use crate::dataconnector::adbc::{build_db_options, build_join_context, dialect_for_driver};
+use crate::dataconnector::adbc::{
+    build_db_options, build_join_context, dialect_for_driver, enrich_with_bigquery_comments,
+};
 use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
 use adbc_core::options::AdbcVersion;
 use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
@@ -436,8 +438,19 @@ impl AdbcCatalogProvider {
                     async move {
                         let table_ref =
                             TableReference::partial(schema_ref.to_owned(), table_name.clone());
-                        let result: ProviderResult =
-                            table_factory.table_provider(table_ref, dialect).await;
+                        let result: ProviderResult = match table_factory
+                            .table_provider(table_ref.clone(), dialect)
+                            .await
+                        {
+                            Ok(provider) => Ok(enrich_with_bigquery_comments(
+                                &self.driver_name,
+                                &self.pool,
+                                &table_ref,
+                                provider,
+                            )
+                            .await),
+                            Err(error) => Err(error),
+                        };
                         (table_name, result)
                     }
                 }),

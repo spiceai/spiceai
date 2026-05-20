@@ -35,11 +35,11 @@ use datafusion_table_providers::sql::{
     db_connection_pool::DbConnectionPool, sql_provider_datafusion::SqlTable,
 };
 use snowflake_api::SnowflakeApi;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
 use crate::schema_discovery::{NoPermissionsCheck, SchemaProbeResult, discover_schema};
-use crate::{Read, ReadWrite};
+use crate::{COMMENT_METADATA_KEY, Read, ReadWrite};
 
 pub type SnowflakeConnectionPool =
     dyn DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> + Send + Sync;
@@ -151,11 +151,22 @@ async fn probe_snowflake_information_schema(
         "information_schema.columns".to_string()
     };
 
+    let tables_from_clause = if let Some(c) = table_reference.catalog() {
+        let escaped = c.replace('"', "\"\"");
+        format!("\"{escaped}\".information_schema.tables")
+    } else {
+        "information_schema.tables".to_string()
+    };
+
     let sql = format!(
-        "SELECT column_name, data_type, is_nullable, numeric_precision, numeric_scale \
-         FROM {from_clause} \
-         WHERE table_name = '{table}'{schema_filter}{catalog_filter} \
-         ORDER BY ordinal_position"
+        "SELECT c.column_name, c.data_type, c.is_nullable, c.numeric_precision, c.numeric_scale, c.comment, t.comment \
+         FROM {from_clause} c \
+         LEFT JOIN {tables_from_clause} t \
+             ON c.table_catalog = t.table_catalog \
+             AND c.table_schema = t.table_schema \
+             AND c.table_name = t.table_name \
+         WHERE c.table_name = '{table}'{schema_filter}{catalog_filter} \
+         ORDER BY c.ordinal_position"
     );
 
     match api.exec(&sql).await {
@@ -239,7 +250,7 @@ fn is_snowflake_access_denied(msg: &str) -> bool {
 /// Parses the JSON response from `information_schema.columns`.
 ///
 /// Expected columns: `column_name`, `data_type`, `is_nullable`,
-/// `numeric_precision`, `numeric_scale`.
+/// `numeric_precision`, `numeric_scale`, `comment`, `table_comment`.
 fn parse_information_schema_json(
     resp: &serde_json::Value,
     table_name: &str,
@@ -255,6 +266,7 @@ fn parse_information_schema_json(
     }
 
     let mut fields = Vec::new();
+    let mut schema_metadata = HashMap::new();
     for (i, row) in rows.iter().enumerate() {
         let row = row
             .as_array()
@@ -286,10 +298,19 @@ fn parse_information_schema_json(
 
         let data_type = map_snowflake_sql_type(data_type_str, precision, scale);
 
-        fields.push(Field::new(col_name, data_type, is_nullable));
+        if let Some(table_comment) = optional_json_string(row.get(6)) {
+            schema_metadata
+                .entry(COMMENT_METADATA_KEY.to_string())
+                .or_insert_with(|| table_comment.to_string());
+        }
+
+        fields.push(field_with_optional_comment(
+            Field::new(col_name, data_type, is_nullable),
+            optional_json_string(row.get(5)),
+        ));
     }
 
-    Ok(Arc::new(Schema::new(fields)))
+    Ok(Arc::new(Schema::new_with_metadata(fields, schema_metadata)))
 }
 
 /// Parses an Arrow response from `information_schema.columns`.
@@ -300,6 +321,7 @@ fn parse_information_schema_arrow(
     use arrow::array::AsArray;
 
     let mut fields = Vec::new();
+    let mut schema_metadata = HashMap::new();
     for batch in batches {
         if batch.num_columns() < 3 {
             return Err("information_schema Arrow response has fewer than 3 columns".to_string());
@@ -330,6 +352,16 @@ fn parse_information_schema_arrow(
         } else {
             None
         };
+        let comments: Option<&arrow::array::StringArray> = if batch.num_columns() > 5 {
+            batch.column(5).as_string_opt()
+        } else {
+            None
+        };
+        let table_comments: Option<&arrow::array::StringArray> = if batch.num_columns() > 6 {
+            batch.column(6).as_string_opt()
+        } else {
+            None
+        };
 
         for i in 0..batch.num_rows() {
             let col_name = col_names.value(i);
@@ -343,7 +375,16 @@ fn parse_information_schema_arrow(
                 .and_then(|s| s.parse::<i8>().ok());
 
             let data_type = map_snowflake_sql_type(data_type_str, precision, scale);
-            fields.push(Field::new(col_name, data_type, is_nullable));
+            if let Some(table_comment) = optional_arrow_string(table_comments, i) {
+                schema_metadata
+                    .entry(COMMENT_METADATA_KEY.to_string())
+                    .or_insert_with(|| table_comment.to_string());
+            }
+
+            fields.push(field_with_optional_comment(
+                Field::new(col_name, data_type, is_nullable),
+                optional_arrow_string(comments, i),
+            ));
         }
     }
 
@@ -353,7 +394,32 @@ fn parse_information_schema_arrow(
         ));
     }
 
-    Ok(Arc::new(Schema::new(fields)))
+    Ok(Arc::new(Schema::new_with_metadata(fields, schema_metadata)))
+}
+
+fn optional_json_string(value: Option<&serde_json::Value>) -> Option<&str> {
+    value
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn optional_arrow_string(array: Option<&arrow::array::StringArray>, index: usize) -> Option<&str> {
+    array
+        .filter(|array| !array.is_null(index))
+        .map(|array| array.value(index).trim())
+        .filter(|value| !value.is_empty())
+}
+
+fn field_with_optional_comment(field: Field, comment: Option<&str>) -> Field {
+    let Some(comment) = comment else {
+        return field;
+    };
+
+    field.with_metadata(HashMap::from([(
+        COMMENT_METADATA_KEY.to_string(),
+        comment.to_string(),
+    )]))
 }
 
 /// Maps a Snowflake SQL `DATA_TYPE` name to an Arrow `DataType`.
@@ -511,6 +577,65 @@ impl SnowflakeTableFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_information_schema_json_preserves_comment_metadata() {
+        let rows = serde_json::json!([
+            [
+                "ID",
+                "NUMBER",
+                "NO",
+                38,
+                0,
+                "stable identifier",
+                "customer dimension"
+            ],
+            [
+                "NAME",
+                "VARCHAR",
+                "YES",
+                null,
+                null,
+                "display name",
+                "customer dimension"
+            ],
+            ["AMOUNT", "NUMBER", "YES", 12, 2, "", "customer dimension"]
+        ]);
+
+        let schema = parse_information_schema_json(&rows, "CUSTOMERS")
+            .expect("information_schema rows should parse");
+
+        assert_eq!(
+            schema
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .map(String::as_str),
+            Some("customer dimension")
+        );
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .map(String::as_str),
+            Some("stable identifier")
+        );
+        assert_eq!(
+            schema
+                .field(1)
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .map(String::as_str),
+            Some("display name")
+        );
+        assert!(
+            schema
+                .field(2)
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .is_none()
+        );
+    }
 
     /// Every Snowflake `information_schema.columns` `DATA_TYPE` we support, paired
     /// with its expected Arrow mapping. Covers integer/decimal/float variants,

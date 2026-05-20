@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
@@ -675,7 +676,21 @@ pub fn parse_schema_from_json(resp: &serde_json::Value) -> Result<SchemaRef, Err
             .as_str()
             .is_none_or(|s| s.to_uppercase() == "TRUE");
 
-        fields.push(Field::new(column_name, data_type, is_nullable));
+        let field = if let Some(comment) = column
+            .get(5)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|comment| !comment.is_empty())
+        {
+            Field::new(column_name, data_type, is_nullable).with_metadata(HashMap::from([(
+                "comment".to_string(),
+                comment.to_string(),
+            )]))
+        } else {
+            Field::new(column_name, data_type, is_nullable)
+        };
+
+        fields.push(field);
     }
 
     Ok(Arc::new(Schema::new(fields)))
@@ -1306,6 +1321,30 @@ mod tests {
                 "Nullability mismatch for {name}"
             );
         }
+    }
+
+    #[test]
+    fn test_parse_schema_from_json_preserves_column_comment() {
+        let rows = serde_json::json!([[
+            "db",
+            "schema",
+            "customer_id",
+            r#"{"type":"FIXED","precision":38,"scale":0,"nullable":true}"#,
+            "TRUE",
+            "customer dimension key"
+        ]]);
+
+        let schema =
+            parse_schema_from_json(&rows).expect("Should parse SHOW COLUMNS JSON into a Schema");
+
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get("comment")
+                .map(String::as_str),
+            Some("customer dimension key")
+        );
     }
 
     #[test]

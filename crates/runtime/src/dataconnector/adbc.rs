@@ -18,15 +18,19 @@ use crate::component::dataset::Dataset;
 use adbc_core::options::{AdbcVersion, OptionDatabase};
 use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::ManagedDriver;
+use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use async_trait::async_trait;
+use data_components::{FieldMetadata, MetadataEnrichedTableProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
 use datafusion_table_providers::adbc::AdbcTableFactory;
-use datafusion_table_providers::sql::db_connection_pool::JoinPushDown;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::query_arrow;
+use datafusion_table_providers::sql::db_connection_pool::{DbConnectionPool, JoinPushDown};
+use futures::TryStreamExt;
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::any::Any;
@@ -95,6 +99,7 @@ pub struct Adbc {
     /// for cleanup. ADBC drivers perform synchronous FFI calls during drop
     /// (e.g. closing network sessions) that must not run on the async runtime.
     adbc_factory: Option<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>>,
+    pool: Arc<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
     driver_name: String,
 }
 
@@ -521,13 +526,174 @@ impl AdbcFactory {
                 }
             })?;
 
-        let adbc_factory = AdbcTableFactory::new(pool).with_federation_enabled(federation_enabled);
+        let adbc_factory =
+            AdbcTableFactory::new(Arc::clone(&pool)).with_federation_enabled(federation_enabled);
 
         Ok(Arc::new(Adbc {
             adbc_factory: Some(adbc_factory),
+            pool,
             driver_name: driver_name_owned,
         }) as Arc<dyn DataConnector>)
     }
+}
+
+pub(crate) async fn enrich_with_bigquery_comments(
+    driver_name: &str,
+    pool: &Arc<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
+    table_reference: &TableReference,
+    provider: Arc<dyn TableProvider>,
+) -> Arc<dyn TableProvider> {
+    if !driver_name.eq_ignore_ascii_case("bigquery") {
+        return provider;
+    }
+
+    match bigquery_comment_metadata(pool, table_reference).await {
+        Ok((table_metadata, field_metadata)) => {
+            if table_metadata.is_empty() && field_metadata.is_empty() {
+                provider
+            } else {
+                Arc::new(MetadataEnrichedTableProvider::new_with_field_metadata(
+                    provider,
+                    table_metadata,
+                    field_metadata,
+                ))
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                table = %table_reference,
+                error = %error,
+                "Failed to query BigQuery comments via ADBC; registering without comment metadata"
+            );
+            provider
+        }
+    }
+}
+
+async fn bigquery_comment_metadata(
+    pool: &Arc<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
+    table_reference: &TableReference,
+) -> std::result::Result<
+    (HashMap<String, String>, FieldMetadata),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let table_name = bigquery_string_literal(table_reference.table());
+    let table_options = bigquery_information_schema_table(table_reference, "TABLE_OPTIONS");
+    let column_field_paths =
+        bigquery_information_schema_table(table_reference, "COLUMN_FIELD_PATHS");
+
+    let table_sql = format!(
+        "SELECT option_value FROM {table_options} WHERE table_name = {table_name} AND option_name = 'description' AND option_value IS NOT NULL AND option_value != ''"
+    );
+    let column_sql = format!(
+        "SELECT field_path, description FROM {column_field_paths} WHERE table_name = {table_name} AND description IS NOT NULL AND description != ''"
+    );
+
+    let mut table_metadata = HashMap::new();
+    if let Some(comment) = first_string_result(pool, table_sql).await? {
+        table_metadata.insert(data_components::COMMENT_METADATA_KEY.to_string(), comment);
+    }
+
+    let mut field_metadata = FieldMetadata::new();
+    for (field_path, comment) in two_string_column_results(pool, column_sql).await? {
+        if field_path.contains('.') {
+            continue;
+        }
+        field_metadata.insert(
+            field_path,
+            HashMap::from([(data_components::COMMENT_METADATA_KEY.to_string(), comment)]),
+        );
+    }
+
+    Ok((table_metadata, field_metadata))
+}
+
+async fn first_string_result(
+    pool: &Arc<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
+    sql: String,
+) -> std::result::Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let conn = Arc::clone(pool).connect().await?;
+    let batches: Vec<_> = query_arrow(conn, sql, None).await?.try_collect().await?;
+    for batch in &batches {
+        if batch.num_columns() == 0 {
+            continue;
+        }
+        let values = batch.column(0);
+        for row in 0..batch.num_rows() {
+            if let Some(value) = string_value(values, row) {
+                return Ok(Some(value.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn two_string_column_results(
+    pool: &Arc<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
+    sql: String,
+) -> std::result::Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+    let conn = Arc::clone(pool).connect().await?;
+    let batches: Vec<_> = query_arrow(conn, sql, None).await?.try_collect().await?;
+    let mut values = Vec::new();
+    for batch in &batches {
+        if batch.num_columns() < 2 {
+            continue;
+        }
+        let names = batch.column(0);
+        let comments = batch.column(1);
+        for row in 0..batch.num_rows() {
+            if let (Some(name), Some(comment)) =
+                (string_value(names, row), string_value(comments, row))
+            {
+                values.push((name.to_string(), comment.to_string()));
+            }
+        }
+    }
+    Ok(values)
+}
+
+fn string_value(array: &ArrayRef, row: usize) -> Option<&str> {
+    if array.is_null(row) {
+        return None;
+    }
+
+    array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .map(|array| array.value(row))
+        .or_else(|| {
+            array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .map(|array| array.value(row))
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn bigquery_information_schema_table(table_reference: &TableReference, view: &str) -> String {
+    let mut parts = Vec::new();
+    if let Some(catalog) = table_reference.catalog() {
+        parts.push(catalog.to_string());
+    }
+    if let Some(schema) = table_reference.schema() {
+        parts.push(schema.to_string());
+    }
+    parts.push("INFORMATION_SCHEMA".to_string());
+    parts.push(view.to_string());
+
+    format!(
+        "`{}`",
+        parts
+            .into_iter()
+            .map(|part| part.replace('`', "\\`"))
+            .collect::<Vec<_>>()
+            .join(".")
+    )
+}
+
+fn bigquery_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 impl DataConnectorFactory for AdbcFactory {
@@ -960,10 +1126,10 @@ impl DataConnector for Adbc {
                 source: "ADBC connector has been shut down".into(),
             }
         })?;
-        let table_reference = dataset.path().into();
+        let table_reference: TableReference = dataset.path().into();
         let dialect = dialect_for_driver(&self.driver_name);
-        adbc_factory
-            .table_provider(table_reference, dialect)
+        let provider = adbc_factory
+            .table_provider(table_reference.clone(), dialect)
             .await
             .map_err(|e| {
                 classify_adbc_error(e, &self.driver_name, dataset, |dc, cc, src| {
@@ -973,7 +1139,17 @@ impl DataConnector for Adbc {
                         source: src,
                     }
                 })
-            })
+            })?;
+
+        Ok(
+            enrich_with_bigquery_comments(
+                &self.driver_name,
+                &self.pool,
+                &table_reference,
+                provider,
+            )
+            .await,
+        )
     }
 
     async fn read_write_provider(
@@ -992,23 +1168,33 @@ impl DataConnector for Adbc {
             Ok(f) => f,
             Err(e) => return Some(Err(e)),
         };
-        let table_reference = dataset.path().into();
+        let table_reference: TableReference = dataset.path().into();
         let dialect = dialect_for_driver(&self.driver_name);
 
-        Some(
-            adbc_factory
-                .read_write_table_provider(table_reference, dialect)
-                .await
-                .map_err(|e| {
-                    classify_adbc_error(e, &self.driver_name, dataset, |dc, cc, src| {
-                        DataConnectorError::UnableToGetReadWriteProvider {
-                            dataconnector: dc,
-                            connector_component: cc,
-                            source: src,
-                        }
-                    })
-                }),
-        )
+        let result = match adbc_factory
+            .read_write_table_provider(table_reference.clone(), dialect)
+            .await
+        {
+            Ok(provider) => Ok(enrich_with_bigquery_comments(
+                &self.driver_name,
+                &self.pool,
+                &table_reference,
+                provider,
+            )
+            .await),
+            Err(e) => Err(classify_adbc_error(
+                e,
+                &self.driver_name,
+                dataset,
+                |dc, cc, src| DataConnectorError::UnableToGetReadWriteProvider {
+                    dataconnector: dc,
+                    connector_component: cc,
+                    source: src,
+                },
+            )),
+        };
+
+        Some(result)
     }
 }
 
@@ -1543,6 +1729,24 @@ mod tests {
         assert_ne!(
             compute_adbc_cache_key(&params_a),
             compute_adbc_cache_key(&params_b)
+        );
+    }
+
+    #[test]
+    fn test_bigquery_information_schema_table_uses_comment_source_path() {
+        let table_reference = TableReference::full("project-a", "analytics", "customers");
+
+        assert_eq!(
+            bigquery_information_schema_table(&table_reference, "COLUMN_FIELD_PATHS"),
+            "`project-a.analytics.INFORMATION_SCHEMA.COLUMN_FIELD_PATHS`"
+        );
+    }
+
+    #[test]
+    fn test_bigquery_string_literal_escapes_comment_query_value() {
+        assert_eq!(
+            bigquery_string_literal("customer's\\table"),
+            "'customer\\'s\\\\table'"
         );
     }
 
