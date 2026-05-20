@@ -65,6 +65,14 @@ pub type MySqlTableMetadataRow = (
     Option<String>,
 );
 
+type MySqlSchemaMetadataRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 type CommentMap = HashMap<String, TableComments>;
 
 /// A catalog provider for `MySQL` that discovers schemas and tables
@@ -286,13 +294,7 @@ impl MySQLSchemaProvider {
     async fn list_comments(&self) -> Result<CommentMap> {
         let mut conn = self.pool.get_conn().await.context(ConnectionFailedSnafu)?;
 
-        let rows: Vec<(
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        )> = conn
+        let rows: Vec<MySqlSchemaMetadataRow> = conn
             .exec(
                 "SELECT \
                      t.TABLE_NAME, \

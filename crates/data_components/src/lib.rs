@@ -15,7 +15,9 @@ limitations under the License.
 */
 
 #![allow(clippy::missing_errors_doc)]
-use std::{any::Any, borrow::Cow, collections::HashMap, error::Error, sync::Arc};
+use std::{
+    any::Any, borrow::Cow, collections::HashMap, error::Error, hash::BuildHasher, sync::Arc,
+};
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
@@ -159,8 +161,11 @@ impl MetadataEnrichedTableProvider {
     ///
     /// Keys in `extra_metadata` will overwrite any pre-existing schema metadata with the same key.
     #[must_use]
-    pub fn new(inner: Arc<dyn TableProvider>, extra_metadata: HashMap<String, String>) -> Self {
-        Self::new_with_field_metadata(inner, extra_metadata, HashMap::new())
+    pub fn new<S>(inner: Arc<dyn TableProvider>, extra_metadata: HashMap<String, String, S>) -> Self
+    where
+        S: BuildHasher,
+    {
+        Self::new_with_field_metadata(inner, extra_metadata, &FieldMetadata::new())
     }
 
     /// Wrap `inner`, merging schema-level metadata and per-field metadata into its schema.
@@ -168,11 +173,14 @@ impl MetadataEnrichedTableProvider {
     /// Keys in `extra_metadata` overwrite pre-existing schema metadata with the same key. Keys in
     /// `field_metadata` overwrite pre-existing field metadata for matching field names.
     #[must_use]
-    pub fn new_with_field_metadata(
+    pub fn new_with_field_metadata<S>(
         inner: Arc<dyn TableProvider>,
-        extra_metadata: HashMap<String, String>,
-        field_metadata: FieldMetadata,
-    ) -> Self {
+        extra_metadata: HashMap<String, String, S>,
+        field_metadata: &FieldMetadata,
+    ) -> Self
+    where
+        S: BuildHasher,
+    {
         let base = inner.schema();
         let mut metadata = base.metadata().clone();
         metadata.extend(extra_metadata);
@@ -204,11 +212,14 @@ impl MetadataEnrichedTableProvider {
 /// federated adaptor with a fallback provider, keep the adaptor as the outer provider and enrich the
 /// fallback provider instead.
 #[must_use]
-pub fn metadata_enriched_table_provider(
+pub fn metadata_enriched_table_provider<S>(
     provider: Arc<dyn TableProvider>,
-    extra_metadata: HashMap<String, String>,
+    extra_metadata: HashMap<String, String, S>,
     field_metadata: FieldMetadata,
-) -> Arc<dyn TableProvider> {
+) -> Arc<dyn TableProvider>
+where
+    S: BuildHasher,
+{
     if extra_metadata.is_empty() && field_metadata.is_empty() {
         return provider;
     }
@@ -233,7 +244,7 @@ pub fn metadata_enriched_table_provider(
     Arc::new(MetadataEnrichedTableProvider::new_with_field_metadata(
         provider,
         extra_metadata,
-        field_metadata,
+        &field_metadata,
     ))
 }
 

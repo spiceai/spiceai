@@ -85,7 +85,7 @@ async fn configure_sqlite_connection(
 ///
 /// Pool size is `min(available_parallelism, 32)` (minimum 2). If
 /// `available_parallelism()` fails (rare — e.g. seccomp-restricted
-/// environments), K falls back to 4. SQLite WAL mode allows many
+/// environments), `K` falls back to 4. `SQLite` WAL mode allows many
 /// concurrent readers per database file (read-only operations don't take
 /// the WAL write lock), so a larger pool lifts the read-side concurrency
 /// ceiling for metadata-heavy workloads — e.g. 64-core deployments running
