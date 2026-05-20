@@ -497,7 +497,7 @@ pub(crate) fn get_partitions_from_store(
     };
 
     // All required partitions (future: filter by query predicates)
-    let required_partitions: Vec<HashMap<String, String>> = table_metadata
+    let required_partitions: Vec<HashMap<String, Option<String>>> = table_metadata
         .partitions
         .iter()
         .map(|p| p.partition_value.clone())
