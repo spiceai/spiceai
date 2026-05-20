@@ -53,7 +53,7 @@ Cayenne provides a lakehouse format that enables efficient CRUD operations on co
 │  │  In-memory state                                      │   │
 │  │   listing_fence (RwLock) — read/write barrier         │   │
 │  │   listing_table (ArcSwap<ListingTable>)               │   │
-│  │   scan_listing_tables (cache, Mutex<HashMap>)         │   │
+│  │   scan_file_statistics (footer statistics cache)      │   │
 │  │   pk_deletion_strategy (ArcSwap<DeletionSnapshot>)    │   │
 │  │   protected_snapshots (RwLock<HashMap>)               │   │
 │  │   inlined_row_count (AtomicI64) — memtable size       │   │
@@ -258,10 +258,10 @@ pub struct CayenneTableProvider {
     table_metadata: TableMetadata,
     catalog: Arc<dyn MetadataCatalog>,
 
-    // Listing-table state
+    // Listing-table state and direct scan-planning cache
     listing_table: Arc<ArcSwap<ListingTable>>,        // legacy stats path
     listing_fence: Arc<tokio::sync::RwLock<()>>,      // read/write barrier
-    scan_listing_tables: Arc<ParkingMutex<HashMap<ScanListingTableKey, Arc<ListingTable>>>>,
+    scan_file_statistics: Arc<dyn FileStatisticsCache>,
     table_statistics: Arc<parking_lot::RwLock<Option<Statistics>>>,
 
     // Filters and conflict resolution

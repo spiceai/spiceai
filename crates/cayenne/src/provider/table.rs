@@ -51,12 +51,13 @@ use arrow::datatypes::{
 };
 use arrow::record_batch::RecordBatch;
 use arrow_row::{OwnedRow, RowConverter, SortField};
-use arrow_schema::{DataType, SchemaRef, TimeUnit};
+use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use data_components::delete::{DeletionExec, DeletionSink};
 use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+    helpers::{expr_applicable_for_cols, pruned_partition_list},
 };
 use datafusion::datasource::sink::DataSinkExec;
 use datafusion::execution::context::SessionContext;
@@ -64,18 +65,28 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_catalog::{Session, TableProvider};
+use datafusion_common::stats::Precision as DFPrecision;
 use datafusion_common::tree_node::TreeNode;
-use datafusion_common::{ColumnStatistics, Constraints, DFSchema, ScalarValue, Statistics};
+use datafusion_common::{
+    ColumnStatistics, Constraints, DFSchema, Result as DataFusionResult, ScalarValue, Statistics,
+    project_schema,
+};
+use datafusion_datasource::file_groups::FileGroup;
+use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
+use datafusion_datasource::{PartitionedFile, TableSchema, compute_all_files_statistics};
 use datafusion_execution::cache::TableScopedPath;
+use datafusion_execution::cache::cache_manager::FileStatisticsCache;
+use datafusion_execution::cache::cache_unit::DefaultFileStatisticsCache;
 use datafusion_execution::config::SessionConfig;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{Expr, LogicalPlan, Operator, TableProviderFilterPushDown, TableType};
 use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
+use datafusion_physical_expr::{PhysicalExpr, create_lex_ordering, create_physical_expr};
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::collect;
+use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::projection::ProjectionExec;
@@ -83,8 +94,8 @@ use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::on_conflict::OnConflict;
-use futures::{StreamExt, TryStreamExt, stream};
-use object_store::path::Path as ObjectStorePath;
+use futures::{Stream, StreamExt, TryStreamExt, stream};
+use object_store::{ObjectStore, path::Path as ObjectStorePath};
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use roaring::RoaringBitmap;
 use std::any::Any;
@@ -956,21 +967,10 @@ fn inline_memtable_pressure_with_thresholds(
     None
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct ScanListingTableKey {
-    snapshot_id: String,
-    target_partitions: usize,
-    collect_statistics: bool,
-}
-
-impl ScanListingTableKey {
-    fn new(snapshot_id: &str, session_config: &SessionConfig) -> Self {
-        Self {
-            snapshot_id: snapshot_id.to_string(),
-            target_partitions: session_config.target_partitions(),
-            collect_statistics: session_config.collect_statistics(),
-        }
-    }
+struct SnapshotFilesForScan {
+    file_groups: Vec<FileGroup>,
+    statistics: Statistics,
+    grouped_by_partition: bool,
 }
 
 /// Serialize one or more `RecordBatch`es to Arrow IPC stream bytes.
@@ -1087,11 +1087,10 @@ pub struct CayenneTableProvider {
     /// do *not* take the fence — they read a snapshot of the listing table
     /// atomically via [`Self::listing_table`] and never observe partial state.
     listing_fence: Arc<tokio::sync::RwLock<()>>,
-    /// Cached scan listing tables keyed by live snapshot and the session knobs
-    /// that `ListingOptions::with_session_config_options` copies into each
-    /// table. Reusing the table keeps file-statistics caches warm across scans
-    /// while preserving per-session target partition and statistics settings.
-    scan_listing_tables: Arc<ParkingMutex<HashMap<ScanListingTableKey, Arc<ListingTable>>>>,
+    /// File statistics cache used by the direct snapshot scan planner. This
+    /// replaces the per-scan `ListingTable` cache while preserving repeated
+    /// scan behavior when `collect_statistics` asks us to read Vortex footers.
+    scan_file_statistics: Arc<dyn FileStatisticsCache>,
     /// Table-level Vortex statistics cache loaded from the metastore and maintained
     /// after writes. The optimizer-facing `Statistics` and raw `TableStatistics`
     /// blob live under the same lock so clears and updates publish both views
@@ -3088,7 +3087,7 @@ impl CayenneTableProvider {
             catalog,
             listing_table: Arc::new(ArcSwap::new(listing_table)),
             listing_fence: Arc::new(tokio::sync::RwLock::new(())),
-            scan_listing_tables: Arc::new(ParkingMutex::new(HashMap::new())),
+            scan_file_statistics: Arc::new(DefaultFileStatisticsCache::default()),
             table_statistics: Arc::new(RwLock::new(CachedTableStatistics {
                 optimizer: table_statistics,
                 raw: None, // will be populated on first load/persist
@@ -3529,7 +3528,7 @@ impl CayenneTableProvider {
             catalog: Arc::clone(&self.catalog),
             listing_table: Arc::clone(&self.listing_table),
             listing_fence: Arc::clone(&self.listing_fence),
-            scan_listing_tables: Arc::clone(&self.scan_listing_tables),
+            scan_file_statistics: Arc::clone(&self.scan_file_statistics),
             table_statistics: Arc::clone(&self.table_statistics),
             table_statistics_persistence_lock: Arc::clone(&self.table_statistics_persistence_lock),
             context: Arc::clone(&self.context),
@@ -3803,9 +3802,6 @@ impl CayenneTableProvider {
         pk_indices: &[usize],
         converter: &RowConverter,
     ) -> Result<CachedPkKeyset> {
-        // Snapshot the current listing table via ArcSwap (wait-free).
-        let listing_table = self.listing_table.load_full();
-
         // Clone protected snapshots to avoid holding locks across await points
         let protected_snapshots = {
             let guard = self.protected_snapshots.read();
@@ -3816,9 +3812,16 @@ impl CayenneTableProvider {
         // Only read PK columns - no need to load all columns for keyset building
         let pk_projection = pk_indices.to_vec();
 
-        // Scan main listing table
-        let scan_plan = listing_table
-            .scan(&ctx.state(), Some(&pk_projection), &[], None)
+        // Scan the current snapshot directly from its listed Vortex files.
+        let current_snapshot_id = self.get_current_snapshot_id();
+        let scan_plan = self
+            .create_snapshot_scan_plan(
+                &ctx.state(),
+                &current_snapshot_id,
+                Some(&pk_projection),
+                &[],
+                None,
+            )
             .await?;
 
         // Load the deletion caches based on pk_deletion_strategy.
@@ -3870,20 +3873,14 @@ impl CayenneTableProvider {
         // Only deletions with seq > max_delete_seq_at_creation apply, mirroring
         // scan()'s apply_partial_deletion_filter().
         for (snapshot_id, max_delete_seq_at_creation) in &protected_snapshots {
-            let snapshot_url = Self::snapshot_dir_url(
-                &self.table_metadata.path,
-                &self.table_metadata.table_id,
-                snapshot_id,
-            );
-
-            let snapshot_listing_table = self.scan_listing_table_for_config(
-                &snapshot_url,
-                snapshot_id,
-                ctx.state().config(),
-            )?;
-
-            let snapshot_plan = snapshot_listing_table
-                .scan(&ctx.state(), Some(&pk_projection), &[], None)
+            let snapshot_plan = self
+                .create_snapshot_scan_plan(
+                    &ctx.state(),
+                    snapshot_id,
+                    Some(&pk_projection),
+                    &[],
+                    None,
+                )
                 .await?;
 
             let snapshot_stream =
@@ -5645,11 +5642,12 @@ impl CayenneTableProvider {
 
     /// Wrap a plan with a `FilterExec` that enforces the retention filter.
     ///
-    /// `ListingTable::scan()` drops non-partition filters — they only influence
-    /// the file-limit heuristic, not the actual scan. Adding a `FilterExec`
-    /// above `DataSourceExec` allows `DataFusion`'s physical optimizer to push
-    /// the predicate into `VortexSource::try_pushdown_filters`, enabling
-    /// file-level pruning via min/max stats and row-level filtering.
+    /// Snapshot file-scan planning follows `ListingTable` semantics for
+    /// non-partition filters: they only influence the file-limit heuristic, not
+    /// the actual scan. Adding a `FilterExec` above `DataSourceExec` allows
+    /// `DataFusion`'s physical optimizer to push the predicate into
+    /// `VortexSource::try_pushdown_filters`, enabling file-level pruning via
+    /// min/max stats and row-level filtering.
     fn wrap_plan_with_retention_filter(
         &self,
         plan: Arc<dyn ExecutionPlan>,
@@ -5835,43 +5833,17 @@ impl CayenneTableProvider {
         guard.clone()
     }
 
-    fn invalidate_scan_listing_table_cache_for_snapshot(&self, snapshot_id: &str) {
-        let mut cache = self.scan_listing_tables.lock();
-        cache.retain(|key, _| key.snapshot_id != snapshot_id);
-        let cache_entries = cache.len();
-        drop(cache);
-        self.record_scan_listing_table_cache_entries(cache_entries);
-    }
-
-    /// Returns the number of per-scan `ListingTable` entries currently cached.
-    ///
-    /// Exposed as `#[doc(hidden)] pub` so integration tests can assert cache
-    /// invalidation behavior without reaching into private fields.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn scan_listing_table_cache_entry_count(&self) -> usize {
-        self.scan_listing_tables.lock().len()
-    }
-
     /// Update the current snapshot ID after a compaction operation.
     ///
     /// This must be called after `commit_compaction` to keep the in-memory snapshot ID
     /// in sync with the catalog.
     ///
     pub(crate) fn update_current_snapshot_id(&self, new_snapshot_id: &str) {
-        let previous_snapshot_id = {
+        {
             let mut guard = self.current_snapshot_id.write();
-            if guard.as_str() == new_snapshot_id {
-                None
-            } else {
-                let previous_snapshot_id = guard.clone();
+            if guard.as_str() != new_snapshot_id {
                 *guard = new_snapshot_id.to_string();
-                Some(previous_snapshot_id)
             }
-        };
-
-        if let Some(previous_snapshot_id) = previous_snapshot_id {
-            self.invalidate_scan_listing_table_cache_for_snapshot(&previous_snapshot_id);
         }
 
         // Any snapshot rewrite (compaction, sort, etc.) means the "new files
@@ -6083,11 +6055,9 @@ impl CayenneTableProvider {
     /// Publish file additions/removals in the current snapshot without
     /// rebuilding the `ListingTable` object.
     ///
-    /// `ListingTable::scan()` lists files eagerly on every scan and the table
-    /// path is unchanged for ordinary append commits. Invalidating `DataFusion`'s
-    /// list-files cache is therefore enough to make newly moved files visible;
-    /// keeping the existing `ListingTable` preserves its file-statistics cache
-    /// and removes a rebuild from the write hot path.
+    /// Query scan planning lists snapshot files directly through `DataFusion`'s
+    /// list-files cache. The table path is unchanged for ordinary append commits,
+    /// so invalidating that cache is enough to make newly moved files visible.
     pub(crate) fn publish_current_snapshot_files_changed_under_held_fence(&self) {
         let current_snapshot = self.get_current_snapshot_id();
         let snapshot_dir_url = Self::snapshot_dir_url(
@@ -6097,7 +6067,6 @@ impl CayenneTableProvider {
         );
 
         Self::invalidate_list_files_cache(self.context.runtime_env(), &snapshot_dir_url);
-        self.invalidate_scan_listing_table_cache_for_snapshot(&current_snapshot);
 
         tracing::trace!(
             table = self.table_metadata.table_name.as_str(),
@@ -7393,23 +7362,8 @@ impl CayenneTableProvider {
         let mut plans = Vec::with_capacity(protected_snapshots.len());
 
         for (snapshot_id, max_delete_seq_at_creation) in protected_snapshots {
-            // Create listing table for this snapshot
-            let snapshot_url = Self::snapshot_dir_url(
-                &self.table_metadata.path,
-                &self.table_metadata.table_id,
-                &snapshot_id,
-            );
-
-            let listing_table = self
-                .scan_listing_table_for_config(&snapshot_url, &snapshot_id, state.config())
-                .map_err(|e| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to create listing table for protected snapshot {snapshot_id}: {e}"
-                    ))
-                })?;
-
-            let plan = listing_table
-                .scan(state, projection, filters, limit)
+            let plan = self
+                .create_snapshot_scan_plan(state, &snapshot_id, projection, filters, limit)
                 .await?;
 
             // Apply partial deletion filter - only deletions with seq > max_delete_seq_at_creation
@@ -7426,56 +7380,292 @@ impl CayenneTableProvider {
         Ok(plans)
     }
 
-    fn scan_listing_table_for_config(
-        &self,
-        snapshot_dir_url: &str,
-        snapshot_id: &str,
-        session_config: &SessionConfig,
-    ) -> Result<Arc<ListingTable>> {
-        let key = ScanListingTableKey::new(snapshot_id, session_config);
-        if let Some(listing_table) = self.scan_listing_tables.lock().get(&key).cloned() {
-            tracing::trace!(
-                table = %self.table_metadata.table_name,
-                snapshot_id,
-                target_partitions = key.target_partitions,
-                collect_statistics = key.collect_statistics,
-                "Reusing cached Cayenne ListingTable for scan"
-            );
-            return Ok(listing_table);
+    fn snapshot_scan_schema(file_schema: &SchemaRef, options: &ListingOptions) -> SchemaRef {
+        let mut builder = SchemaBuilder::from(file_schema.as_ref().clone());
+        for (name, data_type) in &options.table_partition_cols {
+            builder.push(Field::new(name, data_type.clone(), false));
+        }
+        for metadata_col in &options.metadata_cols {
+            builder.push(metadata_col.field());
         }
 
-        let listing_table = Self::create_listing_table_with_config(
-            snapshot_dir_url,
-            Arc::clone(&self.table_metadata.schema),
-            self.context.file_format(),
-            &self.pk_deletion_strategy,
-            session_config,
-        )?;
-
-        let mut cache = self.scan_listing_tables.lock();
-        let listing_table = Arc::clone(cache.entry(key.clone()).or_insert(listing_table));
-        let cache_entries = cache.len();
-        drop(cache);
-        self.record_scan_listing_table_cache_entries(cache_entries);
-        tracing::trace!(
-            table = %self.table_metadata.table_name,
-            snapshot_id,
-            target_partitions = key.target_partitions,
-            collect_statistics = key.collect_statistics,
-            cache_entries,
-            "Cached Cayenne ListingTable for scan"
-        );
-        Ok(listing_table)
+        Arc::new(
+            builder
+                .finish()
+                .with_metadata(file_schema.metadata().clone()),
+        )
     }
 
-    fn record_scan_listing_table_cache_entries(&self, cache_entries: usize) {
-        telemetry::track_cayenne_scan_listing_table_cache_entries(
-            u64::try_from(cache_entries).unwrap_or(u64::MAX),
-            &[telemetry::KeyValue::new(
-                "dataset",
-                self.table_metadata.table_name.clone(),
-            )],
+    fn snapshot_file_table_schema(
+        file_schema: &SchemaRef,
+        options: &ListingOptions,
+    ) -> TableSchema {
+        TableSchema::new(
+            Arc::clone(file_schema),
+            options
+                .table_partition_cols
+                .iter()
+                .map(|(name, data_type)| Arc::new(Field::new(name, data_type.clone(), false)))
+                .collect(),
+        )
+    }
+
+    async fn create_snapshot_scan_plan(
+        &self,
+        state: &dyn Session,
+        snapshot_id: &str,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            snapshot_id,
         );
+        let table_url = ListingTableUrl::parse(&snapshot_dir_url)?;
+        let options = Self::create_listing_options(
+            self.context.file_format(),
+            &self.pk_deletion_strategy,
+            state.config(),
+        );
+        let scan_schema = Self::snapshot_scan_schema(&self.table_metadata.schema, &options);
+
+        let partition_column_names = options
+            .table_partition_cols
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        let (partition_filters, data_filters): (Vec<_>, Vec<_>) =
+            filters.iter().cloned().partition(|filter| {
+                !partition_column_names.is_empty()
+                    && expr_applicable_for_cols(&partition_column_names, filter)
+            });
+        let statistic_file_limit = if data_filters.is_empty() { limit } else { None };
+
+        let SnapshotFilesForScan {
+            file_groups: mut partitioned_file_lists,
+            statistics,
+            grouped_by_partition,
+        } = self
+            .list_files_for_snapshot_scan(
+                state,
+                &table_url,
+                &options,
+                &partition_filters,
+                statistic_file_limit,
+                Arc::clone(&scan_schema),
+            )
+            .await?;
+
+        if partitioned_file_lists.is_empty() {
+            let projected_schema = project_schema(&scan_schema, projection)?;
+            return Ok(Arc::new(EmptyExec::new(projected_schema)));
+        }
+
+        let output_ordering = create_lex_ordering(
+            &scan_schema,
+            &options.file_sort_order,
+            state.execution_props(),
+        )?;
+        if state
+            .config_options()
+            .execution
+            .split_file_groups_by_statistics
+            && let Some(first_output_ordering) = output_ordering.first()
+        {
+            match FileScanConfig::split_groups_by_statistics_with_target_partitions(
+                &scan_schema,
+                &partitioned_file_lists,
+                first_output_ordering,
+                options.target_partitions,
+            ) {
+                Ok(new_groups) if new_groups.len() <= options.target_partitions => {
+                    partitioned_file_lists = new_groups;
+                }
+                Ok(_) => {
+                    tracing::debug!(
+                        table = %self.table_metadata.table_name,
+                        "Attempted to split file groups by statistics, but there were more file groups than target_partitions; falling back to unordered"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        table = %self.table_metadata.table_name,
+                        "Failed to split file groups by statistics: {e}"
+                    );
+                }
+            }
+        }
+
+        let file_source = options.format.file_source(Self::snapshot_file_table_schema(
+            &self.table_metadata.schema,
+            &options,
+        ));
+
+        options
+            .format
+            .create_physical_plan(
+                state,
+                FileScanConfigBuilder::new(table_url.object_store(), file_source)
+                    .with_file_groups(partitioned_file_lists)
+                    .with_constraints(Constraints::default())
+                    .with_statistics(statistics)
+                    .with_metadata_cols(options.metadata_cols.clone())
+                    .with_projection_indices(projection.cloned())?
+                    .with_limit(limit)
+                    .with_output_ordering(output_ordering)
+                    .with_partitioned_by_file_group(grouped_by_partition)
+                    .build(),
+            )
+            .await
+    }
+
+    async fn list_files_for_snapshot_scan(
+        &self,
+        state: &dyn Session,
+        table_url: &ListingTableUrl,
+        options: &ListingOptions,
+        partition_filters: &[Expr],
+        limit: Option<usize>,
+        scan_schema: SchemaRef,
+    ) -> datafusion_common::Result<SnapshotFilesForScan> {
+        let store = state.runtime_env().object_store(table_url)?;
+        let meta_fetch_concurrency = state.config_options().execution.meta_fetch_concurrency;
+        let file_list = pruned_partition_list(
+            state,
+            store.as_ref(),
+            table_url,
+            partition_filters,
+            &options.file_extension,
+            &options.table_partition_cols,
+        )
+        .await?;
+
+        let files = file_list
+            .map(|part_file| async {
+                let part_file = part_file?;
+                let statistics = if options.collect_stat {
+                    self.collect_scan_file_statistics(
+                        state,
+                        &store,
+                        options.format.as_ref(),
+                        &part_file,
+                    )
+                    .await?
+                } else {
+                    Arc::new(Statistics::new_unknown(&self.table_metadata.schema))
+                };
+                DataFusionResult::Ok(part_file.with_statistics(statistics))
+            })
+            .buffer_unordered(meta_fetch_concurrency);
+
+        let (file_group, inexact_stats) =
+            Self::collect_scan_files_with_limit(files, limit, options.collect_stat).await?;
+
+        let threshold = state.config_options().optimizer.preserve_file_partitions;
+        let (file_groups, grouped_by_partition) =
+            if threshold > 0 && !options.table_partition_cols.is_empty() {
+                let grouped = file_group.group_by_partition_values(options.target_partitions);
+                if grouped.len() >= threshold {
+                    (grouped, true)
+                } else {
+                    let all_files = grouped
+                        .into_iter()
+                        .flat_map(FileGroup::into_inner)
+                        .collect::<Vec<_>>();
+                    (
+                        FileGroup::new(all_files).split_files(options.target_partitions),
+                        false,
+                    )
+                }
+            } else {
+                (file_group.split_files(options.target_partitions), false)
+            };
+
+        let (file_groups, statistics) = compute_all_files_statistics(
+            file_groups,
+            scan_schema,
+            options.collect_stat,
+            inexact_stats,
+        )?;
+
+        Ok(SnapshotFilesForScan {
+            file_groups,
+            statistics,
+            grouped_by_partition,
+        })
+    }
+
+    async fn collect_scan_file_statistics(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn ObjectStore>,
+        format: &dyn FileFormat,
+        part_file: &PartitionedFile,
+    ) -> datafusion_common::Result<Arc<Statistics>> {
+        if let Some(statistics) = self
+            .scan_file_statistics
+            .get_with_extra(&part_file.object_meta.location, &part_file.object_meta)
+        {
+            return Ok(statistics);
+        }
+
+        let statistics = Arc::new(
+            format
+                .infer_stats(
+                    state,
+                    store,
+                    Arc::clone(&self.table_metadata.schema),
+                    &part_file.object_meta,
+                )
+                .await?,
+        );
+        self.scan_file_statistics.put_with_extra(
+            &part_file.object_meta.location,
+            Arc::clone(&statistics),
+            &part_file.object_meta,
+        );
+
+        Ok(statistics)
+    }
+
+    async fn collect_scan_files_with_limit(
+        files: impl Stream<Item = DataFusionResult<PartitionedFile>>,
+        limit: Option<usize>,
+        collect_stats: bool,
+    ) -> DataFusionResult<(FileGroup, bool)> {
+        let mut file_group = FileGroup::default();
+        let mut all_files = Box::pin(files.fuse());
+        let mut reached_limit = false;
+        let mut num_rows = DFPrecision::Absent;
+
+        while let Some(file_result) = all_files.next().await {
+            if reached_limit {
+                break;
+            }
+
+            let file = file_result?;
+            if collect_stats && let Some(file_stats) = &file.statistics {
+                num_rows = if file_group.is_empty() {
+                    file_stats.num_rows
+                } else {
+                    num_rows.add(&file_stats.num_rows)
+                };
+            }
+
+            file_group.push(file);
+
+            if let Some(limit) = limit
+                && let DFPrecision::Exact(row_count) = num_rows
+                && row_count > limit
+            {
+                reached_limit = true;
+            }
+        }
+
+        let inexact_stats = all_files.next().await.is_some();
+        Ok((file_group, inexact_stats))
     }
 
     fn record_listing_fence_wait_duration(&self, duration: Duration) {
@@ -7839,41 +8029,37 @@ impl TableProvider for CayenneTableProvider {
 
         let target_partitions = state.config().target_partitions();
 
-        // Hold listing_fence.read() across the inner ListingTable::scan() call
-        // so concurrent writer barriers (#10125 §6.4) cannot interleave file
-        // moves with this scan's listing operation. Multiple concurrent scans
+        // Hold listing_fence.read() across direct snapshot file listing and
+        // FileScanConfig creation so concurrent writer barriers (#10125 §6.4)
+        // cannot interleave file moves with this scan's listing operation.
+        // Multiple concurrent scans
         // share the read fence and do not block each other; only a writer-side
         // barrier holding the write fence blocks scans, and vice versa.
         //
-        // PR #10811 builds a fresh ListingTable per scan from the live
-        // current_snapshot_id so it can apply per-scan DataFusion config
-        // (target_partitions, etc.). The fence still matters because
+        // The plan is built from the live current_snapshot_id so it can apply
+        // per-scan DataFusion config (target_partitions, etc.). The fence still matters because
         // append-mode coordinators move files into the CURRENT snapshot dir.
         let listing_fence_wait_start = Instant::now();
         let _fence = self.listing_fence.read().await;
         self.record_listing_fence_wait_duration(listing_fence_wait_start.elapsed());
         let current_snapshot_id = self.get_current_snapshot_id();
-        let snapshot_dir_url = Self::snapshot_dir_url(
-            &self.table_metadata.path,
-            &self.table_metadata.table_id,
-            &current_snapshot_id,
-        );
-        let listing_table = self.scan_listing_table_for_config(
-            &snapshot_dir_url,
-            &current_snapshot_id,
-            state.config(),
-        )?;
         let listing_scan_start = Instant::now();
-        let main_plan_result = listing_table
-            .scan(state, effective_projection.as_ref(), scan_filters, limit)
+        let main_plan_result = self
+            .create_snapshot_scan_plan(
+                state,
+                &current_snapshot_id,
+                effective_projection.as_ref(),
+                scan_filters,
+                limit,
+            )
             .await;
         self.record_listing_scan_duration(listing_scan_start.elapsed());
         let main_plan = main_plan_result?;
         // Note: we deliberately keep `_fence` alive until after the main plan
-        // has been built (i.e. until end of this function). DataFusion's
-        // ListingTable::scan resolves the file listing eagerly, so the fence
-        // really only needs to outlive `listing_table.scan(...).await`; we
-        // hold it slightly longer for clarity and to avoid micro-optimizing a
+        // has been built (i.e. until end of this function). Direct scan
+        // planning resolves the file listing eagerly, so the fence really only
+        // needs to outlive `create_snapshot_scan_plan(...).await`; we hold it
+        // slightly longer for clarity and to avoid micro-optimizing a
         // microsecond-scale wait.
 
         // Check for protected snapshots that need to be scanned with partial deletion filter.
@@ -8011,12 +8197,29 @@ impl TableProvider for CayenneTableProvider {
         &self,
         filters: &[&Expr],
     ) -> datafusion_common::Result<Vec<TableProviderFilterPushDown>> {
-        // Synchronous TableProvider trait method: a wait-free ArcSwap snapshot
-        // is sufficient. No need to hold the listing fence — this delegates to
-        // ListingTable::supports_filters_pushdown which doesn't touch the
-        // filesystem.
-        let listing_table = self.listing_table.load_full();
-        listing_table.supports_filters_pushdown(filters)
+        let options = Self::create_listing_options(
+            self.context.file_format(),
+            &self.pk_deletion_strategy,
+            &SessionConfig::default(),
+        );
+        let partition_column_names = options
+            .table_partition_cols
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+
+        filters
+            .iter()
+            .map(|filter| {
+                if !partition_column_names.is_empty()
+                    && expr_applicable_for_cols(&partition_column_names, filter)
+                {
+                    Ok(TableProviderFilterPushDown::Exact)
+                } else {
+                    Ok(TableProviderFilterPushDown::Inexact)
+                }
+            })
+            .collect()
     }
 
     fn statistics(&self) -> Option<datafusion_common::Statistics> {
@@ -9395,8 +9598,11 @@ mod tests {
     }
 
     /// Helper to insert a `RecordBatch` into a `CayenneTableProvider`.
-    async fn insert_batch(provider: &CayenneTableProvider, batch: RecordBatch) {
-        let ctx = SessionContext::new();
+    async fn insert_batch_with_context(
+        ctx: &SessionContext,
+        provider: &CayenneTableProvider,
+        batch: RecordBatch,
+    ) {
         let schema = batch.schema();
 
         let mem_exec = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
@@ -9410,6 +9616,218 @@ mod tests {
         let _ = collect(insert_plan, ctx.task_ctx())
             .await
             .expect("insert done");
+    }
+
+    /// Helper to insert a `RecordBatch` into a `CayenneTableProvider`.
+    async fn insert_batch(provider: &CayenneTableProvider, batch: RecordBatch) {
+        let ctx = SessionContext::new();
+        insert_batch_with_context(&ctx, provider, batch).await;
+    }
+
+    fn make_listing_parity_batch(schema: SchemaRef, start: i64, row_count: usize) -> RecordBatch {
+        let row_count = i64::try_from(row_count).expect("test row count fits in i64");
+        let ids = (start..start + row_count).collect::<Vec<_>>();
+        let categories = ids
+            .iter()
+            .map(|id| format!("category_{}", id.rem_euclid(3)))
+            .collect::<Vec<_>>();
+        let values = ids
+            .iter()
+            .map(|id| id.saturating_mul(10))
+            .collect::<Vec<_>>();
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(categories)),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )
+        .expect("listing parity test batch is valid")
+    }
+
+    fn file_group_paths(file_groups: &[FileGroup]) -> Vec<Vec<String>> {
+        file_groups
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .map(|file| file.path().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn file_group_row_counts(file_groups: &[FileGroup]) -> Vec<Vec<DFPrecision<usize>>> {
+        file_groups
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .map(|file| {
+                        file.statistics
+                            .as_ref()
+                            .map_or(DFPrecision::Absent, |statistics| statistics.num_rows)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    async fn collect_value_id_rows(
+        ctx: &SessionContext,
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> Vec<(i64, i64)> {
+        let batches = collect(plan, ctx.task_ctx())
+            .await
+            .expect("scan plan should collect");
+        let mut rows = Vec::new();
+
+        for batch in batches {
+            let value_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("projected value column should be Int64");
+            let id_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("projected id column should be Int64");
+
+            rows.extend((0..batch.num_rows()).map(|row| (value_col.value(row), id_col.value(row))));
+        }
+
+        rows.sort_unstable();
+        rows
+    }
+
+    #[tokio::test]
+    async fn direct_snapshot_scan_matches_listing_table_scan_behavior() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let config = SessionConfig::new()
+            .with_target_partitions(2)
+            .set_usize("datafusion.execution.meta_fetch_concurrency", 1);
+        let ctx = SessionContext::new_with_config(config);
+        let (provider, _temp_dir) = create_sorted_cayenne_table(
+            "listing_table_parity",
+            Arc::clone(&schema),
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let rows_per_file = INLINE_MAX_ROWS + 16;
+        for batch_idx in 0..3_usize {
+            let start =
+                i64::try_from(batch_idx * rows_per_file).expect("test batch start fits in i64");
+            insert_batch_with_context(
+                &ctx,
+                &provider,
+                make_listing_parity_batch(Arc::clone(&schema), start, rows_per_file),
+            )
+            .await;
+        }
+
+        let snapshot_id = provider.get_current_snapshot_id();
+        let snapshot_dir_url = CayenneTableProvider::snapshot_dir_url(
+            &provider.table_metadata.path,
+            &provider.table_metadata.table_id,
+            &snapshot_id,
+        );
+        let listing_table = CayenneTableProvider::create_listing_table_with_config(
+            &snapshot_dir_url,
+            Arc::clone(&provider.table_metadata.schema),
+            provider.context.file_format(),
+            &provider.pk_deletion_strategy,
+            ctx.state().config(),
+        )
+        .expect("legacy listing table should be created");
+
+        let table_url = ListingTableUrl::parse(&snapshot_dir_url).expect("snapshot URL parses");
+        let options = CayenneTableProvider::create_listing_options(
+            provider.context.file_format(),
+            &provider.pk_deletion_strategy,
+            ctx.state().config(),
+        );
+        let scan_schema =
+            CayenneTableProvider::snapshot_scan_schema(&provider.table_metadata.schema, &options);
+        let file_limit = Some(rows_per_file + 1);
+
+        let direct_files = provider
+            .list_files_for_snapshot_scan(
+                &ctx.state(),
+                &table_url,
+                &options,
+                &[],
+                file_limit,
+                Arc::clone(&scan_schema),
+            )
+            .await
+            .expect("direct scan file listing should succeed");
+        let listing_files = listing_table
+            .list_files_for_scan(&ctx.state(), &[], file_limit)
+            .await
+            .expect("ListingTable file listing should succeed");
+
+        assert_eq!(
+            direct_files.grouped_by_partition,
+            listing_files.grouped_by_partition
+        );
+        assert_eq!(direct_files.statistics, listing_files.statistics);
+        assert_eq!(
+            file_group_paths(&direct_files.file_groups),
+            file_group_paths(&listing_files.file_groups),
+            "direct scan planning must preserve ListingTable file grouping"
+        );
+        assert_eq!(
+            file_group_row_counts(&direct_files.file_groups),
+            file_group_row_counts(&listing_files.file_groups),
+            "direct scan planning must preserve per-file row-count statistics"
+        );
+
+        let projection = vec![2, 0];
+        let direct_plan = provider
+            .create_snapshot_scan_plan(&ctx.state(), &snapshot_id, Some(&projection), &[], None)
+            .await
+            .expect("direct scan plan should be created");
+        let listing_plan = listing_table
+            .scan(&ctx.state(), Some(&projection), &[], None)
+            .await
+            .expect("ListingTable scan plan should be created");
+
+        assert_eq!(direct_plan.schema(), listing_plan.schema());
+        assert_eq!(
+            direct_plan
+                .partition_statistics(None)
+                .expect("direct scan plan statistics should be available"),
+            listing_plan
+                .partition_statistics(None)
+                .expect("ListingTable scan plan statistics should be available")
+        );
+        assert_eq!(
+            direct_plan
+                .properties()
+                .output_partitioning()
+                .partition_count(),
+            listing_plan
+                .properties()
+                .output_partitioning()
+                .partition_count()
+        );
+        assert_eq!(
+            direct_plan.properties().output_ordering().is_some(),
+            listing_plan.properties().output_ordering().is_some()
+        );
+        assert_eq!(
+            collect_value_id_rows(&ctx, direct_plan).await,
+            collect_value_id_rows(&ctx, listing_plan).await
+        );
     }
 
     /// Helper to read all data from a `CayenneTableProvider` as `RecordBatch`es.
