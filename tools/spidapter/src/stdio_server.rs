@@ -416,9 +416,11 @@ impl Handler for SpidapterHandler {
                         serde_json::Value::String(state.password().to_string()),
                     ),
                 ]);
+                let db_kwargs = pg.adbc_kwargs();
+                eprintln!("[stdio] ADBC db_kwargs: {:?}", db_kwargs);
                 SetupResponse {
                     driver: AdbcDriver::Postgresql,
-                    db_kwargs: pg.adbc_kwargs(),
+                    db_kwargs,
                     catalog_namespace: None,
                     read_driver: Some((AdbcDriver::Flightsql, flight_kwargs)),
                     endpoints: HashMap::new(),
