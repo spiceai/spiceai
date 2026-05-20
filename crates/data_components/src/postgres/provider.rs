@@ -283,12 +283,16 @@ impl PostgresCatalogProvider {
             }
             if let Some(column_name) = column_name {
                 if let Some(comment) = column_comment.filter(|comment| !comment.is_empty()) {
-                    comments.column_comments.insert(column_name.clone(), comment);
+                    comments
+                        .column_comments
+                        .insert(column_name.clone(), comment);
                 }
                 if let Some(source_type) =
                     column_source_type.filter(|source_type| !source_type.is_empty())
                 {
-                    comments.column_source_types.insert(column_name, source_type);
+                    comments
+                        .column_source_types
+                        .insert(column_name, source_type);
                 }
             }
         }
@@ -489,26 +493,30 @@ async fn build_table_providers_for_schema(
                     }
                 }
 
-                let field_metadata = comments.get(&table_name).map_or_else(HashMap::new, |comments| {
-                    if let Some(comment) = &comments.table_comment {
-                        table_metadata.insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
-                    }
+                let field_metadata =
+                    comments
+                        .get(&table_name)
+                        .map_or_else(HashMap::new, |comments| {
+                            if let Some(comment) = &comments.table_comment {
+                                table_metadata
+                                    .insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
+                            }
 
-                    let mut field_metadata = FieldMetadata::new();
-                    for (column, source_type) in &comments.column_source_types {
-                        field_metadata
-                            .entry(column.clone())
-                            .or_default()
-                            .insert(SOURCE_TYPE_METADATA_KEY.to_string(), source_type.clone());
-                    }
-                    for (column, comment) in &comments.column_comments {
-                        field_metadata
-                            .entry(column.clone())
-                            .or_default()
-                            .insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
-                    }
-                    field_metadata
-                });
+                            let mut field_metadata = FieldMetadata::new();
+                            for (column, source_type) in &comments.column_source_types {
+                                field_metadata.entry(column.clone()).or_default().insert(
+                                    SOURCE_TYPE_METADATA_KEY.to_string(),
+                                    source_type.clone(),
+                                );
+                            }
+                            for (column, comment) in &comments.column_comments {
+                                field_metadata
+                                    .entry(column.clone())
+                                    .or_default()
+                                    .insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
+                            }
+                            field_metadata
+                        });
 
                 let provider = if table_metadata.is_empty() && field_metadata.is_empty() {
                     provider

@@ -297,7 +297,12 @@ async fn mysql_comment_metadata(
         .map(ToString::to_string);
     let table_name = table_reference.table().to_string();
 
-    let rows: Vec<(Option<String>, Option<String>, Option<String>, Option<String>)> = conn
+    let rows: Vec<(
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = conn
         .exec(
             "SELECT \
                  NULLIF(t.TABLE_COMMENT, '') AS TABLE_COMMENT, \
@@ -326,7 +331,10 @@ async fn mysql_comment_metadata(
         if let Some(column_name) = column_name {
             let metadata = field_metadata.entry(column_name).or_default();
             if let Some(source_type) = column_source_type {
-                metadata.insert(data_components::SOURCE_TYPE_METADATA_KEY.to_string(), source_type);
+                metadata.insert(
+                    data_components::SOURCE_TYPE_METADATA_KEY.to_string(),
+                    source_type,
+                );
             }
             if let Some(comment) = column_comment {
                 metadata.insert(data_components::COMMENT_METADATA_KEY.to_string(), comment);

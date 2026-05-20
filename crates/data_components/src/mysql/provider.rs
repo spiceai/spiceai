@@ -315,10 +315,16 @@ impl MySQLSchemaProvider {
             }
             if let Some(column_name) = column_name {
                 if let Some(comment) = column_comment {
-                    comments.column_comments.insert(column_name.clone(), comment);
+                    comments
+                        .column_comments
+                        .insert(column_name.clone(), comment);
                 }
-                if let Some(source_type) = column_source_type.filter(|source_type| !source_type.is_empty()) {
-                    comments.column_source_types.insert(column_name, source_type);
+                if let Some(source_type) =
+                    column_source_type.filter(|source_type| !source_type.is_empty())
+                {
+                    comments
+                        .column_source_types
+                        .insert(column_name, source_type);
                 }
             }
         }

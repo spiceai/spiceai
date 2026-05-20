@@ -640,7 +640,10 @@ async fn bigquery_schema_metadata(
         field_metadata
             .entry(field_path.clone())
             .or_default()
-            .insert(data_components::COMMENT_METADATA_KEY.to_string(), comment.clone());
+            .insert(
+                data_components::COMMENT_METADATA_KEY.to_string(),
+                comment.clone(),
+            );
     }
 
     Ok((table_metadata, field_metadata))
