@@ -28,13 +28,13 @@ use crate::persistent::source::VortexSource;
 pub(crate) static PARTITION_LABEL: &str = "partition";
 pub(crate) static PATH_LABEL: &str = "file_path";
 
-/// Extracts `DataFusion` metrics from all `VortexExec` instances in
+/// Extracts DataFusion metrics from all VortexExec instances in
 /// a given physical plan.
 #[derive(Default)]
 pub struct VortexMetricsFinder(Vec<MetricsSet>);
 
 impl VortexMetricsFinder {
-    /// Find all metrics for `VortexExec` nodes.
+    /// Find all metrics for VortexExec nodes.
     pub fn find_all(plan: &dyn ExecutionPlan) -> Vec<MetricsSet> {
         let mut finder = Self::default();
         match accept(plan, &mut finder) {
@@ -157,7 +157,7 @@ fn metric_value_to_datafusion(name: &str, metric: &MetricValue) -> Vec<Datafusio
             res
         }
         // TODO(os): add more metric types when added to VortexMetrics
-        MetricValue::Gauge(_) => Vec::new(),
+        _ => vec![],
     }
 }
 
@@ -188,12 +188,14 @@ fn df_timer(name: String, value: Duration) -> DatafusionMetricValue {
     }
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "truncation is checked before cast"
+)]
 fn f_to_u(f: f64) -> Option<usize> {
-    if !f.is_finite() || f.is_sign_negative() {
-        return None;
-    }
-
-    format!("{:.0}", f.trunc()).parse().ok()
+    (f.is_finite() && f >= usize::MIN as f64 && f <= usize::MAX as f64).then(||
+        // After the range check, truncation is guaranteed to keep the value in usize bounds.
+        f.trunc() as usize)
 }
 
 #[cfg(test)]
