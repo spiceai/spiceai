@@ -460,3 +460,331 @@ async fn drop_replication_slot(client: &tokio_postgres::Client, slot: &str) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{Field, Schema, TimeUnit};
+    use std::sync::Arc;
+
+    fn make_pg_config() -> PgConfig {
+        PgConfig {
+            host: "localhost".to_string(),
+            port: 5432,
+            user: "spice".to_string(),
+            password: "s3cr3t".to_string(),
+            database: "spicebench".to_string(),
+            schema: "tpch_abc12345".to_string(),
+        }
+    }
+
+    fn make_dataset(fields: Vec<Field>, pks: Vec<&str>) -> DatasetConfig {
+        DatasetConfig {
+            schema: Arc::new(Schema::new(fields)),
+            primary_key_columns: pks.into_iter().map(str::to_string).collect(),
+            location: None,
+            time_column: None,
+            partition_columns: Vec::new(),
+        }
+    }
+
+    // ── pg_type_for_arrow ────────────────────────────────────────────────────
+
+    #[test]
+    fn pg_type_maps_integer_types() {
+        assert_eq!(pg_type_for_arrow(&DataType::Int8).expect("Int8"), "SMALLINT");
+        assert_eq!(pg_type_for_arrow(&DataType::UInt8).expect("UInt8"), "SMALLINT");
+        assert_eq!(pg_type_for_arrow(&DataType::Int16).expect("Int16"), "SMALLINT");
+        assert_eq!(pg_type_for_arrow(&DataType::UInt16).expect("UInt16"), "SMALLINT");
+        assert_eq!(pg_type_for_arrow(&DataType::Int32).expect("Int32"), "INTEGER");
+        assert_eq!(pg_type_for_arrow(&DataType::UInt32).expect("UInt32"), "INTEGER");
+        assert_eq!(pg_type_for_arrow(&DataType::Int64).expect("Int64"), "BIGINT");
+        assert_eq!(pg_type_for_arrow(&DataType::UInt64).expect("UInt64"), "BIGINT");
+    }
+
+    #[test]
+    fn pg_type_maps_float_and_decimal_types() {
+        assert_eq!(pg_type_for_arrow(&DataType::Float16).expect("Float16"), "REAL");
+        assert_eq!(pg_type_for_arrow(&DataType::Float32).expect("Float32"), "REAL");
+        assert_eq!(
+            pg_type_for_arrow(&DataType::Float64).expect("Float64"),
+            "DOUBLE PRECISION"
+        );
+        assert_eq!(
+            pg_type_for_arrow(&DataType::Decimal128(10, 2)).expect("Decimal128"),
+            "DOUBLE PRECISION"
+        );
+        assert_eq!(
+            pg_type_for_arrow(&DataType::Decimal256(18, 6)).expect("Decimal256"),
+            "DOUBLE PRECISION"
+        );
+    }
+
+    #[test]
+    fn pg_type_maps_text_and_binary_types() {
+        assert_eq!(pg_type_for_arrow(&DataType::Utf8).expect("Utf8"), "TEXT");
+        assert_eq!(pg_type_for_arrow(&DataType::LargeUtf8).expect("LargeUtf8"), "TEXT");
+        assert_eq!(pg_type_for_arrow(&DataType::Utf8View).expect("Utf8View"), "TEXT");
+        assert_eq!(pg_type_for_arrow(&DataType::Binary).expect("Binary"), "BYTEA");
+        assert_eq!(pg_type_for_arrow(&DataType::LargeBinary).expect("LargeBinary"), "BYTEA");
+        assert_eq!(pg_type_for_arrow(&DataType::BinaryView).expect("BinaryView"), "BYTEA");
+    }
+
+    #[test]
+    fn pg_type_maps_temporal_types() {
+        assert_eq!(pg_type_for_arrow(&DataType::Date32).expect("Date32"), "DATE");
+        assert_eq!(pg_type_for_arrow(&DataType::Date64).expect("Date64"), "DATE");
+        assert_eq!(
+            pg_type_for_arrow(&DataType::Time32(TimeUnit::Second)).expect("Time32"),
+            "TIME"
+        );
+        assert_eq!(
+            pg_type_for_arrow(&DataType::Time64(TimeUnit::Nanosecond)).expect("Time64"),
+            "TIME"
+        );
+        assert_eq!(
+            pg_type_for_arrow(&DataType::Timestamp(TimeUnit::Microsecond, None)).expect("Timestamp"),
+            "TIMESTAMP"
+        );
+    }
+
+    #[test]
+    fn pg_type_errors_for_unsupported_type() {
+        let err = pg_type_for_arrow(&DataType::Struct(
+            vec![Field::new("k", DataType::Utf8, true)].into(),
+        ))
+        .expect_err("struct type should be unsupported");
+        assert!(
+            err.to_string().contains("Unsupported Arrow type"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── pg_create_table_ddl ──────────────────────────────────────────────────
+
+    #[test]
+    fn pg_ddl_generates_correct_create_table() {
+        let dataset = make_dataset(
+            vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, true),
+                Field::new("price", DataType::Float64, true),
+            ],
+            vec!["id"],
+        );
+        let ddl = pg_create_table_ddl("tpch_abc12345", "orders", &dataset).expect("ddl should generate");
+
+        assert!(ddl.starts_with("CREATE TABLE IF NOT EXISTS tpch_abc12345.orders ("));
+        assert!(ddl.contains("id BIGINT NOT NULL"));
+        assert!(ddl.contains("name TEXT"));
+        assert!(ddl.contains("price DOUBLE PRECISION"));
+        assert!(ddl.contains("PRIMARY KEY (id)"));
+    }
+
+    #[test]
+    fn pg_ddl_handles_composite_primary_key() {
+        let dataset = make_dataset(
+            vec![
+                Field::new("pk1", DataType::Int32, false),
+                Field::new("pk2", DataType::Utf8, false),
+            ],
+            vec!["pk1", "pk2"],
+        );
+        let ddl = pg_create_table_ddl("myschema", "mytable", &dataset).expect("ddl should generate");
+        assert!(ddl.contains("PRIMARY KEY (pk1, pk2)"));
+    }
+
+    #[test]
+    fn pg_ddl_excludes_op_columns() {
+        let dataset = make_dataset(
+            vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("_op", DataType::Utf8, true),
+                Field::new("_op_index", DataType::Int32, true),
+            ],
+            vec![],
+        );
+        let ddl = pg_create_table_ddl("s", "t", &dataset).expect("ddl should generate");
+        assert!(
+            !ddl.contains("_op"),
+            "DDL should not include _op column: {ddl}"
+        );
+        assert!(
+            !ddl.contains("_op_index"),
+            "DDL should not include _op_index: {ddl}"
+        );
+    }
+
+    #[test]
+    fn pg_ddl_errors_when_no_data_columns() {
+        let dataset = make_dataset(
+            vec![
+                Field::new("_op", DataType::Utf8, true),
+                Field::new("_op_index", DataType::Int32, true),
+            ],
+            vec![],
+        );
+        let err = pg_create_table_ddl("s", "empty_table", &dataset)
+            .expect_err("should fail when only _op columns remain");
+        assert!(
+            err.to_string().contains("no columns"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn pg_ddl_errors_for_unsupported_column_type() {
+        let dataset = make_dataset(
+            vec![Field::new(
+                "data",
+                DataType::Struct(vec![Field::new("k", DataType::Utf8, true)].into()),
+                true,
+            )],
+            vec![],
+        );
+        let err =
+            pg_create_table_ddl("s", "t", &dataset).expect_err("unsupported type should fail");
+        assert!(
+            err.to_string().contains("Unsupported Arrow type"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── PgConfig helpers ─────────────────────────────────────────────────────
+
+    #[test]
+    fn pg_config_adbc_uri_formats_correctly() {
+        let pg = make_pg_config();
+        let uri = pg.adbc_uri();
+        assert_eq!(uri, "postgresql://spice:s3cr3t@localhost:5432/spicebench");
+    }
+
+    #[test]
+    fn pg_config_adbc_uri_url_encodes_credentials() {
+        let pg = PgConfig {
+            user: "sp ice".to_string(),
+            password: "p@ss/word".to_string(),
+            ..make_pg_config()
+        };
+        let uri = pg.adbc_uri();
+        assert!(uri.contains("sp%20ice"), "space should be encoded: {uri}");
+        assert!(
+            uri.contains("p%40ss%2Fword"),
+            "@ and / should be encoded: {uri}"
+        );
+    }
+
+    #[test]
+    fn pg_config_libpq_connection_string_format() {
+        let pg = make_pg_config();
+        let cs = pg.libpq_connection_string();
+        assert_eq!(
+            cs,
+            "host=localhost port=5432 user=spice password=s3cr3t dbname=spicebench sslmode=disable"
+        );
+    }
+
+    #[test]
+    fn pg_config_adbc_kwargs_contains_uri() {
+        let pg = make_pg_config();
+        let kwargs = pg.adbc_kwargs();
+        let uri = kwargs.get("uri").expect("uri key should be present");
+        assert!(
+            uri.as_str().expect("uri should be a string").starts_with("postgresql://"),
+            "uri should be a postgresql:// URL: {uri}"
+        );
+    }
+
+    // ── generate_postgres_wal_spicepod ───────────────────────────────────────
+
+    #[test]
+    fn wal_spicepod_includes_schema_qualified_from_and_plain_name() {
+        let pg = make_pg_config();
+        let run_id = uuid::Uuid::nil();
+        let dataset = make_dataset(
+            vec![
+                Field::new("l_orderkey", DataType::Int64, false),
+                Field::new("l_quantity", DataType::Float64, true),
+            ],
+            vec!["l_orderkey"],
+        );
+        let datasets = HashMap::from([("lineitem".to_string(), dataset)]);
+
+        let spicepod = generate_postgres_wal_spicepod(&run_id, &pg, &datasets, "duckdb");
+        let yaml = yaml::to_string(&spicepod).expect("serialize");
+
+        // `from` must include the schema so the WAL connector reads from the right schema.
+        assert!(
+            yaml.contains("from: \"postgres:tpch_abc12345.lineitem\"")
+                || yaml.contains("from: 'postgres:tpch_abc12345.lineitem'"),
+            "from path should be schema-qualified: {yaml}"
+        );
+        // `name` must be the plain table name so TPCH queries resolve correctly.
+        assert!(
+            yaml.contains("name: lineitem"),
+            "dataset name should be unqualified: {yaml}"
+        );
+    }
+
+    #[test]
+    fn wal_spicepod_sets_per_table_publication() {
+        let pg = make_pg_config();
+        let run_id = uuid::Uuid::nil();
+        let datasets = HashMap::from([(
+            "orders".to_string(),
+            make_dataset(
+                vec![Field::new("o_orderkey", DataType::Int64, false)],
+                vec!["o_orderkey"],
+            ),
+        )]);
+
+        let spicepod = generate_postgres_wal_spicepod(&run_id, &pg, &datasets, "duckdb");
+        let yaml = yaml::to_string(&spicepod).expect("serialize");
+
+        assert!(
+            yaml.contains("spicebench_pub_orders"),
+            "publication name should include table name: {yaml}"
+        );
+    }
+
+    #[test]
+    fn wal_spicepod_sets_primary_key_and_upsert() {
+        let pg = make_pg_config();
+        let run_id = uuid::Uuid::nil();
+        let datasets = HashMap::from([(
+            "nation".to_string(),
+            make_dataset(
+                vec![
+                    Field::new("n_nationkey", DataType::Int32, false),
+                    Field::new("n_name", DataType::Utf8, false),
+                ],
+                vec!["n_nationkey"],
+            ),
+        )]);
+
+        let spicepod = generate_postgres_wal_spicepod(&run_id, &pg, &datasets, "duckdb");
+        let yaml = yaml::to_string(&spicepod).expect("serialize");
+
+        assert!(
+            yaml.contains("primary_key: n_nationkey"),
+            "primary key missing: {yaml}"
+        );
+        assert!(
+            yaml.contains("upsert"),
+            "on_conflict upsert missing: {yaml}"
+        );
+    }
+
+    #[test]
+    fn wal_spicepod_disables_telemetry() {
+        let pg = make_pg_config();
+        let run_id = uuid::Uuid::nil();
+        let spicepod = generate_postgres_wal_spicepod(&run_id, &pg, &HashMap::new(), "duckdb");
+        let yaml = yaml::to_string(&spicepod).expect("serialize");
+
+        assert!(
+            yaml.contains("enabled: false"),
+            "telemetry should be disabled: {yaml}"
+        );
+    }
+}

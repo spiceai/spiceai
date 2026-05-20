@@ -23,7 +23,7 @@ use uuid::Uuid;
 use super::{
     RunState, SetupConfig, generate_initial_spicepod, post_setup_sink_action, serialize_spicepod,
 };
-use crate::args::StdioArgs;
+use crate::args::{DeploymentMode, StdioArgs};
 use crate::commands;
 
 pub(super) async fn provision_scp_app(
@@ -31,6 +31,7 @@ pub(super) async fn provision_scp_app(
     args: &StdioArgs,
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
+    deployment_mode: &DeploymentMode,
 ) -> anyhow::Result<RunState> {
     let api_url = args.spice_cloud_api_url.trim_end_matches('/');
     let cloud = commands::build_cloud_client(Some(api_url), args.api_key.as_deref())?;
@@ -65,7 +66,7 @@ pub(super) async fn provision_scp_app(
         ephemeral_storage_limit_gb: args.ephemeral_storage_limit_gb.clone(),
         organization_tag: args.organization_tag.clone(),
     };
-    let app_id = commands::ensure_spice_cloud_app(&cloud, &app_name, &app_create_config).await?;
+    let app_id = commands::ensure_spice_cloud_app(&cloud, &app_name, &app_create_config, deployment_mode).await?;
 
     // Fetch API key from the dedicated api-keys endpoint
     let api_keys = cloud
@@ -93,8 +94,10 @@ pub(super) async fn provision_scp_app(
     eprintln!("[stdio] Spicepod secrets set");
 
     eprintln!("[stdio] Setting RUNNER secret...");
-    commands::secrets::set_secret(&cloud, app_id, "RUNNER", "spidapter").await?;
-    eprintln!("[stdio] RUNNER secret set");
+    match commands::secrets::set_secret(&cloud, app_id, "RUNNER", "spidapter").await {
+        Ok(()) => eprintln!("[stdio] RUNNER secret set"),
+        Err(e) => eprintln!("[stdio] warning: failed to set RUNNER secret (non-fatal): {e}"),
+    }
 
     // Apply custom image configuration if any image-related overrides are provided.
     // This updates the app's image_tag/update_channel before creating the deployment,
@@ -136,23 +139,19 @@ pub(super) async fn provision_scp_app(
     )
     .await?;
 
-    let _expected_executors: u64 = std::env::var("SPIDAPTER_NUM_EXECUTORS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
+    if deployment_mode == &DeploymentMode::Distributed {
+        let executor_wait_timeout = std::env::var("SPIDAPTER_DEPLOYMENT_READY_WAIT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(120);
 
-    let executor_wait_timeout = std::env::var("SPIDAPTER_DEPLOYMENT_READY_WAIT")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(120);
-
-    // after the deployment is reported "ready", wait for another 10 seconds (or SPIDAPTER_DEPLOYMENT_READY_WAIT seconds if set)
-    // not all executors may be connected yet. executors should know to create missing tables when they join: https://github.com/spiceai/spiceai/issues/9848
-    eprintln!(
-        "[stdio] Deployment is ready, waiting an additional {executor_wait_timeout}s for executors to connect..."
-    );
-    tokio::time::sleep(Duration::from_secs(executor_wait_timeout)).await;
-    // wait_for_scp_executor_count(&cloud, app_id, expected_executors, Duration::from_secs(executor_wait_timeout)).await;
+        // after the deployment is reported "ready", wait for executors to connect.
+        // not all executors may be connected yet. executors should know to create missing tables when they join: https://github.com/spiceai/spiceai/issues/9848
+        eprintln!(
+            "[stdio] Deployment is ready, waiting an additional {executor_wait_timeout}s for executors to connect..."
+        );
+        tokio::time::sleep(Duration::from_secs(executor_wait_timeout)).await;
+    }
 
     eprintln!("[stdio] Spice Cloud deployment ready for app '{app_name}' at {flight_url}");
 

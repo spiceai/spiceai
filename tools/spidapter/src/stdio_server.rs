@@ -313,8 +313,8 @@ impl Handler for SpidapterHandler {
         let backend = self.args.backend;
 
         let state = match (backend, self.args.deployment_mode) {
-            (BackendMode::Scp, _) => {
-                provision_scp_app(run_id, &self.args, &setup_config, &datasets).await
+            (BackendMode::Scp, deployment_mode) => {
+                provision_scp_app(run_id, &self.args, &setup_config, &datasets, &deployment_mode).await
             }
             (BackendMode::Local, DeploymentMode::SingleNode) => {
                 provision_local_single_node(
