@@ -2292,9 +2292,9 @@ mod accelerator_compat_tests {
             .expect("insert successful");
     }
 
-    /// DuckDB may rename inner field names in compound types (List, Map)
+    /// `DuckDB` may rename inner field names in compound types (`List`, `Map`)
     /// while keeping the data type structurally equivalent.
-    /// E.g. List(Field { name: "item", .. }) vs List(Field { name: "l", .. })
+    /// E.g. `List(Field { name: "item", .. })` vs `List(Field { name: "l", .. })`
     fn complex_types_structurally_equal(a: &DataType, b: &DataType) -> bool {
         match (a, b) {
             (DataType::List(fa), DataType::List(fb))
@@ -2407,11 +2407,7 @@ mod accelerator_compat_tests {
                                 DataType::Time64(TimeUnit::Microsecond)
                             )
                             | (
-                                DataType::Duration(_),
-                                DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
-                            )
-                            | (
-                                DataType::Interval(_),
+                                DataType::Duration(_) | DataType::Interval(_),
                                 DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
                             )
                     ) || complex_types_structurally_equal(original_type, table_type);
