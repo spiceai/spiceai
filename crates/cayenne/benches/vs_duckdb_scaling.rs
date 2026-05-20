@@ -13,7 +13,7 @@
 //! for 64-core deployments where Spice runs both ingestion (CDC / refresh)
 //! and query traffic in parallel.
 //!
-//! Two workloads are exercised, each across `[1, 2, 4, 8, 16, 32, 64]`
+//! Three workloads are exercised, each across `[1, 2, 4, 8, 16, 32, 64]`
 //! concurrency levels:
 //!
 //! * **`vs_duckdb_scaling_reads`** — N concurrent `SELECT COUNT(*)` queries
@@ -24,11 +24,24 @@
 //!   by mutex contention or runs cleanly to the core count.
 //!
 //! * **`vs_duckdb_scaling_writes`** — sustained insert throughput driven by
-//!   N concurrent background writer tasks against one table. Each writer
-//!   issues an insert, the runner waits N inserts then samples; criterion's
-//!   `throughput` metric reports rows/sec. Measures whether the per-table
-//!   write path scales with concurrent writers, or whether the per-table
-//!   `write_lock` at `provider/table.rs:1131` serialises them.
+//!   N concurrent background writer tasks against one table via the generic
+//!   `CayenneTableProvider::insert_into` path. Each writer pumps inserts in
+//!   a loop, the bench iter waits for N completions to pass before sampling.
+//!   Measures whether the per-table write path scales with concurrent
+//!   writers, or whether the per-table `write_lock` at
+//!   `provider/table.rs:1131` serialises them.
+//!
+//! * **`vs_duckdb_scaling_cdc`** — same shape as writes, but pumping
+//!   `CayenneTableProvider::write_cdc_append_stream` + `finish()` (the
+//!   production CDC pipelined path used by `refresh_mode: changes`) instead
+//!   of `insert_into`. Compares against DuckDB INSERT as the closest analog
+//!   since DuckDB has no CDC-pipelined entry point of its own.
+//!
+//! Workers in every lane are pooled per concurrency level (spawned once,
+//! signaled per iteration via per-worker `mpsc` channels), so worker-spawn
+//! cost falls outside criterion's timed region. The bench thread blocks on
+//! `mpsc::Receiver::recv_timeout` to drain completion signals — no CPU-burning
+//! `spin_loop`, no AtomicUsize counter.
 //!
 //! `BenchmarkId::new("…", N)` naming makes the throughput-vs-N curve visible
 //! directly in criterion's HTML output and parse-able from the text logs.
@@ -164,11 +177,7 @@ struct DuckDbReader {
 }
 
 impl DuckDbReader {
-    fn spawn(
-        conn: Connection,
-        go_rx: mpsc::Receiver<()>,
-        done_tx: mpsc::Sender<()>,
-    ) -> Self {
+    fn spawn(conn: Connection, go_rx: mpsc::Receiver<()>, done_tx: mpsc::Sender<()>) -> Self {
         let handle = std::thread::spawn(move || {
             // `recv()` returns Err when the bench drops its sender — exit
             // cleanly on teardown.
@@ -249,7 +258,8 @@ fn bench_read_scaling(c: &mut Criterion) {
         // `go_rx.recv()` returns None and the worker exits.
         cayenne_go_txs.clear();
         for w in cayenne_workers.drain(..) {
-            rt.block_on(async { w.handle.await }).expect("cayenne reader task");
+            rt.block_on(async { w.handle.await })
+                .expect("cayenne reader task");
         }
 
         // --- DuckDB pool: N persistent OS threads with the same per-worker
@@ -264,7 +274,11 @@ fn bench_read_scaling(c: &mut Criterion) {
                 .expect("duckdb connection clone");
             let (go_tx, go_rx) = mpsc::channel::<()>();
             duckdb_go_txs.push(go_tx);
-            duckdb_workers.push(DuckDbReader::spawn(conn_clone, go_rx, duckdb_done_tx.clone()));
+            duckdb_workers.push(DuckDbReader::spawn(
+                conn_clone,
+                go_rx,
+                duckdb_done_tx.clone(),
+            ));
         }
         drop(duckdb_done_tx);
 
@@ -310,12 +324,7 @@ struct CayenneBgWriter {
 }
 
 impl CayenneBgWriter {
-    fn spawn(
-        rt: &Runtime,
-        fixture: &CayenneFixture,
-        tx: mpsc::Sender<()>,
-        writer_id: i64,
-    ) -> Self {
+    fn spawn(rt: &Runtime, fixture: &CayenneFixture, tx: mpsc::Sender<()>, writer_id: i64) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
         let table = Arc::clone(&fixture.table);
@@ -463,7 +472,12 @@ fn bench_write_scaling(c: &mut Criterion) {
         let (duckdb_tx, duckdb_rx) = mpsc::channel::<()>();
         let mut duckdb_writers: Vec<DuckDbBgWriter> = (0..concurrency)
             .map(|i| {
-                DuckDbBgWriter::spawn(&duckdb_db_path, "scaling_write", duckdb_tx.clone(), i as i64)
+                DuckDbBgWriter::spawn(
+                    &duckdb_db_path,
+                    "scaling_write",
+                    duckdb_tx.clone(),
+                    i as i64,
+                )
             })
             .collect();
         drop(duckdb_tx);
@@ -505,12 +519,7 @@ struct CayenneCdcBgWriter {
 }
 
 impl CayenneCdcBgWriter {
-    fn spawn(
-        rt: &Runtime,
-        fixture: &CayenneFixture,
-        tx: mpsc::Sender<()>,
-        writer_id: i64,
-    ) -> Self {
+    fn spawn(rt: &Runtime, fixture: &CayenneFixture, tx: mpsc::Sender<()>, writer_id: i64) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
         let table = Arc::clone(&fixture.table);
