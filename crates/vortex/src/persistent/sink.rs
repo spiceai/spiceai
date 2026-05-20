@@ -261,7 +261,7 @@ async fn write_record_batch_stream_to_files(
                 );
                 active_writer = Some(start_file_writer(
                     &session,
-                    Arc::clone(&object_store),
+                    object_store.clone(),
                     file_path,
                     dtype.clone(),
                 ));
