@@ -393,7 +393,7 @@ impl TableProvider for EnsureSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::physical_expr::LexOrdering;
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::physical_plan::expressions::col as physical_col;
