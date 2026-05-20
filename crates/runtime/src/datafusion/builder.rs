@@ -506,17 +506,6 @@ impl DataFusionBuilder {
             }
         }
 
-        if cfg!(feature = "models") {
-            use super::SPICE_EVAL_SCHEMA;
-            let eval_schema = SpiceSchemaProvider::new();
-            match catalog.register_schema(SPICE_EVAL_SCHEMA, Arc::new(eval_schema)) {
-                Ok(_) => {}
-                Err(e) => {
-                    panic!("Unable to register spice eval schema: {e}");
-                }
-            }
-        }
-
         match catalog.register_schema(SPICE_METADATA_SCHEMA, Arc::new(metadata_schema)) {
             Ok(_) => {}
             Err(e) => {
