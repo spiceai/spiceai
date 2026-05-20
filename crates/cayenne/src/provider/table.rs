@@ -7818,9 +7818,7 @@ fn rewrite_consecutive_inlist_to_range_if_needed(expr: &Expr) -> Option<Expr> {
     let original_len = in_list.list.len();
     let mut values: Vec<i64> = Vec::with_capacity(original_len);
     for item in &in_list.list {
-        let Some(v) = extract_integer_literal(item) else {
-            return None;
-        };
+        let v = extract_integer_literal(item)?;
         values.push(v);
     }
     values.sort_unstable();
@@ -7831,9 +7829,7 @@ fn rewrite_consecutive_inlist_to_range_if_needed(expr: &Expr) -> Option<Expr> {
     // Safe: sorted+deduped+len>=2 guarantees both ends exist.
     let min = values[0];
     let max = values[values.len() - 1];
-    let Some(span) = max.checked_sub(min).and_then(|d| d.checked_add(1)) else {
-        return None;
-    };
+    let span = max.checked_sub(min).and_then(|d| d.checked_add(1))?;
     if usize::try_from(span).ok() != Some(values.len()) {
         return None;
     }

@@ -657,14 +657,13 @@ impl CayenneDeletionSink {
             // Deduplicate incoming row IDs first to avoid over-counting and redundant writes.
             let mut unique_new_row_ids: Vec<u32> = Vec::with_capacity(incoming_row_ids.len());
             for &id in incoming_row_ids {
-                match u32::try_from(id) {
-                    Ok(id32) => unique_new_row_ids.push(id32),
-                    Err(_) => {
-                        if first_overflow_id.is_none() {
-                            first_overflow_id = Some(id);
-                        }
-                        overflow_count += 1;
+                if let Ok(id32) = u32::try_from(id) {
+                    unique_new_row_ids.push(id32);
+                } else {
+                    if first_overflow_id.is_none() {
+                        first_overflow_id = Some(id);
                     }
+                    overflow_count += 1;
                 }
             }
             unique_new_row_ids.sort_unstable();
