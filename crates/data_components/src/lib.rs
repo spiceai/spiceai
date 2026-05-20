@@ -227,8 +227,11 @@ where
     if let Some(adaptor) = provider
         .as_any()
         .downcast_ref::<FederatedTableProviderAdaptor>()
-        && let Some(table_provider) = &adaptor.table_provider
     {
+        let Some(table_provider) = &adaptor.table_provider else {
+            return Arc::clone(&provider);
+        };
+
         let enriched_provider = metadata_enriched_table_provider(
             Arc::clone(table_provider),
             extra_metadata,
