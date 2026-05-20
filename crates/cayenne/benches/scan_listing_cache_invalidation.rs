@@ -14,31 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Regression bench: amplification cost of clearing the full
-//! [`scan_listing_tables`] cache on every CDC commit.
+//! Historical regression bench: amplification cost of clearing the former
+//! per-scan `ListingTable` cache on every CDC commit.
 //!
 //! Older versions of
 //! [`CayenneTableProvider::publish_current_snapshot_files_changed_under_held_fence`]
 //! cleared the entire scan-listing-table cache on every staged-append commit.
-//! The cache holds one [`Arc<ListingTable>`] per
+//! That cache held one [`Arc<ListingTable>`] per
 //! (`snapshot_id`, `target_partitions`, `collect_statistics`) tuple, populated
-//! lazily on the scan path via
-//! `CayenneTableProvider::scan_listing_table_for_config`
-//! (`crates/cayenne/src/provider/table.rs:7126-7163`).
+//! lazily on the scan path.
 //!
 //! Every PK-conflict-handled write inserts a fresh snapshot into
 //! `protected_snapshots` (`publish_written_snapshot_with_sequence`,
-//! `provider/table.rs:3058-3080`), so a table that absorbs upserts between
-//! compactions has N protected snapshots whose listing-table entries are
-//! still valid (their on-disk file set has not changed). A full cache clear
-//! evicts those entries too, so the next scan rebuilds `N + 1`
+//! in `provider/table.rs`), so a table that absorbs upserts between compactions
+//! has N protected snapshots whose listing-table entries are still valid (their
+//! on-disk file set has not changed). A full cache clear evicts those entries
+//! too, so the next scan rebuilds `N + 1`
 //! `ListingTable`s (current snapshot + every protected snapshot).
 //!
-//! The production path now retains entries whose snapshot IDs did not change:
-//! invalidate only the entries that became stale, preserve the rest. This is
-//! the same pattern Cayenne already uses for
-//! the runtime's per-URL `list_files_cache` (which `invalidate_list_files_cache`
-//! also targets at the current snapshot only).
+//! The production scan path now builds `FileScanConfig`s directly from listed
+//! `PartitionedFile`s, but this benchmark remains useful for comparing the
+//! construction overhead avoided by removing per-scan `ListingTable` planning.
 //!
 //! ## What this bench measures
 //!
@@ -47,13 +43,11 @@ limitations under the License.
 //!
 //! - `full_clear_baseline/<snapshots>` — mirrors the old behavior: clear
 //!   the cache, then rebuild `N + 1` `ListingTable` instances (one per
-//!   snapshot) using the same `ListingTable::try_new` path the production
-//!   `scan_listing_table_for_config` exercises. Models the next scan after
-//!   one CDC commit when `N` protected snapshots exist.
-//! - `targeted_retain_protected/<snapshots>` — models current behavior: clone the
-//!   `Arc<ListingTable>` for each non-current snapshot (cache hit), and
-//!   rebuild only the current snapshot's entry. Wall time is `N`
-//!   `Arc::clone` plus one `ListingTable::try_new`.
+//!   snapshot). Models the old next-scan-after-write shape when `N` protected
+//!   snapshots exist.
+//! - `targeted_retain_protected/<snapshots>` — models the targeted-invalidation
+//!   improvement that preceded direct scan planning: clone the `Arc<ListingTable>`
+//!   for each non-current snapshot and rebuild only the current snapshot's entry.
 //!
 //! The gap visualizes the per-scan-after-write overhead avoided by targeted
 //! invalidation. Per-scan, not per-write: writes are paced by their own cost,

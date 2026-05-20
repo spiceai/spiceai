@@ -1,0 +1,6 @@
+---
+source: crates/vortex/src/convert/exprs.rs
+expression: result.display_tree().to_string()
+---
+vortex.get_item(test_column)
+└── input: vortex.root()

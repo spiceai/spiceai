@@ -87,6 +87,7 @@ use std::sync::Arc;
 
 use arrow::array::UInt64Array;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use datafusion::catalog::TableProvider;
 use datafusion::prelude::SessionContext;
 use datafusion_expr::{col, lit};
 use tokio::runtime::Runtime;

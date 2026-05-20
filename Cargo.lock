@@ -21389,11 +21389,12 @@ dependencies = [
 
 [[package]]
 name = "vortex-datafusion"
-version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=86cc337cb133fc54ec45bd665e348453a84785a6#86cc337cb133fc54ec45bd665e348453a84785a6"
+version = "2.0.0-unstable"
 dependencies = [
+ "anyhow",
  "arrow-schema",
  "async-trait",
+ "datafusion",
  "datafusion-catalog",
  "datafusion-common",
  "datafusion-common-runtime",
@@ -21407,11 +21408,16 @@ dependencies = [
  "datafusion-physical-plan",
  "datafusion-pruning",
  "futures",
+ "insta",
  "itertools 0.14.0",
+ "moka",
  "object_store",
+ "rstest 0.26.1",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tracing",
+ "url",
  "uuid 1.21.0",
  "vortex",
  "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=86cc337cb133fc54ec45bd665e348453a84785a6)",
