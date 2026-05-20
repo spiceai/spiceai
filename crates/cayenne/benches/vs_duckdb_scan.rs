@@ -32,8 +32,8 @@ use tokio::runtime::Runtime;
 
 use common::{
     CAYENNE_LANES, CayenneFixture, DuckDbFixture, Metastore, capture_comparison_plans,
-    cayenne_insert, cayenne_query, duckdb_insert_parquet, duckdb_query_scalar, make_batch, schema,
-    setup_cayenne_for, setup_duckdb, write_parquet,
+    cayenne_insert, cayenne_query, cayenne_query_warm, duckdb_insert_parquet, duckdb_query_scalar,
+    make_batch, schema, setup_cayenne_for, setup_duckdb, warm_session_for, write_parquet,
 };
 
 const ROW_COUNTS: &[usize] = &[16_384, 131_072, 1_048_576];
@@ -85,6 +85,12 @@ fn bench_scan(c: &mut Criterion) {
             "SELECT SUM(value) FROM scan_bench",
         ));
 
+        // Long-lived SessionContext for the cayenne_warm/ lane. This measures
+        // Cayenne under steady-state session reuse — what a running Spice
+        // daemon actually pays per query, vs the cold-session path measured by
+        // the existing cayenne/ lane.
+        let warm_ctx = Arc::new(warm_session_for(&plan_cayenne_fixture.table));
+
         // --- count_star ---
         let mut cayenne_fixtures = Vec::new();
         for &lane in CAYENNE_LANES {
@@ -108,6 +114,19 @@ fn bench_scan(c: &mut Criterion) {
             );
         }
 
+        let wc = Arc::clone(&warm_ctx);
+        group.bench_with_input(
+            BenchmarkId::new("cayenne_warm/count_star", rows),
+            &rows,
+            |b, &_rows| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let batches = cayenne_query_warm(&wc, "SELECT COUNT(*) FROM t").await;
+                        black_box(batches);
+                    });
+                });
+            },
+        );
         let df = Arc::clone(&duckdb_fixture);
         group.bench_with_input(
             BenchmarkId::new("duckdb/count_star", rows),
@@ -138,6 +157,19 @@ fn bench_scan(c: &mut Criterion) {
             );
         }
 
+        let wc = Arc::clone(&warm_ctx);
+        group.bench_with_input(
+            BenchmarkId::new("cayenne_warm/sum_value", rows),
+            &rows,
+            |b, &_rows| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let batches = cayenne_query_warm(&wc, "SELECT SUM(value) FROM t").await;
+                        black_box(batches);
+                    });
+                });
+            },
+        );
         let df = Arc::clone(&duckdb_fixture);
         group.bench_with_input(
             BenchmarkId::new("duckdb/sum_value", rows),
@@ -182,6 +214,20 @@ fn bench_scan(c: &mut Criterion) {
             );
         }
 
+        let wc = Arc::clone(&warm_ctx);
+        let cayenne_sql_warm = cayenne_sql.clone();
+        group.bench_with_input(
+            BenchmarkId::new("cayenne_warm/filter_sum", rows),
+            &rows,
+            |b, &_rows| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let batches = cayenne_query_warm(&wc, &cayenne_sql_warm).await;
+                        black_box(batches);
+                    });
+                });
+            },
+        );
         let df = Arc::clone(&duckdb_fixture);
         let duckdb_sql_owned = duckdb_sql.clone();
         group.bench_with_input(

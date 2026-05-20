@@ -149,6 +149,7 @@ runtime:
   # Runtime params
   params:
     custom_runtime_param: value
+    cayenne_footer_cache_mb: '256'
     http_max_concurrent_requests: '8'
     http_requests_per_second_limit: '10'
     http_requests_per_minute_limit: '300'
@@ -592,7 +593,6 @@ datasets:
         cayenne_cayenne_s3_client_timeout: 30s
         cayenne_cayenne_s3_allow_http: 'false'
         cayenne_cayenne_s3_zone_ids: zone1,zone2
-        cayenne_footer_cache_mb: '256'
         cayenne_segment_cache_mb: '512'
         cayenne_cayenne_target_file_size_mb: '128'
         cayenne_sort_columns: id,timestamp

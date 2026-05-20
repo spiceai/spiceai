@@ -75,6 +75,16 @@ impl PositionDeletionVector {
     }
 
     #[must_use]
+    pub(crate) fn count_before_row(&self, row_count: usize) -> usize {
+        let deleted_rows = u32::try_from(row_count).map_or_else(
+            |_| self.row_ids.len(),
+            |row_count| self.row_ids.range_cardinality(0..row_count),
+        );
+
+        usize::try_from(deleted_rows).unwrap_or(usize::MAX)
+    }
+
+    #[must_use]
     pub(crate) fn to_bitmap(&self) -> RoaringBitmap {
         self.row_ids.clone()
     }

@@ -49,7 +49,7 @@ pub struct CayenneCatalogProviderConfig {
     pub metadata_dir: Option<String>,
     /// Base path used when data/metadata directories are not explicitly set.
     pub spice_data_base_path: String,
-    /// Footer cache size in MB.
+    /// Runtime-global footer cache size in MB, when explicitly configured by a caller.
     pub footer_cache_mb: Option<usize>,
     /// Segment cache size in MB.
     pub segment_cache_mb: Option<usize>,
@@ -261,10 +261,10 @@ impl CayenneCatalogProvider {
     }
 
     fn vortex_config_from_config(provider_config: &CayenneCatalogProviderConfig) -> VortexConfig {
-        let mut config = VortexConfig::default();
-        if let Some(v) = provider_config.footer_cache_mb {
-            config.footer_cache_mb = v;
-        }
+        let mut config = VortexConfig {
+            footer_cache_mb: provider_config.footer_cache_mb,
+            ..Default::default()
+        };
         if let Some(v) = provider_config.segment_cache_mb {
             config.segment_cache_mb = v;
         }

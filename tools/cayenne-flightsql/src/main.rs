@@ -23,7 +23,7 @@ use clap::Parser;
 use data_components::RefreshableCatalogProvider as _;
 use datafusion::{
     catalog::{CatalogProvider as _, SchemaProvider},
-    execution::SessionStateBuilder,
+    execution::{SessionStateBuilder, runtime_env::RuntimeEnvBuilder},
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_ddl::{DdlAnalyzerRule, DdlExtensionPlanner, new_shared_store};
@@ -95,6 +95,11 @@ enum Error {
         source: cayenne::catalog_provider::Error,
     },
 
+    #[snafu(display("Failed to initialize DataFusion runtime environment: {source}"))]
+    RuntimeEnv {
+        source: datafusion::error::DataFusionError,
+    },
+
     #[snafu(display("Failed to refresh Cayenne catalog: {source}"))]
     CayenneCatalogRefresh {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -139,10 +144,18 @@ async fn main() -> Result<()> {
             .clone_from(&args.default_schema);
     }
 
+    let mut runtime_env_builder = RuntimeEnvBuilder::new();
+    if let Some(footer_cache_mb) = args.cayenne_footer_cache_mb {
+        runtime_env_builder = runtime_env_builder
+            .with_metadata_cache_limit(footer_cache_mb.saturating_mul(1024 * 1024));
+    }
+    let runtime_env = runtime_env_builder.build_arc().context(RuntimeEnvSnafu)?;
+
     // Register DdlExtensionPlanner so that CREATE TABLE / DROP TABLE / CREATE SCHEMA
     // executed via Flight SQL create real Cayenne (Vortex) tables, not in-memory ones.
     let state = SessionStateBuilder::new()
         .with_config(session_config)
+        .with_runtime_env(runtime_env)
         .with_default_features()
         .with_query_planner(Arc::new(
             ExtensionPlanQueryPlanner::from_extension_planners(vec![Arc::new(DdlExtensionPlanner)]),
