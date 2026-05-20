@@ -7800,7 +7800,16 @@ impl CayenneTableProvider {
             }
         }
 
-        let inexact_stats = all_files.next().await.is_some();
+        let inexact_stats = if reached_limit {
+            match all_files.next().await {
+                Some(Ok(_)) => true,
+                Some(Err(err)) => return Err(err),
+                None => false,
+            }
+        } else {
+            false
+        };
+
         Ok((file_group, inexact_stats))
     }
 
