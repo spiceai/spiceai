@@ -191,7 +191,11 @@ impl MetadataEnrichedTableProvider {
             .map(|field| {
                 if let Some(extra) = field_metadata.get(field.name().as_str()) {
                     let mut metadata = field.metadata().clone();
-                    metadata.extend(extra.clone());
+                    metadata.extend(
+                        extra
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone())),
+                    );
                     Arc::new(field.as_ref().clone().with_metadata(metadata))
                 } else {
                     Arc::clone(field)
