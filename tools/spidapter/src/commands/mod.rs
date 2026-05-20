@@ -181,7 +181,7 @@ pub(crate) async fn ensure_spice_cloud_app(
         None
     };
 
-    eprintln!("[stdio] CreateAppRequest: {:?}", &CreateAppRequest {
+    let create_app_request = CreateAppRequest {
         name: app_name.to_string(),
         description: None,
         visibility: "private".to_string(),
@@ -197,27 +197,11 @@ pub(crate) async fn ensure_spice_cloud_app(
         resources: Some(resources),
         executor,
         storage_size_gb: None,
-    });
+    };
 
-    let create_result = cloud
-        .create_app(&CreateAppRequest {
-            name: app_name.to_string(),
-            description: None,
-            visibility: "private".to_string(),
-            cname: Some(cname),
-            tags: {
-                let mut tags = BTreeMap::from([("kind".to_string(), "cluster".to_string())]);
-                if let Some(org) = &config.organization_tag {
-                    tags.insert("organization".to_string(), org.clone());
-                }
-                Some(tags)
-            },
-            replicas: config.app_replicas,
-            resources: Some(resources),
-            executor,
-            storage_size_gb: None,
-        })
-        .await;
+    eprintln!("[stdio] CreateAppRequest: {:?}", create_app_request);
+
+    let create_result = cloud.create_app(&create_app_request).await;
 
     match create_result {
         Ok(app) => {
