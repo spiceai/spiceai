@@ -79,6 +79,7 @@ pub(super) async fn provision_scp_app(
     })?;
 
     eprintln!("[stdio] App ID: {app_id}");
+    eprintln!("[stdio] Deployment mode: {deployment_mode:?}");
 
     let spicepod = generate_initial_spicepod(&run_id, setup_config, datasets, None, args).await?;
     let spicepod_yaml = serialize_spicepod(&spicepod)?;
