@@ -4447,7 +4447,17 @@ impl CayenneTableProvider {
                     return Ok((Some(batch), 0));
                 }
 
-                let converter = self.build_pk_converter(pk_indices)?;
+                // Reuse the table's cached RowConverter when available — building
+                // a fresh one revalidates each SortField.
+                let owned_converter;
+                let converter: &RowConverter = match self.pk_row_converter.as_deref() {
+                    Some(c) => c,
+                    None => {
+                        owned_converter = self.build_pk_converter(pk_indices)?;
+                        &owned_converter
+                    }
+                };
+
                 let pk_columns: Vec<_> = pk_indices
                     .iter()
                     .map(|idx| Arc::clone(batch.column(*idx)))
@@ -7553,7 +7563,10 @@ impl CayenneTableProvider {
     }
 
     fn snapshot_scan_schema(file_schema: &SchemaRef, options: &ListingOptions) -> SchemaRef {
-        let mut builder = SchemaBuilder::from(file_schema.as_ref().clone());
+        // `SchemaBuilder::from(&Schema)` clones the metadata HashMap, but we then
+        // overwrite that metadata via `.with_metadata(...)` below. Building from
+        // `Fields` skips the wasted first clone.
+        let mut builder = SchemaBuilder::from(file_schema.fields());
         for (name, data_type) in &options.table_partition_cols {
             builder.push(Field::new(name, data_type.clone(), false));
         }
@@ -8462,9 +8475,10 @@ impl TableProvider for CayenneTableProvider {
         } else {
             // Apply projection to inlined batches if needed
             let proj_schema = if let Some(ref proj) = effective_projection {
+                let schema_fields = self.table_metadata.schema.fields();
                 let fields: Vec<arrow_schema::FieldRef> = proj
                     .iter()
-                    .map(|&i| self.table_metadata.schema.field(i).clone().into())
+                    .map(|&i| Arc::clone(&schema_fields[i]))
                     .collect();
                 Arc::new(arrow_schema::Schema::new(fields))
             } else {
@@ -8738,11 +8752,15 @@ impl TableProvider for CayenneTableProvider {
                 .build()?;
         }
 
-        let mut proj_exprs = Vec::new();
+        let assignment_by_col: HashMap<&str, &Expr> = assignments
+            .iter()
+            .map(|(name, expr)| (name.as_str(), expr))
+            .collect();
+        let mut proj_exprs = Vec::with_capacity(schema.fields().len());
         for field in schema.fields() {
             let col_name = field.name();
-            if let Some((_, expr)) = assignments.iter().find(|(name, _)| name == col_name) {
-                proj_exprs.push(expr.clone().alias(col_name));
+            if let Some(expr) = assignment_by_col.get(col_name.as_str()) {
+                proj_exprs.push((*expr).clone().alias(col_name));
             } else {
                 proj_exprs.push(datafusion_expr::col(col_name));
             }
