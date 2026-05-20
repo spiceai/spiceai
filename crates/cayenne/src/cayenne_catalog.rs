@@ -518,30 +518,34 @@ impl CayenneCatalog {
         pk_bytes_list: &[Vec<u8>],
         sequence_number: i64,
     ) -> (String, Vec<MetastoreValue>) {
-        let mut values_parts = Vec::with_capacity(pk_bytes_list.len());
+        use std::fmt::Write as _;
+
+        const PREFIX: &str = "INSERT OR REPLACE INTO cayenne_insert_record \
+             (insert_record_id, table_id, pk_bytes, sequence_number) VALUES ";
+        // Each "(?N, ?N, ?N, ?N)" row is ≤ 32 bytes for the placeholder counts we hit.
+        let mut sql = String::with_capacity(PREFIX.len() + pk_bytes_list.len() * 32);
+        sql.push_str(PREFIX);
         let mut params = Vec::with_capacity(pk_bytes_list.len() * 4);
-        let table_id = table_id.to_string();
 
         for (i, pk_bytes) in pk_bytes_list.iter().enumerate() {
             let base = i * 4 + 1; // SQLite params are 1-indexed
-            values_parts.push(format!(
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            // `write!` into a `String` is infallible.
+            let _ = write!(
+                sql,
                 "(?{}, ?{}, ?{}, ?{})",
                 base,
                 base + 1,
                 base + 2,
                 base + 3
-            ));
+            );
             params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
-            params.push(MetastoreValue::Text(table_id.clone()));
+            params.push(MetastoreValue::Text(table_id.to_string()));
             params.push(MetastoreValue::Blob(pk_bytes.clone()));
             params.push(MetastoreValue::Integer(sequence_number));
         }
-
-        let sql = format!(
-            "INSERT OR REPLACE INTO cayenne_insert_record \
-             (insert_record_id, table_id, pk_bytes, sequence_number) VALUES {}",
-            values_parts.join(", ")
-        );
 
         (sql, params)
     }
@@ -554,13 +558,38 @@ impl CayenneCatalog {
     fn build_insert_delete_files_chunk_sql(
         delete_files: &[DeleteFile],
     ) -> (String, Vec<MetastoreValue>) {
+        use std::fmt::Write as _;
+
         const PARAMS_PER_ROW: usize = 9;
-        let mut values_parts = Vec::with_capacity(delete_files.len());
+        const PREFIX: &str = "INSERT INTO cayenne_delete_file (\
+                 delete_file_id, table_id, path, path_is_relative, \
+                 format, delete_count, file_size_bytes, source_data_file_path, sequence_number\
+             ) VALUES ";
+        const SUFFIX: &str = " \
+             ON CONFLICT(table_id, path) DO UPDATE SET \
+                 path = CASE \
+                     WHEN cayenne_delete_file.path_is_relative = excluded.path_is_relative \
+                         AND cayenne_delete_file.format = excluded.format \
+                         AND cayenne_delete_file.delete_count = excluded.delete_count \
+                         AND cayenne_delete_file.file_size_bytes = excluded.file_size_bytes \
+                         AND cayenne_delete_file.source_data_file_path IS excluded.source_data_file_path \
+                         AND cayenne_delete_file.sequence_number = excluded.sequence_number \
+                     THEN cayenne_delete_file.path \
+                     ELSE NULL \
+                 END";
+        // Each "(?N, ?N, ?N, ?N, ?N, ?N, ?N, ?N, ?N)" row averages ~64 bytes.
+        let mut sql =
+            String::with_capacity(PREFIX.len() + SUFFIX.len() + delete_files.len() * 64);
+        sql.push_str(PREFIX);
         let mut params = Vec::with_capacity(delete_files.len() * PARAMS_PER_ROW);
 
         for (i, delete_file) in delete_files.iter().enumerate() {
             let base = i * PARAMS_PER_ROW + 1; // 1-indexed
-            values_parts.push(format!(
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            let _ = write!(
+                sql,
                 "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
                 base,
                 base + 1,
@@ -571,7 +600,7 @@ impl CayenneCatalog {
                 base + 6,
                 base + 7,
                 base + 8,
-            ));
+            );
             params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
             params.push(MetastoreValue::Text(delete_file.table_id.clone()));
             params.push(MetastoreValue::Text(delete_file.path.clone()));
@@ -588,25 +617,7 @@ impl CayenneCatalog {
             params.push(MetastoreValue::Integer(delete_file.sequence_number));
         }
 
-        let sql = format!(
-            "INSERT INTO cayenne_delete_file (\
-                 delete_file_id, table_id, path, path_is_relative, \
-                 format, delete_count, file_size_bytes, source_data_file_path, sequence_number\
-             ) VALUES {} \
-             ON CONFLICT(table_id, path) DO UPDATE SET \
-                 path = CASE \
-                     WHEN cayenne_delete_file.path_is_relative = excluded.path_is_relative \
-                         AND cayenne_delete_file.format = excluded.format \
-                         AND cayenne_delete_file.delete_count = excluded.delete_count \
-                         AND cayenne_delete_file.file_size_bytes = excluded.file_size_bytes \
-                         AND cayenne_delete_file.source_data_file_path IS excluded.source_data_file_path \
-                         AND cayenne_delete_file.sequence_number = excluded.sequence_number \
-                     THEN cayenne_delete_file.path \
-                     ELSE NULL \
-                 END",
-            values_parts.join(", ")
-        );
-
+        sql.push_str(SUFFIX);
         (sql, params)
     }
 }
@@ -1094,16 +1105,19 @@ impl MetadataCatalog for CayenneCatalog {
             return Ok(());
         }
 
-        let placeholders = delete_file_ids
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| format!("?{}", idx + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
+        use std::fmt::Write as _;
 
-        let sql = format!(
-            "DELETE FROM cayenne_delete_file WHERE table_id = ?1 AND delete_file_id IN ({placeholders})"
-        );
+        const PREFIX: &str =
+            "DELETE FROM cayenne_delete_file WHERE table_id = ?1 AND delete_file_id IN (";
+        let mut sql = String::with_capacity(PREFIX.len() + delete_file_ids.len() * 6 + 1);
+        sql.push_str(PREFIX);
+        for idx in 0..delete_file_ids.len() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+            let _ = write!(sql, "?{}", idx + 2);
+        }
+        sql.push(')');
 
         let mut params = Vec::with_capacity(delete_file_ids.len() + 1);
         params.push(MetastoreValue::Text(table_id.to_string()));
