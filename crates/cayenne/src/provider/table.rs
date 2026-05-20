@@ -7805,43 +7805,80 @@ fn is_literal_like(expr: &Expr) -> bool {
 /// short list, non-integer literals, sparse values, duplicate values) are
 /// returned unchanged.
 pub(crate) fn rewrite_consecutive_inlist_to_range(expr: Expr) -> Expr {
+    rewrite_consecutive_inlist_to_range_if_needed(&expr).unwrap_or(expr)
+}
+
+fn rewrite_consecutive_inlist_to_range_if_needed(expr: &Expr) -> Option<Expr> {
     let Expr::InList(in_list) = &expr else {
-        return expr;
+        return None;
     };
     if in_list.negated || in_list.list.len() < MIN_CONSECUTIVE_INLIST_REWRITE_VALUES {
-        return expr;
+        return None;
     }
     let original_len = in_list.list.len();
     let mut values: Vec<i64> = Vec::with_capacity(original_len);
     for item in &in_list.list {
         let Some(v) = extract_integer_literal(item) else {
-            return expr;
+            return None;
         };
         values.push(v);
     }
     values.sort_unstable();
     values.dedup();
     if values.len() != original_len {
-        return expr;
+        return None;
     }
     // Safe: sorted+deduped+len>=2 guarantees both ends exist.
     let min = values[0];
     let max = values[values.len() - 1];
     let Some(span) = max.checked_sub(min).and_then(|d| d.checked_add(1)) else {
-        return expr;
+        return None;
     };
     if usize::try_from(span).ok() != Some(values.len()) {
-        return expr;
+        return None;
     }
     let col_expr = (*in_list.expr).clone();
     let lit_min = Expr::Literal(ScalarValue::Int64(Some(min)), None);
     let lit_max = Expr::Literal(ScalarValue::Int64(Some(max)), None);
-    Expr::Between(datafusion_expr::expr::Between::new(
+    Some(Expr::Between(datafusion_expr::expr::Between::new(
         Box::new(col_expr),
         false,
         Box::new(lit_min),
         Box::new(lit_max),
-    ))
+    )))
+}
+
+fn rewritten_scan_filters(
+    filters: &[Expr],
+    retention_keep_filter: Option<&Expr>,
+) -> Option<Vec<Expr>> {
+    if let Some(keep_filter) = retention_keep_filter {
+        return Some(
+            filters
+                .iter()
+                .map(|filter| {
+                    rewrite_consecutive_inlist_to_range_if_needed(filter)
+                        .unwrap_or_else(|| filter.clone())
+                })
+                .chain(std::iter::once(keep_filter.clone()))
+                .collect(),
+        );
+    }
+
+    for (index, filter) in filters.iter().enumerate() {
+        if let Some(rewritten_filter) = rewrite_consecutive_inlist_to_range_if_needed(filter) {
+            let mut effective_filters = Vec::with_capacity(filters.len());
+            effective_filters.extend(filters[..index].iter().cloned());
+            effective_filters.push(rewritten_filter);
+            effective_filters.extend(filters[index + 1..].iter().map(|filter| {
+                rewrite_consecutive_inlist_to_range_if_needed(filter)
+                    .unwrap_or_else(|| filter.clone())
+            }));
+            return Some(effective_filters);
+        }
+    }
+
+    None
 }
 
 /// Returns `Some(v)` if `expr` is an integer-typed literal (possibly wrapped
@@ -7984,29 +8021,15 @@ impl TableProvider for CayenneTableProvider {
         // are semantically equivalent but the range path is ~50 % cheaper per
         // row (two `i64` comparisons vs an N-element set probe). See
         // `pk_in_list_vs_range_rewrite` bench.
-        let effective_filters: Vec<Expr> = match &retention_keep_filter {
-            Some(keep_filter) => filters
-                .iter()
-                .cloned()
-                .map(rewrite_consecutive_inlist_to_range)
-                .chain(std::iter::once(keep_filter.clone()))
-                .collect(),
-            None => filters
-                .iter()
-                .cloned()
-                .map(rewrite_consecutive_inlist_to_range)
-                .collect(),
-        };
+        let effective_filters = rewritten_scan_filters(filters, retention_keep_filter.as_ref());
+        let scan_filters: &[Expr] = effective_filters.as_ref().map_or(filters, Vec::as_slice);
         if retention_keep_filter.is_some() {
             tracing::trace!(
                 table = %self.table_metadata.table_name,
-                total_filters = effective_filters.len(),
+                total_filters = scan_filters.len(),
                 "Injected time_retention keep-filter into scan filters"
             );
         }
-        let scan_filters: &[Expr] = &effective_filters;
-
-        let target_partitions = state.config().target_partitions();
 
         // For PK point lookups (e.g. `WHERE pk_col = K`), force the inner
         // `ListingTable` to use `target_partitions = 1` so DataFusion does NOT

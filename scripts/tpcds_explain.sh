@@ -54,7 +54,7 @@ done
 
 if [[ $need_gen -eq 1 ]]; then
   echo "Generating TPC-DS SF${SCALE_FACTOR} Parquet into $DATA_DIR/ (this can take 1-5 min)..."
-  tmpdb=$(mktemp -t tpcds.XXXXXX).duckdb
+  tmpdb=$(mktemp -t tpcds.XXXXXX.duckdb)
   duckdb "$tmpdb" <<SQL
 INSTALL tpcds; LOAD tpcds;
 CALL dsdgen(sf=${SCALE_FACTOR});
