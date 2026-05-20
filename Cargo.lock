@@ -4143,6 +4143,7 @@ version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "chrono",
+ "data_components",
  "datafusion",
  "datafusion-table-providers",
  "linkme",
@@ -4215,6 +4216,7 @@ dependencies = [
  "snafu",
  "tokio",
  "tokio-postgres",
+ "tracing",
 ]
 
 [[package]]
