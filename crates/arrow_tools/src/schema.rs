@@ -344,19 +344,19 @@ pub fn is_numeric_widening(from: &DataType, to: &DataType) -> bool {
     matches!(
         (from, to),
         (
-            DataType::Int8,
-            DataType::Int16 | DataType::Int32 | DataType::Int64
-        ) | (DataType::Int16, DataType::Int32 | DataType::Int64)
-            | (DataType::Int32, DataType::Int64)
+            DataType::Int8 | DataType::Int16 | DataType::Int32,
+            DataType::Int64
+        ) | (DataType::Int8 | DataType::Int16, DataType::Int32)
+            | (DataType::Int8, DataType::Int16)
             | (
-                DataType::UInt8,
-                DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+                DataType::UInt8 | DataType::UInt16 | DataType::UInt32,
+                DataType::UInt64
             )
-            | (DataType::UInt16, DataType::UInt32 | DataType::UInt64)
-            | (DataType::UInt32, DataType::UInt64)
-            | (DataType::Float32, DataType::Float64)
+            | (DataType::UInt8 | DataType::UInt16, DataType::UInt32)
+            | (DataType::UInt8, DataType::UInt16)
             | (
-                DataType::Int8
+                DataType::Float32
+                    | DataType::Int8
                     | DataType::Int16
                     | DataType::Int32
                     | DataType::UInt8
