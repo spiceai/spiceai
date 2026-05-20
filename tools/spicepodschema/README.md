@@ -265,7 +265,6 @@ The schema generator enriches the base Spicepod schema with connector-specific p
 | **Secrets**               | ✅                | Secret Stores          | ✅            | ⚠️ No `ParameterSpec` defined |
 | **Views**                 | ❌                | None (SQL-based)       | ❌            | N/A                          |
 | **Workers**               | ❌                | None                   | ✅ (generic)  | N/A                          |
-| **Evals**                 | ❌                | None                   | ❌            | N/A                          |
 
 ### Currently Covered
 
