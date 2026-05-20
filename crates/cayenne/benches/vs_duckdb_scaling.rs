@@ -76,17 +76,21 @@ use duckdb::Connection;
 use tokio::runtime::Runtime;
 
 /// Whether the given Cayenne metastore lane is exercised by the
-/// sustained-writes scaling benches. Returns `false` for Turso today —
-/// the sustained-writes pattern (one fixture, many writes through a
-/// single writer task) reproducibly trips Turso's optimistic concurrency
-/// control. The reader scaling bench is unaffected and still runs both
-/// lanes. See the comment at the top of `bench_write_scaling` for the
-/// full story and the follow-up plan.
+/// sustained-writes scaling benches. Returns `true` for every backend
+/// currently — earlier this gated Turso off because the sustained-writes
+/// pattern tripped Turso's BEGIN CONCURRENT commit-time MVCC and the
+/// retry-on-conflict matcher in `turso-shared` only recognised SQLite
+/// `BUSY`/`LOCKED` messages, not Turso's `"Write-write conflict"`. That
+/// matcher now accepts the Turso message, so the existing retry loops
+/// in `commit_inlined_mutation` (and siblings) converge under
+/// sustained writes. Kept as a switch so a future backend that genuinely
+/// can't survive sustained writes (e.g., a snapshot-only metastore) can
+/// opt out without bench-file surgery.
 fn lane_supports_sustained_writes(lane: common::Metastore) -> bool {
     match lane {
         common::Metastore::Sqlite => true,
         #[cfg(feature = "turso")]
-        common::Metastore::Turso => false,
+        common::Metastore::Turso => true,
     }
 }
 
@@ -476,19 +480,13 @@ fn bench_write_scaling(c: &mut Criterion) {
     // For each Cayenne metastore lane: run the full concurrency sweep.
     // Each (lane, concurrency) point gets a fresh fixture because writes
     // accumulate state on disk and we want every measurement to start
-    // from an empty table.
-    //
-    // Turso writes are intentionally skipped here. The sustained-writes
-    // pattern this bench uses (one fixture, many writes from a single
-    // writer task) reproducibly trips Turso's optimistic concurrency
-    // control on the very first insert with
-    // `"Failed to commit transaction: Write-write conflict"`. The
-    // existing `vs_duckdb_burst/cayenne_turso/*` and
-    // `vs_duckdb_upsert/cayenne_turso/*` benches do work because they
-    // use `iter_batched` with a fresh fixture per criterion sample, so
-    // writes never stack against one Turso instance. The interaction
-    // between Cayenne's mutation path and Turso's K=16 pool needs its
-    // own follow-up — track at the issue named in the PR description.
+    // from an empty table. Both backends (`Sqlite` + `Turso`) run today —
+    // earlier Turso was gated off because `is_retryable_write_conflict`
+    // didn't recognise Turso's BEGIN CONCURRENT "Write-write conflict"
+    // message. Once that matcher was fixed, the existing retry-on-conflict
+    // loop in `commit_inlined_mutation` converges and sustained Turso
+    // writes complete cleanly. The `lane_supports_sustained_writes` gate
+    // stays as a future switch.
     for &lane in CAYENNE_LANES {
         if !lane_supports_sustained_writes(lane) {
             continue;
@@ -672,9 +670,9 @@ fn bench_cdc_scaling(c: &mut Criterion) {
     // instead of `insert_into`. Lane id is `cayenne_cdc` (Sqlite) or
     // `cayenne_turso_cdc` (Turso).
     //
-    // Turso CDC is skipped here for the same sustained-writes /
-    // write-write-conflict reason as `bench_write_scaling` — see the
-    // long comment there.
+    // Both backends (`Sqlite` + `Turso`) run today — see the comment at
+    // the top of `bench_write_scaling` for why the Turso lane is no
+    // longer gated off.
     for &lane in CAYENNE_LANES {
         if !lane_supports_sustained_writes(lane) {
             continue;

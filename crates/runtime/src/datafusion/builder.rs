@@ -38,7 +38,10 @@ use cayenne::optimizer_rules::{
     CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneOptimizerConfig,
 };
 #[cfg(not(windows))]
-use cayenne::{CayenneTableProvider, logical_optimizer::CayennePropagateFilterAcrossEquiJoinKeys};
+use cayenne::{
+    CayenneTableProvider,
+    logical_optimizer::{CayenneInListToRangeRewrite, CayennePropagateFilterAcrossEquiJoinKeys},
+};
 #[cfg(not(windows))]
 use data_components::poly::PolyTableProvider;
 #[cfg(not(windows))]
@@ -370,11 +373,17 @@ impl DataFusionBuilder {
         if let Some(target_partitions) = self.target_partitions {
             if target_partitions > 0 {
                 config = config.with_target_partitions(target_partitions);
+                tracing::info!(target_partitions, "Applied runtime.query.target_partitions");
             } else {
                 tracing::warn!(
                     "Ignoring runtime.query.target_partitions=0; value must be greater than 0"
                 );
             }
+        } else {
+            tracing::info!(
+                effective = config.options().execution.target_partitions,
+                "runtime.query.target_partitions not set; using DataFusion default"
+            );
         }
 
         let exact_join_filter_memory_limit =
@@ -678,30 +687,42 @@ fn with_cayenne_logical_optimizer(mut state: SessionStateBuilder) -> SessionStat
 
 #[cfg(not(windows))]
 fn insert_cayenne_logical_optimizer_rule(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
-    if rules
+    if !rules
         .iter()
         .any(|rule| rule.name() == "cayenne_propagate_filter_across_equi_join_keys")
     {
-        return;
+        let insert_at = rules
+            .iter()
+            .position(|rule| rule.name() == "decorrelate_predicate_subquery")
+            .unwrap_or_else(|| {
+                rules
+                    .iter()
+                    .position(|rule| rule.name() == "push_down_filter")
+                    .unwrap_or(rules.len())
+            });
+        rules.insert(
+            insert_at,
+            Arc::new(
+                CayennePropagateFilterAcrossEquiJoinKeys::new_with_table_provider_predicate(
+                    is_cayenne_accelerated_table_provider,
+                ),
+            ),
+        );
     }
 
-    let insert_at = rules
+    // Run the IN-list → BETWEEN rewrite ahead of `simplify_expressions` so the
+    // downstream simplifier can fold the resulting `Expr::Between` the same way
+    // it folds a SQL-parsed BETWEEN.
+    if !rules
         .iter()
-        .position(|rule| rule.name() == "decorrelate_predicate_subquery")
-        .unwrap_or_else(|| {
-            rules
-                .iter()
-                .position(|rule| rule.name() == "push_down_filter")
-                .unwrap_or(rules.len())
-        });
-    rules.insert(
-        insert_at,
-        Arc::new(
-            CayennePropagateFilterAcrossEquiJoinKeys::new_with_table_provider_predicate(
-                is_cayenne_accelerated_table_provider,
-            ),
-        ),
-    );
+        .any(|rule| rule.name() == "cayenne_inlist_to_range_rewrite")
+    {
+        let insert_at = rules
+            .iter()
+            .position(|rule| rule.name() == "simplify_expressions")
+            .unwrap_or(rules.len());
+        rules.insert(insert_at, Arc::new(CayenneInListToRangeRewrite::new()));
+    }
 }
 
 #[cfg(not(windows))]
@@ -1092,6 +1113,54 @@ mod tests {
         assert!((config.sort_merge_memory_pool_fraction - 0.25).abs() < f64::EPSILON);
         assert_eq!(config.sort_merge_memory_pool_bytes, Some(1_024));
         assert_eq!(config.exact_join_filter_max_bytes, 128);
+    }
+
+    #[test]
+    fn test_target_partitions_wires_through_to_session_config() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle.clone(),
+        )
+        .target_partitions(Some(4))
+        .build();
+
+        assert_eq!(
+            df.ctx
+                .state()
+                .config()
+                .options()
+                .execution
+                .target_partitions,
+            4,
+            "target_partitions wired through DataFusionBuilder should be visible on the session config"
+        );
+
+        // Sanity check the inverse — None leaves DataFusion's default in place.
+        let df_default = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .target_partitions(None)
+        .build();
+        assert_ne!(
+            df_default
+                .ctx
+                .state()
+                .config()
+                .options()
+                .execution
+                .target_partitions,
+            4,
+            "Without an override target_partitions should fall back to DataFusion's default"
+        );
     }
 
     #[test]

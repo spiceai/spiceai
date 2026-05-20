@@ -34,7 +34,7 @@ limitations under the License.
 
 use hash_index::{BloomFilter, hash_key};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 /// Bloom filter capacity floor: keep some signal even for empty / tiny sets so that the
 /// "probably-not-present" path stays useful when a fresh index is constructed.
@@ -83,6 +83,17 @@ impl DeletionIndex {
             max_sequence_number: None,
             bloom_capacity: MIN_BLOOM_CAPACITY,
         }
+    }
+
+    /// Process-wide shared empty index. Use this instead of
+    /// `Arc::new(Self::empty())` from per-scan hot paths — the bloom
+    /// allocation is amortized across every caller. See
+    /// `apply_partial_filter_empty_alloc` bench.
+    #[must_use]
+    pub fn shared_empty() -> Arc<Self> {
+        static EMPTY: LazyLock<Arc<DeletionIndex>> =
+            LazyLock::new(|| Arc::new(DeletionIndex::empty()));
+        Arc::clone(&EMPTY)
     }
 
     /// Build a frozen index from an owned `HashMap` of `pk -> delete_sequence`.
@@ -284,6 +295,15 @@ impl KeyDeletionIndex {
             max_sequence_number: None,
             bloom_capacity: MIN_BLOOM_CAPACITY,
         }
+    }
+
+    /// Process-wide shared empty index. Use this instead of
+    /// `Arc::new(Self::empty())` from per-scan hot paths.
+    #[must_use]
+    pub fn shared_empty() -> Arc<Self> {
+        static EMPTY: LazyLock<Arc<KeyDeletionIndex>> =
+            LazyLock::new(|| Arc::new(KeyDeletionIndex::empty()));
+        Arc::clone(&EMPTY)
     }
 
     /// Build a frozen index from an owned `HashMap` of `pk_bytes -> delete_sequence`.

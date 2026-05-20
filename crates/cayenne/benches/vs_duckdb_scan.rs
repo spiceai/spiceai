@@ -31,15 +31,15 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use tokio::runtime::Runtime;
 
 use common::{
-    CayenneFixture, DuckDbFixture, capture_comparison_plans, cayenne_insert, cayenne_query,
-    cayenne_query_warm, duckdb_insert_parquet, duckdb_query_scalar, make_batch, schema,
-    setup_cayenne, setup_duckdb, warm_session_for, write_parquet,
+    CAYENNE_LANES, CayenneFixture, DuckDbFixture, Metastore, capture_comparison_plans,
+    cayenne_insert, cayenne_query, cayenne_query_warm, duckdb_insert_parquet, duckdb_query_scalar,
+    make_batch, schema, setup_cayenne_for, setup_duckdb, warm_session_for, write_parquet,
 };
 
 const ROW_COUNTS: &[usize] = &[16_384, 131_072, 1_048_576];
 
-async fn load_cayenne(rows: usize) -> CayenneFixture {
-    let fixture = setup_cayenne("scan_bench").await;
+async fn load_cayenne(lane: Metastore, rows: usize) -> CayenneFixture {
+    let fixture = setup_cayenne_for("scan_bench", lane).await;
     let batch = make_batch(schema(), 0, rows);
     let _ = cayenne_insert(&fixture.table, batch).await;
     fixture
@@ -66,12 +66,12 @@ fn bench_scan(c: &mut Criterion) {
         write_parquet(&batch, &parquet_path);
 
         // Load once, query many times — match the steady-state read pattern.
-        let cayenne_fixture = Arc::new(rt.block_on(load_cayenne(rows)));
+        let plan_cayenne_fixture = Arc::new(rt.block_on(load_cayenne(Metastore::Sqlite, rows)));
         let duckdb_fixture = Arc::new(load_duckdb(&parquet_path));
 
         rt.block_on(capture_comparison_plans(
             &format!("scan/{rows}/count_star"),
-            &cayenne_fixture.table,
+            &plan_cayenne_fixture.table,
             &duckdb_fixture.conn,
             "SELECT COUNT(*) FROM t",
             "SELECT COUNT(*) FROM scan_bench",
@@ -79,7 +79,7 @@ fn bench_scan(c: &mut Criterion) {
 
         rt.block_on(capture_comparison_plans(
             &format!("scan/{rows}/sum_value"),
-            &cayenne_fixture.table,
+            &plan_cayenne_fixture.table,
             &duckdb_fixture.conn,
             "SELECT SUM(value) FROM t",
             "SELECT SUM(value) FROM scan_bench",
@@ -89,22 +89,31 @@ fn bench_scan(c: &mut Criterion) {
         // Cayenne under steady-state session reuse — what a running Spice
         // daemon actually pays per query, vs the cold-session path measured by
         // the existing cayenne/ lane.
-        let warm_ctx = Arc::new(warm_session_for(&cayenne_fixture.table));
+        let warm_ctx = Arc::new(warm_session_for(&plan_cayenne_fixture.table));
 
         // --- count_star ---
-        let cf = Arc::clone(&cayenne_fixture);
-        group.bench_with_input(
-            BenchmarkId::new("cayenne/count_star", rows),
-            &rows,
-            |b, &_rows| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        let batches = cayenne_query(&cf.table, "SELECT COUNT(*) FROM t").await;
-                        black_box(batches);
+        let mut cayenne_fixtures = Vec::new();
+        for &lane in CAYENNE_LANES {
+            cayenne_fixtures.push((lane.lane(), Arc::new(rt.block_on(load_cayenne(lane, rows)))));
+        }
+
+        for (lane_label, cayenne_fixture) in &cayenne_fixtures {
+            let fixture = Arc::clone(cayenne_fixture);
+            group.bench_with_input(
+                BenchmarkId::new(format!("{lane_label}/count_star"), rows),
+                &rows,
+                |b, &_rows| {
+                    b.iter(|| {
+                        rt.block_on(async {
+                            let batches =
+                                cayenne_query(&fixture.table, "SELECT COUNT(*) FROM t").await;
+                            black_box(batches);
+                        });
                     });
-                });
-            },
-        );
+                },
+            );
+        }
+
         let wc = Arc::clone(&warm_ctx);
         group.bench_with_input(
             BenchmarkId::new("cayenne_warm/count_star", rows),
@@ -131,19 +140,23 @@ fn bench_scan(c: &mut Criterion) {
         );
 
         // --- sum_value ---
-        let cf = Arc::clone(&cayenne_fixture);
-        group.bench_with_input(
-            BenchmarkId::new("cayenne/sum_value", rows),
-            &rows,
-            |b, &_rows| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        let batches = cayenne_query(&cf.table, "SELECT SUM(value) FROM t").await;
-                        black_box(batches);
+        for (lane_label, cayenne_fixture) in &cayenne_fixtures {
+            let fixture = Arc::clone(cayenne_fixture);
+            group.bench_with_input(
+                BenchmarkId::new(format!("{lane_label}/sum_value"), rows),
+                &rows,
+                |b, &_rows| {
+                    b.iter(|| {
+                        rt.block_on(async {
+                            let batches =
+                                cayenne_query(&fixture.table, "SELECT SUM(value) FROM t").await;
+                            black_box(batches);
+                        });
                     });
-                });
-            },
-        );
+                },
+            );
+        }
+
         let wc = Arc::clone(&warm_ctx);
         group.bench_with_input(
             BenchmarkId::new("cayenne_warm/sum_value", rows),
@@ -178,26 +191,29 @@ fn bench_scan(c: &mut Criterion) {
 
         rt.block_on(capture_comparison_plans(
             &format!("scan/{rows}/filter_sum"),
-            &cayenne_fixture.table,
+            &plan_cayenne_fixture.table,
             &duckdb_fixture.conn,
             &cayenne_sql,
             &duckdb_sql,
         ));
 
-        let cf = Arc::clone(&cayenne_fixture);
-        let cayenne_sql_owned = cayenne_sql.clone();
-        group.bench_with_input(
-            BenchmarkId::new("cayenne/filter_sum", rows),
-            &rows,
-            |b, &_rows| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        let batches = cayenne_query(&cf.table, &cayenne_sql_owned).await;
-                        black_box(batches);
+        for (lane_label, cayenne_fixture) in &cayenne_fixtures {
+            let fixture = Arc::clone(cayenne_fixture);
+            let cayenne_sql_owned = cayenne_sql.clone();
+            group.bench_with_input(
+                BenchmarkId::new(format!("{lane_label}/filter_sum"), rows),
+                &rows,
+                |b, &_rows| {
+                    b.iter(|| {
+                        rt.block_on(async {
+                            let batches = cayenne_query(&fixture.table, &cayenne_sql_owned).await;
+                            black_box(batches);
+                        });
                     });
-                });
-            },
-        );
+                },
+            );
+        }
+
         let wc = Arc::clone(&warm_ctx);
         let cayenne_sql_warm = cayenne_sql.clone();
         group.bench_with_input(
