@@ -4147,9 +4147,9 @@ mod tests {
         id_column.description = Some("stable row id".to_string());
         dataset.columns.push(id_column);
 
+        let metadata = dataset.metadata();
         let schema =
-            registered_schema_with_metadata("dataset_meta", &dataset.metadata(), &dataset.columns)
-                .await;
+            registered_schema_with_metadata("dataset_meta", &metadata, &dataset.columns).await;
 
         assert_eq!(
             schema.metadata().get("comment").map(String::as_str),
@@ -4175,8 +4175,8 @@ mod tests {
         name_column.description = Some("display name".to_string());
         view.columns.push(name_column);
 
-        let schema =
-            registered_schema_with_metadata("view_meta", &view.metadata(), &view.columns).await;
+        let metadata = view.metadata();
+        let schema = registered_schema_with_metadata("view_meta", &metadata, &view.columns).await;
 
         assert_eq!(
             schema.metadata().get("comment").map(String::as_str),

@@ -75,6 +75,8 @@ struct TableComments {
     column_source_types: HashMap<String, String>,
 }
 
+pub type PostgresTableMetadataRow = (Option<String>, String, Option<String>, String);
+
 /// Comment metadata grouped by source table name within a schema.
 type CommentMap = HashMap<String, TableComments>;
 
@@ -497,24 +499,9 @@ async fn build_table_providers_for_schema(
                     comments
                         .get(&table_name)
                         .map_or_else(HashMap::new, |comments| {
-                            if let Some(comment) = &comments.table_comment {
-                                table_metadata
-                                    .insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
-                            }
-
-                            let mut field_metadata = FieldMetadata::new();
-                            for (column, source_type) in &comments.column_source_types {
-                                field_metadata.entry(column.clone()).or_default().insert(
-                                    SOURCE_TYPE_METADATA_KEY.to_string(),
-                                    source_type.clone(),
-                                );
-                            }
-                            for (column, comment) in &comments.column_comments {
-                                field_metadata
-                                    .entry(column.clone())
-                                    .or_default()
-                                    .insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
-                            }
+                            let (comment_metadata, field_metadata) =
+                                table_comments_metadata(comments);
+                            table_metadata.extend(comment_metadata);
                             field_metadata
                         });
 
@@ -537,6 +524,55 @@ async fn build_table_providers_for_schema(
     }
 
     tables
+}
+
+fn table_comments_metadata(comments: &TableComments) -> (HashMap<String, String>, FieldMetadata) {
+    let mut table_metadata = HashMap::new();
+    if let Some(comment) = &comments.table_comment {
+        table_metadata.insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
+    }
+
+    let mut field_metadata = FieldMetadata::new();
+    for (column, source_type) in &comments.column_source_types {
+        field_metadata
+            .entry(column.clone())
+            .or_default()
+            .insert(SOURCE_TYPE_METADATA_KEY.to_string(), source_type.clone());
+    }
+    for (column, comment) in &comments.column_comments {
+        field_metadata
+            .entry(column.clone())
+            .or_default()
+            .insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
+    }
+
+    (table_metadata, field_metadata)
+}
+
+#[must_use]
+pub fn postgres_metadata_from_rows(
+    rows: impl IntoIterator<Item = PostgresTableMetadataRow>,
+) -> (HashMap<String, String>, FieldMetadata) {
+    let mut comments = TableComments::default();
+    for (table_comment, column_name, column_comment, column_source_type) in rows {
+        if comments.table_comment.is_none()
+            && let Some(comment) = table_comment.filter(|comment| !comment.is_empty())
+        {
+            comments.table_comment = Some(comment);
+        }
+        if let Some(comment) = column_comment.filter(|comment| !comment.is_empty()) {
+            comments
+                .column_comments
+                .insert(column_name.clone(), comment);
+        }
+        if !column_source_type.is_empty() {
+            comments
+                .column_source_types
+                .insert(column_name, column_source_type);
+        }
+    }
+
+    table_comments_metadata(&comments)
 }
 
 #[async_trait]

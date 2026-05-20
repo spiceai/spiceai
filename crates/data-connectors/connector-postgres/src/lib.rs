@@ -284,31 +284,11 @@ async fn postgres_comment_metadata(
             &[&table_path],
         )
         .await?;
+    let rows = rows
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)));
 
-    let mut table_metadata = HashMap::new();
-    let mut field_metadata = data_components::FieldMetadata::new();
-    for row in &rows {
-        let table_comment: Option<String> = row.get(0);
-        let column_name: String = row.get(1);
-        let column_comment: Option<String> = row.get(2);
-        let column_source_type: String = row.get(3);
-
-        if !table_metadata.contains_key(data_components::COMMENT_METADATA_KEY)
-            && let Some(comment) = table_comment.filter(|comment| !comment.is_empty())
-        {
-            table_metadata.insert(data_components::COMMENT_METADATA_KEY.to_string(), comment);
-        }
-        let metadata = field_metadata.entry(column_name).or_default();
-        metadata.insert(
-            data_components::SOURCE_TYPE_METADATA_KEY.to_string(),
-            column_source_type,
-        );
-        if let Some(comment) = column_comment.filter(|comment| !comment.is_empty()) {
-            metadata.insert(data_components::COMMENT_METADATA_KEY.to_string(), comment);
-        }
-    }
-
-    Ok((table_metadata, field_metadata))
+    Ok(data_components::postgres::provider::postgres_metadata_from_rows(rows))
 }
 
 async fn enrich_with_postgres_comments(

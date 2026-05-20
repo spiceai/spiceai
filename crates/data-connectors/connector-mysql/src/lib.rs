@@ -297,12 +297,7 @@ async fn mysql_comment_metadata(
         .map(ToString::to_string);
     let table_name = table_reference.table().to_string();
 
-    let rows: Vec<(
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )> = conn
+    let rows: Vec<data_components::mysql::provider::MySqlTableMetadataRow> = conn
         .exec(
             "SELECT \
                  NULLIF(t.TABLE_COMMENT, '') AS TABLE_COMMENT, \
@@ -320,29 +315,9 @@ async fn mysql_comment_metadata(
         )
         .await?;
 
-    let mut table_metadata = HashMap::new();
-    let mut field_metadata = data_components::FieldMetadata::new();
-    for (table_comment, column_name, column_comment, column_source_type) in rows {
-        if !table_metadata.contains_key(data_components::COMMENT_METADATA_KEY)
-            && let Some(comment) = table_comment
-        {
-            table_metadata.insert(data_components::COMMENT_METADATA_KEY.to_string(), comment);
-        }
-        if let Some(column_name) = column_name {
-            let metadata = field_metadata.entry(column_name).or_default();
-            if let Some(source_type) = column_source_type {
-                metadata.insert(
-                    data_components::SOURCE_TYPE_METADATA_KEY.to_string(),
-                    source_type,
-                );
-            }
-            if let Some(comment) = column_comment {
-                metadata.insert(data_components::COMMENT_METADATA_KEY.to_string(), comment);
-            }
-        }
-    }
-
-    Ok((table_metadata, field_metadata))
+    Ok(data_components::mysql::provider::mysql_metadata_from_rows(
+        rows,
+    ))
 }
 
 async fn enrich_with_mysql_comments(

@@ -58,6 +58,13 @@ struct TableComments {
     column_source_types: HashMap<String, String>,
 }
 
+pub type MySqlTableMetadataRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 type CommentMap = HashMap<String, TableComments>;
 
 /// A catalog provider for `MySQL` that discovers schemas and tables
@@ -341,6 +348,16 @@ fn provider_with_comments(
         return provider;
     };
 
+    let (table_metadata, field_metadata) = table_comments_metadata(comments);
+
+    if table_metadata.is_empty() && field_metadata.is_empty() {
+        provider
+    } else {
+        metadata_enriched_table_provider(provider, table_metadata, field_metadata)
+    }
+}
+
+fn table_comments_metadata(comments: &TableComments) -> (HashMap<String, String>, FieldMetadata) {
     let mut table_metadata = HashMap::new();
     if let Some(comment) = &comments.table_comment {
         table_metadata.insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
@@ -360,11 +377,37 @@ fn provider_with_comments(
             .insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
     }
 
-    if table_metadata.is_empty() && field_metadata.is_empty() {
-        provider
-    } else {
-        metadata_enriched_table_provider(provider, table_metadata, field_metadata)
+    (table_metadata, field_metadata)
+}
+
+#[must_use]
+pub fn mysql_metadata_from_rows(
+    rows: impl IntoIterator<Item = MySqlTableMetadataRow>,
+) -> (HashMap<String, String>, FieldMetadata) {
+    let mut comments = TableComments::default();
+    for (table_comment, column_name, column_comment, column_source_type) in rows {
+        if comments.table_comment.is_none()
+            && let Some(comment) = table_comment.filter(|comment| !comment.is_empty())
+        {
+            comments.table_comment = Some(comment);
+        }
+        if let Some(column_name) = column_name {
+            if let Some(comment) = column_comment.filter(|comment| !comment.is_empty()) {
+                comments
+                    .column_comments
+                    .insert(column_name.clone(), comment);
+            }
+            if let Some(source_type) =
+                column_source_type.filter(|source_type| !source_type.is_empty())
+            {
+                comments
+                    .column_source_types
+                    .insert(column_name, source_type);
+            }
+        }
     }
+
+    table_comments_metadata(&comments)
 }
 
 #[async_trait]
