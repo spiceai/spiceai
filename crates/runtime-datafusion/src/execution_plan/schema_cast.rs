@@ -650,25 +650,20 @@ mod tests {
         // by 1000 preserves ordering). DuckDB stores µs; source might report ns.
         use arrow::datatypes::TimeUnit;
 
-        let input_schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                false,
-            ),
-        ]));
-        let target_schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                false,
-            ),
-        ]));
+        let input_schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            false,
+        )]));
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )]));
 
         let empty = Arc::new(EmptyExec::new(Arc::clone(&input_schema)));
         let lex_ordering = LexOrdering::new(vec![
-            PhysicalSortExpr::new_default(physical_col("ts", &input_schema).expect("col ts"))
-                .asc(),
+            PhysicalSortExpr::new_default(physical_col("ts", &input_schema).expect("col ts")).asc(),
         ])
         .expect("lex ordering");
         let sorted_input: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, empty));
