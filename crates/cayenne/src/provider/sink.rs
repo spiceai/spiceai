@@ -47,7 +47,7 @@ use super::table::CayenneTableProvider;
 ///
 /// File sizing is delegated to the downstream Vortex/DataFusion writer using
 /// the configured target file size (`VortexConfig.target_vortex_file_size_mb`,
-/// default 128 MB).
+/// default 256 MB).
 ///
 /// # Performance
 ///

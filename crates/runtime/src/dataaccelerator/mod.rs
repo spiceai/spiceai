@@ -192,13 +192,21 @@ impl AcceleratorEngineRegistry {
         }
     }
 
-    async fn register_accelerator_engine(
+    pub(crate) async fn register_accelerator_engine(
         &self,
         engine: Engine,
         accelerator_engine: Arc<dyn DataAccelerator>,
     ) {
-        let mut registry = self.accelerator_engine_registry.write().await;
-        registry.insert(engine, accelerator_engine);
+        let replaced_engine = {
+            let mut registry = self.accelerator_engine_registry.write().await;
+            registry.insert(engine, accelerator_engine)
+        };
+
+        if let Some(replaced_engine) = replaced_engine
+            && let Err(e) = replaced_engine.shutdown().await
+        {
+            tracing::error!("Failed to shutdown replaced accelerator engine {engine}: {e}");
+        }
     }
 
     pub(crate) async fn register_all(&self) {
