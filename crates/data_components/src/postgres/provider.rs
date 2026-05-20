@@ -34,7 +34,7 @@ use snafu::prelude::*;
 
 use crate::{
     COMMENT_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, FieldMetadata, MetadataEnrichedTableProvider,
-    Read, RefreshableCatalogProvider,
+    Read, RefreshableCatalogProvider, SOURCE_TYPE_METADATA_KEY,
 };
 
 #[derive(Debug, Snafu)]
@@ -72,6 +72,7 @@ type ForeignKeyMap = HashMap<String, Vec<ForeignKeyConstraint>>;
 struct TableComments {
     table_comment: Option<String>,
     column_comments: HashMap<String, String>,
+    column_source_types: HashMap<String, String>,
 }
 
 /// Comment metadata grouped by source table name within a schema.
@@ -250,7 +251,8 @@ impl PostgresCatalogProvider {
                      c.relname AS table_name, \
                      obj_description(c.oid, 'pg_class') AS table_comment, \
                      a.attname AS column_name, \
-                     col_description(c.oid, a.attnum) AS column_comment \
+                     col_description(c.oid, a.attnum) AS column_comment, \
+                     format_type(a.atttypid, a.atttypmod) AS column_source_type \
                  FROM pg_catalog.pg_class c \
                  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
                  LEFT JOIN pg_catalog.pg_attribute a \
@@ -271,6 +273,7 @@ impl PostgresCatalogProvider {
             let table_comment: Option<String> = row.get(1);
             let column_name: Option<String> = row.get(2);
             let column_comment: Option<String> = row.get(3);
+            let column_source_type: Option<String> = row.get(4);
 
             let comments: &mut TableComments = comments_by_table.entry(table_name).or_default();
             if comments.table_comment.is_none()
@@ -278,10 +281,15 @@ impl PostgresCatalogProvider {
             {
                 comments.table_comment = Some(comment);
             }
-            if let (Some(column_name), Some(comment)) = (column_name, column_comment)
-                && !comment.is_empty()
-            {
-                comments.column_comments.insert(column_name, comment);
+            if let Some(column_name) = column_name {
+                if let Some(comment) = column_comment.filter(|comment| !comment.is_empty()) {
+                    comments.column_comments.insert(column_name.clone(), comment);
+                }
+                if let Some(source_type) =
+                    column_source_type.filter(|source_type| !source_type.is_empty())
+                {
+                    comments.column_source_types.insert(column_name, source_type);
+                }
             }
         }
 
@@ -481,29 +489,26 @@ async fn build_table_providers_for_schema(
                     }
                 }
 
-                let field_metadata =
-                    comments
-                        .get(&table_name)
-                        .map_or_else(HashMap::new, |comments| {
-                            if let Some(comment) = &comments.table_comment {
-                                table_metadata
-                                    .insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
-                            }
+                let field_metadata = comments.get(&table_name).map_or_else(HashMap::new, |comments| {
+                    if let Some(comment) = &comments.table_comment {
+                        table_metadata.insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
+                    }
 
-                            comments
-                                .column_comments
-                                .iter()
-                                .map(|(column, comment)| {
-                                    (
-                                        column.clone(),
-                                        HashMap::from([(
-                                            COMMENT_METADATA_KEY.to_string(),
-                                            comment.clone(),
-                                        )]),
-                                    )
-                                })
-                                .collect::<FieldMetadata>()
-                        });
+                    let mut field_metadata = FieldMetadata::new();
+                    for (column, source_type) in &comments.column_source_types {
+                        field_metadata
+                            .entry(column.clone())
+                            .or_default()
+                            .insert(SOURCE_TYPE_METADATA_KEY.to_string(), source_type.clone());
+                    }
+                    for (column, comment) in &comments.column_comments {
+                        field_metadata
+                            .entry(column.clone())
+                            .or_default()
+                            .insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
+                    }
+                    field_metadata
+                });
 
                 let provider = if table_metadata.is_empty() && field_metadata.is_empty() {
                     provider
@@ -567,7 +572,7 @@ mod tests {
         CommentMap, ForeignKeyConstraint, ForeignKeyMap, TableComments,
         build_table_providers_for_schema, is_table_included,
     };
-    use crate::{COMMENT_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, Read};
+    use crate::{COMMENT_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, Read, SOURCE_TYPE_METADATA_KEY};
     use async_trait::async_trait;
     use datafusion::catalog::Session;
     use datafusion::datasource::{TableProvider, TableType};
@@ -867,6 +872,10 @@ mod tests {
                     "customer_id".to_string(),
                     "customer dimension key".to_string(),
                 )]),
+                column_source_types: HashMap::from([(
+                    "customer_id".to_string(),
+                    "bigint".to_string(),
+                )]),
             },
         );
 
@@ -898,6 +907,13 @@ mod tests {
                 .get(COMMENT_METADATA_KEY)
                 .map(String::as_str),
             Some("customer dimension key")
+        );
+        assert_eq!(
+            field
+                .metadata()
+                .get(SOURCE_TYPE_METADATA_KEY)
+                .map(String::as_str),
+            Some("bigint")
         );
     }
 }

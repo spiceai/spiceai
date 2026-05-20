@@ -21,7 +21,7 @@ limitations under the License.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::dataconnector::adbc::{
-    build_db_options, build_join_context, dialect_for_driver, enrich_with_bigquery_comments,
+    build_db_options, build_join_context, dialect_for_driver, enrich_with_bigquery_metadata,
 };
 use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
 use adbc_core::options::AdbcVersion;
@@ -442,7 +442,7 @@ impl AdbcCatalogProvider {
                             .table_provider(table_ref.clone(), dialect)
                             .await
                         {
-                            Ok(provider) => Ok(enrich_with_bigquery_comments(
+                            Ok(provider) => Ok(enrich_with_bigquery_metadata(
                                 &self.driver_name,
                                 &self.pool,
                                 &table_ref,

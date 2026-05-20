@@ -47,6 +47,20 @@ pub const FOREIGN_KEYS_METADATA_KEY: &str = "foreign_keys";
 /// Canonical Arrow metadata key for user-facing table and column comments.
 pub const COMMENT_METADATA_KEY: &str = "comment";
 
+/// Canonical Arrow field metadata key for the source-native column type.
+pub const SOURCE_TYPE_METADATA_KEY: &str = "source_type";
+
+/// Canonical Arrow field metadata key marking source partition columns.
+pub const PARTITION_METADATA_KEY: &str = "partition";
+
+/// Canonical Arrow field metadata key marking source clustering columns.
+///
+/// Values are one-based ordinals when the source reports clustering order.
+pub const CLUSTERING_METADATA_KEY: &str = "clustering";
+
+/// Canonical Arrow schema metadata key for a source-native clustering expression.
+pub const CLUSTERING_KEY_METADATA_KEY: &str = "clustering_key";
+
 /// Metadata to merge into fields, keyed by field name.
 pub type FieldMetadata = HashMap<String, HashMap<String, String>>;
 

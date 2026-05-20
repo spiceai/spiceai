@@ -34,7 +34,7 @@ use snafu::prelude::*;
 
 use crate::{
     COMMENT_METADATA_KEY, FieldMetadata, MetadataEnrichedTableProvider, Read,
-    RefreshableCatalogProvider,
+    RefreshableCatalogProvider, SOURCE_TYPE_METADATA_KEY,
 };
 
 #[derive(Debug, Snafu)]
@@ -55,6 +55,7 @@ const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "mysql", "performance_sc
 struct TableComments {
     table_comment: Option<String>,
     column_comments: HashMap<String, String>,
+    column_source_types: HashMap<String, String>,
 }
 
 type CommentMap = HashMap<String, TableComments>;
@@ -278,13 +279,20 @@ impl MySQLSchemaProvider {
     async fn list_comments(&self) -> Result<CommentMap> {
         let mut conn = self.pool.get_conn().await.context(ConnectionFailedSnafu)?;
 
-        let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = conn
+        let rows: Vec<(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = conn
             .exec(
                 "SELECT \
                      t.TABLE_NAME, \
                      NULLIF(t.TABLE_COMMENT, '') AS TABLE_COMMENT, \
                      c.COLUMN_NAME, \
-                     NULLIF(c.COLUMN_COMMENT, '') AS COLUMN_COMMENT \
+                     NULLIF(c.COLUMN_COMMENT, '') AS COLUMN_COMMENT, \
+                     c.COLUMN_TYPE \
                  FROM information_schema.TABLES t \
                  LEFT JOIN information_schema.COLUMNS c \
                      ON c.TABLE_SCHEMA = t.TABLE_SCHEMA \
@@ -298,15 +306,20 @@ impl MySQLSchemaProvider {
             .context(QueryFailedSnafu)?;
 
         let mut comments_by_table = HashMap::new();
-        for (table_name, table_comment, column_name, column_comment) in rows {
+        for (table_name, table_comment, column_name, column_comment, column_source_type) in rows {
             let comments: &mut TableComments = comments_by_table.entry(table_name).or_default();
             if comments.table_comment.is_none()
                 && let Some(comment) = table_comment
             {
                 comments.table_comment = Some(comment);
             }
-            if let (Some(column_name), Some(comment)) = (column_name, column_comment) {
-                comments.column_comments.insert(column_name, comment);
+            if let Some(column_name) = column_name {
+                if let Some(comment) = column_comment {
+                    comments.column_comments.insert(column_name.clone(), comment);
+                }
+                if let Some(source_type) = column_source_type.filter(|source_type| !source_type.is_empty()) {
+                    comments.column_source_types.insert(column_name, source_type);
+                }
             }
         }
 
@@ -327,16 +340,19 @@ fn provider_with_comments(
         table_metadata.insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
     }
 
-    let field_metadata = comments
-        .column_comments
-        .iter()
-        .map(|(column, comment)| {
-            (
-                column.clone(),
-                HashMap::from([(COMMENT_METADATA_KEY.to_string(), comment.clone())]),
-            )
-        })
-        .collect::<FieldMetadata>();
+    let mut field_metadata = FieldMetadata::new();
+    for (column, source_type) in &comments.column_source_types {
+        field_metadata
+            .entry(column.clone())
+            .or_default()
+            .insert(SOURCE_TYPE_METADATA_KEY.to_string(), source_type.clone());
+    }
+    for (column, comment) in &comments.column_comments {
+        field_metadata
+            .entry(column.clone())
+            .or_default()
+            .insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
+    }
 
     if table_metadata.is_empty() && field_metadata.is_empty() {
         provider

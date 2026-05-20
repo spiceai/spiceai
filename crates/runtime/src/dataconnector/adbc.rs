@@ -537,7 +537,7 @@ impl AdbcFactory {
     }
 }
 
-pub(crate) async fn enrich_with_bigquery_comments(
+pub(crate) async fn enrich_with_bigquery_metadata(
     driver_name: &str,
     pool: &Arc<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
     table_reference: &TableReference,
@@ -547,7 +547,7 @@ pub(crate) async fn enrich_with_bigquery_comments(
         return provider;
     }
 
-    match bigquery_comment_metadata(pool, table_reference).await {
+    match bigquery_schema_metadata(pool, table_reference).await {
         Ok((table_metadata, field_metadata)) => {
             if table_metadata.is_empty() && field_metadata.is_empty() {
                 provider
@@ -563,14 +563,14 @@ pub(crate) async fn enrich_with_bigquery_comments(
             tracing::warn!(
                 table = %table_reference,
                 error = %error,
-                "Failed to query BigQuery comments via ADBC; registering without comment metadata"
+                "Failed to query BigQuery schema metadata via ADBC; registering without source metadata"
             );
             provider
         }
     }
 }
 
-async fn bigquery_comment_metadata(
+async fn bigquery_schema_metadata(
     pool: &Arc<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
     table_reference: &TableReference,
 ) -> std::result::Result<
@@ -581,12 +581,16 @@ async fn bigquery_comment_metadata(
     let table_options = bigquery_information_schema_table(table_reference, "TABLE_OPTIONS");
     let column_field_paths =
         bigquery_information_schema_table(table_reference, "COLUMN_FIELD_PATHS");
+    let columns = bigquery_information_schema_table(table_reference, "COLUMNS");
 
     let table_sql = format!(
         "SELECT option_value FROM {table_options} WHERE table_name = {table_name} AND option_name = 'description' AND option_value IS NOT NULL AND option_value != ''"
     );
-    let column_sql = format!(
+    let comment_sql = format!(
         "SELECT field_path, description FROM {column_field_paths} WHERE table_name = {table_name} AND description IS NOT NULL AND description != ''"
+    );
+    let column_sql = format!(
+        "SELECT column_name, data_type, CASE WHEN is_partitioning_column = 'YES' THEN 'true' ELSE NULL END, CAST(clustering_ordinal_position AS STRING) FROM {columns} WHERE table_name = {table_name}"
     );
 
     let mut table_metadata = HashMap::new();
@@ -595,14 +599,48 @@ async fn bigquery_comment_metadata(
     }
 
     let mut field_metadata = FieldMetadata::new();
-    for (field_path, comment) in two_string_column_results(pool, column_sql).await? {
+    for row in string_column_results(pool, column_sql, 4).await? {
+        let [column_name, source_type, partition, clustering] = row.as_slice() else {
+            continue;
+        };
+        let Some(column_name) = column_name else {
+            continue;
+        };
+        let metadata = field_metadata.entry(column_name.clone()).or_default();
+        if let Some(source_type) = source_type {
+            metadata.insert(
+                data_components::SOURCE_TYPE_METADATA_KEY.to_string(),
+                source_type.clone(),
+            );
+        }
+        if partition.as_deref() == Some("true") {
+            metadata.insert(
+                data_components::PARTITION_METADATA_KEY.to_string(),
+                "true".to_string(),
+            );
+        }
+        if let Some(clustering) = clustering {
+            metadata.insert(
+                data_components::CLUSTERING_METADATA_KEY.to_string(),
+                clustering.clone(),
+            );
+        }
+    }
+
+    for row in string_column_results(pool, comment_sql, 2).await? {
+        let [field_path, comment] = row.as_slice() else {
+            continue;
+        };
+        let (Some(field_path), Some(comment)) = (field_path, comment) else {
+            continue;
+        };
         if field_path.contains('.') {
             continue;
         }
-        field_metadata.insert(
-            field_path,
-            HashMap::from([(data_components::COMMENT_METADATA_KEY.to_string(), comment)]),
-        );
+        field_metadata
+            .entry(field_path.clone())
+            .or_default()
+            .insert(data_components::COMMENT_METADATA_KEY.to_string(), comment.clone());
     }
 
     Ok((table_metadata, field_metadata))
@@ -628,25 +666,24 @@ async fn first_string_result(
     Ok(None)
 }
 
-async fn two_string_column_results(
+async fn string_column_results(
     pool: &Arc<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
     sql: String,
-) -> std::result::Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+    column_count: usize,
+) -> std::result::Result<Vec<Vec<Option<String>>>, Box<dyn std::error::Error + Send + Sync>> {
     let conn = Arc::clone(pool).connect().await?;
     let batches: Vec<_> = query_arrow(conn, sql, None).await?.try_collect().await?;
     let mut values = Vec::new();
     for batch in &batches {
-        if batch.num_columns() < 2 {
+        if batch.num_columns() < column_count {
             continue;
         }
-        let names = batch.column(0);
-        let comments = batch.column(1);
         for row in 0..batch.num_rows() {
-            if let (Some(name), Some(comment)) =
-                (string_value(names, row), string_value(comments, row))
-            {
-                values.push((name.to_string(), comment.to_string()));
-            }
+            values.push(
+                (0..column_count)
+                    .map(|column| string_value(batch.column(column), row).map(ToString::to_string))
+                    .collect(),
+            );
         }
     }
     Ok(values)
@@ -1142,7 +1179,7 @@ impl DataConnector for Adbc {
             })?;
 
         Ok(
-            enrich_with_bigquery_comments(
+            enrich_with_bigquery_metadata(
                 &self.driver_name,
                 &self.pool,
                 &table_reference,
@@ -1175,7 +1212,7 @@ impl DataConnector for Adbc {
             .read_write_table_provider(table_reference.clone(), dialect)
             .await
         {
-            Ok(provider) => Ok(enrich_with_bigquery_comments(
+            Ok(provider) => Ok(enrich_with_bigquery_metadata(
                 &self.driver_name,
                 &self.pool,
                 &table_reference,

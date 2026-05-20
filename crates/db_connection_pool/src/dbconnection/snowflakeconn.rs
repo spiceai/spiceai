@@ -73,6 +73,8 @@ pub enum Error {
 }
 
 static UTC_TIMEZONE: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("UTC"));
+const COMMENT_METADATA_KEY: &str = "comment";
+const SOURCE_TYPE_METADATA_KEY: &str = "source_type";
 
 pub struct SnowflakeConnection {
     pub api: Arc<SnowflakeApi>,
@@ -676,19 +678,20 @@ pub fn parse_schema_from_json(resp: &serde_json::Value) -> Result<SchemaRef, Err
             .as_str()
             .is_none_or(|s| s.to_uppercase() == "TRUE");
 
-        let field = if let Some(comment) = column
+        let mut metadata = HashMap::from([(
+            SOURCE_TYPE_METADATA_KEY.to_string(),
+            data_type_str.to_string(),
+        )]);
+        if let Some(comment) = column
             .get(5)
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|comment| !comment.is_empty())
         {
-            Field::new(column_name, data_type, is_nullable).with_metadata(HashMap::from([(
-                "comment".to_string(),
-                comment.to_string(),
-            )]))
-        } else {
-            Field::new(column_name, data_type, is_nullable)
-        };
+            metadata.insert(COMMENT_METADATA_KEY.to_string(), comment.to_string());
+        }
+
+        let field = Field::new(column_name, data_type, is_nullable).with_metadata(metadata);
 
         fields.push(field);
     }
@@ -1344,6 +1347,14 @@ mod tests {
                 .get("comment")
                 .map(String::as_str),
             Some("customer dimension key")
+        );
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get("source_type")
+                .map(String::as_str),
+            Some(r#"{"type":"FIXED","precision":38,"scale":0,"nullable":true}"#)
         );
     }
 

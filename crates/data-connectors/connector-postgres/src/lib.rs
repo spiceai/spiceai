@@ -272,7 +272,8 @@ async fn postgres_comment_metadata(
             "SELECT \
                  obj_description(c.oid, 'pg_class') AS table_comment, \
                  a.attname AS column_name, \
-                 col_description(c.oid, a.attnum) AS column_comment \
+                 col_description(c.oid, a.attnum) AS column_comment, \
+                 format_type(a.atttypid, a.atttypmod) AS column_source_type \
              FROM pg_catalog.pg_class c \
              JOIN pg_catalog.pg_attribute a \
                  ON a.attrelid = c.oid \
@@ -290,17 +291,20 @@ async fn postgres_comment_metadata(
         let table_comment: Option<String> = row.get(0);
         let column_name: String = row.get(1);
         let column_comment: Option<String> = row.get(2);
+        let column_source_type: String = row.get(3);
 
         if !table_metadata.contains_key(data_components::COMMENT_METADATA_KEY)
             && let Some(comment) = table_comment.filter(|comment| !comment.is_empty())
         {
             table_metadata.insert(data_components::COMMENT_METADATA_KEY.to_string(), comment);
         }
+        let metadata = field_metadata.entry(column_name).or_default();
+        metadata.insert(
+            data_components::SOURCE_TYPE_METADATA_KEY.to_string(),
+            column_source_type,
+        );
         if let Some(comment) = column_comment.filter(|comment| !comment.is_empty()) {
-            field_metadata.insert(
-                column_name,
-                HashMap::from([(data_components::COMMENT_METADATA_KEY.to_string(), comment)]),
-            );
+            metadata.insert(data_components::COMMENT_METADATA_KEY.to_string(), comment);
         }
     }
 
