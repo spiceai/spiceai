@@ -42,6 +42,7 @@ pub mod component;
 pub mod extension;
 pub mod fts;
 mod keywords;
+mod metadata;
 pub mod metric;
 pub mod param;
 pub mod partitioning;

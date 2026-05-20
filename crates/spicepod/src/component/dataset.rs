@@ -25,6 +25,7 @@ use super::{Nameable, WithDependsOn, embeddings::ColumnEmbeddingConfig, is_defau
 use crate::acceleration::Acceleration;
 use crate::component::access::AccessMode;
 use crate::fts::FtsStore;
+use crate::metadata::metadata_value_to_string;
 use crate::metric::Metrics;
 use crate::param::Params;
 use crate::semantic::Column;
@@ -326,12 +327,6 @@ impl Dataset {
         }
         metadata
     }
-}
-
-fn metadata_value_to_string(value: &Value) -> String {
-    value
-        .as_str()
-        .map_or_else(|| value.to_string(), ToString::to_string)
 }
 
 impl WithDependsOn<Dataset> for Dataset {

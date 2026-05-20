@@ -253,7 +253,7 @@ fn is_snowflake_access_denied(msg: &str) -> bool {
 /// Parses the JSON response from `information_schema.columns`.
 ///
 /// Expected columns: `column_name`, `data_type`, `is_nullable`,
-/// `numeric_precision`, `numeric_scale`, `comment`, `table_comment`.
+/// `numeric_precision`, `numeric_scale`, `comment`, `table_comment`, `clustering_key`.
 fn parse_information_schema_json(
     resp: &serde_json::Value,
     table_name: &str,

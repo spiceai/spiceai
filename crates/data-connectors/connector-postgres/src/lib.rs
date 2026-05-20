@@ -367,7 +367,7 @@ impl DataConnector for Postgres {
                     }
                 }
 
-                Some(Err(DataConnectorError::UnableToGetReadProvider {
+                Some(Err(DataConnectorError::UnableToGetReadWriteProvider {
                     dataconnector: "postgres".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     source: e,

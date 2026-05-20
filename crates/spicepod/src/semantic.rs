@@ -24,6 +24,7 @@ use serde_json::Value;
 
 use crate::{
     component::embeddings::{EmbeddingAggregation, EmbeddingChunkConfig},
+    metadata::metadata_value_to_string,
     param::Params,
 };
 
@@ -129,12 +130,6 @@ impl Column {
         // If it doesn't deserialize to `MetadataType`, not an issue, just not a `MetadataType`.
         serde_json::from_value(value).ok()
     }
-}
-
-fn metadata_value_to_string(value: &Value) -> String {
-    value
-        .as_str()
-        .map_or_else(|| value.to_string(), ToString::to_string)
 }
 
 impl From<&str> for Column {

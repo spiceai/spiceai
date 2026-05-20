@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{Nameable, WithDependsOn, dataset::ReadyState, is_default};
-use crate::{acceleration::Acceleration, semantic::Column, vector::VectorStore};
+use crate::{
+    acceleration::Acceleration, metadata::metadata_value_to_string, semantic::Column,
+    vector::VectorStore,
+};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -120,12 +123,6 @@ impl View {
                 .iter()
                 .find_map(|c| c.full_text_search.as_ref().and_then(|f| f.row_ids.clone())))
     }
-}
-
-fn metadata_value_to_string(value: &Value) -> String {
-    value
-        .as_str()
-        .map_or_else(|| value.to_string(), ToString::to_string)
 }
 
 impl WithDependsOn<View> for View {
