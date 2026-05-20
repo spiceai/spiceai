@@ -99,7 +99,7 @@ impl View {
     pub fn metadata(&self) -> HashMap<String, String> {
         let mut metadata = HashMap::new();
         if let Some(d) = self.description.as_ref() {
-            metadata.insert("description".to_string(), d.clone());
+            metadata.insert("comment".to_string(), d.clone());
         }
         for (k, v) in &self.metadata {
             metadata.insert(k.clone(), v.to_string());

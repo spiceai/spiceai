@@ -18,7 +18,7 @@ limitations under the License.
 use std::{any::Any, borrow::Cow, collections::HashMap, error::Error, sync::Arc};
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::{
     catalog::{CatalogProvider, Session},
     common::{Constraints, Statistics},
@@ -43,6 +43,12 @@ use datafusion::{
 /// ]
 /// ```
 pub const FOREIGN_KEYS_METADATA_KEY: &str = "foreign_keys";
+
+/// Canonical Arrow metadata key for user-facing table and column comments.
+pub const COMMENT_METADATA_KEY: &str = "comment";
+
+/// Metadata to merge into fields, keyed by field name.
+pub type FieldMetadata = HashMap<String, HashMap<String, String>>;
 
 pub mod arrow;
 #[cfg(feature = "clickhouse")]
@@ -139,10 +145,38 @@ impl MetadataEnrichedTableProvider {
     /// Keys in `extra_metadata` will overwrite any pre-existing schema metadata with the same key.
     #[must_use]
     pub fn new(inner: Arc<dyn TableProvider>, extra_metadata: HashMap<String, String>) -> Self {
+        Self::new_with_field_metadata(inner, extra_metadata, HashMap::new())
+    }
+
+    /// Wrap `inner`, merging schema-level metadata and per-field metadata into its schema.
+    ///
+    /// Keys in `extra_metadata` overwrite pre-existing schema metadata with the same key. Keys in
+    /// `field_metadata` overwrite pre-existing field metadata for matching field names.
+    #[must_use]
+    pub fn new_with_field_metadata(
+        inner: Arc<dyn TableProvider>,
+        extra_metadata: HashMap<String, String>,
+        field_metadata: FieldMetadata,
+    ) -> Self {
         let base = inner.schema();
         let mut metadata = base.metadata().clone();
         metadata.extend(extra_metadata);
-        let schema = Arc::new(base.as_ref().clone().with_metadata(metadata));
+
+        let fields = base
+            .fields()
+            .iter()
+            .map(|field| {
+                if let Some(extra) = field_metadata.get(field.name().as_str()) {
+                    let mut metadata = field.metadata().clone();
+                    metadata.extend(extra.clone());
+                    Arc::new(field.as_ref().clone().with_metadata(metadata))
+                } else {
+                    Arc::clone(field)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
         Self { inner, schema }
     }
 }
