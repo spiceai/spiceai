@@ -1385,10 +1385,15 @@ impl MetadataCatalog for CayenneCatalog {
                 source: Box::new(e),
             })?;
 
-        Ok(results
-            .into_iter()
-            .map(|(pk, seq)| (pk.into_boxed_slice(), seq))
-            .collect())
+        // Pre-size the map so the load path skips bucket reallocations as the
+        // insert-record set grows; `collect()` starts from capacity 0 and grows
+        // by doubling.
+        let mut map =
+            std::collections::HashMap::<Box<[u8]>, i64>::with_capacity(results.len());
+        for (pk, seq) in results {
+            map.insert(pk.into_boxed_slice(), seq);
+        }
+        Ok(map)
     }
 
     async fn clear_insert_records(&self, table_id: &str) -> CatalogResult<()> {

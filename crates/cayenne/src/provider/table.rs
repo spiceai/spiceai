@@ -3643,29 +3643,41 @@ impl CayenneTableProvider {
             self.has_pending_deletions() || self.inlined_row_count.load(Ordering::Relaxed) > 0;
 
         let cache = self.table_statistics.read();
-        let stats = if has_pending_visibility_changes {
-            // Prefer the pre-converted inexact cache; fall back to transforming
-            // on-the-fly if the cache hasn't been populated yet (e.g. test seed).
-            match cache.optimizer_inexact.clone() {
-                Some(inexact) => inexact,
-                None => Self::statistics_to_inexact(cache.optimizer.clone()?),
-            }
+        let cached_ref: Option<&Statistics> = if has_pending_visibility_changes {
+            cache.optimizer_inexact.as_ref()
         } else {
-            cache.optimizer.clone()?
+            cache.optimizer.as_ref()
         };
-        drop(cache);
 
-        if stats.column_statistics.len() > TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT {
-            tracing::trace!(
-                table = self.table_metadata.table_name.as_str(),
-                column_count = stats.column_statistics.len(),
-                full_column_sync_limit = TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT,
-                "Returning top-level table statistics only for wide table"
-            );
-            return Some(Self::top_level_statistics_only(&stats, false));
+        if let Some(source) = cached_ref {
+            // Wide-table fast path: build the top-level summary directly from a
+            // borrowed reference instead of cloning the full column_statistics
+            // vector only to discard it. See `cached_table_statistics_wide` bench.
+            if source.column_statistics.len() > TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT {
+                tracing::trace!(
+                    table = self.table_metadata.table_name.as_str(),
+                    column_count = source.column_statistics.len(),
+                    full_column_sync_limit = TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT,
+                    "Returning top-level table statistics only for wide table"
+                );
+                return Some(Self::top_level_statistics_only(source, false));
+            }
+            return Some(source.clone());
         }
 
-        Some(stats)
+        // Cache-miss visibility-overlay path: cache.optimizer_inexact is None,
+        // so transform optimizer on-the-fly. Rare — test seed only.
+        if has_pending_visibility_changes {
+            let optimizer = cache.optimizer.clone()?;
+            drop(cache);
+            let inexact = Self::statistics_to_inexact(optimizer);
+            if inexact.column_statistics.len() > TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT {
+                return Some(Self::top_level_statistics_only(&inexact, false));
+            }
+            return Some(inexact);
+        }
+
+        None
     }
 
     fn top_level_statistics_only(stats: &Statistics, inexact: bool) -> Statistics {
