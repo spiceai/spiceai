@@ -39,10 +39,15 @@
 //!   since DuckDB has no CDC-pipelined entry point of its own.
 //!
 //! Workers in every lane are pooled per concurrency level (spawned once,
-//! signaled per iteration via per-worker `mpsc` channels), so worker-spawn
-//! cost falls outside criterion's timed region. The bench thread blocks on
-//! `mpsc::Receiver::recv_timeout` to drain completion signals — no CPU-burning
-//! `spin_loop`, no AtomicUsize counter.
+//! signaled per iteration via `mpsc` channels), so worker-spawn cost
+//! falls outside criterion's timed region. The bench thread blocks on
+//! bounded-timeout receives (`tokio::time::timeout` over
+//! `tokio::sync::mpsc` for the async Cayenne reader lane,
+//! `std::sync::mpsc::Receiver::recv_timeout` via `wait_for_completions`
+//! for the threaded DuckDB and write/CDC lanes) — no CPU-burning
+//! `spin_loop`, no AtomicUsize counter, and a stalled or panicked worker
+//! surfaces as a labeled panic naming the bench, lane, and completion
+//! number instead of hanging indefinitely.
 //!
 //! `BenchmarkId::new("…", N)` naming makes the throughput-vs-N curve visible
 //! directly in criterion's HTML output and parse-able from the text logs.
@@ -259,11 +264,26 @@ fn bench_read_scaling(c: &mut Criterion) {
                         for tx in &cayenne_go_txs {
                             tx.send(()).expect("cayenne go-tx (worker exited?)");
                         }
-                        for _ in 0..concurrency {
-                            cayenne_done_rx
-                                .recv()
-                                .await
-                                .expect("cayenne done-rx (worker exited?)");
+                        // Bounded per-completion timeout. If any reader task
+                        // panics or stalls, surface a clear error instead of
+                        // hanging the bench thread indefinitely.
+                        for i in 0..concurrency {
+                            match tokio::time::timeout(
+                                Duration::from_secs(30),
+                                cayenne_done_rx.recv(),
+                            )
+                            .await
+                            {
+                                Ok(Some(())) => {}
+                                Ok(None) => panic!(
+                                    "vs_duckdb_scaling_reads/cayenne_warm: done channel closed at completion {}/{concurrency} (worker exited?)",
+                                    i + 1
+                                ),
+                                Err(_) => panic!(
+                                    "vs_duckdb_scaling_reads/cayenne_warm: stalled waiting for reader completion {}/{concurrency} after 30s",
+                                    i + 1
+                                ),
+                            }
                         }
                     });
                 });
@@ -447,7 +467,7 @@ fn bench_write_scaling(c: &mut Criterion) {
         // writer stalls or panics). Replaces the earlier
         // AtomicUsize + std::hint::spin_loop pattern flagged in PR review.
         let (cayenne_tx, cayenne_rx) = mpsc::channel::<()>();
-        let mut cayenne_writers: Vec<CayenneBgWriter> = (0..concurrency)
+        let cayenne_writers: Vec<CayenneBgWriter> = (0..concurrency)
             .map(|i| CayenneBgWriter::spawn(&rt, &cayenne_fixture, cayenne_tx.clone(), i as i64))
             .collect();
         // Drop the spare sender so the channel closes naturally when all
@@ -460,10 +480,16 @@ fn bench_write_scaling(c: &mut Criterion) {
             &concurrency,
             |b, &_n| {
                 b.iter(|| {
-                    // Wait for one full pass (each writer contributes ≥1
-                    // insert) so a single iteration captures the full
-                    // concurrency cost — not just the latency of one of N
-                    // writers.
+                    // Drain `concurrency` total completed inserts from the
+                    // shared channel — total system throughput across N
+                    // writers, not per-writer fairness. One fast writer
+                    // can contribute multiple of the N counted messages
+                    // in an iteration; that's by design for a
+                    // throughput-under-concurrency measurement. The
+                    // `BenchmarkId::new(_, concurrency)` then divides this
+                    // by `concurrency * WRITE_BATCH_ROWS` to report
+                    // per-worker throughput in criterion's
+                    // `Throughput::Elements` mode.
                     wait_for_completions(
                         &cayenne_rx,
                         concurrency,
@@ -475,14 +501,14 @@ fn bench_write_scaling(c: &mut Criterion) {
 
         // Explicit drop order: writers first (stops the loops + joins the
         // tasks), then the fixture (its TempDir cleans up the data).
-        cayenne_writers.drain(..);
+        drop(cayenne_writers);
         drop(cayenne_fixture);
 
         // --- DuckDB lane ---
         let duckdb_fixture = setup_duckdb("scaling_write");
         let duckdb_db_path = duckdb_fixture.db_path();
         let (duckdb_tx, duckdb_rx) = mpsc::channel::<()>();
-        let mut duckdb_writers: Vec<DuckDbBgWriter> = (0..concurrency)
+        let duckdb_writers: Vec<DuckDbBgWriter> = (0..concurrency)
             .map(|i| {
                 DuckDbBgWriter::spawn(
                     &duckdb_db_path,
@@ -508,7 +534,7 @@ fn bench_write_scaling(c: &mut Criterion) {
             },
         );
 
-        duckdb_writers.drain(..);
+        drop(duckdb_writers);
         drop(duckdb_fixture);
     }
 
@@ -579,7 +605,7 @@ fn bench_cdc_scaling(c: &mut Criterion) {
         // --- Cayenne CDC pipelined lane ---
         let cayenne_fixture = rt.block_on(setup_cayenne("scaling_cdc"));
         let (cayenne_tx, cayenne_rx) = mpsc::channel::<()>();
-        let mut cayenne_writers: Vec<CayenneCdcBgWriter> = (0..concurrency)
+        let cayenne_writers: Vec<CayenneCdcBgWriter> = (0..concurrency)
             .map(|i| CayenneCdcBgWriter::spawn(&rt, &cayenne_fixture, cayenne_tx.clone(), i as i64))
             .collect();
         drop(cayenne_tx);
@@ -598,7 +624,7 @@ fn bench_cdc_scaling(c: &mut Criterion) {
             },
         );
 
-        cayenne_writers.drain(..);
+        drop(cayenne_writers);
         drop(cayenne_fixture);
 
         // --- DuckDB INSERT lane (closest analog — DuckDB has no CDC pipelined
@@ -607,7 +633,7 @@ fn bench_cdc_scaling(c: &mut Criterion) {
         let duckdb_fixture = setup_duckdb("scaling_cdc");
         let duckdb_db_path = duckdb_fixture.db_path();
         let (duckdb_tx, duckdb_rx) = mpsc::channel::<()>();
-        let mut duckdb_writers: Vec<DuckDbBgWriter> = (0..concurrency)
+        let duckdb_writers: Vec<DuckDbBgWriter> = (0..concurrency)
             .map(|i| {
                 DuckDbBgWriter::spawn(&duckdb_db_path, "scaling_cdc", duckdb_tx.clone(), i as i64)
             })
@@ -624,7 +650,7 @@ fn bench_cdc_scaling(c: &mut Criterion) {
             },
         );
 
-        duckdb_writers.drain(..);
+        drop(duckdb_writers);
         drop(duckdb_fixture);
     }
 
