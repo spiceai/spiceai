@@ -46,6 +46,12 @@ pub enum Error {
     #[snafu(display("Vector search cannot be run on {}.", data_source.to_quoted_string()))]
     CannotVectorSearchDataset { data_source: TableReference },
 
+    #[snafu(display(
+        "Search cannot be run on {} because it has no embeddings or full text search indexes.",
+        data_source.to_quoted_string()
+    ))]
+    CannotSearchDataset { data_source: TableReference },
+
     #[snafu(display("Failed to execute search query: {}", format_datafusion_error(source)))]
     DataFusionError {
         source: datafusion::error::DataFusionError,
