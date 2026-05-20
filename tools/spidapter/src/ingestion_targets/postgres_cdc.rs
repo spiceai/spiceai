@@ -72,13 +72,16 @@ impl PgConfig {
     }
 
     pub(crate) fn adbc_uri(&self) -> String {
+        // Embed search_path so ADBC UPDATE/INSERT statements can resolve
+        // unqualified table names without requiring callers to schema-qualify.
         format!(
-            "postgresql://{}:{}@{}:{}/{}",
+            "postgresql://{}:{}@{}:{}/{}?options=-c%20search_path%3D{}",
             urlencoding::encode(&self.user),
             urlencoding::encode(&self.password),
             self.host,
             self.port,
             self.database,
+            urlencoding::encode(&self.schema),
         )
     }
 
@@ -656,7 +659,20 @@ mod tests {
     fn pg_config_adbc_uri_formats_correctly() {
         let pg = make_pg_config();
         let uri = pg.adbc_uri();
-        assert_eq!(uri, "postgresql://spice:s3cr3t@localhost:5432/spicebench");
+        assert_eq!(
+            uri,
+            "postgresql://spice:s3cr3t@localhost:5432/spicebench?options=-c%20search_path%3Dtpch_abc12345"
+        );
+    }
+
+    #[test]
+    fn pg_config_adbc_uri_includes_search_path() {
+        let pg = make_pg_config();
+        let uri = pg.adbc_uri();
+        assert!(
+            uri.contains("search_path%3Dtpch_abc12345"),
+            "URI should encode search_path for the run schema: {uri}"
+        );
     }
 
     #[test]
