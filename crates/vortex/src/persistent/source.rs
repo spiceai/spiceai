@@ -118,7 +118,7 @@ impl VortexSource {
         self
     }
 
-    /// Set an [`ExpressionConvertor`] to control how DataFusion expressions should be converted and pushed down.
+    /// Set an [`ExpressionConvertor`] to control how `DataFusion` expressions should be converted and pushed down.
     #[must_use]
     pub fn with_expression_convertor(
         mut self,

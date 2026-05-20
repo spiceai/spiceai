@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use datafusion_common::DataFusionError;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_physical_plan::ExecutionPlan;
@@ -27,24 +28,27 @@ use crate::persistent::source::VortexSource;
 pub(crate) static PARTITION_LABEL: &str = "partition";
 pub(crate) static PATH_LABEL: &str = "file_path";
 
-/// Extracts datafusion metrics from all `VortexExec` instances in
+/// Extracts `DataFusion` metrics from all `VortexExec` instances in
 /// a given physical plan.
 #[derive(Default)]
 pub struct VortexMetricsFinder(Vec<MetricsSet>);
 
 impl VortexMetricsFinder {
-    /// find all metrics for `VortexExec` nodes.
+    /// Find all metrics for `VortexExec` nodes.
     pub fn find_all(plan: &dyn ExecutionPlan) -> Vec<MetricsSet> {
         let mut finder = Self::default();
         match accept(plan, &mut finder) {
             Ok(()) => finder.0,
-            Err(_) => Vec::new(),
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to collect Vortex metrics from physical plan");
+                Vec::new()
+            }
         }
     }
 }
 
 impl ExecutionPlanVisitor for VortexMetricsFinder {
-    type Error = std::convert::Infallible;
+    type Error = DataFusionError;
     fn pre_visit(&mut self, plan: &dyn ExecutionPlan) -> Result<bool, Self::Error> {
         if let Some(exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
             // Start with exec metrics or create a new set
