@@ -4201,10 +4201,6 @@ mod tests {
                 check_availability: crate::component::dataset::CheckAvailability::Disabled,
                 on_schema_change: crate::component::dataset::OnSchemaChange::default(),
             };
-
-            dataset_builder
-                .build()
-                .expect("dataset builder should build a valid test dataset")
         }
 
         fn create_snapshots_behavior(
