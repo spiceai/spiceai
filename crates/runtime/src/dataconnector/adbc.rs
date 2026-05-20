@@ -98,7 +98,7 @@ pub struct Adbc {
     /// Wrapped in `Option` so `Drop` can move the factory to a blocking thread
     /// for cleanup. ADBC drivers perform synchronous FFI calls during drop
     /// (e.g. closing network sessions) that must not run on the async runtime.
-    adbc_factory: Option<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>>,
+    factory: Option<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>>,
     pool: Weak<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
     driver_name: String,
 }
@@ -111,7 +111,7 @@ impl std::fmt::Debug for Adbc {
 
 impl Drop for Adbc {
     fn drop(&mut self) {
-        if let Some(factory) = self.adbc_factory.take() {
+        if let Some(factory) = self.factory.take() {
             // Send to the dedicated cleanup thread so we don't stall the Tokio
             // runtime. If the bounded queue is full or the worker is gone,
             // offload to a dedicated overflow thread instead of dropping inline.
@@ -530,7 +530,7 @@ impl AdbcFactory {
             AdbcTableFactory::new(Arc::clone(&pool)).with_federation_enabled(federation_enabled);
 
         Ok(Arc::new(Adbc {
-            adbc_factory: Some(adbc_factory),
+            factory: Some(adbc_factory),
             pool: Arc::downgrade(&pool),
             driver_name: driver_name_owned,
         }) as Arc<dyn DataConnector>)
@@ -1172,13 +1172,14 @@ impl DataConnector for Adbc {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let adbc_factory = self.adbc_factory.as_ref().ok_or_else(|| {
-            DataConnectorError::UnableToConnectInternal {
-                dataconnector: "adbc".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                source: "ADBC connector has been shut down".into(),
-            }
-        })?;
+        let adbc_factory =
+            self.factory
+                .as_ref()
+                .ok_or_else(|| DataConnectorError::UnableToConnectInternal {
+                    dataconnector: "adbc".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: "ADBC connector has been shut down".into(),
+                })?;
         let table_reference: TableReference = dataset.path().into();
         let dialect = dialect_for_driver(&self.driver_name);
         let provider = adbc_factory
@@ -1208,7 +1209,7 @@ impl DataConnector for Adbc {
         dataset: &Dataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         let adbc_factory =
-            self.adbc_factory
+            self.factory
                 .as_ref()
                 .ok_or_else(|| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "adbc".to_string(),
