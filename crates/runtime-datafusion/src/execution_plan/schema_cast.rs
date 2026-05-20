@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::datatypes::{Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_tools::record_batch;
 use async_stream::stream;
 use async_trait::async_trait;
@@ -532,9 +532,9 @@ mod tests {
     }
 
     #[test]
-    fn test_ordering_not_propagated_when_types_differ() {
-        // When the ordered column undergoes a type cast, ordering should NOT be
-        // propagated since the cast may not be monotonic.
+    fn test_ordering_not_propagated_when_cast_not_monotonic() {
+        // When the ordered column undergoes a non-monotonic type cast (Utf8 -> Int64),
+        // ordering should NOT be propagated.
         let input_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("name", DataType::Utf8, true),
@@ -555,7 +555,178 @@ mod tests {
 
         assert!(
             schema_cast.properties().output_ordering().is_none(),
-            "Ordering should NOT be propagated when types differ"
+            "Ordering should NOT be propagated for non-monotonic cast (Utf8 -> Int64)"
+        );
+    }
+
+    #[test]
+    fn test_ordering_propagated_for_timestamp_unit_widening() {
+        // Timestamp(µs, UTC) → Timestamp(ns, UTC) is a monotonic cast (multiply by 1000).
+        // Ordering must be propagated so SortPreservingMergeExec can merge
+        // partitioned DuckDB streams without a RowConverter schema mismatch.
+        use arrow::datatypes::TimeUnit;
+
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+        ]));
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+        ]));
+
+        let empty = Arc::new(EmptyExec::new(Arc::clone(&input_schema)));
+        let lex_ordering = LexOrdering::new(vec![
+            PhysicalSortExpr::new_default(
+                physical_col("created_at", &input_schema).expect("col created_at"),
+            )
+            .asc(),
+        ])
+        .expect("lex ordering");
+        let sorted_input: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, empty));
+
+        let schema_cast = SchemaCastScanExec::new(sorted_input, target_schema);
+
+        let output_ordering = schema_cast.properties().output_ordering();
+        assert!(
+            output_ordering.is_some(),
+            "Ordering should be propagated for monotonic temporal cast (µs -> ns)"
+        );
+        let sort_expr = &output_ordering.expect("checked above")[0];
+        let col = sort_expr
+            .expr
+            .as_any()
+            .downcast_ref::<Column>()
+            .expect("should be Column expr");
+        assert_eq!(col.name(), "created_at");
+    }
+
+    #[test]
+    fn test_ordering_propagated_for_timestamp_narrowing() {
+        // Timestamp(ns, UTC) → Timestamp(µs, UTC) is also monotonic (integer division
+        // by 1000 preserves ordering). DuckDB stores µs; source might report ns.
+        use arrow::datatypes::TimeUnit;
+
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+        ]));
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+        ]));
+
+        let empty = Arc::new(EmptyExec::new(Arc::clone(&input_schema)));
+        let lex_ordering = LexOrdering::new(vec![
+            PhysicalSortExpr::new_default(physical_col("ts", &input_schema).expect("col ts"))
+                .asc(),
+        ])
+        .expect("lex ordering");
+        let sorted_input: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, empty));
+
+        let schema_cast = SchemaCastScanExec::new(sorted_input, target_schema);
+
+        assert!(
+            schema_cast.properties().output_ordering().is_some(),
+            "Ordering should be propagated for monotonic temporal cast (ns -> µs)"
+        );
+    }
+
+    #[test]
+    fn test_ordering_propagated_for_integer_widening() {
+        // Int32 → Int64 is a monotonic widening cast.
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false), // Int32 -> Int64 (monotonic)
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let empty = Arc::new(EmptyExec::new(Arc::clone(&input_schema)));
+        let lex_ordering = LexOrdering::new(vec![
+            PhysicalSortExpr::new_default(physical_col("id", &input_schema).expect("col id")).asc(),
+        ])
+        .expect("lex ordering");
+        let sorted_input: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, empty));
+
+        let schema_cast = SchemaCastScanExec::new(sorted_input, target_schema);
+
+        assert!(
+            schema_cast.properties().output_ordering().is_some(),
+            "Ordering should be propagated for monotonic numeric widening (Int32 -> Int64)"
+        );
+    }
+
+    #[test]
+    fn test_maintains_input_order_false_for_non_monotonic_cast() {
+        // When any column in the schema undergoes a non-monotonic cast,
+        // maintains_input_order should return false to prevent the optimizer
+        // from placing SortExec below the cast.
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false), // Utf8 -> Int64 is not monotonic
+            Field::new("value", DataType::Float64, true),
+        ]));
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        let input = Arc::new(EmptyExec::new(input_schema));
+        let schema_cast = SchemaCastScanExec::new(input, target_schema);
+
+        assert_eq!(
+            schema_cast.maintains_input_order(),
+            vec![false],
+            "maintains_input_order should be false when non-monotonic cast exists"
+        );
+    }
+
+    #[test]
+    fn test_maintains_input_order_true_for_monotonic_cast() {
+        // When all columns undergo monotonic casts (or no cast), maintains_input_order
+        // should remain true so the optimizer can keep SortExec below the cast.
+        use arrow::datatypes::TimeUnit;
+
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+        ]));
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false), // same type
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ), // temporal -> temporal (monotonic)
+        ]));
+
+        let input = Arc::new(EmptyExec::new(input_schema));
+        let schema_cast = SchemaCastScanExec::new(input, target_schema);
+
+        assert_eq!(
+            schema_cast.maintains_input_order(),
+            vec![true],
+            "maintains_input_order should be true when all casts are monotonic"
         );
     }
 
