@@ -82,7 +82,7 @@ pub struct VortexSource {
 
 impl VortexSource {
     /// Creates a new `VortexSource` with default configuration and a provided [`VortexSession`].
-    /// Meant to be use with a [`FileScanConfig`] to scan a file with the provided schema.
+    /// Meant to be used with a [`FileScanConfig`] to scan a file with the provided schema.
     ///
     /// Can be configured using the provided methods.
     #[must_use]
@@ -118,7 +118,7 @@ impl VortexSource {
         self
     }
 
-    /// Set a [`ExpressionConvertor`] to control how Datafusion expression should be converted and pushed down.
+    /// Set an [`ExpressionConvertor`] to control how DataFusion expressions should be converted and pushed down.
     #[must_use]
     pub fn with_expression_convertor(
         mut self,

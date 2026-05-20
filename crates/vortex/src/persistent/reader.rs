@@ -11,11 +11,13 @@ use vortex::io::object_store::ObjectStoreReadAt;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 
+/// Shared reader for a Vortex object.
+pub type VortexReader = Arc<dyn VortexReadAt>;
+
 /// Factory to create [`VortexReadAt`] instances to read the target file.
 pub trait VortexReaderFactory: Debug + Send + Sync + 'static {
     /// Create a reader for a target object.
-    fn create_reader(&self, path: &str, session: &VortexSession)
-    -> DFResult<Arc<dyn VortexReadAt>>;
+    fn create_reader(&self, path: &str, session: &VortexSession) -> DFResult<VortexReader>;
 }
 
 /// Default factory, creates [`ObjectStore`] backed readers for files,
@@ -33,11 +35,7 @@ impl DefaultVortexReaderFactory {
 }
 
 impl VortexReaderFactory for DefaultVortexReaderFactory {
-    fn create_reader(
-        &self,
-        path: &str,
-        session: &VortexSession,
-    ) -> DFResult<Arc<dyn VortexReadAt>> {
+    fn create_reader(&self, path: &str, session: &VortexSession) -> DFResult<VortexReader> {
         Ok(Arc::new(ObjectStoreReadAt::new(
             Arc::clone(&self.object_store),
             path.into(),

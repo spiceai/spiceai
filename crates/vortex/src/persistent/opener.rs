@@ -483,7 +483,14 @@ fn collect_vortex_pushdown_conjunct(
         .as_any()
         .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
     {
-        let current = dynamic_filter.current()?;
+        let current = match dynamic_filter.current() {
+            Ok(current) => current,
+            Err(err) => {
+                tracing::debug!(error = %err, filter = ?expr, "Skipping dynamic filter that is not ready for Vortex pushdown");
+                conjuncts.skipped_dynamic.push(expr);
+                return Ok(());
+            }
+        };
         for conjunct in split_conjunction(&current).into_iter().cloned() {
             collect_vortex_pushdown_conjunct(expr_convertor, conjunct, schema, true, conjuncts)?;
         }

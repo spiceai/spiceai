@@ -35,12 +35,12 @@ pub use convert::exprs::ExpressionConvertor;
 pub use convert::exprs::ProcessedProjection;
 pub use persistent::*;
 
-/// Extension trait to convert our [`Precision`](vortex::stats::Precision) to Datafusion's [`Precision`](datafusion_common::stats::Precision)
+/// Extension trait to convert Vortex [`Precision`](vortex::stats::Precision) values to DataFusion [`Precision`](datafusion_common::stats::Precision) values.
 trait PrecisionExt<T>
 where
     T: Debug + Clone + PartialEq + Eq + PartialOrd,
 {
-    /// Convert `Precision` to the datafusion equivalent.
+    /// Convert `Precision` to the DataFusion equivalent.
     fn to_df(self) -> DFPrecision<T>;
 }
 
