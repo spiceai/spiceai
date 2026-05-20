@@ -238,6 +238,11 @@ required-features = ["duckdb-bench"]
 
 [[bench]]
 harness = false
+name = "vs_duckdb_scaling"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
 name = "compaction_picker"
 
 [[bench]]
