@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q52"
+---
++--------+----------+---------------------+------------+
+| d_year | brand_id | brand               | ext_price  |
++--------+----------+---------------------+------------+
+| 2000   | 2001002  | amalgimporto #2     | 5801976.28 |
+| 2000   | 1001002  | amalgamalg #2       | 5740225.93 |
+| 2000   | 2003002  | exportiimporto #2   | 5431418.15 |
+| 2000   | 2004002  | edu packimporto #2  | 5238162.61 |
+| 2000   | 3002002  | importoexporti #2   | 4876288.42 |
+| 2000   | 1004002  | edu packamalg #2    | 4788740.35 |
+| 2000   | 4004002  | edu packedu pack #2 | 4340986.46 |
+| 2000   | 1003001  | exportiamalg #1     | 4104888.26 |
+| 2000   | 5003002  | exportischolar #2   | 4048355.63 |
+| 2000   | 1003002  | exportiamalg #2     | 3955370.09 |
++--------+----------+---------------------+------------+
