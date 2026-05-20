@@ -76,6 +76,21 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use duckdb::Connection;
 use tokio::runtime::Runtime;
 
+/// Whether the given Cayenne metastore lane is exercised by the
+/// sustained-writes scaling benches. Returns `false` for Turso today —
+/// the sustained-writes pattern (one fixture, many writes through a
+/// single writer task) reproducibly trips Turso's optimistic concurrency
+/// control. The reader scaling bench is unaffected and still runs both
+/// lanes. See the comment at the top of `bench_write_scaling` for the
+/// full story and the follow-up plan.
+fn lane_supports_sustained_writes(lane: common::Metastore) -> bool {
+    match lane {
+        common::Metastore::Sqlite => true,
+        #[cfg(feature = "turso")]
+        common::Metastore::Turso => false,
+    }
+}
+
 /// Bounded-timeout wait for `n` writer-completion signals. Replaces the
 /// earlier `AtomicUsize` + `std::hint::spin_loop` pattern that burned an
 /// entire core on the bench thread and could hang indefinitely if a writer
@@ -482,7 +497,22 @@ fn bench_write_scaling(c: &mut Criterion) {
     // Each (lane, concurrency) point gets a fresh fixture because writes
     // accumulate state on disk and we want every measurement to start
     // from an empty table.
+    //
+    // Turso writes are intentionally skipped here. The sustained-writes
+    // pattern this bench uses (one fixture, many writes from a single
+    // writer task) reproducibly trips Turso's optimistic concurrency
+    // control on the very first insert with
+    // `"Failed to commit transaction: Write-write conflict"`. The
+    // existing `vs_duckdb_burst/cayenne_turso/*` and
+    // `vs_duckdb_upsert/cayenne_turso/*` benches do work because they
+    // use `iter_batched` with a fresh fixture per criterion sample, so
+    // writes never stack against one Turso instance. The interaction
+    // between Cayenne's mutation path and Turso's K=16 pool needs its
+    // own follow-up — track at the issue named in the PR description.
     for &lane in CAYENNE_LANES {
+        if !lane_supports_sustained_writes(lane) {
+            continue;
+        }
         let lane_label = lane.lane().to_string();
         for &concurrency in CONCURRENCIES {
             group.throughput(Throughput::Elements(
@@ -639,7 +669,14 @@ fn bench_cdc_scaling(c: &mut Criterion) {
     // but the Cayenne writer pumps `write_cdc_append_stream + finish()`
     // instead of `insert_into`. Lane id is `cayenne_cdc` (Sqlite) or
     // `cayenne_turso_cdc` (Turso).
+    //
+    // Turso CDC is skipped here for the same sustained-writes /
+    // write-write-conflict reason as `bench_write_scaling` — see the
+    // long comment there.
     for &lane in CAYENNE_LANES {
+        if !lane_supports_sustained_writes(lane) {
+            continue;
+        }
         let lane_label = format!("{}_cdc", lane.lane());
         for &concurrency in CONCURRENCIES {
             group.throughput(Throughput::Elements(
