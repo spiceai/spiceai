@@ -322,10 +322,16 @@ impl Dataset {
             metadata.insert("comment".to_string(), d.clone());
         }
         for (k, v) in &self.metadata {
-            metadata.insert(k.clone(), v.to_string());
+            metadata.insert(k.clone(), metadata_value_to_string(v));
         }
         metadata
     }
+}
+
+fn metadata_value_to_string(value: &Value) -> String {
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), ToString::to_string)
 }
 
 impl WithDependsOn<Dataset> for Dataset {

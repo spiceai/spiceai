@@ -102,7 +102,7 @@ impl View {
             metadata.insert("comment".to_string(), d.clone());
         }
         for (k, v) in &self.metadata {
-            metadata.insert(k.clone(), v.to_string());
+            metadata.insert(k.clone(), metadata_value_to_string(v));
         }
         metadata
     }
@@ -120,6 +120,12 @@ impl View {
                 .iter()
                 .find_map(|c| c.full_text_search.as_ref().and_then(|f| f.row_ids.clone())))
     }
+}
+
+fn metadata_value_to_string(value: &Value) -> String {
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), ToString::to_string)
 }
 
 impl WithDependsOn<View> for View {

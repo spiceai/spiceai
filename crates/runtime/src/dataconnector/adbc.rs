@@ -99,7 +99,7 @@ pub struct Adbc {
     /// for cleanup. ADBC drivers perform synchronous FFI calls during drop
     /// (e.g. closing network sessions) that must not run on the async runtime.
     adbc_factory: Option<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>>,
-    pool: Arc<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
+    pool: Weak<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
     driver_name: String,
 }
 
@@ -531,10 +531,27 @@ impl AdbcFactory {
 
         Ok(Arc::new(Adbc {
             adbc_factory: Some(adbc_factory),
-            pool,
+            pool: Arc::downgrade(&pool),
             driver_name: driver_name_owned,
         }) as Arc<dyn DataConnector>)
     }
+}
+
+async fn enrich_with_bigquery_metadata_from_weak_pool(
+    driver_name: &str,
+    pool: &Weak<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
+    table_reference: &TableReference,
+    provider: Arc<dyn TableProvider>,
+) -> Arc<dyn TableProvider> {
+    let Some(pool) = pool.upgrade() else {
+        tracing::warn!(
+            table = %table_reference,
+            "Failed to query BigQuery schema metadata via ADBC because the connection pool is shutting down; registering without source metadata"
+        );
+        return provider;
+    };
+
+    enrich_with_bigquery_metadata(driver_name, &pool, table_reference, provider).await
 }
 
 pub(crate) async fn enrich_with_bigquery_metadata(
@@ -1181,15 +1198,13 @@ impl DataConnector for Adbc {
                 })
             })?;
 
-        Ok(
-            enrich_with_bigquery_metadata(
-                &self.driver_name,
-                &self.pool,
-                &table_reference,
-                provider,
-            )
-            .await,
+        Ok(enrich_with_bigquery_metadata_from_weak_pool(
+            &self.driver_name,
+            &self.pool,
+            &table_reference,
+            provider,
         )
+        .await)
     }
 
     async fn read_write_provider(
@@ -1215,7 +1230,7 @@ impl DataConnector for Adbc {
             .read_write_table_provider(table_reference.clone(), dialect)
             .await
         {
-            Ok(provider) => Ok(enrich_with_bigquery_metadata(
+            Ok(provider) => Ok(enrich_with_bigquery_metadata_from_weak_pool(
                 &self.driver_name,
                 &self.pool,
                 &table_reference,

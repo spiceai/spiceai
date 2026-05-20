@@ -3264,7 +3264,7 @@ impl DataFusion {
         self.ctx
             .register_table(table.clone(), table_provider)
             .map_err(|e| Error::UnableToCreateView {
-                reason: format!("Failed to registed view: {e}"),
+                reason: format!("Failed to register view: {e}"),
             })?;
 
         tracing::info!("{}", view_registered_trace(table, Some(acceleration)));
@@ -4161,7 +4161,7 @@ mod tests {
         );
         assert_eq!(
             schema.metadata().get("source_owner").map(String::as_str),
-            Some("\"analytics\"")
+            Some("analytics")
         );
         let id_field = schema.field_with_name("id").expect("id field should exist");
         assert_eq!(

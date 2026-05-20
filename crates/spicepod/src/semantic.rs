@@ -118,7 +118,7 @@ impl Column {
             metadata.insert("comment".to_string(), d.clone());
         }
         for (k, v) in &self.metadata {
-            metadata.insert(k.clone(), v.to_string());
+            metadata.insert(k.clone(), metadata_value_to_string(v));
         }
         metadata
     }
@@ -129,6 +129,12 @@ impl Column {
         // If it doesn't deserialize to `MetadataType`, not an issue, just not a `MetadataType`.
         serde_json::from_value(value).ok()
     }
+}
+
+fn metadata_value_to_string(value: &Value) -> String {
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), ToString::to_string)
 }
 
 impl From<&str> for Column {
