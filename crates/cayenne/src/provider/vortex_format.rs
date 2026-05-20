@@ -106,10 +106,7 @@ fn adjust_num_rows_for_deletions(
 }
 
 fn deleted_rows_within_file(deletion_vector: &PositionDeletionVector, row_count: usize) -> usize {
-    deletion_vector
-        .iter()
-        .take_while(|row_id| usize::try_from(*row_id).is_ok_and(|row_id| row_id < row_count))
-        .count()
+    deletion_vector.count_before_row(row_count)
 }
 
 #[cfg(test)]

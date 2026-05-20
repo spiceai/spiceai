@@ -40,6 +40,7 @@ use vortex_utils::aliases::dash_map::DashMap;
 
 use super::opener::VortexOpener;
 use super::segment_cache::SharedSegmentCache;
+use crate::ProjectionPushdown;
 use crate::ScanConcurrency;
 use crate::VortexTableOptions;
 use crate::convert::exprs::DefaultExpressionConvertor;
@@ -110,10 +111,10 @@ impl VortexSource {
         }
     }
 
-    /// Enable or disable expression pushdown into the underlying Vortex scan.
+    /// Set projection-expression pushdown behavior for the underlying Vortex scan.
     #[must_use]
-    pub fn with_projection_pushdown(mut self, enabled: bool) -> Self {
-        self.options.projection_pushdown = enabled;
+    pub fn with_projection_pushdown(mut self, mode: ProjectionPushdown) -> Self {
+        self.options.projection_pushdown = mode;
         self
     }
 
@@ -243,7 +244,7 @@ impl FileSource for VortexSource {
             expression_convertor: Arc::clone(&self.expression_convertor),
             file_metadata_cache: self.file_metadata_cache.as_ref().map(Arc::clone),
             segment_cache: self.segment_cache.as_ref().map(Arc::clone),
-            projection_pushdown: self.options.projection_pushdown,
+            projection_pushdown: self.options.projection_pushdown.enabled(),
             scan_concurrency: Some(scan_concurrency),
         };
 

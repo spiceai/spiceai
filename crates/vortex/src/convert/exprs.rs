@@ -744,10 +744,7 @@ mod tests {
             .convert(&col_expr)
             .unwrap();
 
-        assert_snapshot!(result.display_tree().to_string(), @r"
-        vortex.get_item(test_column)
-        └── input: vortex.root()
-        ");
+        assert_snapshot!("expr_from_df_column", result.display_tree().to_string());
     }
 
     #[test]
@@ -757,7 +754,7 @@ mod tests {
             .convert(&literal_expr)
             .unwrap();
 
-        assert_snapshot!(result.display_tree().to_string(), @"vortex.literal(42i32)");
+        assert_snapshot!("expr_from_df_literal", result.display_tree().to_string());
     }
 
     #[test]
@@ -771,12 +768,7 @@ mod tests {
             .convert(&binary_expr)
             .unwrap();
 
-        assert_snapshot!(result.display_tree().to_string(), @r"
-        vortex.binary(=)
-        ├── lhs: vortex.get_item(left)
-        │   └── input: vortex.root()
-        └── rhs: vortex.literal(42i32)
-        ");
+        assert_snapshot!("expr_from_df_binary", result.display_tree().to_string());
     }
 
     #[test]
@@ -909,13 +901,10 @@ mod tests {
             .convert(&case_expr)
             .unwrap();
 
-        assert_snapshot!(result.display_tree().to_string(), @r#"
-        vortex.zip()
-        ├── if_true: vortex.literal("yes")
-        ├── if_false: vortex.literal("no")
-        └── mask: vortex.get_item(active)
-            └── input: vortex.root()
-        "#);
+        assert_snapshot!(
+            "expr_from_df_case_when_with_else",
+            result.display_tree().to_string()
+        );
     }
 
     #[test]

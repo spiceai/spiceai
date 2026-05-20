@@ -80,6 +80,7 @@ mod common_tests {
     use object_store::memory::InMemory;
     use url::Url;
 
+    use crate::ProjectionPushdown;
     use crate::VortexFormatFactory;
     use crate::VortexTableOptions;
 
@@ -99,7 +100,7 @@ mod common_tests {
         pub fn new(projection_pushdown: bool) -> Self {
             let store = Arc::new(InMemory::new());
             let opts = VortexTableOptions {
-                projection_pushdown,
+                projection_pushdown: ProjectionPushdown::from_bool(projection_pushdown),
                 ..Default::default()
             };
             let factory = Arc::new(VortexFormatFactory::new().with_options(opts));

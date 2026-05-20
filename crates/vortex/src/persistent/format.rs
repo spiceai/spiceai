@@ -74,6 +74,85 @@ use crate::convert::TryToDataFusion;
 const DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES: usize = MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE;
 const DEFAULT_TARGET_FILE_SIZE_MB: usize = 128;
 
+/// Controls projection-expression pushdown into Vortex scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProjectionPushdown {
+    /// Evaluate all projection expressions after the scan.
+    #[default]
+    Off,
+    /// Push safe projection expressions into the scan and evaluate unsafe fragments after the scan.
+    On,
+    /// Let Vortex choose the safe projection-pushdown behavior for the scan.
+    Auto,
+}
+
+impl ProjectionPushdown {
+    /// Returns whether this mode enables safe projection-expression pushdown.
+    #[must_use]
+    pub fn enabled(self) -> bool {
+        matches!(self, Self::On | Self::Auto)
+    }
+
+    /// Converts a legacy boolean projection-pushdown setting into the enum mode.
+    #[must_use]
+    pub fn from_bool(enabled: bool) -> Self {
+        if enabled { Self::On } else { Self::Off }
+    }
+}
+
+impl Display for ProjectionPushdown {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => f.write_str("off"),
+            Self::On => f.write_str("on"),
+            Self::Auto => f.write_str("auto"),
+        }
+    }
+}
+
+impl ConfigField for ProjectionPushdown {
+    fn visit<V: datafusion_common::config::Visit>(
+        &self,
+        v: &mut V,
+        key: &str,
+        description: &'static str,
+    ) {
+        v.some(key, self, description);
+    }
+
+    fn set(&mut self, key: &str, value: &str) -> DFResult<()> {
+        if !key.is_empty() {
+            return Err(DataFusionError::Configuration(format!(
+                "Config field projection_pushdown is a scalar and does not have nested field {key}"
+            )));
+        }
+
+        *self = match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Self::Auto,
+            "on" | "enabled" | "true" | "1" => Self::On,
+            "off" | "disabled" | "false" | "0" => Self::Off,
+            value => {
+                return Err(DataFusionError::Configuration(format!(
+                    "Invalid projection_pushdown value {value:?}; expected 'auto', 'on', or 'off'"
+                )));
+            }
+        };
+
+        Ok(())
+    }
+
+    fn reset(&mut self, key: &str) -> DFResult<()> {
+        if key.is_empty() {
+            *self = Self::default();
+            Ok(())
+        } else {
+            Err(DataFusionError::Configuration(format!(
+                "Config field projection_pushdown is a scalar and does not have nested field {key}"
+            )))
+        }
+    }
+}
+
 /// Controls intra-file Vortex scan concurrency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScanConcurrency {
@@ -184,12 +263,13 @@ config_namespace! {
         /// DataFusion's file demuxer and splits output files based on
         /// approximate byte size rather than row count.
         pub target_file_size_mb: usize, default = DEFAULT_TARGET_FILE_SIZE_MB
-        /// Whether to enable projection pushdown into the underlying Vortex scan.
+        /// Projection pushdown behavior for the underlying Vortex scan.
         ///
-        /// When enabled, projection expressions may be partially evaluated during
-        /// the scan. When disabled, Vortex reads only the referenced columns and
-        /// all expressions are evaluated after the scan.
-        pub projection_pushdown: bool, default = false
+        /// Accepted values are `off`, `on`, or `auto`. `off` reads referenced columns
+        /// and evaluates all projection expressions after the scan. `on` and `auto`
+        /// push safe projection expressions into the scan while keeping unsafe
+        /// fragments above the scan.
+        pub projection_pushdown: ProjectionPushdown, default = ProjectionPushdown::Off
         /// The intra-file scan concurrency, controlling the number of row splits to process
         /// concurrently within each file.
         ///
@@ -812,6 +892,31 @@ mod tests {
     fn format_scan_concurrency_default_is_auto() {
         let opts = VortexTableOptions::default();
         assert_eq!(opts.scan_concurrency, ScanConcurrency::Auto);
+    }
+
+    #[test]
+    fn format_projection_pushdown_default_is_off() {
+        let opts = VortexTableOptions::default();
+        assert_eq!(opts.projection_pushdown, ProjectionPushdown::Off);
+    }
+
+    #[test]
+    fn format_plumbs_projection_pushdown_modes() {
+        let mut opts = VortexTableOptions::default();
+        opts.set("projection_pushdown", "auto").unwrap();
+        assert_eq!(opts.projection_pushdown, ProjectionPushdown::Auto);
+        assert!(opts.projection_pushdown.enabled());
+
+        opts.set("projection_pushdown", "on").unwrap();
+        assert_eq!(opts.projection_pushdown, ProjectionPushdown::On);
+        assert!(opts.projection_pushdown.enabled());
+
+        opts.set("projection_pushdown", "true").unwrap();
+        assert_eq!(opts.projection_pushdown, ProjectionPushdown::On);
+
+        opts.set("projection_pushdown", "off").unwrap();
+        assert_eq!(opts.projection_pushdown, ProjectionPushdown::Off);
+        assert!(!opts.projection_pushdown.enabled());
     }
 
     #[test]

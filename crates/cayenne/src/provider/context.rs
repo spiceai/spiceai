@@ -21,7 +21,7 @@ use std::sync::Arc;
 use datafusion_execution::{config::SessionConfig, runtime_env::RuntimeEnv};
 use tokio::sync::Semaphore;
 use vortex::VortexSessionDefault;
-use vortex_datafusion::{VortexFormat, VortexTableOptions};
+use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions};
 use vortex_session::VortexSession;
 
 use crate::metadata::{PkConflictDetection, VortexConfig};
@@ -252,7 +252,7 @@ impl CayenneContext {
 
         let vortex_opts = VortexTableOptions {
             target_file_size_mb: config.target_vortex_file_size_mb,
-            projection_pushdown: true,
+            projection_pushdown: ProjectionPushdown::On,
             segment_cache_size_bytes,
             ..VortexTableOptions::default()
         };
@@ -270,6 +270,9 @@ mod tests {
         let runtime_env = Arc::new(RuntimeEnv::default());
         let context = CayenneContext::new(&VortexConfig::default(), runtime_env);
 
-        assert!(context.file_format().options().projection_pushdown);
+        assert_eq!(
+            context.file_format().options().projection_pushdown,
+            ProjectionPushdown::On
+        );
     }
 }

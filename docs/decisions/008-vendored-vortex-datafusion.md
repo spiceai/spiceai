@@ -20,6 +20,12 @@ Related decisions:
 * [DR-004: Use Apache Ballista as Spice's distributed query framework](./004-distributed-query-framework.md)
 * [DR-005: Extend Apache Ballista with Remote Catalog, UDF Sync, and Cluster Security](./005-ballista-extensions.md) — same vendoring pattern for an external framework Spice depends on.
 
+## Options Considered
+
+1. **Only upstream**: contribute all Cayenne-required changes to upstream `vortex-datafusion` and wait to consume them after release. This keeps long-term ownership clean, but blocks Cayenne on external review/release timing and on upstream's DataFusion target matching Spice's fork.
+2. **Fork the Vortex repository**: keep `vortex-datafusion` in a Spice fork and point Cargo at the forked crate. This makes upstream comparison easier than vendoring, but still couples every Spice-specific iteration to a separate repository and keeps the integration boundary outside the Spice workspace.
+3. **Vendor the crate internally**: copy `vortex-datafusion` into the Spice workspace and make Cayenne depend on the local package. This gives Cayenne immediate control over DataFusion compatibility, deletion semantics, and performance work, at the cost of owning the downstream merge burden.
+
 ## Design Principles
 
 * **Data correctness is non-negotiable**: Cayenne queries must return exact results even when files have external position deletes. Statistics, predicate pushdown, and projection handling must preserve SQL semantics.
@@ -69,7 +75,7 @@ The vendored crate exposes Spice-shaped options on the DataFusion `config_namesp
 
 * `footer_initial_read_size_bytes` — bounded footer prefetch.
 * `target_file_size_mb` — size-based file splitting for non-partitioned writes.
-* `projection_pushdown` — opt-in pushdown of projection expressions.
+* `projection_pushdown` — `off`/`on`/`auto` projection-expression pushdown.
 * `scan_concurrency` — `auto`/`off`/explicit intra-file Vortex scan concurrency, derived from `DataFusion` target partitions and planned file count in `auto` mode.
 * `segment_cache_size_bytes` — capacity of the shared segment cache.
 
@@ -101,6 +107,7 @@ These are surfaced through Cayenne's accelerator configuration (e.g. `cayenne_fo
 
 * Spice now owns a non-trivial DataFusion file-format adapter and must keep it building against an evolving Vortex and an evolving DataFusion fork.
 * Divergence from upstream `vortex-datafusion` will accrue over time, which makes future upstreaming (or replacement with an upstream adapter) more expensive.
+* Vendoring makes merging upstream Vortex changes back down into Spice harder than tracking a fork or consuming the upstream crate directly, because each upstream update must be reconciled against local workspace changes.
 * Bug fixes and features from upstream `vortex-datafusion` must be manually evaluated and ported.
 
 ### Risks and Mitigations
