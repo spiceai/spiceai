@@ -2292,6 +2292,22 @@ mod accelerator_compat_tests {
             .expect("insert successful");
     }
 
+    /// DuckDB may rename inner field names in compound types (List, Map)
+    /// while keeping the data type structurally equivalent.
+    /// E.g. List(Field { name: "item", .. }) vs List(Field { name: "l", .. })
+    fn complex_types_structurally_equal(a: &DataType, b: &DataType) -> bool {
+        match (a, b) {
+            (DataType::List(fa), DataType::List(fb))
+            | (DataType::LargeList(fa), DataType::LargeList(fb)) => {
+                fa.data_type() == fb.data_type() && fa.is_nullable() == fb.is_nullable()
+            }
+            (DataType::Map(fa, ka), DataType::Map(fb, kb)) => {
+                ka == kb && fa.data_type() == fb.data_type() && fa.is_nullable() == fb.is_nullable()
+            }
+            _ => false,
+        }
+    }
+
     #[tokio::test]
     async fn test_schema_preservation() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
@@ -2372,8 +2388,47 @@ mod accelerator_compat_tests {
                             table_type
                         );
                     }
+                } else if matches!(engine, Engine::DuckDB) {
+                    // DuckDB normalises certain Arrow types to its canonical storage variants
+                    //   LargeUtf8 -> Utf8
+                    //   LargeBinary -> Binary
+                    //   Date64 -> Date32
+                    //   Time32(*) -> Time64(Microsecond)
+                    //   Duration(*) -> Interval(MonthDayNano)
+                    //   Interval(*) -> Interval(MonthDayNano)
+                    //   List/Map inner field names may be renamed (e.g. "item" -> "l")
+                    let duckdb_compatible = matches!(
+                        (original_type, table_type),
+                        (DataType::LargeUtf8, DataType::Utf8)
+                            | (DataType::LargeBinary, DataType::Binary)
+                            | (DataType::Date64, DataType::Date32)
+                            | (
+                                DataType::Time32(_),
+                                DataType::Time64(TimeUnit::Microsecond)
+                            )
+                            | (
+                                DataType::Duration(_),
+                                DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
+                            )
+                            | (
+                                DataType::Interval(_),
+                                DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
+                            )
+                    ) || complex_types_structurally_equal(original_type, table_type);
+                    if !duckdb_compatible {
+                        assert_eq!(
+                            original_type,
+                            table_type,
+                            "{:?}: Field {} ({}) data type mismatch. Expected {:?}, got {:?}",
+                            engine,
+                            i,
+                            original_field.name(),
+                            original_type,
+                            table_type
+                        );
+                    }
                 } else {
-                    // For non-Vortex engines, types should match exactly
+                    // For other engines, types should match exactly
                     assert_eq!(
                         original_type,
                         table_type,
