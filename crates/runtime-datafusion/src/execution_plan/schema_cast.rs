@@ -48,26 +48,38 @@ use std::sync::Arc;
 
 /// Returns `true` if casting from `from` to `to` is guaranteed to preserve ordering.
 ///
-/// This mirrors the logic in DataFusion's `CastExpr::get_properties()` which treats
-/// temporal→temporal and numeric→numeric casts as order-preserving. These casts are
-/// monotonic transformations (scaling by a positive constant or lossless widening),
-/// so sorted input produces sorted output.
+/// Mirrors DataFusion's `CastExpr::get_properties()`: temporal→temporal and
+/// numeric widening casts are monotonic. Arrow timestamps are UTC instants
+/// regardless of timezone annotation, so unit conversions are always monotonic.
 fn is_order_preserving_cast(from: &DataType, to: &DataType) -> bool {
     if from == to {
         return true;
     }
-    // Temporal → temporal: timestamp unit conversions (µs↔ns↔ms↔s), Date32↔Date64, etc.
-    // All are monotonic (multiply/divide by positive constant).
     if from.is_temporal() && to.is_temporal() {
         return true;
     }
-    // Numeric → numeric: integer widening (Int8→Int16→Int32→Int64), unsigned widening,
-    // Float32→Float64, integer→float where exactly representable.
-    // All preserve ordering (value-preserving or monotonic widening).
     if from.is_numeric() && to.is_numeric() {
-        return true;
+        return is_numeric_widening(from, to);
     }
     false
+}
+
+/// Same-signedness integer widening, float widening, and integer→float where
+/// all values are exactly representable.
+fn is_numeric_widening(from: &DataType, to: &DataType) -> bool {
+    use DataType::*;
+    matches!(
+        (from, to),
+        (Int8, Int16 | Int32 | Int64)
+            | (Int16, Int32 | Int64)
+            | (Int32, Int64)
+            | (UInt8, UInt16 | UInt32 | UInt64)
+            | (UInt16, UInt32 | UInt64)
+            | (UInt32, UInt64)
+            | (Float32, Float64)
+            | (Int8 | Int16 | Int32 | UInt8 | UInt16 | UInt32, Float64)
+            | (Int8 | Int16 | UInt8 | UInt16, Float32)
+    )
 }
 
 pub struct SchemaCastScanExec {
@@ -111,11 +123,8 @@ impl SchemaCastScanExec {
             .with_metadata(schema.metadata().clone()),
         );
 
-        // Propagate input ordering only when all ordered columns exist in the output
-        // schema with the same data type. Column indices are remapped by name because
-        // the output schema may reorder columns relative to the input. Type casts are
-        // not universally monotonic (e.g., Utf8→numeric, float NaN handling), so we
-        // only propagate ordering when no type change occurs for the ordered columns.
+        // Propagate input ordering for columns whose cast is monotonic.
+        // Indices are remapped by name since the output may reorder columns.
         let mut eq_properties = EquivalenceProperties::new(Arc::clone(&output_schema));
         if let Some(ordering) = input.properties().output_ordering() {
             let remapped: Option<Vec<PhysicalSortExpr>> = ordering
@@ -761,6 +770,39 @@ mod tests {
     }
 
     #[test]
+    fn test_ordering_propagated_when_sort_key_unchanged_but_other_column_cast() {
+        // Sort key (id) has same type; another column has a non-monotonic cast.
+        // Ordering should still propagate via equivalence_properties since the
+        // sort-key column itself is unaffected.
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, true),
+        ]));
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("label", DataType::Int64, true), // Utf8 -> Int64 (non-monotonic)
+        ]));
+
+        let empty = Arc::new(EmptyExec::new(Arc::clone(&input_schema)));
+        let lex_ordering = LexOrdering::new(vec![
+            PhysicalSortExpr::new_default(physical_col("id", &input_schema).expect("col id")).asc(),
+        ])
+        .expect("lex ordering");
+        let sorted_input: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, empty));
+
+        let schema_cast = SchemaCastScanExec::new(sorted_input, target_schema);
+
+        // Ordering propagates because the sort key itself is unchanged.
+        assert!(
+            schema_cast.properties().output_ordering().is_some(),
+            "Ordering should propagate when sort key type is unchanged"
+        );
+        // But maintains_input_order is false (conservative) because a column has
+        // a non-monotonic cast.
+        assert_eq!(schema_cast.maintains_input_order(), vec![false]);
+    }
+
+    #[test]
     fn test_ordering_remaps_indices_when_schema_reorders_columns() {
         // When the target schema reorders columns, the ordering column indices
         // should be remapped to the output schema positions.
@@ -801,5 +843,250 @@ mod tests {
             "Column 'a' should be remapped to index 1 in the output schema"
         );
         assert_eq!(col.name(), "a");
+    }
+
+    // ─── is_order_preserving_cast / is_numeric_widening unit tests ───
+
+    mod monotonic_cast_tests {
+        use super::super::{is_numeric_widening, is_order_preserving_cast};
+        use arrow::datatypes::{DataType, TimeUnit};
+
+        // --- Temporal casts (all should be order-preserving) ---
+
+        #[test]
+        fn timestamp_us_to_ns_same_tz() {
+            let from = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+            let to = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
+            assert!(is_order_preserving_cast(&from, &to));
+        }
+
+        #[test]
+        fn timestamp_ns_to_us_same_tz() {
+            let from = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
+            let to = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+            assert!(is_order_preserving_cast(&from, &to));
+        }
+
+        #[test]
+        fn timestamp_s_to_ns() {
+            let from = DataType::Timestamp(TimeUnit::Second, Some("UTC".into()));
+            let to = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
+            assert!(is_order_preserving_cast(&from, &to));
+        }
+
+        #[test]
+        fn timestamp_ms_to_us() {
+            let from = DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
+            let to = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+            assert!(is_order_preserving_cast(&from, &to));
+        }
+
+        #[test]
+        fn timestamp_different_tz_annotations() {
+            // Arrow timestamps are always UTC instants; tz is display metadata.
+            let from = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+            let to = DataType::Timestamp(TimeUnit::Nanosecond, Some("America/New_York".into()));
+            assert!(is_order_preserving_cast(&from, &to));
+        }
+
+        #[test]
+        fn timestamp_tz_to_no_tz() {
+            let from = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+            let to = DataType::Timestamp(TimeUnit::Nanosecond, None);
+            assert!(is_order_preserving_cast(&from, &to));
+        }
+
+        #[test]
+        fn date32_to_date64() {
+            assert!(is_order_preserving_cast(
+                &DataType::Date32,
+                &DataType::Date64
+            ));
+        }
+
+        #[test]
+        fn date64_to_date32() {
+            assert!(is_order_preserving_cast(
+                &DataType::Date64,
+                &DataType::Date32
+            ));
+        }
+
+        // --- Numeric widening (should be order-preserving) ---
+
+        #[test]
+        fn int8_to_int16() {
+            assert!(is_numeric_widening(&DataType::Int8, &DataType::Int16));
+            assert!(is_order_preserving_cast(&DataType::Int8, &DataType::Int16));
+        }
+
+        #[test]
+        fn int8_to_int32() {
+            assert!(is_numeric_widening(&DataType::Int8, &DataType::Int32));
+        }
+
+        #[test]
+        fn int8_to_int64() {
+            assert!(is_numeric_widening(&DataType::Int8, &DataType::Int64));
+        }
+
+        #[test]
+        fn int16_to_int32() {
+            assert!(is_numeric_widening(&DataType::Int16, &DataType::Int32));
+        }
+
+        #[test]
+        fn int16_to_int64() {
+            assert!(is_numeric_widening(&DataType::Int16, &DataType::Int64));
+        }
+
+        #[test]
+        fn int32_to_int64() {
+            assert!(is_numeric_widening(&DataType::Int32, &DataType::Int64));
+        }
+
+        #[test]
+        fn uint8_to_uint16() {
+            assert!(is_numeric_widening(&DataType::UInt8, &DataType::UInt16));
+        }
+
+        #[test]
+        fn uint8_to_uint32() {
+            assert!(is_numeric_widening(&DataType::UInt8, &DataType::UInt32));
+        }
+
+        #[test]
+        fn uint8_to_uint64() {
+            assert!(is_numeric_widening(&DataType::UInt8, &DataType::UInt64));
+        }
+
+        #[test]
+        fn uint16_to_uint32() {
+            assert!(is_numeric_widening(&DataType::UInt16, &DataType::UInt32));
+        }
+
+        #[test]
+        fn uint16_to_uint64() {
+            assert!(is_numeric_widening(&DataType::UInt16, &DataType::UInt64));
+        }
+
+        #[test]
+        fn uint32_to_uint64() {
+            assert!(is_numeric_widening(&DataType::UInt32, &DataType::UInt64));
+        }
+
+        #[test]
+        fn float32_to_float64() {
+            assert!(is_numeric_widening(&DataType::Float32, &DataType::Float64));
+        }
+
+        #[test]
+        fn int32_to_float64() {
+            assert!(is_numeric_widening(&DataType::Int32, &DataType::Float64));
+        }
+
+        #[test]
+        fn uint32_to_float64() {
+            assert!(is_numeric_widening(&DataType::UInt32, &DataType::Float64));
+        }
+
+        #[test]
+        fn int16_to_float32() {
+            assert!(is_numeric_widening(&DataType::Int16, &DataType::Float32));
+        }
+
+        #[test]
+        fn uint16_to_float32() {
+            assert!(is_numeric_widening(&DataType::UInt16, &DataType::Float32));
+        }
+
+        #[test]
+        fn int8_to_float32() {
+            assert!(is_numeric_widening(&DataType::Int8, &DataType::Float32));
+        }
+
+        #[test]
+        fn int8_to_float64() {
+            assert!(is_numeric_widening(&DataType::Int8, &DataType::Float64));
+        }
+
+        // --- Non-monotonic / disallowed casts ---
+
+        #[test]
+        fn int32_to_uint32_not_monotonic() {
+            // Signed → unsigned reinterprets negatives as large positives.
+            assert!(!is_numeric_widening(&DataType::Int32, &DataType::UInt32));
+            assert!(!is_order_preserving_cast(
+                &DataType::Int32,
+                &DataType::UInt32
+            ));
+        }
+
+        #[test]
+        fn uint32_to_int32_not_monotonic() {
+            // Unsigned → signed of same width: values > i32::MAX wrap.
+            assert!(!is_numeric_widening(&DataType::UInt32, &DataType::Int32));
+        }
+
+        #[test]
+        fn int64_to_int32_not_widening() {
+            // Narrowing: potential overflow changes ordering.
+            assert!(!is_numeric_widening(&DataType::Int64, &DataType::Int32));
+        }
+
+        #[test]
+        fn float64_to_float32_not_widening() {
+            assert!(!is_numeric_widening(&DataType::Float64, &DataType::Float32));
+        }
+
+        #[test]
+        fn int64_to_float64_not_widening() {
+            // Int64 values > 2^53 lose precision in Float64, which can reorder.
+            assert!(!is_numeric_widening(&DataType::Int64, &DataType::Float64));
+        }
+
+        #[test]
+        fn uint64_to_float64_not_widening() {
+            assert!(!is_numeric_widening(&DataType::UInt64, &DataType::Float64));
+        }
+
+        #[test]
+        fn int32_to_float32_not_widening() {
+            // Int32 values > 2^24 lose precision in Float32.
+            assert!(!is_numeric_widening(&DataType::Int32, &DataType::Float32));
+        }
+
+        #[test]
+        fn uint32_to_float32_not_widening() {
+            assert!(!is_numeric_widening(&DataType::UInt32, &DataType::Float32));
+        }
+
+        #[test]
+        fn utf8_to_int64_not_order_preserving() {
+            assert!(!is_order_preserving_cast(&DataType::Utf8, &DataType::Int64));
+        }
+
+        #[test]
+        fn int64_to_utf8_not_order_preserving() {
+            assert!(!is_order_preserving_cast(&DataType::Int64, &DataType::Utf8));
+        }
+
+        #[test]
+        fn utf8_to_utf8_same_type() {
+            assert!(is_order_preserving_cast(&DataType::Utf8, &DataType::Utf8));
+        }
+
+        #[test]
+        fn same_type_always_preserving() {
+            assert!(is_order_preserving_cast(&DataType::Int64, &DataType::Int64));
+            assert!(is_order_preserving_cast(
+                &DataType::Float64,
+                &DataType::Float64
+            ));
+            assert!(is_order_preserving_cast(
+                &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+            ));
+        }
     }
 }
