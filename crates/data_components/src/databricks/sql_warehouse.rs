@@ -56,7 +56,6 @@ use util::{
     format_datafusion_error,
 };
 
-use crate::{COMMENT_METADATA_KEY, PARTITION_METADATA_KEY, SOURCE_TYPE_METADATA_KEY};
 #[cfg(test)]
 use crate::resilient_http::configure_client_builder;
 use crate::resilient_http::{
@@ -67,6 +66,7 @@ use crate::schema_discovery::{
     DatasetPermissions, NoPermissionsCheck, PermissionCheckResult, SchemaProbeResult,
     discover_schema,
 };
+use crate::{COMMENT_METADATA_KEY, PARTITION_METADATA_KEY, SOURCE_TYPE_METADATA_KEY};
 use tracing::Instrument;
 use util::retry_strategy::BackoffMethod;
 
@@ -1768,7 +1768,10 @@ fn field_with_optional_metadata(
         metadata.insert(COMMENT_METADATA_KEY.to_string(), comment.to_string());
     }
     if let Some(source_type) = source_type.map(str::trim).filter(|value| !value.is_empty()) {
-        metadata.insert(SOURCE_TYPE_METADATA_KEY.to_string(), source_type.to_string());
+        metadata.insert(
+            SOURCE_TYPE_METADATA_KEY.to_string(),
+            source_type.to_string(),
+        );
     }
 
     if metadata.is_empty() {
@@ -1828,10 +1831,12 @@ fn partition_columns_from_describe_detail_json(
         return Ok(Vec::new());
     };
 
-    let row_array = row.as_array().ok_or_else(|| Error::UnexpectedSchemaResponse {
-        dataset_name: dataset_name.to_string(),
-        reason: "DESCRIBE DETAIL row is not an array".to_string(),
-    })?;
+    let row_array = row
+        .as_array()
+        .ok_or_else(|| Error::UnexpectedSchemaResponse {
+            dataset_name: dataset_name.to_string(),
+            reason: "DESCRIBE DETAIL row is not an array".to_string(),
+        })?;
 
     let Some(partition_columns) = row_array.get(7) else {
         return Ok(Vec::new());
@@ -1859,17 +1864,19 @@ fn partition_column_names(value: &Value) -> Option<Vec<String>> {
             if trimmed.is_empty() {
                 return Some(Vec::new());
             }
-            serde_json::from_str::<Vec<String>>(trimmed).ok().or_else(|| {
-                Some(
-                    trimmed
-                        .trim_matches(['[', ']'])
-                        .split(',')
-                        .map(|value| value.trim().trim_matches('"'))
-                        .filter(|value| !value.is_empty())
-                        .map(ToString::to_string)
-                        .collect(),
-                )
-            })
+            serde_json::from_str::<Vec<String>>(trimmed)
+                .ok()
+                .or_else(|| {
+                    Some(
+                        trimmed
+                            .trim_matches(['[', ']'])
+                            .split(',')
+                            .map(|value| value.trim().trim_matches('"'))
+                            .filter(|value| !value.is_empty())
+                            .map(ToString::to_string)
+                            .collect(),
+                    )
+                })
         }
         Value::Null => Some(Vec::new()),
         _ => None,
@@ -2137,11 +2144,27 @@ mod tests {
         );
         assert_eq!(
             schema
+                .field(0)
+                .metadata()
+                .get(SOURCE_TYPE_METADATA_KEY)
+                .map(String::as_str),
+            Some("int")
+        );
+        assert_eq!(
+            schema
                 .field(1)
                 .metadata()
                 .get(COMMENT_METADATA_KEY)
                 .map(String::as_str),
             Some("display name")
+        );
+        assert_eq!(
+            schema
+                .field(1)
+                .metadata()
+                .get(SOURCE_TYPE_METADATA_KEY)
+                .map(String::as_str),
+            Some("string")
         );
         assert!(
             schema
@@ -2150,17 +2173,17 @@ mod tests {
                 .get(COMMENT_METADATA_KEY)
                 .is_none()
         );
-    }
-
-    #[test]
         assert_eq!(
             schema
-                .field(0)
+                .field(2)
                 .metadata()
                 .get(SOURCE_TYPE_METADATA_KEY)
                 .map(String::as_str),
-            Some("int")
+            Some("double")
         );
+    }
+
+    #[test]
     fn test_schema_from_json_many_types() {
         let response = make_schema_response(&json!([
             ["col_bigint", "bigint", "NO"],
@@ -2174,14 +2197,6 @@ mod tests {
         ]));
 
         let schema = schema_from_json(&response, "test_table").expect("should parse schema");
-        assert_eq!(
-            schema
-                .field(1)
-                .metadata()
-                .get(SOURCE_TYPE_METADATA_KEY)
-                .map(String::as_str),
-            Some("string")
-        );
         assert_eq!(schema.fields().len(), 8);
         assert_eq!(schema.field(0).data_type(), &DataType::Int64);
         assert_eq!(schema.field(1).data_type(), &DataType::Int16);
@@ -2189,14 +2204,11 @@ mod tests {
         assert_eq!(schema.field(3).data_type(), &DataType::Float32);
         assert_eq!(schema.field(4).data_type(), &DataType::Date32);
         assert_eq!(
-        assert_eq!(
-            schema
-                .field(2)
-                .metadata()
-                .get(SOURCE_TYPE_METADATA_KEY)
-                .map(String::as_str),
-            Some("double")
+            schema.field(5).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
         );
+        assert_eq!(schema.field(6).data_type(), &DataType::Binary);
+        assert_eq!(schema.field(7).data_type(), &DataType::Decimal128(10, 2));
     }
 
     #[test]
@@ -2242,11 +2254,6 @@ mod tests {
                 .get(PARTITION_METADATA_KEY)
                 .is_none()
         );
-            schema.field(5).data_type(),
-            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
-        );
-        assert_eq!(schema.field(6).data_type(), &DataType::Binary);
-        assert_eq!(schema.field(7).data_type(), &DataType::Decimal128(10, 2));
     }
 
     #[test]

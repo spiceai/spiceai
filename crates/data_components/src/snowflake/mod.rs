@@ -802,11 +802,43 @@ mod tests {
         );
         assert_eq!(
             schema
+                .field(0)
+                .metadata()
+                .get(SOURCE_TYPE_METADATA_KEY)
+                .map(String::as_str),
+            Some("NUMBER(38,0)")
+        );
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get(CLUSTERING_METADATA_KEY)
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            schema
                 .field(1)
                 .metadata()
                 .get(COMMENT_METADATA_KEY)
                 .map(String::as_str),
             Some("display name")
+        );
+        assert_eq!(
+            schema
+                .field(1)
+                .metadata()
+                .get(SOURCE_TYPE_METADATA_KEY)
+                .map(String::as_str),
+            Some("VARCHAR")
+        );
+        assert_eq!(
+            schema
+                .field(1)
+                .metadata()
+                .get(CLUSTERING_METADATA_KEY)
+                .map(String::as_str),
+            Some("2")
         );
         assert!(
             schema
@@ -815,25 +847,17 @@ mod tests {
                 .get(COMMENT_METADATA_KEY)
                 .is_none()
         );
+        assert_eq!(
+            schema
+                .field(2)
+                .metadata()
+                .get(SOURCE_TYPE_METADATA_KEY)
+                .map(String::as_str),
+            Some("NUMBER(12,2)")
+        );
     }
 
     /// Every Snowflake `information_schema.columns` `DATA_TYPE` we support, paired
-    assert_eq!(
-        schema
-            .field(0)
-            .metadata()
-            .get(SOURCE_TYPE_METADATA_KEY)
-            .map(String::as_str),
-        Some("NUMBER(38,0)")
-    );
-    assert_eq!(
-        schema
-            .field(0)
-            .metadata()
-            .get(CLUSTERING_METADATA_KEY)
-            .map(String::as_str),
-        Some("1")
-    );
     /// with its expected Arrow mapping. Covers integer/decimal/float variants,
     /// string/semi-structured types (including `OBJECT`), binary, boolean,
     /// date/time, and all timestamp variants.
@@ -959,35 +983,10 @@ mod tests {
             ("DECFLOAT", DataType::Utf8),
         ] {
             assert_eq!(
-                    map_snowflake_sql_type(sql_type, None, None),
-            assert_eq!(
-                schema
-                    .field(1)
-                    .metadata()
-                    .get(SOURCE_TYPE_METADATA_KEY)
-                    .map(String::as_str),
-                Some("VARCHAR")
+                map_snowflake_sql_type(sql_type, None, None),
+                expected,
+                "Mismatch for {sql_type}"
             );
-            assert_eq!(
-                schema
-                    .field(1)
-                    .metadata()
-                    .get(CLUSTERING_METADATA_KEY)
-                    .map(String::as_str),
-                Some("2")
-            );
-                    expected,
-                    "Mismatch for {sql_type}"
-                );
         }
     }
 }
-
-assert_eq!(
-    schema
-        .field(2)
-        .metadata()
-        .get(SOURCE_TYPE_METADATA_KEY)
-        .map(String::as_str),
-    Some("NUMBER(12,2)")
-);
