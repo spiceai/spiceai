@@ -278,12 +278,20 @@ fn approx_pk_keyset_entry_bytes(key: &OwnedRow) -> usize {
 struct PostWriteMaintenanceState {
     stats: Option<Arc<ColumnStatsAccumulator>>,
     refresh_listing: bool,
+    /// Set when the writer wants retention filters applied. Coalesces — multiple
+    /// writes scheduling retention collapse to one scan per debounce window.
+    retention_requested: bool,
 }
 
 impl PostWriteMaintenanceState {
     fn is_empty(&self) -> bool {
-        self.stats.is_none() && !self.refresh_listing
+        self.stats.is_none() && !self.refresh_listing && !self.retention_requested
     }
+}
+
+enum RetentionFailureAction {
+    Requeue,
+    ReturnError,
 }
 
 #[derive(Default)]
@@ -391,9 +399,17 @@ impl CayenneCdcWrite {
             prepared_append.apply_under_barrier().await?;
             let rows = prepared_append.finish().await?;
             record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
-            self.table.record_file_pk_keys(&self.validated_file_keys);
+            let retention_requested = self.table.has_retention_delete_filters();
+            if retention_requested {
+                // Match the non-pipelined path: retention's delete outcome is
+                // not yet known, so clear conservatively. See the comment in
+                // `AppendMutationWriter::write_prepared_stream`.
+                self.table.clear_cached_pk_keyset();
+            } else {
+                self.table.record_file_pk_keys(&self.validated_file_keys);
+            }
             self.table
-                .schedule_post_write_maintenance(self.stats, false);
+                .schedule_post_write_maintenance(self.stats, false, retention_requested);
             Ok(rows)
         } else {
             Ok(self.rows)
@@ -5141,8 +5157,9 @@ impl CayenneTableProvider {
         &self,
         stats: Option<Arc<ColumnStatsAccumulator>>,
         refresh_listing: bool,
+        retention_requested: bool,
     ) {
-        if stats.is_none() && !refresh_listing {
+        if stats.is_none() && !refresh_listing && !retention_requested {
             return;
         }
 
@@ -5156,6 +5173,7 @@ impl CayenneTableProvider {
                 }
             }
             maintenance_state.refresh_listing |= refresh_listing;
+            maintenance_state.retention_requested |= retention_requested;
         }
 
         if self
@@ -5172,6 +5190,122 @@ impl CayenneTableProvider {
         });
     }
 
+    /// Synchronously drain any pending post-write maintenance, including any
+    /// iteration the background loop is currently executing.
+    ///
+    /// Public for two callers:
+    ///   1. Tests that assert on the post-retention state (where retention is
+    ///      scheduled asynchronously via [`Self::schedule_post_write_maintenance`]
+    ///      and runs after a 100 ms debounce by default).
+    ///   2. Coordinated shutdown — callers that want to make sure no scheduled
+    ///      retention is lost when the table is dropped.
+    ///
+    /// Loops until both (a) the queued maintenance state is empty AND (b) the
+    /// background loop is not active (so no iteration is mid-flight). Within
+    /// each pass, queued state is drained synchronously; if retention fails
+    /// while flushing, the error is returned instead of re-queueing, avoiding
+    /// an unbounded synchronous retry loop during tests or shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if retention maintenance fails while the explicit flush
+    /// is draining queued work.
+    pub async fn flush_pending_maintenance(&self) -> CatalogResult<()> {
+        loop {
+            let state = {
+                let mut guard = self.post_write_maintenance.state.lock();
+                std::mem::take(&mut *guard)
+            };
+            if !state.is_empty() {
+                self.run_maintenance_state(state, RetentionFailureAction::ReturnError)
+                    .await?;
+                continue;
+            }
+            if !self
+                .post_write_maintenance
+                .scheduled
+                .load(Ordering::Acquire)
+            {
+                return Ok(());
+            }
+            // The background loop has the state lock and is mid-iteration.
+            // Wait briefly and re-check; we cannot drain its work from here,
+            // but we can spin until it finishes its current pass.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Apply one snapshot of accumulated maintenance state.
+    ///
+    /// Extracted from [`Self::run_post_write_maintenance_loop`] so
+    /// [`Self::flush_pending_maintenance`] can reuse the same work.
+    ///
+    /// Listing-table refresh is deferred until after retention so the pass
+    /// rebuilds the listing at most once, even when both
+    /// `state.refresh_listing` is set and retention deletes rows.
+    async fn run_maintenance_state(
+        &self,
+        state: PostWriteMaintenanceState,
+        retention_failure_action: RetentionFailureAction,
+    ) -> CatalogResult<()> {
+        let had_stats = state.stats.is_some();
+        if let Some(stats) = state.stats {
+            self.persist_table_stats(&stats).await;
+        }
+
+        let mut retention_deleted = 0_u64;
+        if state.retention_requested {
+            match self.apply_retention_filters().await {
+                Ok(deleted) => {
+                    retention_deleted = deleted;
+                    if deleted > 0 {
+                        tracing::info!(
+                            table = self.table_metadata.table_name.as_str(),
+                            "Background retention deleted {deleted} row(s)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    match retention_failure_action {
+                        RetentionFailureAction::Requeue => {
+                            // Re-queue so the next debounce cycle retries. A
+                            // persistently failing retention scan would
+                            // otherwise leave expired rows undeleted
+                            // indefinitely; re-queueing makes delivery eventual
+                            // and the repeated error log observable. Logged at
+                            // `error` (not `warn`) because the retry semantics
+                            // turn a single failure into a steady signal worth
+                            // alerting on.
+                            tracing::error!(
+                                table = self.table_metadata.table_name.as_str(),
+                                "Background retention scan failed: {e}. Re-queueing for retry."
+                            );
+                            self.post_write_maintenance.state.lock().retention_requested = true;
+                        }
+                        RetentionFailureAction::ReturnError => return Err(e),
+                    }
+                }
+            }
+        }
+
+        // One refresh per pass, deferred until after retention so deleted
+        // rows are reflected in the rebuilt listing table.
+        if (state.refresh_listing || retention_deleted > 0)
+            && let Err(e) = self.refresh_listing_table().await
+        {
+            tracing::warn!(
+                table = self.table_metadata.table_name.as_str(),
+                "Post-write listing refresh failed: {e}"
+            );
+        }
+
+        if state.refresh_listing || had_stats || retention_deleted > 0 {
+            self.schedule_post_write_compaction();
+        }
+
+        Ok(())
+    }
+
     async fn run_post_write_maintenance_loop(self) {
         loop {
             tokio::time::sleep(POST_WRITE_MAINTENANCE_DEBOUNCE).await;
@@ -5181,22 +5315,14 @@ impl CayenneTableProvider {
                 std::mem::take(&mut *guard)
             };
 
-            if state.refresh_listing
-                && let Err(e) = self.refresh_listing_table().await
+            if let Err(e) = self
+                .run_maintenance_state(state, RetentionFailureAction::Requeue)
+                .await
             {
-                tracing::warn!(
+                tracing::error!(
                     table = self.table_metadata.table_name.as_str(),
-                    "Post-write listing refresh failed: {e}"
+                    "Post-write maintenance failed: {e}"
                 );
-            }
-
-            let had_stats = state.stats.is_some();
-            if let Some(stats) = state.stats {
-                self.persist_table_stats(&stats).await;
-            }
-
-            if state.refresh_listing || had_stats {
-                self.schedule_post_write_compaction();
             }
 
             self.post_write_maintenance
@@ -5674,6 +5800,16 @@ impl CayenneTableProvider {
         Ok(Arc::new(filter_exec))
     }
 
+    /// Apply retention filters by running the configured delete sink against
+    /// the current table state.
+    ///
+    /// The sole caller is the post-write maintenance loop (see
+    /// [`Self::run_maintenance_state`]), which runs outside any writer's
+    /// `write_lock`. The deletion sink is built with
+    /// `Some(Arc::clone(&self.write_lock))` so the sink itself serializes
+    /// against concurrent inserts / listing refreshes for the duration of the
+    /// scan — same exclusion guarantee the inline-retention path used to
+    /// provide, just held inside the sink rather than the writer.
     pub(crate) async fn apply_retention_filters(&self) -> CatalogResult<u64> {
         use data_components::delete::DeletionSink;
 
@@ -5693,7 +5829,7 @@ impl CayenneTableProvider {
             self.pk_column_indices.clone(),
             Vec::new(), // Retention filters don't need to scan protected snapshots
             Arc::clone(self.context.runtime_env()),
-            None, // Already under write_lock from write_all_append
+            Some(Arc::clone(&self.write_lock)),
         );
 
         let deleted_count =
