@@ -73,6 +73,9 @@ pub enum DeletionIdentifier {
     PositionBased {
         file_path: String,
         row_ids: Vec<u64>,
+        /// When `true`, `row_ids` is already strictly increasing and the writer
+        /// can skip its sort/dedup pass.
+        pre_sorted: bool,
     },
     /// Primary key-based row keys (for tables with primary key).
     KeyBased(Vec<Box<[u8]>>),
@@ -103,10 +106,35 @@ impl DeletionVectorWriteSpec {
     /// Create a new specification with position-based row IDs for a specific data file.
     ///
     /// The row IDs should be file-local positions (0 to N-1 within the specified file).
+    /// The writer sorts and deduplicates them; use [`Self::new_position_based_sorted`]
+    /// instead when the caller can guarantee monotone-unique input to skip the redundant
+    /// O(N log N) pass.
+    ///
+    /// Currently only the test suite exercises this constructor; production
+    /// code uses the `_sorted` variant.
     #[must_use]
+    #[allow(dead_code)]
     pub fn new_position_based(file_path: String, row_ids: Vec<u64>) -> Self {
         Self {
-            identifiers: DeletionIdentifier::PositionBased { file_path, row_ids },
+            identifiers: DeletionIdentifier::PositionBased {
+                file_path,
+                row_ids,
+                pre_sorted: false,
+            },
+        }
+    }
+
+    /// Same as [`Self::new_position_based`] but the caller guarantees `row_ids` is
+    /// strictly increasing (sorted + deduplicated). The writer skips the redundant
+    /// sort/dedup pass. See `position_delete_redundant_walks` bench.
+    #[must_use]
+    pub fn new_position_based_sorted(file_path: String, row_ids: Vec<u64>) -> Self {
+        Self {
+            identifiers: DeletionIdentifier::PositionBased {
+                file_path,
+                row_ids,
+                pre_sorted: true,
+            },
         }
     }
 
@@ -223,9 +251,17 @@ impl<'a> DeletionVectorWriter<'a> {
                 DeletionIdentifier::PositionBased {
                     file_path: source_file,
                     mut row_ids,
+                    pre_sorted,
                 } => {
-                    row_ids.sort_unstable();
-                    row_ids.dedup();
+                    if !pre_sorted {
+                        row_ids.sort_unstable();
+                        row_ids.dedup();
+                    } else {
+                        debug_assert!(
+                            row_ids.windows(2).all(|w| w[0] < w[1]),
+                            "pre_sorted=true but row_ids is not strictly increasing",
+                        );
+                    }
                     let count = row_ids.len();
                     let schema = position_based_deletion_schema();
                     let batch = build_position_based_batch(&schema, &row_ids)?;
@@ -236,6 +272,7 @@ impl<'a> DeletionVectorWriter<'a> {
                         DeletionIdentifier::PositionBased {
                             file_path: source_file.clone(),
                             row_ids,
+                            pre_sorted,
                         },
                         Some(source_file),
                     )
@@ -467,7 +504,9 @@ pub fn detect_deletion_type_and_read(
 fn build_position_based_batch(schema: &SchemaRef, row_ids: &[u64]) -> Result<RecordBatch> {
     let deleted_at = Utc::now().timestamp_micros();
 
-    let row_id_array = UInt64Array::from(row_ids.to_vec());
+    // `from_iter_values` builds directly from the slice; `from(Vec)` would
+    // require an extra `to_vec()` allocation we never need to keep.
+    let row_id_array = UInt64Array::from_iter_values(row_ids.iter().copied());
     let deleted_at_array = Int64Array::from(vec![deleted_at; row_ids.len()]);
 
     Ok(RecordBatch::try_new(

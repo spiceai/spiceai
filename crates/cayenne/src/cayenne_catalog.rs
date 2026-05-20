@@ -578,8 +578,7 @@ impl CayenneCatalog {
                      ELSE NULL \
                  END";
         // Each "(?N, ?N, ?N, ?N, ?N, ?N, ?N, ?N, ?N)" row averages ~64 bytes.
-        let mut sql =
-            String::with_capacity(PREFIX.len() + SUFFIX.len() + delete_files.len() * 64);
+        let mut sql = String::with_capacity(PREFIX.len() + SUFFIX.len() + delete_files.len() * 64);
         sql.push_str(PREFIX);
         let mut params = Vec::with_capacity(delete_files.len() * PARAMS_PER_ROW);
 
@@ -1388,8 +1387,7 @@ impl MetadataCatalog for CayenneCatalog {
         // Pre-size the map so the load path skips bucket reallocations as the
         // insert-record set grows; `collect()` starts from capacity 0 and grows
         // by doubling.
-        let mut map =
-            std::collections::HashMap::<Box<[u8]>, i64>::with_capacity(results.len());
+        let mut map = std::collections::HashMap::<Box<[u8]>, i64>::with_capacity(results.len());
         for (pk, seq) in results {
             map.insert(pk.into_boxed_slice(), seq);
         }
