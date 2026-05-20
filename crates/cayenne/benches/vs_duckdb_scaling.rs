@@ -76,17 +76,21 @@ use duckdb::Connection;
 use tokio::runtime::Runtime;
 
 /// Whether the given Cayenne metastore lane is exercised by the
-/// sustained-writes scaling benches. Returns `false` for Turso today —
-/// the sustained-writes pattern (one fixture, many writes through a
-/// single writer task) reproducibly trips Turso's optimistic concurrency
-/// control. The reader scaling bench is unaffected and still runs both
-/// lanes. See the comment at the top of `bench_write_scaling` for the
-/// full story and the follow-up plan.
+/// sustained-writes scaling benches. Returns `true` for every backend
+/// currently — earlier this gated Turso off because the sustained-writes
+/// pattern tripped Turso's BEGIN CONCURRENT commit-time MVCC and the
+/// retry-on-conflict matcher in `turso-shared` only recognised SQLite
+/// `BUSY`/`LOCKED` messages, not Turso's `"Write-write conflict"`. That
+/// matcher now accepts the Turso message, so the existing retry loops
+/// in `commit_inlined_mutation` (and siblings) converge under
+/// sustained writes. Kept as a switch so a future backend that genuinely
+/// can't survive sustained writes (e.g., a snapshot-only metastore) can
+/// opt out without bench-file surgery.
 fn lane_supports_sustained_writes(lane: common::Metastore) -> bool {
     match lane {
         common::Metastore::Sqlite => true,
         #[cfg(feature = "turso")]
-        common::Metastore::Turso => false,
+        common::Metastore::Turso => true,
     }
 }
 
