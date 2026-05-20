@@ -13,8 +13,10 @@
 //! for 64-core deployments where Spice runs both ingestion (CDC / refresh)
 //! and query traffic in parallel.
 //!
-//! Three workloads are exercised, each across `[1, 2, 4, 8, 16, 32, 64]`
-//! concurrency levels and across **both Cayenne metastore backends**
+//! Three workloads are exercised, each across `[1, 2, 4, 8, 16, 32, 64, 128]`
+//! concurrency levels (64 covers the stated single-machine goal, 128 covers
+//! oversubscription on common 64-core SMT-2 boxes) and across **both
+//! Cayenne metastore backends**
 //! (`Sqlite` and `Turso`, the latter compiled in when the `turso` feature
 //! is enabled — see `CAYENNE_LANES`). DuckDB runs once per workload as the
 //! external baseline.
@@ -101,8 +103,10 @@ use common::{
 };
 
 /// Concurrency levels measured. Spans the typical core counts we care about
-/// (1, 2, 4, 8, 16, 32) up to the 64-core goal stated by the user.
-const CONCURRENCIES: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
+/// (1 → 32) up through the 64-core baseline goal and out to 128 so the
+/// per-iteration curve covers oversubscription on common 64-core deployments
+/// (every workload runs 1× hyperthread + 1× extra-task-per-core headroom).
+const CONCURRENCIES: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128];
 
 /// Rows in the pre-loaded read fixture. Single fixed value because the
 /// variable we're studying is concurrency, not data size.
