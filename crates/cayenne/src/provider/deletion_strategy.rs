@@ -84,10 +84,6 @@ impl PositionDeletionVector {
         usize::try_from(deleted_rows).unwrap_or(usize::MAX)
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = u32> + '_ {
-        self.row_ids.iter()
-    }
-
     #[must_use]
     pub(crate) fn to_bitmap(&self) -> RoaringBitmap {
         self.row_ids.clone()

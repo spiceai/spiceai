@@ -32,16 +32,16 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 
 use common::{
-    CayenneFixture, DuckDbFixture, capture_comparison_plans, cayenne_insert, cayenne_query,
-    duckdb_insert_parquet, duckdb_query_scalar, make_batch, schema, setup_cayenne_pk,
-    setup_duckdb_pk, write_parquet,
+    CAYENNE_LANES, CayenneFixture, DuckDbFixture, Metastore, capture_comparison_plans,
+    cayenne_insert, cayenne_query, duckdb_insert_parquet, duckdb_query_scalar, make_batch, schema,
+    setup_cayenne_pk_for, setup_duckdb_pk, write_parquet,
 };
 
 const TABLE_SIZES: &[usize] = &[16_384, 131_072, 1_048_576];
 const BATCH_KEYS: usize = 32;
 
-async fn load_cayenne(rows: usize) -> CayenneFixture {
-    let fixture = setup_cayenne_pk("pk_bench").await;
+async fn load_cayenne(lane: Metastore, rows: usize) -> CayenneFixture {
+    let fixture = setup_cayenne_pk_for("pk_bench", lane).await;
     let batch = make_batch(schema(), 0, rows);
     let _ = cayenne_insert(&fixture.table, batch).await;
     fixture
@@ -65,8 +65,13 @@ fn bench_pk_lookup(c: &mut Criterion) {
         let batch = make_batch(schema(), 0, rows);
         write_parquet(&batch, &parquet_path);
 
-        let cayenne_fixture = Arc::new(rt.block_on(load_cayenne(rows)));
+        let plan_cayenne_fixture = Arc::new(rt.block_on(load_cayenne(Metastore::Sqlite, rows)));
         let duckdb_fixture = Arc::new(load_duckdb(&parquet_path));
+
+        let mut cayenne_fixtures = Vec::new();
+        for &lane in CAYENNE_LANES {
+            cayenne_fixtures.push((lane.lane(), Arc::new(rt.block_on(load_cayenne(lane, rows)))));
+        }
 
         // Pick a stable key in the middle so neither engine's caching is
         // accidentally over-counted at edges.
@@ -80,26 +85,29 @@ fn bench_pk_lookup(c: &mut Criterion) {
         let duckdb_sql = format!("SELECT value FROM pk_bench WHERE id = {target_id}");
         rt.block_on(capture_comparison_plans(
             &format!("pk_lookup/{rows}/single_pk"),
-            &cayenne_fixture.table,
+            &plan_cayenne_fixture.table,
             &duckdb_fixture.conn,
             &cayenne_sql,
             &duckdb_sql,
         ));
 
-        let cf = Arc::clone(&cayenne_fixture);
-        let s = cayenne_sql.clone();
-        group.bench_with_input(
-            BenchmarkId::new("cayenne/single_pk", rows),
-            &rows,
-            |b, &_rows| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        let batches = cayenne_query(&cf.table, &s).await;
-                        black_box(batches);
+        for (lane_label, cayenne_fixture) in &cayenne_fixtures {
+            let fixture = Arc::clone(cayenne_fixture);
+            let sql = cayenne_sql.clone();
+            group.bench_with_input(
+                BenchmarkId::new(format!("{lane_label}/single_pk"), rows),
+                &rows,
+                |b, &_rows| {
+                    b.iter(|| {
+                        rt.block_on(async {
+                            let batches = cayenne_query(&fixture.table, &sql).await;
+                            black_box(batches);
+                        });
                     });
-                });
-            },
-        );
+                },
+            );
+        }
+
         let df = Arc::clone(&duckdb_fixture);
         let s = duckdb_sql.clone();
         group.bench_with_input(
@@ -122,26 +130,29 @@ fn bench_pk_lookup(c: &mut Criterion) {
         let duckdb_sql = format!("SELECT SUM(value) FROM pk_bench WHERE id IN ({in_list})");
         rt.block_on(capture_comparison_plans(
             &format!("pk_lookup/{rows}/pk_in_list"),
-            &cayenne_fixture.table,
+            &plan_cayenne_fixture.table,
             &duckdb_fixture.conn,
             &cayenne_sql,
             &duckdb_sql,
         ));
 
-        let cf = Arc::clone(&cayenne_fixture);
-        let s = cayenne_sql.clone();
-        group.bench_with_input(
-            BenchmarkId::new("cayenne/pk_in_list", rows),
-            &rows,
-            |b, &_rows| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        let batches = cayenne_query(&cf.table, &s).await;
-                        black_box(batches);
+        for (lane_label, cayenne_fixture) in &cayenne_fixtures {
+            let fixture = Arc::clone(cayenne_fixture);
+            let sql = cayenne_sql.clone();
+            group.bench_with_input(
+                BenchmarkId::new(format!("{lane_label}/pk_in_list"), rows),
+                &rows,
+                |b, &_rows| {
+                    b.iter(|| {
+                        rt.block_on(async {
+                            let batches = cayenne_query(&fixture.table, &sql).await;
+                            black_box(batches);
+                        });
                     });
-                });
-            },
-        );
+                },
+            );
+        }
+
         let df = Arc::clone(&duckdb_fixture);
         let s = duckdb_sql.clone();
         group.bench_with_input(
@@ -164,26 +175,29 @@ fn bench_pk_lookup(c: &mut Criterion) {
         );
         rt.block_on(capture_comparison_plans(
             &format!("pk_lookup/{rows}/pk_range"),
-            &cayenne_fixture.table,
+            &plan_cayenne_fixture.table,
             &duckdb_fixture.conn,
             &cayenne_sql,
             &duckdb_sql,
         ));
 
-        let cf = Arc::clone(&cayenne_fixture);
-        let s = cayenne_sql.clone();
-        group.bench_with_input(
-            BenchmarkId::new("cayenne/pk_range", rows),
-            &rows,
-            |b, &_rows| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        let batches = cayenne_query(&cf.table, &s).await;
-                        black_box(batches);
+        for (lane_label, cayenne_fixture) in &cayenne_fixtures {
+            let fixture = Arc::clone(cayenne_fixture);
+            let sql = cayenne_sql.clone();
+            group.bench_with_input(
+                BenchmarkId::new(format!("{lane_label}/pk_range"), rows),
+                &rows,
+                |b, &_rows| {
+                    b.iter(|| {
+                        rt.block_on(async {
+                            let batches = cayenne_query(&fixture.table, &sql).await;
+                            black_box(batches);
+                        });
                     });
-                });
-            },
-        );
+                },
+            );
+        }
+
         let df = Arc::clone(&duckdb_fixture);
         let s = duckdb_sql.clone();
         group.bench_with_input(

@@ -31,6 +31,49 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
 
 const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_delete_file_table_path ON cayenne_delete_file(table_id, path)";
+const SQLITE_PRAGMA_RETRY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 200];
+
+fn is_sqlite_lock_error(error: &tokio_rusqlite::Error<rusqlite::Error>) -> bool {
+    matches!(
+        error,
+        tokio_rusqlite::Error::Error(rusqlite::Error::SqliteFailure(err, _))
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+async fn configure_sqlite_connection(
+    conn: &tokio_rusqlite::Connection,
+) -> Result<(), tokio_rusqlite::Error<rusqlite::Error>> {
+    let mut retry_delays = SQLITE_PRAGMA_RETRY_DELAYS_MS.iter();
+    loop {
+        let result = conn
+            .call(|conn| {
+                conn.busy_timeout(std::time::Duration::from_secs(5))?;
+                conn.pragma_update(None, "journal_mode", "WAL")?;
+                conn.pragma_update(None, "synchronous", "NORMAL")?;
+                conn.pragma_update(None, "cache_size", -32000)?;
+                conn.pragma_update(None, "foreign_keys", true)?;
+                conn.pragma_update(None, "temp_store", "memory")?;
+
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await;
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if is_sqlite_lock_error(&error) => {
+                let Some(delay_ms) = retry_delays.next() else {
+                    return Err(error);
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 /// Round-robin connection pool for the [`SqliteMetastore`].
 ///
@@ -189,18 +232,7 @@ impl SqliteMetastore {
                 message: format!("Failed to open SQLite database: {e}"),
             })?;
 
-        conn.call(|conn| {
-            conn.pragma_update(None, "journal_mode", "WAL")?;
-            conn.busy_timeout(std::time::Duration::from_secs(5))?;
-            conn.pragma_update(None, "synchronous", "NORMAL")?;
-            conn.pragma_update(None, "cache_size", -32000)?;
-            conn.pragma_update(None, "foreign_keys", true)?;
-            conn.pragma_update(None, "temp_store", "memory")?;
-
-            Ok::<_, rusqlite::Error>(())
-        })
-        .await
-        .map_err(
+        configure_sqlite_connection(&conn).await.map_err(
             |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
                 message: format!("Failed to configure SQLite pragmas: {e}"),
             },
