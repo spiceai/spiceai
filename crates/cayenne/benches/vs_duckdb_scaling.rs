@@ -540,10 +540,11 @@ fn bench_write_scaling(c: &mut Criterion) {
                             tx.send(()).expect("cayenne go-tx (worker exited?)");
                         }
                         // Then drain exactly N new completions. The
-                        // `Throughput::Elements` configuration above
-                        // divides this iteration's wall time by
-                        // `concurrency * WRITE_BATCH_ROWS` so criterion
-                        // reports per-worker throughput.
+                        // `Throughput::Elements(concurrency * WRITE_BATCH_ROWS)`
+                        // declaration tells criterion that this iteration
+                        // processes that many rows total — criterion reports
+                        // the **aggregate** rows/sec across all N writers,
+                        // not a per-worker rate.
                         wait_for_completions(&cayenne_done_rx, concurrency, &bench_ctx);
                     });
                 },
@@ -636,13 +637,20 @@ impl CayenneCdcBgWriter {
     ) -> Self {
         let table = Arc::clone(&fixture.table);
         let handle = rt.spawn(async move {
+            // One SessionContext per writer, reused across every batch.
+            // `cayenne_cdc_write` used to construct a fresh `SessionContext`
+            // per call which added per-batch setup + allocator churn that
+            // a long-running Spice runtime would not pay — see the doc
+            // comment on `cayenne_cdc_write`.
+            let session = datafusion::prelude::SessionContext::new();
+            let task_ctx = session.task_ctx();
             let id_stride = (WRITE_BATCH_ROWS as i64) * 1024 * 1024;
             let mut cursor = writer_id * id_stride;
             let mut written = 0u64;
             while go_rx.recv().await.is_some() {
                 let batch = make_batch(schema(), cursor, WRITE_BATCH_ROWS);
                 cursor += WRITE_BATCH_ROWS as i64;
-                if cayenne_cdc_write(&table, batch).await > 0 {
+                if cayenne_cdc_write(&table, &task_ctx, batch).await > 0 {
                     written += 1;
                 }
                 let _ = done_tx.send(());
