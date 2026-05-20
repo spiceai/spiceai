@@ -68,7 +68,6 @@ mod common;
 
 use std::hint::black_box;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -384,78 +383,71 @@ fn bench_read_scaling(c: &mut Criterion) {
 // vs_duckdb_scaling_writes — N background writers sustaining inserts
 // ---------------------------------------------------------------------------
 
-/// Sustained-throughput Cayenne writer. Spawns one async task on the runtime
-/// that pumps `cayenne_insert` calls in a tight loop, signaling each
-/// completion through `tx`. Dropping the writer stops the loop and joins
-/// the task — modeled after `CayenneBgWriter` in `vs_duckdb_concurrent.rs`.
+/// Per-iteration Cayenne writer. Waits on its dedicated `go_rx` channel
+/// for a "do one insert" tick from the bench thread, executes one
+/// `cayenne_insert`, signals completion through the shared `done_tx`,
+/// then loops back to wait for the next tick. Workers exit cleanly when
+/// the bench drops its `go_tx` clone (recv returns None / Err).
+///
+/// Why not a sustained loop driven by `AtomicBool::stop`? Sustained
+/// writers race ahead between criterion iterations and leave completed
+/// messages backlogged in the shared channel, so the next iteration
+/// drains the backlog instantly and over-reports throughput. The
+/// go-signal pattern defines a clean iteration boundary: each iter
+/// measures exactly N **new** writes.
 struct CayenneBgWriter {
-    stop: Arc<AtomicBool>,
-    handle: Option<tokio::task::JoinHandle<u64>>,
-    rt_handle: tokio::runtime::Handle,
+    handle: tokio::task::JoinHandle<u64>,
 }
 
 impl CayenneBgWriter {
-    fn spawn(rt: &Runtime, fixture: &CayenneFixture, tx: mpsc::Sender<()>, writer_id: i64) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = Arc::clone(&stop);
+    fn spawn(
+        rt: &Runtime,
+        fixture: &CayenneFixture,
+        mut go_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+        done_tx: mpsc::Sender<()>,
+        writer_id: i64,
+    ) -> Self {
         let table = Arc::clone(&fixture.table);
         let handle = rt.spawn(async move {
-            let mut written = 0u64;
             // Each writer uses a disjoint id range so concurrent writers
             // never produce overlapping primary key candidates — keeps
             // behavior deterministic across concurrency levels.
             let id_stride = (WRITE_BATCH_ROWS as i64) * 1024 * 1024;
             let mut cursor = writer_id * id_stride;
-            while !stop_clone.load(Ordering::Relaxed) {
+            let mut written = 0u64;
+            while go_rx.recv().await.is_some() {
                 let batch = make_batch(schema(), cursor, WRITE_BATCH_ROWS);
                 cursor += WRITE_BATCH_ROWS as i64;
                 if cayenne_insert(&table, batch).await > 0 {
                     written += 1;
-                    // Sender drop after stop is the normal teardown path;
-                    // ignore the error in that case.
-                    let _ = tx.send(());
                 }
+                // Always send a completion (even on a degenerate
+                // zero-rows-returned path) so the bench iter sees
+                // exactly N completions for N go ticks.
+                let _ = done_tx.send(());
             }
             written
         });
-        Self {
-            stop,
-            handle: Some(handle),
-            rt_handle: rt.handle().clone(),
-        }
+        Self { handle }
     }
 }
 
-impl Drop for CayenneBgWriter {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            // Block the bench thread on writer settling. The bench thread is
-            // not a runtime worker, so block_on is safe here.
-            let _ = self.rt_handle.block_on(handle);
-        }
-    }
-}
-
-/// Sustained-throughput DuckDB writer. Same shape as `CayenneBgWriter` but
-/// uses a dedicated OS thread and a fresh DuckDB connection opened from the
-/// fixture's on-disk file. Each thread holds its own connection — DuckDB
-/// serializes commits internally, but we want concurrent writers to expose
-/// any reader-side contention on the shared database.
+/// Per-iteration DuckDB writer. Same go/done channel shape as
+/// [`CayenneBgWriter`], running on a dedicated OS thread with its own
+/// `Connection` opened from the shared DB path (`vs_duckdb_concurrent.rs:108`
+/// follows the same pattern — DuckDB connections aren't `Send`).
 struct DuckDbBgWriter {
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    handle: Option<std::thread::JoinHandle<u64>>,
+    handle: std::thread::JoinHandle<u64>,
 }
 
 impl DuckDbBgWriter {
     fn spawn(
         db_path: &std::path::Path,
         table_name: &str,
-        tx: mpsc::Sender<()>,
+        go_rx: mpsc::Receiver<()>,
+        done_tx: mpsc::Sender<()>,
         writer_id: i64,
     ) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = Arc::clone(&stop);
         let db_path = db_path.to_path_buf();
         let table_name = table_name.to_string();
         let handle = std::thread::spawn(move || {
@@ -463,28 +455,16 @@ impl DuckDbBgWriter {
             let id_stride = (WRITE_BATCH_ROWS as i64) * 1024 * 1024;
             let mut cursor = writer_id * id_stride;
             let mut written = 0u64;
-            while !stop_clone.load(Ordering::Relaxed) {
+            while go_rx.recv().is_ok() {
                 let batch = make_batch(schema(), cursor, WRITE_BATCH_ROWS);
                 cursor += WRITE_BATCH_ROWS as i64;
                 duckdb_insert_rows(&conn, &table_name, &batch);
                 written += 1;
-                let _ = tx.send(());
+                let _ = done_tx.send(());
             }
             written
         });
-        Self {
-            stop,
-            handle: Some(handle),
-        }
-    }
-}
-
-impl Drop for DuckDbBgWriter {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        Self { handle }
     }
 }
 
@@ -521,19 +501,32 @@ fn bench_write_scaling(c: &mut Criterion) {
 
             // --- Cayenne lane ---
             let cayenne_fixture = rt.block_on(setup_cayenne_for("scaling_write", lane));
-            // Each writer holds a clone of `cayenne_tx`; bench iter reads N
-            // completions from `cayenne_rx` via `wait_for_completions`
-            // (blocking, bounded timeout, surfaces a useful error if any
-            // writer stalls or panics).
-            let (cayenne_tx, cayenne_rx) = mpsc::channel::<()>();
-            let cayenne_writers: Vec<CayenneBgWriter> = (0..concurrency)
-                .map(|i| {
-                    CayenneBgWriter::spawn(&rt, &cayenne_fixture, cayenne_tx.clone(), i as i64)
-                })
-                .collect();
-            // Drop the spare sender so the channel closes naturally when
-            // all writers exit on the teardown signal.
-            drop(cayenne_tx);
+            // Per-iteration go-signaling: bench sends one tick per
+            // worker to start the iteration's writes; workers each do
+            // exactly ONE insert and send a completion. The bench iter
+            // then drains exactly `concurrency` completions. This
+            // defines a clean per-iteration boundary so backlog from
+            // criterion warm-up or inter-iteration drift can't inflate
+            // the measurement.
+            let (cayenne_done_tx, cayenne_done_rx) = mpsc::channel::<()>();
+            let mut cayenne_go_txs: Vec<tokio::sync::mpsc::UnboundedSender<()>> =
+                Vec::with_capacity(concurrency);
+            let mut cayenne_workers: Vec<CayenneBgWriter> = Vec::with_capacity(concurrency);
+            for i in 0..concurrency {
+                let (go_tx, go_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                cayenne_go_txs.push(go_tx);
+                cayenne_workers.push(CayenneBgWriter::spawn(
+                    &rt,
+                    &cayenne_fixture,
+                    go_rx,
+                    cayenne_done_tx.clone(),
+                    i as i64,
+                ));
+            }
+            // Drop the bench's spare done sender so a stalled writer
+            // surfaces as a recv timeout / channel-closed error rather
+            // than a quiet hang.
+            drop(cayenne_done_tx);
 
             let bench_ctx = format!("vs_duckdb_scaling_writes/{lane_label}");
             group.bench_with_input(
@@ -541,24 +534,27 @@ fn bench_write_scaling(c: &mut Criterion) {
                 &concurrency,
                 |b, &_n| {
                     b.iter(|| {
-                        // Drain `concurrency` total completed inserts from
-                        // the shared channel — total system throughput
-                        // across N writers, not per-writer fairness. One
-                        // fast writer can contribute multiple of the N
-                        // counted messages in an iteration; by design for
-                        // a throughput-under-concurrency measurement.
-                        // criterion's `Throughput::Elements` divides by
-                        // `concurrency * WRITE_BATCH_ROWS` to report
-                        // per-worker throughput.
-                        wait_for_completions(&cayenne_rx, concurrency, &bench_ctx);
+                        // Kick off exactly one insert per worker for
+                        // this iteration.
+                        for tx in &cayenne_go_txs {
+                            tx.send(()).expect("cayenne go-tx (worker exited?)");
+                        }
+                        // Then drain exactly N new completions. The
+                        // `Throughput::Elements` configuration above
+                        // divides this iteration's wall time by
+                        // `concurrency * WRITE_BATCH_ROWS` so criterion
+                        // reports per-worker throughput.
+                        wait_for_completions(&cayenne_done_rx, concurrency, &bench_ctx);
                     });
                 },
             );
 
-            // Explicit drop order: writers first (stops the loops + joins
-            // the tasks), then the fixture (its TempDir cleans up the
-            // data).
-            drop(cayenne_writers);
+            // Teardown: drop the go senders to close each worker's
+            // receiver, then await each writer.
+            cayenne_go_txs.clear();
+            for w in cayenne_workers.drain(..) {
+                let _ = rt.block_on(async { w.handle.await });
+            }
             drop(cayenne_fixture);
         }
     }
@@ -571,29 +567,34 @@ fn bench_write_scaling(c: &mut Criterion) {
             (concurrency as u64) * (WRITE_BATCH_ROWS as u64),
         ));
 
-        // --- DuckDB lane ---
         let duckdb_fixture = setup_duckdb("scaling_write");
         let duckdb_db_path = duckdb_fixture.db_path();
-        let (duckdb_tx, duckdb_rx) = mpsc::channel::<()>();
-        let duckdb_writers: Vec<DuckDbBgWriter> = (0..concurrency)
-            .map(|i| {
-                DuckDbBgWriter::spawn(
-                    &duckdb_db_path,
-                    "scaling_write",
-                    duckdb_tx.clone(),
-                    i as i64,
-                )
-            })
-            .collect();
-        drop(duckdb_tx);
+        let (duckdb_done_tx, duckdb_done_rx) = mpsc::channel::<()>();
+        let mut duckdb_go_txs: Vec<mpsc::Sender<()>> = Vec::with_capacity(concurrency);
+        let mut duckdb_workers: Vec<DuckDbBgWriter> = Vec::with_capacity(concurrency);
+        for i in 0..concurrency {
+            let (go_tx, go_rx) = mpsc::channel::<()>();
+            duckdb_go_txs.push(go_tx);
+            duckdb_workers.push(DuckDbBgWriter::spawn(
+                &duckdb_db_path,
+                "scaling_write",
+                go_rx,
+                duckdb_done_tx.clone(),
+                i as i64,
+            ));
+        }
+        drop(duckdb_done_tx);
 
         group.bench_with_input(
             BenchmarkId::new("duckdb", concurrency),
             &concurrency,
             |b, &_n| {
                 b.iter(|| {
+                    for tx in &duckdb_go_txs {
+                        tx.send(()).expect("duckdb go-tx (worker exited?)");
+                    }
                     wait_for_completions(
-                        &duckdb_rx,
+                        &duckdb_done_rx,
                         concurrency,
                         "vs_duckdb_scaling_writes/duckdb",
                     );
@@ -601,7 +602,10 @@ fn bench_write_scaling(c: &mut Criterion) {
             },
         );
 
-        drop(duckdb_writers);
+        duckdb_go_txs.clear();
+        for w in duckdb_workers.drain(..) {
+            let _ = w.handle.join();
+        }
         drop(duckdb_fixture);
     }
 
@@ -612,50 +616,40 @@ fn bench_write_scaling(c: &mut Criterion) {
 // vs_duckdb_scaling_cdc — sustained CDC pipelined writes
 // ---------------------------------------------------------------------------
 
-/// Sustained-throughput Cayenne CDC writer. Same shape as `CayenneBgWriter`
-/// but pumps `write_cdc_append_stream` + `finish()` (the production CDC
-/// pipelined path used by `refresh_mode: changes`) instead of the generic
-/// `insert_into`. Lets us see whether the Stage-A / Stage-B split actually
-/// translates into higher sustained throughput vs the regular write path.
+/// Per-iteration Cayenne CDC writer. Same go/done shape as
+/// [`CayenneBgWriter`] but pumps `write_cdc_append_stream` + `finish()`
+/// (the production CDC pipelined path used by `refresh_mode: changes`)
+/// instead of `insert_into`. Lets us compare the Stage-A / Stage-B
+/// split against the generic write path under the same per-iteration
+/// boundary discipline.
 struct CayenneCdcBgWriter {
-    stop: Arc<AtomicBool>,
-    handle: Option<tokio::task::JoinHandle<u64>>,
-    rt_handle: tokio::runtime::Handle,
+    handle: tokio::task::JoinHandle<u64>,
 }
 
 impl CayenneCdcBgWriter {
-    fn spawn(rt: &Runtime, fixture: &CayenneFixture, tx: mpsc::Sender<()>, writer_id: i64) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = Arc::clone(&stop);
+    fn spawn(
+        rt: &Runtime,
+        fixture: &CayenneFixture,
+        mut go_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+        done_tx: mpsc::Sender<()>,
+        writer_id: i64,
+    ) -> Self {
         let table = Arc::clone(&fixture.table);
         let handle = rt.spawn(async move {
-            let mut written = 0u64;
             let id_stride = (WRITE_BATCH_ROWS as i64) * 1024 * 1024;
             let mut cursor = writer_id * id_stride;
-            while !stop_clone.load(Ordering::Relaxed) {
+            let mut written = 0u64;
+            while go_rx.recv().await.is_some() {
                 let batch = make_batch(schema(), cursor, WRITE_BATCH_ROWS);
                 cursor += WRITE_BATCH_ROWS as i64;
                 if cayenne_cdc_write(&table, batch).await > 0 {
                     written += 1;
-                    let _ = tx.send(());
                 }
+                let _ = done_tx.send(());
             }
             written
         });
-        Self {
-            stop,
-            handle: Some(handle),
-            rt_handle: rt.handle().clone(),
-        }
-    }
-}
-
-impl Drop for CayenneCdcBgWriter {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = self.rt_handle.block_on(handle);
-        }
+        Self { handle }
     }
 }
 
@@ -684,13 +678,22 @@ fn bench_cdc_scaling(c: &mut Criterion) {
             ));
 
             let cayenne_fixture = rt.block_on(setup_cayenne_for("scaling_cdc", lane));
-            let (cayenne_tx, cayenne_rx) = mpsc::channel::<()>();
-            let cayenne_writers: Vec<CayenneCdcBgWriter> = (0..concurrency)
-                .map(|i| {
-                    CayenneCdcBgWriter::spawn(&rt, &cayenne_fixture, cayenne_tx.clone(), i as i64)
-                })
-                .collect();
-            drop(cayenne_tx);
+            let (cayenne_done_tx, cayenne_done_rx) = mpsc::channel::<()>();
+            let mut cayenne_go_txs: Vec<tokio::sync::mpsc::UnboundedSender<()>> =
+                Vec::with_capacity(concurrency);
+            let mut cayenne_workers: Vec<CayenneCdcBgWriter> = Vec::with_capacity(concurrency);
+            for i in 0..concurrency {
+                let (go_tx, go_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                cayenne_go_txs.push(go_tx);
+                cayenne_workers.push(CayenneCdcBgWriter::spawn(
+                    &rt,
+                    &cayenne_fixture,
+                    go_rx,
+                    cayenne_done_tx.clone(),
+                    i as i64,
+                ));
+            }
+            drop(cayenne_done_tx);
 
             let bench_ctx = format!("vs_duckdb_scaling_cdc/{lane_label}");
             group.bench_with_input(
@@ -698,12 +701,18 @@ fn bench_cdc_scaling(c: &mut Criterion) {
                 &concurrency,
                 |b, &_n| {
                     b.iter(|| {
-                        wait_for_completions(&cayenne_rx, concurrency, &bench_ctx);
+                        for tx in &cayenne_go_txs {
+                            tx.send(()).expect("cayenne cdc go-tx (worker exited?)");
+                        }
+                        wait_for_completions(&cayenne_done_rx, concurrency, &bench_ctx);
                     });
                 },
             );
 
-            drop(cayenne_writers);
+            cayenne_go_txs.clear();
+            for w in cayenne_workers.drain(..) {
+                let _ = rt.block_on(async { w.handle.await });
+            }
             drop(cayenne_fixture);
         }
     }
@@ -719,25 +728,43 @@ fn bench_cdc_scaling(c: &mut Criterion) {
 
         let duckdb_fixture = setup_duckdb("scaling_cdc");
         let duckdb_db_path = duckdb_fixture.db_path();
-        let (duckdb_tx, duckdb_rx) = mpsc::channel::<()>();
-        let duckdb_writers: Vec<DuckDbBgWriter> = (0..concurrency)
-            .map(|i| {
-                DuckDbBgWriter::spawn(&duckdb_db_path, "scaling_cdc", duckdb_tx.clone(), i as i64)
-            })
-            .collect();
-        drop(duckdb_tx);
+        let (duckdb_done_tx, duckdb_done_rx) = mpsc::channel::<()>();
+        let mut duckdb_go_txs: Vec<mpsc::Sender<()>> = Vec::with_capacity(concurrency);
+        let mut duckdb_workers: Vec<DuckDbBgWriter> = Vec::with_capacity(concurrency);
+        for i in 0..concurrency {
+            let (go_tx, go_rx) = mpsc::channel::<()>();
+            duckdb_go_txs.push(go_tx);
+            duckdb_workers.push(DuckDbBgWriter::spawn(
+                &duckdb_db_path,
+                "scaling_cdc",
+                go_rx,
+                duckdb_done_tx.clone(),
+                i as i64,
+            ));
+        }
+        drop(duckdb_done_tx);
 
         group.bench_with_input(
             BenchmarkId::new("duckdb", concurrency),
             &concurrency,
             |b, &_n| {
                 b.iter(|| {
-                    wait_for_completions(&duckdb_rx, concurrency, "vs_duckdb_scaling_cdc/duckdb");
+                    for tx in &duckdb_go_txs {
+                        tx.send(()).expect("duckdb cdc go-tx (worker exited?)");
+                    }
+                    wait_for_completions(
+                        &duckdb_done_rx,
+                        concurrency,
+                        "vs_duckdb_scaling_cdc/duckdb",
+                    );
                 });
             },
         );
 
-        drop(duckdb_writers);
+        duckdb_go_txs.clear();
+        for w in duckdb_workers.drain(..) {
+            let _ = w.handle.join();
+        }
         drop(duckdb_fixture);
     }
 
