@@ -4200,7 +4200,7 @@ mod tests {
                 full_text_search: None,
                 check_availability: crate::component::dataset::CheckAvailability::Disabled,
                 on_schema_change: crate::component::dataset::OnSchemaChange::default(),
-            };
+            }
         }
 
         fn create_snapshots_behavior(
