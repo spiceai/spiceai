@@ -19,9 +19,10 @@
 //! * **`vs_duckdb_scaling_reads`** — N concurrent `SELECT COUNT(*)` queries
 //!   against one pre-loaded 1M-row table. Cayenne uses one long-lived warm
 //!   `SessionContext` shared across the N reader tasks (mirrors a running
-//!   Spice runtime). DuckDB uses one `Connection` per task via
-//!   `try_clone()`. The bench shows whether reader-side scaling is bounded
-//!   by mutex contention or runs cleanly to the core count.
+//!   Spice runtime). DuckDB opens one fresh `Connection` per OS thread
+//!   from the shared on-disk database path. The bench shows whether
+//!   reader-side scaling is bounded by mutex contention or runs cleanly
+//!   to the core count.
 //!
 //! * **`vs_duckdb_scaling_writes`** — sustained insert throughput driven by
 //!   N concurrent background writer tasks against one table via the generic
@@ -107,12 +108,18 @@ const WRITE_BATCH_ROWS: usize = 1_024;
 // vs_duckdb_scaling_reads — N concurrent COUNT(*) against ONE table
 // ---------------------------------------------------------------------------
 
-/// Owns both the pre-loaded Cayenne table and the matching DuckDB table.
-/// Built once at bench start; reused across every concurrency level so the
-/// data-load cost is paid exactly once.
+/// Owns both the pre-loaded Cayenne table and the matching DuckDB
+/// database. Built once at bench start; reused across every concurrency
+/// level so the data-load cost is paid exactly once.
+///
+/// The DuckDB side stores the on-disk database path rather than a shared
+/// `Connection` because `duckdb::Connection` is not `Send` in this
+/// codebase (`vs_duckdb_concurrent.rs:108` follows the same pattern —
+/// each background-writer thread calls `Connection::open(&db_path)` so
+/// every thread owns its own connection). Reader threads do the same.
 struct ReadFixtures {
     cayenne: Arc<CayenneFixture>,
-    duckdb_conn: Arc<Connection>,
+    duckdb_db_path: std::path::PathBuf,
     _duckdb_temp: tempfile::TempDir,
     _parquet_dir: tempfile::TempDir,
 }
@@ -128,9 +135,10 @@ async fn build_read_fixtures() -> ReadFixtures {
     write_parquet(&batch, &parquet_path);
     duckdb_insert_parquet(&duckdb_fixture.conn, "scaling_read", &parquet_path);
 
+    let duckdb_db_path = duckdb_fixture.db_path();
     ReadFixtures {
         cayenne: Arc::new(cayenne_fixture),
-        duckdb_conn: Arc::new(duckdb_fixture.conn),
+        duckdb_db_path,
         _duckdb_temp: duckdb_fixture._temp_dir,
         _parquet_dir: parquet_dir,
     }
@@ -170,15 +178,23 @@ impl CayenneReader {
 
 /// Persistent DuckDB reader worker. OS thread with the same channel shape
 /// as `CayenneReader` — its own `go_rx` for per-worker ticks, a shared
-/// `done_tx` for completion signals. Reused across every criterion sample
-/// so the thread-spawn cost is paid exactly once per concurrency level.
+/// `done_tx` for completion signals. Each worker opens its own
+/// `Connection` from the shared on-disk database (DuckDB connections are
+/// not `Send` in this codebase, see `vs_duckdb_concurrent.rs:108` for the
+/// same pattern). Reused across every criterion sample so the
+/// thread-spawn cost is paid exactly once per concurrency level.
 struct DuckDbReader {
     handle: std::thread::JoinHandle<()>,
 }
 
 impl DuckDbReader {
-    fn spawn(conn: Connection, go_rx: mpsc::Receiver<()>, done_tx: mpsc::Sender<()>) -> Self {
+    fn spawn(
+        db_path: std::path::PathBuf,
+        go_rx: mpsc::Receiver<()>,
+        done_tx: mpsc::Sender<()>,
+    ) -> Self {
         let handle = std::thread::spawn(move || {
+            let conn = Connection::open(&db_path).expect("duckdb reader connection open");
             // `recv()` returns Err when the bench drops its sender — exit
             // cleanly on teardown.
             while go_rx.recv().is_ok() {
@@ -268,14 +284,10 @@ fn bench_read_scaling(c: &mut Criterion) {
         let mut duckdb_go_txs: Vec<mpsc::Sender<()>> = Vec::with_capacity(concurrency);
         let mut duckdb_workers: Vec<DuckDbReader> = Vec::with_capacity(concurrency);
         for _ in 0..concurrency {
-            let conn_clone = fixtures
-                .duckdb_conn
-                .try_clone()
-                .expect("duckdb connection clone");
             let (go_tx, go_rx) = mpsc::channel::<()>();
             duckdb_go_txs.push(go_tx);
             duckdb_workers.push(DuckDbReader::spawn(
-                conn_clone,
+                fixtures.duckdb_db_path.clone(),
                 go_rx,
                 duckdb_done_tx.clone(),
             ));

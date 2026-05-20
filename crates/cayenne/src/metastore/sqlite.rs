@@ -205,10 +205,13 @@ impl SqliteMetastore {
 
     /// Return the connection pool, initialising it lazily on first call.
     ///
-    /// Opens K = `min(available_parallelism, 32)` (minimum 2) connections once
-    /// and reuses them for the lifetime of the metastore. All operations draw
-    /// from the same pool; `begin_transaction` holds an [`OwnedMutexGuard`]
-    /// on the acquired slot for the full transaction lifetime.
+    /// Opens K = `min(available_parallelism, 32)` connections once and reuses
+    /// them for the lifetime of the metastore. If `available_parallelism()`
+    /// fails (rare — e.g. seccomp-restricted environments), K falls back to
+    /// 4. K is then clamped to a minimum of 2 so single-core systems still
+    /// have one slot reserved for read-while-write. All operations draw from
+    /// the same pool; `begin_transaction` holds an [`OwnedMutexGuard`] on
+    /// the acquired slot for the full transaction lifetime.
     async fn pool(&self) -> CatalogResult<&Arc<SqliteConnectionPool>> {
         self.pool
             .get_or_try_init(|| async {
