@@ -115,6 +115,7 @@ fn make_cayenne_catalog(catalog_name: &str, data_dir: &str, metadata_dir: &str) 
 // =============================================================================
 
 #[tokio::test]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -422,6 +423,7 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
 // =============================================================================
 
 #[tokio::test]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn cayenne_catalog_ddl_create_if_not_exists() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -506,6 +508,7 @@ async fn cayenne_catalog_ddl_create_if_not_exists() -> Result<(), String> {
 // =============================================================================
 
 #[tokio::test]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn cayenne_catalog_ddl_multiple_tables() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -659,6 +662,7 @@ async fn cayenne_catalog_ddl_multiple_tables() -> Result<(), String> {
 // =============================================================================
 
 #[tokio::test]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn cayenne_catalog_ddl_drop_table() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -753,6 +757,7 @@ async fn cayenne_catalog_ddl_drop_table() -> Result<(), String> {
 // =============================================================================
 
 #[tokio::test]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn cayenne_catalog_ddl_primary_key_upsert() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -946,6 +951,7 @@ async fn cayenne_catalog_ddl_primary_key_upsert() -> Result<(), String> {
 // =============================================================================
 
 #[tokio::test]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn cayenne_catalog_ddl_multiple_schemas() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -1070,6 +1076,7 @@ async fn cayenne_catalog_ddl_multiple_schemas() -> Result<(), String> {
 // =============================================================================
 
 #[tokio::test]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn cayenne_catalog_merge_into() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -1328,6 +1335,7 @@ async fn cayenne_catalog_merge_into() -> Result<(), String> {
 // =============================================================================
 
 #[tokio::test]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn cayenne_catalog_merge_partition_key_differs_from_join_key() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -1452,6 +1460,7 @@ async fn cayenne_catalog_merge_partition_key_differs_from_join_key() -> Result<(
 // =============================================================================
 
 #[tokio::test]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn cayenne_catalog_merge_composite_on_key() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -1589,6 +1598,7 @@ async fn cayenne_catalog_merge_composite_on_key() -> Result<(), String> {
 /// but source only matches (US,A) and (EU,B). The unmatched rows (US,B) and (EU,A)
 /// must be preserved unchanged.
 #[tokio::test]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn cayenne_catalog_merge_composite_key_no_cross_product() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -1718,6 +1728,7 @@ async fn cayenne_catalog_merge_composite_key_no_cross_product() -> Result<(), St
 // =============================================================================
 
 #[tokio::test]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn cayenne_catalog_merge_duplicate_source_keys_rejected() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -1837,6 +1848,7 @@ async fn cayenne_catalog_merge_duplicate_source_keys_rejected() -> Result<(), St
 // → executor forwarding path; this test covers the direct TableProvider::update
 // call.
 #[tokio::test]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn cayenne_catalog_ddl_update() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -2004,6 +2016,7 @@ async fn cayenne_catalog_ddl_update() -> Result<(), String> {
 //
 // Distinct SQL parse path from `WHERE true`.
 #[tokio::test]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn cayenne_catalog_ddl_dml_no_where() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -2094,6 +2107,7 @@ async fn cayenne_catalog_ddl_dml_no_where() -> Result<(), String> {
 // partition pruning. This test uses `PARTITION BY region` and filters on
 // `sku` to exercise the no-pruning path.
 #[tokio::test]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn cayenne_catalog_ddl_dml_non_partition_filter() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -2209,6 +2223,7 @@ async fn cayenne_catalog_ddl_dml_non_partition_filter() -> Result<(), String> {
 // All other DML tests except the MERGE ones use `PARTITION BY id BIGINT`.
 // This test exercises INSERT/UPDATE/DELETE on a string-partitioned table.
 #[tokio::test]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn cayenne_catalog_ddl_string_partition_dml() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -2327,6 +2342,7 @@ async fn cayenne_catalog_ddl_string_partition_dml() -> Result<(), String> {
 // =============================================================================
 
 #[tokio::test]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn cayenne_catalog_rejected_without_distributed_mode() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;

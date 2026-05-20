@@ -31,7 +31,6 @@ const SUPPORTED_TRACE_TASKS: &[&str] = &[
     "ai_chat",
     "acceleration_refresh",
     "ai_completion",
-    "eval_run",
     "nsql",
     "sql_query",
     "tool_use::search",

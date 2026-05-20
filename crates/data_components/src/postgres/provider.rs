@@ -83,6 +83,7 @@ type CommentMap = HashMap<String, TableComments>;
 /// A catalog provider for `PostgreSQL` that discovers schemas and tables
 /// by querying `information_schema`.
 pub struct PostgresCatalogProvider {
+    catalog_name: String,
     pool: Arc<PostgresConnectionPool>,
     table_creator: Arc<dyn Read>,
     schemas: RwLock<HashMap<String, Arc<PostgresSchemaProvider>>>,
@@ -99,11 +100,13 @@ impl std::fmt::Debug for PostgresCatalogProvider {
 impl PostgresCatalogProvider {
     #[must_use]
     pub fn new(
+        catalog_name: String,
         pool: Arc<PostgresConnectionPool>,
         table_creator: Arc<dyn Read>,
         include: Option<GlobSet>,
     ) -> Self {
         Self {
+            catalog_name,
             pool,
             table_creator,
             schemas: RwLock::new(HashMap::new()),
@@ -215,7 +218,10 @@ impl PostgresCatalogProvider {
 
             let table_constraints = constraints_by_table.entry(table_name).or_default();
 
-            let foreign_table = format!("{referenced_schema}.{referenced_table}");
+            let foreign_table = format!(
+                "{}.{}.{}",
+                self.catalog_name, referenced_schema, referenced_table
+            );
             let fk =
                 table_constraints
                     .entry(constraint_name)

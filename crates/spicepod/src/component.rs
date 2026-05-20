@@ -31,7 +31,6 @@ pub mod caching;
 pub mod catalog;
 pub mod dataset;
 pub mod embeddings;
-pub mod eval;
 pub mod function;
 pub mod management;
 pub mod model;

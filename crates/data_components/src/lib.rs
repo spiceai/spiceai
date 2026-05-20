@@ -38,7 +38,7 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 /// [
 ///   {
 ///     "columns": ["customer_id"],
-///     "foreign_table": "public.customers",
+///     "foreign_table": "catalog.public.customers",
 ///     "foreign_columns": ["id"]
 ///   }
 /// ]
