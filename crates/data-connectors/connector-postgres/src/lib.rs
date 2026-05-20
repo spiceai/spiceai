@@ -321,12 +321,10 @@ async fn enrich_with_postgres_comments(
             if table_metadata.is_empty() && field_metadata.is_empty() {
                 provider
             } else {
-                Arc::new(
-                    data_components::MetadataEnrichedTableProvider::new_with_field_metadata(
-                        provider,
-                        table_metadata,
-                        field_metadata,
-                    ),
+                data_components::metadata_enriched_table_provider(
+                    provider,
+                    table_metadata,
+                    field_metadata,
                 )
             }
         }

@@ -29,6 +29,7 @@ use datafusion::{
     prelude::Expr,
     sql::TableReference,
 };
+use datafusion_federation::FederatedTableProviderAdaptor;
 
 /// Schema-level metadata key for foreign key relationships.
 ///
@@ -195,6 +196,47 @@ impl MetadataEnrichedTableProvider {
     }
 }
 
+/// Wrap `provider` with schema metadata while preserving federation pushdown when possible.
+///
+/// `datafusion-federation` discovers federated tables by downcasting to
+/// [`FederatedTableProviderAdaptor`]. If metadata enrichment is placed outside that adaptor, the
+/// federated table is hidden from the analyzer and pushdown is lost. When the provider is already a
+/// federated adaptor with a fallback provider, keep the adaptor as the outer provider and enrich the
+/// fallback provider instead.
+#[must_use]
+pub fn metadata_enriched_table_provider(
+    provider: Arc<dyn TableProvider>,
+    extra_metadata: HashMap<String, String>,
+    field_metadata: FieldMetadata,
+) -> Arc<dyn TableProvider> {
+    if extra_metadata.is_empty() && field_metadata.is_empty() {
+        return provider;
+    }
+
+    if let Some(adaptor) = provider
+        .as_any()
+        .downcast_ref::<FederatedTableProviderAdaptor>()
+        && let Some(table_provider) = &adaptor.table_provider
+    {
+        let enriched_provider = metadata_enriched_table_provider(
+            Arc::clone(table_provider),
+            extra_metadata,
+            field_metadata,
+        );
+
+        return Arc::new(FederatedTableProviderAdaptor::new_with_provider(
+            Arc::clone(&adaptor.source),
+            enriched_provider,
+        ));
+    }
+
+    Arc::new(MetadataEnrichedTableProvider::new_with_field_metadata(
+        provider,
+        extra_metadata,
+        field_metadata,
+    ))
+}
+
 impl std::fmt::Debug for MetadataEnrichedTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MetadataEnrichedTableProvider")
@@ -295,4 +337,125 @@ pub trait ReadWrite: Send + Sync {
 #[async_trait]
 pub trait RefreshableCatalogProvider: CatalogProvider {
     async fn refresh(&self) -> Result<(), Box<dyn Error + Send + Sync>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::error::DataFusionError;
+    use datafusion::logical_expr::TableSource;
+    use datafusion_federation::{
+        FederatedTableProviderAdaptor, FederatedTableSource, FederationAnalyzerForLogicalPlan,
+        FederationProvider,
+    };
+
+    #[derive(Debug)]
+    struct TestFederationProvider;
+
+    impl FederationProvider for TestFederationProvider {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        fn compute_context(&self) -> Option<String> {
+            Some("test-context".to_string())
+        }
+
+        fn analyzer(&self, _plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestFederatedSource {
+        schema: SchemaRef,
+    }
+
+    impl TableSource for TestFederatedSource {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+    }
+
+    impl FederatedTableSource for TestFederatedSource {
+        fn federation_provider(&self) -> Arc<dyn FederationProvider> {
+            Arc::new(TestFederationProvider)
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestTableProvider {
+        schema: SchemaRef,
+    }
+
+    #[async_trait]
+    impl TableProvider for TestTableProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Err(DataFusionError::NotImplemented("scan".to_string()))
+        }
+    }
+
+    #[test]
+    fn metadata_enrichment_preserves_federated_table_provider_adaptor() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let source: Arc<dyn FederatedTableSource> = Arc::new(TestFederatedSource {
+            schema: Arc::clone(&schema),
+        });
+        let fallback: Arc<dyn TableProvider> = Arc::new(TestTableProvider { schema });
+        let provider: Arc<dyn TableProvider> = Arc::new(
+            FederatedTableProviderAdaptor::new_with_provider(source, fallback),
+        );
+
+        let field_metadata = HashMap::from([(
+            "id".to_string(),
+            HashMap::from([("source_type".to_string(), "BIGINT".to_string())]),
+        )]);
+        let enriched = metadata_enriched_table_provider(
+            provider,
+            HashMap::from([("comment".to_string(), "orders".to_string())]),
+            field_metadata,
+        );
+
+        let adaptor = enriched
+            .as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+            .expect("metadata enrichment should preserve the federated adaptor");
+        let schema = adaptor.schema();
+        assert_eq!(
+            schema.metadata().get("comment").map(String::as_str),
+            Some("orders")
+        );
+        assert_eq!(
+            schema
+                .field_with_name("id")
+                .expect("id field should exist")
+                .metadata()
+                .get("source_type")
+                .map(String::as_str),
+            Some("BIGINT")
+        );
+    }
 }

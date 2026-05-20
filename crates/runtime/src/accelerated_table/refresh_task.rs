@@ -47,7 +47,7 @@ use arrow::{
 use arrow_schema::SchemaRef;
 use async_stream::stream;
 use data_components::poly::PolyTableProvider;
-use data_components::{FieldMetadata, MetadataEnrichedTableProvider};
+use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use datafusion::catalog::MemoryCatalogProvider;
 use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::execution::SessionStateBuilder;
@@ -123,11 +123,7 @@ fn table_provider_with_existing_metadata(
         return provider;
     }
 
-    Arc::new(MetadataEnrichedTableProvider::new_with_field_metadata(
-        provider,
-        table_metadata,
-        field_metadata,
-    ))
+    metadata_enriched_table_provider(provider, table_metadata, field_metadata)
 }
 
 #[derive(Debug, Clone, Default)]

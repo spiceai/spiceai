@@ -68,7 +68,7 @@ use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
 use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
-use data_components::{FieldMetadata, MetadataEnrichedTableProvider, poly::PolyTableProvider};
+use data_components::{FieldMetadata, metadata_enriched_table_provider, poly::PolyTableProvider};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::common::{Constraint, Constraints, ToDFSchema};
@@ -628,11 +628,7 @@ fn table_provider_with_spicepod_metadata(
         return provider;
     }
 
-    Arc::new(MetadataEnrichedTableProvider::new_with_field_metadata(
-        provider,
-        table_metadata.clone(),
-        field_metadata,
-    ))
+    metadata_enriched_table_provider(provider, table_metadata.clone(), field_metadata)
 }
 
 fn field_metadata_from_columns(columns: &[Column]) -> FieldMetadata {

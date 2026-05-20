@@ -33,8 +33,8 @@ use globset::GlobSet;
 use snafu::prelude::*;
 
 use crate::{
-    COMMENT_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, FieldMetadata, MetadataEnrichedTableProvider,
-    Read, RefreshableCatalogProvider, SOURCE_TYPE_METADATA_KEY,
+    COMMENT_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, FieldMetadata, Read,
+    RefreshableCatalogProvider, SOURCE_TYPE_METADATA_KEY, metadata_enriched_table_provider,
 };
 
 #[derive(Debug, Snafu)]
@@ -521,11 +521,7 @@ async fn build_table_providers_for_schema(
                 let provider = if table_metadata.is_empty() && field_metadata.is_empty() {
                     provider
                 } else {
-                    Arc::new(MetadataEnrichedTableProvider::new_with_field_metadata(
-                        provider,
-                        table_metadata,
-                        field_metadata,
-                    )) as Arc<dyn TableProvider>
+                    metadata_enriched_table_provider(provider, table_metadata, field_metadata)
                 };
                 tables.insert(table_name, provider);
             }

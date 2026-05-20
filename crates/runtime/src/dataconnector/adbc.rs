@@ -20,7 +20,7 @@ use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::ManagedDriver;
 use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use async_trait::async_trait;
-use data_components::{FieldMetadata, MetadataEnrichedTableProvider};
+use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
@@ -569,11 +569,7 @@ pub(crate) async fn enrich_with_bigquery_metadata(
             if table_metadata.is_empty() && field_metadata.is_empty() {
                 provider
             } else {
-                Arc::new(MetadataEnrichedTableProvider::new_with_field_metadata(
-                    provider,
-                    table_metadata,
-                    field_metadata,
-                ))
+                metadata_enriched_table_provider(provider, table_metadata, field_metadata)
             }
         }
         Err(error) => {

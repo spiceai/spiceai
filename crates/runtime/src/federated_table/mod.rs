@@ -34,7 +34,7 @@ use std::sync::{
 
 use arrow::datatypes::SchemaRef;
 use arrow_tools::schema::schema_difference;
-use data_components::{FieldMetadata, MetadataEnrichedTableProvider};
+use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use datafusion::catalog::TableProvider;
 use datafusion::common::DataFusionError;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
@@ -160,11 +160,7 @@ fn table_provider_with_dataset_metadata(
         return provider;
     }
 
-    Arc::new(MetadataEnrichedTableProvider::new_with_field_metadata(
-        provider,
-        dataset.metadata.clone(),
-        field_metadata,
-    ))
+    metadata_enriched_table_provider(provider, dataset.metadata.clone(), field_metadata)
 }
 
 fn field_metadata_from_columns(columns: &[spicepod::semantic::Column]) -> FieldMetadata {
