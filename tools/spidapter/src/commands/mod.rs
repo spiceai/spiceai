@@ -187,9 +187,10 @@ pub(crate) async fn ensure_spice_cloud_app(
         visibility: "private".to_string(),
         cname: Some(cname),
         tags: {
-            let mut tags = BTreeMap::from([
-                // ("kind".to_string(), "cluster".to_string())
-            ]);
+            let mut tags = BTreeMap::new();
+            if matches!(deployment_mode, DeploymentMode::Distributed) {
+                tags.insert("kind".to_string(), "cluster".to_string());
+            }
             if let Some(org) = &config.organization_tag {
                 tags.insert("organization".to_string(), org.clone());
             }

@@ -193,6 +193,29 @@ pub struct StdioArgs {
     #[arg(long, env = "PG_ACCELERATION", default_value = "cayenne")]
     pub pg_acceleration: PgAccelerationEngine,
 
+    /// EC2 subnet ID for provisioning a `PostgreSQL` instance. When set together with
+    /// `EC2_SECURITY_GROUP_ID`, spidapter launches an EC2 instance instead of using
+    /// an existing `PostgreSQL` host.
+    #[arg(long, env = "EC2_SUBNET_ID")]
+    pub ec2_subnet_id: Option<String>,
+
+    /// EC2 security group ID for the provisioned `PostgreSQL` instance.
+    #[arg(long, env = "EC2_SECURITY_GROUP_ID")]
+    pub ec2_security_group_id: Option<String>,
+
+    /// AMI ID for the EC2 `PostgreSQL` instance (Ubuntu 22.04 recommended).
+    #[arg(long, env = "EC2_AMI_ID")]
+    pub ec2_ami_id: Option<String>,
+
+    /// EC2 instance type for the `PostgreSQL` instance.
+    #[arg(long, env = "EC2_INSTANCE_TYPE", default_value = "m5.large")]
+    pub ec2_instance_type: String,
+
+    /// Assign a public IP to the provisioned EC2 `PostgreSQL` instance.
+    /// Required when running spidapter outside the target VPC (e.g. local development).
+    #[arg(long, env = "EC2_ASSOCIATE_PUBLIC_IP", default_value_t = false)]
+    pub ec2_associate_public_ip: bool,
+
     /// Name or path of the spiced binary to spawn (local backend only).
     #[arg(long, default_value = "spiced")]
     pub spiced_binary: String,

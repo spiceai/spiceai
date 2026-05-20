@@ -166,6 +166,8 @@ pub(super) async fn provision_scp_app(
         sql_url,
         cloud,
         pg_config: Box::new(setup_config.pg_config.clone()),
+        ec2_instance_id: None,
+        ec2_region: None,
     })
 }
 

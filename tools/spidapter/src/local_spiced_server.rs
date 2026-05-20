@@ -59,6 +59,12 @@ fn to_stdio_args(args: &LocalSpicedArgs) -> StdioArgs {
         pg_password: String::new(),
         pg_database: None,
         pg_acceleration: crate::args::PgAccelerationEngine::Cayenne,
+        // EC2 provisioning is SCP-only
+        ec2_subnet_id: None,
+        ec2_security_group_id: None,
+        ec2_ami_id: None,
+        ec2_instance_type: "m5.large".to_string(),
+        ec2_associate_public_ip: false,
         spiced_binary: "spiced".to_string(),
     }
 }

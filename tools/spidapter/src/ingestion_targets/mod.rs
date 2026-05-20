@@ -13,4 +13,5 @@
 // limitations under the License.
 
 pub(super) mod cayenne;
+pub(super) mod ec2_postgres;
 pub(super) mod postgres_cdc;

@@ -48,8 +48,12 @@ mod provision_local;
 use ingestion_targets::cayenne::{
     build_cayenne_setup_response, generate_cayenne_sink_spicepod, generate_hive_spicepod,
 };
+use ingestion_targets::ec2_postgres::{
+    Ec2PostgresInstance, is_ec2_mode, launch_postgres_ec2, terminate_ec2_instance,
+};
 use ingestion_targets::postgres_cdc::{
     PgConfig, generate_postgres_wal_spicepod, setup_postgres_for_wal, teardown_postgres,
+    tpch_schema_name,
 };
 use provision_local::{
     provision_local_single_node, provision_local_spiced_cluster, teardown_local_run,
@@ -73,6 +77,10 @@ enum RunState {
         cloud: CloudClient,
         /// If the run used `PostgreSQL` WAL CDC, connection details needed for teardown.
         pg_config: Box<Option<PgConfig>>,
+        /// EC2 instance ID provisioned for this run, if any.
+        ec2_instance_id: Option<String>,
+        /// AWS region of the EC2 instance.
+        ec2_region: Option<String>,
     },
     Local(Box<LocalRunState>),
 }
@@ -297,14 +305,43 @@ impl Handler for SpidapterHandler {
             metadata.keys().collect::<Vec<_>>()
         );
 
-        let pg_config = PgConfig::from_args(&self.args, &run_id);
+        // EC2 mode: provision a fresh PostgreSQL instance on EC2 for this run.
+        let ec2_instance: Option<Ec2PostgresInstance> = if is_ec2_mode(&self.args) {
+            let run_id_str = run_id.to_string();
+            let short_id = run_id_str.split('-').next().unwrap_or_default();
+            let instance = launch_postgres_ec2(&self.args, short_id)
+                .await
+                .map_err(|e| format!("Failed to provision EC2 PostgreSQL instance: {e}"))?;
+            Some(instance)
+        } else {
+            None
+        };
+
+        let pg_config = if let Some(ref ec2) = ec2_instance {
+            Some(PgConfig {
+                host: ec2.host.clone(),
+                port: ec2.pg_port,
+                user: ec2.pg_user.clone(),
+                password: ec2.pg_password.clone(),
+                database: ec2.pg_database.clone(),
+                schema: tpch_schema_name(&run_id),
+            })
+        } else {
+            PgConfig::from_args(&self.args, &run_id)
+        };
 
         // WAL CDC mode: set up PostgreSQL tables, replication slot, and publication
         // before provisioning Spice so the spicepod can reference them immediately.
         if let Some(ref pg) = pg_config {
-            setup_postgres_for_wal(pg, &datasets)
-                .await
-                .map_err(|e| format!("Failed to set up PostgreSQL for WAL CDC: {e}"))?;
+            if let Err(e) = setup_postgres_for_wal(pg, &datasets).await {
+                // Terminate EC2 if we provisioned one and WAL setup fails.
+                if let Some(ref ec2) = ec2_instance {
+                    if let Err(te) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await {
+                        eprintln!("[stdio] warning: failed to terminate EC2 instance after WAL setup failure: {te}");
+                    }
+                }
+                return Err(format!("Failed to set up PostgreSQL for WAL CDC: {e}"));
+            }
         }
 
         let setup_config = SetupConfig::from_metadata(&metadata)
@@ -312,7 +349,7 @@ impl Handler for SpidapterHandler {
             .set_pg_config(pg_config);
         let backend = self.args.backend;
 
-        let state = match (backend, self.args.deployment_mode) {
+        let provision_result = match (backend, self.args.deployment_mode) {
             (BackendMode::Scp, deployment_mode) => {
                 provision_scp_app(run_id, &self.args, &setup_config, &datasets, &deployment_mode).await
             }
@@ -336,8 +373,28 @@ impl Handler for SpidapterHandler {
                 )
                 .await
             }
+        };
+
+        let mut state = match provision_result {
+            Ok(s) => s,
+            Err(e) => {
+                // Terminate EC2 if we provisioned one before the SCP app failed.
+                if let Some(ref ec2) = ec2_instance {
+                    if let Err(te) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await {
+                        eprintln!("[stdio] warning: failed to terminate EC2 instance after provision failure: {te}");
+                    }
+                }
+                return Err(format!("Setup failed: {e}"));
+            }
+        };
+
+        // Attach EC2 instance info to the run state so teardown can terminate it.
+        if let (RunState::Scp { ec2_instance_id, ec2_region, .. }, Some(ec2)) =
+            (&mut state, ec2_instance)
+        {
+            *ec2_instance_id = Some(ec2.instance_id);
+            *ec2_region = Some(ec2.region);
         }
-        .map_err(|e| format!("Setup failed: {e}"))?;
 
         let response = match setup_config.ingestion_target {
             IngestionTarget::PostgresCdc => {
@@ -449,7 +506,13 @@ impl Handler for SpidapterHandler {
         };
 
         match state {
-            RunState::Scp { app_id, cloud, .. } => {
+            RunState::Scp {
+                app_id,
+                cloud,
+                ec2_instance_id,
+                ec2_region,
+                ..
+            } => {
                 eprintln!(
                     "[stdio] teardown: deleting app {app_id} at {}",
                     cloud.base_url()
@@ -458,6 +521,12 @@ impl Handler for SpidapterHandler {
                     .await
                     .map_err(|e| format!("Failed to delete app {app_id}: {e}"))?;
                 eprintln!("[stdio] teardown: app {app_id} deleted");
+
+                if let (Some(instance_id), Some(region)) = (ec2_instance_id, ec2_region) {
+                    if let Err(e) = terminate_ec2_instance(&region, &instance_id).await {
+                        eprintln!("[stdio] warning: failed to terminate EC2 instance {instance_id}: {e}");
+                    }
+                }
             }
             RunState::Local(mut local_state) => {
                 teardown_local_run(&mut local_state)
@@ -887,6 +956,10 @@ mod tests {
             pg_password: String::new(),
             pg_database: None,
             pg_acceleration: PgAccelerationEngine::Cayenne,
+            ec2_subnet_id: None,
+            ec2_security_group_id: None,
+            ec2_ami_id: None,
+            ec2_instance_type: "m5.large".to_string(),
             spiced_binary: "spiced".to_string(),
         }
     }

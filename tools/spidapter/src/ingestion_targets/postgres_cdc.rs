@@ -31,7 +31,7 @@ use crate::args::StdioArgs;
 #[expect(dead_code)]
 pub(crate) const PG_REPLICATION_SLOT_NAME: &str = "spicebench_slot";
 
-fn tpch_schema_name(run_id: &Uuid) -> String {
+pub(crate) fn tpch_schema_name(run_id: &Uuid) -> String {
     format!("tpch_{}", crate::commands::run_id_short(run_id))
 }
 /// Legacy single-publication name kept for teardown cleanup only.
