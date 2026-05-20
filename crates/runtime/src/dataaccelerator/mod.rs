@@ -2386,14 +2386,19 @@ mod accelerator_compat_tests {
                     );
                 }
 
-                assert_eq!(
-                    original_field.is_nullable(),
-                    table_field.is_nullable(),
-                    "{:?}: Field {} ({}) nullable mismatch",
-                    engine,
-                    i,
-                    original_field.name()
-                );
+                // DuckDB does not preserve NOT NULL field metadata when returning
+                // Arrow results — all scanned columns are reported as nullable.
+                // See: https://github.com/duckdb/duckdb/issues/13947
+                if !matches!(engine, Engine::DuckDB) {
+                    assert_eq!(
+                        original_field.is_nullable(),
+                        table_field.is_nullable(),
+                        "{:?}: Field {} ({}) nullable mismatch",
+                        engine,
+                        i,
+                        original_field.name()
+                    );
+                }
             }
         })
         .await;
