@@ -723,6 +723,7 @@ impl SqlWarehouseApi {
             })?;
 
             result.log_warnings(table);
+            let token = self.token_provider.get_token();
             Ok(self
                 .enrich_schema_with_partition_columns(&token, table, result.schema)
                 .await)
