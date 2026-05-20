@@ -472,6 +472,8 @@ impl CayenneCatalog {
     ) -> CatalogResult<TableMetadata> {
         match self.get_table(table_name).await {
             Ok(stored_metadata) => {
+                log_runtime_footer_cache_drift(table_name, &stored_metadata, options);
+
                 if configuration_matches(&stored_metadata, options) {
                     return Ok(stored_metadata);
                 }
@@ -2786,6 +2788,25 @@ fn validate_create_table_options(options: &CreateTableOptions) -> CatalogResult<
     Ok(())
 }
 
+fn log_runtime_footer_cache_drift(
+    table_name: &str,
+    stored: &TableMetadata,
+    options: &CreateTableOptions,
+) {
+    if let (Some(stored_footer_cache_mb), Some(configured_footer_cache_mb)) = (
+        stored.vortex_config.footer_cache_mb,
+        options.vortex_config.footer_cache_mb,
+    ) && stored_footer_cache_mb != configured_footer_cache_mb
+    {
+        tracing::warn!(
+            table = table_name,
+            stored_footer_cache_mb,
+            configured_footer_cache_mb,
+            "Cayenne table was registered with a different runtime.params.cayenne_footer_cache_mb than the value stored in the metastore; using the current runtime value"
+        );
+    }
+}
+
 /// Logs a warning describing exactly which configuration fields differ between the
 /// stored table metadata and the newly requested [`CreateTableOptions`].
 ///
@@ -4353,7 +4374,7 @@ mod tests {
 
         // Change only cache sizes (non-data-affecting) — should NOT trigger recreation
         let vortex_config = crate::metadata::VortexConfig {
-            footer_cache_mb: 512,
+            footer_cache_mb: Some(512),
             segment_cache_mb: 1024,
             upload_concurrency: 8,
             write_concurrency: Some(16),
@@ -5297,6 +5318,64 @@ mod tests {
         );
 
         // Cleanup
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_existing_table_configuration_allows_configured_footer_cache_drift() {
+        let test_db = format!(
+            "sqlite://./.test_footer_cache_validate_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+
+        let options = CreateTableOptions {
+            table_name: "footer_cache_validate_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_footer_cache_validate_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig {
+                footer_cache_mb: Some(128),
+                ..Default::default()
+            },
+        };
+        catalog
+            .create_table(options)
+            .await
+            .expect("Failed to create table");
+
+        let changed_options = CreateTableOptions {
+            table_name: "footer_cache_validate_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_footer_cache_validate_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig {
+                footer_cache_mb: Some(256),
+                ..Default::default()
+            },
+        };
+        let result = catalog
+            .validate_existing_table_configuration("footer_cache_validate_table", &changed_options)
+            .await;
+        assert!(
+            result.is_ok(),
+            "Expected Ok for footer cache runtime tuning drift, got: {result:?}"
+        );
+
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));
