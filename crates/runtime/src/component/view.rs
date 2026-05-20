@@ -185,6 +185,8 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
             });
         };
 
+        let metadata = view.metadata();
+
         let acceleration = view
             .acceleration
             .map(acceleration::Acceleration::try_from)
@@ -212,7 +214,7 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
         Ok(ViewBuilder {
             name: table_reference,
             sql,
-            metadata: view.metadata(),
+            metadata,
             columns: view.columns,
             acceleration,
             ready_state: ReadyState::from(view.ready_state),
