@@ -632,6 +632,29 @@ impl ClusterService for ClusterServiceImpl {
             &executor_url
         };
 
+        // Gate on dataset readiness. Partition-expression serialization needs
+        // every accelerated table's schema to be in the SessionContext; if a
+        // dataset is still loading from its source, `partition_value_to_bytes`
+        // would fail with "Table not found when parsing expression" — return
+        // a transient `Unavailable` so the executor retries with backoff.
+        {
+            let app_guard = self.app.read().await;
+            if let Some(app) = app_guard.as_ref() {
+                for table_ref in super::partition::accelerated_tables(app).keys() {
+                    if self.datafusion.get_table(table_ref).await.is_none() {
+                        tracing::debug!(
+                            executor = %executor_id,
+                            table = %table_ref,
+                            "Deferring allocate_initial_partitions: accelerated table not yet registered"
+                        );
+                        return Err(Status::unavailable(format!(
+                            "partition metadata not ready: accelerated table {table_ref} still loading"
+                        )));
+                    }
+                }
+            }
+        }
+
         let tls_config_opt = self.datafusion.cluster_config.client_tls_config();
         match create_executor_flight_client(&executor_url, tls_config_opt) {
             Ok(client) => {
@@ -697,9 +720,17 @@ impl ClusterService for ClusterServiceImpl {
                             {
                                 Ok(bytes) => items.push(bytes.to_vec()),
                                 Err(e) => {
+                                    // The readiness gate above should make this
+                                    // path unreachable for the dataset-not-ready
+                                    // case. Anything that lands here is a real
+                                    // bug (corrupt expression, etc.) — fail loud
+                                    // rather than silently dropping the partition.
                                     tracing::error!(
                                         "Failed to serialize partition expression for table {table_ref}: {e}"
                                     );
+                                    return Err(Status::internal(format!(
+                                        "Failed to serialize partition expression for table {table_ref}: {e}"
+                                    )));
                                 }
                             }
                         }
