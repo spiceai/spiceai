@@ -2048,10 +2048,7 @@ async fn executor_bind_app(
 /// "failed to resolve schema" or "Registering new schemas is not supported".
 ///
 /// Returns the number of successfully replayed statements.
-async fn replay_ddl_statements(
-    rt: &Runtime,
-    statements: &[datafusion_ddl::DdlStatement],
-) -> usize {
+async fn replay_ddl_statements(rt: &Runtime, statements: &[datafusion_ddl::DdlStatement]) -> usize {
     use futures::TryStreamExt as _;
     let df = rt.datafusion();
     for (i, stmt) in statements.iter().enumerate() {
