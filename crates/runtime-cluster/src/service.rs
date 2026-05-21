@@ -44,7 +44,7 @@ use spicepod::partitioning::PartitionedBy;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 
-use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 
 use crate::context::PartitionOperations;
 use crate::executor_registry::{self, ExecutorRegistry};
@@ -1106,6 +1106,18 @@ async fn notify_executors(
     Ok(())
 }
 
+/// How long the scheduler waits for an executor to ack a single
+/// `UpdatePartitions` message before considering the attempt failed.
+const NOTIFY_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound on the per-attempt backoff between notify retries.
+const NOTIFY_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// Maximum number of retry attempts for a single executor notification.
+/// After exhaustion the assignment stays committed in the partition store;
+/// the next reconcile cycle will re-attempt notification.
+const NOTIFY_MAX_RETRIES: usize = 8;
+
 async fn notify_executor_of_assignments(
     registry: &ExecutorRegistry,
     ops: &dyn PartitionOperations,
@@ -1129,30 +1141,69 @@ async fn notify_executor_of_assignments(
             partitions_bytes.push(bytes.to_vec());
         }
 
-        let command = SchedulerControlMessage {
-            message: Some(SchedulerControlMessageEnum::UpdatePartitions(
-                UpdatePartitions {
-                    new_partitions: HashMap::from([(
-                        table.to_string(),
-                        BytesArray {
-                            items: partitions_bytes,
-                        },
-                    )]),
-                    removed_partitions: HashMap::new(),
-                    // TODO: switched to ack-based send in the next commit; this
-                    // empty request_id keeps the legacy fire-and-forget shape
-                    // until the new call site replaces it.
-                    request_id: String::new(),
-                },
-            )),
-        };
+        let mut backoff = FibonacciBackoffBuilder::new()
+            .max_duration(Some(NOTIFY_BACKOFF_MAX))
+            .max_retries(Some(NOTIFY_MAX_RETRIES))
+            .build();
+        let table_str = table.to_string();
 
-        registry
-            .send_command(executor_id, command)
-            .await
-            .context(SendCommandSnafu {
-                executor_id: executor_id.to_string(),
-            })?;
+        loop {
+            // Clone per attempt — both build_command's FnOnce and a possible
+            // retry require fresh owned data.
+            let partitions_bytes = partitions_bytes.clone();
+            let table_str = table_str.clone();
+            let send_result = registry
+                .send_command_with_ack(
+                    executor_id,
+                    move |request_id| SchedulerControlMessage {
+                        message: Some(SchedulerControlMessageEnum::UpdatePartitions(
+                            UpdatePartitions {
+                                new_partitions: HashMap::from([(
+                                    table_str,
+                                    BytesArray {
+                                        items: partitions_bytes,
+                                    },
+                                )]),
+                                removed_partitions: HashMap::new(),
+                                request_id,
+                            },
+                        )),
+                    },
+                    NOTIFY_ACK_TIMEOUT,
+                )
+                .await;
+
+            match send_result {
+                Ok(()) => break,
+                Err(err) if err.is_retryable() => {
+                    let Some(delay) = backoff.next_duration() else {
+                        tracing::warn!(
+                            executor = %executor_id,
+                            table = %table,
+                            error = %err,
+                            "Exhausted retries notifying executor of partition assignments; \
+                             assignment remains committed and will retry on next reconcile cycle"
+                        );
+                        return Err(err).context(SendCommandSnafu {
+                            executor_id: executor_id.to_string(),
+                        });
+                    };
+                    tracing::debug!(
+                        executor = %executor_id,
+                        table = %table,
+                        delay_ms = delay.as_millis(),
+                        error = %err,
+                        "Executor ack failed for partition update; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(err) => {
+                    return Err(err).context(SendCommandSnafu {
+                        executor_id: executor_id.to_string(),
+                    });
+                }
+            }
+        }
     }
 
     Ok(())
