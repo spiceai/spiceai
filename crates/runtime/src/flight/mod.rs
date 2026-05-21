@@ -46,6 +46,7 @@ use flight_client::Error as FlightClientError;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use governor::{Quota, RateLimiter};
+use itertools::Either;
 use metrics::track_flight_request;
 use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{AuthRequestContext, FlightBasicAuth, layer::flight::BasicAuthLayer};
@@ -242,31 +243,30 @@ impl Service {
         Ok(schema_bytes)
     }
 
+    /// Construct a stream of [`FlightData`] for a given sql statement.
+    ///
+    /// To enforce read-only protections, provide a `read_only_plan`. In this case, `sql`
+    /// is used for tracing and observability.
+    ///
+    /// Otherwise `sql` will be used, and could be a DDL/DML statement.
     async fn sql_to_flight_stream(
         datafusion: Arc<DataFusion>,
         sql: &str,
         parameters: Option<ParamValues>,
-        pre_parsed_plan: Option<LogicalPlan>,
+        read_only_plan: Option<LogicalPlan>,
     ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, CacheStatus), Status> {
-        let read_only = crate::http::v1::current_principal_requires_read_only().await;
-        let query_result = if let Some(plan) = pre_parsed_plan {
+        let query_builder = if let Some(plan) = read_only_plan {
             QueryBuilder::from_plan(plan, sql, Arc::clone(&datafusion))
-                .parameters(parameters)
-                .read_only(read_only)
-                .build()
-                .run()
-                .await
-                .map_err(handle_query_error)?
         } else {
             QueryBuilder::new(sql, Arc::clone(&datafusion))
-                .parameters(parameters)
-                .read_only(read_only)
-                .build()
-                .run()
-                .await
-                .map_err(handle_query_error)?
         };
 
+        let query_result = query_builder
+            .parameters(parameters)
+            .build()
+            .run()
+            .await
+            .map_err(handle_query_error)?;
         Ok(Self::query_result_to_flight_stream(query_result))
     }
 
