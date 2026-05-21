@@ -35,7 +35,6 @@ use datafusion_substrait::substrait::proto::Plan;
 use prost::Message;
 use tonic::{Request, Response, Status};
 
-use crate::datafusion::DataFusion;
 use crate::datafusion::query::QueryBuilder;
 use crate::datafusion::request_context_extension::get_current_datafusion;
 use crate::datafusion::sql_validator::validate_sql_query_read_only;
@@ -45,6 +44,7 @@ use crate::flight::{
     to_tonic_err,
     util::{attach_cache_metadata, set_flightsql_protocol},
 };
+use crate::{datafusion::DataFusion, flight::handle_query_error};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use telemetry::timing::TimedStream;
 
@@ -174,8 +174,7 @@ pub(crate) async fn do_get(
         .await
         .map_err(handle_query_error)?;
 
-    let (output, from_cache) =
-        Box::pin(Service::query_result_to_flight_stream(query_result)).await?;
+    let (output, from_cache) = Service::query_result_to_flight_stream(query_result);
     let timed_output = TimedStream::new(output, move || start);
 
     let mut response =
