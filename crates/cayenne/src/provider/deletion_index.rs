@@ -191,9 +191,11 @@ impl DeletionIndex {
         let mut entries_arc = Arc::clone(&self.entries);
         let entries = Arc::make_mut(&mut entries_arc);
         let mut max_sequence_number = self.max_sequence_number;
+        let additions = additions.into_iter();
         // Track newly-inserted keys so the bloom can be updated incrementally
-        // without re-iterating the entire entry set.
-        let mut new_keys: Vec<i64> = Vec::new();
+        // without re-iterating the entire entry set. Pre-size from the
+        // iterator's hint to skip Vec growth reallocations.
+        let mut new_keys: Vec<i64> = Vec::with_capacity(additions.size_hint().0);
         for (pk, seq) in additions {
             let stored_sequence = match entries.entry(pk) {
                 std::collections::hash_map::Entry::Occupied(mut e) => {
@@ -386,9 +388,12 @@ impl KeyDeletionIndex {
         let mut entries_arc = Arc::clone(&self.entries);
         let entries = Arc::make_mut(&mut entries_arc);
         let mut max_sequence_number = self.max_sequence_number;
-        // Track newly-inserted keys so the bloom can be updated incrementally
-        // without re-iterating the entire entry set.
-        let mut new_keys: Vec<Box<[u8]>> = Vec::new();
+        let additions = additions.into_iter();
+        // Hash newly-inserted keys inline so the bloom can be updated
+        // incrementally without paying for a `Box<[u8]>` clone per key (the
+        // bloom only needs the hash, not the byte slice). Pre-size from the
+        // iterator's hint to skip Vec growth reallocations.
+        let mut new_hashes: Vec<u64> = Vec::with_capacity(additions.size_hint().0);
         for (key, seq) in additions {
             let stored_sequence = match entries.entry(key) {
                 std::collections::hash_map::Entry::Occupied(mut e) => {
@@ -401,9 +406,8 @@ impl KeyDeletionIndex {
                     }
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    let key_clone: Box<[u8]> = e.key().clone();
+                    new_hashes.push(hash_key(&e.key().as_ref()));
                     e.insert(seq);
-                    new_keys.push(key_clone);
                     seq
                 }
             };
@@ -430,8 +434,8 @@ impl KeyDeletionIndex {
         }
 
         let mut bloom = self.bloom.clone();
-        for key in &new_keys {
-            bloom.insert(hash_key(&key.as_ref()));
+        for h in new_hashes {
+            bloom.insert(h);
         }
         Self {
             entries: entries_arc,
