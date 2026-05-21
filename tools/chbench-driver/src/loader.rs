@@ -748,7 +748,7 @@ async fn load_nation(client: &Client) -> Result<()> {
 
     for &(key, name, region) in NATIONS.iter().chain(EXTRA_NATIONS.iter()) {
         row.clear();
-        let _ = write!(row, "({key}, {}, {region}, NULL)", sql_str(name));
+        let _ = write!(row, "({key}, {}, {region}, '')", sql_str(name));
         sink.write_row(&row);
         sink.maybe_flush(client, "nation").await?;
     }
@@ -762,13 +762,13 @@ async fn load_region(client: &Client) -> Result<()> {
 
     for &(key, name) in REGIONS {
         row.clear();
-        let _ = write!(row, "({key}, {}, NULL)", sql_str(name));
+        let _ = write!(row, "({key}, {}, '')", sql_str(name));
         sink.write_row(&row);
     }
     sink.flush(client, "region").await
 }
 
-/// Load 10,000 supplier rows (matching go-tpc / TPC-H dbgen at SF1).
+/// Load 10,000 supplier rows (matching BenchBase CH-Benchmark reference).
 async fn load_supplier(client: &Client, rng: &mut impl Rng) -> Result<()> {
     const SUPPLIER_COUNT: i64 = 10_000;
     println!("  loading supplier ({SUPPLIER_COUNT} rows)");
@@ -777,10 +777,11 @@ async fn load_supplier(client: &Client, rng: &mut impl Rng) -> Result<()> {
     );
     let mut row = String::new();
 
-    let nation_count = i64::try_from(NATIONS.len()).unwrap_or(25);
+    let nation_count =
+        i64::try_from(NATIONS.len() + EXTRA_NATIONS.len()).unwrap_or(62);
 
     for i in 1..=SUPPLIER_COUNT {
-        let s_name = format!("Supplier#{i:09}");
+        let s_name = tpcc_rand::rand_chars(rng, 25, 25);
         let s_address = tpcc_rand::rand_chars(rng, 10, 25);
         let s_nationkey: i64 = rng.random_range(0..nation_count);
         let s_phone = format!(
@@ -790,7 +791,7 @@ async fn load_supplier(client: &Client, rng: &mut impl Rng) -> Result<()> {
             rng.random_range(100..=999),
             rng.random_range(1000..=9999),
         );
-        let s_acctbal: f64 = f64::from(rng.random_range(-99_999..=999_999)) / 100.0;
+        let s_acctbal: f64 = f64::from(rng.random_range(10_000i32..=1_000_000_000i32)) / 100.0;
         let s_comment = tpcc_rand::rand_chars(rng, 25, 63);
 
         row.clear();
