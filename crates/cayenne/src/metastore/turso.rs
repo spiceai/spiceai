@@ -347,7 +347,7 @@ impl TursoRow<'_> {
 
 impl MetastoreRow for TursoRow<'_> {
     fn get_value(&self, index: usize) -> CatalogResult<MetastoreValue> {
-        Ok(convert_turso_value(&self.raw_value(index)?))
+        Ok(convert_turso_value(self.raw_value(index)?))
     }
 
     fn get_i64(&self, index: usize) -> CatalogResult<i64> {
@@ -411,27 +411,29 @@ impl MetastoreRow for TursoRow<'_> {
     }
 }
 
-/// Convert Turso Value to `MetastoreValue`.
-fn convert_turso_value(value: &TursoValue) -> MetastoreValue {
+/// Convert Turso Value to `MetastoreValue`, consuming the source so the
+/// Text/Blob payload moves without an extra heap copy.
+fn convert_turso_value(value: TursoValue) -> MetastoreValue {
     match value {
         TursoValue::Null => MetastoreValue::Null,
-        TursoValue::Integer(i) => MetastoreValue::Integer(*i),
+        TursoValue::Integer(i) => MetastoreValue::Integer(i),
         TursoValue::Real(_) => {
             // We don't use real numbers in metadata
             MetastoreValue::Null
         }
-        TursoValue::Text(t) => MetastoreValue::Text(t.clone()),
-        TursoValue::Blob(b) => MetastoreValue::Blob(b.clone()),
+        TursoValue::Text(t) => MetastoreValue::Text(t),
+        TursoValue::Blob(b) => MetastoreValue::Blob(b),
     }
 }
 
-/// Convert `MetastoreValue` to Turso Value.
-fn to_turso_value(value: &MetastoreValue) -> TursoValue {
+/// Convert `MetastoreValue` to Turso Value, consuming the source so Text/Blob
+/// payloads move without an extra heap copy.
+fn to_turso_value(value: MetastoreValue) -> TursoValue {
     match value {
-        MetastoreValue::Integer(i) => TursoValue::Integer(*i),
-        MetastoreValue::Text(s) => TursoValue::Text(s.clone()),
-        MetastoreValue::Bool(b) => TursoValue::Integer(i64::from(*b)),
-        MetastoreValue::Blob(b) => TursoValue::Blob(b.clone()),
+        MetastoreValue::Integer(i) => TursoValue::Integer(i),
+        MetastoreValue::Text(s) => TursoValue::Text(s),
+        MetastoreValue::Bool(b) => TursoValue::Integer(i64::from(b)),
+        MetastoreValue::Blob(b) => TursoValue::Blob(b),
         MetastoreValue::Null => TursoValue::Null,
     }
 }
@@ -556,7 +558,7 @@ impl MetastoreBackend for TursoMetastore {
     async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
         let conn = self.pool().await?.acquire().await;
 
-        let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
+        let turso_params: Vec<TursoValue> = params.params.into_iter().map(to_turso_value).collect();
 
         let mut stmt = conn
             .prepare_cached(params.sql)
@@ -602,7 +604,7 @@ impl MetastoreBackend for TursoMetastore {
     {
         let conn = self.pool().await?.acquire().await;
 
-        let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
+        let turso_params: Vec<TursoValue> = params.params.into_iter().map(to_turso_value).collect();
 
         let mut stmt =
             conn.prepare_cached(params.sql)
@@ -636,7 +638,7 @@ impl MetastoreBackend for TursoMetastore {
     {
         let conn = self.pool().await?.acquire().await;
 
-        let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
+        let turso_params: Vec<TursoValue> = params.params.into_iter().map(to_turso_value).collect();
 
         let mut stmt =
             conn.prepare_cached(params.sql)
@@ -736,7 +738,7 @@ impl MetastoreTransaction for TursoTransaction {
             message: "Transaction already completed".to_string(),
         })?;
 
-        let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
+        let turso_params: Vec<TursoValue> = params.params.into_iter().map(to_turso_value).collect();
 
         let mut stmt = conn
             .prepare_cached(params.sql)
@@ -756,7 +758,7 @@ impl MetastoreTransaction for TursoTransaction {
         let conn = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
             message: "Transaction already completed".to_string(),
         })?;
-        let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
+        let turso_params: Vec<TursoValue> = params.params.into_iter().map(to_turso_value).collect();
 
         let mut stmt = conn
             .prepare_cached(params.sql)
@@ -775,7 +777,7 @@ impl MetastoreTransaction for TursoTransaction {
         (0..row.column_count())
             .map(|i| {
                 row.get_value(i)
-                    .map(|v| convert_turso_value(&v))
+                    .map(convert_turso_value)
                     .map_err(convert_turso_error)
             })
             .collect::<CatalogResult<_>>()
