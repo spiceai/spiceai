@@ -244,8 +244,9 @@ impl Service {
 
     /// Construct a stream of [`FlightData`] for a given sql statement.
     ///
-    /// To enforce read-only protections, provide a `read_only_plan`. In this case, `sql`
-    /// is used for tracing and observability.
+    /// To enforce read-only protections, provide a prevalidated `read_only_plan`
+    ///  (see [`check_read_only_sql`]). In this case, `sql` is used for caching,
+    /// tracing and observability.
     ///
     /// Otherwise `sql` will be used, and could be a DDL/DML statement.
     async fn sql_to_flight_stream(
