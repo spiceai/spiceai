@@ -1,0 +1,17 @@
+---
+source: crates/vortex/src/persistent/mod.rs
+expression: "DisplayableExecutionPlan::new(physical_plan.as_ref()).tree_render().to_string()"
+---
+┌───────────────────────────┐
+│  SortPreservingMergeExec  │
+│    --------------------   │
+│     c1 ASC NULLS LAST     │
+│                           │
+│          limit: 3         │
+└─────────────┬─────────────┘
+┌─────────────┴─────────────┐
+│       DataSourceExec      │
+│    --------------------   │
+│          files: 3         │
+│       format: vortex      │
+└───────────────────────────┘

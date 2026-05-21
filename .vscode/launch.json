@@ -26,29 +26,6 @@
     {
       "type": "lldb",
       "request": "launch",
-      "name": "Debug testoperator",
-      "program": "${workspaceFolder}/target/debug/testoperator",
-      "args": [
-        "run",
-        "evals",
-        "--ready-wait",
-        "180",
-        "--eval",
-        "tpch_nsql",
-        "--model",
-        "gpt-4o-mini",
-        "-p",
-        "./test/nsql_bench/spicepod.yaml",
-        "-d",
-        "./test/nsql_bench/data"
-      ],
-      "env": {},
-      "cwd": "${workspaceFolder}",
-      "preLaunchTask": "rust: cargo build testoperator"
-    },
-    {
-      "type": "lldb",
-      "request": "launch",
       "name": "Debug testoperator (Search)",
       "program": "${workspaceFolder}/target/debug/testoperator",
       "args": [

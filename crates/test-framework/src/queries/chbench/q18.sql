@@ -6,7 +6,7 @@ SELECT
     o_ol_cnt,
     sum(ol_amount) AS amount_sum
 FROM
-    customer, orders, order_line
+    customer, oorder, order_line
 WHERE
     c_id = o_c_id
     AND c_w_id = o_w_id

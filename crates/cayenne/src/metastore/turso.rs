@@ -17,8 +17,8 @@ limitations under the License.
 //! Turso implementation of the metastore backend.
 
 use super::{
-    ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreTransaction,
-    MetastoreValue, QueryParams, QueryRowParams, duplicate_delete_file_index_error_message,
+    ExecuteParams, MetastoreBackend, MetastoreRow, MetastoreTransaction, MetastoreValue,
+    QueryParams, QueryRowParams, duplicate_delete_file_index_error_message,
 };
 use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
@@ -324,79 +324,90 @@ impl TursoMetastore {
     const INLINED_DELETE_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_delete_table_seq ON cayenne_inlined_delete(table_id, sequence_number)";
 }
 
-/// Turso row wrapper implementing `MetastoreRow`.
-struct TursoRow {
-    values: Vec<MetastoreValue>,
+/// Borrowed view of a `turso::Row` implementing `MetastoreRow`. Typed
+/// accessors take ownership of the value returned by `get_value` directly,
+/// avoiding the per-row `Vec<MetastoreValue>` materialization plus the
+/// redundant Text/Blob clone the conversion-then-extract path paid. See
+/// `metastore_operations::query_batch` (`Turso` vs `SQLite` gap).
+struct TursoRow<'a> {
+    inner: &'a turso::Row,
 }
 
-impl MetastoreRow for TursoRow {
+impl TursoRow<'_> {
+    fn raw_value(&self, index: usize) -> CatalogResult<TursoValue> {
+        let count = self.inner.column_count();
+        if index >= count {
+            return Err(CatalogError::Database {
+                message: format!("Column index {index} out of bounds (column_count={count})"),
+            });
+        }
+        self.inner.get_value(index).map_err(convert_turso_error)
+    }
+}
+
+impl MetastoreRow for TursoRow<'_> {
     fn get_value(&self, index: usize) -> CatalogResult<MetastoreValue> {
-        self.values
-            .get(index)
-            .cloned()
-            .ok_or_else(|| CatalogError::Database {
-                message: format!("Column index {index} out of bounds"),
-            })
+        Ok(convert_turso_value(&self.raw_value(index)?))
     }
 
     fn get_i64(&self, index: usize) -> CatalogResult<i64> {
-        let value = self
-            .values
-            .get(index)
-            .ok_or_else(|| CatalogError::Database {
-                message: format!("Column index {index} out of bounds"),
-            })?;
-        i64::from_value(value)
+        match self.raw_value(index)? {
+            TursoValue::Integer(i) => Ok(i),
+            other => Err(CatalogError::Database {
+                message: format!("Expected integer at index {index}, found {other:?}"),
+            }),
+        }
     }
 
     fn get_string(&self, index: usize) -> CatalogResult<String> {
-        let value = self
-            .values
-            .get(index)
-            .ok_or_else(|| CatalogError::Database {
-                message: format!("Column index {index} out of bounds"),
-            })?;
-        String::from_value(value)
+        match self.raw_value(index)? {
+            TursoValue::Text(s) => Ok(s),
+            other => Err(CatalogError::Database {
+                message: format!("Expected text at index {index}, found {other:?}"),
+            }),
+        }
     }
 
     fn get_bool(&self, index: usize) -> CatalogResult<bool> {
-        let value = self
-            .values
-            .get(index)
-            .ok_or_else(|| CatalogError::Database {
-                message: format!("Column index {index} out of bounds"),
-            })?;
-        bool::from_value(value)
+        match self.raw_value(index)? {
+            TursoValue::Integer(i) => Ok(i != 0),
+            other => Err(CatalogError::Database {
+                message: format!(
+                    "Expected boolean (Integer 0/1) at index {index}, found {other:?}"
+                ),
+            }),
+        }
     }
 
     fn get_blob(&self, index: usize) -> CatalogResult<Vec<u8>> {
-        let value = self
-            .values
-            .get(index)
-            .ok_or_else(|| CatalogError::Database {
-                message: format!("Column index {index} out of bounds"),
-            })?;
-        Vec::<u8>::from_value(value)
+        match self.raw_value(index)? {
+            TursoValue::Blob(b) => Ok(b),
+            other => Err(CatalogError::Database {
+                message: format!("Expected blob at index {index}, found {other:?}"),
+            }),
+        }
     }
 
     fn get_optional_i64(&self, index: usize) -> CatalogResult<Option<i64>> {
-        let value = self
-            .values
-            .get(index)
-            .ok_or_else(|| CatalogError::Database {
-                message: format!("Column index {index} out of bounds"),
-            })?;
-        Option::<i64>::from_value(value)
+        // Real is treated as Null because the metastore schema never stores Real values;
+        // this mirrors the historic `convert_turso_value` mapping.
+        match self.raw_value(index)? {
+            TursoValue::Integer(i) => Ok(Some(i)),
+            TursoValue::Null | TursoValue::Real(_) => Ok(None),
+            other => Err(CatalogError::Database {
+                message: format!("Expected integer or null at index {index}, found {other:?}"),
+            }),
+        }
     }
 
     fn get_optional_string(&self, index: usize) -> CatalogResult<Option<String>> {
-        let value = self
-            .values
-            .get(index)
-            .ok_or_else(|| CatalogError::Database {
-                message: format!("Column index {index} out of bounds"),
-            })?;
-        Option::<String>::from_value(value)
+        match self.raw_value(index)? {
+            TursoValue::Text(s) => Ok(Some(s)),
+            TursoValue::Null | TursoValue::Real(_) => Ok(None),
+            other => Err(CatalogError::Database {
+                message: format!("Expected text or null at index {index}, found {other:?}"),
+            }),
+        }
     }
 }
 
@@ -614,16 +625,7 @@ impl MetastoreBackend for TursoMetastore {
             message: "Query returned no rows".to_string(),
         })?;
 
-        // Convert row values
-        let values: Vec<MetastoreValue> = (0..row.column_count())
-            .map(|i| {
-                row.get_value(i)
-                    .map(|v| convert_turso_value(&v))
-                    .unwrap_or(MetastoreValue::Null)
-            })
-            .collect();
-
-        let turso_row = TursoRow { values };
+        let turso_row = TursoRow { inner: &row };
         f(&turso_row)
     }
 
@@ -654,16 +656,7 @@ impl MetastoreBackend for TursoMetastore {
         loop {
             match rows.next().await {
                 Ok(Some(row)) => {
-                    // Convert row values
-                    let values: Vec<MetastoreValue> = (0..row.column_count())
-                        .map(|i| {
-                            row.get_value(i)
-                                .map(|v| convert_turso_value(&v))
-                                .unwrap_or(MetastoreValue::Null)
-                        })
-                        .collect();
-
-                    let turso_row = TursoRow { values };
+                    let turso_row = TursoRow { inner: &row };
                     results.push(f(&turso_row)?);
                 }
                 Ok(None) => break,
@@ -754,6 +747,38 @@ impl MetastoreTransaction for TursoTransaction {
             .map_err(convert_turso_error)?;
 
         Ok(())
+    }
+
+    async fn query_row_values(
+        &self,
+        params: QueryRowParams<'_>,
+    ) -> CatalogResult<Vec<MetastoreValue>> {
+        let conn = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Transaction already completed".to_string(),
+        })?;
+        let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
+
+        let mut stmt = conn
+            .prepare_cached(params.sql)
+            .await
+            .map_err(convert_turso_error)?;
+        let mut rows = stmt
+            .query(turso_params)
+            .await
+            .map_err(convert_turso_error)?;
+
+        let row = rows.next().await.map_err(convert_turso_error)?;
+        let row = row.ok_or_else(|| CatalogError::Database {
+            message: "Query returned no rows".to_string(),
+        })?;
+
+        (0..row.column_count())
+            .map(|i| {
+                row.get_value(i)
+                    .map(|v| convert_turso_value(&v))
+                    .map_err(convert_turso_error)
+            })
+            .collect::<CatalogResult<_>>()
     }
 
     async fn execute_batch(&self, sql: &str) -> CatalogResult<()> {

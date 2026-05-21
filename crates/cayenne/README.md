@@ -53,7 +53,7 @@ Cayenne provides a lakehouse format that enables efficient CRUD operations on co
 │  │  In-memory state                                      │   │
 │  │   listing_fence (RwLock) — read/write barrier         │   │
 │  │   listing_table (ArcSwap<ListingTable>)               │   │
-│  │   scan_listing_tables (cache, Mutex<HashMap>)         │   │
+│  │   scan_file_statistics (footer statistics cache)      │   │
 │  │   pk_deletion_strategy (ArcSwap<DeletionSnapshot>)    │   │
 │  │   protected_snapshots (RwLock<HashMap>)               │   │
 │  │   inlined_row_count (AtomicI64) — memtable size       │   │
@@ -122,9 +122,10 @@ pub trait MetadataCatalog: Send + Sync {
     async fn get_table(&self, table_name: &str) -> CatalogResult<TableMetadata>;
     async fn drop_table(&self, table_name: &str) -> CatalogResult<bool>;
 
-    // Sequence numbers
+    // Sequence numbers (reserve reduces round-trips on serialized backends)
     async fn increment_sequence_number(&self, table_id: &str) -> CatalogResult<i64>;
     async fn get_sequence_number(&self, table_id: &str) -> CatalogResult<i64>;
+    async fn reserve_sequence_numbers(&self, table_id: &str, count: u32) -> CatalogResult<i64>;
 
     // Delete files (position- and key-based)
     async fn add_delete_file(&self, delete_file: DeleteFile) -> CatalogResult<String>;
@@ -186,14 +187,14 @@ pub trait MetadataCatalog: Send + Sync {
 - **`InlinedDataStats`** — `{ total_rows, segment_count, total_bytes }` aggregated from `cayenne_inlined_data` for memtable-pressure decisions.
 - **`PartitionMetadata`** — composite partition key, partition path, record/byte counts.
 - **`TableStatistics`** — serialized `FileStatistics` blob plus `num_rows`; populated from Vortex file footers and read by the DataFusion planner.
-- **`VortexConfig`** — Vortex-side tuning. All fields configurable per dataset via `cayenne_*` runtime parameters:
+- **`VortexConfig`** — Vortex-side tuning. Most fields are configurable per dataset via `cayenne_*` runtime parameters. Footer metadata cache sizing is runtime-global and configured with `runtime.params.cayenne_footer_cache_mb`; when set, the configured value is stored in the metastore for compatibility validation during dataset registration. The runtime applies refresh-mode defaults before parsing explicit params: `refresh_mode: caching`, `changes`, and `append` with `refresh_check_interval <= 5m` favor small incremental writes, while manual/cron/long-interval append plus `refresh_mode: full`, `snapshot`, `disabled`, and unspecified refresh modes favor large Vortex writes by default. Append workloads can be small or large depending on caller batch size, so tune the inline and compaction parameters explicitly if refresh cadence does not reflect write size.
 
 ```rust
 pub struct VortexConfig {
     // Vortex caches and file shape
-    pub footer_cache_mb: usize,               // default 128 (currently ignored in 2.0.0-unstable)
-    pub segment_cache_mb: usize,              // default 256 (currently ignored in 2.0.0-unstable)
-    pub target_vortex_file_size_mb: usize,    // default 128
+    pub footer_cache_mb: Option<usize>,       // None unless runtime.params.cayenne_footer_cache_mb is set
+    pub segment_cache_mb: usize,              // default 256; configures the shared Vortex segment cache capacity
+    pub target_vortex_file_size_mb: usize,    // default 256
 
     // Encoding / sort
     pub sort_columns: Vec<String>,            // default []
@@ -204,20 +205,22 @@ pub struct VortexConfig {
     pub write_concurrency: Option<usize>,     // None = session target_partitions; forced to 1 if sort_columns set
 
     // Compaction
-    pub compaction_trigger_files: usize,      // default 8
+    pub compaction_trigger_files: usize,      // default caching/changes/short-append=4, otherwise=8
+    pub compaction_trigger_protected_snapshots: usize, // default caching/changes/short-append=4, otherwise=8
+    pub compaction_trigger_snapshot_age_ms: u64,  // default caching/changes/short-append=60_000, otherwise=300_000; 0 disables age trigger
     pub compaction_max_levels: usize,         // default 3
     pub compaction_max_files_per_pick: usize, // default 32
-    pub compaction_background_interval_ms: u64,  // default 30_000, 0 disables background loop
+    pub compaction_background_interval_ms: u64,  // default caching/changes/short-append=10_000, otherwise=30_000; 0 disables background loop
 
     // Inline-write admission (per-call gate)
-    pub inline_max_rows: usize,               // default 1_024
-    pub inline_max_bytes: usize,              // default 1_048_576 (1 MiB serialized IPC)
-    pub inline_max_buffer_bytes: usize,       // default 4_194_304 (4 MiB pre-decode buffer)
+    pub inline_max_rows: usize,               // default caching/changes/short-append=1_024, otherwise=0
+    pub inline_max_bytes: usize,              // default caching/changes/short-append=1_048_576, otherwise=0
+    pub inline_max_buffer_bytes: usize,       // default caching/changes/short-append=4_194_304, otherwise=0
 
     // Inline-memtable flush triggers (cumulative gate)
-    pub inline_flush_max_rows: i64,           // default 10_000
-    pub inline_flush_max_segments: i64,       // default 64
-    pub inline_flush_max_bytes: i64,          // default 8_388_608 (8 MiB total IPC)
+    pub inline_flush_max_rows: i64,           // default caching/changes/short-append=2_048, otherwise=10_000
+    pub inline_flush_max_segments: i64,       // default caching/changes/short-append=16, otherwise=64
+    pub inline_flush_max_bytes: i64,          // default caching/changes/short-append=2_097_152, otherwise=8_388_608
 
     // PK conflict detection
     pub pk_conflict_detection: PkConflictDetection,  // default Auto; None opts into blind append for CDC
@@ -255,10 +258,10 @@ pub struct CayenneTableProvider {
     table_metadata: TableMetadata,
     catalog: Arc<dyn MetadataCatalog>,
 
-    // Listing-table state
+    // Listing-table state and direct scan-planning cache
     listing_table: Arc<ArcSwap<ListingTable>>,        // legacy stats path
     listing_fence: Arc<tokio::sync::RwLock<()>>,      // read/write barrier
-    scan_listing_tables: Arc<ParkingMutex<HashMap<ScanListingTableKey, Arc<ListingTable>>>>,
+    scan_file_statistics: Arc<dyn FileStatisticsCache>,
     table_statistics: Arc<parking_lot::RwLock<Option<Statistics>>>,
 
     // Filters and conflict resolution

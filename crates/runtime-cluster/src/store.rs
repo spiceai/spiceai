@@ -225,7 +225,7 @@ impl PartitionStore {
     pub async fn set_unassigned_partitions(
         &self,
         table: &TableReference,
-        partition_values: Vec<HashMap<String, String>>,
+        partition_values: Vec<HashMap<String, Option<String>>>,
         partition_expressions: Vec<String>,
     ) -> Result<()> {
         let key = normalized_table_name(table);
@@ -664,7 +664,7 @@ mod tests {
     }
 
     fn partition_value(key: &str, val: &str) -> PartitionValue {
-        HashMap::from([(key.to_string(), val.to_string())])
+        HashMap::from([(key.to_string(), Some(val.to_string()))])
     }
 
     #[tokio::test]
@@ -702,7 +702,7 @@ mod tests {
             metadata
                 .partitions
                 .iter()
-                .find(|p| p.partition_value.get("bucket(3, id)") == Some(&val.to_string()))
+                .find(|p| p.partition_value.get("bucket(3, id)") == Some(&Some(val.to_string())))
                 .expect("partition not found")
         };
 
@@ -786,14 +786,14 @@ mod tests {
         let east = metadata
             .partitions
             .iter()
-            .find(|p| p.partition_value.get("region") == Some(&"us-east".to_string()))
+            .find(|p| p.partition_value.get("region") == Some(&Some("us-east".to_string())))
             .expect("us-east");
         assert!(east.is_assigned_to("executor-1"));
 
         let west = metadata
             .partitions
             .iter()
-            .find(|p| p.partition_value.get("region") == Some(&"us-west".to_string()))
+            .find(|p| p.partition_value.get("region") == Some(&Some("us-west".to_string())))
             .expect("us-west");
         assert!(west.is_assigned_to("executor-2"));
     }
@@ -830,12 +830,12 @@ mod tests {
             .await
             .expect("should initialize");
 
-        let pv = HashMap::from([("region".to_string(), "us-east-1".to_string())]);
+        let pv = HashMap::from([("region".to_string(), Some("us-east-1".to_string()))]);
         pm.set_unassigned_partitions(&source, vec![pv], vec![])
             .await
             .expect("should set partitions");
         let partition_value: PartitionValue =
-            HashMap::from([("region".to_string(), "us-east-1".to_string())]);
+            HashMap::from([("region".to_string(), Some("us-east-1".to_string()))]);
         pm.assign_partition(&source, &partition_value, "executor-1")
             .await
             .expect("should assign");
@@ -890,7 +890,7 @@ mod tests {
             .await
             .expect("should initialize target");
 
-        let pv = HashMap::from([("region".to_string(), "eu-west-1".to_string())]);
+        let pv = HashMap::from([("region".to_string(), Some("eu-west-1".to_string()))]);
         pm.set_unassigned_partitions(&source, vec![pv], vec![])
             .await
             .expect("should set partitions");
@@ -959,7 +959,7 @@ mod tests {
             .await
             .expect("should initialize");
 
-        let pv = HashMap::from([("org_id".to_string(), "test_org_name".to_string())]);
+        let pv = HashMap::from([("org_id".to_string(), Some("test_org_name".to_string()))]);
         pm.set_unassigned_partitions(&bare, vec![pv], vec![])
             .await
             .expect("should set partitions");
@@ -973,7 +973,7 @@ mod tests {
         assert_eq!(meta_via_full.partitions.len(), 1);
 
         let partition_value: PartitionValue =
-            HashMap::from([("org_id".to_string(), "test_org_name".to_string())]);
+            HashMap::from([("org_id".to_string(), Some("test_org_name".to_string()))]);
         pm.assign_partition(&full, &partition_value, "executor-1")
             .await
             .expect("should assign via fully qualified ref");
@@ -999,7 +999,7 @@ mod tests {
         acc.initialize_metadata(&table, vec!["region".to_string()])
             .await
             .expect("init");
-        let pv = HashMap::from([("region".to_string(), "us-east-1".to_string())]);
+        let pv = HashMap::from([("region".to_string(), Some("us-east-1".to_string()))]);
         acc.set_unassigned_partitions(&table, vec![pv.clone()], vec![])
             .await
             .expect("set");
@@ -1018,8 +1018,8 @@ mod tests {
         pm.initialize_metadata(&table, vec!["region".to_string()])
             .await
             .expect("init");
-        let values: Vec<HashMap<String, String>> = (0..50)
-            .map(|i| HashMap::from([("region".to_string(), format!("r-{i}"))]))
+        let values: Vec<HashMap<String, Option<String>>> = (0..50)
+            .map(|i| HashMap::from([("region".to_string(), Some(format!("r-{i}")))]))
             .collect();
         pm.set_unassigned_partitions(&table, values.clone(), vec![])
             .await

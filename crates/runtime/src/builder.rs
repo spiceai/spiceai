@@ -21,8 +21,12 @@ use crate::cluster::PartitionStore;
 use crate::cluster::ResolvedClusterConfig;
 use crate::cluster::SchedulerHeartbeatStore;
 use crate::cluster::partition::service::PartitionService;
+#[cfg(not(windows))]
+use crate::component::dataset::acceleration::Engine;
 use crate::config::ClusterRole;
 use crate::config::Config;
+#[cfg(not(windows))]
+use crate::dataaccelerator::cayenne::CayenneAccelerator;
 use crate::datafusion::udf::register_udfs;
 use crate::metrics_reader::MetricsReader;
 use crate::{
@@ -50,6 +54,8 @@ use tokio::sync::{Mutex, RwLock};
 use util::{in_tracing_context, in_tracing_context_async};
 
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
+
+const CAYENNE_FOOTER_CACHE_MB_PARAM: &str = "cayenne_footer_cache_mb";
 
 pub struct RuntimeBuilder {
     app: Option<Arc<app::App>>,
@@ -242,6 +248,22 @@ impl RuntimeBuilder {
             &spicepod_rt.params,
             "cayenne_sort_merge_memory_pool_fraction",
         );
+        let cayenne_footer_cache_mb =
+            parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_FOOTER_CACHE_MB_PARAM);
+        let cayenne_filter_propagation_enabled =
+            parse_cayenne_filter_propagation(&spicepod_rt.params).is_enabled();
+
+        #[cfg(not(windows))]
+        if cayenne_footer_cache_mb.is_some() {
+            self.accelerator_engine_registry
+                .register_accelerator_engine(
+                    Engine::Cayenne,
+                    Arc::new(CayenneAccelerator::with_footer_cache_mb(
+                        cayenne_footer_cache_mb,
+                    )),
+                )
+                .await;
+        }
 
         let caching = Runtime::init_caching(Some(&spicepod_rt.caching));
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
@@ -389,7 +411,9 @@ impl RuntimeBuilder {
         .with_resource_monitor(resource_monitor.clone())
         .with_url_tables(url_tables_enabled)
         .cayenne_sort_merge_min_rows(cayenne_sort_merge_min_rows)
-        .cayenne_sort_merge_memory_pool_fraction(cayenne_sort_merge_memory_pool_fraction);
+        .cayenne_sort_merge_memory_pool_fraction(cayenne_sort_merge_memory_pool_fraction)
+        .cayenne_footer_cache_mb(cayenne_footer_cache_mb)
+        .cayenne_filter_propagation_enabled(cayenne_filter_propagation_enabled);
 
         if let Some(DistributedNode::Scheduler {
             executor_registry,
@@ -672,6 +696,37 @@ fn parse_f64_runtime_param(params: &HashMap<String, String>, key: &str) -> Optio
     }
 }
 
+const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CayenneFilterPropagation {
+    Disabled,
+    Enabled,
+}
+
+impl CayenneFilterPropagation {
+    fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+fn parse_cayenne_filter_propagation(params: &HashMap<String, String>) -> CayenneFilterPropagation {
+    let Some(raw) = params.get(CAYENNE_FILTER_PROPAGATION_PARAM) else {
+        return CayenneFilterPropagation::Disabled;
+    };
+
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "enabled" => CayenneFilterPropagation::Enabled,
+        "disabled" => CayenneFilterPropagation::Disabled,
+        _ => {
+            tracing::warn!(
+                "runtime.params.{CAYENNE_FILTER_PROPAGATION_PARAM}={raw:?} must be 'enabled' or 'disabled'; using disabled"
+            );
+            CayenneFilterPropagation::Disabled
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -759,5 +814,36 @@ mod test {
         assert_eq!(parse_f64_runtime_param(&params, "nan"), None);
         assert_eq!(parse_f64_runtime_param(&params, "bad"), None);
         assert_eq!(parse_f64_runtime_param(&params, "missing"), None);
+    }
+
+    #[test]
+    fn test_parse_cayenne_filter_propagation() {
+        let params = HashMap::from([(
+            CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
+            "enabled".to_string(),
+        )]);
+
+        assert_eq!(
+            parse_cayenne_filter_propagation(&params),
+            CayenneFilterPropagation::Enabled
+        );
+        assert_eq!(
+            parse_cayenne_filter_propagation(&HashMap::from([(
+                CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
+                "disabled".to_string(),
+            )])),
+            CayenneFilterPropagation::Disabled
+        );
+        assert_eq!(
+            parse_cayenne_filter_propagation(&HashMap::from([(
+                CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
+                "true".to_string(),
+            )])),
+            CayenneFilterPropagation::Disabled
+        );
+        assert_eq!(
+            parse_cayenne_filter_propagation(&HashMap::new()),
+            CayenneFilterPropagation::Disabled
+        );
     }
 }

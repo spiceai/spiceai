@@ -41,11 +41,9 @@ limitations under the License.
 //! - the table has any on-conflict deletions
 //! - the table has `sort_columns` configured
 //! - the table is partitioned
-//! - the table has write-time retention delete filters
 //!
 //! Those paths can't be safely deferred to Stage B because they require holding
-//! state (deletion vectors, sort order, retention pruning) until the visibility
-//! flip is durable.
+//! state (deletion vectors, sort order) until the visibility flip is durable.
 //!
 //! ## Inline-memtable admission
 //!
@@ -64,6 +62,7 @@ limitations under the License.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -80,6 +79,7 @@ use super::context::CayenneContext;
 use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 use super::table::{
     CayenneCdcWrite, CayenneTableProvider, ColumnStatsAccumulator, PostValidationState,
+    record_cayenne_write_phase,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,10 +225,14 @@ impl<'a> AppendMutationWriter<'a> {
         let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
         let mut prepared_stream = prepared.stream;
 
+        // Retention used to block the pipelined path because it ran inline
+        // under `write_lock`. Now that retention is scheduled via
+        // `PostWriteMaintenance`, the pipelined path can run for retention-
+        // configured tables — the bg scheduler picks up the retention request
+        // after publish (see `CayenneCdcWrite::finish`).
         let can_stage_for_pipeline = !pending_pk_deletions
             && !may_have_on_conflict_deletions
-            && self.table.metadata().partition_column.is_none()
-            && !self.table.has_retention_delete_filters();
+            && self.table.metadata().partition_column.is_none();
 
         if !can_stage_for_pipeline {
             let _write_guard = write_guard;
@@ -391,15 +395,20 @@ impl<'a> AppendMutationWriter<'a> {
             (rows, stats_acc, validated_keys)
         };
 
-        let retention_deleted_rows = self.apply_retention_if_configured().await?;
+        let retention_requested = self.table.has_retention_delete_filters();
 
         self.table.schedule_post_write_maintenance(
             Some(write_stats_acc),
-            needs_new_snapshot
-                || should_refresh_listing_table_after_post_write(retention_deleted_rows),
+            needs_new_snapshot,
+            retention_requested,
         );
 
-        if retention_deleted_rows > 0 {
+        if retention_requested {
+            // Retention runs asynchronously after this write returns; its delete
+            // outcome is not yet known. Clearing the cache is the conservative
+            // path — any subsequent insert pays one fresh disk-scan to rebuild
+            // (vs the existing pre-fix logic, which read the inline delete
+            // count and cleared only when retention had actually deleted rows).
             self.table.clear_cached_pk_keyset();
         } else {
             self.table.record_file_pk_keys(&validated_keys);
@@ -419,6 +428,7 @@ impl<'a> AppendMutationWriter<'a> {
     )> {
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let target_size_bytes = self.context.target_file_size_bytes();
+        let write_start = Instant::now();
         let (rows, writer_ops, stats_acc) = self
             .table
             .write_to_snapshot(
@@ -428,6 +438,7 @@ impl<'a> AppendMutationWriter<'a> {
                 self.task_context.session_config().target_partitions(),
             )
             .await?;
+        record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
 
         tracing::debug!(
             "Insert to deferred-validation snapshot {} completed, wrote {} rows to Vortex in {} writer operation(s)",
@@ -441,10 +452,17 @@ impl<'a> AppendMutationWriter<'a> {
             validated_keys,
         } = take_post_validation(post_validation);
 
+        let deletion_start = Instant::now();
         self.table
             .apply_on_conflict_deletions(on_conflict_deletions)
             .await?;
+        record_cayenne_write_phase(
+            self.table.table_name(),
+            "apply_on_conflict_deletions",
+            deletion_start,
+        );
 
+        let publish_start = Instant::now();
         let new_sequence = self
             .table
             .catalog()
@@ -454,6 +472,7 @@ impl<'a> AppendMutationWriter<'a> {
         self.table
             .publish_written_snapshot_with_sequence(&new_snapshot_id, new_sequence)
             .await?;
+        record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
 
         Ok((rows, stats_acc, validated_keys))
     }
@@ -503,7 +522,7 @@ impl<'a> AppendMutationWriter<'a> {
                 }
 
                 self.table
-                    .schedule_post_write_maintenance(Some(Arc::new(stats_acc)), false);
+                    .schedule_post_write_maintenance(Some(Arc::new(stats_acc)), false, false);
 
                 self.table
                     .schedule_inline_checkpoint_if_memtable_pressure_exceeded();
@@ -539,6 +558,7 @@ impl<'a> AppendMutationWriter<'a> {
             .staging_may_have_files()
             .store(true, Ordering::Release);
 
+        let write_start = Instant::now();
         let result = match self
             .table
             .write_to_snapshot(
@@ -564,6 +584,7 @@ impl<'a> AppendMutationWriter<'a> {
                 return Err(e);
             }
         };
+        record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
 
         let staged_append = CayenneStagedAppend::from_staged_append_in(
             self.table.clone_for_write_operations(),
@@ -571,7 +592,9 @@ impl<'a> AppendMutationWriter<'a> {
             staging_snapshot_id,
             result.0,
         );
+        let publish_start = Instant::now();
         staged_append.finalize_staged_write().await?;
+        record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
 
         Ok(result)
     }
@@ -592,6 +615,7 @@ impl<'a> AppendMutationWriter<'a> {
             .staging_may_have_files()
             .store(true, Ordering::Release);
 
+        let write_start = Instant::now();
         let (rows, writer_ops, stats_acc) = match self
             .table
             .write_to_snapshot(
@@ -617,6 +641,7 @@ impl<'a> AppendMutationWriter<'a> {
                 return Err(e);
             }
         };
+        record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
 
         let staged_append = CayenneStagedAppend::from_staged_append_in(
             self.table.clone_for_write_operations(),
@@ -624,6 +649,7 @@ impl<'a> AppendMutationWriter<'a> {
             staging_snapshot_id.clone(),
             rows,
         );
+        let prepare_start = Instant::now();
         let prepared_append = match staged_append.prepare().await {
             Ok(prepared_append) => prepared_append,
             Err(e) => {
@@ -640,34 +666,10 @@ impl<'a> AppendMutationWriter<'a> {
                 return Err(e);
             }
         };
+        record_cayenne_write_phase(self.table.table_name(), "stage_wal_prepare", prepare_start);
 
         Ok((rows, writer_ops, stats_acc, prepared_append))
     }
-
-    async fn apply_retention_if_configured(&self) -> Result<u64> {
-        if !self.table.has_retention_delete_filters() {
-            return Ok(0);
-        }
-
-        let deleted = self.table.apply_retention_filters().await?;
-        if deleted > 0 {
-            tracing::info!(
-                "Retention filters deleted {} row(s) for table {}",
-                deleted,
-                self.table.table_name()
-            );
-        } else {
-            tracing::debug!(
-                "Retention filters found no rows to delete for table {}",
-                self.table.table_name()
-            );
-        }
-        Ok(deleted)
-    }
-}
-
-fn should_refresh_listing_table_after_post_write(retention_deleted_rows: u64) -> bool {
-    retention_deleted_rows > 0
 }
 
 #[cfg(test)]
@@ -744,11 +746,5 @@ mod tests {
         buffer.push(batch);
 
         assert!(!buffer.should_continue_buffering());
-    }
-
-    #[test]
-    fn refresh_listing_table_only_when_post_write_steps_changed_files() {
-        assert!(!should_refresh_listing_table_after_post_write(0));
-        assert!(should_refresh_listing_table_after_post_write(1));
     }
 }

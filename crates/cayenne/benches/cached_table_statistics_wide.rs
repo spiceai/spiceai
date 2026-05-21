@@ -239,10 +239,42 @@ fn bench_top_level_only(c: &mut Criterion) {
     group.finish();
 }
 
+/// Models the proposed memoised path: the cache stores
+/// `Arc<Statistics>` for both the no-overlay and the overlay-active form.
+/// The hot path picks the right Arc and pays a single `(*arc).clone()`.
+///
+/// Wall time is the same `Vec<ColumnStatistics>` deep clone as
+/// `bench_full_clone_no_overlay`, but the per-call `statistics_to_inexact`
+/// walk is amortised to a one-shot cost paid at cache rebuild — moved
+/// outside the scan hot path.
+///
+/// The headroom this exposes vs `bench_full_clone_with_overlay` is the
+/// proposed win at 200-256-column overlay-active scans:
+/// `with_overlay - memoised_arc_clone`.
+fn bench_memoised_arc_clone_with_overlay(c: &mut Criterion) {
+    use std::sync::Arc;
+    let mut group = c.benchmark_group("cached_table_statistics_memoised_arc_clone_with_overlay");
+    for &n in COLUMN_COUNTS {
+        let raw_stats = build_stats(n);
+        // Memoise the inexact transform once at cache-build time.
+        let pre_clean: Arc<Statistics> = Arc::new(statistics_to_inexact(raw_stats));
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| {
+                // Per-scan hot path under the proposed memoised cache.
+                let cloned: Statistics = (*pre_clean).clone();
+                black_box(cloned);
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_full_clone_no_overlay,
     bench_full_clone_with_overlay,
     bench_top_level_only,
+    bench_memoised_arc_clone_with_overlay,
 );
 criterion_main!(benches);

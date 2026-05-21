@@ -39,7 +39,7 @@ use crate::context::PartitionExprResolver;
 /// {"date": "2024-01-01", "region": "us-west"}
 /// {"date": "2024-01-02", "region": "us-east"}
 /// ```
-pub type PartitionValue = HashMap<String, String>;
+pub type PartitionValue = HashMap<String, Option<String>>;
 
 /// Metadata for a single partition of an accelerated table
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,7 +56,7 @@ pub struct PartitionMetadata {
 
 impl PartitionMetadata {
     #[must_use]
-    pub fn new(partition_value: HashMap<String, String>) -> Self {
+    pub fn new(partition_value: HashMap<String, Option<String>>) -> Self {
         Self {
             partition_value,
             assigned_executors: Vec::new(),
@@ -99,7 +99,10 @@ pub async fn partition_value_to_bytes(
     let mut expr: Option<Expr> = None;
     for (partition_expr, val) in p {
         let partition_by = resolver.try_parse_expr(tbl, &partition_expr).await?;
-        let e = partition_by.eq(lit(val));
+        let e = match val {
+            None => partition_by.is_null(),
+            Some(v) => partition_by.eq(lit(v)),
+        };
         expr = match expr {
             Some(existing) => Some(existing.and(e)),
             None => Some(e),
@@ -179,17 +182,21 @@ impl TablePartitionMetadata {
             //   key1 = val1 AND key2 = val2 AND ...
             let partition_predicate = partition_value
                 .iter()
-                .map(|(proj, lit)| {
-                    // Ensure lit is same type as proj
+                .map(|(proj, val)| {
                     let col = ctx.parse_sql_expr(proj, &df_schema)?;
+                    let Some(val) = val else {
+                        // NULL partition values need IS NULL, not = NULL
+                        // (SQL: `col = NULL` is always UNKNOWN, never TRUE)
+                        return Ok(col.is_null());
+                    };
                     let col_type = col.get_type(&df_schema)?;
-                    let mut lit = ctx.parse_sql_expr(lit, &df_schema)?;
-                    if let Expr::Literal(ref s, None) = lit
+                    let mut lit_expr = ctx.parse_sql_expr(val, &df_schema)?;
+                    if let Expr::Literal(ref s, None) = lit_expr
                         && s.data_type() != col_type
                     {
-                        lit = lit.cast_to(&col_type, &df_schema)?;
+                        lit_expr = lit_expr.cast_to(&col_type, &df_schema)?;
                     }
-                    Ok(col.eq(lit))
+                    Ok(col.eq(lit_expr))
                 })
                 .collect::<Result<Vec<Expr>, DataFusionError>>()?
                 .into_iter()
