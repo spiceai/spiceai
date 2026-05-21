@@ -208,7 +208,16 @@ impl PartitionTableProvider {
             })
             .collect();
 
-        let partitions = Arc::new(RwLock::new(partitions?));
+        let partitions = partitions?;
+
+        // Prefer the actual engine schema from existing partitions over the source schema.
+        let schema = partitions
+            .values()
+            .next()
+            .map(|p| p.table_provider.schema())
+            .unwrap_or(schema);
+
+        let partitions = Arc::new(RwLock::new(partitions));
 
         Ok(Self {
             creator,
