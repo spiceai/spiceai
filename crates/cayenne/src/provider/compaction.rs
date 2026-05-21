@@ -154,8 +154,12 @@ pub(crate) fn pick_candidates<P: Clone>(
     files: impl IntoIterator<Item = FileEntry<P>>,
     cfg: &CompactionPickerConfig,
 ) -> Option<CompactionCandidate<P>> {
-    let mut small = Vec::new();
-    let mut mid = Vec::new();
+    let files = files.into_iter();
+    // Reserve based on the iterator's size_hint so the buckets do not
+    // re-allocate as they grow when the caller knows the total file count.
+    let hint = files.size_hint().0;
+    let mut small = Vec::with_capacity(hint);
+    let mut mid = Vec::with_capacity(hint);
 
     for entry in files {
         match Tier::classify(entry.size_bytes, &cfg.tiers) {
@@ -199,8 +203,14 @@ fn pick_from_bucket<P: Clone>(
         return None;
     }
 
-    bucket.sort_by_key(|entry| entry.size_bytes);
+    // We only need the K smallest entries — `select_nth_unstable_by_key` runs
+    // in O(N) expected time vs O(N log N) for a full sort, and the candidate
+    // downstream consumers (path collection + byte sum) don't depend on
+    // ordering within the picked set. See `compaction_picker` bench.
     let max_pick = cfg.max_files_per_pick.min(bucket.len());
+    if max_pick < bucket.len() {
+        let _ = bucket.select_nth_unstable_by_key(max_pick, |entry| entry.size_bytes);
+    }
     let picked = &bucket[..max_pick];
     let picked_bytes: u64 = picked.iter().map(|entry| entry.size_bytes).sum();
     let paths = picked.iter().map(|entry| entry.path.clone()).collect();

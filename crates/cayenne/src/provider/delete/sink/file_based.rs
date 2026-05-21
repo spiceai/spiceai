@@ -46,7 +46,6 @@ use datafusion_catalog::TableProvider;
 use datafusion_common::ScalarValue;
 use datafusion_expr::Expr;
 use object_store::{ObjectMeta, ObjectStore};
-use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
@@ -101,7 +100,7 @@ pub struct FileBasedDeletionSink {
     /// Metadata catalog for clearing snapshot sequence records.
     catalog: Arc<dyn MetadataCatalog>,
     /// In-memory protected snapshots map (shared with `CayenneTableProvider`).
-    protected_snapshots: Arc<RwLock<HashMap<String, i64>>>,
+    protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
     /// Table ID for catalog operations.
     table_id: String,
     /// Table base path for constructing snapshot directory paths.
@@ -141,7 +140,7 @@ impl FileBasedDeletionSink {
         filter: Expr,
         table_name: String,
         catalog: Arc<dyn MetadataCatalog>,
-        protected_snapshots: Arc<RwLock<HashMap<String, i64>>>,
+        protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
         table_id: String,
         table_path: String,
         runtime_env: Arc<RuntimeEnv>,
@@ -464,8 +463,12 @@ impl FileBasedDeletionSink {
                 continue;
             }
 
-            // 2. Remove from in-memory map
-            self.protected_snapshots.write().remove(snapshot_id);
+            // 2. Remove from in-memory map (copy-on-write atomic publish)
+            self.protected_snapshots.rcu(|current| {
+                let mut new_map = (**current).clone();
+                new_map.remove(snapshot_id);
+                Arc::new(new_map)
+            });
 
             // 3. Delete the empty snapshot directory
             let snapshot_dir = std::path::PathBuf::from(&self.table_path)

@@ -519,6 +519,10 @@ impl CayenneDeletionSink {
 
         let mut matching_positions: Vec<u64> = Vec::new();
         let mut row_position: u64 = 0;
+        // Resolved on the first chunk and reused across the stream — schema is
+        // stable per file, so the per-chunk `index_of` lookups become wasted
+        // work as files grow past one chunk.
+        let mut key_indices: Option<Vec<usize>> = None;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result.map_err(|e| Error::Vortex {
@@ -548,21 +552,27 @@ impl CayenneDeletionSink {
                 })?;
             let batch = arrow::record_batch::RecordBatch::from(struct_array);
 
-            // Resolve key column indices (once per chunk — schema is stable across chunks).
-            let key_indices: Vec<usize> = key_columns
-                .iter()
-                .map(|col_name| {
-                    batch
-                        .schema()
-                        .index_of(col_name)
-                        .map_err(|_| Error::Internal {
-                            table: table_name.clone(),
-                            message: format!(
-                                "Key column '{col_name}' not found in Vortex file schema"
-                            ),
-                        })
-                })
-                .collect::<crate::provider::Result<Vec<_>>>()?;
+            let key_indices: &[usize] = if let Some(indices) = &key_indices {
+                indices.as_slice()
+            } else {
+                let resolved: Vec<usize> = key_columns
+                    .iter()
+                    .map(|col_name| {
+                        batch
+                            .schema()
+                            .index_of(col_name)
+                            .map_err(|_| Error::Internal {
+                                table: table_name.clone(),
+                                message: format!(
+                                    "Key column '{col_name}' not found in Vortex file schema"
+                                ),
+                            })
+                    })
+                    .collect::<crate::provider::Result<Vec<_>>>()?;
+                key_indices = Some(resolved);
+                // SAFETY: we just assigned `Some` above
+                key_indices.as_deref().unwrap_or(&[])
+            };
 
             for row_idx in 0..batch.num_rows() {
                 let key: Vec<datafusion_common::ScalarValue> = key_indices
@@ -695,8 +705,10 @@ impl CayenneDeletionSink {
                 });
             updated_bitmap.extend(unique_new_row_ids.iter().copied());
 
+            // RoaringBitmap::iter yields strictly-increasing values, so the writer
+            // can skip its sort/dedup pass — see `position_delete_redundant_walks` bench.
             let combined_ids: Vec<u64> = updated_bitmap.iter().map(u64::from).collect();
-            specs.push(DeletionVectorWriteSpec::new_position_based(
+            specs.push(DeletionVectorWriteSpec::new_position_based_sorted(
                 file_path.clone(),
                 combined_ids,
             ));
