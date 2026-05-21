@@ -2941,7 +2941,7 @@ async fn test_bucket_partition_expr_filter_plan_snapshot() -> Result<(), Box<dyn
 }
 
 /// A partition creator that returns partitions with a different schema than the source schema,
-/// simulating how DuckDB downgrades types (e.g. Timestamp(ns) -> Timestamp(µs)).
+/// simulating how `DuckDB` downgrades types (e.g. Timestamp(ns) -> Timestamp(µs)).
 #[derive(Debug)]
 struct SchemaTransformingCreator {
     #[expect(dead_code)]
@@ -3038,9 +3038,9 @@ impl PartitionCreator for SchemaTransformingCreator {
     }
 }
 
-/// Tests that PartitionTableProvider advertises the actual engine schema (from partitions)
+/// Tests that `PartitionTableProvider` advertises the actual engine schema (from partitions)
 /// rather than the source schema passed at construction time.
-/// This simulates DuckDB's type downgrading: Timestamp(ns, "UTC") -> Timestamp(µs, "UTC").
+/// This simulates `DuckDB`'s type downgrading: Timestamp(ns, "UTC") -> Timestamp(µs, "UTC").
 #[tokio::test]
 async fn test_partition_schema_uses_engine_schema() -> Result<(), Box<dyn std::error::Error>> {
     // Source schema with Timestamp(ns) - what the federated source provides
