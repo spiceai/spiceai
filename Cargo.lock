@@ -16121,6 +16121,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "bytes",
+ "dashmap",
  "data_components",
  "datafusion",
  "datafusion-expr",
