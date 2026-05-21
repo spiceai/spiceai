@@ -1362,7 +1362,8 @@ pub async fn initialize_cluster_executor(
         let rt = Arc::clone(&partition_update_handler_rt);
         Box::pin(async move {
             rt.update_partition_assignments(new_partitions, removed_partitions)
-                .await;
+                .await
+                .map_err(|e| e.to_string())
         })
     }));
 

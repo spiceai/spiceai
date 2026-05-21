@@ -238,6 +238,12 @@ pub enum Error {
     #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]
     UnableToLoadDataConnectorSecrets { data_connector: String },
 
+    #[snafu(display("Unable to update cluster partition filters for table {table}: {source}"))]
+    UnableToUpdateClusterPartitionFilters {
+        table: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Unable to get secret for data connector {data_connector}: {source}"))]
     UnableToGetSecretForDataConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -715,7 +721,7 @@ impl Runtime {
         &self,
         new_partitions: HashMap<String, Vec<Vec<u8>>>,
         removed_partitions: HashMap<String, Vec<Vec<u8>>>,
-    ) {
+    ) -> Result<()> {
         if let Some(DistributedNode::Executor {
             partition_assignments,
         }) = self.distributed.as_ref()
@@ -775,22 +781,25 @@ impl Runtime {
                 assignments_guard.clone()
             };
 
-            // Update all affected tables
+            // Update all affected tables. If any fails, propagate the first
+            // error so the executor can ack the scheduler with a real reason —
+            // the scheduler can then retry the assignment later.
             for table_name in affected_tables {
                 let resolved = TableReference::parse_str(table_name)
                     .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
 
-                if let Err(e) = self
-                    .update_partition_refresh_sql(resolved.clone(), &assignments)
-                    .await
-                {
-                    tracing::warn!("Failed to update partition refresh SQL for {table_name}: {e}");
-                }
+                self.update_partition_refresh_sql(resolved.clone(), &assignments)
+                    .await?;
             }
+            Ok(())
         } else {
             tracing::warn!(
                 "Attempted to update partition assignments on a non-executor node. Ignoring."
             );
+            // Not an executor — there's nothing for us to apply. Report success
+            // so the scheduler doesn't retry; the routing layer is what'd be
+            // misconfigured here.
+            Ok(())
         }
     }
 
@@ -807,20 +816,22 @@ impl Runtime {
             Arc::<str>::clone(&table.schema),
             Arc::<str>::clone(&table.table),
         );
-        if let Err(e) = self
-            .datafusion()
+        // Propagate the filter-update error so the caller (and the executor's
+        // ack to the scheduler) sees the failure rather than just logging it.
+        self.datafusion()
             .update_partition_filters(table_ref.clone(), partition_filters)
             .await
-        {
-            tracing::error!("Failed to update partition filters for {table}: {e}");
-        } else {
-            tracing::info!("Updated partition assignments for {table}");
-            // Trigger a refresh to load the data for the new partitions
-            if let Err(e) = self.datafusion().refresh_table(&table_ref, None).await {
-                tracing::warn!(
-                    "Failed to trigger refresh for {table} after updating partitions: {e}"
-                );
-            }
+            .map_err(|source| Error::UnableToUpdateClusterPartitionFilters {
+                table: table.to_string(),
+                source: Box::new(source),
+            })?;
+
+        tracing::info!("Updated partition assignments for {table}");
+        // Trigger a refresh to load the data for the new partitions. Refresh
+        // failures are non-fatal — the assignment is still valid; data just
+        // hasn't been pulled yet.
+        if let Err(e) = self.datafusion().refresh_table(&table_ref, None).await {
+            tracing::warn!("Failed to trigger refresh for {table} after updating partitions: {e}");
         }
 
         Ok(())
