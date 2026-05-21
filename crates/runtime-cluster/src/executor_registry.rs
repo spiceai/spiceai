@@ -31,9 +31,9 @@ use flight_client::cookie::CookieStore;
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;
 use runtime_proto::{MetricsRequest, MetricsResponse, SchedulerControlMessage};
 use snafu::prelude::*;
-use tokio::sync::{RwLock, mpsc, oneshot};
-use uuid::Uuid;
+use tokio::sync::{RwLock, mpsc};
 
+use crate::correlated::{CorrelatedResponses, CorrelationError, send_correlated};
 use crate::{PartitionStore, PartitionValue, executor_selection};
 
 /// Error type for executor registry operations.
@@ -54,10 +54,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Represents a single executor's control stream connection.
 #[derive(Debug)]
 pub struct ExecutorConnection {
-    /// Channel to send control messages to this executor
+    /// Channel to send control messages to this executor.
     request_tx: mpsc::Sender<SchedulerControlMessage>,
-    /// Pending metrics requests awaiting responses
-    pending_requests: Arc<RwLock<HashMap<String, oneshot::Sender<MetricsResponse>>>>,
+    /// Pending metrics requests awaiting responses, keyed by `request_id`.
+    pending_metrics: CorrelatedResponses<MetricsResponse>,
 }
 
 impl ExecutorConnection {
@@ -66,51 +66,44 @@ impl ExecutorConnection {
     pub fn new(request_tx: mpsc::Sender<SchedulerControlMessage>) -> Self {
         Self {
             request_tx,
-            pending_requests: Arc::new(RwLock::new(HashMap::new())),
+            pending_metrics: CorrelatedResponses::new(),
         }
     }
 
-    /// Returns a clone of the pending requests map for handling responses.
+    /// Returns a cheap clone of the pending-metrics registry. Used by the
+    /// control-stream inbound handler to deliver `MetricsResponse` messages.
     #[must_use]
-    pub fn pending_requests(
-        &self,
-    ) -> Arc<RwLock<HashMap<String, oneshot::Sender<MetricsResponse>>>> {
-        Arc::clone(&self.pending_requests)
+    pub fn pending_metrics(&self) -> CorrelatedResponses<MetricsResponse> {
+        self.pending_metrics.clone()
     }
 
     /// Sends a metrics request to this executor and waits for the response.
     async fn request_metrics(&self, executor_id: &str) -> Result<MetricsResponse> {
-        let request_id = Uuid::new_v4().to_string();
-        let (response_tx, response_rx) = oneshot::channel();
-
-        // Register the pending request
-        {
-            let mut pending = self.pending_requests.write().await;
-            pending.insert(request_id.clone(), response_tx);
-        }
-
-        // Send the metrics request
-        let message = SchedulerControlMessage {
-            message: Some(
-                runtime_proto::scheduler_control_message::Message::RequestMetrics(MetricsRequest {
-                    request_id: request_id.clone(),
-                }),
-            ),
-        };
-
-        if self.request_tx.send(message).await.is_err() {
-            // Clean up the pending request on send failure
-            let mut pending = self.pending_requests.write().await;
-            pending.remove(&request_id);
-            return Err(Error::SendFailed {
+        send_correlated(
+            &self.request_tx,
+            &self.pending_metrics,
+            |request_id| SchedulerControlMessage {
+                message: Some(
+                    runtime_proto::scheduler_control_message::Message::RequestMetrics(
+                        MetricsRequest { request_id },
+                    ),
+                ),
+            },
+            None,
+        )
+        .await
+        .map_err(|e| match e {
+            CorrelationError::SendFailed => Error::SendFailed {
                 executor_id: executor_id.to_string(),
-            });
-        }
-
-        // Wait for the response
-        response_rx.await.map_err(|_| Error::ReceiveFailed {
-            executor_id: executor_id.to_string(),
-            reason: "response channel closed".to_string(),
+            },
+            CorrelationError::Cancelled => Error::ReceiveFailed {
+                executor_id: executor_id.to_string(),
+                reason: "response channel closed".to_string(),
+            },
+            CorrelationError::Timeout { duration } => Error::ReceiveFailed {
+                executor_id: executor_id.to_string(),
+                reason: format!("timed out after {duration:?}"),
+            },
         })
     }
 }
@@ -241,9 +234,9 @@ impl ExecutorRegistry {
         &self,
         executor_id: String,
         request_tx: mpsc::Sender<SchedulerControlMessage>,
-    ) -> Arc<RwLock<HashMap<String, oneshot::Sender<MetricsResponse>>>> {
+    ) -> CorrelatedResponses<MetricsResponse> {
         let connection = ExecutorConnection::new(request_tx);
-        let pending_requests = connection.pending_requests();
+        let pending_metrics = connection.pending_metrics();
 
         let mut connections = self.connections.write().await;
         if connections.contains_key(&executor_id) {
@@ -253,7 +246,7 @@ impl ExecutorRegistry {
         }
         connections.insert(executor_id, connection);
 
-        pending_requests
+        pending_metrics
     }
 
     /// Unregisters an executor and removes it from all three tracking maps.
@@ -381,12 +374,12 @@ impl ExecutorRegistry {
         for (executor_id, connection) in connections.iter() {
             let executor_id = executor_id.clone();
             let request_tx = connection.request_tx.clone();
-            let pending_requests = connection.pending_requests();
+            let pending_metrics = connection.pending_metrics();
 
             handles.push(tokio::spawn(async move {
                 let temp_connection = ExecutorConnection {
                     request_tx,
-                    pending_requests,
+                    pending_metrics,
                 };
                 let result = temp_connection.request_metrics(&executor_id).await;
                 (executor_id, result)

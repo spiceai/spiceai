@@ -526,7 +526,7 @@ impl ClusterService for ClusterServiceImpl {
             };
 
             // Register the executor with the registry.
-            let pending_requests = executor_registry
+            let pending_metrics = executor_registry
                 .register(executor_id.clone(), outbound_tx_for_registry)
                 .await;
 
@@ -547,12 +547,12 @@ impl ClusterService for ClusterServiceImpl {
                         match result {
                             Some(Ok(msg)) => {
                                 if let Some(message) = msg.message {
-                                    // Handle metrics responses by completing pending requests.
+                                    // Route correlated responses (metrics) to their waiters;
+                                    // anything else goes to the general handler.
                                     if let ExecutorMessage::Metrics(response) = &message {
-                                        let mut pending = pending_requests.write().await;
-                                        if let Some(sender) = pending.remove(&response.request_id) {
-                                            let _ = sender.send(response.clone());
-                                        } else {
+                                        if !pending_metrics
+                                            .deliver(&response.request_id, response.clone())
+                                        {
                                             tracing::warn!(
                                                 "Received metrics response for unknown request_id: {}",
                                                 response.request_id
