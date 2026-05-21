@@ -168,19 +168,19 @@ impl ExecutionPlan for UdtfExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![]
+        vec![Distribution::UnspecifiedDistribution]
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
-        vec![]
+        vec![None]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
-        vec![]
+        vec![true]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![]
+        vec![false]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -475,5 +475,54 @@ impl ExecutionPlan for PlaceholderExec {
         _order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
         Ok(SortOrderPushdownResult::Unsupported)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::physical_plan::empty::EmptyExec;
+    use runtime_proto::ListUdfsArgs;
+    use runtime_proto::udtf_args::Args;
+
+    fn test_udtf_args() -> UdtfArgs {
+        UdtfArgs {
+            args: Some(Args::ListUdfs(ListUdfsArgs {})),
+        }
+    }
+
+    fn test_inner() -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        Arc::new(EmptyExec::new(schema))
+    }
+
+    /// Regression test for issue #10951.
+    ///
+    /// `check_default_invariants` (invoked by optimizer rules like `EnforceSorting`
+    /// when `UdtfExec` is composed under another plan, e.g. `rrf(text_search(...),
+    /// vector_search(...))`) asserts that `maintains_input_order`,
+    /// `required_input_ordering`, `required_input_distribution`, and
+    /// `benefits_from_input_partitioning` each return a Vec with one entry per
+    /// child. `UdtfExec` reports one child (the inner plan), so each of these
+    /// must return a single-element Vec.
+    #[test]
+    fn invariant_vec_lengths_match_children_count() {
+        let exec = UdtfExec::new(test_udtf_args(), test_inner());
+        let children_len = exec.children().len();
+        assert_eq!(children_len, 1);
+        assert_eq!(exec.maintains_input_order().len(), children_len);
+        assert_eq!(exec.required_input_ordering().len(), children_len);
+        assert_eq!(exec.required_input_distribution().len(), children_len);
+        assert_eq!(exec.benefits_from_input_partitioning().len(), children_len);
+    }
+
+    #[test]
+    fn check_default_invariants_passes() {
+        let exec = UdtfExec::new(test_udtf_args(), test_inner());
+        exec.check_invariants(InvariantLevel::Always)
+            .expect("default invariants should pass for UdtfExec");
+        exec.check_invariants(InvariantLevel::Executable)
+            .expect("default invariants should pass for UdtfExec");
     }
 }

@@ -1632,6 +1632,52 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+async fn test_explicit_dataset_searchability_validation() -> Result<(), anyhow::Error> {
+    run_search(
+        AppBuilder::new("search_app")
+            .with_dataset(get_mega_science_dataset(
+                Some("searchable"),
+                None,
+                Some(
+                    Column::new("answer")
+                        .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
+                ),
+            ))
+            .with_dataset(get_mega_science_dataset(Some("plain"), None, None))
+            .build(),
+        vec![
+            SearchTestCase::new(
+                "explicit_non_searchable_dataset_errors",
+                SearchTestType::Http(json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["plain"],
+                })),
+            )
+            .should_fail(),
+            SearchTestCase::new(
+                "explicit_mixed_datasets_fail_fast",
+                SearchTestType::Http(json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["searchable", "plain"],
+                })),
+            )
+            .should_fail(),
+            SearchTestCase::new(
+                "explicit_searchable_dataset_no_matches_returns_empty",
+                SearchTestType::Http(json!({
+                    "text": "query-that-will-not-match-any-megascience-row-xyz",
+                    "limit": 4,
+                    "datasets": ["searchable"],
+                })),
+            ),
+        ],
+    )
+    .await
+}
+
+#[tokio::test]
 async fn test_text_search_view() -> Result<(), anyhow::Error> {
     let (ds, views) = get_mega_science_view(
         Some("qs"),

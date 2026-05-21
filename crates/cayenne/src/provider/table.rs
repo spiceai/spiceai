@@ -1488,6 +1488,12 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
         let deleted = self.inner.delete_from().await?;
         if deleted > 0 {
             self.table.clear_cached_pk_keyset();
+            // Drop the per-file stats `CayenneTableProvider::collect_scan_file_statistics`
+            // caches. Without this, a follow-up `COUNT(*)` (or any other stats-driven
+            // query) is served the row count we computed *before* this delete added
+            // its rows to the position-based deletion vector, so the count is stale —
+            // see `tests/position_based_deletion_test.rs::test_position_based_sequential_deletes`.
+            self.table.invalidate_scan_file_statistics();
         }
         Ok(deleted)
     }
@@ -6205,6 +6211,16 @@ impl CayenneTableProvider {
         // every participating partition's fence across one barrier window.
         let _fence = self.listing_fence.write().await;
         self.refresh_listing_table_under_held_fence()
+    }
+
+    /// Drop every entry in [`Self::scan_file_statistics`].
+    ///
+    /// Calls must follow any operation that adds, removes, or updates
+    /// position-based deletion vectors so the next stats-driven query (e.g.
+    /// `COUNT(*)`) reinvokes `infer_stats`, which in turn reapplies the
+    /// `VortexAccessPlanProvider` and observes the fresh deletion bitmap.
+    pub(crate) fn invalidate_scan_file_statistics(&self) {
+        self.scan_file_statistics.clear();
     }
 
     /// Refresh the listing table, ASSUMING the caller already holds

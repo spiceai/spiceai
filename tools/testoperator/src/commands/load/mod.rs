@@ -229,7 +229,9 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .query_overrides
         .clone()
         .map(test_framework::queries::QueryOverrides::from);
-    let _queries = query_set.get_queries(query_overrides, None, None).await?;
+    let _queries = query_set
+        .get_queries(query_overrides, None, None, args.test_args.scale_factor)
+        .await?;
 
     let throughput_test = SpiceTest::<NotStarted>::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
@@ -336,7 +338,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     // Use baseline_queries that represent unique query names, otherwise the same failure
     // could be reported multiple times for each parameterized query params set variation
     for query in baseline_query_set
-        .get_queries(query_overrides, None, None)
+        .get_queries(query_overrides, None, None, args.test_args.scale_factor)
         .await?
     {
         let Some(baseline_percentile) = baseline_percentiles.get(&query.name) else {
