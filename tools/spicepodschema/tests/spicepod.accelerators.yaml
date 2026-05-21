@@ -7,6 +7,10 @@ version: v1
 kind: Spicepod
 name: schema-test-accelerators
 
+runtime:
+  params:
+    cayenne_footer_cache_mb: "256"
+
 datasets:
   # ===========================================================================
   # Arrow Accelerator
@@ -135,4 +139,3 @@ datasets:
         cayenne_file_path: ./data/accel.cayenne
         cayenne_metastore: sqlite
         file_watcher: "true"
-        cayenne_footer_cache_mb: "256"

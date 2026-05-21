@@ -207,7 +207,8 @@ pub(crate) async fn post(
         Err(e) => {
             let error_type = match e {
                 VectorSearchError::NoTablesWithSearchFound {}
-                | VectorSearchError::CannotVectorSearchDataset { .. } => StatusCode::BAD_REQUEST,
+                | VectorSearchError::CannotVectorSearchDataset { .. }
+                | VectorSearchError::CannotSearchDataset { .. } => StatusCode::BAD_REQUEST,
                 VectorSearchError::SearchPipelineError { ref source } if source.is_user_error() => {
                     StatusCode::BAD_REQUEST
                 }

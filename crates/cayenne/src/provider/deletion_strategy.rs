@@ -74,8 +74,14 @@ impl PositionDeletionVector {
         self.row_ids.contains(row_id)
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = u32> + '_ {
-        self.row_ids.iter()
+    #[must_use]
+    pub(crate) fn count_before_row(&self, row_count: usize) -> usize {
+        let deleted_rows = u32::try_from(row_count).map_or_else(
+            |_| self.row_ids.len(),
+            |row_count| self.row_ids.range_cardinality(0..row_count),
+        );
+
+        usize::try_from(deleted_rows).unwrap_or(usize::MAX)
     }
 
     #[must_use]

@@ -72,8 +72,11 @@ impl NotStarted {
         mut self,
         query_set: QuerySet,
         overrides: Option<QueryOverrides>,
+        scale_factor: Option<f64>,
     ) -> Result<Self> {
-        self.queries = query_set.get_queries(overrides, None, None).await?;
+        self.queries = query_set
+            .get_queries(overrides, None, None, scale_factor)
+            .await?;
         self.query_count = self.queries.len();
         self.query_set = query_set;
         Ok(self)

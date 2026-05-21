@@ -321,6 +321,7 @@ impl SearchEngine {
             additional_columns,
             keywords,
         } = req;
+        let explicit_datasets_requested = data_source_opt.is_some();
 
         let tables = match data_source_opt {
             Some(ts) => ts.iter().map(TableReference::from).collect(),
@@ -367,6 +368,12 @@ impl SearchEngine {
                     if let Some(mut fts) = full_text_search_candidates(&self.df, &tbl).await.transpose()? {
                         telemetry::track_text_search(&request_context.to_dimensions());
                         generators.append(&mut fts);
+                    }
+
+                    if explicit_datasets_requested && generators.is_empty() {
+                        return Err(Error::CannotSearchDataset {
+                            data_source: tbl.clone(),
+                        });
                     }
 
                     // Ensure columns for a specific table aren't used on all tables.

@@ -50,7 +50,6 @@ pub enum ComponentType {
     Model,
     Embedding,
     Tool,
-    Eval,
     View,
 }
 
@@ -63,7 +62,6 @@ impl Display for ComponentType {
             ComponentType::Model => write!(f, "model"),
             ComponentType::Embedding => write!(f, "embedding"),
             ComponentType::Tool => write!(f, "tool"),
-            ComponentType::Eval => write!(f, "eval"),
             ComponentType::View => write!(f, "view"),
         }
     }
