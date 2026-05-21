@@ -46,7 +46,6 @@ use flight_client::Error as FlightClientError;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use governor::{Quota, RateLimiter};
-use itertools::Either;
 use metrics::track_flight_request;
 use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{AuthRequestContext, FlightBasicAuth, layer::flight::BasicAuthLayer};
