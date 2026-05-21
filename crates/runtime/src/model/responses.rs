@@ -23,8 +23,6 @@ use crate::parameters::Parameters;
 use crate::tools::options::SpiceToolsOptions;
 use crate::tools::registry::{TOOL_EMBEDDING_MODEL_PARAM, prepare_model_tools};
 use crate::tools::utils::{create_table_allowlist, get_tools_with_allowlist};
-use async_openai::error::{ApiError, OpenAIError};
-use async_trait::async_trait;
 use llms::chat::Error as LlmError;
 use llms::openai::{DEFAULT_LLM_MODEL, UsageTier};
 use llms::responses::Responses;
@@ -38,6 +36,20 @@ use std::{
 };
 
 pub type LLMResponsesModelStore = HashMap<String, Arc<dyn Responses>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResponsesApiSupport {
+    Supported,
+    UnsupportedProvider { provider: String },
+    Unavailable,
+}
+
+impl ResponsesApiSupport {
+    #[must_use]
+    pub fn supports_responses_api(&self) -> bool {
+        matches!(self, ResponsesApiSupport::Supported)
+    }
+}
 
 const DEFAULT_SPICE_TOOL_RECURSION_LIMIT: usize = 10;
 
@@ -65,10 +77,7 @@ pub async fn try_to_responses_model(
         source,
         ModelSource::OpenAi | ModelSource::Azure | ModelSource::Xai
     ) {
-        return Ok(Arc::new(UnsupportedResponsesModel::new(
-            component.name.clone(),
-            source.short_name(),
-        )));
+        return Err(LlmError::ResponsesNotSupported { from: source });
     }
 
     let param_spec = get_params_spec(&source).ok_or(LlmError::UnsupportedTaskForModel {
@@ -203,53 +212,6 @@ pub fn get_openai_responses_request_overrides(model: &Model, prefix: &str) -> Ve
     request_overrides.into_iter().collect()
 }
 
-struct UnsupportedResponsesModel {
-    model_name: String,
-    provider: &'static str,
-}
-
-impl UnsupportedResponsesModel {
-    fn new(model_name: String, provider: &'static str) -> Self {
-        Self {
-            model_name,
-            provider,
-        }
-    }
-
-    fn error(&self) -> OpenAIError {
-        OpenAIError::ApiError(ApiError {
-            message: format!(
-                "Model '{}' uses provider '{}' which does not support the OpenAI Responses API. Use /v1/chat/completions for this model or configure a model provider that supports Responses.",
-                self.model_name, self.provider
-            ),
-            r#type: Some("invalid_request_error".to_string()),
-            param: Some("model".to_string()),
-            code: Some("invalid_request_error".to_string()),
-        })
-    }
-}
-
-#[async_trait]
-impl Responses for UnsupportedResponsesModel {
-    async fn health(&self) -> llms::responses::Result<()> {
-        Ok(())
-    }
-
-    async fn responses_stream(
-        &self,
-        _req: async_openai::types::responses::CreateResponse,
-    ) -> Result<async_openai::types::responses::ResponseStream, OpenAIError> {
-        Err(self.error())
-    }
-
-    async fn responses_request(
-        &self,
-        _req: async_openai::types::responses::CreateResponse,
-    ) -> Result<async_openai::types::responses::Response, OpenAIError> {
-        Err(self.error())
-    }
-}
-
 fn openai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Responses>, LlmError> {
     let api_base = params.get("endpoint").expose().ok();
     let api_key = params.get("api_key").expose().ok();
@@ -361,7 +323,6 @@ fn xai(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Responses>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_openai::types::responses::CreateResponseArgs;
     use spicepod::component::model::Model;
 
     #[test]
@@ -393,31 +354,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn unsupported_responses_model_returns_invalid_request_error() {
-        let model = UnsupportedResponsesModel::new("anthropic_model".to_string(), "anthropic");
-        let req = CreateResponseArgs::default()
-            .model("anthropic_model")
-            .input("hello")
-            .build()
-            .expect("response request should build");
-
-        let err = model
-            .responses_request(req)
-            .await
-            .expect_err("unsupported provider should return an error");
-
-        let OpenAIError::ApiError(api_error) = err else {
-            panic!("unsupported provider should return an OpenAI API error");
-        };
-
-        assert_eq!(api_error.r#type.as_deref(), Some("invalid_request_error"));
-        assert_eq!(api_error.param.as_deref(), Some("model"));
-        assert_eq!(api_error.code.as_deref(), Some("invalid_request_error"));
-        assert!(
-            api_error
-                .message
-                .contains("does not support the OpenAI Responses API")
-        );
-    }
 }

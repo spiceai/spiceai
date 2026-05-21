@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::http::v1::chat::{KEEP_ALIVE_INTERVAL, OpenaiErrorEvent, openai_error_to_response};
+use async_openai::error::{ApiError, OpenAIError};
 use async_openai::traits::EventType;
 use async_openai::types::responses::{
     CreateResponse, OutputItem, OutputMessageContent, Response as OpenAIResponse,
@@ -22,7 +23,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
-use crate::model::LLMResponsesModelStore;
+use crate::{Runtime, model::LLMResponsesModelStore};
 use llms::responses::Responses;
 
 fn extract_text(resp: &OpenAIResponse) -> String {
@@ -123,6 +124,7 @@ fn extract_text(resp: &OpenAIResponse) -> String {
     )
 ))]
 pub(crate) async fn post(
+    Extension(rt): Extension<Arc<Runtime>>,
     Extension(llms): Extension<Arc<RwLock<LLMResponsesModelStore>>>,
     Json(req): Json<CreateResponse>,
 ) -> Response {
@@ -150,6 +152,19 @@ pub(crate) async fn post(
     async move {
         let model_id = model_id.clone();
         let stream = req.stream.unwrap_or(false);
+
+        let responses_support = rt.responses_api_support_for_model(&model_id).await;
+        if let crate::model::ResponsesApiSupport::UnsupportedProvider { provider } = responses_support
+        {
+            return openai_error_to_response(OpenAIError::ApiError(ApiError {
+                message: format!(
+                    "Model '{model_id}' uses provider '{provider}' which does not support the OpenAI Responses API. Use /v1/chat/completions for this model or configure a model provider that supports Responses."
+                ),
+                r#type: Some("invalid_request_error".to_string()),
+                param: Some("model".to_string()),
+                code: Some("invalid_request_error".to_string()),
+            }));
+        }
 
         let Some(model) = llms.read().await.get(&model_id).cloned() else {
             return (StatusCode::NOT_FOUND, format!("model '{model_id}' not found")).into_response();

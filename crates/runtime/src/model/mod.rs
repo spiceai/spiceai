@@ -42,9 +42,56 @@ pub use model_context::{
     ModelContextExtension, ModelContextLayer, add_tools_used, track_ai_inferences_with_spice_count,
 };
 pub use rerank::{RerankerModelStore, try_to_rerank_model};
-pub use responses::{LLMResponsesModelStore, try_to_responses_model};
+pub use responses::{LLMResponsesModelStore, ResponsesApiSupport, try_to_responses_model};
 pub use tool_use::ToolUsingChat;
 pub use tool_use_responses::ToolUsingResponses;
+
+#[derive(Clone)]
+pub struct LlmRuntimeStores {
+    completion_llms: Arc<tokio::sync::RwLock<LLMChatCompletionsModelStore>>,
+    responses_llms: Arc<tokio::sync::RwLock<LLMResponsesModelStore>>,
+    rate_controllers:
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<runtime_rate_control::RateController>>>>,
+    responses_api_support:
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, ResponsesApiSupport>>>,
+}
+
+impl Default for LlmRuntimeStores {
+    fn default() -> Self {
+        Self {
+            completion_llms: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            responses_llms: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            rate_controllers: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            responses_api_support: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+}
+
+impl LlmRuntimeStores {
+    #[must_use]
+    pub fn completion_llms(&self) -> Arc<tokio::sync::RwLock<LLMChatCompletionsModelStore>> {
+        Arc::clone(&self.completion_llms)
+    }
+
+    #[must_use]
+    pub fn responses_llms(&self) -> Arc<tokio::sync::RwLock<LLMResponsesModelStore>> {
+        Arc::clone(&self.responses_llms)
+    }
+
+    #[must_use]
+    pub fn rate_controllers(
+        &self,
+    ) -> Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<runtime_rate_control::RateController>>>> {
+        Arc::clone(&self.rate_controllers)
+    }
+
+    #[must_use]
+    pub fn responses_api_support(
+        &self,
+    ) -> Arc<tokio::sync::RwLock<std::collections::HashMap<String, ResponsesApiSupport>>> {
+        Arc::clone(&self.responses_api_support)
+    }
+}
 
 use crate::DataFusion;
 

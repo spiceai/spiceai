@@ -415,12 +415,12 @@ pub(crate) fn routes(
             .route("/v1/search", post(v1::search::post))
             .merge(tools_router)
             .route("/v1/workers", get(v1::workers::get))
-            .layer(Extension(Arc::clone(&rt.completion_llms)))
+            .layer(Extension(rt.completion_llms()))
             .layer(Extension(Arc::clone(&rt.models)))
             .layer(Extension(search))
             .layer(Extension(Arc::clone(&rt.embeds)))
             .layer(Extension(Arc::clone(&rt.workers)))
-            .layer(Extension(Arc::clone(&rt.responses_llms)));
+            .layer(Extension(rt.responses_llms()));
     }
 
     // Add async queries API routes - registered unconditionally for discoverability and consistency.
