@@ -269,29 +269,6 @@ impl Service {
         Ok(Self::query_result_to_flight_stream(query_result))
     }
 
-    /// Run a pre-built [`LogicalPlan`] and stream results as Flight data.
-    ///
-    /// Used by surfaces that produce a logical plan outside the SQL parser
-    /// (e.g. `FlightSQL` `CommandStatementSubstraitPlan`). The `cache_key`
-    /// identifies the plan in the results cache; callers should derive it
-    /// from the plan source so that semantically identical inputs hit the
-    /// same cache entry.
-    pub(crate) async fn plan_to_flight_stream(
-        datafusion: Arc<DataFusion>,
-        plan: LogicalPlan,
-        cache_key: impl Into<Arc<str>>,
-    ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, CacheStatus), Status> {
-        let read_only = crate::http::v1::current_principal_requires_read_only().await;
-        let query_result = QueryBuilder::from_plan(plan, cache_key, Arc::clone(&datafusion))
-            .read_only(read_only)
-            .build()
-            .run()
-            .await
-            .map_err(handle_query_error)?;
-
-        Ok(Self::query_result_to_flight_stream(query_result))
-    }
-
     fn query_result_to_flight_stream(
         query_result: QueryResult,
     ) -> (BoxStream<'static, Result<FlightData, Status>>, CacheStatus) {

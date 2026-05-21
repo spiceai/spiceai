@@ -132,9 +132,7 @@ pub(crate) async fn get_flight_info(
             .map_err(|e| Status::permission_denied(format!("Write access denied. {e}")))?;
     }
 
-    let query = QueryBuilder::from_plan(plan, cache_key, Arc::clone(&datafusion))
-        .read_only(read_only)
-        .build();
+    let query = QueryBuilder::from_plan(plan, cache_key, Arc::clone(&datafusion)).build();
     let (dataset_schema, _) = query.get_schema().await.map_err(handle_datafusion_error)?;
     let dataset_schema = arrow_tools::schema::expand_views_schema(&dataset_schema);
 
@@ -170,8 +168,14 @@ pub(crate) async fn do_get(
             .map_err(|e| Status::permission_denied(format!("Write access denied. {e}")))?;
     }
 
+    let query_result = QueryBuilder::from_plan(plan, cache_key, Arc::clone(&datafusion))
+        .build()
+        .run()
+        .await
+        .map_err(handle_query_error)?;
+
     let (output, from_cache) =
-        Box::pin(Service::plan_to_flight_stream(datafusion, plan, cache_key)).await?;
+        Box::pin(Service::query_result_to_flight_stream(query_result)).await?;
     let timed_output = TimedStream::new(output, move || start);
 
     let mut response =
