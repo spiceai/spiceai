@@ -96,8 +96,16 @@ pub async fn partition_value_to_bytes(
     tbl: &TableReference,
     resolver: &dyn PartitionExprResolver,
 ) -> Result<Bytes, DataFusionError> {
+    // Sort keys so the resulting AND-tree (and its proto bytes) is
+    // independent of HashMap iteration order. The scheduler uses these
+    // bytes as a stable identifier for a partition when matching
+    // executor PartitionsLoaded acks against assigned partitions, so a
+    // non-deterministic encoding would produce false misses.
+    let mut entries: Vec<_> = p.into_iter().collect();
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
     let mut expr: Option<Expr> = None;
-    for (partition_expr, val) in p {
+    for (partition_expr, val) in entries {
         let partition_by = resolver.try_parse_expr(tbl, &partition_expr).await?;
         let e = match val {
             None => partition_by.is_null(),

@@ -617,6 +617,13 @@ impl ClusterService for ClusterServiceImpl {
             // Unregister the executor stream.
             executor_streams.unregister(&executor_id);
 
+            // Drop any partition-load acks the executor had; until it
+            // reconnects (or another executor takes over and acks), the
+            // affected datasets should no longer be considered loaded.
+            if let Some(tracker) = datafusion.partition_load_tracker.as_ref() {
+                tracker.drop_executor(&executor_id).await;
+            }
+
             tracing::debug!("Executor control stream ended: {executor_id}");
         });
 
@@ -860,6 +867,9 @@ async fn handle_executor_message(
             // This shouldn't be reached, but log if it is.
             tracing::warn!("Unexpected ack in handle_executor_message for {executor_id}");
         }
+        ExecutorMessage::PartitionsLoaded(loaded) => {
+            handle_partitions_loaded(executor_id, loaded, datafusion).await;
+        }
         ExecutorMessage::Shutdown(shutdown) => {
             let reason = if shutdown.reason.is_empty() {
                 "executor shutdown".to_string()
@@ -910,6 +920,84 @@ async fn notify_scheduler_executor_shutdown(
 
     Ok(())
 }
+
+/// Records a `PartitionsLoaded` ack from an executor and, if all assigned
+/// partitions for the table are now covered by an executor ack, flips the
+/// dataset's status to `Ready`. This is the only path that marks an
+/// accelerated dataset ready on the scheduler — the dataset starts
+/// `Refreshing` at registration time and stays there until the cluster
+/// actually has data.
+async fn handle_partitions_loaded(
+    executor_id: &str,
+    loaded: &runtime_proto::PartitionsLoaded,
+    datafusion: &DataFusion,
+) {
+    let Some(tracker) = datafusion.partition_load_tracker.as_ref() else {
+        return;
+    };
+    let Some(partition_store) = datafusion
+        .partition_service
+        .as_ref()
+        .map(|s| Arc::clone(&s.partition_store))
+    else {
+        // No partition store available — nothing to evaluate against.
+        return;
+    };
+
+    let table = ::datafusion::sql::TableReference::parse_str(&loaded.table_name);
+
+    let partition_expr_bytes: std::collections::HashSet<bytes::Bytes> = loaded
+        .partition_expr_bytes
+        .as_ref()
+        .map(|arr| {
+            arr.items
+                .iter()
+                .map(|v| bytes::Bytes::copy_from_slice(v))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    tracing::debug!(
+        executor_id,
+        table = %loaded.table_name,
+        partitions = partition_expr_bytes.len(),
+        "Received PartitionsLoaded ack"
+    );
+
+    tracker
+        .replace(table.clone(), executor_id.to_string(), partition_expr_bytes)
+        .await;
+
+    // Refresh in-memory partition metadata snapshot before evaluating
+    // readiness — the tracker compares against the latest assigned set.
+    // Fail closed: if we can't refresh we may be looking at a stale
+    // assignment, which could flip a dataset to `Ready` based on outdated
+    // executor membership. Skip this evaluation and let the next ack or
+    // reconcile cycle retry.
+    if let Err(err) = partition_store.refresh().await {
+        tracing::warn!(
+            table = %loaded.table_name,
+            "Skipping readiness evaluation: partition store refresh failed: {err}"
+        );
+        return;
+    }
+    let Some(metadata) = partition_store.get_cached_table_metadata(&table) else {
+        // No partition metadata yet — likely raced with first discovery
+        // cycle; the next reconcile will re-evaluate.
+        return;
+    };
+
+    if tracker.is_table_loaded(&table, &metadata, datafusion).await {
+        tracing::info!(
+            table = %loaded.table_name,
+            "All assigned partitions loaded; marking dataset Ready"
+        );
+        datafusion
+            .runtime_status
+            .update_dataset(&table, crate::status::ComponentStatus::Ready);
+    }
+}
+
 /// Discovers all Cayenne table references registered in the `DataFusion` catalog.
 ///
 /// Iterates through all catalogs, identifies Cayenne-backed catalogs, and returns

@@ -33,8 +33,8 @@ use futures::StreamExt;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
 use runtime_proto::scheduler_control_message::Message as SchedulerMessage;
 use runtime_proto::{
-    Ack, ExecutorControlMessage, ExecutorHeartbeat, ExecutorShutdown, MetricsResponse,
-    executor_control_message::Message as ExecutorMessage,
+    Ack, BytesArray, ExecutorControlMessage, ExecutorHeartbeat, ExecutorShutdown, MetricsResponse,
+    PartitionsLoaded, executor_control_message::Message as ExecutorMessage,
 };
 use tokio::sync::{Notify, RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -73,6 +73,114 @@ pub type PartitionUpdateHandler = Arc<
 pub type RefreshDatasetHandler =
     Arc<dyn Fn(String, Option<String>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Per-scheduler outbound senders, shared between the [`ControlStreamManager`]
+/// and the executor runtime. The manager populates this map on each
+/// (re)connect and clears entries on disconnect; the runtime uses it to
+/// broadcast unsolicited messages (e.g. `PartitionsLoaded`) to every
+/// scheduler the executor is currently connected to.
+///
+/// Cloning is cheap (just `Arc::clone`).
+#[derive(Clone, Debug, Default)]
+pub struct ExecutorOutboundBroadcaster {
+    inner: Arc<ExecutorOutboundBroadcasterInner>,
+}
+
+#[derive(Debug, Default)]
+struct ExecutorOutboundBroadcasterInner {
+    streams: RwLock<HashMap<String, mpsc::Sender<ExecutorControlMessage>>>,
+    executor_id: RwLock<String>,
+}
+
+impl ExecutorOutboundBroadcaster {
+    #[must_use]
+    pub fn new(executor_id: String) -> Self {
+        Self {
+            inner: Arc::new(ExecutorOutboundBroadcasterInner {
+                streams: RwLock::new(HashMap::new()),
+                executor_id: RwLock::new(executor_id),
+            }),
+        }
+    }
+
+    /// Updates the executor id stamped on outbound messages. Called once the
+    /// executor's advertise address is finalised.
+    pub async fn set_executor_id(&self, executor_id: String) {
+        *self.inner.executor_id.write().await = executor_id;
+    }
+
+    pub(crate) async fn register(
+        &self,
+        scheduler_address: String,
+        tx: mpsc::Sender<ExecutorControlMessage>,
+    ) {
+        self.inner
+            .streams
+            .write()
+            .await
+            .insert(scheduler_address, tx);
+    }
+
+    pub(crate) async fn unregister(&self, scheduler_address: &str) {
+        self.inner.streams.write().await.remove(scheduler_address);
+    }
+
+    /// Broadcasts a `PartitionsLoaded` message to every connected scheduler.
+    /// Returns the number of schedulers the message was queued for.
+    ///
+    /// Uses `send().await` with a short timeout rather than `try_send`. The
+    /// scheduler's readiness gate depends on this ack arriving, so silently
+    /// dropping it (e.g. on a transiently full channel) could leave a dataset
+    /// stuck in `Refreshing` until the next refresh. The timeout keeps a
+    /// stuck/slow scheduler from blocking the broadcast to its peers.
+    pub async fn broadcast_partitions_loaded(
+        &self,
+        table_name: String,
+        partition_expr_bytes: Vec<Vec<u8>>,
+    ) -> usize {
+        let executor_id = self.inner.executor_id.read().await.clone();
+        let payload = ExecutorControlMessage {
+            executor_id,
+            message: Some(ExecutorMessage::PartitionsLoaded(PartitionsLoaded {
+                table_name,
+                partition_expr_bytes: Some(BytesArray {
+                    items: partition_expr_bytes,
+                }),
+            })),
+        };
+
+        // Snapshot the (address, sender) pairs so we don't hold the read lock
+        // across awaits — a slow scheduler shouldn't block register/unregister.
+        let targets: Vec<(String, mpsc::Sender<ExecutorControlMessage>)> = {
+            let streams = self.inner.streams.read().await;
+            streams
+                .iter()
+                .map(|(addr, tx)| (addr.clone(), tx.clone()))
+                .collect()
+        };
+
+        let mut sent = 0usize;
+        for (scheduler_address, tx) in targets {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), tx.send(payload.clone()))
+                .await
+            {
+                Ok(Ok(())) => sent += 1,
+                Ok(Err(err)) => {
+                    tracing::debug!(
+                        "PartitionsLoaded send to {scheduler_address} failed (channel closed): {err}"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        scheduler = %scheduler_address,
+                        "Timed out sending PartitionsLoaded; scheduler may miss this ack until next refresh"
+                    );
+                }
+            }
+        }
+        sent
+    }
+}
+
 /// Handle for a single control stream connection to a scheduler.
 struct ControlStreamHandle {
     cancel: CancellationToken,
@@ -99,6 +207,7 @@ fn spawn_control_stream(
     outbound_tx_state: Arc<RwLock<Option<mpsc::Sender<ExecutorControlMessage>>>>,
     partition_update_handler: Option<&PartitionUpdateHandler>,
     refresh_dataset_handler: Option<&RefreshDatasetHandler>,
+    broadcaster: Option<ExecutorOutboundBroadcaster>,
 ) -> ControlStreamHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
@@ -184,6 +293,10 @@ fn spawn_control_stream(
                 let mut outbound_guard = outbound_tx_state_for_task.write().await;
                 *outbound_guard = Some(outbound_tx.clone());
             }
+            if let Some(b) = broadcaster.as_ref() {
+                b.register(scheduler_address.clone(), outbound_tx.clone())
+                    .await;
+            }
 
             // Spawn heartbeat sender
             let heartbeat_executor_id = executor_id.clone();
@@ -229,6 +342,9 @@ fn spawn_control_stream(
                 heartbeat_task.abort();
                 let mut outbound_guard = outbound_tx_state_for_task.write().await;
                 *outbound_guard = None;
+                if let Some(b) = broadcaster.as_ref() {
+                    b.unregister(&scheduler_address).await;
+                }
                 continue;
             }
 
@@ -245,6 +361,9 @@ fn spawn_control_stream(
                     heartbeat_task.abort();
                     let mut outbound_guard = outbound_tx_state_for_task.write().await;
                     *outbound_guard = None;
+                    if let Some(b) = broadcaster.as_ref() {
+                        b.unregister(&scheduler_address).await;
+                    }
                     if let Some(delay) = backoff.next_duration() {
                         tokio::select! {
                             () = token.cancelled() => break,
@@ -266,6 +385,9 @@ fn spawn_control_stream(
                         {
                             let mut outbound_guard = outbound_tx_state_for_task.write().await;
                             *outbound_guard = None;
+                        }
+                        if let Some(b) = broadcaster.as_ref() {
+                            b.unregister(&scheduler_address).await;
                         }
                         tracing::debug!(
                             "Control stream to {scheduler_address} cancelled"
@@ -311,6 +433,9 @@ fn spawn_control_stream(
             {
                 let mut outbound_guard = outbound_tx_state_for_task.write().await;
                 *outbound_guard = None;
+            }
+            if let Some(b) = broadcaster.as_ref() {
+                b.unregister(&scheduler_address).await;
             }
             tracing::debug!("Control stream to {scheduler_address} disconnected, will reconnect");
 
@@ -512,11 +637,15 @@ pub struct ControlStreamManager {
     partition_update_handler: Option<PartitionUpdateHandler>,
     /// Callback handler for dataset refresh commands.
     refresh_dataset_handler: Option<RefreshDatasetHandler>,
+    /// Shared per-scheduler sender map used by the runtime to broadcast
+    /// unsolicited messages (e.g. `PartitionsLoaded`).
+    broadcaster: Option<ExecutorOutboundBroadcaster>,
 }
 
 impl ControlStreamManager {
     /// Creates a new control stream manager.
     #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         executor_id: String,
         ballista_executor_id: String,
@@ -525,6 +654,7 @@ impl ControlStreamManager {
         partition_update_handler: Option<PartitionUpdateHandler>,
         executor: Option<Arc<Executor>>,
         refresh_dataset_handler: Option<RefreshDatasetHandler>,
+        broadcaster: Option<ExecutorOutboundBroadcaster>,
     ) -> Self {
         Self {
             executor_id,
@@ -537,6 +667,7 @@ impl ControlStreamManager {
             poll_now_notify: Arc::new(Notify::new()),
             partition_update_handler,
             refresh_dataset_handler,
+            broadcaster,
         }
     }
 
@@ -620,6 +751,7 @@ impl ControlStreamManager {
                 Arc::clone(&outbound_tx_state),
                 self.partition_update_handler.as_ref(),
                 self.refresh_dataset_handler.as_ref(),
+                self.broadcaster.clone(),
             );
             self.streams.insert(address, handle);
         }
@@ -703,6 +835,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(manager.known_schedulers.is_empty());
         assert!(manager.streams.is_empty());
@@ -720,6 +853,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(manager.metrics_reader.is_some());
     }
@@ -729,6 +863,7 @@ mod tests {
         let mut manager = ControlStreamManager::new(
             "executor-1".to_string(),
             "executor-1".to_string(),
+            None,
             None,
             None,
             None,
@@ -745,6 +880,7 @@ mod tests {
         let mut manager = ControlStreamManager::new(
             "executor-1".to_string(),
             "executor-1".to_string(),
+            None,
             None,
             None,
             None,

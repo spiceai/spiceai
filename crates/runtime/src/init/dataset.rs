@@ -1200,6 +1200,8 @@ impl Runtime {
         // The accelerated refresh task will set the dataset status to `Ready` once it finishes loading.
         self.status
             .update_dataset(&ds.name, status::ComponentStatus::Refreshing);
+        // Capture this before `initial_partition_filters` is moved into `register_table`.
+        let has_initial_partitions = !initial_partition_filters.is_empty();
         let notifier = self
             .df
             .register_table(
@@ -1219,13 +1221,66 @@ impl Runtime {
                 connector_component: ConnectorComponent::from(&ds),
             })?;
 
-        if let Some(notifier) = notifier {
+        if notifier.is_some() {
             // spawn a background task to wait for the accelerated table to be ready before creating schedules
             let runtime = ds.runtime();
+            let runtime_status = Arc::clone(&self.status);
             let ds = Arc::clone(&ds);
             let dataset_name = ds.name.to_string();
+            let dataset_table_ref = ds.name.clone();
+            let broadcaster = runtime.executor_outbound_broadcaster();
+            let resolved_name = ds.name.clone().resolve(
+                crate::datafusion::SPICE_DEFAULT_CATALOG,
+                crate::datafusion::SPICE_DEFAULT_SCHEMA,
+            );
             tokio::task::spawn(async move {
-                notifier.notified().await;
+                // Wait for the dataset's status to reach `Ready` rather than
+                // relying on the `Notify`-based completion handle (which is
+                // edge-triggered and can race with this spawn for fast
+                // initial refreshes).
+                runtime_status
+                    .wait_for_dataset_ready(&dataset_table_ref)
+                    .await;
+                // After the executor's initial load for this dataset finishes,
+                // ack the scheduler with the partition expressions we currently
+                // hold. This is the executor → scheduler readiness signal that
+                // lets the scheduler flip the dataset to `Ready` once every
+                // assigned partition has at least one executor ack.
+                if has_initial_partitions
+                    && let Some(b) = broadcaster
+                    && let Some(assignments_lock) = runtime.partition_assignments()
+                {
+                    let bytes: Vec<Vec<u8>> = {
+                        let assignments = assignments_lock.read().await;
+                        assignments
+                            .get(&resolved_name)
+                            .map(|exprs| {
+                                use datafusion_proto::bytes::Serializeable;
+                                exprs
+                                    .iter()
+                                    .filter_map(|e| match e.to_bytes() {
+                                        Ok(b) => Some(b.to_vec()),
+                                        Err(err) => {
+                                            tracing::warn!(
+                                                dataset = %dataset_name,
+                                                "Failed to encode partition Expr for initial PartitionsLoaded ack: {err}"
+                                            );
+                                            None
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    };
+                    if !bytes.is_empty() {
+                        let sent = b
+                            .broadcast_partitions_loaded(dataset_name.clone(), bytes)
+                            .await;
+                        tracing::info!(
+                            "Broadcast initial PartitionsLoaded for {dataset_name} to {sent} scheduler(s)"
+                        );
+                    }
+                }
                 if let Err(e) = runtime.create_dataset_or_view_schedule(ds).await {
                     tracing::error!("Failed to create dataset schedule for '{dataset_name}': {e}");
                 }

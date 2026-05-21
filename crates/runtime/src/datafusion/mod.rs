@@ -683,6 +683,10 @@ pub struct DataFusion {
     pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
     /// Partition service for discovering/assigning partitions (scheduler mode only).
     pub(crate) partition_service: Option<Arc<PartitionService>>,
+    /// Tracks executor `PartitionsLoaded` acks so dataset readiness on the
+    /// scheduler reflects actual data availability on executors. Only set
+    /// in scheduler mode.
+    pub(crate) partition_load_tracker: Option<Arc<runtime_cluster::PartitionLoadTracker>>,
     #[cfg(not(windows))]
     pub(crate) cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
 }
