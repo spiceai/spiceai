@@ -406,9 +406,7 @@ async fn handle_scheduler_message(
             };
 
             if let Err(ref e) = result {
-                tracing::error!(
-                    "Failed to apply partition update from {scheduler_address}: {e}"
-                );
+                tracing::error!("Failed to apply partition update from {scheduler_address}: {e}");
             }
 
             // Send an Ack only if the scheduler asked for one (non-empty

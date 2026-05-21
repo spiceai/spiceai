@@ -261,6 +261,17 @@ impl ClusterServiceImpl {
         self.executor_streams.broadcast_poll_now(reason);
     }
 
+    /// Returns the first accelerated table that hasn't yet been registered in
+    /// the local `SessionContext`, or `None` if every accelerated table is
+    /// ready. Snapshots the app under the read lock and releases it before
+    /// the per-table `get_table` lookups so no async guard is held across
+    /// `.await`.
+    async fn first_unready_accelerated_table(&self) -> Option<TableReference> {
+        let app = self.app.read().await.clone();
+        let app = app?;
+        super::partition::first_unready_accelerated_table(&app, self.datafusion.as_ref()).await
+    }
+
     /// Returns the executor registry for use by other components.
     #[must_use]
     pub fn executor_registry(&self) -> Arc<ExecutorRegistry> {
@@ -637,22 +648,15 @@ impl ClusterService for ClusterServiceImpl {
         // dataset is still loading from its source, `partition_value_to_bytes`
         // would fail with "Table not found when parsing expression" — return
         // a transient `Unavailable` so the executor retries with backoff.
-        {
-            let app_guard = self.app.read().await;
-            if let Some(app) = app_guard.as_ref() {
-                for table_ref in super::partition::accelerated_tables(app).keys() {
-                    if self.datafusion.get_table(table_ref).await.is_none() {
-                        tracing::debug!(
-                            executor = %executor_id,
-                            table = %table_ref,
-                            "Deferring allocate_initial_partitions: accelerated table not yet registered"
-                        );
-                        return Err(Status::unavailable(format!(
-                            "partition metadata not ready: accelerated table {table_ref} still loading"
-                        )));
-                    }
-                }
-            }
+        if let Some(not_ready) = self.first_unready_accelerated_table().await {
+            tracing::debug!(
+                executor = %executor_id,
+                table = %not_ready,
+                "Deferring allocate_initial_partitions: accelerated table not yet registered"
+            );
+            return Err(Status::unavailable(format!(
+                "partition metadata not ready: accelerated table {not_ready} still loading"
+            )));
         }
 
         let tls_config_opt = self.datafusion.cluster_config.client_tls_config();

@@ -916,8 +916,8 @@ mod tests {
     }
 
     /// Spawn a tiny fake executor: receives `SchedulerControlMessage`s from
-    /// `rx`, extracts the request_id from `UpdatePartitions`, and delivers an
-    /// `Ack` (with the provided error, if any) via `pending_acks`.
+    /// `rx`, extracts the `request_id` from `UpdatePartitions`, and delivers
+    /// an `Ack` (with the provided error, if any) via `pending_acks`.
     fn spawn_fake_executor_ack(
         mut rx: mpsc::Receiver<SchedulerControlMessage>,
         pending_acks: CorrelatedResponses<Ack>,
@@ -929,14 +929,14 @@ mod tests {
                     up,
                 )) = msg.message
                 {
-                    let request_id = up.request_id.clone();
+                    let request_id = up.request_id;
                     if request_id.is_empty() {
                         continue; // legacy fire-and-forget
                     }
                     pending_acks.deliver(
                         &request_id,
                         Ack {
-                            request_id,
+                            request_id: request_id.clone(),
                             error: responder_error.clone(),
                         },
                     );
@@ -1037,7 +1037,10 @@ mod tests {
             .await
             .expect_err("unknown executor should fail");
 
-        assert!(matches!(err, Error::ExecutorNotRegistered { .. }), "got {err:?}");
+        assert!(
+            matches!(err, Error::ExecutorNotRegistered { .. }),
+            "got {err:?}"
+        );
         assert!(!err.is_retryable());
     }
 }

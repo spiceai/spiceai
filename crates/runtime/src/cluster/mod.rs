@@ -84,6 +84,12 @@ use util::session_state::builder_from_existing;
 const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const SCHEDULER_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
+/// Upper bound on retries when the scheduler returns `Unavailable` to
+/// `allocate_initial_partitions` (i.e. its `load_datasets()` hasn't finished
+/// registering all accelerated tables yet). At ~5s per attempt this gives a
+/// few minutes of patience before the executor startup hard-fails.
+const ALLOCATE_INITIAL_PARTITIONS_MAX_RETRIES: usize = 60;
+
 #[derive(Clone)]
 pub enum DistributedNode {
     Scheduler {
@@ -1508,6 +1514,7 @@ pub async fn initialize_cluster_executor(
         let initial_partitions = {
             let mut backoff = FibonacciBackoffBuilder::new()
                 .max_duration(Some(SCHEDULER_BACKOFF_MAX))
+                .max_retries(Some(ALLOCATE_INITIAL_PARTITIONS_MAX_RETRIES))
                 .build();
             loop {
                 match executor_request_initial_partitions(

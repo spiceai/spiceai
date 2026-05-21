@@ -65,6 +65,7 @@ impl<Resp> CorrelatedResponses<Resp> {
     /// Registers a pending request and returns the receiver to await its response.
     /// Prefer [`send_correlated`] for the common case; this is exposed for callers
     /// that need to interleave the register/send steps.
+    #[must_use]
     pub fn register(&self, id: String) -> oneshot::Receiver<Resp> {
         let (tx, rx) = oneshot::channel();
         self.pending.insert(id, tx);
@@ -118,9 +119,22 @@ pub enum CorrelationError {
 /// `build_req` receives the generated `request_id` so the caller can place it into
 /// the appropriate field of whatever request message type it's constructing.
 ///
-/// Pass `Some(duration)` to bound the wait; `None` to wait indefinitely (the
-/// caller is then responsible for ensuring the pending entry doesn't leak — e.g.
-/// the message channel itself will drop the sender on disconnect).
+/// Pass `Some(duration)` to bound the wait; `None` to wait indefinitely. The
+/// pending entry lives in the [`CorrelatedResponses`] map regardless of
+/// `request_tx` state — closing the outbound channel does not drop the
+/// pending sender. With `None`, the caller is responsible for ensuring some
+/// other path eventually drops the pending entry to unblock the receiver
+/// (e.g. dropping the entire [`CorrelatedResponses`] when the executor
+/// connection is torn down, or calling [`CorrelatedResponses::remove`]).
+///
+/// # Errors
+///
+/// - [`CorrelationError::SendFailed`] if the outbound channel is closed.
+/// - [`CorrelationError::Timeout`] if `timeout` is `Some(_)` and elapses
+///   before a response arrives.
+/// - [`CorrelationError::Cancelled`] if the pending entry is removed (e.g.
+///   via [`CorrelatedResponses::remove`]) or the registry is dropped
+///   before delivery.
 pub async fn send_correlated<Req, Resp>(
     request_tx: &mpsc::Sender<Req>,
     pending: &CorrelatedResponses<Resp>,
@@ -135,15 +149,14 @@ pub async fn send_correlated<Req, Resp>(
         return SendFailedSnafu.fail();
     }
 
-    let recv_result = match timeout {
-        Some(duration) => match tokio::time::timeout(duration, rx).await {
-            Ok(inner) => inner,
-            Err(_) => {
-                pending.remove(&id);
-                return TimeoutSnafu { duration }.fail();
-            }
-        },
-        None => rx.await,
+    let recv_result = if let Some(duration) = timeout {
+        let Ok(inner) = tokio::time::timeout(duration, rx).await else {
+            pending.remove(&id);
+            return TimeoutSnafu { duration }.fail();
+        };
+        inner
+    } else {
+        rx.await
     };
 
     match recv_result {
@@ -165,7 +178,10 @@ mod tests {
         assert_eq!(pending.len(), 1);
 
         assert!(pending.deliver("a", 42));
-        assert_eq!(rx.await.unwrap(), 42);
+        assert_eq!(
+            rx.await.expect("deliver should have completed receiver"),
+            42
+        );
         assert!(pending.is_empty());
     }
 
@@ -181,7 +197,7 @@ mod tests {
         let rx = pending.register("a".to_string());
         pending.remove("a");
         // Sender was dropped, receiver sees Err.
-        assert!(rx.await.is_err());
+        rx.await.expect_err("receiver should observe sender drop");
     }
 
     #[tokio::test]
@@ -197,14 +213,9 @@ mod tests {
             }
         });
 
-        let resp = send_correlated(
-            &tx,
-            &pending,
-            |id| (id, 21),
-            Some(Duration::from_secs(1)),
-        )
-        .await
-        .unwrap();
+        let resp = send_correlated(&tx, &pending, |id| (id, 21), Some(Duration::from_secs(1)))
+            .await
+            .expect("send_correlated should succeed");
 
         assert_eq!(resp, 42);
         assert!(pending.is_empty());
@@ -223,7 +234,9 @@ mod tests {
             }
         });
 
-        let resp = send_correlated(&tx, &pending, |id| (id, 7), None).await.unwrap();
+        let resp = send_correlated(&tx, &pending, |id| (id, 7), None)
+            .await
+            .expect("send_correlated should succeed");
         assert_eq!(resp, 8);
         assert!(pending.is_empty());
     }
@@ -236,7 +249,7 @@ mod tests {
 
         let err = send_correlated(&tx, &pending, |id| id, Some(Duration::from_secs(1)))
             .await
-            .unwrap_err();
+            .expect_err("closed channel should fail send");
         assert!(matches!(err, CorrelationError::SendFailed));
         assert!(pending.is_empty());
     }
@@ -248,7 +261,7 @@ mod tests {
 
         let err = send_correlated(&tx, &pending, |id| id, Some(Duration::from_millis(50)))
             .await
-            .unwrap_err();
+            .expect_err("absent response should time out");
         assert!(matches!(err, CorrelationError::Timeout { .. }));
         assert!(pending.is_empty());
     }

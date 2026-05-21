@@ -244,6 +244,12 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Unable to deserialize partition expression for table {table}: {source}"))]
+    UnableToDeserializeClusterPartitionExpression {
+        table: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Unable to get secret for data connector {data_connector}: {source}"))]
     UnableToGetSecretForDataConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -722,85 +728,86 @@ impl Runtime {
         new_partitions: HashMap<String, Vec<Vec<u8>>>,
         removed_partitions: HashMap<String, Vec<Vec<u8>>>,
     ) -> Result<()> {
-        if let Some(DistributedNode::Executor {
+        let Some(DistributedNode::Executor {
             partition_assignments,
         }) = self.distributed.as_ref()
-        {
-            let mut guard = partition_assignments.write().await;
-
-            // Handle removed partitions
-            for (table_name, partitions) in &removed_partitions {
-                let table_ref = TableReference::parse_str(table_name)
-                    .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
-                if let Some(current_partitions) = guard.get_mut(&table_ref) {
-                    for partition_bytes in partitions {
-                        if let Ok(partition_expr) =
-                            Expr::from_bytes_with_registry(partition_bytes, self.df.ctx.as_ref())
-                        {
-                            current_partitions.retain(|p| p != &partition_expr);
-                        } else {
-                            tracing::warn!(
-                                "Failed to deserialize removed partition expression for table {table_name}"
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Handle new partitions
-            for (table_name, partitions) in &new_partitions {
-                let table_ref = TableReference::parse_str(table_name)
-                    .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
-                let current_partitions = guard.entry(table_ref.clone()).or_default();
-                for partition_bytes in partitions {
-                    if let Ok(partition_expr) = ::datafusion_expr::Expr::from_bytes_with_registry(
-                        partition_bytes,
-                        self.df.ctx.as_ref(),
-                    ) {
-                        if !current_partitions.contains(&partition_expr) {
-                            current_partitions.push(partition_expr);
-                        }
-                    } else {
-                        tracing::warn!(
-                            "Failed to deserialize new partition expression for table {table_name}"
-                        );
-                    }
-                }
-            }
-
-            // Identify all affected tables
-            let affected_tables: HashSet<_> = new_partitions
-                .keys()
-                .chain(removed_partitions.keys())
-                .collect();
-            drop(guard); // drop lock before updating tables
-
-            // Take a snapshot of the current assignments without holding the lock across .await
-            let assignments = {
-                let assignments_guard = partition_assignments.read().await;
-                assignments_guard.clone()
-            };
-
-            // Update all affected tables. If any fails, propagate the first
-            // error so the executor can ack the scheduler with a real reason —
-            // the scheduler can then retry the assignment later.
-            for table_name in affected_tables {
-                let resolved = TableReference::parse_str(table_name)
-                    .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
-
-                self.update_partition_refresh_sql(resolved.clone(), &assignments)
-                    .await?;
-            }
-            Ok(())
-        } else {
+        else {
             tracing::warn!(
                 "Attempted to update partition assignments on a non-executor node. Ignoring."
             );
             // Not an executor — there's nothing for us to apply. Report success
             // so the scheduler doesn't retry; the routing layer is what'd be
             // misconfigured here.
-            Ok(())
+            return Ok(());
+        };
+
+        // Compute the prospective post-update state from a snapshot of the
+        // current map. We apply the DataFusion filter updates against this
+        // *before* committing to shared state, so a per-table failure leaves
+        // the routing map unchanged and the scheduler's retry sees a
+        // consistent starting point on the next attempt.
+        let mut prospective: PartitionAssignments = partition_assignments.read().await.clone();
+
+        for (table_name, partitions) in &removed_partitions {
+            let table_ref = TableReference::parse_str(table_name)
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+            if let Some(current_partitions) = prospective.get_mut(&table_ref) {
+                for partition_bytes in partitions {
+                    let partition_expr =
+                        Expr::from_bytes_with_registry(partition_bytes, self.df.ctx.as_ref())
+                            .map_err(|source| {
+                                Error::UnableToDeserializeClusterPartitionExpression {
+                                    table: table_name.clone(),
+                                    source: Box::new(source),
+                                }
+                            })?;
+                    current_partitions.retain(|p| p != &partition_expr);
+                }
+            }
         }
+
+        for (table_name, partitions) in &new_partitions {
+            let table_ref = TableReference::parse_str(table_name)
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+            let current_partitions = prospective.entry(table_ref.clone()).or_default();
+            for partition_bytes in partitions {
+                let partition_expr = ::datafusion_expr::Expr::from_bytes_with_registry(
+                    partition_bytes,
+                    self.df.ctx.as_ref(),
+                )
+                .map_err(|source| {
+                    Error::UnableToDeserializeClusterPartitionExpression {
+                        table: table_name.clone(),
+                        source: Box::new(source),
+                    }
+                })?;
+                if !current_partitions.contains(&partition_expr) {
+                    current_partitions.push(partition_expr);
+                }
+            }
+        }
+
+        let affected_tables: HashSet<_> = new_partitions
+            .keys()
+            .chain(removed_partitions.keys())
+            .collect();
+
+        // Apply DataFusion filter updates against the prospective state. If any
+        // fails, the shared partition_assignments map is not modified — the
+        // scheduler retries the update and we'll re-attempt all tables.
+        for table_name in affected_tables {
+            let resolved = TableReference::parse_str(table_name)
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+
+            self.update_partition_refresh_sql(resolved.clone(), &prospective)
+                .await?;
+        }
+
+        // All filter updates succeeded — commit the new routing state. Last
+        // step so the planner's view of executor partitions never gets ahead
+        // of what the AcceleratedTables actually know about.
+        *partition_assignments.write().await = prospective;
+        Ok(())
     }
 
     pub(crate) async fn update_partition_refresh_sql(

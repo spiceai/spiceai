@@ -157,6 +157,22 @@ impl PartitionAssignmentTask {
             return Ok(());
         };
 
+        // Defer the cycle while any accelerated table is still loading — the
+        // notify path inside reconcile_all calls partition_value_to_bytes,
+        // which needs each table's schema in the SessionContext. Skipping is
+        // safe: the next periodic tick will retry.
+        let app_snapshot = service.app.read().await.clone();
+        if let Some(app) = app_snapshot
+            && let Some(not_ready) =
+                super::first_unready_accelerated_table(&app, self.df.as_ref()).await
+        {
+            tracing::debug!(
+                table = %not_ready,
+                "Deferring partition assignment cycle: accelerated table not yet registered"
+            );
+            return Ok(());
+        }
+
         service
             .reconcile_all(self.df.as_ref())
             .await

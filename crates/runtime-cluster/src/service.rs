@@ -44,7 +44,7 @@ use spicepod::partitioning::PartitionedBy;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 
-use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 use crate::context::PartitionOperations;
 use crate::executor_registry::{self, ExecutorRegistry};
@@ -1147,11 +1147,21 @@ async fn notify_executor_of_assignments(
             .build();
         let table_str = table.to_string();
 
+        // Wrap the payload in an Arc so each attempt's closure-build clones a
+        // cheap Arc handle instead of the full Vec<Vec<u8>>. We still
+        // materialize an owned Vec inside the closure body when constructing
+        // the proto message — that deep copy is unavoidable because
+        // BytesArray/UpdatePartitions own their data over the wire — but the
+        // Arc keeps it limited to one materialization per actual send rather
+        // than two per loop iteration.
+        let payload = Arc::new(BytesArray {
+            items: partitions_bytes,
+        });
+        let table_str = Arc::new(table_str);
+
         loop {
-            // Clone per attempt — both build_command's FnOnce and a possible
-            // retry require fresh owned data.
-            let partitions_bytes = partitions_bytes.clone();
-            let table_str = table_str.clone();
+            let payload = Arc::clone(&payload);
+            let table_str = Arc::clone(&table_str);
             let send_result = registry
                 .send_command_with_ack(
                     executor_id,
@@ -1159,10 +1169,8 @@ async fn notify_executor_of_assignments(
                         message: Some(SchedulerControlMessageEnum::UpdatePartitions(
                             UpdatePartitions {
                                 new_partitions: HashMap::from([(
-                                    table_str,
-                                    BytesArray {
-                                        items: partitions_bytes,
-                                    },
+                                    (*table_str).clone(),
+                                    (*payload).clone(),
                                 )]),
                                 removed_partitions: HashMap::new(),
                                 request_id,
