@@ -17,7 +17,8 @@ use std::time::Duration;
 use aws_config::Region;
 use aws_sdk_ec2::Client as Ec2Client;
 use aws_sdk_ec2::types::{
-    InstanceNetworkInterfaceSpecification, InstanceType, ResourceType, Tag, TagSpecification,
+    IamInstanceProfileSpecification, InstanceNetworkInterfaceSpecification, InstanceType,
+    ResourceType, Tag, TagSpecification,
 };
 use base64::Engine as _;
 use tokio_postgres::NoTls;
@@ -105,6 +106,19 @@ pub(crate) async fn launch_postgres_ec2(
                 .build(),
         );
 
+    if let Some(profile) = &args.ec2_iam_instance_profile {
+        let spec = if profile.starts_with("arn:") {
+            IamInstanceProfileSpecification::builder()
+                .arn(profile)
+                .build()
+        } else {
+            IamInstanceProfileSpecification::builder()
+                .name(profile)
+                .build()
+        };
+        run_req = run_req.iam_instance_profile(spec);
+    }
+
     if args.ec2_associate_public_ip {
         run_req = run_req.network_interfaces(
             InstanceNetworkInterfaceSpecification::builder()
@@ -139,6 +153,13 @@ pub(crate) async fn launch_postgres_ec2(
         get_instance_private_ip(&ec2, &instance_id).await?
     };
     eprintln!("[stdio] EC2: instance {instance_id} running at {host}");
+
+    if args.ec2_iam_instance_profile.is_some() {
+        eprintln!(
+            "[stdio] EC2: Session Manager console: \
+             https://{region}.console.aws.amazon.com/systems-manager/session-manager/{instance_id}?region={region}"
+        );
+    }
 
     eprintln!("[stdio] EC2: waiting for PostgreSQL at {host}:{PG_PORT}...");
     wait_for_postgres(&host, PG_PORT, DEFAULT_PG_USER, &pg_password, DEFAULT_PG_DATABASE).await?;

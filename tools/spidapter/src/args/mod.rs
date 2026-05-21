@@ -216,6 +216,12 @@ pub struct StdioArgs {
     #[arg(long, env = "EC2_ASSOCIATE_PUBLIC_IP", default_value_t = false)]
     pub ec2_associate_public_ip: bool,
 
+    /// IAM instance profile name or ARN to attach to the provisioned EC2 instance.
+    /// Required for AWS Systems Manager Session Manager access (connect via AWS console).
+    /// The profile must include the `AmazonSSMManagedInstanceCore` managed policy.
+    #[arg(long, env = "EC2_IAM_INSTANCE_PROFILE")]
+    pub ec2_iam_instance_profile: Option<String>,
+
     /// Name or path of the spiced binary to spawn (local backend only).
     #[arg(long, default_value = "spiced")]
     pub spiced_binary: String,
