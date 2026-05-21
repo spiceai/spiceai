@@ -241,7 +241,7 @@ impl SpiceCloudPlatformCatalog {
                 return Err(super::Error::InvalidConfigurationNoSource {
                     connector: "spice.ai".into(),
                     message: format!(
-                        "Invalid Spice Cloud region: {region}. Specify a valid region, for example us-east-1. To list available regions, run: spice cloud regions"
+                        "Invalid Spice Cloud region: {region}. Specify a valid region, for example 'spiceai_region: us-east-1'. To list available regions, run: 'spice cloud regions'"
                     ),
                     connector_component: ConnectorComponent::from(catalog),
                 });
@@ -252,7 +252,7 @@ impl SpiceCloudPlatformCatalog {
 
         Err(super::Error::InvalidConfigurationNoSource {
             connector: "spice.ai".into(),
-            message: "Missing Spice Cloud region. Specify a valid region, for example us-east-1. To list available regions, run: spice cloud regions".to_string(),
+            message: "Missing Spice Cloud region. Specify a valid region, for example 'spiceai_region: us-east-1'. To list available regions, run: 'spice cloud regions'".to_string(),
             connector_component: ConnectorComponent::from(catalog),
         })
     }
