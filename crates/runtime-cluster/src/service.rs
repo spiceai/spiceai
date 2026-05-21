@@ -772,6 +772,9 @@ async fn notify_executor_to_unload(
                                 items: partitions_bytes,
                             },
                         )]),
+                        // Empty == no ack requested. This call site is the
+                        // unload path; switch to ack-based in a follow-up.
+                        request_id: String::new(),
                     },
                 )),
             },
@@ -1136,6 +1139,10 @@ async fn notify_executor_of_assignments(
                         },
                     )]),
                     removed_partitions: HashMap::new(),
+                    // TODO: switched to ack-based send in the next commit; this
+                    // empty request_id keeps the legacy fire-and-forget shape
+                    // until the new call site replaces it.
+                    request_id: String::new(),
                 },
             )),
         };

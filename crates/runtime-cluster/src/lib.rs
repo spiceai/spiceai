@@ -37,7 +37,9 @@ pub use cluster_state::{
     ClusterState, ClusterStateStore, MutateError, MutateOk, MutationOutcome, PartitionScope,
     SchedulerEntry, SchedulerId,
 };
-pub use executor_registry::{ExecutorRegistry, FederatedPartitionProvider, TablePartitions};
+pub use executor_registry::{
+    ExecutorRegistry, FederatedPartitionProvider, RegisteredHandles, TablePartitions,
+};
 pub use metadata::{
     PartitionMetadata, PartitionValue, TablePartitionMetadata, normalized_table_name,
     partition_value_to_bytes,

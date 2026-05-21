@@ -29,7 +29,7 @@ use datafusion::{catalog::TableProvider, sql::TableReference};
 use datafusion_expr::{Expr, TableScan};
 use flight_client::cookie::CookieStore;
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;
-use runtime_proto::{MetricsRequest, MetricsResponse, SchedulerControlMessage};
+use runtime_proto::{Ack, MetricsRequest, MetricsResponse, SchedulerControlMessage};
 use snafu::prelude::*;
 use tokio::sync::{RwLock, mpsc};
 
@@ -58,6 +58,10 @@ pub struct ExecutorConnection {
     request_tx: mpsc::Sender<SchedulerControlMessage>,
     /// Pending metrics requests awaiting responses, keyed by `request_id`.
     pending_metrics: CorrelatedResponses<MetricsResponse>,
+    /// Pending control-command acks awaiting responses, keyed by `request_id`.
+    /// Used by commands (e.g. `UpdatePartitions`) that need delivery
+    /// confirmation rather than fire-and-forget.
+    pending_acks: CorrelatedResponses<Ack>,
 }
 
 impl ExecutorConnection {
@@ -67,6 +71,7 @@ impl ExecutorConnection {
         Self {
             request_tx,
             pending_metrics: CorrelatedResponses::new(),
+            pending_acks: CorrelatedResponses::new(),
         }
     }
 
@@ -75,6 +80,14 @@ impl ExecutorConnection {
     #[must_use]
     pub fn pending_metrics(&self) -> CorrelatedResponses<MetricsResponse> {
         self.pending_metrics.clone()
+    }
+
+    /// Returns a cheap clone of the pending-acks registry. Used by the
+    /// control-stream inbound handler to deliver `Ack` messages, and by
+    /// notify-with-ack call sites to await delivery confirmation.
+    #[must_use]
+    pub fn pending_acks(&self) -> CorrelatedResponses<Ack> {
+        self.pending_acks.clone()
     }
 
     /// Sends a metrics request to this executor and waits for the response.
@@ -109,6 +122,15 @@ impl ExecutorConnection {
 }
 
 pub type TablePartitions = HashMap<TableReference, Vec<Expr>>;
+
+/// Cheap-to-clone handles returned to the control-stream inbound dispatcher
+/// at registration time. Routes correlated executor→scheduler messages
+/// (metrics responses, command acks) to whoever is awaiting them.
+#[derive(Debug, Clone)]
+pub struct RegisteredHandles {
+    pub pending_metrics: CorrelatedResponses<MetricsResponse>,
+    pub pending_acks: CorrelatedResponses<Ack>,
+}
 
 /// Append-only log of DDL SQL statements applied to the cluster.
 ///
@@ -234,9 +256,12 @@ impl ExecutorRegistry {
         &self,
         executor_id: String,
         request_tx: mpsc::Sender<SchedulerControlMessage>,
-    ) -> CorrelatedResponses<MetricsResponse> {
+    ) -> RegisteredHandles {
         let connection = ExecutorConnection::new(request_tx);
-        let pending_metrics = connection.pending_metrics();
+        let handles = RegisteredHandles {
+            pending_metrics: connection.pending_metrics(),
+            pending_acks: connection.pending_acks(),
+        };
 
         let mut connections = self.connections.write().await;
         if connections.contains_key(&executor_id) {
@@ -246,7 +271,7 @@ impl ExecutorRegistry {
         }
         connections.insert(executor_id, connection);
 
-        pending_metrics
+        handles
     }
 
     /// Unregisters an executor and removes it from all three tracking maps.
@@ -380,6 +405,7 @@ impl ExecutorRegistry {
                 let temp_connection = ExecutorConnection {
                     request_tx,
                     pending_metrics,
+                    pending_acks: CorrelatedResponses::new(),
                 };
                 let result = temp_connection.request_metrics(&executor_id).await;
                 (executor_id, result)

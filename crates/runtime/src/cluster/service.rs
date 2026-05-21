@@ -526,7 +526,7 @@ impl ClusterService for ClusterServiceImpl {
             };
 
             // Register the executor with the registry.
-            let pending_metrics = executor_registry
+            let handles = executor_registry
                 .register(executor_id.clone(), outbound_tx_for_registry)
                 .await;
 
@@ -547,24 +547,39 @@ impl ClusterService for ClusterServiceImpl {
                         match result {
                             Some(Ok(msg)) => {
                                 if let Some(message) = msg.message {
-                                    // Route correlated responses (metrics) to their waiters;
+                                    // Route correlated responses (metrics, acks) to their waiters;
                                     // anything else goes to the general handler.
-                                    if let ExecutorMessage::Metrics(response) = &message {
-                                        if !pending_metrics
-                                            .deliver(&response.request_id, response.clone())
-                                        {
-                                            tracing::warn!(
-                                                "Received metrics response for unknown request_id: {}",
-                                                response.request_id
-                                            );
+                                    match &message {
+                                        ExecutorMessage::Metrics(response) => {
+                                            if !handles
+                                                .pending_metrics
+                                                .deliver(&response.request_id, response.clone())
+                                            {
+                                                tracing::warn!(
+                                                    "Received metrics response for unknown request_id: {}",
+                                                    response.request_id
+                                                );
+                                            }
                                         }
-                                    } else {
-                                        handle_executor_message(
-                                            &executor_id,
-                                            &message,
-                                            &datafusion,
-                                        )
-                                        .await;
+                                        ExecutorMessage::Ack(ack) => {
+                                            if !handles
+                                                .pending_acks
+                                                .deliver(&ack.request_id, ack.clone())
+                                            {
+                                                tracing::warn!(
+                                                    "Received ack for unknown request_id: {}",
+                                                    ack.request_id
+                                                );
+                                            }
+                                        }
+                                        _ => {
+                                            handle_executor_message(
+                                                &executor_id,
+                                                &message,
+                                                &datafusion,
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
                             }
@@ -804,6 +819,11 @@ async fn handle_executor_message(
             tracing::warn!(
                 "Unexpected metrics response in handle_executor_message for {executor_id}"
             );
+        }
+        ExecutorMessage::Ack(_) => {
+            // Acks are handled separately in the stream handler via pending_acks.
+            // This shouldn't be reached, but log if it is.
+            tracing::warn!("Unexpected ack in handle_executor_message for {executor_id}");
         }
         ExecutorMessage::Shutdown(shutdown) => {
             let reason = if shutdown.reason.is_empty() {
