@@ -112,8 +112,8 @@ impl DeletionVectorWriteSpec {
     ///
     /// Currently only the test suite exercises this constructor; production
     /// code uses the `_sorted` variant.
+    #[cfg(test)]
     #[must_use]
-    #[allow(dead_code)]
     pub fn new_position_based(file_path: String, row_ids: Vec<u64>) -> Self {
         Self {
             identifiers: DeletionIdentifier::PositionBased {
@@ -253,14 +253,14 @@ impl<'a> DeletionVectorWriter<'a> {
                     mut row_ids,
                     pre_sorted,
                 } => {
-                    if !pre_sorted {
-                        row_ids.sort_unstable();
-                        row_ids.dedup();
-                    } else {
+                    if pre_sorted {
                         debug_assert!(
                             row_ids.windows(2).all(|w| w[0] < w[1]),
                             "pre_sorted=true but row_ids is not strictly increasing",
                         );
+                    } else {
+                        row_ids.sort_unstable();
+                        row_ids.dedup();
                     }
                     let count = row_ids.len();
                     let schema = position_based_deletion_schema();

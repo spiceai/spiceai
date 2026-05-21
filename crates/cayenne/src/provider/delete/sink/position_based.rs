@@ -552,27 +552,26 @@ impl CayenneDeletionSink {
                 })?;
             let batch = arrow::record_batch::RecordBatch::from(struct_array);
 
-            let key_indices: &[usize] = match &key_indices {
-                Some(indices) => indices.as_slice(),
-                None => {
-                    let resolved: Vec<usize> = key_columns
-                        .iter()
-                        .map(|col_name| {
-                            batch.schema().index_of(col_name).map_err(|_| {
-                                Error::Internal {
-                                    table: table_name.clone(),
-                                    message: format!(
-                                        "Key column '{col_name}' not found in Vortex file schema"
-                                    ),
-                                }
+            let key_indices: &[usize] = if let Some(indices) = &key_indices {
+                indices.as_slice()
+            } else {
+                let resolved: Vec<usize> = key_columns
+                    .iter()
+                    .map(|col_name| {
+                        batch
+                            .schema()
+                            .index_of(col_name)
+                            .map_err(|_| Error::Internal {
+                                table: table_name.clone(),
+                                message: format!(
+                                    "Key column '{col_name}' not found in Vortex file schema"
+                                ),
                             })
-                        })
-                        .collect::<crate::provider::Result<Vec<_>>>()?;
-                    key_indices = Some(resolved);
-                    key_indices
-                        .as_deref()
-                        .expect("just stored Some(_)")
-                }
+                    })
+                    .collect::<crate::provider::Result<Vec<_>>>()?;
+                key_indices = Some(resolved);
+                // SAFETY: we just assigned `Some` above
+                key_indices.as_deref().unwrap_or(&[])
             };
 
             for row_idx in 0..batch.num_rows() {

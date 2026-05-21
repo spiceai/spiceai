@@ -1100,14 +1100,14 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         delete_file_ids: &[String],
     ) -> CatalogResult<()> {
-        if delete_file_ids.is_empty() {
-            return Ok(());
-        }
-
         use std::fmt::Write as _;
 
         const PREFIX: &str =
             "DELETE FROM cayenne_delete_file WHERE table_id = ?1 AND delete_file_id IN (";
+
+        if delete_file_ids.is_empty() {
+            return Ok(());
+        }
         let mut sql = String::with_capacity(PREFIX.len() + delete_file_ids.len() * 6 + 1);
         sql.push_str(PREFIX);
         for idx in 0..delete_file_ids.len() {

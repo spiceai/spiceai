@@ -1175,7 +1175,7 @@ pub struct CayenneTableProvider {
     /// At scan time, data from these snapshots is scanned without deletion filtering.
     /// Snapshot-id → max-delete-sequence-at-creation. Wait-free reads via
     /// `ArcSwap`: scan paths take `Arc::clone` instead of cloning the
-    /// HashMap; writes use `rcu` to publish a copy-on-write update.
+    /// `HashMap`; writes use `rcu` to publish a copy-on-write update.
     protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
     /// Table-scoped warning dedupe for protected snapshot ids that cannot
     /// provide a `UUIDv7` timestamp for age-triggered maintenance.
@@ -2076,12 +2076,8 @@ impl CayenneTableProvider {
             // Read the LIVE protected set after the grace period. During the
             // sleep, CDC writers may have created new protected snapshots that
             // must not be deleted.
-            let protected_snapshot_ids: HashSet<String> = self
-                .protected_snapshots
-                .load()
-                .keys()
-                .cloned()
-                .collect();
+            let protected_snapshot_ids: HashSet<String> =
+                self.protected_snapshots.load().keys().cloned().collect();
             if let Err(err) = self
                 .cleanup_old_snapshots_s3(current_snapshot, &protected_snapshot_ids)
                 .await
@@ -4478,12 +4474,11 @@ impl CayenneTableProvider {
                 // Reuse the table's cached RowConverter when available — building
                 // a fresh one revalidates each SortField.
                 let owned_converter;
-                let converter: &RowConverter = match self.pk_row_converter.as_deref() {
-                    Some(c) => c,
-                    None => {
-                        owned_converter = self.build_pk_converter(pk_indices)?;
-                        &owned_converter
-                    }
+                let converter: &RowConverter = if let Some(c) = self.pk_row_converter.as_deref() {
+                    c
+                } else {
+                    owned_converter = self.build_pk_converter(pk_indices)?;
+                    &owned_converter
                 };
 
                 let pk_columns: Vec<_> = pk_indices
@@ -6001,8 +5996,7 @@ impl CayenneTableProvider {
         }
 
         // Clear protected snapshots - after compaction all data is in the main snapshot
-        self.protected_snapshots
-            .store(Arc::new(HashMap::new()));
+        self.protected_snapshots.store(Arc::new(HashMap::new()));
 
         self.clear_cached_pk_keyset();
 
