@@ -298,6 +298,7 @@ impl ExecutionPlan for IcebergCreateSchemaExec {
                     &df_schema_name,
                     if_not_exists,
                 );
+                registry.append_ddl(forward_sql.clone()).await;
                 forward_ddl_to_executors(registry, &forward_sql).await?;
             }
 
@@ -983,6 +984,7 @@ async fn synchronize_distributed_write_through_registration(
             dataset_options,
             partition_expr_sql,
         )?;
+        registry.append_ddl(forward_sql.clone()).await;
         forward_ddl_to_executors(registry, &forward_sql).await?;
     }
 
@@ -1105,6 +1107,7 @@ fn render_refresh_mode(mode: &spicepod::acceleration::RefreshMode) -> &'static s
         spicepod::acceleration::RefreshMode::Append => "append",
         spicepod::acceleration::RefreshMode::Changes => "changes",
         spicepod::acceleration::RefreshMode::Caching => "caching",
+        spicepod::acceleration::RefreshMode::Snapshot => "snapshot",
     }
 }
 

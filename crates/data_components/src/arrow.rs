@@ -154,8 +154,8 @@ impl TableProviderFactory for ArrowFactory {
         // Extract primary key columns for hash index
         let primary_key_columns = extract_primary_key_columns(&cmd.constraints, &schema);
 
-        // Hash index is disabled by default. Must be explicitly enabled with hash_index=enabled.
-        // When enabled, either a primary_key or secondary indexes (via `indexes`) must be specified.
+        // Hash index is enabled by the runtime through this internal option when a primary_key
+        // or secondary indexes are specified.
         let enable_hash_index = cmd
             .options
             .get("hash_index")
@@ -163,21 +163,17 @@ impl TableProviderFactory for ArrowFactory {
 
         // If hash index is enabled, use IndexedMemTable
         if enable_hash_index {
-            // Parse secondary indexes to check if any are unique
+            // Parse secondary indexes to check if any are configured.
             let indexes_config = if let Some(indexes_str) = cmd.options.get("indexes") {
                 parse_indexes_option(indexes_str, &schema)?
             } else {
                 Vec::new()
             };
-            let has_unique_secondary_indexes = indexes_config
-                .iter()
-                .any(|(_, index_type)| *index_type == IndexType::Unique);
 
-            // At least one of primary_key or unique indexes must be specified
-            if primary_key_columns.is_empty() && !has_unique_secondary_indexes {
+            // At least one of primary_key or indexes must be specified.
+            if primary_key_columns.is_empty() && indexes_config.is_empty() {
                 return Err(DataFusionError::Configuration(
-                    "hash_index requires a primary_key or unique indexes to be specified"
-                        .to_string(),
+                    "hash_index requires a primary_key or indexes to be specified".to_string(),
                 ));
             }
 
@@ -414,12 +410,12 @@ mod tests {
         let state = SessionStateBuilder::new().build();
         let result = factory.create(&state, &cmd).await;
 
-        // Should fail because hash_index=enabled requires primary_key or unique indexes
+        // Should fail because hash_index=enabled requires primary_key or indexes.
         assert!(result.is_err());
         let err = result.expect_err("expected error");
         assert!(
-            err.to_string().contains("primary_key or unique indexes"),
-            "Error should mention primary_key or unique indexes requirement: {err}"
+            err.to_string().contains("primary_key or indexes"),
+            "Error should mention primary_key or indexes requirement: {err}"
         );
     }
 

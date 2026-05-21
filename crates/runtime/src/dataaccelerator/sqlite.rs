@@ -21,6 +21,7 @@ use crate::{
     dataaccelerator::{
         FilePathError,
         snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
+        storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
     },
     datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
@@ -36,7 +37,8 @@ use datafusion::{
 };
 use datafusion_table_providers::{
     sql::db_connection_pool::{
-        dbconnection::sqliteconn::SqliteConnection, sqlitepool::SqliteConnectionPool,
+        self as db_connection_pool, dbconnection::sqliteconn::SqliteConnection,
+        sqlitepool::SqliteConnectionPool,
     },
     sqlite::{SqliteTableProviderFactory, write::SqliteTableWriter},
 };
@@ -124,7 +126,7 @@ impl SqliteAccelerator {
             sqlite_factory: SqliteTableProviderFactory::new()
                 .with_batch_insert_use_prepared_statements(true)
                 .with_decimal_between(true)
-                .with_function_support(deny_spice_specific_functions().clone()),
+                .with_function_support(deny_spice_specific_functions().as_ref().clone()),
         }
     }
 
@@ -161,6 +163,45 @@ impl SqliteAccelerator {
         Ok(Duration::from_millis(5000))
     }
 
+    /// Returns the effective `busy_timeout`, applying storage-profile defaults
+    /// when the user did not explicitly set `busy_timeout`.
+    ///
+    /// For network-attached storage (`Ebs`), fsync latency spikes are more
+    /// likely, so we default to a longer timeout to reduce spurious
+    /// `SQLITE_BUSY` errors.
+    fn effective_busy_timeout(
+        &self,
+        source: &dyn AccelerationSource,
+        storage: ResolvedAccelerationStorage,
+    ) -> Result<Duration> {
+        let user_set = source
+            .acceleration()
+            .is_some_and(|a| a.params.contains_key("busy_timeout"));
+        if user_set {
+            return self.sqlite_busy_timeout(source);
+        }
+        Ok(match storage {
+            ResolvedAccelerationStorage::Ebs => Duration::from_millis(15_000),
+            _ => Duration::from_millis(5_000),
+        })
+    }
+
+    /// Returns extra PRAGMA statements to apply post-init based on storage
+    /// profile. These are durability-preserving (cache size + memory mapping)
+    /// and never weaken `synchronous` or `journal_mode`.
+    fn storage_setup_pragmas(storage: ResolvedAccelerationStorage) -> &'static [&'static str] {
+        match storage {
+            // Larger page cache to absorb network latency on EBS-class storage.
+            // `cache_size` in negative form is KiB; -200000 => ~200 MiB.
+            ResolvedAccelerationStorage::Ebs => {
+                &["PRAGMA cache_size=-200000", "PRAGMA mmap_size=268435456"]
+            }
+            ResolvedAccelerationStorage::Tmpfs
+            | ResolvedAccelerationStorage::LocalSsd
+            | ResolvedAccelerationStorage::Unknown => &[],
+        }
+    }
+
     /// Returns an existing `SQLite` connection pool for the given dataset, or creates a new one if it doesn't exist.
     pub async fn get_shared_pool(
         &self,
@@ -178,18 +219,71 @@ impl SqliteAccelerator {
             }
             Mode::Memory => datafusion_table_providers::sql::db_connection_pool::Mode::Memory,
         };
+
+        let storage = if matches!(
+            acceleration.mode,
+            Mode::File | Mode::FileCreate | Mode::FileUpdate
+        ) {
+            let resolved =
+                resolve_acceleration_storage_async(acceleration.storage_profile, &sqlite_file)
+                    .await;
+            tracing::debug!(
+                "SQLite accelerator for {dataset} using storage profile {resolved} (file: {file})",
+                dataset = source.name(),
+                file = sqlite_file
+            );
+            resolved
+        } else {
+            ResolvedAccelerationStorage::Unknown
+        };
+
         let file_path: Arc<str> = sqlite_file.into();
-        let busy_timeout = self.sqlite_busy_timeout(source)?;
+        let busy_timeout = self.effective_busy_timeout(source, storage)?;
 
         let pool = self
             .sqlite_factory
-            .get_or_init_instance(file_path, mode, busy_timeout)
+            .get_or_init_instance(Arc::clone(&file_path), mode, busy_timeout)
             .await
             .boxed()
             .context(AccelerationCreationFailedSnafu)?;
 
+        // Apply storage-profile pragmas after the pool's own `setup()` so they
+        // override the engine-default cache/mmap sizes.
+        let pragmas = Self::storage_setup_pragmas(storage);
+        if !pragmas.is_empty() {
+            apply_sqlite_pragmas(&pool, pragmas)
+                .await
+                .map_err(|source| Error::AccelerationCreationFailed { source })?;
+        }
+
         Ok(pool)
     }
+}
+
+/// Execute a sequence of PRAGMA statements against the shared `SQLite`
+/// connection backing the pool. Failures are logged and propagated so that
+/// pool creation surfaces misconfiguration rather than silently dropping the
+/// pragma.
+async fn apply_sqlite_pragmas(
+    pool: &SqliteConnectionPool,
+    pragmas: &[&'static str],
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
+    let conn = pool.connect().await?;
+    let Some(async_conn) = conn.as_async() else {
+        unreachable!("SqliteConnectionPool only returns async-capable SQLite connections");
+    };
+    for pragma in pragmas {
+        if let Err(err) = async_conn.execute(pragma, &[]).await {
+            tracing::warn!(
+                pragma,
+                error = %err,
+                "Failed to apply SQLite storage-profile pragma"
+            );
+            return Err(err);
+        }
+    }
+    Ok(())
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
@@ -276,6 +370,7 @@ impl DataAccelerator for SqliteAccelerator {
                         )),
                         AccelerationEngine::Sqlite,
                         Arc::new(arrow_schema::Schema::empty()),
+                        None,
                     )
                     .await;
 
@@ -294,6 +389,7 @@ impl DataAccelerator for SqliteAccelerator {
                 source,
                 runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
                 AccelerationEngine::Sqlite,
+                None,
             )
             .await;
 
@@ -392,6 +488,47 @@ impl DataAccelerator for SqliteAccelerator {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    fn supports_snapshot_reload(&self) -> bool {
+        true
+    }
+
+    /// Reloads the SQLite-backed table provider from the snapshot file that
+    /// was just written to the primary path.
+    ///
+    /// Drops the previous provider, evicts the cached connection pool from
+    /// the upstream `SqliteTableProviderFactory` registry, and then re-runs
+    /// the registry factory to build a fresh provider over the on-disk file.
+    /// See the `DuckDB` implementation for the rationale around evicting the
+    /// pool before rebuilding.
+    async fn reload_from_snapshot(
+        &self,
+        source: &dyn AccelerationSource,
+        previous_provider: Arc<dyn TableProvider>,
+        provider_factory: super::ReloadProviderFactory,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        drop(previous_provider);
+
+        let acceleration =
+            source
+                .acceleration()
+                .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                    "acceleration not configured for snapshot reload".into()
+                })?;
+        match acceleration.mode {
+            Mode::File | Mode::FileCreate | Mode::FileUpdate => {
+                let path = self.sqlite_file_path(source).boxed()?;
+                self.sqlite_factory.invalidate_file_instance(path).await;
+            }
+            Mode::Memory => {
+                self.sqlite_factory
+                    .invalidate_instance(&db_connection_pool::DbInstanceKey::memory())
+                    .await;
+            }
+        }
+
+        provider_factory().await
     }
 
     async fn drop_table(

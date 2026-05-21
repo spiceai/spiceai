@@ -13,11 +13,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#[cfg(test)]
 use crate::accelerated_table::refresh_task::changes::get_primary_key_value;
+use crate::accelerated_table::refresh_task::changes::get_primary_key_value_at_row;
 use arrow::array::RecordBatch;
 use data_components::cdc::ChangeBatch;
 use datafusion::logical_expr::{Expr, col};
 
+#[cfg(test)]
 pub fn build_batch_delete_expr<F, G>(
     row_indices: &[usize],
     get_primary_keys: F,
@@ -74,12 +77,40 @@ pub fn build_batch_delete_expr_from_change_batch(
     row_indices: &[usize],
     dataset_name: &str,
 ) -> crate::accelerated_table::Result<Option<Expr>> {
-    build_batch_delete_expr(
-        row_indices,
-        |row| change_batch.primary_keys(row),
-        |row| change_batch.data(row),
-        dataset_name,
-    )
+    if row_indices.is_empty() {
+        return Ok(None);
+    }
+
+    let first_row_pks = change_batch.primary_keys(row_indices[0]);
+    if first_row_pks.is_empty() {
+        return Err(crate::accelerated_table::Error::NoPrimaryKeysDefined {
+            dataset_name: dataset_name.to_string(),
+        });
+    }
+
+    let data_batch = change_batch.data_batch();
+    if first_row_pks.len() == 1 {
+        return Ok(Some(build_in_list_expr_from_batch(
+            row_indices,
+            &first_row_pks[0],
+            &data_batch,
+        )?));
+    }
+
+    let row_conditions: Vec<Expr> = row_indices
+        .iter()
+        .map(|&row| {
+            let primary_keys = change_batch.primary_keys(row);
+            let exprs = get_delete_where_expr_from_batch(&data_batch, row, primary_keys)?;
+            balanced_binary(exprs, Expr::and).ok_or_else(|| {
+                crate::accelerated_table::Error::NoPrimaryKeysDefined {
+                    dataset_name: dataset_name.to_string(),
+                }
+            })
+        })
+        .collect::<crate::accelerated_table::Result<Vec<_>>>()?;
+
+    Ok(balanced_binary(row_conditions, Expr::or))
 }
 
 /// Builds a balanced binary tree of expressions to avoid deep nesting.
@@ -122,6 +153,7 @@ fn balanced_binary_impl(mut conditions: Vec<Expr>, op: fn(Expr, Expr) -> Expr) -
 ///
 /// Instead of `id = 1 OR id = 2 OR id = 3 ...` (deeply nested tree),
 /// creates `id IN (1, 2, 3, ...)` which is a flat structure with O(1) depth.
+#[cfg(test)]
 fn build_in_list_expr<G>(
     row_indices: &[usize],
     primary_key: &str,
@@ -142,6 +174,23 @@ where
     Ok(col(primary_key).in_list(values, false))
 }
 
+fn build_in_list_expr_from_batch(
+    row_indices: &[usize],
+    primary_key: &str,
+    data: &RecordBatch,
+) -> crate::accelerated_table::Result<Expr> {
+    let values: Vec<Expr> = row_indices
+        .iter()
+        .map(|&row| {
+            let (_, expr_val) = get_primary_key_value_at_row(data, row, primary_key)?;
+            Ok(expr_val)
+        })
+        .collect::<crate::accelerated_table::Result<Vec<_>>>()?;
+
+    Ok(col(primary_key).in_list(values, false))
+}
+
+#[cfg(test)]
 fn get_delete_where_expr(
     data: &RecordBatch,
     primary_keys: Vec<String>,
@@ -156,6 +205,21 @@ fn get_delete_where_expr(
     Ok(delete_where_exprs)
 }
 
+fn get_delete_where_expr_from_batch(
+    data: &RecordBatch,
+    row: usize,
+    primary_keys: Vec<String>,
+) -> crate::accelerated_table::Result<Vec<Expr>> {
+    let mut delete_where_exprs: Vec<Expr> = Vec::with_capacity(primary_keys.len());
+
+    for primary_key in primary_keys {
+        let (_, expr_val) = get_primary_key_value_at_row(data, row, &primary_key)?;
+        delete_where_exprs.push(col(primary_key).eq(expr_val));
+    }
+
+    Ok(delete_where_exprs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +228,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::Operator;
+    use datafusion::logical_expr::utils::split_binary;
     use std::sync::Arc;
 
     fn make_single_row_batch(pk: i64, sk: &str) -> RecordBatch {
@@ -447,28 +512,12 @@ mod tests {
         assert!(pairs.contains(&(2, "b".to_string())));
     }
 
-    /// Recursively collects all leaf conditions from an OR tree
     fn collect_or_conditions(expr: &Expr) -> Vec<&Expr> {
-        match expr {
-            Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
-                let mut conditions = collect_or_conditions(&binary.left);
-                conditions.extend(collect_or_conditions(&binary.right));
-                conditions
-            }
-            _ => vec![expr],
-        }
+        split_binary(expr, Operator::Or)
     }
 
-    /// Recursively collects all leaf conditions from an AND tree
     fn collect_and_conditions(expr: &Expr) -> Vec<&Expr> {
-        match expr {
-            Expr::BinaryExpr(binary) if binary.op == Operator::And => {
-                let mut conditions = collect_and_conditions(&binary.left);
-                conditions.extend(collect_and_conditions(&binary.right));
-                conditions
-            }
-            _ => vec![expr],
-        }
+        split_binary(expr, Operator::And)
     }
 
     /// Checks if expression is `column_name = <something>`

@@ -71,6 +71,8 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   CARGO_NET_RETRY: 10
   CARGO_HTTP_TIMEOUT: 60
+  AI_INTEGRATION_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/ai-integration-test-archive/integration.tar.zst
+  AI_INTEGRATION_EXTENDED_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/ai-integration-test-archive-extended/integration-extended.tar.zst
 
 jobs:
   build:
@@ -80,7 +82,7 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
           fetch-depth: 1 # Shallow clone for faster checkout
@@ -91,7 +93,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
+        uses: spiceai/spiceio/.github/actions/setup@e31c63cbe88a6e284fc187875261106a05034775 # v0.5.4
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -129,34 +131,68 @@ jobs:
 
           cargo nextest archive -p runtime --test integration_models --features ${FEATURES} --archive-file integration.tar.zst
 
-      # Upload the test archive as an artifact
+      - name: Preserve sccache spiceio log
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: cp "${{ runner.temp }}/spiceio.log" "${{ runner.temp }}/spiceio-sccache.log" || true
+
+      - name: Stop sccache spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Clean spiceio install directory
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        run: rm -rf "${{ runner.temp }}/spiceio-bin"
+
+      - name: Set up spiceio for build archive
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio-build
+        uses: spiceai/spiceio/.github/actions/setup@e31c63cbe88a6e284fc187875261106a05034775 # v0.5.4
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: build
+          region: us-west-1
+
+      - name: Upload test archive to spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        env:
+          SPICEIO_ENDPOINT: ${{ steps.setup-spiceio-build.outputs.endpoint }}
+        run: |
+          set -euo pipefail
+          : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to upload the AI integration test archive}"
+          archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}"
+          curl --fail --silent --show-error --upload-file ./integration.tar.zst "$archive_url"
+
       - name: Upload test archive
+        if: env.HAS_SPICEIO_SECRET != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ai-integration-test-archive
           path: ./integration.tar.zst
           retention-days: 3
-          # Archive is already zstd-compressed; use minimal artifact zip compression.
           compression-level: 1
 
-      - name: Kill spiceio
-        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
-        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+      - name: Kill build archive spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio-build.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio-build.outputs.pid }} || true
 
       - name: Upload spiceio logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiceio-models-build-logs
-          path: ${{ runner.temp }}/spiceio.log
+          path: ${{ runner.temp }}/spiceio*.log
           if-no-files-found: ignore
 
   test-models:
     name: Test Models, AI & Search
     needs: build
     runs-on: spiceai-macos
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
 
@@ -166,7 +202,30 @@ jobs:
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
 
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@e31c63cbe88a6e284fc187875261106a05034775 # v0.5.4
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: build
+          region: us-west-1
+
+      - name: Download test archive from spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        env:
+          SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
+        run: |
+          set -euo pipefail
+          : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to download the AI integration test archive}"
+          mkdir -p ./integration_test
+          archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}"
+          curl --fail --silent --show-error --output ./integration_test/integration.tar.zst "$archive_url"
+
       - name: Download test archive
+        if: env.HAS_SPICEIO_SECRET != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: ai-integration-test-archive
@@ -310,13 +369,19 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Kill spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
   test-hf:
     name: Test Hugging Face Models
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
     runs-on: spiceai-macos
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
 
@@ -326,7 +391,30 @@ jobs:
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
 
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@e31c63cbe88a6e284fc187875261106a05034775 # v0.5.4
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: build
+          region: us-west-1
+
+      - name: Download test archive from spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        env:
+          SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
+        run: |
+          set -euo pipefail
+          : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to download the AI integration test archive}"
+          mkdir -p ./integration_test
+          archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}"
+          curl --fail --silent --show-error --output ./integration_test/integration.tar.zst "$archive_url"
+
       - name: Download test archive
+        if: env.HAS_SPICEIO_SECRET != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: ai-integration-test-archive
@@ -360,13 +448,19 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Kill spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
   test-bedrock:
     name: Test Bedrock Models
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
     runs-on: spiceai-macos
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
 
@@ -376,7 +470,30 @@ jobs:
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
 
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@e31c63cbe88a6e284fc187875261106a05034775 # v0.5.4
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: build
+          region: us-west-1
+
+      - name: Download test archive from spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        env:
+          SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
+        run: |
+          set -euo pipefail
+          : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to download the AI integration test archive}"
+          mkdir -p ./integration_test
+          archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}"
+          curl --fail --silent --show-error --output ./integration_test/integration.tar.zst "$archive_url"
+
       - name: Download test archive
+        if: env.HAS_SPICEIO_SECRET != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: ai-integration-test-archive
@@ -396,6 +513,10 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Kill spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
   build-extended:
     name: Build Test Binary (Extended)
     runs-on: spiceai-macos
@@ -403,7 +524,7 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
           fetch-depth: 1 # Shallow clone for faster checkout
@@ -414,7 +535,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
+        uses: spiceai/spiceio/.github/actions/setup@e31c63cbe88a6e284fc187875261106a05034775 # v0.5.4
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -449,24 +570,56 @@ jobs:
 
           cargo nextest archive -p runtime --test integration_models --features ${FEATURES} --archive-file integration-extended.tar.zst
 
-      # Upload the test archive as an artifact
+      - name: Preserve sccache spiceio log
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: cp "${{ runner.temp }}/spiceio.log" "${{ runner.temp }}/spiceio-sccache.log" || true
+
+      - name: Stop sccache spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Clean spiceio install directory
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        run: rm -rf "${{ runner.temp }}/spiceio-bin"
+
+      - name: Set up spiceio for build archive
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio-build
+        uses: spiceai/spiceio/.github/actions/setup@e31c63cbe88a6e284fc187875261106a05034775 # v0.5.4
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: build
+          region: us-west-1
+
+      - name: Upload test archive to spiceio
+        if: env.HAS_SPICEIO_SECRET == 'true'
+        env:
+          SPICEIO_ENDPOINT: ${{ steps.setup-spiceio-build.outputs.endpoint }}
+        run: |
+          set -euo pipefail
+          : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to upload the extended AI integration test archive}"
+          archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_EXTENDED_TEST_ARCHIVE_S3_URI#s3://}"
+          curl --fail --silent --show-error --upload-file ./integration-extended.tar.zst "$archive_url"
+
       - name: Upload test archive
+        if: env.HAS_SPICEIO_SECRET != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ai-integration-test-archive-extended
           path: ./integration-extended.tar.zst
           retention-days: 3
-          # Archive is already zstd-compressed; use minimal artifact zip compression.
           compression-level: 1
 
-      - name: Kill spiceio
-        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
-        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+      - name: Kill build archive spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio-build.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio-build.outputs.pid }} || true
 
       - name: Upload spiceio logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiceio-models-build-extended-logs
-          path: ${{ runner.temp }}/spiceio.log
+          path: ${{ runner.temp }}/spiceio*.log
           if-no-files-found: ignore

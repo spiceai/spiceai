@@ -2,32 +2,32 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q13"
 ---
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                |
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: c DESC NULLS FIRST, fetch=10                                                                                                                  |
-|               |   Projection: hits.SearchPhrase, count(Int64(1)) AS c                                                                                               |
-|               |     Aggregate: groupBy=[[hits.SearchPhrase]], aggr=[[count(Int64(1))]]                                                                              |
-|               |       Filter: hits.SearchPhrase != LargeUtf8("")                                                                                                    |
-|               |         TableScan: hits projection=[SearchPhrase], partial_filters=[hits.SearchPhrase != LargeUtf8("")]                                             |
-| physical_plan | SortPreservingMergeExec: [c@1 DESC], fetch=10                                                                                                       |
-|               |   SortExec: TopK(fetch=10), expr=[c@1 DESC], preserve_partitioning=[true]                                                                           |
-|               |     ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase, count(Int64(1))@1 as c]                                                                   |
-|               |       AggregateExec: mode=FinalPartitioned, gby=[SearchPhrase@0 as SearchPhrase], aggr=[count(Int64(1))]                                            |
-|               |         RepartitionExec: partitioning=Hash([SearchPhrase@0], 16), input_partitions=80                                                               |
-|               |           AggregateExec: mode=Partial, gby=[SearchPhrase@0 as SearchPhrase], aggr=[count(Int64(1))]                                                 |
-|               |             FilterExec: SearchPhrase@0 !=                                                                                                           |
-|               |               SchemaCastScanExec                                                                                                                    |
-|               |                 PartitionedUnionExec                                                                                                                |
-|               |                   BytesProcessedExec                                                                                                                |
-|               |                     DataSourceExec: partitions=16, partition_sizes=[111, 111, 111, 111, 111, 111, 111, 110, 110, 110, 110, 110, 110, 123, 174, 461] |
-|               |                   BytesProcessedExec                                                                                                                |
-|               |                     DataSourceExec: partitions=16, partition_sizes=[140, 140, 140, 140, 140, 140, 140, 140, 140, 140, 139, 139, 139, 142, 187, 499] |
-|               |                   BytesProcessedExec                                                                                                                |
-|               |                     DataSourceExec: partitions=16, partition_sizes=[21, 21, 21, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 24, 194]                |
-|               |                   BytesProcessedExec                                                                                                                |
-|               |                     DataSourceExec: partitions=16, partition_sizes=[37, 37, 37, 37, 37, 37, 36, 36, 36, 36, 36, 36, 36, 36, 53, 275]                |
-|               |                   BytesProcessedExec                                                                                                                |
-|               |                     DataSourceExec: partitions=16, partition_sizes=[75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 76, 462]                |
-|               |                                                                                                                                                     |
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+----------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                     |
++---------------+----------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: c DESC NULLS FIRST, fetch=10                                                                       |
+|               |   Projection: hits.SearchPhrase, count(Int64(1)) AS c                                                    |
+|               |     Aggregate: groupBy=[[hits.SearchPhrase]], aggr=[[count(Int64(1))]]                                   |
+|               |       Filter: hits.SearchPhrase != LargeUtf8("")                                                         |
+|               |         TableScan: hits projection=[SearchPhrase], partial_filters=[hits.SearchPhrase != LargeUtf8("")]  |
+| physical_plan | SortPreservingMergeExec: [c@1 DESC], fetch=10                                                            |
+|               |   SortExec: TopK(fetch=10), expr=[c@1 DESC], preserve_partitioning=[true]                                |
+|               |     ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase, count(Int64(1))@1 as c]                        |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[SearchPhrase@0 as SearchPhrase], aggr=[count(Int64(1))] |
+|               |         RepartitionExec: partitioning=Hash([SearchPhrase@0], 16), input_partitions=80                    |
+|               |           AggregateExec: mode=Partial, gby=[SearchPhrase@0 as SearchPhrase], aggr=[count(Int64(1))]      |
+|               |             FilterExec: SearchPhrase@0 !=                                                                |
+|               |               SchemaCastScanExec                                                                         |
+|               |                 PartitionedUnionExec                                                                     |
+|               |                   BytesProcessedExec                                                                     |
+|               |                     DataSourceExec: partitions=16, partition_sizes=[<redacted>]                          |
+|               |                   BytesProcessedExec                                                                     |
+|               |                     DataSourceExec: partitions=16, partition_sizes=[<redacted>]                          |
+|               |                   BytesProcessedExec                                                                     |
+|               |                     DataSourceExec: partitions=16, partition_sizes=[<redacted>]                          |
+|               |                   BytesProcessedExec                                                                     |
+|               |                     DataSourceExec: partitions=16, partition_sizes=[<redacted>]                          |
+|               |                   BytesProcessedExec                                                                     |
+|               |                     DataSourceExec: partitions=16, partition_sizes=[<redacted>]                          |
+|               |                                                                                                          |
++---------------+----------------------------------------------------------------------------------------------------------+

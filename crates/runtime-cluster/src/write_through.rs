@@ -454,7 +454,14 @@ async fn route_batch_and_assign_unseen(
             let partition_value: PartitionValue = partition_expr_keys
                 .iter()
                 .zip(scalar_values.iter())
-                .map(|(expr_key, scalar)| (expr_key.clone(), scalar_to_sql_literal(scalar)))
+                .map(|(expr_key, scalar)| {
+                    let val = if scalar.is_null() {
+                        None
+                    } else {
+                        Some(scalar_to_sql_literal(scalar))
+                    };
+                    (expr_key.clone(), val)
+                })
                 .collect();
             Some((scalar_values, partition_value, sub_batch))
         })
@@ -510,7 +517,13 @@ async fn route_batch_and_assign_unseen(
             let new_pred = partition_phys_exprs
                 .iter()
                 .zip(scalar_values.iter())
-                .map(|((logical_expr, _), scalar)| logical_expr.clone().eq(lit(scalar.clone())))
+                .map(|((logical_expr, _), scalar)| {
+                    if scalar.is_null() {
+                        logical_expr.clone().is_null()
+                    } else {
+                        logical_expr.clone().eq(lit(scalar.clone()))
+                    }
+                })
                 .reduce(Expr::and);
 
             if let Some(new_pred) = new_pred {

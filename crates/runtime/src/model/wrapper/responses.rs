@@ -42,6 +42,26 @@ pub struct ResponsesWrapper {
     pub public_name: String,
     pub responses: Arc<dyn Responses>,
     pub system_prompt: Option<String>,
+    pub defaults: Vec<(String, serde_json::Value)>,
+}
+
+macro_rules! set_default_w_warning {
+    ($req:expr, $field:ident, $value:expr, $model:expr) => {
+        $req.$field = $req
+            .$field
+            .or_else(|| match serde_json::from_value($value.clone()) {
+                Ok(val) => Some(val),
+                Err(_) => {
+                    tracing::warn!(
+                        "Failed to parse Responses API `{}` override for model='{}'. Ensure {:?} is of the correct format.",
+                        stringify!($field),
+                        $model,
+                        $value
+                    );
+                    None
+                }
+            })
+    };
 }
 
 impl ResponsesWrapper {
@@ -49,16 +69,18 @@ impl ResponsesWrapper {
         responses: Arc<dyn Responses>,
         public_name: &str,
         system_prompt: Option<&str>,
+        defaults: Vec<(String, serde_json::Value)>,
     ) -> Self {
         Self {
             public_name: public_name.to_string(),
             responses,
             system_prompt: system_prompt.map(ToString::to_string),
+            defaults,
         }
     }
 
     fn prepare_req(&self, req: CreateResponse) -> CreateResponse {
-        self.with_system_prompt(req)
+        self.with_model_defaults(self.with_system_prompt(req))
     }
 
     /// Injects a system prompt into the instructions field in the request, if it exists.
@@ -69,6 +91,21 @@ impl ResponsesWrapper {
                 Some(existing) => format!("{prompt}\n\n{existing}"),
                 None => prompt.clone(),
             });
+        }
+        req
+    }
+
+    fn with_model_defaults(&self, mut req: CreateResponse) -> CreateResponse {
+        for (key, value) in &self.defaults {
+            match key.as_str() {
+                "prompt_cache_key" => {
+                    set_default_w_warning!(req, prompt_cache_key, value, self.public_name);
+                }
+                "prompt_cache_retention" => {
+                    set_default_w_warning!(req, prompt_cache_retention, value, self.public_name);
+                }
+                _ => tracing::debug!("Ignoring unknown Responses API default key: {key}"),
+            }
         }
         req
     }
@@ -297,7 +334,7 @@ impl<S> Drop for TracedResponseStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_openai::types::responses::CreateResponse;
+    use async_openai::types::responses::{CreateResponse, PromptCacheRetention};
 
     /// Helper to create a [`ResponsesWrapper`] with the given system prompt (no underlying model needed for `with_system_prompt` tests).
     fn wrapper_with_prompt(prompt: Option<&str>) -> ResponsesWrapper {
@@ -305,6 +342,7 @@ mod tests {
             public_name: "test-model".to_string(),
             responses: Arc::new(NoopResponses),
             system_prompt: prompt.map(ToString::to_string),
+            defaults: Vec::new(),
         }
     }
 
@@ -393,6 +431,37 @@ mod tests {
         assert_eq!(
             result.instructions, None,
             "Instructions should remain None when neither is set"
+        );
+    }
+
+    #[test]
+    fn test_prompt_cache_defaults_preserve_request_values() {
+        let wrapper = ResponsesWrapper {
+            public_name: "test-model".to_string(),
+            responses: Arc::new(NoopResponses),
+            system_prompt: None,
+            defaults: vec![
+                (
+                    "prompt_cache_key".to_string(),
+                    serde_json::Value::String("default-key".to_string()),
+                ),
+                (
+                    "prompt_cache_retention".to_string(),
+                    serde_json::Value::String("24h".to_string()),
+                ),
+            ],
+        };
+
+        let req = CreateResponse {
+            prompt_cache_key: Some("request-key".to_string()),
+            ..CreateResponse::default()
+        };
+        let result = wrapper.with_model_defaults(req);
+
+        assert_eq!(result.prompt_cache_key.as_deref(), Some("request-key"));
+        assert_eq!(
+            result.prompt_cache_retention,
+            Some(PromptCacheRetention::Hours24)
         );
     }
 }

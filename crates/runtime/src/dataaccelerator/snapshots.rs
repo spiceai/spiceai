@@ -30,6 +30,7 @@ use crate::{
 use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_acceleration::snapshot::AccelerationLayout;
 use runtime_acceleration::snapshot::ForceCreate;
+use runtime_acceleration::snapshot::engine::SnapshotEngine;
 use runtime_acceleration::{
     dataset_checkpoint::make_checkpointer_factory,
     snapshot::{SnapshotBehavior, SnapshotManager, metrics},
@@ -38,11 +39,18 @@ use snafu::{ResultExt, Snafu};
 
 /// Downloads a snapshot if needed for bootstrapping.
 /// Returns `BootstrapStatus`::`Bootstrapped` if a snapshot was successfully downloaded.
+///
+/// `engine_override`, when set, replaces the engine that the resulting
+/// `SnapshotManager` would otherwise build via
+/// `runtime_acceleration::snapshot::engine::create_snapshot_engine`. Used by
+/// the Cayenne accelerator to inject a `CayenneSnapshotEngine` that knows
+/// how to import a per-dataset metastore slice on extract.
 pub(super) async fn download_snapshot_if_needed(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
     layout: AccelerationLayout,
     engine: AccelerationEngine,
+    engine_override: Option<Arc<dyn SnapshotEngine>>,
 ) -> BootstrapStatus {
     if !acceleration.snapshot_behavior.bootstrap_enabled() {
         return BootstrapStatus::none();
@@ -86,7 +94,10 @@ pub(super) async fn download_snapshot_if_needed(
     )
     .await
     {
-        let manager = manager.with_checkpointer_factory(checkpoint_factory);
+        let mut manager = manager.with_checkpointer_factory(checkpoint_factory);
+        if let Some(engine_override) = engine_override {
+            manager = manager.with_snapshot_engine(engine_override);
+        }
         let start_time = Instant::now();
         match manager.download_latest_snapshot().await {
             Ok(Some(info)) => {
@@ -117,12 +128,15 @@ pub(super) async fn download_snapshot_if_needed(
 ///
 /// This is a best-effort operation: if snapshotting fails, a warning is logged and the
 /// caller proceeds with recreation.
+///
+/// `engine_override` parallels [`download_snapshot_if_needed`].
 pub(crate) async fn snapshot_before_recreate(
     acceleration: &Acceleration,
     dataset_name: &str,
     layout: AccelerationLayout,
     engine: AccelerationEngine,
     schema: Arc<arrow_schema::Schema>,
+    engine_override: Option<Arc<dyn SnapshotEngine>>,
 ) {
     if !acceleration.snapshot_behavior.create_enabled() {
         return;
@@ -137,6 +151,11 @@ pub(crate) async fn snapshot_before_recreate(
     .await
     else {
         return;
+    };
+    let manager = if let Some(engine_override) = engine_override {
+        manager.with_snapshot_engine(engine_override)
+    } else {
+        manager
     };
 
     // If the caller provided an empty schema (e.g. during file_create init when the table
@@ -318,13 +337,15 @@ pub fn validate_cayenne_snapshot_consistency(
             );
         }
 
-        // If all datasets have snapshots enabled and there are multiple, that's an error
-        if !enabled.is_empty() && disabled.is_empty() && enabled.len() > 1 {
-            return Err(CayenneSnapshotValidationError::SharedAcceleration {
-                metadata_dir,
-                datasets: enabled.join(", "),
-            });
-        }
+        // Multiple datasets sharing the metadata directory with snapshots all
+        // enabled is supported: each dataset's snapshot ships a per-dataset
+        // metastore-slice JSON via `CayenneSnapshotEngine`. That engine is
+        // wired in by `Cayenne::snapshot_engine_for_source` and threaded
+        // through both the snapshot-creation pipeline
+        // (`build_snapshot_creation_config`) and the snapshot-refresh-mode
+        // pipeline (`build_snapshot_refresh_state`), so per-dataset slices
+        // never clobber each other on extract. The previous restriction
+        // (single-dataset-per-metadata-dir) is therefore lifted.
     }
 
     Ok(())
@@ -426,22 +447,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cayenne_shared_acceleration_with_snapshots_errors() {
+    async fn test_cayenne_shared_acceleration_with_snapshots_now_supported() {
+        // Multi-dataset shared metastore + snapshots-enabled used to error
+        // with SharedAcceleration. With per-dataset metastore-slice snapshots
+        // (`CayenneSnapshotEngine`), this configuration is now supported.
         let sources: Vec<Arc<dyn AccelerationSource>> = vec![
             MockSource::cayenne_with_metadata_dir("ds1", "/tmp/meta", true),
             MockSource::cayenne_with_metadata_dir("ds2", "/tmp/meta", true),
         ];
 
-        let result = validate_cayenne_snapshot_consistency(&sources);
-        assert!(result.is_err());
-        let err = result.expect_err("expected error");
-        assert!(
-            matches!(
-                err,
-                CayenneSnapshotValidationError::SharedAcceleration { .. }
-            ),
-            "Expected SharedAcceleration error, got: {err}"
-        );
+        validate_cayenne_snapshot_consistency(&sources)
+            .expect("shared metastore + snapshots is now valid");
     }
 
     #[tokio::test]

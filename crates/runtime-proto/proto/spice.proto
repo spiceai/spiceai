@@ -36,6 +36,13 @@ service ClusterService {
     // Called by executors when they first register to get initial Accelerated Table partitions.
     // Allows schedulers to subsequently query executors over FlightSQL for accelerated table data.
     rpc AllocateInitialPartitions(AllocateInitialPartitionsRequest) returns (AllocateInitialPartitionsResponse);
+
+    // Get DDL catch-up statements since a given version.
+    // Called by executors after loading catalogs and replaying initial DDL
+    // Executors call this after replaying the DDL snapshot from GetAppDefinition
+    // to close the TOCTOU window: any DDL committed on the scheduler between the
+    // GetAppDefinition snapshot and now is returned so the executor can replay it.
+    rpc GetDdlCatchup(GetDdlCatchupRequest) returns (GetDdlCatchupResponse);
 }
 
 // Request message for GetAppDefinition RPC.
@@ -47,6 +54,25 @@ message GetAppDefinitionRequest {
 message GetAppDefinitionResponse {
     // JSON-serialized app definition.
     string app_json = 1;
+
+    // Ordered list of DDL SQL statements applied since cluster start.
+    // Executors should replay these after loading catalogs.
+    repeated string ddl_statements = 2;
+
+    // Version of the DDL log at the time of this snapshot.
+    // Used by executors to request catch-up DDL via GetDdlCatchup.
+    uint64 ddl_version = 3;
+}
+
+// Request message for GetDdlCatchup RPC.
+message GetDdlCatchupRequest {
+    string executor_id = 1;
+    uint64 since_version = 2;
+}
+
+// Response message for GetDdlCatchup RPC.
+message GetDdlCatchupResponse {
+    repeated string ddl_statements = 1;
 }
 
 // Request message for ExpandSecret RPC.
@@ -104,6 +130,8 @@ message ExecutorControlMessage {
         ExecutorHeartbeat heartbeat = 2;
         MetricsResponse metrics = 3;
         ExecutorShutdown shutdown = 4;
+        // Acknowledgement for a scheduler command (correlated by request_id).
+        Ack ack = 5;
     }
 }
 
@@ -123,6 +151,9 @@ message UpdatePartitions {
     map<string, BytesArray> new_partitions = 1;
     // Map of table name to list of REMOVED partition expressions to remove.
     map<string, BytesArray> removed_partitions = 2;
+    // Unique identifier for this request, used to correlate the executor's Ack.
+    // Empty string means "no ack expected" (legacy / fire-and-forget callers).
+    string request_id = 3;
 }
 
 // Request message for AllocateInitialPartitions RPC.
@@ -196,6 +227,18 @@ message MetricsResponse {
     string request_id = 1;
     // OTLP ExportMetricsServiceRequest protobuf-encoded metrics.
     bytes otlp_metrics = 2;
+}
+
+// Generic acknowledgement for a scheduler command that needs delivery
+// confirmation (e.g. UpdatePartitions). Correlated by request_id.
+//
+// On success the `error` field is unset. On failure, `error` carries a
+// short human-readable description; the scheduler decides whether to retry.
+message Ack {
+    // Request ID this ack corresponds to.
+    string request_id = 1;
+    // Optional error message. Absent/empty means the command applied successfully.
+    optional string error = 2;
 }
 
 // Physical plan — wrapper with oneof to unambiguously tag each node type.

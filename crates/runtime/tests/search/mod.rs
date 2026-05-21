@@ -46,6 +46,7 @@ use serde_json::{Value, json};
 use spicepod::{
     acceleration::{Acceleration, Mode},
     component::embeddings::Embeddings,
+    fts::FtsStore,
     param::ParamValue,
     vector::VectorStore,
 };
@@ -70,6 +71,7 @@ use crate::{
     },
 };
 
+mod elasticsearch;
 pub mod megascience;
 #[cfg(feature = "s3_vectors")]
 mod s3_vectors;
@@ -232,6 +234,43 @@ impl VectorEngineOptions {
     }
 }
 
+enum TextEngineOptions {
+    NoTextEngine,
+    Elasticsearch,
+}
+
+impl fmt::Display for TextEngineOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            TextEngineOptions::NoTextEngine => "no_text_engine",
+            TextEngineOptions::Elasticsearch => "elasticsearch",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl TextEngineOptions {
+    /// Build an [`FtsStore`] pointing at `endpoint`.
+    ///
+    /// Pass the actual container endpoint (e.g. `http://localhost:19200`) for
+    /// local Docker runs, or the CI service endpoint for CI.
+    fn to_fts_store(&self, endpoint: &str) -> Option<FtsStore> {
+        match self {
+            TextEngineOptions::NoTextEngine => None,
+            TextEngineOptions::Elasticsearch => Some(FtsStore {
+                enabled: true,
+                engine: Some("elasticsearch".to_string()),
+                params: Some(spicepod::param::Params::from_string_map(
+                    std::collections::HashMap::from([(
+                        "endpoint".to_string(),
+                        endpoint.to_string(),
+                    )]),
+                )),
+            }),
+        }
+    }
+}
+
 enum EmbeddingModels {
     Model2Vec8m,
     Model2Vec,
@@ -266,6 +305,8 @@ async fn test_megascience_permutations(
         VectorEngineOptions::S3Vectors
     )]
     vector_engine: VectorEngineOptions,
+    #[values(TextEngineOptions::NoTextEngine, TextEngineOptions::Elasticsearch)]
+    text_engine: TextEngineOptions,
     #[values(
         AccelerationOptions::NoAcceleration,
         AccelerationOptions::Arrow,
@@ -295,10 +336,12 @@ async fn test_megascience_permutations(
 ) {
     use runtime::spice_data_base_path;
 
-    let slug =
-        format!("{acceleration_opt}-{vector_engine}-{table_option}-{column_config}_megascience");
+    let slug = format!(
+        "{acceleration_opt}-{vector_engine}-{text_engine}-{table_option}-{column_config}_megascience"
+    );
     if let Err(e) = validate_combination(
         &vector_engine,
+        &text_engine,
         &acceleration_opt,
         &table_option,
         &column_config,
@@ -313,7 +356,8 @@ async fn test_megascience_permutations(
     let mut z = DefaultHasher::new();
     slug.hash(&mut z);
     std::fs::create_dir_all(spice_data_base_path()).expect("failed to create spice data base path");
-    let acceleration = acceleration_opt.to_acceleration(&z.finish().to_string());
+    let unique_id = z.finish().to_string();
+    let acceleration = acceleration_opt.to_acceleration(&unique_id);
 
     let mut app = AppBuilder::new(slug);
     let (views, datasets) = table_option.to_tables();
@@ -341,6 +385,48 @@ async fn test_megascience_permutations(
         .await
         .expect("could not prepare vector store for tests");
 
+    // Start Elasticsearch Docker container if needed, and get the endpoint URL.
+    // The container is kept alive for the duration of the test then dropped.
+    let _es_container;
+    let es_endpoint: String;
+    if matches!(text_engine, TextEngineOptions::Elasticsearch) {
+        // Pick a random high port to avoid collisions with other parallel test runs.
+        let port = {
+            use rand::RngExt;
+            let mut rng = rand::rng();
+            rng.random_range(19200_u16..19300_u16)
+        };
+        let container = elasticsearch::start_elasticsearch_docker_container(port)
+            .await
+            .expect("failed to start Elasticsearch Docker container");
+        es_endpoint = elasticsearch::elasticsearch_endpoint(port);
+        _es_container = Some(container);
+    } else {
+        es_endpoint = String::new();
+        _es_container = None;
+    }
+
+    // Build the FTS store, injecting the live endpoint and a unique per-combination index name.
+    let mut fts_store = text_engine.to_fts_store(&es_endpoint);
+    if let Some(fts) = fts_store.as_mut()
+        && fts.engine.as_deref() == Some("elasticsearch")
+    {
+        let params = fts
+            .params
+            .get_or_insert_with(spicepod::param::Params::default);
+        // Unique index name per permutation so parallel runs don't clobber each other.
+        params.data.insert(
+            "index".to_string(),
+            ParamValue::String(format!(
+                "{}-{}-{}-{}",
+                acceleration_opt,
+                table_option.to_string().replace('_', "-"),
+                column_config.to_string().replace('_', "-"),
+                rand::random::<u8>() % 11
+            )),
+        );
+    }
+
     let (views, datasets) = enrich_table(
         SearchTable {
             table_name: table_option.table_to_search_on().to_string(),
@@ -349,6 +435,7 @@ async fn test_megascience_permutations(
         },
         columns,
         Some(vector_store),
+        fts_store.as_ref(),
         &acceleration,
     );
 
@@ -382,6 +469,7 @@ async fn test_megascience_permutations(
 
 fn validate_combination(
     vector_engine: &VectorEngineOptions,
+    text_engine: &TextEngineOptions,
     acceleration_opt: &AccelerationOptions,
     table_option: &megascience::TableOptions,
     column_config: &megascience::ColumnConfigOptions,
@@ -397,6 +485,11 @@ fn validate_combination(
     }
     if matches!(&acceleration_opt, AccelerationOptions::NoAcceleration) && column_config.is_fts() {
         return Err("Cannot have hybrid column with no acceleration".to_string());
+    }
+    if matches!(text_engine, TextEngineOptions::Elasticsearch) && !column_config.is_fts() {
+        return Err(
+            "Elasticsearch text engine only applies to FTS column configurations".to_string(),
+        );
     }
     if matches!(&vector_engine, VectorEngineOptions::DuckDb)
         && !matches!(
@@ -420,6 +513,22 @@ fn validate_combination(
         )
     {
         return Err("S3 Vectors on reduced set of combinations".to_string());
+    }
+    if matches!(text_engine, TextEngineOptions::Elasticsearch) {
+        if cfg!(not(feature = "elasticsearch")) {
+            return Err(
+                "Elasticsearch text engine tests require the elasticsearch feature".to_string(),
+            );
+        }
+        if !column_config.is_fts() {
+            return Err("Elasticsearch text engine tests require full-text columns".to_string());
+        }
+        if !matches!(table_option, megascience::TableOptions::Dataset) {
+            return Err("Elasticsearch text engine tests are limited to datasets".to_string());
+        }
+        if std::env::var("ELASTICSEARCH_URL").is_err() {
+            return Err("Elasticsearch text engine tests require ELASTICSEARCH_URL".to_string());
+        }
     }
     Ok(())
 }

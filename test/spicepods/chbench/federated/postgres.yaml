@@ -1,0 +1,48 @@
+version: v1
+kind: Spicepod
+name: postgres-federated
+
+datasets:
+  - from: postgres:warehouse
+    name: warehouse
+    params: &postgres_params
+      pg_host: 127.0.0.1
+      pg_port: 5432
+      pg_db: chbench
+      pg_user: bench
+      pg_pass: bench
+      pg_sslmode: disable
+      connection_pool_size: 20
+  - from: postgres:district
+    name: district
+    params: *postgres_params
+  - from: postgres:customer
+    name: customer
+    params: *postgres_params
+  - from: postgres:history
+    name: history
+    params: *postgres_params
+  - from: postgres:oorder
+    name: oorder
+    params: *postgres_params
+  - from: postgres:new_order
+    name: new_order
+    params: *postgres_params
+  - from: postgres:order_line
+    name: order_line
+    params: *postgres_params
+  - from: postgres:item
+    name: item
+    params: *postgres_params
+  - from: postgres:stock
+    name: stock
+    params: *postgres_params
+  - from: postgres:nation
+    name: nation
+    params: *postgres_params
+  - from: postgres:region
+    name: region
+    params: *postgres_params
+  - from: postgres:supplier
+    name: supplier
+    params: *postgres_params

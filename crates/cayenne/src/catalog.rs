@@ -21,8 +21,8 @@ limitations under the License.
 //! (`SQLite`, `PostgreSQL`, etc.).
 
 use super::metadata::{
-    CreateTableOptions, DeleteFile, InlinedData, InlinedDelete, PartitionMetadata, TableMetadata,
-    TableStatistics,
+    CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
+    PartitionMetadata, TableMetadata, TableStatistics,
 };
 use async_trait::async_trait;
 use snafu::Snafu;
@@ -240,6 +240,25 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get the current sequence number for a table.
     async fn get_sequence_number(&self, table_id: &str) -> CatalogResult<i64>;
 
+    /// Reserve `count` consecutive sequence numbers for this table in one atomic
+    /// operation and return the *first* number of the reserved block.
+    /// `count` must be at least 1.
+    ///
+    /// The caller may then use `[result, result + count)` locally (e.g. `result`,
+    /// `result+1`) without any further catalog round-trips. This is the
+    /// recommended way for writers that need more than one sequence number for a
+    /// logical operation (most notably the on-conflict/upsert path, which needs a
+    /// delete sequence and a higher insert sequence for the replacement rows).
+    ///
+    /// On serialized backends such as the embedded `SQLite` metastore, this
+    /// significantly reduces writer-lock acquisitions and RPC latency compared
+    /// with calling `increment_sequence_number` multiple times.
+    ///
+    /// The returned value is guaranteed to be unique and strictly increasing
+    /// across all calls for the table (modulo crashes that lose in-flight
+    /// reservations — gaps are acceptable for the sequence ordering contract).
+    async fn reserve_sequence_numbers(&self, table_id: &str, count: u32) -> CatalogResult<i64>;
+
     /// Add a delete file (deletion vector) for a data file.
     ///
     /// Tracks a deletion vector file that marks rows as deleted in a specific
@@ -292,6 +311,41 @@ pub trait MetadataCatalog: Send + Sync {
         sequence_number: i64,
     ) -> CatalogResult<()>;
 
+    /// Atomically commit the catalog side of an on-conflict (upsert)
+    /// deletion.
+    ///
+    /// Implementations MUST commit every delete-file row and every
+    /// insert-record row in one durable transaction. The caller allocates
+    /// the needed sequence numbers (via `reserve_sequence_numbers` or
+    /// `increment_sequence_number`) before this call, so a failed transaction
+    /// may leave a sequence-number gap, but it must not leave a partially
+    /// committed delete-file / insert-record pair. A non-atomic implementation
+    /// reintroduces the crash window this method exists to close.
+    /// When insert records are provided, `insert_sequence` must be greater than
+    /// each delete file's sequence number so replacement rows remain visible.
+    ///
+    /// This replaces the legacy 3-call sequence on the on-conflict path
+    /// (`add_delete_file` per file → `add_insert_records_batch`), which
+    /// left a crash window where the catalog could persist deletion
+    /// records without their corresponding insert sequences. After
+    /// restart, the new row (already in the data files) would then be
+    /// permanently hidden by the deletion filter — see
+    /// [`crate::provider::table::CayenneTableProvider::apply_on_conflict_deletions`]
+    /// for the original sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be opened, any insert
+    /// fails, or the commit fails. Failures roll back the entire txn —
+    /// the catalog is unchanged.
+    async fn commit_on_conflict_deletions(
+        &self,
+        delete_files: Vec<DeleteFile>,
+        table_id: &str,
+        insert_pk_bytes_list: Vec<Vec<u8>>,
+        insert_sequence: i64,
+    ) -> CatalogResult<()>;
+
     /// Get all insert records for a table.
     ///
     /// Returns a map of PK bytes to their sequence numbers.
@@ -342,6 +396,24 @@ pub trait MetadataCatalog: Send + Sync {
     /// Atomically update snapshot and clear delete files in a single transaction.
     async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
 
+    /// Atomically commit an overwrite: update the snapshot pointer, clear all
+    /// per-snapshot delete tracking, AND drop inlined data, inlined deletes,
+    /// and table statistics — everything that belonged to the old snapshot
+    /// and no longer applies once the user has replaced the table's contents.
+    ///
+    /// Differs from [`commit_compaction`] in that compaction PRESERVES inlined
+    /// data (the inlined memtable is still valid for the new snapshot — the
+    /// rewrite only consolidates Vortex files). Overwrite REPLACES everything,
+    /// so anything keyed on the old snapshot must be dropped atomically with
+    /// the pointer flip; otherwise a crash between the pointer flip and the
+    /// (separate) inlined-data clear would leave stale inlined rows that scan
+    /// would union into the new snapshot's results.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be committed.
+    async fn commit_overwrite(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
+
     /// Add a partition to a table.
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<String>;
 
@@ -380,11 +452,38 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get the total number of inlined rows for a table.
     async fn get_inlined_data_count(&self, table_id: &str) -> CatalogResult<i64>;
 
+    /// Get aggregate inline data size information for a table.
+    async fn get_inlined_data_stats(&self, table_id: &str) -> CatalogResult<InlinedDataStats>;
+
     /// Remove all inlined data for a table (called after checkpoint flushes to Vortex).
     async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()>;
 
+    /// Remove all inlined data and inlined deletes for a table atomically.
+    ///
+    /// Implementations may override this to use a single backend transaction or
+    /// batch call. The default preserves the existing behavior for implementors
+    /// that do not have a combined primitive.
+    async fn clear_inlined_data_and_deletes(&self, table_id: &str) -> CatalogResult<()> {
+        self.clear_inlined_data(table_id).await?;
+        self.clear_inlined_deletes(table_id).await
+    }
+
     /// Add a small batch of delete identifiers inlined in the metastore.
     async fn add_inlined_delete(&self, delete: InlinedDelete) -> CatalogResult<String>;
+
+    /// Atomically rewrite existing inline data rows, remove emptied inline data rows,
+    /// and append new inline data rows.
+    ///
+    /// Inline mutations rewrite row-store metadata entries in place instead of adding
+    /// delete-marker side records. Newly appended inline data rows receive a fresh
+    /// sequence number when present; rewritten rows retain their original sequence.
+    async fn commit_inlined_mutation(
+        &self,
+        table_id: &str,
+        updated_data: Vec<InlinedData>,
+        deleted_inlined_ids: Vec<String>,
+        data: Vec<InlinedData>,
+    ) -> CatalogResult<()>;
 
     /// Get all inlined delete entries for a table.
     async fn get_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>>;
@@ -412,6 +511,49 @@ pub trait MetadataCatalog: Send + Sync {
     ///
     /// Returns `Ok(true)` if the table was dropped, `Ok(false)` if the table didn't exist.
     async fn drop_table(&self, table_name: &str) -> CatalogResult<bool>;
+
+    /// Export the metastore rows for `dataset_name` as a portable, versioned
+    /// slice with path columns rewritten relative to `data_dir_anchor`.
+    ///
+    /// Default implementation returns [`CatalogError::InvalidOperation`].
+    /// `CayenneCatalog` overrides this with a real implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dataset is not present or the underlying metastore
+    /// query fails.
+    async fn export_dataset_slice(
+        &self,
+        dataset_name: &str,
+        data_dir_anchor: &std::path::Path,
+    ) -> CatalogResult<crate::metastore::snapshot::DatasetMetastoreSlice> {
+        let _ = (dataset_name, data_dir_anchor);
+        Err(CatalogError::InvalidOperationNoSource {
+            message: "export_dataset_slice is not supported by this catalog".to_string(),
+        })
+    }
+
+    /// Atomically import a dataset slice into the metastore, replacing any
+    /// prior rows for the same `dataset_name`. Path columns are re-anchored
+    /// at `data_dir_anchor`.
+    ///
+    /// Default implementation returns [`CatalogError::InvalidOperation`].
+    /// `CayenneCatalog` overrides this with a real implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the slice format is unsupported, the engine identifier
+    /// mismatches, or any DML in the underlying transaction fails.
+    async fn import_dataset_slice(
+        &self,
+        slice: &crate::metastore::snapshot::DatasetMetastoreSlice,
+        data_dir_anchor: &std::path::Path,
+    ) -> CatalogResult<()> {
+        let _ = (slice, data_dir_anchor);
+        Err(CatalogError::InvalidOperationNoSource {
+            message: "import_dataset_slice is not supported by this catalog".to_string(),
+        })
+    }
 }
 
 /// Factory trait for creating catalog instances.

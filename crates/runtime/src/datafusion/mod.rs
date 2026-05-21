@@ -19,6 +19,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
+use crate::accelerated_table::snapshots::SnapshotRefreshState;
 use crate::accelerated_table::{
     self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
 };
@@ -28,17 +29,20 @@ use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
+use crate::dataaccelerator::ReloadProviderFactory;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
+use crate::dataaccelerator::swappable::SwappableTableProvider;
 use crate::dataaccelerator::{self, BootstrapStatus};
 use crate::dataaccelerator::{AcceleratorEngineRegistry, get_acceleration_layout};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
-use crate::datafusion::query::Query;
+use crate::datafusion::query::{Query, registry::QueryCancelRegistry};
 use crate::dataupdate::{
-    DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
+    DataUpdate, DataUpdateBroadcaster, StreamingDataUpdate, StreamingDataUpdateExecutionPlan,
+    UpdateType,
 };
 use crate::federated_table::FederatedTable;
 use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
@@ -57,6 +61,7 @@ use {
 use crate::cluster::partition::service::PartitionService;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
+use arrow::record_batch::RecordBatch;
 use arrow_tools::schema::verify_schema;
 use builder::DataFusionBuilder;
 use cache::TabledCacheProvider;
@@ -74,13 +79,15 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
-use datafusion::sql::parser::DFParser;
+use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::{find_datafusion_root, format_datafusion_error};
+use futures::StreamExt;
 use itertools::Itertools;
+use parking_lot::Mutex as ParkingMutex;
 use query::QueryBuilder;
 use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_acceleration::snapshot::AccelerationLayout;
@@ -129,8 +136,10 @@ pub mod request_context_extension;
 pub mod retention_sql;
 pub mod schema;
 pub mod secrets_context_extension;
+pub mod table;
 pub use runtime_datafusion::sort_columns;
 pub(crate) mod sql_validator;
+pub mod tool_udf;
 pub mod udf;
 pub mod udtf;
 
@@ -140,6 +149,49 @@ pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";
 pub const SPICE_EVAL_SCHEMA: &str = "eval";
 pub const SPICE_METADATA_SCHEMA: &str = "metadata";
 pub const SPICE_SCP_SCHEMA: &str = "scp";
+
+const MAX_STREAMING_BROADCAST_BATCHES: usize = 128;
+const MAX_STREAMING_BROADCAST_ROWS: usize = 1_000_000;
+const MAX_STREAMING_BROADCAST_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Default)]
+struct StreamingBroadcastBuffer {
+    batches: Vec<RecordBatch>,
+    rows: usize,
+    bytes: usize,
+    limit_exceeded: bool,
+}
+
+impl StreamingBroadcastBuffer {
+    fn push(&mut self, batch: &RecordBatch) -> bool {
+        if self.limit_exceeded {
+            return false;
+        }
+
+        let next_batches = self.batches.len().saturating_add(1);
+        let next_rows = self.rows.saturating_add(batch.num_rows());
+        let next_bytes = self.bytes.saturating_add(batch.get_array_memory_size());
+        if next_batches > MAX_STREAMING_BROADCAST_BATCHES
+            || next_rows > MAX_STREAMING_BROADCAST_ROWS
+            || next_bytes > MAX_STREAMING_BROADCAST_BYTES
+        {
+            self.batches.clear();
+            self.rows = 0;
+            self.bytes = 0;
+            self.limit_exceeded = true;
+            return true;
+        }
+
+        self.rows = next_rows;
+        self.bytes = next_bytes;
+        self.batches.push(batch.clone());
+        false
+    }
+
+    fn batches(&self) -> Option<Vec<RecordBatch>> {
+        (!self.limit_exceeded).then(|| self.batches.clone())
+    }
+}
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -410,6 +462,36 @@ pub enum Error {
     ))]
     UnsupportedAccelerationEngineForSnapshots,
 
+    #[snafu(display(
+        "refresh_mode: snapshot requires snapshot bootstrap to be enabled \
+         (set `acceleration.snapshots: enabled` or `bootstrap_only`); \
+         `disabled` and `create_only` are not sufficient because the dataset \
+         must be able to load from a snapshot."
+    ))]
+    SnapshotRefreshModeRequiresSnapshots,
+
+    #[snafu(display(
+        "refresh_mode: snapshot requires a snapshot-capable file-based engine \
+         (DuckDB, SQLite, Cayenne, or Turso); engine '{engine}' is not supported."
+    ))]
+    SnapshotRefreshModeUnsupportedEngine { engine: String },
+
+    #[snafu(display(
+        "refresh_mode: snapshot requires the accelerator to support snapshot reload, but \
+         engine '{engine}' does not implement `reload_from_snapshot`."
+    ))]
+    SnapshotRefreshModeReloadUnsupported { engine: String },
+
+    #[snafu(display("Failed to construct snapshot manager for refresh_mode: snapshot."))]
+    SnapshotRefreshModeManagerUnavailable,
+
+    #[snafu(display(
+        "refresh_mode: snapshot could not resolve the accelerator file layout: {source}"
+    ))]
+    SnapshotRefreshModeLayoutUnavailable {
+        source: crate::dataaccelerator::FilePathError,
+    },
+
     #[snafu(display("Pre-refresh partition discovery failed for table '{table_name}': {source}"))]
     PreRefreshPartitionDiscoveryFailed {
         table_name: String,
@@ -512,6 +594,12 @@ fn remap_constraints_to_refresh_schema(
 const DEFAULT_SNAPSHOT_CREATION_INTERVAL: Duration = Duration::from_mins(10);
 const DEFAULT_SNAPSHOT_CREATION_BATCHES: i64 = 100;
 
+/// Default polling interval for `refresh_mode: snapshot` when the user does
+/// not specify `refresh_check_interval` explicitly. Picked to be slightly
+/// shorter than the default snapshot creation interval so a freshly created
+/// snapshot is picked up promptly without aggressive object-store load.
+const DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL: Duration = Duration::from_mins(1);
+
 pub enum Table {
     Accelerated {
         source: Arc<dyn DataConnector>,
@@ -544,6 +632,7 @@ pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     pub(crate) runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
+    data_update_broadcaster: DataUpdateBroadcaster,
     writable_catalogs: RwLock<HashSet<String>>,
     /// Catalogs that allow DDL operations (CREATE TABLE, DROP TABLE, etc.)
     ddl_enabled_catalogs: Arc<RwLock<HashSet<String>>>,
@@ -557,6 +646,21 @@ pub struct DataFusion {
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
     deferred_tables: TokioRwLock<HashMap<String, DeferredTableRegistration>>,
     deferred_catalogs: TokioRwLock<HashMap<String, Arc<DeferredCatalogProvider>>>,
+
+    /// Registry of dataset placeholders awaiting first-reference
+    /// initialization. Populated by `register_deferred_dataset` and
+    /// drained by `resolve_pending_initializations`.
+    pending_initializations: TokioRwLock<
+        HashMap<
+            TableReference,
+            Arc<crate::datafusion::table::dataset_table_provider::DatasetTableProvider>,
+        >,
+    >,
+    /// Mirrors `pending_initializations` size and is read on the
+    /// steady-state hot path: when zero, queries pay only a single
+    /// `Acquire`-ordered atomic load and skip the lookup entirely.
+    pending_initializations_count: std::sync::atomic::AtomicUsize,
+    query_cancel_registry: Arc<QueryCancelRegistry>,
 
     pub(crate) accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
@@ -616,6 +720,87 @@ impl DataFusion {
     }
 
     #[must_use]
+    pub fn data_update_broadcaster(&self) -> DataUpdateBroadcaster {
+        self.data_update_broadcaster.clone()
+    }
+
+    #[must_use]
+    pub(crate) fn normalize_table_reference(
+        &self,
+        table_reference: TableReference,
+    ) -> TableReference {
+        // NOTE: this uses synchronous `table_exist` checks on schema providers. These
+        // checks are expected to be in-memory lookups in current catalog implementations.
+        match table_reference {
+            TableReference::Full { .. } => table_reference,
+            TableReference::Partial { schema, table } => {
+                let matching_catalogs = self
+                    .ctx
+                    .catalog_names()
+                    .into_iter()
+                    .filter(|catalog_name| {
+                        self.ctx
+                            .catalog(catalog_name)
+                            .and_then(|catalog| catalog.schema(schema.as_ref()))
+                            .is_some_and(|schema_provider| {
+                                schema_provider.table_exist(table.as_ref())
+                                    || self.is_catalog_writable(catalog_name)
+                            })
+                    })
+                    .collect::<Vec<_>>();
+
+                if matching_catalogs.len() == 1 {
+                    return TableReference::full(
+                        matching_catalogs[0].clone(),
+                        schema.to_string(),
+                        table.to_string(),
+                    );
+                }
+
+                TableReference::partial(schema, table)
+            }
+            TableReference::Bare { table } => {
+                let table_name = table.to_string();
+                let matching_tables =
+                    self.ctx
+                        .catalog_names()
+                        .into_iter()
+                        .flat_map(|catalog_name| {
+                            let table_name_for_catalog = table_name.clone();
+                            self.ctx
+                                .catalog(&catalog_name)
+                                .into_iter()
+                                .flat_map(move |catalog| {
+                                    let catalog_name = catalog_name.clone();
+                                    let table_name = table_name_for_catalog.clone();
+                                    catalog.schema_names().into_iter().filter_map(
+                                        move |schema_name| {
+                                            let table_name = table_name.clone();
+                                            catalog
+                                                .schema(&schema_name)
+                                                .filter(|schema_provider| {
+                                                    schema_provider.table_exist(table_name.as_str())
+                                                })
+                                                .map(|_| {
+                                                    (catalog_name.clone(), schema_name, table_name)
+                                                })
+                                        },
+                                    )
+                                })
+                        })
+                        .collect::<Vec<_>>();
+
+                if matching_tables.len() == 1 {
+                    let (catalog, schema, table_name) = matching_tables[0].clone();
+                    return TableReference::full(catalog, schema, table_name);
+                }
+
+                TableReference::bare(table_name)
+            }
+        }
+    }
+
+    #[must_use]
     fn schema(&self, schema_name: &str) -> Option<Arc<dyn SchemaProvider>> {
         if let Some(catalog) = self.ctx.catalog(SPICE_DEFAULT_CATALOG) {
             return catalog.schema(schema_name);
@@ -626,6 +811,11 @@ impl DataFusion {
 
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    #[must_use]
+    pub fn query_cancel_registry(&self) -> Arc<QueryCancelRegistry> {
+        Arc::clone(&self.query_cancel_registry)
     }
 
     pub async fn get_table(
@@ -1123,6 +1313,26 @@ impl DataFusion {
         Ok(table_provider)
     }
 
+    /// Resolver hook used by `create_logical_plan` to ensure any
+    /// `DatasetTableProvider` placeholders referenced by `statement`
+    /// are initialized (and swapped to their real providers in the
+    /// catalog) before logical planning runs federation analysis.
+    ///
+    /// Hot-path fast exit: a single `Acquire`-ordered atomic load on
+    /// `pending_initializations_count` skips the
+    /// `resolve_table_references` call when no datasets are pending.
+    async fn resolve_pending_initializations_for_statement(
+        &self,
+        session: &SessionState,
+        statement: &Statement,
+    ) -> Result<(), DataFusionError> {
+        if !self.has_pending_initializations() {
+            return Ok(());
+        }
+        let table_refs = session.resolve_table_references(statement)?;
+        self.resolve_pending_initializations(&table_refs).await
+    }
+
     pub async fn load_deferred_dataset(&self, table_reference: TableReference) -> Result<()> {
         let deferred_tables = self.deferred_tables.read().await;
         if let Some(deferred_registration) = deferred_tables.get(&table_reference.to_string()) {
@@ -1147,6 +1357,160 @@ impl DataFusion {
         }
 
         Ok(())
+    }
+
+    /// Register a deferred dataset.
+    ///
+    /// Inserts a `DatasetTableProvider` placeholder in the catalog with
+    /// the supplied schema and tracks the dataset in the pending
+    /// initialization registry. The lazy `DatasetInitialization` is
+    /// consumed at most once on first reference via the resolver hook
+    /// in `create_logical_plan`.
+    pub async fn register_deferred_dataset(
+        &self,
+        dataset: Arc<Dataset>,
+        init: crate::init::dataset_initialization::DatasetInitialization,
+        schema: arrow_schema::SchemaRef,
+    ) -> Result<()> {
+        use crate::datafusion::table::dataset_table_provider::DatasetTableProvider;
+        schema::ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
+
+        let placeholder = Arc::new(DatasetTableProvider::new(
+            dataset.name.clone(),
+            schema,
+            init,
+        ));
+
+        self.ctx
+            .register_table(
+                dataset.name.clone(),
+                Arc::clone(&placeholder) as Arc<dyn TableProvider>,
+            )
+            .map_err(find_datafusion_root)
+            .context(UnableToRegisterTableToDataFusionSnafu)?;
+
+        self.pending_initializations
+            .write()
+            .await
+            .insert(dataset.name.clone(), placeholder);
+        self.pending_initializations_count
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+
+        self.runtime_status
+            .update_dataset(&dataset.name, status::ComponentStatus::Ready);
+
+        Ok(())
+    }
+
+    /// Steady-state hot-path probe: returns `true` iff at least one
+    /// dataset placeholder is awaiting initialization.
+    ///
+    /// Single `Acquire`-ordered atomic load. Pods with no deferred
+    /// datasets, and post-warm-up pods, pay nothing here.
+    #[must_use]
+    pub fn has_pending_initializations(&self) -> bool {
+        self.pending_initializations_count
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    }
+
+    /// Resolve any pending placeholders that match `table_refs`.
+    ///
+    /// For each match, calls `ensure_ready` on the placeholder; on
+    /// success, removes it from the pending registry and decrements
+    /// the counter, then swaps the real provider into the catalog via
+    /// `replace_table`.
+    pub async fn resolve_pending_initializations(
+        &self,
+        table_refs: &[TableReference],
+    ) -> std::result::Result<(), DataFusionError> {
+        if !self.has_pending_initializations() {
+            return Ok(());
+        }
+
+        // Snapshot just the matching placeholders under the read lock,
+        // then run `ensure_ready` (which awaits source I/O) without
+        // holding it.
+        let to_resolve: Vec<_> = {
+            let pending = self.pending_initializations.read().await;
+            table_refs
+                .iter()
+                .filter_map(|r| pending.get(r).map(|p| (r.clone(), Arc::clone(p))))
+                .collect()
+        };
+
+        for (table_ref, placeholder) in to_resolve {
+            let ready = placeholder.ensure_ready().await.map_err(|e| {
+                DataFusionError::External(Box::new(std::io::Error::other(e.to_string())))
+            })?;
+
+            // Swap the placeholder out of the catalog with the real
+            // provider so federation analysis on the eventual logical
+            // plan downcasts to the underlying
+            // `FederatedTableProviderAdaptor`.
+            if let Some(real_provider) = ready.table_provider.clone() {
+                self.replace_table(&table_ref, real_provider).map_err(|e| {
+                    DataFusionError::External(Box::new(std::io::Error::other(e.to_string())))
+                })?;
+            }
+
+            // Drop from the pending registry. Decrement only if the
+            // entry was still present (concurrent resolvers may have
+            // already removed it).
+            let mut pending = self.pending_initializations.write().await;
+            if pending.remove(&table_ref).is_some() {
+                self.pending_initializations_count
+                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Replace the table provider registered under `name` with
+    /// `provider`. Used by the deferred dataset initialization swap.
+    pub fn replace_table(
+        &self,
+        name: &TableReference,
+        provider: Arc<dyn TableProvider>,
+    ) -> Result<()> {
+        // DataFusion has no atomic replace; deregister + register is
+        // the documented pattern.
+        let _ = self.ctx.deregister_table(name.clone());
+        self.ctx
+            .register_table(name.clone(), provider)
+            .map_err(find_datafusion_root)
+            .context(UnableToRegisterTableToDataFusionSnafu)?;
+        Ok(())
+    }
+
+    /// Deregister a placeholder so the eager bring-up path
+    /// can register the real (accelerated) table provider in its
+    /// place. Removes the entry from the pending registry and
+    /// decrements the counter so the resolver fast-path stops
+    /// matching this dataset.
+    pub async fn drop_pending_initialization(&self, name: &TableReference) -> Result<()> {
+        let _ = self.ctx.deregister_table(name.clone());
+        let mut pending = self.pending_initializations.write().await;
+        if pending.remove(name).is_some() {
+            self.pending_initializations_count
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Clear placeholder bookkeeping after a swap-in-place. Unlike
+    /// `drop_pending_initialization`, this does **not** call
+    /// `deregister_table`. The caller has already replaced the
+    /// placeholder with a real provider (e.g. via `register_table`
+    /// inside `register_loaded_dataset`), so deregistering would
+    /// remove the freshly-registered real provider.
+    pub async fn complete_pending_initialization(&self, name: &TableReference) {
+        let mut pending = self.pending_initializations.write().await;
+        if pending.remove(name).is_some() {
+            self.pending_initializations_count
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
     }
 
     pub async fn load_deferred_catalog(&self, name: &str, access: &AccessMode) -> Result<()> {
@@ -1246,40 +1610,59 @@ impl DataFusion {
 
         let table_provider = self.get_table_provider(table_reference).await?;
 
-        verify_schema(
-            table_provider.schema().fields(),
-            data_update.schema.fields(),
-        )
-        .context(SchemaMismatchSnafu)?;
+        let DataUpdate {
+            schema: update_schema,
+            data: update_data,
+            update_type,
+        } = data_update;
 
-        let overwrite = match data_update.update_type {
+        verify_schema(table_provider.schema().fields(), update_schema.fields())
+            .context(SchemaMismatchSnafu)?;
+        for batch in &update_data {
+            verify_schema(update_schema.fields(), batch.schema().fields())
+                .context(SchemaMismatchSnafu)?;
+        }
+
+        let update_data = Arc::new(update_data);
+
+        let overwrite = match &update_type {
             UpdateType::Overwrite => InsertOp::Overwrite,
             UpdateType::Append => InsertOp::Append,
             UpdateType::Changes => InsertOp::Replace,
         };
 
-        let streaming_update = StreamingDataUpdate::try_from(data_update)
-            .map_err(find_datafusion_root)
-            .context(UnableToCreateStreamingUpdateSnafu)?;
+        {
+            let insert_data = Arc::clone(&update_data);
+            let insert_stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    Arc::clone(&update_schema),
+                    Box::pin(futures::stream::iter((0..insert_data.len()).map(
+                        move |batch_index| {
+                            Ok::<_, DataFusionError>(insert_data[batch_index].clone())
+                        },
+                    ))),
+                ),
+            );
 
-        let insert_plan = table_provider
-            .insert_into(
-                &self.ctx.state(),
-                Arc::new(StreamingDataUpdateExecutionPlan::new(streaming_update.data)),
-                overwrite,
-            )
-            .await
-            .map_err(find_datafusion_root)
-            .context(UnableToPlanTableInsertSnafu {
-                table_name: table_reference.to_string(),
-            })?;
+            let insert_plan = table_provider
+                .insert_into(
+                    &self.ctx.state(),
+                    Arc::new(StreamingDataUpdateExecutionPlan::new(insert_stream)),
+                    overwrite,
+                )
+                .await
+                .map_err(find_datafusion_root)
+                .context(UnableToPlanTableInsertSnafu {
+                    table_name: table_reference.to_string(),
+                })?;
 
-        let _ = collect(insert_plan, self.ctx.task_ctx())
-            .await
-            .map_err(find_datafusion_root)
-            .context(UnableToExecuteTableInsertSnafu {
-                table_name: table_reference.to_string(),
-            })?;
+            let _ = collect(insert_plan, self.ctx.task_ctx())
+                .await
+                .map_err(find_datafusion_root)
+                .context(UnableToExecuteTableInsertSnafu {
+                    table_name: table_reference.to_string(),
+                })?;
+        }
 
         // Invalidate cached query state for this table.
         // Both results and logical plans can become stale after a write:
@@ -1296,6 +1679,25 @@ impl DataFusion {
         self.runtime_status
             .update_dataset(table_reference, status::ComponentStatus::Ready);
 
+        let broadcast_table_reference = self.normalize_table_reference(table_reference.clone());
+        if self
+            .data_update_broadcaster
+            .has_subscribers(&broadcast_table_reference)
+            .await
+        {
+            let data = Arc::try_unwrap(update_data).unwrap_or_else(|data| data.as_ref().clone());
+            self.data_update_broadcaster
+                .publish(
+                    &broadcast_table_reference,
+                    DataUpdate {
+                        schema: update_schema,
+                        data,
+                        update_type,
+                    },
+                )
+                .await;
+        }
+
         Ok(())
     }
 
@@ -1311,7 +1713,9 @@ impl DataFusion {
             .fail()?;
         }
 
-        let update_schema = streaming_update.data.schema();
+        let StreamingDataUpdate { data, update_type } = streaming_update;
+        let update_schema = data.schema();
+        let broadcast_table_reference = self.normalize_table_reference(table_reference.clone());
 
         self.ensure_sink_dataset(table_reference.clone(), Arc::clone(&update_schema))
             .await?;
@@ -1321,16 +1725,44 @@ impl DataFusion {
         verify_schema(table_provider.schema().fields(), update_schema.fields())
             .context(SchemaMismatchSnafu)?;
 
-        let overwrite = match streaming_update.update_type {
+        let overwrite = match update_type {
             UpdateType::Overwrite => InsertOp::Overwrite,
             UpdateType::Append => InsertOp::Append,
             UpdateType::Changes => InsertOp::Replace,
         };
 
+        let (broadcast_batches, data): (
+            Option<Arc<ParkingMutex<StreamingBroadcastBuffer>>>,
+            datafusion::execution::SendableRecordBatchStream,
+        ) = if self
+            .data_update_broadcaster
+            .has_subscribers(&broadcast_table_reference)
+            .await
+        {
+            let broadcast_batches =
+                Arc::new(ParkingMutex::new(StreamingBroadcastBuffer::default()));
+            let batches = Arc::clone(&broadcast_batches);
+            let stream = data.map(move |batch_result| {
+                if let Ok(batch) = &batch_result {
+                    batches.lock().push(batch);
+                }
+                batch_result
+            });
+            let data: datafusion::execution::SendableRecordBatchStream = Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    Arc::clone(&update_schema),
+                    Box::pin(stream),
+                ),
+            );
+            (Some(broadcast_batches), data)
+        } else {
+            (None, data)
+        };
+
         let insert_plan = table_provider
             .insert_into(
                 &self.ctx.state(),
-                Arc::new(StreamingDataUpdateExecutionPlan::new(streaming_update.data)),
+                Arc::new(StreamingDataUpdateExecutionPlan::new(data)),
                 overwrite,
             )
             .await
@@ -1356,6 +1788,43 @@ impl DataFusion {
             tracing::warn!(
                 "Failed to invalidate caches for table {table_reference} after streaming write: {e}"
             );
+        }
+
+        self.runtime_status
+            .update_dataset(table_reference, status::ComponentStatus::Ready);
+
+        if let Some(broadcast_batches) = broadcast_batches
+            && self
+                .data_update_broadcaster
+                .has_subscribers(&broadcast_table_reference)
+                .await
+        {
+            let broadcast_data = broadcast_batches.lock().batches();
+            if let Some(data) = broadcast_data {
+                self.data_update_broadcaster
+                    .publish(
+                        &broadcast_table_reference,
+                        DataUpdate {
+                            schema: update_schema,
+                            data,
+                            update_type,
+                        },
+                    )
+                    .await;
+            } else {
+                let subscribers_closed = self
+                    .data_update_broadcaster
+                    .close_subscribers(&broadcast_table_reference)
+                    .await;
+                tracing::warn!(
+                    dataset = %broadcast_table_reference,
+                    max_batches = MAX_STREAMING_BROADCAST_BATCHES,
+                    max_rows = MAX_STREAMING_BROADCAST_ROWS,
+                    max_bytes = MAX_STREAMING_BROADCAST_BYTES,
+                    subscribers_closed,
+                    "Closed DoExchange subscribers because the buffered streaming data update exceeded limits; subscribers must reconnect to receive a fresh snapshot"
+                );
+            }
         }
 
         Ok(())
@@ -1447,7 +1916,16 @@ impl DataFusion {
             .acceleration
             .as_ref()
             .is_some_and(|acc| !acc.on_conflict.is_empty());
-        let needs_source_writes = dataset.access().allows_write() && !has_on_conflict;
+        // When refresh_mode is `changes` (CDC), on_conflict provides WAL UPDATE upsert routing
+        // only — it does not imply accelerator-only writes. Writes should reach the federated
+        // source per write_mode. Without CDC, on_conflict means the source may be read-only and
+        // writes are directed to the accelerator only.
+        let has_changes_refresh = dataset.acceleration.as_ref().is_some_and(|acc| {
+            acc.refresh_mode
+                .is_some_and(|m| matches!(m, RefreshMode::Changes))
+        });
+        let needs_source_writes =
+            dataset.access().allows_write() && (!has_on_conflict || has_changes_refresh);
 
         let source_table_provider = if needs_source_writes {
             let read_write_provider = source
@@ -1538,11 +2016,35 @@ impl DataFusion {
             &dataset.name.to_string(),
         )?;
 
+        // For caching mode, the underlying accelerator storage is augmented
+        // with a hidden `__spice_cache_namespace` column so cached rows can be
+        // scoped per-principal. The user-facing schema (and therefore query
+        // planning, projection indices, and federation) continues to see only
+        // the original columns. This is a breaking change: existing caching
+        // accelerator storage from earlier Spice versions does not have the
+        // column and must be deleted (e.g. remove the duckdb_file or drop the
+        // SQLite/Postgres/Cayenne backing table) before upgrading.
+        let storage_schema = if matches!(refresh_mode, RefreshMode::Caching) {
+            Arc::new(
+                crate::accelerated_table::caching::extend_schema_with_cache_namespace(
+                    &dataset.name.to_string(),
+                    &refresh_schema,
+                )
+                .map_err(|source| Error::UnableToCreateDataAccelerator {
+                    source: crate::dataaccelerator::Error::InvalidConfiguration {
+                        msg: source.to_string(),
+                    },
+                })?,
+            )
+        } else {
+            Arc::clone(&refresh_schema)
+        };
+
         let accelerated_table_provider = self
             .accelerator_engine_registry
             .create_accelerator_table(
                 dataset.name.clone(),
-                Arc::clone(&refresh_schema),
+                Arc::clone(&storage_schema),
                 constraints.as_ref(),
                 &acceleration_settings,
                 Arc::clone(&secrets),
@@ -1551,6 +2053,30 @@ impl DataFusion {
             )
             .await
             .context(UnableToCreateDataAcceleratorSnafu)?;
+
+        // For RefreshMode::Snapshot, wrap the accelerator in a SwappableTableProvider
+        // so the underlying provider can be replaced atomically when a newer snapshot
+        // is loaded. The snapshot refresh state captures everything `RefreshTask` needs
+        // to query the snapshot store and rebuild the provider on reload.
+        let (accelerated_table_provider, snapshot_refresh_state) =
+            if matches!(refresh_mode, RefreshMode::Snapshot) {
+                let snapshot_state = build_snapshot_refresh_state(
+                    self,
+                    dataset,
+                    Arc::clone(&refresh_schema),
+                    constraints.clone(),
+                    &acceleration_settings,
+                    Arc::clone(&secrets),
+                    Arc::clone(&accelerated_table_provider),
+                    bootstrap_status.loaded_snapshot_id(),
+                )
+                .await?;
+                let swappable: Arc<dyn TableProvider> =
+                    Arc::clone(&snapshot_state.swappable_provider) as Arc<dyn TableProvider>;
+                (swappable, Some(snapshot_state))
+            } else {
+                (accelerated_table_provider, None)
+            };
 
         // If we already have an existing dataset checkpoint table that has been checkpointed,
         // it means there is data from a previous acceleration and we don't need
@@ -1602,6 +2128,16 @@ impl DataFusion {
         }
         if let Some(check_interval) = dataset.refresh_check_interval() {
             refresh = refresh.check_interval(check_interval);
+        } else if matches!(refresh_mode, RefreshMode::Snapshot) {
+            // Snapshot mode polls the snapshot store for newer snapshots; if the
+            // user did not configure a polling interval, fall back to a sensible
+            // default so the dataset stays current without requiring manual config.
+            tracing::info!(
+                dataset = %dataset.name,
+                interval_secs = DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL.as_secs(),
+                "refresh_mode: snapshot - using default refresh_check_interval"
+            );
+            refresh = refresh.check_interval(DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL);
         }
         if let Some(max_jitter) = dataset.refresh_max_jitter() {
             refresh = refresh.max_jitter(max_jitter);
@@ -1652,6 +2188,11 @@ impl DataFusion {
         accelerated_table_builder.cpu_runtime(self.refresh_runtime().cloned());
         accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
         accelerated_table_builder.accelerator_write_mutex(Arc::clone(&accelerator_write_mutex));
+        if matches!(refresh_mode, RefreshMode::Caching) {
+            // Hide the storage-only namespace column from query planning. Users
+            // see the same columns they would have seen pre-isolation.
+            accelerated_table_builder.user_facing_schema(Arc::clone(&refresh_schema));
+        }
 
         let retention_delete_expr = match dataset.retention_sql() {
             Some(retention_sql) => {
@@ -1768,11 +2309,23 @@ impl DataFusion {
         if acceleration_settings.snapshot_behavior.create_enabled() {
             if let Some(ref layout) = acceleration_layout {
                 if layout.is_enabled() {
+                    // Resolve any engine-specific snapshot engine override
+                    // (e.g. CayenneSnapshotEngine) so the upload pipeline
+                    // ships the engine's preferred archive format.
+                    let snapshot_engine_override = match self
+                        .accelerator_engine_registry
+                        .get_accelerator_engine(acceleration_settings.engine)
+                        .await
+                    {
+                        Some(accel) => accel.snapshot_engine_for_source(dataset).await,
+                        None => None,
+                    };
                     if let Some(snapshot_config) = build_snapshot_creation_config(
                         dataset,
                         &acceleration_settings,
                         refresh_mode,
                         layout.clone(),
+                        snapshot_engine_override,
                     )
                     .await?
                     {
@@ -1791,6 +2344,8 @@ impl DataFusion {
                 );
             }
         }
+
+        accelerated_table_builder.snapshot_refresh_state(snapshot_refresh_state);
 
         // Pass the acceleration layout for size metrics
         if let Some(layout) = acceleration_layout {
@@ -1835,6 +2390,7 @@ impl DataFusion {
                 dataset,
                 Arc::clone(&accelerated_table_provider),
                 Arc::clone(&accelerator_write_mutex),
+                self.refresh_runtime().cloned(),
             );
 
             if let Some(changes_stream) = changes_stream {
@@ -1842,15 +2398,15 @@ impl DataFusion {
             }
         }
 
-        // For append mode without time_column, check if source provides append_stream
-        // Skip this check for Cayenne which has its own validation (supports primary_key or time_column)
-        if refresh_mode == RefreshMode::Append
-            && dataset.time_column.is_none()
-            && acceleration_settings.engine != Engine::Cayenne
-        {
+        // For append mode without time_column, attach the source's append_stream
+        // when available (e.g. Kafka). This enables streaming append into any
+        // accelerator engine, including Cayenne. When the source does not
+        // provide an append_stream, Cayenne falls back to its own validation
+        // (supports primary_key); other engines require time_column.
+        if refresh_mode == RefreshMode::Append && dataset.time_column.is_none() {
             if let Some(append_stream) = source.append_stream(source_table_provider) {
                 accelerated_table_builder.append_stream(append_stream);
-            } else {
+            } else if acceleration_settings.engine != Engine::Cayenne {
                 return Err(Error::AppendRequiresTimeColumn {
                     from: dataset.from.clone(),
                 });
@@ -1863,10 +2419,28 @@ impl DataFusion {
                 .await;
         }
 
-        // When on_conflict is configured, writes go to the accelerated table only,
-        // not to the federated source (which may not support writes).
-        if has_on_conflict {
+        // on_conflict forces accelerator-only writes when CDC is not in use. With CDC
+        // (refresh_mode: changes), on_conflict is for WAL UPDATE upsert routing only and
+        // does not override the write destination — writes follow write_mode instead.
+        if has_on_conflict && !has_changes_refresh {
             accelerated_table_builder.write_to_accelerator_only();
+        } else if dataset.access().allows_write() {
+            match acceleration_settings.write_mode {
+                spicepod::acceleration::WriteMode::WriteBack => {
+                    accelerated_table_builder.write_back();
+                }
+                spicepod::acceleration::WriteMode::WriteThrough
+                    if acceleration_settings.engine == Engine::Cayenne =>
+                {
+                    // write_through with staged commit/rollback is only supported for Cayenne.
+                    // For other engines (e.g. DuckDB + CDC), writes fall through to FederatedOnly:
+                    // the write goes directly to the federated source and CDC propagates it back.
+                    accelerated_table_builder.write_through();
+                }
+                spicepod::acceleration::WriteMode::WriteThrough => {
+                    // FederatedOnly is the default for non-Cayenne engines.
+                }
+            }
         }
 
         accelerated_table_builder.bootstrap_status(bootstrap_status);
@@ -1885,6 +2459,11 @@ impl DataFusion {
         #[cfg(windows)]
         let is_s3_express_acceleration = false;
         accelerated_table_builder.s3_express_acceleration(is_s3_express_acceleration);
+
+        source
+            .on_accelerator_setup(dataset, &mut accelerated_table_builder)
+            .await
+            .context(AccelerationRegistrationSnafu)?;
 
         accelerated_table_builder
             .build()
@@ -1949,6 +2528,7 @@ impl DataFusion {
                         layout,
                         accel_engine,
                         Arc::clone(&existing_schema),
+                        None,
                     )
                     .await;
                 }
@@ -2327,7 +2907,7 @@ impl DataFusion {
 
         let federated_table_provider = federated_read_table.table_provider().await;
 
-        let source_table_provider = match dataset.access() {
+        let source_table_provider: Arc<dyn TableProvider> = match dataset.access() {
             AccessMode::Read => federated_table_provider,
             AccessMode::ReadWrite | AccessMode::ReadWriteCreate => source
                 .read_write_provider(dataset)
@@ -2603,6 +3183,21 @@ impl DataFusion {
             builder.refresh_semaphore(Arc::clone(semaphore));
         }
 
+        // Wrap the DuckDB accelerator with HNSW vector indexes (if applicable).
+        // This mirrors the dataset path in `EmbeddingConnector::on_accelerator_setup`.
+        #[cfg(feature = "duckdb")]
+        {
+            crate::embeddings::connector::try_wrap_view_accelerator_with_hnsw(
+                view,
+                table,
+                &mut builder,
+            )
+            .await
+            .map_err(|e| Error::UnableToCreateView {
+                reason: format!("Failed to create HNSW vector indexes for view: {e}"),
+            })?;
+        }
+
         let accelerated_table =
             builder
                 .build()
@@ -2715,11 +3310,19 @@ impl DataFusion {
     }
 
     /// Performs `DataFusion` cleanup during shutdown.
-    /// Currently performs cleanup of accelerated tables only.
+    /// Currently cancels active queries and cleans up accelerated tables.
     pub async fn shutdown(&self) {
         // Don't block self.accelerated_tables as it needs to be modified during table removal
         // and will be cleaned up authomatically by removing accelerated tables.
         tracing::debug!("Datafusion shutdown started");
+
+        let cancelled_queries = self.query_cancel_registry.cancel_all();
+        if cancelled_queries > 0 {
+            tracing::debug!(
+                cancelled_queries,
+                "Cancelled active queries during DataFusion shutdown"
+            );
+        }
 
         let accelerated_tables = self.accelerated_tables.read().await.clone();
 
@@ -2774,6 +3377,11 @@ impl DataFusion {
         session: &SessionState,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
+        let dialect = session.config().options().sql_parser.dialect;
+        let statement = session.sql_to_statement(sql, &dialect)?;
+        self.resolve_pending_initializations_for_statement(session, &statement)
+            .await?;
+
         let ctx = planner::PlannerContext {
             catalog_mode: if self.has_cayenne_catalog() {
                 planner::CatalogMode::Cayenne
@@ -2787,7 +3395,7 @@ impl DataFusion {
             io_runtime: self.io_runtime.clone(),
         };
 
-        planner::create_logical_plan(sql, session, &ctx).await
+        planner::create_logical_plan_from_statement(sql, statement, session, &ctx).await
     }
 
     /// On Windows the `planner` module is not available, so delegate
@@ -2798,7 +3406,11 @@ impl DataFusion {
         session: &SessionState,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
-        session.create_logical_plan(sql).await
+        let dialect = session.config().options().sql_parser.dialect;
+        let statement = session.sql_to_statement(sql, &dialect)?;
+        self.resolve_pending_initializations_for_statement(session, &statement)
+            .await?;
+        session.statement_to_plan(statement).await
     }
 
     pub(crate) async fn clear_cached_plans(&self) {
@@ -3105,9 +3717,17 @@ async fn wait_until_dependent_tables_are_ready(
             .into_iter()
             .map(|(key, value)| (resolve_table_reference(key), value))
             .collect::<std::collections::HashMap<_, _>>();
+        let catalog_statuses = runtime_status.get_catalog_statuses();
 
         if let Some(not_ready_table) = dependent_tables.iter().find(|dependent_table| {
-            statuses.get(dependent_table) != Some(&status::ComponentStatus::Ready)
+            if let Some(s) = statuses.get(dependent_table) {
+                s != &status::ComponentStatus::Ready
+            } else {
+                // Table not tracked as a dataset or view (e.g. a catalog table).
+                // Consider it ready if its catalog is registered and ready.
+                let catalog = dependent_table.catalog.as_ref();
+                catalog_statuses.get(catalog) != Some(&status::ComponentStatus::Ready)
+            }
         }) {
             tracing::debug!(
                 "Dependent table {not_ready_table} is not ready for {table}. Retrying..."
@@ -3125,7 +3745,18 @@ async fn build_snapshot_creation_config(
     acceleration_settings: &Acceleration,
     refresh_mode: RefreshMode,
     acceleration_layout: AccelerationLayout,
+    snapshot_engine_override: Option<
+        Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>,
+    >,
 ) -> Result<Option<SnapshotCreationConfig>> {
+    // `refresh_mode: snapshot` is a read-only snapshot consumer. Even when the
+    // dataset uses `acceleration.snapshots: enabled` (which normally enables
+    // both bootstrap and creation), snapshot refresh mode must not publish new
+    // snapshots or run the refresh-complete snapshot creation path.
+    if matches!(refresh_mode, RefreshMode::Snapshot) {
+        return Ok(None);
+    }
+
     let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
         || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
     let snapshot_trigger = &acceleration_settings.snapshots_trigger;
@@ -3258,17 +3889,228 @@ async fn build_snapshot_creation_config(
     .await
     .map(|sm| {
         let sm = sm.with_snapshots_creation_policy(acceleration_settings.snapshots_creation_policy);
+        let sm = if let Some(engine) = snapshot_engine_override {
+            sm.with_snapshot_engine(engine)
+        } else {
+            sm
+        };
         SnapshotCreationConfig::new(Arc::new(sm), snapshot_creation_trigger)
     }))
 }
 
+/// Build the per-dataset state required to drive `RefreshMode::Snapshot`.
+///
+/// Validates that the configuration is sound (snapshots enabled, supported
+/// engine, supported reload), constructs a [`SnapshotManager`] for the
+/// dataset, wraps the freshly-created accelerator provider in a
+/// [`SwappableTableProvider`], and captures a [`ReloadProviderFactory`] that
+/// re-runs `create_accelerator_table` on each reload.
+#[expect(clippy::too_many_arguments)]
+async fn build_snapshot_refresh_state(
+    df: &DataFusion,
+    dataset: &Dataset,
+    refresh_schema: SchemaRef,
+    constraints: Option<datafusion::common::Constraints>,
+    acceleration_settings: &Acceleration,
+    secrets: Arc<TokioRwLock<Secrets>>,
+    initial_provider: Arc<dyn TableProvider>,
+    bootstrap_loaded_id: Option<u64>,
+) -> Result<SnapshotRefreshState> {
+    // 1. snapshots must be enabled.
+    if !acceleration_settings.snapshot_behavior.bootstrap_enabled() {
+        return SnapshotRefreshModeRequiresSnapshotsSnafu.fail();
+    }
+
+    // 2. engine must be snapshot-capable (file-based with a known layout).
+    let acceleration_engine = engine_to_acceleration_engine(acceleration_settings.engine)
+        .ok_or_else(|| Error::SnapshotRefreshModeUnsupportedEngine {
+            engine: acceleration_settings.engine.to_string(),
+        })?;
+
+    // 3. accelerator must support reload_from_snapshot.
+    let accelerator = df
+        .accelerator_engine_registry
+        .get_accelerator_engine(acceleration_settings.engine)
+        .await
+        .ok_or_else(|| Error::SnapshotRefreshModeUnsupportedEngine {
+            engine: acceleration_settings.engine.to_string(),
+        })?;
+    if !accelerator.supports_snapshot_reload() {
+        return SnapshotRefreshModeReloadUnsupportedSnafu {
+            engine: acceleration_settings.engine.to_string(),
+        }
+        .fail();
+    }
+
+    // 4. obtain (or warn) a SnapshotManager for this dataset.
+    let acceleration_layout = get_acceleration_layout(dataset)
+        .await
+        .context(SnapshotRefreshModeLayoutUnavailableSnafu)?;
+    if !acceleration_layout.is_enabled() {
+        return Err(Error::SnapshotRefreshModeManagerUnavailable);
+    }
+
+    let manager = SnapshotManager::try_new(
+        dataset.name.to_string(),
+        acceleration_settings.snapshot_behavior.clone(),
+        acceleration_layout,
+        acceleration_engine,
+    )
+    .await
+    .ok_or(Error::SnapshotRefreshModeManagerUnavailable)?;
+    // Apply any engine-specific snapshot-engine override (e.g. CayenneSnapshotEngine).
+    let manager = match accelerator.snapshot_engine_for_source(dataset).await {
+        Some(engine) => manager.with_snapshot_engine(engine),
+        None => manager,
+    };
+    // Build a checkpointer factory mirroring the bootstrap path so the
+    // refresh-time `download_latest_snapshot` call can succeed (it requires a
+    // factory to materialize a checkpoint for restore).
+    let source_for_checkpointer: Arc<dyn crate::dataaccelerator::AccelerationSource> =
+        Arc::new(dataset.clone());
+    let snapshot_behavior_for_checkpointer = acceleration_settings.snapshot_behavior.clone();
+    let checkpoint_factory =
+        runtime_acceleration::dataset_checkpoint::make_checkpointer_factory(move || {
+            let source = Arc::clone(&source_for_checkpointer);
+            let snapshot_behavior = snapshot_behavior_for_checkpointer.clone();
+            async move {
+                use crate::dataaccelerator::spice_sys::OpenOption;
+                use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
+                use snafu::ResultExt;
+                DatasetCheckpoint::try_new(source.as_ref(), OpenOption::OpenExisting)
+                    .await
+                    .boxed()
+                    .map(|checkpoint| {
+                        checkpoint
+                            .with_snapshot_behavior(snapshot_behavior)
+                            .to_arc()
+                    })
+            }
+        });
+    let manager = manager
+        .with_snapshots_creation_policy(acceleration_settings.snapshots_creation_policy)
+        .with_checkpointer_factory(checkpoint_factory);
+    let manager = Arc::new(manager);
+
+    // 5. clone everything the reload factory needs into 'static state.
+    let registry = Arc::clone(&df.accelerator_engine_registry);
+    let dataset_owned = Arc::new(dataset.clone());
+    let acceleration_settings_owned = acceleration_settings.clone();
+    let ctx_owned = Arc::clone(&df.ctx);
+    let secrets_for_factory = Arc::clone(&secrets);
+    let table_name = dataset.name.clone();
+    let schema_for_factory = Arc::clone(&refresh_schema);
+    let constraints_for_factory = constraints;
+
+    let provider_factory: ReloadProviderFactory = Arc::new(move || {
+        let registry = Arc::clone(&registry);
+        let dataset_owned = Arc::clone(&dataset_owned);
+        let acceleration_settings_owned = acceleration_settings_owned.clone();
+        let ctx_owned = Arc::clone(&ctx_owned);
+        let secrets_for_factory = Arc::clone(&secrets_for_factory);
+        let table_name = table_name.clone();
+        let schema_for_factory = Arc::clone(&schema_for_factory);
+        let constraints_for_factory = constraints_for_factory.clone();
+        Box::pin(async move {
+            registry
+                .create_accelerator_table(
+                    table_name,
+                    schema_for_factory,
+                    constraints_for_factory.as_ref(),
+                    &acceleration_settings_owned,
+                    secrets_for_factory,
+                    Some(dataset_owned.as_ref()),
+                    ctx_owned,
+                )
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+        })
+    });
+
+    let swappable_provider = SwappableTableProvider::new(initial_provider);
+    let current_snapshot_id = std::sync::Arc::new(std::sync::Mutex::new(bootstrap_loaded_id));
+
+    Ok(SnapshotRefreshState {
+        manager,
+        accelerator,
+        source: Arc::new(dataset.clone()),
+        swappable_provider,
+        provider_factory,
+        current_snapshot_id,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field};
     use cache::{SimpleCache, key::CacheKey};
+    use datafusion::datasource::MemTable;
 
     use crate::builder::RuntimeBuilder;
 
     use super::*;
+
+    fn streaming_broadcast_test_batch(value: i32) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![value])) as arrow::array::ArrayRef],
+        )
+        .expect("test record batch should be valid")
+    }
+
+    #[test]
+    fn test_streaming_broadcast_buffer_records_within_limit() {
+        let mut buffer = StreamingBroadcastBuffer::default();
+
+        assert!(!buffer.push(&streaming_broadcast_test_batch(1)));
+
+        let batches = buffer.batches().expect("buffer should be publishable");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(buffer.bytes, batches[0].get_array_memory_size());
+    }
+
+    #[test]
+    fn test_streaming_broadcast_buffer_disables_when_batch_limit_exceeded() {
+        let mut buffer = StreamingBroadcastBuffer::default();
+
+        for value in 0..MAX_STREAMING_BROADCAST_BATCHES {
+            assert!(!buffer.push(&streaming_broadcast_test_batch(
+                i32::try_from(value).expect("test value fits in i32")
+            )));
+        }
+
+        assert!(buffer.push(&streaming_broadcast_test_batch(999)));
+        assert!(buffer.batches().is_none());
+        assert!(!buffer.push(&streaming_broadcast_test_batch(1000)));
+    }
+
+    #[tokio::test]
+    async fn test_normalize_table_reference_expands_unique_bare_reference() {
+        let runtime = RuntimeBuilder::new().build().await;
+        let df = DataFusion::builder(
+            status::RuntimeStatus::new(),
+            runtime.accelerator_engine_registry(),
+            Handle::current(),
+        )
+        .build();
+        let table_reference =
+            TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, "cdc_table");
+        let table = Arc::new(
+            MemTable::try_new(streaming_broadcast_test_batch(1).schema(), vec![vec![]])
+                .expect("mem table should be created"),
+        );
+
+        df.ctx
+            .register_table(table_reference.clone(), table)
+            .expect("table should be registered");
+
+        assert_eq!(
+            df.normalize_table_reference(TableReference::bare("cdc_table")),
+            table_reference
+        );
+    }
 
     #[tokio::test]
     async fn test_get_or_create_logical_plan() {
@@ -3355,7 +4197,9 @@ mod tests {
                 metrics: Metrics::default(),
                 runtime: Arc::new(runtime),
                 vectors: None,
+                full_text_search: None,
                 check_availability: crate::component::dataset::CheckAvailability::Disabled,
+                on_schema_change: crate::component::dataset::OnSchemaChange::default(),
             }
         }
 
@@ -3409,10 +4253,69 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
             assert!(result.expect("config should exist").is_none());
+        }
+
+        #[tokio::test]
+        async fn test_snapshot_refresh_mode_is_reader_only() {
+            let dataset = create_test_dataset(None).await;
+            let acceleration = create_acceleration_with_trigger(
+                Some("file:///tmp".to_string()),
+                Engine::DuckDB,
+                Some(SnapshotsTrigger::RefreshComplete),
+                None,
+                &dataset.runtime().secrets(),
+            );
+            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let snapshot_path = temp_dir.path().join("snapshot.db");
+
+            let result = build_snapshot_creation_config(
+                &dataset,
+                &acceleration,
+                RefreshMode::Snapshot,
+                AccelerationLayout::file(snapshot_path),
+                None,
+            )
+            .await;
+
+            assert!(
+                result.expect("snapshot reader should not error").is_none(),
+                "refresh_mode: snapshot must not create a snapshot creation config"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_snapshot_refresh_mode_ignores_create_trigger_validation() {
+            let dataset = create_test_dataset(None).await;
+            let acceleration = create_acceleration_with_trigger(
+                Some("file:///tmp".to_string()),
+                Engine::DuckDB,
+                Some(SnapshotsTrigger::StreamBatches),
+                Some("not-a-valid-batch-count".to_string()),
+                &dataset.runtime().secrets(),
+            );
+            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let snapshot_path = temp_dir.path().join("snapshot.db");
+
+            let result = build_snapshot_creation_config(
+                &dataset,
+                &acceleration,
+                RefreshMode::Snapshot,
+                AccelerationLayout::file(snapshot_path),
+                None,
+            )
+            .await;
+
+            assert!(
+                result
+                    .expect("snapshot reader should ignore creation trigger config")
+                    .is_none(),
+                "refresh_mode: snapshot should ignore snapshot creation trigger settings"
+            );
         }
 
         #[tokio::test]
@@ -3433,6 +4336,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3470,6 +4374,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Changes,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3507,6 +4412,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3539,6 +4445,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3571,6 +4478,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3603,6 +4511,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3631,6 +4540,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3659,6 +4569,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 
@@ -3690,6 +4601,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Changes,
                 AccelerationLayout::file(snapshot_path),
+                None,
             )
             .await;
 

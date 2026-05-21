@@ -17,9 +17,12 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion::{
-    common::{plan_err, tree_node::TreeNodeRecursion},
+    common::{
+        plan_err,
+        tree_node::{TreeNode, TreeNodeRecursion},
+    },
     error::DataFusionError,
-    logical_expr::{DdlStatement, LogicalPlan, Statement},
+    logical_expr::{DdlStatement, Expr, LogicalPlan, Statement},
 };
 
 use crate::datafusion::DataFusion;
@@ -261,11 +264,32 @@ pub fn validate_sql_query_read_only(plan: &LogicalPlan) -> Result<(), DataFusion
                     "Write-capable extension plan '{name}' is not allowed in read-only SQL context."
                 )
             } else {
+                validate_no_code_executing_functions(node)?;
                 Ok(TreeNodeRecursion::Continue)
             }
         }
-        _ => Ok(TreeNodeRecursion::Continue),
+        _ => {
+            validate_no_code_executing_functions(node)?;
+            Ok(TreeNodeRecursion::Continue)
+        }
     })?;
+    Ok(())
+}
+
+fn validate_no_code_executing_functions(plan: &LogicalPlan) -> Result<(), DataFusionError> {
+    for expr in plan.expressions() {
+        expr.apply(|expr| {
+            if let Expr::ScalarFunction(function) = expr {
+                let function_name = function.func.name();
+                if crate::datafusion::udf::is_code_executing_function(function_name) {
+                    return plan_err!(
+                        "Function '{function_name}' requires a read-write API key and is not allowed in read-only SQL context."
+                    );
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+    }
     Ok(())
 }
 
@@ -931,6 +955,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_only_validator_rejects_code_executing_function() {
+        use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+        use datafusion::scalar::ScalarValue;
+
+        let df = create_test_datafusion();
+        let function_name = "code_exec_test_fn";
+        let _cleanup = scopeguard::guard(function_name, |name| {
+            crate::datafusion::udf::remove_code_executing_function(name);
+        });
+
+        let udf = create_udf(
+            function_name,
+            vec![],
+            DataType::Utf8,
+            Volatility::Volatile,
+            Arc::new(|_| {
+                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+                    "ok".to_string(),
+                ))))
+            }),
+        );
+        df.ctx.register_udf(udf);
+        crate::datafusion::udf::add_code_executing_function(function_name);
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("SELECT code_exec_test_fn()")
+            .await
+            .expect("plan should be created");
+
+        let err = validate_sql_query_read_only(&plan)
+            .expect_err("code-executing functions must be rejected");
+        assert!(
+            err.to_string().contains("read-write API key"),
+            "error should cite read-write API key requirement, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_read_only_validator_rejects_delete_on_writable_dataset() {
         let df = create_test_datafusion();
 
@@ -943,6 +1007,38 @@ mod tests {
 
         validate_sql_query_read_only(&plan)
             .expect_err("DELETE must be rejected in read-only context");
+    }
+
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_update_on_writable_dataset() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("UPDATE tbl_writable SET name = 'bar' WHERE id = 1")
+            .await
+            .expect("plan should be created");
+
+        validate_sql_query_read_only(&plan)
+            .expect_err("UPDATE must be rejected in read-only context");
+    }
+
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_insert_on_writable_catalog() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(
+                "INSERT INTO writable_catalog.public.test_table VALUES (1, 'foo', 42.0)",
+            )
+            .await
+            .expect("plan should be created");
+
+        validate_sql_query_read_only(&plan)
+            .expect_err("INSERT into a writable catalog must be rejected in read-only context");
     }
 
     #[tokio::test]

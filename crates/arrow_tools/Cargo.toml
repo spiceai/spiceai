@@ -2,7 +2,7 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "arrow_tools"
 repository.workspace = true
 rust-version.workspace = true
@@ -20,3 +20,8 @@ tracing.workspace = true
 insta = {workspace = true, features = ["json"]}
 arrow-json.workspace = true
 serde_json.workspace = true
+criterion = { version = "0.7", features = ["html_reports"] }
+
+[[bench]]
+name = "truncate"
+harness = false

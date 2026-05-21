@@ -20,6 +20,19 @@ use arrow_schema::SchemaRef;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use serde::{Deserialize, Serialize};
 
+/// Default maximum number of rows to inline in the metastore instead of writing a Vortex file.
+pub const DEFAULT_INLINE_MAX_ROWS: usize = 1024;
+/// Default maximum serialized IPC size in bytes for a single inlined entry.
+pub const DEFAULT_INLINE_MAX_BYTES: usize = 1_048_576;
+/// Default maximum in-memory byte budget while buffering an inline fast-path stream.
+pub const DEFAULT_INLINE_MAX_BUFFER_BYTES: usize = 4 * 1_048_576;
+/// Default maximum rows to keep inline before flushing to Vortex.
+pub const DEFAULT_INLINE_FLUSH_MAX_ROWS: i64 = 10_000;
+/// Default maximum inline entries before flushing to Vortex.
+pub const DEFAULT_INLINE_FLUSH_MAX_SEGMENTS: i64 = 64;
+/// Default maximum serialized IPC bytes to keep inline before flushing to Vortex.
+pub const DEFAULT_INLINE_FLUSH_MAX_BYTES: i64 = 8 * 1_048_576;
+
 /// Metadata about a table in the catalog.
 #[derive(Debug, Clone)]
 pub struct TableMetadata {
@@ -235,21 +248,54 @@ pub enum CompressionStrategy {
     Zstd,
 }
 
+/// Primary-key conflict detection behavior for Cayenne inserts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PkConflictDetection {
+    /// Build a PK keyset and apply configured `on_conflict` behavior.
+    #[default]
+    Auto,
+    /// Append without scanning existing PKs. The source must enforce PK uniqueness,
+    /// and the ingestion path must not replay rows across bootstrap/WAL boundaries.
+    None,
+}
+
+impl PkConflictDetection {
+    /// Parse a spicepod parameter value.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    /// Return the spicepod/config string for this mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::None => "none",
+        }
+    }
+}
+
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VortexConfig {
-    /// Footer cache size in MB.
+    /// Runtime-global footer metadata cache size in MB, when explicitly configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer_cache_mb: Option<usize>,
+    /// Shared Vortex segment cache capacity in MB.
     ///
-    /// Currently ignored in Spice.ai `2.0.0-unstable`.
-    pub footer_cache_mb: usize,
-    /// Segment cache size in MB.
-    ///
-    /// Currently ignored in Spice.ai `2.0.0-unstable`.
+    /// Passed through to `vortex-datafusion` as the per-format segment cache size.
     pub segment_cache_mb: usize,
     /// Target size for individual Vortex files in MB. When writes exceed this size,
     /// a new Vortex file will be created in the same listing directory. This allows
     /// for better parallelism and more granular statistics for query optimization.
-    /// Defaults to 128 MB.
+    /// Defaults to 256 MB.
     pub target_vortex_file_size_mb: usize,
     /// Columns to sort data by on refresh operations (empty = no sorting)
     pub sort_columns: Vec<String>,
@@ -258,29 +304,218 @@ pub struct VortexConfig {
     pub compression_strategy: CompressionStrategy,
     /// Maximum number of concurrent file uploads when writing multiple Vortex files.
     /// Each file uses multipart uploads internally via `object_store`.
-    /// Defaults to 4 for balanced I/O throughput vs resource usage.
+    /// Defaults to the available CPU parallelism.
     #[serde(default = "default_upload_concurrency")]
     pub upload_concurrency: usize,
+    /// Optional override for writer partitions when ingesting unsorted data into a snapshot.
+    /// When unset, writes use the current `DataFusion` session target partition count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_concurrency: Option<usize>,
+    /// Minimum number of "small" Vortex files that must accumulate in the current
+    /// snapshot before tiered compaction is eligible to run. Files are classified
+    /// as "small" when their size is below `target_vortex_file_size_mb / 4`. The
+    /// compactor also requires that the eligible tier's total size meets the
+    /// per-tier target before rewriting the current snapshot (see
+    /// [`crate::provider::compaction`]).
+    ///
+    /// Defaults to 8.
+    #[serde(default = "default_compaction_trigger_files")]
+    pub compaction_trigger_files: usize,
+    /// Number of protected snapshots that can accumulate before snapshot-maintenance
+    /// compaction is eligible to run. Kept separate from `compaction_trigger_files`
+    /// so small-file compaction tuning does not silently change scan amplification
+    /// behavior for protected snapshots.
+    ///
+    /// Defaults to 8.
+    #[serde(default = "default_compaction_trigger_protected_snapshots")]
+    pub compaction_trigger_protected_snapshots: usize,
+    /// Maximum age in milliseconds of the oldest protected snapshot before
+    /// snapshot-maintenance compaction is eligible to run. This bounds how long
+    /// low-volume update/delete workloads can keep extra protected snapshots
+    /// attached to every scan when they do not reach the count trigger. Set to
+    /// 0 to disable the age trigger.
+    ///
+    /// Defaults to 300,000 ms (5 minutes).
+    #[serde(default = "default_compaction_trigger_snapshot_age_ms")]
+    pub compaction_trigger_snapshot_age_ms: u64,
+    /// Maximum number of consecutive compaction passes that a single trigger can
+    /// run. Each pass picks the smallest eligible tier and rewrites a single
+    /// snapshot. Capping this avoids unbounded write amplification when the
+    /// picker would keep finding work after each promotion.
+    ///
+    /// Defaults to 3.
+    #[serde(default = "default_compaction_max_levels")]
+    pub compaction_max_levels: usize,
+    /// Maximum number of eligible file paths the picker retains in a single
+    /// compaction candidate. The current runner uses the candidate as a trigger
+    /// and observability signal, then rewrites the whole current snapshot; this
+    /// setting does not bound rewrite IO or memory.
+    ///
+    /// Defaults to 32.
+    #[serde(default = "default_compaction_max_files_per_pick")]
+    pub compaction_max_files_per_pick: usize,
+    /// Background compaction interval in milliseconds. The accelerator spawns a
+    /// per-table background task that calls the compactor every interval. Set to
+    /// 0 to disable the background task — inline compaction on writes still runs.
+    ///
+    /// Defaults to `30_000` ms.
+    #[serde(default = "default_compaction_background_interval_ms")]
+    pub compaction_background_interval_ms: u64,
+    /// Maximum rows in a single write that can be inlined directly into the metastore.
+    /// Set to 0 to disable write-entry inlining.
+    #[serde(default = "default_inline_max_rows")]
+    pub inline_max_rows: usize,
+    /// Maximum serialized Arrow IPC bytes in a single inlined metastore entry.
+    /// Set to 0 to disable write-entry inlining.
+    #[serde(default = "default_inline_max_bytes")]
+    pub inline_max_bytes: usize,
+    /// Maximum Arrow in-memory bytes to buffer while deciding whether to inline a write.
+    /// Set to 0 to force the normal Vortex write path after the first buffered batch.
+    #[serde(default = "default_inline_max_buffer_bytes")]
+    pub inline_max_buffer_bytes: usize,
+    /// Maximum inline rows before checkpointing inline data to Vortex.
+    #[serde(
+        default = "default_inline_flush_max_rows",
+        alias = "inline_memtable_max_rows"
+    )]
+    pub inline_flush_max_rows: i64,
+    /// Maximum inline entries before checkpointing inline data to Vortex.
+    #[serde(
+        default = "default_inline_flush_max_segments",
+        alias = "inline_memtable_max_segments"
+    )]
+    pub inline_flush_max_segments: i64,
+    /// Maximum inline IPC bytes before checkpointing inline data to Vortex.
+    #[serde(
+        default = "default_inline_flush_max_bytes",
+        alias = "inline_memtable_max_bytes"
+    )]
+    pub inline_flush_max_bytes: i64,
+    /// Whether inserts should scan existing data for primary-key conflicts. Set to `none` only
+    /// when the source enforces PK uniqueness and ingestion cannot replay existing rows.
+    #[serde(default)]
+    pub pk_conflict_detection: PkConflictDetection,
 }
 
-const fn default_upload_concurrency() -> usize {
-    4
+fn default_concurrency() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+}
+
+fn default_upload_concurrency() -> usize {
+    default_concurrency()
+}
+
+fn default_compaction_trigger_files() -> usize {
+    8
+}
+
+fn default_compaction_trigger_protected_snapshots() -> usize {
+    8
+}
+
+fn default_compaction_trigger_snapshot_age_ms() -> u64 {
+    300_000
+}
+
+fn default_compaction_max_levels() -> usize {
+    3
+}
+
+fn default_compaction_max_files_per_pick() -> usize {
+    32
+}
+
+fn default_compaction_background_interval_ms() -> u64 {
+    30_000
+}
+
+fn default_inline_max_rows() -> usize {
+    DEFAULT_INLINE_MAX_ROWS
+}
+
+fn default_inline_max_bytes() -> usize {
+    DEFAULT_INLINE_MAX_BYTES
+}
+
+fn default_inline_max_buffer_bytes() -> usize {
+    DEFAULT_INLINE_MAX_BUFFER_BYTES
+}
+
+fn default_inline_flush_max_rows() -> i64 {
+    DEFAULT_INLINE_FLUSH_MAX_ROWS
+}
+
+fn default_inline_flush_max_segments() -> i64 {
+    DEFAULT_INLINE_FLUSH_MAX_SEGMENTS
+}
+
+fn default_inline_flush_max_bytes() -> i64 {
+    DEFAULT_INLINE_FLUSH_MAX_BYTES
 }
 
 impl Default for VortexConfig {
     fn default() -> Self {
         Self {
-            // Larger caches improve read performance
-            footer_cache_mb: 128,
+            footer_cache_mb: None,
             segment_cache_mb: 256,
-            // Smaller files = better parallelism and predicate pushdown
-            target_vortex_file_size_mb: 128,
+            // Balanced file size for scan throughput and write amplification
+            target_vortex_file_size_mb: 256,
             // No sort columns by default
             sort_columns: Vec::new(),
             compression_strategy: CompressionStrategy::default(),
-            // 4 concurrent uploads balances throughput vs resource usage
-            upload_concurrency: 4,
+            upload_concurrency: default_upload_concurrency(),
+            write_concurrency: None,
+            compaction_trigger_files: default_compaction_trigger_files(),
+            compaction_trigger_protected_snapshots: default_compaction_trigger_protected_snapshots(
+            ),
+            compaction_trigger_snapshot_age_ms: default_compaction_trigger_snapshot_age_ms(),
+            compaction_max_levels: default_compaction_max_levels(),
+            compaction_max_files_per_pick: default_compaction_max_files_per_pick(),
+            compaction_background_interval_ms: default_compaction_background_interval_ms(),
+            inline_max_rows: default_inline_max_rows(),
+            inline_max_bytes: default_inline_max_bytes(),
+            inline_max_buffer_bytes: default_inline_max_buffer_bytes(),
+            inline_flush_max_rows: default_inline_flush_max_rows(),
+            inline_flush_max_segments: default_inline_flush_max_segments(),
+            inline_flush_max_bytes: default_inline_flush_max_bytes(),
+            pk_conflict_detection: PkConflictDetection::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PkConflictDetection, VortexConfig};
+
+    #[test]
+    fn test_concurrency_defaults_use_available_parallelism_where_global() {
+        let available_parallelism =
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let config = VortexConfig::default();
+
+        assert_eq!(config.upload_concurrency, available_parallelism);
+        assert_eq!(config.write_concurrency, None);
+        assert_eq!(config.pk_conflict_detection, PkConflictDetection::Auto);
+    }
+
+    #[test]
+    fn test_vortex_config_deserializes_pk_conflict_detection_default() {
+        let config: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
+
+        assert_eq!(config.pk_conflict_detection, PkConflictDetection::Auto);
+    }
+
+    #[test]
+    fn test_pk_conflict_detection_parse() {
+        assert_eq!(
+            PkConflictDetection::parse("auto"),
+            Some(PkConflictDetection::Auto)
+        );
+        assert_eq!(
+            PkConflictDetection::parse("none"),
+            Some(PkConflictDetection::None)
+        );
+        assert_eq!(PkConflictDetection::parse("invalid"), None);
     }
 }
 
@@ -353,6 +588,38 @@ pub struct InlinedData {
     pub sequence_number: i64,
     /// ISO 8601 timestamp of when this entry was created
     pub created_at: String,
+}
+
+/// Aggregate size information for inline data entries in the metastore.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InlinedDataStats {
+    /// Total number of visible rows represented by inline entries.
+    pub record_count: i64,
+    /// Number of inline entries for the table.
+    pub entry_count: i64,
+    /// Total serialized Arrow IPC bytes stored inline.
+    pub ipc_bytes: i64,
+}
+
+impl InlinedData {
+    /// Build an inline data row whose identity, sequence number, and timestamp
+    /// are assigned by `MetadataCatalog::commit_inlined_mutation`.
+    pub(crate) fn pending_catalog_insert(
+        table_id: String,
+        partition_key: Option<String>,
+        data_ipc: Vec<u8>,
+        record_count: i64,
+    ) -> Self {
+        Self {
+            inlined_id: String::new(),
+            table_id,
+            partition_key,
+            data_ipc,
+            record_count,
+            sequence_number: 0,
+            created_at: String::new(),
+        }
+    }
 }
 
 /// A small batch of delete identifiers inlined in the metastore.

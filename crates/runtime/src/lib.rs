@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
+#![recursion_limit = "256"]
 
 use ::tools::SpiceModelTool;
 use ::tools::rename::with_name;
@@ -39,11 +40,12 @@ use worker::WorkerRegistry;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::datafusion::DataFusion;
 use crate::datafusion::error::format_datafusion_error;
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::model::LLMResponsesModelStore;
 use crate::{auth::EndpointAuth, dataconnector::DataConnector};
 
 use ::datafusion::error::DataFusionError;
-use ::datafusion::sql::{TableReference, sqlparser};
+use ::datafusion::sql::{ResolvedTableReference, TableReference, sqlparser};
 use app::App;
 use datafusion_proto::bytes::Serializeable;
 
@@ -59,6 +61,7 @@ use futures::{
     Stream, TryFutureExt,
     future::{join_all, try_join_all},
 };
+use governor::RateLimiter;
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
 use llms::rerank::RerankerModelStore;
@@ -112,6 +115,7 @@ mod metrics;
 pub mod metrics_reader;
 mod metrics_server;
 pub mod model;
+mod object_store_state;
 mod opentelemetry;
 pub mod otel_push_exporter;
 pub mod resource_monitor;
@@ -138,7 +142,8 @@ mod udtfs;
 mod view;
 mod worker;
 
-pub type PartitionAssignments = HashMap<TableReference, Vec<::datafusion::logical_expr::Expr>>;
+pub type PartitionAssignments =
+    HashMap<ResolvedTableReference, Vec<::datafusion::logical_expr::Expr>>;
 pub type SharedPartitionAssignments = Arc<RwLock<PartitionAssignments>>;
 
 #[derive(Debug, Snafu)]
@@ -233,6 +238,18 @@ pub enum Error {
     #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]
     UnableToLoadDataConnectorSecrets { data_connector: String },
 
+    #[snafu(display("Unable to update cluster partition filters for table {table}: {source}"))]
+    UnableToUpdateClusterPartitionFilters {
+        table: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Unable to deserialize partition expression for table {table}: {source}"))]
+    UnableToDeserializeClusterPartitionExpression {
+        table: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Unable to get secret for data connector {data_connector}: {source}"))]
     UnableToGetSecretForDataConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -271,9 +288,14 @@ pub enum Error {
     NeedToSpecifySQLView { name: String },
 
     #[snafu(display(
-        "An accelerated table was configured as read_write without setting replication.enabled = true"
+        "An accelerated table for {dataset_name} cannot be configured with both 'on_conflict' and 'acceleration.write_mode: write_back' without 'refresh_mode: changes'. Without CDC, 'on_conflict' forces writes to the accelerator only and there is no sync path back to the federated source. Add 'refresh_mode: changes' to enable CDC-based sync, or remove 'on_conflict'."
     ))]
-    AcceleratedReadWriteTableWithoutReplication,
+    AcceleratedWriteBackWithOnConflict { dataset_name: String },
+
+    #[snafu(display(
+        "An accelerated table for {dataset_name} was configured with 'acceleration.write_mode: write_back' but 'replication.enabled' is not set. Write-back commits to the local accelerator first and persists to the federated source asynchronously, so source persistence failures are logged rather than returned to the caller. Set 'replication.enabled: true' to opt in to asynchronous source durability, or use a different write_mode."
+    ))]
+    AcceleratedWriteBackWithoutReplication { dataset_name: String },
 
     #[snafu(display(
         "An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."
@@ -470,7 +492,7 @@ pub enum Error {
 const CLUSTER_EXECUTOR: &str = "cluster_executor";
 const CLUSTER_INTERNAL_SERVER: &str = "cluster_internal_server";
 const CLUSTER_SCHEDULER_REGISTRY: &str = "cluster_scheduler_registry";
-const CLUSTER_PARTITION_MANAGEMENT_TASK: &str = "cluster_partition_management_task";
+const CLUSTER_PARTITION_ASSIGNMENT_TASK: &str = "cluster_partition_assignment_task";
 const HTTP_SERVER: &str = "http_server";
 const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
@@ -494,6 +516,7 @@ pub struct Runtime {
     completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
     /// Per-model rate controllers for AI UDF concurrency control.
     model_rate_controllers: Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>>,
+    http_rate_control_registry: Arc<dataconnector::http_rate_control::HttpRateControlRegistry>,
     // LLMs that support the OpenAI Responses API
     responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
@@ -532,6 +555,11 @@ pub struct Runtime {
     resource_monitor: resource_monitor::ResourceMonitor,
 
     config: Arc<Config>,
+
+    /// Shared semaphore that bounds concurrent dataset schema inference
+    /// (`read_provider`) calls so that startup loads and on-demand loads both
+    /// honor `runtime.dataset_load_parallelism`.
+    dataset_load_semaphore: Arc<tokio::sync::Semaphore>,
 
     /// Handle for resolving the spicepod `TelemetryConfig` for anonymous
     /// telemetry. For executors this is set after the app definition is
@@ -608,6 +636,13 @@ impl Runtime {
         &self,
     ) -> Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>> {
         Arc::clone(&self.model_rate_controllers)
+    }
+
+    #[must_use]
+    pub fn http_rate_control_registry(
+        &self,
+    ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
+        Arc::clone(&self.http_rate_control_registry)
     }
 
     #[must_use]
@@ -692,104 +727,118 @@ impl Runtime {
         &self,
         new_partitions: HashMap<String, Vec<Vec<u8>>>,
         removed_partitions: HashMap<String, Vec<Vec<u8>>>,
-    ) {
-        if let Some(DistributedNode::Executor {
+    ) -> Result<()> {
+        let Some(DistributedNode::Executor {
             partition_assignments,
         }) = self.distributed.as_ref()
-        {
-            let mut guard = partition_assignments.write().await;
-
-            // Handle removed partitions
-            for (table_name, partitions) in &removed_partitions {
-                let table_ref = TableReference::parse_str(table_name);
-                if let Some(current_partitions) = guard.get_mut(&table_ref) {
-                    for partition_bytes in partitions {
-                        if let Ok(partition_expr) =
-                            Expr::from_bytes_with_registry(partition_bytes, self.df.ctx.as_ref())
-                        {
-                            current_partitions.retain(|p| p != &partition_expr);
-                        } else {
-                            tracing::warn!(
-                                "Failed to deserialize removed partition expression for table {table_name}"
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Handle new partitions
-            for (table_name, partitions) in &new_partitions {
-                let table_ref = TableReference::parse_str(table_name);
-                let current_partitions = guard.entry(table_ref.clone()).or_default();
-                for partition_bytes in partitions {
-                    if let Ok(partition_expr) = ::datafusion_expr::Expr::from_bytes_with_registry(
-                        partition_bytes,
-                        self.df.ctx.as_ref(),
-                    ) {
-                        if !current_partitions.contains(&partition_expr) {
-                            current_partitions.push(partition_expr);
-                        }
-                    } else {
-                        tracing::warn!(
-                            "Failed to deserialize new partition expression for table {table_name}"
-                        );
-                    }
-                }
-            }
-
-            // Identify all affected tables
-            let affected_tables: HashSet<_> = new_partitions
-                .keys()
-                .chain(removed_partitions.keys())
-                .collect();
-            drop(guard); // drop lock before updating tables
-
-            // Take a snapshot of the current assignments without holding the lock across .await
-            let assignments = {
-                let assignments_guard = partition_assignments.read().await;
-                assignments_guard.clone()
-            };
-
-            // Update all affected tables
-            for table_name in affected_tables {
-                let table_ref = TableReference::parse_str(table_name);
-
-                if let Err(e) = self
-                    .update_partition_refresh_sql(table_ref.clone(), &assignments)
-                    .await
-                {
-                    tracing::warn!("Failed to update partition refresh SQL for {table_name}: {e}");
-                }
-            }
-        } else {
+        else {
             tracing::warn!(
                 "Attempted to update partition assignments on a non-executor node. Ignoring."
             );
+            // Not an executor — there's nothing for us to apply. Report success
+            // so the scheduler doesn't retry; the routing layer is what'd be
+            // misconfigured here.
+            return Ok(());
+        };
+
+        // Compute the prospective post-update state from a snapshot of the
+        // current map. We apply the DataFusion filter updates against this
+        // *before* committing to shared state, so a per-table failure leaves
+        // the routing map unchanged and the scheduler's retry sees a
+        // consistent starting point on the next attempt.
+        let mut prospective: PartitionAssignments = partition_assignments.read().await.clone();
+
+        for (table_name, partitions) in &removed_partitions {
+            let table_ref = TableReference::parse_str(table_name)
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+            if let Some(current_partitions) = prospective.get_mut(&table_ref) {
+                for partition_bytes in partitions {
+                    let partition_expr =
+                        Expr::from_bytes_with_registry(partition_bytes, self.df.ctx.as_ref())
+                            .map_err(|source| {
+                                Error::UnableToDeserializeClusterPartitionExpression {
+                                    table: table_name.clone(),
+                                    source: Box::new(source),
+                                }
+                            })?;
+                    current_partitions.retain(|p| p != &partition_expr);
+                }
+            }
         }
+
+        for (table_name, partitions) in &new_partitions {
+            let table_ref = TableReference::parse_str(table_name)
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+            let current_partitions = prospective.entry(table_ref.clone()).or_default();
+            for partition_bytes in partitions {
+                let partition_expr = ::datafusion_expr::Expr::from_bytes_with_registry(
+                    partition_bytes,
+                    self.df.ctx.as_ref(),
+                )
+                .map_err(|source| {
+                    Error::UnableToDeserializeClusterPartitionExpression {
+                        table: table_name.clone(),
+                        source: Box::new(source),
+                    }
+                })?;
+                if !current_partitions.contains(&partition_expr) {
+                    current_partitions.push(partition_expr);
+                }
+            }
+        }
+
+        let affected_tables: HashSet<_> = new_partitions
+            .keys()
+            .chain(removed_partitions.keys())
+            .collect();
+
+        // Apply DataFusion filter updates against the prospective state. If any
+        // fails, the shared partition_assignments map is not modified — the
+        // scheduler retries the update and we'll re-attempt all tables.
+        for table_name in affected_tables {
+            let resolved = TableReference::parse_str(table_name)
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+
+            self.update_partition_refresh_sql(resolved.clone(), &prospective)
+                .await?;
+        }
+
+        // All filter updates succeeded — commit the new routing state. Last
+        // step so the planner's view of executor partitions never gets ahead
+        // of what the AcceleratedTables actually know about.
+        *partition_assignments.write().await = prospective;
+        Ok(())
     }
 
     pub(crate) async fn update_partition_refresh_sql(
         &self,
-        table: TableReference,
+        table: ResolvedTableReference,
         assignments: &PartitionAssignments,
     ) -> Result<()> {
         let partition_filters =
             crate::cluster::partition::get_partition_filter_exprs(&table, assignments);
 
-        if let Err(e) = self
-            .datafusion()
-            .update_partition_filters(table.clone(), partition_filters)
+        let table_ref = TableReference::full(
+            Arc::<str>::clone(&table.catalog),
+            Arc::<str>::clone(&table.schema),
+            Arc::<str>::clone(&table.table),
+        );
+        // Propagate the filter-update error so the caller (and the executor's
+        // ack to the scheduler) sees the failure rather than just logging it.
+        self.datafusion()
+            .update_partition_filters(table_ref.clone(), partition_filters)
             .await
-        {
-            tracing::error!("Failed to update partition filters for {table}: {e}");
-        } else {
-            tracing::info!("Updated partition assignments for {table}");
-            // Trigger a refresh to load the data for the new partitions
-            if let Err(e) = self.datafusion().refresh_table(&table, None).await {
-                tracing::warn!(
-                    "Failed to trigger refresh for {table} after updating partitions: {e}"
-                );
-            }
+            .map_err(|source| Error::UnableToUpdateClusterPartitionFilters {
+                table: table.to_string(),
+                source: Box::new(source),
+            })?;
+
+        tracing::info!("Updated partition assignments for {table}");
+        // Trigger a refresh to load the data for the new partitions. Refresh
+        // failures are non-fatal — the assignment is still valid; data just
+        // hasn't been pulled yet.
+        if let Err(e) = self.datafusion().refresh_table(&table_ref, None).await {
+            tracing::warn!("Failed to trigger refresh for {table} after updating partitions: {e}");
         }
 
         Ok(())
@@ -1010,7 +1059,7 @@ impl Runtime {
                         metrics_server::cluster::ClusterMetricsCollector::new(
                             Arc::clone(peers),
                             Arc::clone(executor_registry),
-                            self.df.cluster_config.client_tls_config().cloned(),
+                            self.df.cluster_config.client_tls_config(),
                             self.df.cluster_config.node_id(),
                             local_metrics_collector,
                         ),
@@ -1129,6 +1178,7 @@ impl Runtime {
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
         let auth = endpoint_auth.http_auth.clone();
+        let identity_source = endpoint_auth.identity_source;
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 
@@ -1142,6 +1192,7 @@ impl Runtime {
                     cloned_config.into(),
                     cloned_tls_config,
                     auth,
+                    identity_source,
                     Some(http_shutdown),
                 )
                 .map_err(Error::from),
@@ -1152,6 +1203,8 @@ impl Runtime {
         let metrics_endpoint = self.metrics_endpoint;
         let prometheus_registry = self.prometheus_registry.clone();
         let cloned_tls_config = tls_config.clone();
+        let metrics_rate_limiter =
+            Arc::new(RateLimiter::direct(self.rate_limits.metrics_endpoint_limit));
 
         let metrics_future = self
             .start_runtime_task(METRICS_SERVER, None, async move {
@@ -1160,6 +1213,7 @@ impl Runtime {
                     prometheus_registry,
                     cloned_tls_config,
                     cluster_collector,
+                    Some(metrics_rate_limiter),
                 )
                 .await
                 .context(UnableToStartMetricsServerSnafu)
@@ -1430,16 +1484,20 @@ impl Runtime {
 
         let start_time = Instant::now();
 
-        // shutdown all running components except the HTTP and Metrics servers
+        // Shutdown running components in phases so request-serving tasks drain
+        // before query execution resources are cleaned up.
         let mut runtime_tasks = self.tasks.write().await;
 
-        // HTTP and METRICS servers must be shutdown last
+        // Query-serving tasks, including HTTP and Flight, must drain before
+        // DataFusion cleanup so in-flight queries still have access to their
+        // execution resources during graceful shutdown. Metrics can stay up
+        // until the end for health and observability during shutdown.
         let mut first_shutdown_group = Vec::new();
         let mut last_shutdown_group = Vec::new();
 
         for (name, handle) in runtime_tasks.drain() {
             match name.as_str() {
-                HTTP_SERVER | METRICS_SERVER => last_shutdown_group.push((name, handle)),
+                METRICS_SERVER => last_shutdown_group.push((name, handle)),
                 _ => first_shutdown_group.push((name, handle)),
             }
         }
@@ -1468,11 +1526,11 @@ impl Runtime {
         document_parse::unregister_all().await;
 
         // Measure elapsed time since shutdown started and calculate remaining time within the configured timeout. Remaining shutdown
-        // group includes only Metrics and HTTP Healthcheck endpoints; general HTTP API endpoints have already stopped accepting requests.
+        // group includes only Metrics endpoints.
         let elapsed = start_time.elapsed();
         let remaining_timeout = shutdown_timeout.saturating_sub(elapsed);
 
-        // Shutdown HTTP & Metrics servers last
+        // Shutdown Metrics server last
         let shutdown_futures: Vec<_> = last_shutdown_group
             .into_iter()
             .map(|(name, handle)| {
@@ -1524,7 +1582,7 @@ impl Runtime {
                 .collect::<HashSet<_>>();
             for (name, tooling) in tool_lock.iter() {
                 match tooling {
-                    Tooling::Tool(tool) => {
+                    Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
                         yield Arc::clone(tool);
                     }
                     Tooling::Catalog(catalog) => {
@@ -1551,7 +1609,8 @@ impl Runtime {
                 };
                 return catalog.get(name).await;
             } else {
-                let Some(Tooling::Tool(tool)) = tools.get(tool_name) else {
+                let Some(Tooling::Tool(tool) | Tooling::FunctionTool(tool)) = tools.get(tool_name)
+                else {
                     return None;
                 };
                 Arc::clone(tool)

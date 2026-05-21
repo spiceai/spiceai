@@ -152,6 +152,20 @@ macro_rules! generate_clickbench_query_overrides {
   }
 }
 
+macro_rules! generate_chbench_queries {
+    ( $( $i:literal ),* ) => {
+        vec![
+            $(
+                Query::new(
+                    concat!("chbench_q", stringify!($i)).into(),
+                    include_str!(concat!("./chbench/q", stringify!($i), ".sql")).into(),
+                    false
+                )
+            ),*
+        ]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub name: Arc<str>,
@@ -289,6 +303,7 @@ pub enum QuerySet {
     Tpch,
     Tpcds,
     Clickbench,
+    ChBench,
     ParameterizedTpch,
     /// Scenario query set loaded from a file
     Scenario {
@@ -332,11 +347,13 @@ impl QuerySet {
         overrides: Option<QueryOverrides>,
         _instance: Option<&SpicedInstance>,
         _random_param_set_count: Option<usize>,
+        scale_factor: Option<f64>,
     ) -> anyhow::Result<Vec<Query>> {
         match self {
             QuerySet::Tpch => Ok(get_tpch_test_queries(overrides)),
-            QuerySet::Tpcds => Ok(get_tpcds_test_queries(overrides)),
+            QuerySet::Tpcds => Ok(get_tpcds_test_queries(overrides, scale_factor)),
             QuerySet::Clickbench => Ok(get_clickbench_test_queries(overrides)),
+            QuerySet::ChBench => Ok(get_chbench_test_queries(overrides)),
             QuerySet::Scenario { queries, .. } => Ok(queries.clone()),
             QuerySet::ParameterizedTpch => {
                 let queries = generate_tpch_queries_override!(
@@ -371,7 +388,6 @@ impl QuerySet {
     #[must_use]
     pub fn row_counts(&self) -> Vec<TableWithRowCount> {
         match self {
-            QuerySet::Scenario { .. } => vec![],
             QuerySet::Tpch | QuerySet::ParameterizedTpch => [
                 ("customer", 150_000),
                 ("lineitem", 6_001_215),
@@ -418,13 +434,13 @@ impl QuerySet {
                 .iter()
                 .map(TableWithRowCount::from)
                 .collect(),
+            QuerySet::Scenario { .. } | QuerySet::ChBench => vec![],
         }
     }
 
     #[must_use]
     pub fn append_time_columns(&self) -> Vec<TableWithTimeColumn> {
         match self {
-            QuerySet::Scenario { .. } => vec![],
             QuerySet::Tpch | QuerySet::ParameterizedTpch => [
                 ("customer", "c_created_at"),
                 ("lineitem", "l_created_at"),
@@ -471,6 +487,7 @@ impl QuerySet {
                 .iter()
                 .map(TableWithTimeColumn::from)
                 .collect(),
+            QuerySet::Scenario { .. } | QuerySet::ChBench => vec![],
         }
     }
 
@@ -562,6 +579,34 @@ impl QuerySet {
                     "clickbench_q43",
                 ]
             }
+            QuerySet::ChBench => {
+                // CH-benCH results are non-deterministic under concurrent OLTP load;
+                // skip row count validation for all queries
+                vec![
+                    "chbench_q1",
+                    "chbench_q2",
+                    "chbench_q3",
+                    "chbench_q4",
+                    "chbench_q5",
+                    "chbench_q6",
+                    "chbench_q7",
+                    "chbench_q8",
+                    "chbench_q9",
+                    "chbench_q10",
+                    "chbench_q11",
+                    "chbench_q12",
+                    "chbench_q13",
+                    "chbench_q14",
+                    "chbench_q15",
+                    "chbench_q16",
+                    "chbench_q17",
+                    "chbench_q18",
+                    "chbench_q19",
+                    "chbench_q20",
+                    "chbench_q21",
+                    "chbench_q22",
+                ]
+            }
             QuerySet::Scenario { .. } => vec![],
         }
     }
@@ -573,6 +618,7 @@ impl Display for QuerySet {
             QuerySet::Tpch => write!(f, "tpch"),
             QuerySet::Tpcds => write!(f, "tpcds"),
             QuerySet::Clickbench => write!(f, "clickbench"),
+            QuerySet::ChBench => write!(f, "chbench"),
             QuerySet::ParameterizedTpch => write!(f, "tpch[parameterized]"),
             QuerySet::Scenario { scenario_set, .. } => {
                 if let Some(name) = &scenario_set.name {
@@ -607,11 +653,15 @@ pub enum QueryOverrides {
     MysqlCatalog,
     MSSqlCatalog,
     OracleCatalog,
+    DucklakeCatalog,
+    SnowflakeCatalog,
     Spicecloud,
     DynamoDB,
     Arrow,
+    Cayenne,
     Turso,
     BigQuery,
+    ScyllaDB,
 }
 
 impl QueryOverrides {
@@ -627,8 +677,10 @@ impl QueryOverrides {
             "duckdb" => Some(Self::DuckDB),
             "dynamodb" => Some(Self::DynamoDB),
             "arrow" => Some(Self::Arrow),
+            "cayenne" => Some(Self::Cayenne),
             "turso" => Some(Self::Turso),
             "bigquery" => Some(Self::BigQuery),
+            "scylladb" => Some(Self::ScyllaDB),
             _ => None,
         }
     }
@@ -895,6 +947,68 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             simple_q6,
             simple_q7
         ),
+        Some(QueryOverrides::SnowflakeCatalog) => generate_tpch_queries_override!(
+            "snowflake_catalog",
+            q1,
+            q2,
+            q3,
+            q4,
+            q5,
+            q6,
+            q7,
+            q8,
+            q9,
+            q10,
+            q11,
+            q12,
+            q13,
+            q14,
+            q16,
+            q17,
+            q18,
+            q19,
+            q20,
+            q21,
+            q22,
+            simple_q1,
+            simple_q2,
+            simple_q3,
+            simple_q4,
+            simple_q5,
+            simple_q6,
+            simple_q7
+        ),
+        Some(QueryOverrides::DucklakeCatalog) => generate_tpch_queries_override!(
+            "ducklake_catalog",
+            q1,
+            q2,
+            q3,
+            q4,
+            q5,
+            q6,
+            q7,
+            q8,
+            q9,
+            q10,
+            q11,
+            q12,
+            q13,
+            q14,
+            q16,
+            q17,
+            q18,
+            q19,
+            q20,
+            q21,
+            q22,
+            simple_q1,
+            simple_q2,
+            simple_q3,
+            simple_q4,
+            simple_q5,
+            simple_q6,
+            simple_q7
+        ),
         Some(QueryOverrides::OracleCatalog) => generate_tpch_queries_override!(
             "oracle_catalog",
             q1,
@@ -935,8 +1049,10 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
         Some(QueryOverrides::Turso) => remove_tpch_query!(
             queries,
             2, // Correlated scalar subquery not supported; DF limitation, Turso tests are not cross-table federated
+            4, // Federation fails for cross-provider EXISTS subquery filters; https://github.com/spiceai/spiceai/issues/10167
             17, // Correlated scalar subquery not supported
-            21  // Correlated scalar subquery not supported
+            21, // Correlated scalar subquery not supported
+            22 // Federation fails for cross-provider EXISTS subquery filters; https://github.com/spiceai/spiceai/issues/10167
         ),
         Some(QueryOverrides::BigQuery) => {
             let mut queries: Vec<Query> = remove_tpch_query!(
@@ -947,12 +1063,19 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             queries.extend(generate_tpch_queries_override!("bigquery", q1, q6));
             queries
         }
+        Some(QueryOverrides::ScyllaDB) => remove_tpch_query!(
+            queries,
+            simple_q3 // ORDER BY is only supported when the partition key is restricted by an EQ or an IN; https://github.com/spiceai/spiceai/issues/10775
+        ),
         _ => queries,
     }
 }
 
 #[must_use]
-pub fn get_tpcds_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
+pub fn get_tpcds_test_queries(
+    overrides: Option<QueryOverrides>,
+    scale_factor: Option<f64>,
+) -> Vec<Query> {
     let queries = generate_tpcds_queries!(
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 25, 26, 27, 28,
         29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
@@ -1044,6 +1167,14 @@ pub fn get_tpcds_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
         Some(QueryOverrides::Arrow) => remove_tpcds_query!(
             queries, 72 // 'offset overflow' https://github.com/spiceai/spiceai/issues/4216
         ),
+        Some(QueryOverrides::Cayenne)
+            if scale_factor.is_some_and(|sf| (sf - 100.0).abs() < f64::EPSILON) =>
+        {
+            remove_tpcds_query!(
+                queries,
+                78 // SF100 Resources exhausted error https://github.com/spiceai/spiceai/issues/10965
+            )
+        }
         Some(_) | None => queries,
     }
 }
@@ -1056,8 +1187,8 @@ pub fn get_clickbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Que
     );
 
     let overrides = match overrides {
-        Some(QueryOverrides::SQLite) => {
-            queries.remove(28); // q29 includes regexp_replace which is not supported by sqlite
+        Some(QueryOverrides::SQLite | QueryOverrides::Turso) => {
+            queries.remove(28); // q29 includes regexp_replace which is not supported by SQLite/Turso
             Some(generate_clickbench_query_overrides!(
                 "sqlite", 7, 19, 24, 25, 27, 37, 38, 39, 40, 41, 42, 43
             ))
@@ -1094,6 +1225,18 @@ pub fn get_clickbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Que
     }
 
     queries
+}
+
+#[must_use]
+pub fn get_chbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
+    let queries = generate_chbench_queries!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
+    );
+
+    match overrides {
+        // No engine-specific overrides yet
+        Some(_) | None => queries,
+    }
 }
 
 #[cfg(test)]

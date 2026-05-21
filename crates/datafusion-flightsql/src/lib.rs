@@ -256,7 +256,10 @@ impl FlightSqlService {
             df
         };
 
-        let schema = std::sync::Arc::clone(df.schema().inner());
+        let raw_schema = std::sync::Arc::clone(df.schema().inner());
+        // Expand view types (Utf8View → LargeUtf8, BinaryView → LargeBinary) so
+        // that the advertised schema matches the cast batches we send below.
+        let schema = Arc::new(arrow_tools::schema::expand_views_schema(&raw_schema));
         let data_stream = df.execute_stream().await.map_err(handle_datafusion_error)?;
 
         // Pre-compute schema flight data once, matching the runtime's approach.
@@ -286,6 +289,10 @@ impl FlightSqlService {
             while let Some(batch_result) = data_stream.next().await {
                 match batch_result {
                     Ok(batch) => {
+                        // Cast view types to their non-view equivalents to match
+                        // the expanded schema we advertised in GetFlightInfo.
+                        let batch = arrow_tools::schema::cast_view_columns(batch, &schema)
+                            .map_err(|e| Status::internal(e.to_string()))?;
                         let (dicts, batch_data) = encoder
                             .encode(
                                 &batch,

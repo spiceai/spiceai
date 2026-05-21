@@ -16,7 +16,7 @@ limitations under the License.
 
 use reqwest::{
     ClientBuilder, RequestBuilder, Response, StatusCode,
-    header::{ACCEPT_ENCODING, HeaderMap, RETRY_AFTER},
+    header::{ACCEPT_ENCODING, HeaderMap},
 };
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime};
@@ -29,8 +29,6 @@ const DEFAULT_HTTP_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 const DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST: usize = 16;
 const DEFAULT_HTTP_RETRIES: usize = 3;
 const MAX_HTTP_BACKOFF: Duration = Duration::from_secs(300);
-const RETRY_AFTER_MS_HEADER: &str = "retry-after-ms";
-const X_RETRY_AFTER_MS_HEADER: &str = "x-retry-after-ms";
 pub const SUPPORTED_ACCEPT_ENCODINGS: &str = "zstd, br, gzip, deflate";
 
 /// Groups the optional retry, concurrency, and observability knobs accepted by
@@ -310,12 +308,7 @@ fn retry_reason_from_status(status: StatusCode) -> Option<RetryReason> {
 }
 
 fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {
-    retry_after_millis_duration(headers).or_else(|| {
-        headers
-            .get(RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| retry_after_duration_from_value(value, SystemTime::now()))
-    })
+    crate::rate_limit::retry_after_duration(headers, SystemTime::now())
 }
 
 fn bounded_retry_delay(
@@ -326,35 +319,6 @@ fn bounded_retry_delay(
     retry_after
         .map_or(backoff, |retry_after| retry_after.max(backoff))
         .min(max_delay)
-}
-
-fn retry_after_millis_duration(headers: &HeaderMap) -> Option<Duration> {
-    [RETRY_AFTER_MS_HEADER, X_RETRY_AFTER_MS_HEADER]
-        .into_iter()
-        .find_map(|header_name| {
-            headers
-                .get(header_name)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.trim().parse::<u64>().ok())
-                .map(Duration::from_millis)
-        })
-}
-
-fn retry_after_duration_from_value(value: &str, now: SystemTime) -> Option<Duration> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    trimmed
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
-        .or_else(|| {
-            httpdate::parse_http_date(trimmed)
-                .ok()
-                .map(|retry_after| retry_after.duration_since(now).unwrap_or(Duration::ZERO))
-        })
 }
 
 /// Marker appended to a sanitized body when it was truncated. Defined here so
@@ -609,8 +573,9 @@ mod tests {
 
     #[test]
     fn test_retry_after_duration_from_seconds() {
-        let duration = retry_after_duration_from_value("42", SystemTime::UNIX_EPOCH)
-            .expect("seconds-based Retry-After should parse");
+        let duration =
+            crate::rate_limit::retry_after_duration_from_value("42", SystemTime::UNIX_EPOCH)
+                .expect("seconds-based Retry-After should parse");
 
         assert_eq!(duration, Duration::from_secs(42));
     }
@@ -618,8 +583,11 @@ mod tests {
     #[test]
     fn test_retry_after_duration_from_http_date() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(50);
-        let duration = retry_after_duration_from_value("Thu, 01 Jan 1970 00:01:40 GMT", now)
-            .expect("HTTP-date Retry-After should parse");
+        let duration = crate::rate_limit::retry_after_duration_from_value(
+            "Thu, 01 Jan 1970 00:01:40 GMT",
+            now,
+        )
+        .expect("HTTP-date Retry-After should parse");
 
         assert_eq!(duration, Duration::from_secs(50));
     }
@@ -628,7 +596,7 @@ mod tests {
     fn test_retry_after_duration_from_millisecond_headers() {
         let mut headers = HeaderMap::new();
         headers.insert(
-            RETRY_AFTER_MS_HEADER,
+            "retry-after-ms",
             reqwest::header::HeaderValue::from_static("1250"),
         );
 

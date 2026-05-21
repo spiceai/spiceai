@@ -4,8 +4,7 @@
     "title": "runtime",
     "description": "The spiced runtime",
     "license": {
-      "name": "Apache-2.0",
-      "identifier": "Apache-2.0"
+      "name": ""
     },
     "version": "2.0.0-unstable"
   },
@@ -343,7 +342,7 @@
           "Datasets"
         ],
         "summary": "Refresh Dataset",
-        "description": "Trigger an on-demand refresh for an accelerated dataset.\n\nThis endpoint triggers an on-demand refresh for an accelerated dataset.\nThe refresh only applies to `full` and `append` refresh modes (not `changes` mode).",
+        "description": "Trigger an on-demand refresh for an accelerated dataset.\n\nThe refresh only applies to `full` and `append` refresh modes (not\n`changes` mode). Datasets without acceleration return 400 — the\nprevious `load: on_demand` flow has been removed; deferred datasets\n(declared schema + `ready_state: on_registration`) are materialised\nautomatically on first query and do not need a manual trigger.",
         "operationId": "post_dataset_refresh",
         "parameters": [
           {
@@ -387,7 +386,7 @@
             }
           },
           "400": {
-            "description": "Acceleration not enabled for the dataset",
+            "description": "Dataset is not accelerated; nothing to refresh",
             "content": {
               "application/json": {
                 "schema": {
@@ -824,42 +823,103 @@
         }
       }
     },
-    "/v1/mcp/sse": {
+    "/v1/mcp": {
       "get": {
         "tags": [
           "mcp"
         ],
-        "summary": "Establish an MCP SSE Connection",
-        "description": "Initiates a Server-Sent Events (SSE) connection using the Model Context Protocol (MCP) to interact with Spice tools.\n\n\n             Once connected, clients can send messages via `POST /v1/mcp/sse` and receive responses through this SSE stream.",
-        "operationId": "operation_id",
-        "responses": {}
+        "summary": "Open an MCP server-to-client SSE stream",
+        "description": "Open a long-lived server-to-client SSE stream for the current MCP session as defined by the Streamable HTTP transport. The `Mcp-Session-Id` header must identify an existing session created via `POST /v1/mcp`.",
+        "operationId": "mcp_stream",
+        "parameters": [
+          {
+            "name": "Mcp-Session-Id",
+            "in": "header",
+            "description": "Session identifier returned by the server on `initialize` and required on subsequent requests to maintain MCP session continuity.",
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream (`text/event-stream`) of server-originated MCP messages."
+          },
+          "401": {
+            "description": "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod and retry with credentials."
+          },
+          "403": {
+            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list."
+          },
+          "404": {
+            "description": "Unknown or expired `Mcp-Session-Id`."
+          }
+        }
       },
       "post": {
         "tags": [
           "mcp"
         ],
-        "summary": "Send message to MCP server",
-        "description": "Send message to the MCP endoint, for a given session.",
-        "operationId": "mcp_event",
+        "summary": "Send a Model Context Protocol message",
+        "description": "Send a JSON-RPC message to the Spice MCP server using the MCP Streamable HTTP transport. The response is either a single JSON-RPC response (`application/json`) or an SSE stream (`text/event-stream`), selected via the `Accept` header. Session continuity is carried via the `Mcp-Session-Id` header.",
+        "operationId": "mcp_message",
         "parameters": [
           {
-            "name": "sessionId",
-            "in": "query",
-            "required": true
+            "name": "Mcp-Session-Id",
+            "in": "header",
+            "description": "Session identifier returned by the server on `initialize` and required on subsequent requests to maintain MCP session continuity.",
+            "required": false
           }
         ],
         "responses": {
+          "200": {
+            "description": "JSON-RPC response. Returned as `application/json` for a single response or `text/event-stream` when the server streams additional messages."
+          },
           "202": {
-            "description": "Message accepted. Response will stream via SSE."
+            "description": "Message accepted (for JSON-RPC notifications / responses that do not require a reply)."
+          },
+          "400": {
+            "description": "Malformed JSON-RPC payload."
+          },
+          "401": {
+            "description": "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod and retry with credentials."
+          },
+          "403": {
+            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list. Configure `runtime.mcp.allowed_hosts` or set it to `[\"*\"]` to allow all hosts."
           },
           "404": {
-            "description": "Session not found. No active session for the given `session_id`."
+            "description": "Unknown or expired `Mcp-Session-Id`."
           },
           "413": {
-            "description": "Payload too large. Maximum allowed size is 4MB."
+            "description": "Payload too large. Maximum allowed size is 32 MiB."
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "mcp"
+        ],
+        "summary": "Terminate an MCP Streamable HTTP session",
+        "description": "Terminate the MCP session identified by the `Mcp-Session-Id` header. Subsequent requests bearing the same session id will receive `404 Not Found`.",
+        "operationId": "mcp_terminate_session",
+        "parameters": [
+          {
+            "name": "Mcp-Session-Id",
+            "in": "header",
+            "description": "Session identifier returned by the server on `initialize` and required on subsequent requests to maintain MCP session continuity.",
+            "required": false
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Session terminated."
           },
-          "500": {
-            "description": "Internal server error. An unexpected issue occurred."
+          "401": {
+            "description": "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod and retry with credentials."
+          },
+          "403": {
+            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list."
+          },
+          "404": {
+            "description": "Unknown or already-terminated `Mcp-Session-Id`."
           }
         }
       }
@@ -1066,12 +1126,12 @@
               },
               "example": {
                 "query": "Get the top 5 customers by total sales",
-                "model": "nql",
                 "stream": false,
-                "sample_data_enabled": true,
+                "sample_data_enabled": false,
                 "datasets": [
                   "sales_data"
-                ]
+                ],
+                "prompt_cache_key": "sales-dashboard"
               }
             }
           },
@@ -1325,8 +1385,47 @@
           "Ready"
         ],
         "summary": "Check Readiness",
-        "description": "Check the runtime status of all the components of the runtime. If the service is ready, it returns an HTTP 200 status with the message \"ready\". If not, it returns a 503 status with the message \"not ready\".\n\nThe behavior for when an accelerated dataset is considered ready is configurable via the `ready_state` parameter. See [Data refresh](https://spiceai.org/docs/components/data-accelerators/data-refresh#ready-state) for more details.\n\n### Readiness Probe\nIn production deployments, the /v1/ready endpoint can be used as a readiness probe for a Spice deployment to ensure traffic is routed to the Spice runtime only after all datasets have finished loading.\n\nExample Kubernetes readiness probe:\n```yaml\nreadinessProbe:\n httpGet:\n   path: /v1/ready\n   port: 8090\n```",
+        "description": "Check the runtime status of all the components of the runtime. If the service is ready, it returns an HTTP 200 status with the message \"ready\". If not, it returns a 503 status with the message \"not ready\".\n\nThe behavior for when an accelerated dataset is considered ready is configurable via the `ready_state` parameter. See [Data refresh](https://spiceai.org/docs/components/data-accelerators/data-refresh#ready-state) for more details.\n\nIn distributed (scheduler) mode the readiness response can additionally be gated on executor\navailability via the `min_ready_executors` and `min_ready_executors_percent` query parameters\n(both optional). Both must pass when supplied. Pass `verbose=true` to get a multi-line\ndiagnostic body explaining each gate.\n\n### Readiness Probe\nIn production deployments, the /v1/ready endpoint can be used as a readiness probe for a Spice deployment to ensure traffic is routed to the Spice runtime only after all datasets have finished loading.\n\nExample Kubernetes readiness probe:\n```yaml\nreadinessProbe:\n httpGet:\n   path: /v1/ready\n   port: 8090\n```\n\nExample with executor gating (scheduler role):\n```yaml\nreadinessProbe:\n httpGet:\n   path: /v1/ready?min_ready_executors=3&min_ready_executors_percent=80\n   port: 8090\n```",
         "operationId": "ready",
+        "parameters": [
+          {
+            "name": "min_ready_executors",
+            "in": "query",
+            "description": "Minimum number of currently-ready executors required for the probe to succeed. \"Ready\"\nmeans the scheduler has a live `FlightSQL` client for the executor — i.e. it can route\nqueries to it. A value of `0` is treated as \"gate disabled\" and never blocks. Requires\nscheduler role; supplying a non-zero value outside scheduler role returns `400`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "min_ready_executors_percent",
+            "in": "query",
+            "description": "Minimum percentage (0-100) of currently-ready executors relative to the number of\nexecutors currently registered (control stream open). A value of `0` is treated as \"gate\ndisabled\" and never blocks. Values above 100 return `400`. Requires scheduler role;\nsupplying a non-zero value outside scheduler role returns `400`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "verbose",
+            "in": "query",
+            "description": "When `true`, the response body becomes a multi-line diagnostic listing the result of each\ngate. The HTTP status code is unchanged. Useful for `kubectl describe` / curl debugging.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Service is ready",
@@ -1336,6 +1435,17 @@
                   "type": "string"
                 },
                 "example": "ready"
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query parameter or executor gate requested outside scheduler role",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "min_ready_executors_percent must be between 0 and 100"
               }
             }
           },
@@ -1437,6 +1547,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "The specified model provider does not support the Responses API or the request is invalid"
           },
           "404": {
             "description": "The specified model was not found"
@@ -1902,15 +2015,102 @@
                 "example": [
                   {
                     "name": "get_readiness",
-                    "description": "Retrieves the readiness status of all runtime components including registered datasets, models, and embeddings.",
+                    "description": "Report the readiness state of every Spice runtime component (datasets, accelerators, models, embeddings, catalogs).",
                     "parameters": null
                   },
                   {
                     "name": "list_datasets",
-                    "description": "List all SQL tables available.",
+                    "description": "List every dataset, view, and catalog visible to this runtime.",
                     "parameters": null
                   }
                 ]
+              }
+            }
+          },
+          "401": {
+            "description": "Tool routes require runtime auth to be configured",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "message": "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tools/search": {
+      "get": {
+        "tags": [
+          "Tools"
+        ],
+        "summary": "List Searchable Tool Registry Tools",
+        "description": "Returns the small set of tool definitions an external LLM client should inject to use Spice's searchable tool registry. Invoke returned tools with `POST /v1/tools/{name}`.",
+        "operationId": "list_searchable_tool_registry_tools",
+        "parameters": [
+          {
+            "name": "embedding_model",
+            "in": "query",
+            "description": "Embedding model name to use for searchable tool discovery. Required only when multiple embedding models are configured.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Searchable tool registry tools to inject into an external LLM prompt",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ListToolElement"
+                  }
+                },
+                "example": [
+                  {
+                    "name": "tool_search",
+                    "description": "Search the Spice tool registry for tools relevant to the current task.",
+                    "parameters": {
+                      "type": "object"
+                    }
+                  },
+                  {
+                    "name": "tool_invoke",
+                    "description": "Invoke one Spice tool returned by tool_search.",
+                    "parameters": {
+                      "type": "object"
+                    }
+                  },
+                  {
+                    "name": "list_datasets",
+                    "description": "List every dataset, view, and catalog visible to this runtime.",
+                    "parameters": null
+                  }
+                ]
+              }
+            }
+          },
+          "400": {
+            "description": "Searchable tool registry is not configured",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Tool routes require runtime auth to be configured",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "message": "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured."
+                }
               }
             }
           }
@@ -1931,6 +2131,15 @@
             "in": "path",
             "description": "Name of the tool",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "embedding_model",
+            "in": "query",
+            "description": "Embedding model to use when invoking the searchable tool registry's tool_search meta-tool",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -1981,14 +2190,33 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid searchable tool registry configuration",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Tool routes require runtime auth to be configured",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "message": "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured."
+                }
+              }
+            }
+          },
           "404": {
             "description": "Tool not found",
             "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                },
-                "example": "Tool no_sql not found"
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "message": "Tool 'no_sql' not found"
+                }
               }
             }
           },
@@ -9653,7 +9881,7 @@
         "type": "string",
         "description": "The retention policy for the prompt cache.",
         "enum": [
-          "in-memory",
+          "in_memory",
           "24h"
         ]
       },
@@ -9835,7 +10063,8 @@
           "full",
           "append",
           "changes",
-          "caching"
+          "caching",
+          "snapshot"
         ]
       },
       "RefreshOverrides": {
@@ -9900,8 +10129,18 @@
             "description": "Names of datasets to sample from when constructing model context; this is a sampling hint and does not restrict which tables queries can target. If omitted, all datasets are used."
           },
           "model": {
-            "type": "string",
-            "description": "The name of the model to use for SQL generation. Default: \"nql\""
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The name of the model to use for SQL generation. If omitted, Spice defaults to the only compatible LLM model configured in the Spicepod."
+          },
+          "prompt_cache_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stable prompt-cache key forwarded to the configured NSQL model for provider-specific cache handling."
           },
           "query": {
             "type": "string",
@@ -9909,7 +10148,7 @@
           },
           "sample_data_enabled": {
             "type": "boolean",
-            "description": "Whether sample data is included in the context for SQL generation. Default: true"
+            "description": "Whether sample data is included in the context for SQL generation. Default: false"
           },
           "stream": {
             "type": "boolean",
@@ -10617,6 +10856,13 @@
             "description": "The component is in the process of shutting down",
             "enum": [
               "ShuttingDown"
+            ]
+          },
+          {
+            "type": "string",
+            "description": "The component is configured but not loaded yet",
+            "enum": [
+              "NotLoaded"
             ]
           }
         ],

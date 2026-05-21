@@ -80,6 +80,57 @@ impl Runtime {
             .update_tool(&name, status::ComponentStatus::Ready);
     }
 
+    /// When a spicepod `tools:` entry has `as_sql: true` + a `signature:`,
+    /// register a `DataFusion` async UDF whose invocation calls back into
+    /// the tool. The UDF is always `Volatile` and added to the federation
+    /// deny-list for correctness.
+    async fn maybe_register_tool_as_udf(&self, decl: &Tool, tooling: &Tooling) {
+        if !decl.as_sql {
+            return;
+        }
+        let functions_enabled = self
+            .read_app()
+            .await
+            .is_some_and(|app| app.runtime.functions.enabled);
+        if !functions_enabled {
+            tracing::warn!(
+                tool = %decl.name,
+                "`as_sql: true` but user-defined functions are disabled. Set `runtime.functions.enabled: true` to expose tools as SQL functions."
+            );
+            return;
+        }
+        let Some(sig) = decl.signature.as_ref() else {
+            tracing::warn!(
+                tool = %decl.name,
+                "`as_sql: true` but no `signature:` — skipping SQL registration"
+            );
+            return;
+        };
+        let inner: Arc<dyn crate::tools::SpiceModelTool> = match tooling {
+            Tooling::Tool(t) | Tooling::FunctionTool(t) => Arc::clone(t),
+            Tooling::Catalog(_) => {
+                tracing::warn!(
+                    tool = %decl.name,
+                    "Tool catalogs cannot currently be exposed as SQL UDFs — skipping"
+                );
+                return;
+            }
+        };
+        match crate::datafusion::tool_udf::build_scalar_udf(inner, &decl.name, sig) {
+            Ok(udf) => {
+                if crate::datafusion::udf::register_async_user_udf(&self.df.ctx, &udf, &decl.name) {
+                    tracing::info!(name = %decl.name, "Exposed tool as SQL function");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    tool = %decl.name,
+                    "Skipping SQL exposure for tool: {e}"
+                );
+            }
+        }
+    }
+
     async fn load_tool(self: Arc<Self>, tool: &Tool) {
         let retry_strategy = FibonacciBackoffBuilder::new()
             .max_retries(None)
@@ -105,6 +156,7 @@ impl Runtime {
             .context(UnableToInitializeLlmToolSnafu)
             {
                 Ok(t) => {
+                    self.maybe_register_tool_as_udf(tool, &t).await;
                     self.insert_tool(t).await;
                     Ok(())
                 }

@@ -39,6 +39,8 @@ mod ai_udf;
 mod bedrock;
 mod embedding;
 pub(crate) mod hf;
+#[cfg(feature = "duckdb")]
+mod hnsw_index;
 mod local;
 mod models_http_endpoint;
 pub(crate) mod openai;

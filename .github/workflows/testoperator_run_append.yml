@@ -13,6 +13,11 @@ on:
         required: true
         default: '720'
         type: string
+      concurrency:
+        description: 'Number of analytical query workers to run while append operations execute'
+        required: false
+        default: '1'
+        type: string
       spicepod_path:
         description: 'The spicepod file to test with'
         required: true
@@ -50,6 +55,7 @@ on:
           - 'spicecloud'
           - 'iceberg-hadoop'
           - 'dynamodb'
+          - 'arrow'
           - 'postgres-catalog'
           - 'mysql-catalog'
           - 'mssql-catalog'
@@ -80,7 +86,7 @@ jobs:
     runs-on: spiceai-dev-runners
     timeout-minutes: 600
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
 
@@ -147,6 +153,7 @@ jobs:
             --disable-progress-bars \
             --metrics \
             --duration ${{ github.event.inputs.duration }} \
+            --concurrency ${{ github.event.inputs.concurrency }} \
             --load-interval ${{ github.event.inputs.load_interval }} \
             --load-steps ${{ github.event.inputs.load_steps }} \
             ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \

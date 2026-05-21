@@ -18,8 +18,13 @@ use std::{collections::HashMap, sync::Arc};
 
 use app::App;
 
-use datafusion::{execution::FunctionRegistry, logical_expr::Expr, sql::TableReference};
+use datafusion::{
+    execution::FunctionRegistry,
+    logical_expr::Expr,
+    sql::{ResolvedTableReference, TableReference},
+};
 use datafusion_proto::bytes::Serializeable;
+use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use runtime_proto::{
     AllocateInitialPartitionsRequest, cluster_service_client::ClusterServiceClient,
 };
@@ -78,7 +83,7 @@ pub async fn initialize_partition_metadata(
 }
 
 /// Verify that all accelerated datasets and views have at least one `partition_by`
-/// key configured, which is required for cluster partition management.
+/// key configured, which is required for cluster partition assignment.
 pub fn validate_partition_keys(app: &App) -> Result<()> {
     for ds in &app.datasets {
         if ds
@@ -107,6 +112,31 @@ pub fn validate_partition_keys(app: &App) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Returns the first accelerated, partitioned table from `app` that isn't
+/// yet registered in `df`'s `SessionContext`, or `None` if every such table
+/// is ready.
+///
+/// Used as a readiness gate by scheduler paths whose partition-expression
+/// serialization needs each accelerated table's schema to be in the catalog
+/// — e.g. `allocate_initial_partitions` and `PartitionAssignmentTask::
+/// run_assignment_cycle`. During the scheduler's own `load_datasets()`
+/// startup window the answer is `Some(table)`; the caller should defer.
+pub async fn first_unready_accelerated_table(
+    app: &Arc<App>,
+    df: &crate::datafusion::DataFusion,
+) -> Option<TableReference> {
+    // Collect without holding any external lock — the caller is expected to
+    // pass an already-snapshotted `Arc<App>` so we don't hold an async
+    // RwLock guard across the get_table awaits.
+    let table_refs: Vec<TableReference> = accelerated_tables(app).into_keys().collect();
+    for table_ref in table_refs {
+        if df.get_table(&table_ref).await.is_none() {
+            return Some(table_ref);
+        }
+    }
+    None
 }
 
 /// Helper to find all tables with acceleration partitioning configured, along with their partitioning columns.
@@ -148,7 +178,7 @@ pub async fn executor_request_initial_partitions(
     mut client: ClusterServiceClient<Channel>,
     executor_url: String,
     registry: &(dyn FunctionRegistry + Send + Sync),
-) -> Result<HashMap<TableReference, Vec<Expr>>> {
+) -> Result<HashMap<ResolvedTableReference, Vec<Expr>>> {
     let response = client
         .allocate_initial_partitions(AllocateInitialPartitionsRequest { executor_url })
         .await
@@ -158,7 +188,8 @@ pub async fn executor_request_initial_partitions(
     let mut result = HashMap::new();
 
     for (table_name, partitions) in response.table_partitions {
-        let table_ref = TableReference::parse_str(&table_name);
+        let resolved = TableReference::parse_str(&table_name)
+            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
         let mut exprs = Vec::new();
 
         for item in partitions.items {
@@ -167,7 +198,7 @@ pub async fn executor_request_initial_partitions(
             exprs.push(expr);
         }
 
-        result.insert(table_ref, exprs);
+        result.insert(resolved, exprs);
     }
 
     Ok(result)

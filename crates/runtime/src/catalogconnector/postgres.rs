@@ -45,7 +45,8 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("port").description("The PostgreSQL port number."),
     ParameterSpec::component("db").description("The PostgreSQL database name."),
     ParameterSpec::component("sslmode").description("The SSL mode for the connection."),
-    ParameterSpec::component("sslrootcert").description("The path to the SSL root certificate."),
+    ParameterSpec::component("sslrootcert")
+        .description("The path to, or inline PEM content for, the SSL root certificate."),
 ];
 
 /// A catalog connector for `PostgreSQL`, providing access to schemas and tables
@@ -87,6 +88,7 @@ impl CatalogConnector for PostgresCatalog {
         let table_factory = Arc::new(PostgresTableFactory::new(Arc::clone(&pool)));
 
         let catalog_provider = Arc::new(PostgresCatalogProvider::new(
+            catalog.name.clone(),
             pool,
             table_factory,
             catalog.include.clone(),

@@ -80,16 +80,17 @@ impl QueryTracker {
             tags.push("error");
         }
 
+        let mut dataset_names: Vec<String> =
+            self.datasets.iter().map(ToString::to_string).collect();
+        // Sort so that the same set of datasets always produces the same
+        // joined string. Without this, HashSet iteration order would cause
+        // identical workloads to land on multiple distinct telemetry series
+        // (e.g. "a,b" vs "b,a").
+        dataset_names.sort();
+
         let mut labels = vec![
             KeyValue::new("tags", tags.join(",")),
-            KeyValue::new(
-                "datasets",
-                self.datasets
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<String>>()
-                    .join(","),
-            ),
+            KeyValue::new("datasets", dataset_names.join(",")),
         ];
 
         labels.extend(request_context.to_dimensions());

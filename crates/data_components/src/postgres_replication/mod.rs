@@ -53,6 +53,14 @@ pub enum Error {
     SetupExec { source: tokio_postgres::Error },
 
     #[snafu(display(
+        "PostgreSQL logical replication is not enabled on this server. \
+         Set wal_level = 'logical' in postgresql.conf and restart PostgreSQL. \
+         You can also run: ALTER SYSTEM SET wal_level = 'logical'; \
+         then restart the server for the change to take effect."
+    ))]
+    LogicalReplicationNotEnabled,
+
+    #[snafu(display(
         "Table {schema}.{table} has REPLICA IDENTITY NOTHING. Logical replication requires \
          REPLICA IDENTITY DEFAULT (primary key) or FULL. Run: \
          ALTER TABLE {schema}.{table} REPLICA IDENTITY FULL;"

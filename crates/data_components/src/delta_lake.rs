@@ -1244,10 +1244,18 @@ fn to_delta_kernel_scalar(scalar: ScalarValue) -> Option<Scalar> {
                 None
             }
         }
-        ScalarValue::TimestampSecond(Some(v), Some(_)) => Some(Scalar::Timestamp(v * 1_000_000)), // Convert to microseconds
-        ScalarValue::TimestampSecond(Some(v), None) => Some(Scalar::TimestampNtz(v * 1_000_000)), // Convert to microseconds
-        ScalarValue::TimestampMillisecond(Some(v), Some(_)) => Some(Scalar::Timestamp(v * 1000)), // Convert to microseconds
-        ScalarValue::TimestampMillisecond(Some(v), None) => Some(Scalar::TimestampNtz(v * 1000)), // Convert to microseconds
+        ScalarValue::TimestampSecond(Some(v), Some(_)) => {
+            v.checked_mul(1_000_000).map(Scalar::Timestamp)
+        }
+        ScalarValue::TimestampSecond(Some(v), None) => {
+            v.checked_mul(1_000_000).map(Scalar::TimestampNtz)
+        }
+        ScalarValue::TimestampMillisecond(Some(v), Some(_)) => {
+            v.checked_mul(1000).map(Scalar::Timestamp)
+        }
+        ScalarValue::TimestampMillisecond(Some(v), None) => {
+            v.checked_mul(1000).map(Scalar::TimestampNtz)
+        }
         ScalarValue::TimestampMicrosecond(Some(v), Some(_)) => Some(Scalar::Timestamp(v)),
         ScalarValue::TimestampMicrosecond(Some(v), None) => Some(Scalar::TimestampNtz(v)),
         ScalarValue::TimestampNanosecond(Some(v), Some(_)) => Some(Scalar::Timestamp(v / 1000)), // Convert to microseconds

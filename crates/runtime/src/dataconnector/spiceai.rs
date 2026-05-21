@@ -17,6 +17,7 @@ limitations under the License.
 use std::any::Any;
 use std::borrow::Borrow;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -29,9 +30,16 @@ use datafusion::sql::unparser::dialect::{Dialect, IntervalStyle, PostgreSqlDiale
 use datafusion_federation::FederatedTableProviderAdaptor;
 use flight_client::Credentials;
 use flight_client::FlightClient;
+use flight_client::tls::{ClientIdentity, ClientTlsOptions};
 use futures::{Stream, StreamExt};
 use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
+use spice_cloud_client::endpoints::{
+    flight_endpoint as spice_cloud_flight_endpoint,
+    flight_endpoint_region as spice_cloud_endpoint_region,
+    is_legacy_flight_endpoint as is_legacy_spice_cloud_endpoint,
+    is_spice_cloud_flight_endpoint as is_spice_cloud_endpoint, is_valid_region,
+};
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue, errors::InvalidMetadataValue};
 
 use super::{
@@ -79,9 +87,100 @@ pub enum Error {
         parameter: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Invalid Spice Cloud region: {region}. Specify a valid region, for example us-east-1. To list available regions, run: spice cloud regions"
+    ))]
+    InvalidRegion { region: String },
+
+    #[snafu(display(
+        "Spice Cloud endpoint region mismatch: endpoint {endpoint} does not match region {region}. Use the endpoint for the configured region or remove the endpoint parameter."
+    ))]
+    CloudEndpointRegionMismatch { endpoint: String, region: String },
+
+    #[snafu(display(
+        "Unsupported SpiceAI endpoint scheme in endpoint {endpoint}: grpc:// is not supported. Use http:// for plaintext Flight or https:// or grpc+tls:// for TLS."
+    ))]
+    UnsupportedEndpointScheme { endpoint: String },
+
+    #[snafu(display(
+        "mTLS client identity is half-configured: '{set_field}' is set but '{missing_field}' is missing. Set both fields to present a client certificate to the upstream Spice runtime, or set neither."
+    ))]
+    IncompleteClientIdentity {
+        set_field: String,
+        missing_field: String,
+    },
+
+    #[snafu(display(
+        "mTLS client identity is ambiguous: both file-based ('tls_client_certificate_file') and inline ('tls_client_certificate') params are set. Use one or the other, not both."
+    ))]
+    AmbiguousClientIdentity,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Resolves the client identity from the four possible params:
+/// `tls_client_certificate_file` / `tls_client_key_file` (file-based) and
+/// `tls_client_certificate` / `tls_client_key` (inline PEM).
+///
+/// Returns `Ok(None)` when no client identity is configured, `Ok(Some(...))`
+/// when a complete identity is found, or `Err` when the params are
+/// half-configured or ambiguous (both file and inline set).
+fn resolve_client_identity_params(
+    cert_file: Option<PathBuf>,
+    key_file: Option<PathBuf>,
+    cert_inline: Option<Vec<u8>>,
+    key_inline: Option<Vec<u8>>,
+) -> std::result::Result<Option<ClientIdentity>, Box<dyn std::error::Error + Send + Sync>> {
+    let has_file_cert = cert_file.is_some();
+    let has_file_key = key_file.is_some();
+    let has_inline_cert = cert_inline.is_some();
+    let has_inline_key = key_inline.is_some();
+
+    // Reject ambiguous: both file and inline cert set.
+    if (has_file_cert || has_file_key) && (has_inline_cert || has_inline_key) {
+        return Err(Box::new(Error::AmbiguousClientIdentity));
+    }
+
+    // File-based identity.
+    if has_file_cert || has_file_key {
+        return match (cert_file, key_file) {
+            (Some(cert_path), Some(key_path)) => Ok(Some(ClientIdentity::FromFiles {
+                cert_path,
+                key_path,
+            })),
+            (Some(_), None) => Err(Box::new(Error::IncompleteClientIdentity {
+                set_field: "tls_client_certificate_file".to_string(),
+                missing_field: "tls_client_key_file".to_string(),
+            })),
+            (None, Some(_)) => Err(Box::new(Error::IncompleteClientIdentity {
+                set_field: "tls_client_key_file".to_string(),
+                missing_field: "tls_client_certificate_file".to_string(),
+            })),
+            (None, None) => unreachable!(),
+        };
+    }
+
+    // Inline identity.
+    if has_inline_cert || has_inline_key {
+        return match (cert_inline, key_inline) {
+            (Some(cert_pem), Some(key_pem)) => {
+                Ok(Some(ClientIdentity::FromPem { cert_pem, key_pem }))
+            }
+            (Some(_), None) => Err(Box::new(Error::IncompleteClientIdentity {
+                set_field: "tls_client_certificate".to_string(),
+                missing_field: "tls_client_key".to_string(),
+            })),
+            (None, Some(_)) => Err(Box::new(Error::IncompleteClientIdentity {
+                set_field: "tls_client_key".to_string(),
+                missing_field: "tls_client_certificate".to_string(),
+            })),
+            (None, None) => unreachable!(),
+        };
+    }
+
+    Ok(None)
+}
 
 #[derive(Clone, Debug)]
 pub struct SpiceAI {
@@ -154,25 +253,141 @@ impl SpiceAIFactory {
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("api_key").secret(),
     ParameterSpec::component("token").secret(),
+    ParameterSpec::component("region"),
     ParameterSpec::component("endpoint"),
+    ParameterSpec::component("flight_endpoint"),
+    ParameterSpec::component("tls_ca_certificate_file")
+        .description("Path to a CA certificate file (PEM format) to use for TLS verification instead of system certificates."),
+    ParameterSpec::component("tls_client_certificate_file")
+        .description("Path to a PEM client certificate chain to present during the TLS handshake when the upstream Spice runtime requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate'."),
+    ParameterSpec::component("tls_client_key_file")
+        .description("Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_key'."),
+    ParameterSpec::component("tls_client_certificate").secret()
+        .description("Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file'."),
+    ParameterSpec::component("tls_client_key").secret()
+        .description("Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_key_file'."),
 ];
 
 const HEADER_ORG: &str = "spiceai-org";
 const HEADER_APP: &str = "spiceai-app";
 
-fn get_api_key(params: &ConnectorParams) -> Result<secrecy::SecretString> {
+fn get_explicit_endpoint(params: &ConnectorParams) -> Option<&str> {
+    params
+        .parameters
+        .get("endpoint")
+        .expose()
+        .ok()
+        .or_else(|| params.parameters.get("flight_endpoint").expose().ok())
+}
+
+fn get_from_endpoint(params: &ConnectorParams) -> Option<&str> {
+    let ConnectorComponent::Dataset(dataset) = &params.component else {
+        return None;
+    };
+
+    let path = dataset.path();
+    is_flight_endpoint_path(path).then_some(path)
+}
+
+fn is_flight_endpoint_path(path: &str) -> bool {
+    path.starts_with("http://")
+        || path.starts_with("https://")
+        || path.starts_with("grpc://")
+        || path.starts_with("grpc+tls://")
+}
+
+fn ensure_supported_endpoint_scheme(endpoint: &str) -> Result<()> {
+    ensure!(
+        !endpoint.starts_with("grpc://"),
+        UnsupportedEndpointSchemeSnafu {
+            endpoint: endpoint.to_string()
+        }
+    );
+
+    Ok(())
+}
+
+fn get_region(params: &ConnectorParams) -> Option<&str> {
+    params.parameters.get("region").expose().ok()
+}
+
+fn require_valid_region(region: Option<&str>) -> Result<&str> {
+    let region = region.ok_or_else(|| {
+        MissingRequiredParameterSnafu {
+            parameter: "region".to_string(),
+        }
+        .build()
+    })?;
+    ensure!(
+        !region.is_empty(),
+        MissingRequiredParameterSnafu {
+            parameter: "region".to_string()
+        }
+    );
+    ensure!(
+        is_valid_region(region),
+        InvalidRegionSnafu {
+            region: region.to_string()
+        }
+    );
+
+    Ok(region)
+}
+
+fn get_endpoint(params: &ConnectorParams) -> Result<Arc<str>> {
+    let region = get_region(params);
+
+    let Some(endpoint) = get_explicit_endpoint(params).or_else(|| get_from_endpoint(params)) else {
+        let region = require_valid_region(region)?;
+        return Ok(spice_cloud_flight_endpoint(region).into());
+    };
+
+    ensure_supported_endpoint_scheme(endpoint)?;
+
+    if is_legacy_spice_cloud_endpoint(endpoint) {
+        let region = require_valid_region(region)?;
+        return Ok(spice_cloud_flight_endpoint(region).into());
+    }
+
+    if let Some(endpoint_region) = spice_cloud_endpoint_region(endpoint) {
+        let region = require_valid_region(region)?;
+        ensure!(
+            endpoint_region == region,
+            CloudEndpointRegionMismatchSnafu {
+                endpoint: endpoint.to_string(),
+                region: region.to_string()
+            }
+        );
+    }
+
+    Ok(endpoint.into())
+}
+
+fn get_optional_api_key(params: &ConnectorParams) -> Option<&secrecy::SecretString> {
     if let Some(api_key) = params.parameters.get("api_key").ok() {
-        return Ok(api_key.clone());
+        return Some(api_key);
     }
 
     if let Some(token) = params.parameters.get("token").ok() {
-        return Ok(token.clone());
+        return Some(token);
     }
 
-    MissingRequiredParameterSnafu {
-        parameter: "api_key or token".to_string(),
+    None
+}
+
+fn get_credentials(params: &ConnectorParams, endpoint: &str) -> Result<Credentials> {
+    if let Some(api_key) = get_optional_api_key(params) {
+        return Ok(Credentials::new("", api_key.clone()));
     }
-    .fail()
+
+    if is_spice_cloud_endpoint(endpoint) {
+        return MissingRequiredParameterSnafu {
+            parameter: "api_key or token".to_string(),
+        }
+        .fail();
+    }
+
+    Ok(Credentials::anonymous())
 }
 
 impl DataConnectorFactory for SpiceAIFactory {
@@ -185,13 +400,7 @@ impl DataConnectorFactory for SpiceAIFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let url: Arc<str> = params
-                .parameters
-                .get("endpoint")
-                .expose()
-                .ok()
-                .unwrap_or("https://flight.spiceai.io")
-                .into();
+            let url = get_endpoint(&params)?;
             tracing::trace!("Connecting to SpiceAI with flight url: {url}");
 
             verify_endpoint_connection(&url).await.with_context(|_| {
@@ -200,12 +409,54 @@ impl DataConnectorFactory for SpiceAIFactory {
                 }
             })?;
 
-            let api_key = get_api_key(&params)?;
-            let credentials = Credentials::new("", api_key.clone());
+            let credentials = get_credentials(&params, &url)?;
+            let ca_certificate_path: Option<PathBuf> = params
+                .parameters
+                .get("tls_ca_certificate_file")
+                .expose()
+                .ok()
+                .map(PathBuf::from);
+            let client_certificate_path: Option<PathBuf> = params
+                .parameters
+                .get("tls_client_certificate_file")
+                .expose()
+                .ok()
+                .map(PathBuf::from);
+            let client_key_path: Option<PathBuf> = params
+                .parameters
+                .get("tls_client_key_file")
+                .expose()
+                .ok()
+                .map(PathBuf::from);
+            let client_certificate_inline: Option<Vec<u8>> = params
+                .parameters
+                .get("tls_client_certificate")
+                .expose()
+                .ok()
+                .map(|s| s.as_bytes().to_vec());
+            let client_key_inline: Option<Vec<u8>> = params
+                .parameters
+                .get("tls_client_key")
+                .expose()
+                .ok()
+                .map(|s| s.as_bytes().to_vec());
 
-            let mut flight_client = FlightClient::try_new(url, credentials, None, None)
-                .await
-                .context(UnableToCreateFlightClientSnafu)?;
+            let client_identity = resolve_client_identity_params(
+                client_certificate_path,
+                client_key_path,
+                client_certificate_inline,
+                client_key_inline,
+            )?;
+
+            let tls_options = ClientTlsOptions {
+                ca_certificate_path,
+                client_identity,
+            };
+
+            let mut flight_client =
+                FlightClient::try_new_with_tls_options(url, credentials, None, &tls_options)
+                    .await
+                    .context(UnableToCreateFlightClientSnafu)?;
 
             flight_client = configure_max_message_size(flight_client, &params)?;
 
@@ -310,15 +561,7 @@ impl DataConnector for SpiceAI {
                 }));
             }
         };
-        let (flight_factory, table_reference) = match dataset_path {
-            SpiceAIDatasetPath::OrgAppPath { org, app, path } => {
-                let mut map = MetadataMap::new();
-                map.insert(HEADER_ORG, org);
-                map.insert(HEADER_APP, app);
-                (self.flight_factory.clone().with_metadata(map), path)
-            }
-            SpiceAIDatasetPath::Path(path) => (self.flight_factory.clone(), path),
-        };
+        let (flight_factory, table_reference) = self.flight_factory(dataset_path);
 
         let read_write_result = ReadWrite::table_provider(&flight_factory, table_reference)
             .await
@@ -332,6 +575,21 @@ impl DataConnector for SpiceAI {
 
     fn supports_append_stream(&self) -> bool {
         true
+    }
+
+    fn supports_changes_stream(&self) -> bool {
+        false
+    }
+
+    fn changes_stream(
+        &self,
+        federated_table: Arc<FederatedTable>,
+        _dataset: &Dataset,
+        _accelerated_table_provider: Arc<dyn TableProvider>,
+        _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
+        _cpu_runtime: Option<tokio::runtime::Handle>,
+    ) -> Option<ChangesStream> {
+        self.append_stream(federated_table)
     }
 
     fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
@@ -364,6 +622,12 @@ impl DataConnector for SpiceAI {
 }
 
 register_data_connector!("spice.ai", SpiceAIFactory);
+register_data_connector!(
+    register_legacy_spiceai_connector,
+    LEGACY_SPICEAI_CONNECTOR_REGISTRATION,
+    "spiceai",
+    SpiceAIFactory
+);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SpiceAIDatasetPath {
@@ -383,6 +647,10 @@ impl SpiceAI {
     fn spice_dataset_path<T: Borrow<Dataset>>(dataset: T) -> Result<SpiceAIDatasetPath> {
         let dataset = dataset.borrow();
         let path = dataset.path();
+        if is_flight_endpoint_path(path) {
+            return Ok(SpiceAIDatasetPath::Path(dataset.name.clone()));
+        }
+
         let path_parts: Vec<&str> = path.split('/').collect();
 
         match path_parts.as_slice() {
@@ -463,10 +731,17 @@ mod tests {
     use tokio::sync::RwLock;
 
     async fn make_params(params: Vec<(String, SecretString)>) -> ConnectorParams {
+        make_params_for_from("spice.ai/test.table", params).await
+    }
+
+    async fn make_params_for_from(
+        dataset_from: impl Into<String>,
+        params: Vec<(String, SecretString)>,
+    ) -> ConnectorParams {
         let app = app::AppBuilder::new("test").build();
         let runtime = crate::Runtime::builder().build().await;
 
-        let dataset = DatasetBuilder::try_new("spice.ai/test.table".to_string(), "bar")
+        let dataset = DatasetBuilder::try_new(dataset_from.into(), "bar")
             .expect("failed to create builder")
             .with_app(Arc::new(app))
             .with_runtime(Arc::new(runtime))
@@ -519,6 +794,18 @@ mod tests {
                     app: MetadataValue::try_from("demo").expect("failed to parse app"),
                     path: TableReference::parse_str("my_data"),
                 },
+            ),
+            (
+                "spiceai:http://localhost:50051".to_string(),
+                SpiceAIDatasetPath::Path(TableReference::parse_str("bar")),
+            ),
+            (
+                "spice.ai:http://localhost:50051".to_string(),
+                SpiceAIDatasetPath::Path(TableReference::parse_str("bar")),
+            ),
+            (
+                "spice.ai:https://remote.example.com:50051".to_string(),
+                SpiceAIDatasetPath::Path(TableReference::parse_str("bar")),
             ),
             (
                 "spice.ai/eth.recent_blocks".to_string(),
@@ -607,7 +894,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_api_key_prefers_api_key() {
+    async fn test_spiceai_from_variants_resolve_connector_params() {
+        crate::dataconnector::register_all().await;
+
+        for input in [
+            "spiceai:http://localhost:50051",
+            "spice.ai:http://localhost:50051",
+            "spice.ai:spiceai/quickstart/datasets/taxi_trips",
+            "spice.ai/spiceai/quickstart/datasets/taxi_trips",
+        ] {
+            let app = app::AppBuilder::new("test").build();
+            let runtime = crate::Runtime::builder().build().await;
+            let dataset = DatasetBuilder::try_new(input.to_string(), "taxi_trips")
+                .expect("failed to create builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::new(runtime))
+                .build()
+                .expect("failed to build dataset");
+
+            crate::dataconnector::parameters::ConnectorParamsBuilder::new(
+                dataset.source().into(),
+                ConnectorComponent::Dataset(Arc::new(dataset)),
+            )
+            .build(Arc::new(RwLock::new(Secrets::new())), Handle::current())
+            .await
+            .expect("spice.ai connector variant should resolve");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_credentials_prefers_api_key() {
         let params = make_params(vec![
             ("spiceai_api_key".to_string(), "api-key".to_string().into()),
             (
@@ -617,31 +933,254 @@ mod tests {
         ])
         .await;
 
-        let api_key = get_api_key(&params).expect("api key should resolve from api_key");
-        assert_eq!(api_key.expose_secret(), "api-key");
+        let endpoint = spice_cloud_flight_endpoint("us-east-1");
+        let credentials =
+            get_credentials(&params, &endpoint).expect("credentials should resolve from api_key");
+        let Credentials::UsernamePassword { username, password } = credentials else {
+            panic!("expected username/password credentials");
+        };
+        assert_eq!(username.as_ref(), "");
+        assert_eq!(password.expose_secret(), "api-key");
     }
 
     #[tokio::test]
-    async fn test_get_api_key_uses_legacy_token() {
+    async fn test_get_credentials_uses_legacy_token() {
         let params = make_params(vec![(
             "spiceai_token".to_string(),
             "legacy-token".to_string().into(),
         )])
         .await;
 
-        let api_key = get_api_key(&params).expect("api key should resolve from token fallback");
-        assert_eq!(api_key.expose_secret(), "legacy-token");
+        let endpoint = spice_cloud_flight_endpoint("us-east-1");
+        let credentials = get_credentials(&params, &endpoint)
+            .expect("credentials should resolve from token fallback");
+        let Credentials::UsernamePassword { username, password } = credentials else {
+            panic!("expected username/password credentials");
+        };
+        assert_eq!(username.as_ref(), "");
+        assert_eq!(password.expose_secret(), "legacy-token");
     }
 
     #[tokio::test]
-    async fn test_get_api_key_missing_returns_error() {
+    async fn test_get_credentials_requires_api_key_for_spice_cloud_endpoint() {
         let params = make_params(vec![]).await;
 
-        let error = get_api_key(&params).expect_err("missing credentials should return an error");
+        let endpoint = spice_cloud_flight_endpoint("us-east-1");
+        let error = get_credentials(&params, &endpoint)
+            .expect_err("missing cloud credentials should return an error");
         assert!(matches!(
             error,
             Error::MissingRequiredParameter { parameter }
             if parameter == "api_key or token"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_get_credentials_allows_anonymous_custom_endpoint() {
+        let params = make_params(vec![]).await;
+
+        let credentials = get_credentials(&params, "http://localhost:50051")
+            .expect("custom endpoints should allow anonymous credentials");
+        assert!(matches!(credentials, Credentials::Anonymous));
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_builds_cloud_endpoint_from_region() {
+        let params = make_params(vec![(
+            "spiceai_region".to_string(),
+            "us-east-1".to_string().into(),
+        )])
+        .await;
+
+        assert_eq!(
+            get_endpoint(&params)
+                .expect("region should build cloud endpoint")
+                .as_ref(),
+            "https://us-east-1-prod-aws-flight.spiceai.io"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_uses_from_endpoint_for_self_hosted_variants() {
+        for (input, expected) in [
+            ("spiceai:http://localhost:50051", "http://localhost:50051"),
+            ("spice.ai:http://localhost:50051", "http://localhost:50051"),
+            (
+                "spice.ai:https://remote.example.com:50051",
+                "https://remote.example.com:50051",
+            ),
+            (
+                "spice.ai:grpc+tls://remote.example.com:50051",
+                "grpc+tls://remote.example.com:50051",
+            ),
+        ] {
+            let params = make_params_for_from(input, vec![]).await;
+
+            assert_eq!(
+                get_endpoint(&params)
+                    .expect("from endpoint should not require region")
+                    .as_ref(),
+                expected,
+                "failed for input: {input}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_does_not_validate_region_for_self_hosted_endpoint() {
+        let params = make_params(vec![
+            (
+                "spiceai_endpoint".to_string(),
+                "http://localhost:50051".to_string().into(),
+            ),
+            (
+                "spiceai_region".to_string(),
+                "self-hosted".to_string().into(),
+            ),
+        ])
+        .await;
+
+        assert_eq!(
+            get_endpoint(&params)
+                .expect("custom endpoint should not validate unrelated region")
+                .as_ref(),
+            "http://localhost:50051"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_rejects_grpc_from_endpoint() {
+        let params = make_params_for_from("spice.ai:grpc://localhost:50051", vec![]).await;
+
+        let error = get_endpoint(&params).expect_err("grpc endpoint should be rejected");
+        assert!(matches!(
+            error,
+            Error::UnsupportedEndpointScheme { endpoint }
+            if endpoint == "grpc://localhost:50051"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_rejects_grpc_endpoint_parameter() {
+        let params = make_params(vec![(
+            "spiceai_endpoint".to_string(),
+            "grpc://localhost:50051".to_string().into(),
+        )])
+        .await;
+
+        let error = get_endpoint(&params).expect_err("grpc endpoint should be rejected");
+        assert!(matches!(
+            error,
+            Error::UnsupportedEndpointScheme { endpoint }
+            if endpoint == "grpc://localhost:50051"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_requires_region_without_explicit_endpoint() {
+        let params = make_params(vec![]).await;
+
+        let error = get_endpoint(&params).expect_err("missing cloud region should error");
+        assert!(matches!(
+            error,
+            Error::MissingRequiredParameter { parameter }
+            if parameter == "region"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_rewrites_legacy_cloud_endpoint_with_region() {
+        let params = make_params(vec![
+            (
+                "spiceai_endpoint".to_string(),
+                "https://flight.spiceai.io".to_string().into(),
+            ),
+            ("spiceai_region".to_string(), "us-west-2".to_string().into()),
+        ])
+        .await;
+
+        assert_eq!(
+            get_endpoint(&params)
+                .expect("legacy endpoint should be replaced by regional cloud endpoint")
+                .as_ref(),
+            "https://us-west-2-prod-aws-flight.spiceai.io"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_requires_region_for_cloud_endpoint() {
+        let params = make_params(vec![(
+            "spiceai_endpoint".to_string(),
+            "https://us-east-1-prod-aws-flight.spiceai.io"
+                .to_string()
+                .into(),
+        )])
+        .await;
+
+        let error = get_endpoint(&params).expect_err("cloud endpoint should require region");
+        assert!(matches!(
+            error,
+            Error::MissingRequiredParameter { parameter }
+            if parameter == "region"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_rejects_cloud_endpoint_region_mismatch() {
+        let params = make_params(vec![
+            (
+                "spiceai_endpoint".to_string(),
+                "https://us-east-1-prod-aws-flight.spiceai.io"
+                    .to_string()
+                    .into(),
+            ),
+            ("spiceai_region".to_string(), "us-west-2".to_string().into()),
+        ])
+        .await;
+
+        let error = get_endpoint(&params).expect_err("mismatched cloud endpoint should error");
+        assert!(matches!(
+            error,
+            Error::CloudEndpointRegionMismatch { endpoint, region }
+            if endpoint == "https://us-east-1-prod-aws-flight.spiceai.io" && region == "us-west-2"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_prefers_endpoint_parameter() {
+        let params = make_params(vec![
+            (
+                "spiceai_endpoint".to_string(),
+                "http://new:50051".to_string().into(),
+            ),
+            (
+                "spiceai_flight_endpoint".to_string(),
+                "http://legacy:50051".to_string().into(),
+            ),
+        ])
+        .await;
+
+        assert_eq!(
+            get_endpoint(&params)
+                .expect("custom endpoint should not require region")
+                .as_ref(),
+            "http://new:50051"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_uses_legacy_flight_endpoint_parameter() {
+        let params = make_params(vec![(
+            "spiceai_flight_endpoint".to_string(),
+            "http://legacy:50051".to_string().into(),
+        )])
+        .await;
+
+        assert_eq!(
+            get_endpoint(&params)
+                .expect("custom endpoint should not require region")
+                .as_ref(),
+            "http://legacy:50051"
+        );
     }
 }

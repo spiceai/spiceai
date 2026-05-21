@@ -19,6 +19,91 @@ limitations under the License.
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use snafu::Snafu;
+
+// ============================================================================
+// Common enums
+// ============================================================================
+
+/// Runtime update channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    Stable,
+    Preview,
+    Nightly,
+    Internal,
+}
+
+#[derive(Debug, Snafu, PartialEq, Eq)]
+pub enum ParseCloudEnumError {
+    #[snafu(display(
+        "invalid channel '{input}'. Expected one of: stable, preview, nightly, internal"
+    ))]
+    InvalidUpdateChannel { input: String },
+    #[snafu(display("invalid kind '{input}'. Expected one of: set, cluster"))]
+    InvalidAppKind { input: String },
+}
+
+impl std::fmt::Display for UpdateChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stable => write!(f, "stable"),
+            Self::Preview => write!(f, "preview"),
+            Self::Nightly => write!(f, "nightly"),
+            Self::Internal => write!(f, "internal"),
+        }
+    }
+}
+
+impl std::str::FromStr for UpdateChannel {
+    type Err = ParseCloudEnumError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "stable" => Ok(Self::Stable),
+            "preview" => Ok(Self::Preview),
+            "nightly" => Ok(Self::Nightly),
+            "internal" => Ok(Self::Internal),
+            _ => Err(ParseCloudEnumError::InvalidUpdateChannel {
+                input: s.to_string(),
+            }),
+        }
+    }
+}
+
+/// App kind — determines whether the app is a `SpicepodSet` or `SpicepodCluster`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppKind {
+    /// Standard scheduler-only deployment.
+    Set,
+    /// Distributed deployment with separate scheduler and executor pods.
+    Cluster,
+}
+
+impl std::fmt::Display for AppKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Set => write!(f, "set"),
+            Self::Cluster => write!(f, "cluster"),
+        }
+    }
+}
+
+impl std::str::FromStr for AppKind {
+    type Err = ParseCloudEnumError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "set" | "spicepodset" => Ok(Self::Set),
+            "cluster" | "spicepodcluster" => Ok(Self::Cluster),
+            _ => Err(ParseCloudEnumError::InvalidAppKind {
+                input: s.to_string(),
+            }),
+        }
+    }
+}
 
 // ============================================================================
 // Apps
@@ -89,7 +174,10 @@ pub struct AppResources {
 pub struct AppResourceLimits {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<String>,
-    pub memory: String,
+    /// Omitted when the caller leaves memory unspecified; Cloud API treats the missing field as
+    /// unset/default rather than as a request for a synthetic client-side default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
     #[serde(rename = "ephemeral-storage", skip_serializing_if = "Option::is_none")]
     pub ephemeral_storage: Option<String>,
 }
@@ -118,6 +206,8 @@ pub struct CreateAppRequest {
     pub resources: Option<AppResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executor: Option<AppExecutor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_size_gb: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -335,29 +425,136 @@ pub struct MetricsResponse {
 }
 
 // ============================================================================
-// Rollback
-// ============================================================================
-
-#[derive(Debug, Serialize)]
-pub struct RollbackRequest {
-    pub target_deployment_id: i64,
-}
-
-// ============================================================================
 // Auth
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
+// Debug is intentionally not derived: access_token must not appear in logs or error output.
+#[derive(Deserialize)]
 pub struct AuthExchangeResponse {
     pub access_token: Option<String>,
+    #[serde(default)]
     pub access_denied: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+// Debug is intentionally not derived: the device auth `code` is short-lived but
+// exchangeable for an access token, so treat it like a secret.
+#[derive(Serialize)]
+pub struct AuthExchangeRequest<'a> {
+    pub code: &'a str,
+}
+
+// Debug is intentionally not derived: client_secret must not appear in logs or error output.
+#[derive(Serialize)]
+pub struct OAuthTokenRequest<'a> {
+    pub client_id: &'a str,
+    pub client_secret: &'a str,
+    pub grant_type: &'static str,
+}
+
+// Debug is intentionally not derived: access_token must not appear in logs or error output.
+#[derive(Deserialize)]
+pub struct OAuthTokenResponse {
+    pub access_token: String,
+    pub token_type: String,
+}
+
+// Debug is intentionally not derived: app_api_key must not appear in logs or error output.
+#[derive(Serialize, Deserialize)]
 pub struct AuthContext {
     pub username: String,
     pub email: String,
     pub org_name: String,
     pub app_name: Option<String>,
     pub app_api_key: Option<String>,
+}
+
+/// Wire format for the Spice Cloud auth context endpoint, which returns
+/// `org` and `app` as nested objects. Flattened into [`AuthContext`] for the
+/// rest of the CLI.
+#[derive(Deserialize)]
+pub struct AuthContextRaw {
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub org: Option<AuthContextOrg>,
+    #[serde(default)]
+    pub app: Option<AuthContextApp>,
+}
+
+#[derive(Deserialize)]
+pub struct AuthContextOrg {
+    pub name: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct AuthContextApp {
+    pub name: Option<String>,
+    pub api_key: Option<String>,
+}
+
+impl From<AuthContextRaw> for AuthContext {
+    fn from(raw: AuthContextRaw) -> Self {
+        let org_name = raw.org.and_then(|o| o.name).unwrap_or_default();
+        let (app_name, app_api_key) = match raw.app {
+            Some(app) => (app.name, app.api_key),
+            None => (None, None),
+        };
+        Self {
+            username: raw.username,
+            email: raw.email,
+            org_name,
+            app_name,
+            app_api_key,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_channel_parse_error_is_typed() {
+        let error = "beta"
+            .parse::<UpdateChannel>()
+            .expect_err("invalid channel should fail");
+
+        assert!(matches!(
+            error,
+            ParseCloudEnumError::InvalidUpdateChannel { .. }
+        ));
+    }
+
+    #[test]
+    fn app_kind_parse_error_is_typed() {
+        let error = "worker"
+            .parse::<AppKind>()
+            .expect_err("invalid app kind should fail");
+
+        assert!(matches!(error, ParseCloudEnumError::InvalidAppKind { .. }));
+    }
+
+    #[test]
+    fn resource_limits_omit_unspecified_memory() {
+        let limits = AppResourceLimits {
+            cpu: Some("2".to_string()),
+            memory: None,
+            ephemeral_storage: None,
+        };
+
+        let value = serde_json::to_value(limits).expect("limits should serialize");
+        assert_eq!(value, serde_json::json!({ "cpu": "2" }));
+    }
+
+    #[test]
+    fn app_config_preserves_unknown_update_channel() {
+        let config = serde_json::from_value::<AppConfig>(serde_json::json!({
+            "update_channel": "next"
+        }))
+        .expect("unknown update channels should deserialize");
+
+        assert_eq!(config.update_channel.as_deref(), Some("next"));
+    }
 }

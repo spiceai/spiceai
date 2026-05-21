@@ -18,7 +18,7 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::Constraints,
+    common::{Constraints, Statistics},
     datasource::{TableProvider, TableType},
     error::Result as DataFusionResult,
     logical_expr::{LogicalPlan, TableProviderFilterPushDown, dml::InsertOp},
@@ -118,6 +118,9 @@ impl TableProvider for PolyTableProvider {
     }
     fn table_type(&self) -> TableType {
         self.write.table_type()
+    }
+    fn statistics(&self) -> Option<Statistics> {
+        self.write.statistics()
     }
     fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
         self.write.get_logical_plan()

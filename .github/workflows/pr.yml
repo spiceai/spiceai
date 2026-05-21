@@ -62,7 +62,7 @@ jobs:
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           # Use fetch-depth 2 for PR change detection (dorny/paths-filter only needs base + head)
           fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
@@ -85,7 +85,7 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1
@@ -109,7 +109,7 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
+        uses: spiceai/spiceio/.github/actions/setup@e31c63cbe88a6e284fc187875261106a05034775 # v0.5.4
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -176,7 +176,7 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1
@@ -204,7 +204,7 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
+        uses: spiceai/spiceio/.github/actions/setup@e31c63cbe88a6e284fc187875261106a05034775 # v0.5.4
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -294,7 +294,7 @@ jobs:
           path: ${{ runner.temp }}/spiceio.log
           if-no-files-found: ignore
 
-  # Release-profile installs (make install, install-cli, install-runtime)
+  # Release-profile installs (make install, install-cli, install-spiced)
   build-install-release:
     name: Build (release profile)
     runs-on: spiceai-macos
@@ -303,7 +303,7 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1
@@ -315,7 +315,7 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
+        uses: spiceai/spiceio/.github/actions/setup@e31c63cbe88a6e284fc187875261106a05034775 # v0.5.4
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -360,14 +360,14 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: make install-cli
 
-      - name: make install-runtime
+      - name: make install-spiced
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           RUST_PROFILE: release
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-        run: make install-runtime
+        run: make install-spiced
 
       - name: Cancel workflow on failure
         if: failure()

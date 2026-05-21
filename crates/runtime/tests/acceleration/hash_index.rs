@@ -16,8 +16,8 @@ limitations under the License.
 
 //! Integration tests for hash index functionality with Arrow/MemTable accelerator.
 //!
-//! These tests verify that the hash index feature works correctly when enabled
-//! on Arrow-accelerated datasets with primary keys.
+//! These tests verify that the hash index feature works correctly when primary keys
+//! automatically enable it on Arrow-accelerated datasets.
 
 use app::AppBuilder;
 use arrow::array::RecordBatch;
@@ -27,9 +27,7 @@ use runtime::Runtime;
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
     component::dataset::Dataset,
-    param::Params,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::{
@@ -48,7 +46,7 @@ const TEST_CSV: &str = "id,name,age,city,score
 /// Test that verifies hash index works with Arrow accelerator and primary key.
 ///
 /// This test:
-/// 1. Creates a dataset with `hash_index: enabled` and a primary key
+/// 1. Creates a dataset with a primary key, which enables hash indexing
 /// 2. Loads data from a CSV file
 /// 3. Verifies all data is queryable
 /// 4. Verifies point lookups by primary key work correctly
@@ -62,15 +60,11 @@ async fn test_hash_index_arrow_accelerator() -> Result<(), anyhow::Error> {
             let csv_path = std::env::temp_dir().join("test_hash_index.csv");
             std::fs::write(&csv_path, TEST_CSV)?;
 
-            // Create dataset with hash_index enabled and primary key
+            // Create dataset with primary key.
             let mut dataset =
                 Dataset::new(format!("file://{}", csv_path.display()), "hash_index_test");
 
-            let mut params = HashMap::new();
-            params.insert("hash_index".to_string(), "enabled".to_string());
-
             dataset.acceleration = Some(Acceleration {
-                params: Some(Params::from_string_map(params)),
                 enabled: true,
                 engine: None, // Uses Arrow/MemTable by default
                 mode: Mode::Memory,
@@ -151,75 +145,6 @@ async fn test_hash_index_arrow_accelerator() -> Result<(), anyhow::Error> {
                 .await?;
 
             assert!(result.is_empty() || result.iter().all(|b| b.num_rows() == 0));
-
-            // Clean up
-            drop(rt);
-            std::fs::remove_file(&csv_path)?;
-
-            Ok(())
-        })
-        .await
-}
-
-/// Test that hash index requires a primary key.
-///
-/// When `hash_index: enabled` is specified but no primary key is defined,
-/// the dataset should fail to load with an appropriate error.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_hash_index_requires_primary_key() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-
-    test_request_context()
-        .scope(async {
-            // Write the CSV to a file
-            let csv_path = std::env::temp_dir().join("test_hash_index_no_pk.csv");
-            std::fs::write(&csv_path, TEST_CSV)?;
-
-            // Create dataset with hash_index enabled but NO primary key
-            let mut dataset = Dataset::new(
-                format!("file://{}", csv_path.display()),
-                "hash_index_no_pk_test",
-            );
-
-            let mut params = HashMap::new();
-            params.insert("hash_index".to_string(), "enabled".to_string());
-
-            dataset.acceleration = Some(Acceleration {
-                params: Some(Params::from_string_map(params)),
-                enabled: true,
-                engine: None,
-                mode: Mode::Memory,
-                refresh_mode: Some(RefreshMode::Full),
-                primary_key: None, // No primary key - should cause error
-                ..Acceleration::default()
-            });
-
-            let app = AppBuilder::new("test_hash_index_no_pk")
-                .with_dataset(dataset)
-                .build();
-
-            configure_test_datafusion();
-            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-            // Give some time for component loading to process
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
-                () = Arc::clone(&rt).load_components() => {}
-            }
-
-            // The dataset should have failed to load - verify by trying to query it
-            let result = rt
-                .datafusion()
-                .query_builder("SELECT * FROM hash_index_no_pk_test")
-                .build()
-                .run()
-                .await;
-
-            // The table should not exist or the query should fail
-            assert!(
-                result.is_err(),
-                "Expected query to fail because hash_index requires primary_key"
-            );
 
             // Clean up
             drop(rt);

@@ -12,3 +12,4 @@ datasets:
         duckdb_memory_limit: 50gb
     params:
       spiceai_api_key: ${secrets:SPICEAI_CLICKBENCH_API_KEY}
+      spiceai_region: us-east-1

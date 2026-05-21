@@ -21,8 +21,12 @@ use crate::cluster::PartitionStore;
 use crate::cluster::ResolvedClusterConfig;
 use crate::cluster::SchedulerHeartbeatStore;
 use crate::cluster::partition::service::PartitionService;
+#[cfg(not(windows))]
+use crate::component::dataset::acceleration::Engine;
 use crate::config::ClusterRole;
 use crate::config::Config;
+#[cfg(not(windows))]
+use crate::dataaccelerator::cayenne::CayenneAccelerator;
 use crate::datafusion::udf::register_udfs;
 use crate::metrics_reader::MetricsReader;
 use crate::{
@@ -40,6 +44,7 @@ use crate::{
 use app::App;
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
+use spicepod::component::runtime::SourceRateControl as SpicepodSourceRateControl;
 use spicepod::component::runtime::TelemetryConfig;
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use telemetry::timing::TimeMeasurement;
@@ -49,6 +54,8 @@ use tokio::sync::{Mutex, RwLock};
 use util::{in_tracing_context, in_tracing_context_async};
 
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
+
+const CAYENNE_FOOTER_CACHE_MB_PARAM: &str = "cayenne_footer_cache_mb";
 
 pub struct RuntimeBuilder {
     app: Option<Arc<app::App>>,
@@ -214,6 +221,7 @@ impl RuntimeBuilder {
         let query = spicepod_rt.query.clone().unwrap_or_default();
 
         let memory_limit = parse_memory_limit(query.memory_limit.clone());
+        let target_partitions = query.target_partitions;
 
         let metrics = spicepod_rt.metrics.clone();
 
@@ -234,9 +242,42 @@ impl RuntimeBuilder {
         // URL tables are opt-in via `runtime.params.url_tables=enabled`
         let url_tables_enabled =
             spicepod_rt.params.get("url_tables").map(String::as_str) == Some("enabled");
+        let cayenne_sort_merge_min_rows =
+            parse_usize_runtime_param(&spicepod_rt.params, "cayenne_sort_merge_min_rows");
+        let cayenne_sort_merge_memory_pool_fraction = parse_f64_runtime_param(
+            &spicepod_rt.params,
+            "cayenne_sort_merge_memory_pool_fraction",
+        );
+        let cayenne_footer_cache_mb =
+            parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_FOOTER_CACHE_MB_PARAM);
+        let cayenne_filter_propagation_enabled =
+            parse_cayenne_filter_propagation(&spicepod_rt.params).is_enabled();
+
+        #[cfg(not(windows))]
+        if cayenne_footer_cache_mb.is_some() {
+            self.accelerator_engine_registry
+                .register_accelerator_engine(
+                    Engine::Cayenne,
+                    Arc::new(CayenneAccelerator::with_footer_cache_mb(
+                        cayenne_footer_cache_mb,
+                    )),
+                )
+                .await;
+        }
 
         let caching = Runtime::init_caching(Some(&spicepod_rt.caching));
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
+
+        // Resolve CDC tunables once at startup so the per-envelope hot path
+        // doesn't pay map lookup or spicepod-traversal cost. Reads
+        // `cdc_*` knobs from `runtime.params`; missing or rejected values
+        // fall back to the matching `SPICE_CDC_*` env var, then to defaults,
+        // with a warning for rejected explicit values.
+        crate::accelerated_table::refresh_task::changes::set_cdc_config(
+            crate::accelerated_table::refresh_task::changes::cdc_config_from_params(
+                &spicepod_rt.params,
+            ),
+        );
 
         // Create resource monitor early so it can be passed to DataFusion
         let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
@@ -244,6 +285,13 @@ impl RuntimeBuilder {
 
         // Create the shared app reference early so DataFusion, Runtime, and PartitionService share it.
         let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
+
+        let http_rate_control_registry = build_http_rate_control_registry(
+            spicepod_rt.source_rate_control.as_ref(),
+            Arc::clone(&secrets),
+            io_runtime.clone(),
+        )
+        .await;
 
         let distributed: Option<DistributedNode> = match self
             .resolved_cluster_config
@@ -354,13 +402,18 @@ impl RuntimeBuilder {
             io_runtime.clone(),
         )
         .memory_limit(memory_limit)
+        .target_partitions(target_partitions)
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
         .with_caching(caching)
         .with_metrics(metrics)
         .with_resource_monitor(resource_monitor.clone())
-        .with_url_tables(url_tables_enabled);
+        .with_url_tables(url_tables_enabled)
+        .cayenne_sort_merge_min_rows(cayenne_sort_merge_min_rows)
+        .cayenne_sort_merge_memory_pool_fraction(cayenne_sort_merge_memory_pool_fraction)
+        .cayenne_footer_cache_mb(cayenne_footer_cache_mb)
+        .cayenne_filter_propagation_enabled(cayenne_filter_propagation_enabled);
 
         if let Some(DistributedNode::Scheduler {
             executor_registry,
@@ -406,6 +459,7 @@ impl RuntimeBuilder {
             models: Arc::new(RwLock::new(HashMap::new())),
             completion_llms: Arc::new(RwLock::new(HashMap::new())),
             model_rate_controllers: Arc::new(RwLock::new(HashMap::new())),
+            http_rate_control_registry,
             responses_llms: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
@@ -431,6 +485,9 @@ impl RuntimeBuilder {
             distributed,
             resource_monitor,
             config: Arc::clone(&self.runtime_config),
+            dataset_load_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                dataset_parallelism.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
+            )),
             telemetry_config: self.telemetry_config,
         };
 
@@ -479,6 +536,100 @@ impl Default for RuntimeBuilder {
     }
 }
 
+async fn build_http_rate_control_registry(
+    source_rate_control: Option<&SpicepodSourceRateControl>,
+    secrets: Arc<RwLock<Secrets>>,
+    io_runtime: Handle,
+) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
+    #[cfg(not(feature = "rate-control"))]
+    {
+        let _ = (&secrets, &io_runtime);
+        if source_rate_control
+            .and_then(|config| config.state_location.as_ref())
+            .is_some()
+        {
+            tracing::warn!(
+                "Persisted HTTP governor rate-control state requires a Spice.ai Enterprise build. Falling back to in-memory HTTP rate-control state."
+            );
+        }
+        return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
+    }
+
+    #[cfg(feature = "rate-control")]
+    {
+        let Some((state_location, params, refresh_interval, config_path)) = source_rate_control
+            .and_then(|config| {
+                config.state_location.as_deref().map(|state_location| {
+                    (
+                        state_location,
+                        config.params.as_ref(),
+                        config.refresh_interval.as_str(),
+                        "runtime.source_rate_control",
+                    )
+                })
+            })
+        else {
+            return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
+        };
+
+        let Some(refresh_interval) =
+            parse_rate_control_refresh_interval(refresh_interval, config_path)
+        else {
+            return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
+        };
+
+        match crate::object_store_state::build_object_store(
+            secrets,
+            io_runtime,
+            state_location,
+            params,
+            "rate-control state",
+        )
+        .await
+        {
+            Ok((store, base_prefix)) => {
+                tracing::info!(
+                    "Initialized persisted HTTP governor rate-control state with location: {}",
+                    state_location
+                );
+                let registry = Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::with_persisted_governor_state(
+                    store,
+                    base_prefix,
+                    refresh_interval,
+                ));
+                registry.start_persistence_task();
+                registry
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Failed to initialize persisted HTTP governor rate-control state: {error}"
+                );
+                Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "rate-control")]
+fn parse_rate_control_refresh_interval(
+    refresh_interval: &str,
+    config_path: &str,
+) -> Option<Duration> {
+    match fundu::parse_duration(refresh_interval) {
+        Ok(parsed_refresh_interval) if parsed_refresh_interval.is_zero() => {
+            tracing::error!(
+                "Invalid {config_path}.refresh_interval '{refresh_interval}': value must be greater than 0"
+            );
+            None
+        }
+        Ok(parsed_refresh_interval) => Some(parsed_refresh_interval),
+        Err(error) => {
+            tracing::error!("Invalid {config_path}.refresh_interval '{refresh_interval}': {error}");
+            None
+        }
+    }
+}
+
 fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
     let memory_limit = memory_limit?;
     let original_memory_limit = memory_limit.clone();
@@ -506,6 +657,73 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
         None
     } else {
         memory_limit
+    }
+}
+
+fn parse_usize_runtime_param(params: &HashMap<String, String>, key: &str) -> Option<usize> {
+    let raw = params.get(key)?;
+    if raw.eq_ignore_ascii_case("usize::MAX") || raw.eq_ignore_ascii_case("max") {
+        return Some(usize::MAX);
+    }
+
+    match raw.parse::<usize>() {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::warn!(
+                "runtime.params.{key}={raw:?} is not a valid usize ({e}); using default"
+            );
+            None
+        }
+    }
+}
+
+fn parse_f64_runtime_param(params: &HashMap<String, String>, key: &str) -> Option<f64> {
+    let raw = params.get(key)?;
+    match raw.parse::<f64>() {
+        Ok(value) if value.is_finite() && value >= 0.0 => Some(value),
+        Ok(_) => {
+            tracing::warn!(
+                "runtime.params.{key}={raw:?} must be a finite non-negative number; using default"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                "runtime.params.{key}={raw:?} is not a valid number ({e}); using default"
+            );
+            None
+        }
+    }
+}
+
+const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CayenneFilterPropagation {
+    Disabled,
+    Enabled,
+}
+
+impl CayenneFilterPropagation {
+    fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+fn parse_cayenne_filter_propagation(params: &HashMap<String, String>) -> CayenneFilterPropagation {
+    let Some(raw) = params.get(CAYENNE_FILTER_PROPAGATION_PARAM) else {
+        return CayenneFilterPropagation::Disabled;
+    };
+
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "enabled" => CayenneFilterPropagation::Enabled,
+        "disabled" => CayenneFilterPropagation::Disabled,
+        _ => {
+            tracing::warn!(
+                "runtime.params.{CAYENNE_FILTER_PROPAGATION_PARAM}={raw:?} must be 'enabled' or 'disabled'; using disabled"
+            );
+            CayenneFilterPropagation::Disabled
+        }
     }
 }
 
@@ -551,5 +769,81 @@ mod test {
             let result = parse_memory_limit(input.map(ToString::to_string));
             assert_eq!(result, expected, "Input: {input:?}");
         }
+    }
+
+    #[test]
+    fn test_parse_usize_runtime_param() {
+        let params = HashMap::from([
+            (
+                "cayenne_sort_merge_min_rows".to_string(),
+                "100000000".to_string(),
+            ),
+            ("disabled".to_string(), "usize::MAX".to_string()),
+            ("bad".to_string(), "not-a-number".to_string()),
+        ]);
+
+        assert_eq!(
+            parse_usize_runtime_param(&params, "cayenne_sort_merge_min_rows"),
+            Some(100_000_000)
+        );
+        assert_eq!(
+            parse_usize_runtime_param(&params, "disabled"),
+            Some(usize::MAX)
+        );
+        assert_eq!(parse_usize_runtime_param(&params, "bad"), None);
+        assert_eq!(parse_usize_runtime_param(&params, "missing"), None);
+    }
+
+    #[test]
+    fn test_parse_f64_runtime_param() {
+        let params = HashMap::from([
+            (
+                "cayenne_sort_merge_memory_pool_fraction".to_string(),
+                "0.25".to_string(),
+            ),
+            ("negative".to_string(), "-1.0".to_string()),
+            ("nan".to_string(), "NaN".to_string()),
+            ("bad".to_string(), "nope".to_string()),
+        ]);
+
+        assert_eq!(
+            parse_f64_runtime_param(&params, "cayenne_sort_merge_memory_pool_fraction"),
+            Some(0.25)
+        );
+        assert_eq!(parse_f64_runtime_param(&params, "negative"), None);
+        assert_eq!(parse_f64_runtime_param(&params, "nan"), None);
+        assert_eq!(parse_f64_runtime_param(&params, "bad"), None);
+        assert_eq!(parse_f64_runtime_param(&params, "missing"), None);
+    }
+
+    #[test]
+    fn test_parse_cayenne_filter_propagation() {
+        let params = HashMap::from([(
+            CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
+            "enabled".to_string(),
+        )]);
+
+        assert_eq!(
+            parse_cayenne_filter_propagation(&params),
+            CayenneFilterPropagation::Enabled
+        );
+        assert_eq!(
+            parse_cayenne_filter_propagation(&HashMap::from([(
+                CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
+                "disabled".to_string(),
+            )])),
+            CayenneFilterPropagation::Disabled
+        );
+        assert_eq!(
+            parse_cayenne_filter_propagation(&HashMap::from([(
+                CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
+                "true".to_string(),
+            )])),
+            CayenneFilterPropagation::Disabled
+        );
+        assert_eq!(
+            parse_cayenne_filter_propagation(&HashMap::new()),
+            CayenneFilterPropagation::Disabled
+        );
     }
 }

@@ -25,9 +25,11 @@ use std::time::Duration;
 
 use tokio::sync::SetOnce;
 
-use app::spicepod::component::runtime::{Runtime as SpicepodRuntime, TelemetryConfig};
+use app::spicepod::component::runtime::{
+    ClientAuthMode as SpicepodClientAuthMode, Runtime as SpicepodRuntime, TelemetryConfig,
+};
 use app::{App, AppBuilder};
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, ValueEnum};
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -51,6 +53,9 @@ use tokio::runtime::Handle;
 use tpc_extension::TpcExtensionFactory;
 use util::in_tracing_context;
 use yaml::Value;
+
+#[cfg(feature = "anonymous_telemetry")]
+const TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE: &str = "Usage telemetry is anonymous and aggregated. In Spice.ai Open Source, setting runtime.telemetry.enabled: false in a Spicepod or passing --telemetry-enabled=false does not disable anonymous usage telemetry. To remove anonymous telemetry from an Open Source build, build from source without the anonymous_telemetry feature, or consider using Spice.ai Enterprise. Learn more at https://docs.spice.ai/docs/enterprise";
 
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -256,6 +261,49 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Clap mirror of [`SpicepodClientAuthMode`]. Defined here so we can
+/// derive `ValueEnum` for the `--tls-client-auth-mode` CLI flag
+/// without pulling clap into the `spicepod` crate. The two enums
+/// are trivially convertible via [`ClientAuthMode::into_spicepod`]
+/// and [`ClientAuthMode::from_spicepod`].
+#[derive(ValueEnum, Debug, Copy, Clone, PartialEq, Eq, Default)]
+#[clap(rename_all = "snake_case")]
+pub enum ClientAuthMode {
+    /// No client-cert authentication. The server runs
+    /// `with_no_client_auth()` at the rustls layer and never sends a
+    /// `CertificateRequest`. This is the out-of-the-box default.
+    #[default]
+    None,
+    /// Request but do not require a client cert. The server sends a
+    /// `CertificateRequest`; presented certs must be signed by the
+    /// configured client CA, but no-cert handshakes are admitted.
+    /// Useful for migration windows and audit-only deployments.
+    Request,
+    /// Require every connection to present a valid X.509 client cert
+    /// signed by the configured client CA.
+    Required,
+}
+
+impl ClientAuthMode {
+    #[must_use]
+    pub fn into_spicepod(self) -> SpicepodClientAuthMode {
+        match self {
+            ClientAuthMode::None => SpicepodClientAuthMode::None,
+            ClientAuthMode::Request => SpicepodClientAuthMode::Request,
+            ClientAuthMode::Required => SpicepodClientAuthMode::Required,
+        }
+    }
+
+    #[must_use]
+    pub fn from_spicepod(value: SpicepodClientAuthMode) -> Self {
+        match value {
+            SpicepodClientAuthMode::None => ClientAuthMode::None,
+            SpicepodClientAuthMode::Request => ClientAuthMode::Request,
+            SpicepodClientAuthMode::Required => ClientAuthMode::Required,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[clap(about = "Spice.ai OSS Runtime")]
 #[clap(rename_all = "kebab-case")]
@@ -309,7 +357,31 @@ pub struct Args {
     #[arg(long, value_name = "key.pem")]
     pub tls_key_file: Option<String>,
 
-    /// Enable/disable anonymous telemetry collection.
+    /// Path to a PEM-encoded CA bundle used to verify client certificates
+    /// when `--tls-client-auth-mode request` or `required` (or the
+    /// equivalent spicepod `runtime.tls.client_auth_mode`) is set.
+    /// Eligible for hot-reload via the same watcher that picks up
+    /// server cert / key rotations.
+    #[arg(long, value_name = "client-ca.pem")]
+    pub tls_client_auth_ca_file: Option<String>,
+
+    /// Inline PEM-encoded CA bundle used to verify client certificates.
+    /// Mutually exclusive with `--tls-client-auth-ca-file`. Inline material
+    /// is not hot-reloaded.
+    #[arg(long, value_name = "-----BEGIN CERTIFICATE-----...")]
+    pub tls_client_auth_ca: Option<String>,
+
+    /// How the runtime treats client certificates on the public TLS
+    /// endpoints. `none` disables client-cert authentication (default).
+    /// `request` sends `CertificateRequest` but accepts no-cert
+    /// handshakes; presented certs must be signed by the client CA.
+    /// `required` enables strict mTLS — the server demands a valid
+    /// cert signed by `--tls-client-auth-ca` / `--tls-client-auth-ca-file`.
+    #[arg(long, value_enum)]
+    pub tls_client_auth_mode: Option<ClientAuthMode>,
+
+    /// Enable anonymous telemetry collection. In Open Source builds that include anonymous telemetry,
+    /// `false` is ignored; build without the `anonymous_telemetry` feature to remove anonymous usage telemetry.
     #[arg(long)]
     pub telemetry_enabled: Option<bool>,
 
@@ -336,6 +408,49 @@ pub struct Args {
 
     #[arg(skip)]
     pub open_telemetry_deprecated: bool,
+}
+
+/// Spawn a tokio task that listens for `SIGHUP` and asks the
+/// process-wide [`runtime::tls::TlsControl`] to reload every TLS
+/// material the runtime is watching. Mirrors the `nginx -s reload` /
+/// `kill -HUP <pid>` convention.
+///
+/// The reload itself is **best-effort and asynchronous**:
+/// `TlsControl::reload_all` enqueues a sentinel op on the watcher's
+/// dispatcher channel and returns as soon as the op is queued. The
+/// actual parse + validate + `ArcSwap::store` runs on the dispatcher
+/// thread shortly after; operators that need to confirm the rotation
+/// landed should watch the `tls_reload_total{result="ok"}` metric.
+///
+/// On Windows or other targets without SIGHUP semantics this is a
+/// no-op: rotation still works via the polling filesystem watcher.
+fn spawn_sighup_reload_task(control: std::sync::Arc<runtime::tls::TlsControl>) {
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sighup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!("TLS reload: failed to install SIGHUP handler: {err}");
+                    return;
+                }
+            };
+            tracing::debug!("TLS reload: SIGHUP handler installed");
+            while sighup.recv().await.is_some() {
+                tracing::info!("TLS reload: SIGHUP received, reloading TLS material");
+                if let Err(err) = control.reload_all() {
+                    tracing::warn!("TLS reload: SIGHUP reload failed: {err}");
+                }
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        // Non-Unix platforms have no SIGHUP equivalent; rotation still
+        // works via the polling filesystem watcher.
+        let _ = control;
+    }
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -404,8 +519,23 @@ pub async fn run(args: Args) -> Result<()> {
         limits
     };
 
-    let resolved_cluster_config =
-        in_tracing_context(|| ResolvedClusterConfig::try_new(args.runtime.cluster.clone()));
+    // Single, process-wide TLS reload control plane. Both public TLS
+    // (HTTP / Flight / Metrics) and cluster mTLS register their reload
+    // callbacks here so we have one watcher, one dispatcher thread, one
+    // SIGHUP target. Created lazily on success of `TlsControl::new`; if
+    // the watcher fails to spawn we surface the error eagerly.
+    let tls_control = std::sync::Arc::new(runtime::tls::TlsControl::new().map_err(|e| {
+        Error::UnableToInitializeTls {
+            source: Box::new(e),
+        }
+    })?);
+
+    let resolved_cluster_config = in_tracing_context(|| {
+        ResolvedClusterConfig::try_new_with_tls(
+            args.runtime.cluster.clone(),
+            Some(tls_control.as_ref()),
+        )
+    });
 
     let mut builder = Runtime::builder()
         .with_app_opt(app.clone())
@@ -598,9 +728,19 @@ pub async fn run(args: Args) -> Result<()> {
         .context(UnableToInitializeMetricsSnafu)?;
     }
 
-    let tls_config = tls::load_tls_config(&args, spicepod_tls_config.as_ref(), rt.secrets())
-        .await
-        .context(UnableToInitializeTlsSnafu)?;
+    let (tls_config, client_auth_mode) = tls::load_tls_config(
+        &args,
+        spicepod_tls_config.as_ref(),
+        rt.secrets(),
+        tls_control.as_ref(),
+    )
+    .await
+    .context(UnableToInitializeTlsSnafu)?;
+
+    // Wire SIGHUP -> tls_control.reload_all() once. Both public and
+    // cluster TLS register on the same `TlsControl`, so a single signal
+    // pickup rotates everything atomically.
+    spawn_sighup_reload_task(std::sync::Arc::clone(&tls_control));
 
     let telemetry_enabled = args.telemetry_enabled;
     let telemetry_config_clone = Arc::clone(&telemetry_config);
@@ -625,6 +765,37 @@ pub async fn run(args: Args) -> Result<()> {
         Some(app) => EndpointAuth::new(rt.secrets(), app).await,
         None => EndpointAuth::no_auth(),
     };
+
+    // Compute the process-wide IdentitySource from the combination of
+    // `runtime.auth` (recorded by `EndpointAuth::new`) and the
+    // resolved public TLS `client_auth_mode`:
+    //
+    // | runtime.auth | client_auth_mode | IdentitySource |
+    // |--------------|------------------|----------------|
+    // | unset        | none             | Anonymous      |
+    // | unset        | request          | Channel        |
+    // | unset        | required         | Channel        |
+    // | set          | none             | RuntimeAuth    |
+    // | set          | request          | RuntimeAuth    |
+    // | set          | required         | RuntimeAuth    | ("mTLS-as-channel")
+    let runtime_auth_configured = endpoint_auth.http_auth.is_some();
+    let identity_source = match (runtime_auth_configured, client_auth_mode) {
+        (true, _) => runtime_auth::IdentitySource::RuntimeAuth,
+        (false, ClientAuthMode::Request | ClientAuthMode::Required) => {
+            runtime_auth::IdentitySource::Channel
+        }
+        (false, ClientAuthMode::None) => runtime_auth::IdentitySource::Anonymous,
+    };
+    if matches!(
+        (runtime_auth_configured, client_auth_mode),
+        (true, ClientAuthMode::Required)
+    ) {
+        tracing::info!(
+            "mTLS-as-channel mode active: client cert AND `runtime.auth` credentials \
+             are both required"
+        );
+    }
+    let endpoint_auth = endpoint_auth.with_identity_source(identity_source);
 
     let server_thread = tokio::spawn(async move {
         Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await
@@ -851,7 +1022,8 @@ fn create_otel_reader(
 async fn start_anonymous_telemetry(
     telemetry_enabled: Option<bool>,
     telemetry_config: Arc<SetOnce<TelemetryConfig>>,
-    spicepod_name: Option<&String>,
+    #[cfg(feature = "anonymous_telemetry")] spicepod_name: Option<&String>,
+    #[cfg(not(feature = "anonymous_telemetry"))] _spicepod_name: Option<&String>,
 ) {
     // Always log hardware info at debug level regardless of telemetry settings
     // Use async version to avoid blocking the async runtime
@@ -860,32 +1032,51 @@ async fn start_anonymous_telemetry(
         .unwrap_or_else(|_| telemetry::hardware::HardwareInfo::detect());
     hardware_info.log_debug();
 
-    // CLI flag takes immediate priority.
-    if telemetry_enabled == Some(false) {
-        return;
+    #[cfg(not(feature = "anonymous_telemetry"))]
+    {
+        let _ = (telemetry_enabled, telemetry_config);
     }
-
-    // Wait for the spicepod telemetry config to be resolved.  For schedulers
-    // and standalone instances this is already set; for executors it will be
-    // set once the app definition is fetched from the scheduler.
-    let config = telemetry_config.wait().await;
-
-    if telemetry_enabled != Some(true) && !config.enabled {
-        return;
-    }
-
-    let telemetry_properties: Vec<KeyValue> = config
-        .properties
-        .iter()
-        .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
-        .collect();
 
     #[cfg(feature = "anonymous_telemetry")]
-    telemetry::anonymous::start(
-        spicepod_name.map_or_else(|| "unknown", String::as_str),
-        telemetry_properties,
-    )
-    .await;
+    {
+        // Wait for the spicepod telemetry config to be resolved.  For schedulers
+        // and standalone instances this is already set; for executors it will be
+        // set once the app definition is fetched from the scheduler.
+        let config = telemetry_config.wait().await;
+
+        if should_warn_telemetry_disabled_setting_ignored(telemetry_enabled, config) {
+            tracing::warn!("{TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE}");
+        }
+
+        let telemetry_properties: Vec<KeyValue> = config
+            .properties
+            .iter()
+            .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
+            .collect();
+
+        telemetry::anonymous::start(
+            spicepod_name.map_or_else(|| "unknown", String::as_str),
+            telemetry_properties,
+        )
+        .await;
+    }
+}
+
+#[cfg(any(test, feature = "anonymous_telemetry"))]
+fn should_warn_telemetry_disabled_setting_ignored(
+    telemetry_enabled: Option<bool>,
+    config: &TelemetryConfig,
+) -> bool {
+    #[cfg(feature = "anonymous_telemetry")]
+    {
+        telemetry_enabled == Some(false) || (telemetry_enabled.is_none() && !config.enabled)
+    }
+
+    #[cfg(not(feature = "anonymous_telemetry"))]
+    {
+        let _ = (telemetry_enabled, config);
+        false
+    }
 }
 
 fn parse_set_string(s: &str) -> Result<(String, String), String> {
@@ -993,4 +1184,101 @@ fn apply_override(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "anonymous_telemetry")]
+    #[test]
+    fn warns_when_spicepod_disables_telemetry_without_cli_override() {
+        let config = TelemetryConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        assert!(should_warn_telemetry_disabled_setting_ignored(
+            None, &config
+        ));
+    }
+
+    #[cfg(feature = "anonymous_telemetry")]
+    #[test]
+    fn warns_when_cli_disables_telemetry() {
+        let config = TelemetryConfig::default();
+
+        assert!(should_warn_telemetry_disabled_setting_ignored(
+            Some(false),
+            &config
+        ));
+    }
+
+    #[cfg(not(feature = "anonymous_telemetry"))]
+    #[test]
+    fn does_not_warn_when_anonymous_telemetry_is_not_compiled() {
+        let config = TelemetryConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        assert!(!should_warn_telemetry_disabled_setting_ignored(
+            None, &config
+        ));
+
+        assert!(!should_warn_telemetry_disabled_setting_ignored(
+            Some(false),
+            &config
+        ));
+    }
+
+    #[cfg(not(feature = "anonymous_telemetry"))]
+    #[tokio::test]
+    async fn returns_without_telemetry_config_when_anonymous_telemetry_is_not_compiled() {
+        let telemetry_config = Arc::new(SetOnce::new());
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            start_anonymous_telemetry(None, telemetry_config, None),
+        )
+        .await
+        .expect("anonymous telemetry should return without waiting for telemetry config when the feature is disabled");
+    }
+
+    #[test]
+    fn does_not_warn_when_spicepod_enables_telemetry() {
+        let config = TelemetryConfig::default();
+
+        assert!(!should_warn_telemetry_disabled_setting_ignored(
+            None, &config
+        ));
+    }
+
+    #[test]
+    fn does_not_warn_when_cli_enables_telemetry() {
+        let config = TelemetryConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        assert!(!should_warn_telemetry_disabled_setting_ignored(
+            Some(true),
+            &config
+        ));
+    }
+
+    #[cfg(feature = "anonymous_telemetry")]
+    #[test]
+    fn telemetry_disabled_message_mentions_supported_disable_paths() {
+        assert!(TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE.contains("anonymous and aggregated"));
+        assert!(TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE.contains(
+            "runtime.telemetry.enabled: false in a Spicepod or passing --telemetry-enabled=false does not disable anonymous usage telemetry"
+        ));
+        assert!(TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE.contains("--telemetry-enabled=false"));
+        assert!(
+            TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE
+                .contains("without the anonymous_telemetry feature")
+        );
+        assert!(TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE.contains("Spice.ai Enterprise"));
+    }
 }

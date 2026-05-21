@@ -92,6 +92,16 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Returns `true` for configuration errors that will not resolve with retries.
+    pub fn is_configuration_error(&self) -> bool {
+        matches!(
+            self,
+            Error::InvalidConfiguration { .. } | Error::InvalidConfigurationNoSource { .. }
+        )
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[cfg(feature = "adbc")]
@@ -265,16 +275,6 @@ pub async fn register_all() {
         ),
     );
 
-    #[cfg(not(windows))]
-    registry.insert(
-        cayenne::PREFIX.to_string(),
-        CatalogConnectorFactory::new(
-            cayenne::CayenneCatalogConnector::new_connector,
-            cayenne::PREFIX,
-            cayenne::PARAMETERS,
-        ),
-    );
-
     #[cfg(feature = "adbc")]
     registry.insert(
         adbc::PREFIX.to_string(),
@@ -421,6 +421,7 @@ impl RefreshingCatalogProvider {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 impl CatalogProvider for RefreshingCatalogProvider {
     fn as_any(&self) -> &dyn Any {
         self.inner.as_any()
@@ -432,6 +433,22 @@ impl CatalogProvider for RefreshingCatalogProvider {
 
     fn schema(&self, name: &str) -> Option<Arc<dyn datafusion::catalog::SchemaProvider>> {
         self.inner.schema(name)
+    }
+
+    fn register_schema(
+        &self,
+        name: &str,
+        schema: Arc<dyn datafusion::catalog::SchemaProvider>,
+    ) -> datafusion::error::Result<Option<Arc<dyn datafusion::catalog::SchemaProvider>>> {
+        self.inner.register_schema(name, schema)
+    }
+
+    fn deregister_schema(
+        &self,
+        name: &str,
+        cascade: bool,
+    ) -> datafusion::error::Result<Option<Arc<dyn datafusion::catalog::SchemaProvider>>> {
+        self.inner.deregister_schema(name, cascade)
     }
 }
 
@@ -524,11 +541,6 @@ mod tests {
             assert!(
                 guard.contains_key(oracle::PREFIX),
                 "oracle should be registered"
-            );
-            #[cfg(not(windows))]
-            assert!(
-                guard.contains_key(cayenne::PREFIX),
-                "cayenne should be registered"
             );
         }
 

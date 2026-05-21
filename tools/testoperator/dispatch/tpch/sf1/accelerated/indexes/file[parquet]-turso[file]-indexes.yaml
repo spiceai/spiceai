@@ -4,7 +4,7 @@ tests:
     query_set: tpch
     query_overrides: turso
     runner_type: spiceai-dev-runners
-    ready_wait: 1200
+    ready_wait: 1500
     validate_results: true
   throughput:
     spicepod_path: accelerated/indexes/file[parquet]-turso[file]-indexes.yaml

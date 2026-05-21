@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
+use arrow::array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::common::DFSchema;
 use snafu::prelude::*;
@@ -146,6 +147,47 @@ pub fn expand_views_schema(schema: &Schema) -> Schema {
         .collect();
 
     Schema::new_with_metadata(transformed_fields, schema.metadata().clone())
+}
+
+/// Cast any columns whose type differs from the target schema (e.g. `Utf8View` → `LargeUtf8`).
+///
+/// Returns the batch unchanged if the column count differs from the target schema.
+///
+/// # Errors
+///
+/// Returns an [`arrow::error::ArrowError`] if casting a column to the target type fails.
+pub fn cast_view_columns(
+    batch: RecordBatch,
+    target_schema: &Arc<Schema>,
+) -> Result<RecordBatch, arrow::error::ArrowError> {
+    if batch.num_columns() != target_schema.fields().len() {
+        return Ok(batch);
+    }
+
+    if batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(target_schema.fields().iter())
+        .all(|(s, t)| s.data_type() == t.data_type())
+    {
+        return Ok(batch);
+    }
+
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(target_schema.fields().iter())
+        .map(|(col, target_field)| {
+            if col.data_type() == target_field.data_type() {
+                Ok(Arc::clone(col))
+            } else {
+                arrow::compute::cast(col, target_field.data_type())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    RecordBatch::try_new(Arc::clone(target_schema), columns)
 }
 
 /// Replaces Arrow `Dictionary`-encoded fields with the dictionary's value type.
@@ -905,5 +947,184 @@ mod tests {
         assert_eq!(*expanded.field(3).data_type(), DataType::Float64);
         assert_eq!(expanded.field(3).metadata(), &field_metadata);
         assert_eq!(expanded.metadata(), &schema_metadata);
+    }
+
+    mod cast_view_columns_tests {
+        use super::*;
+        use arrow::array::{
+            Array, BinaryViewArray, Int32Array, LargeBinaryArray, LargeStringArray, RecordBatch,
+            StringArray, StringViewArray,
+        };
+
+        fn schema(fields: Vec<(&str, DataType)>) -> Arc<Schema> {
+            Arc::new(Schema::new(
+                fields
+                    .into_iter()
+                    .map(|(name, dt)| Field::new(name, dt, true))
+                    .collect::<Vec<_>>(),
+            ))
+        }
+
+        #[test]
+        fn noop_when_types_already_match() {
+            let src = schema(vec![("id", DataType::Int32)]);
+            let batch = RecordBatch::try_new(
+                Arc::clone(&src),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .expect("valid batch");
+
+            let result = cast_view_columns(batch.clone(), &src).expect("cast should succeed");
+            assert_eq!(result.schema(), batch.schema());
+            assert_eq!(result.num_rows(), 3);
+        }
+
+        #[test]
+        fn noop_when_column_count_differs() {
+            let src = schema(vec![("id", DataType::Int32)]);
+            let tgt = schema(vec![("id", DataType::Int32), ("name", DataType::LargeUtf8)]);
+            let batch =
+                RecordBatch::try_new(Arc::clone(&src), vec![Arc::new(Int32Array::from(vec![1]))])
+                    .expect("valid batch");
+
+            let result = cast_view_columns(batch.clone(), &tgt).expect("cast should succeed");
+            assert_eq!(result.schema(), batch.schema());
+        }
+
+        #[test]
+        fn utf8view_cast_to_large_utf8() {
+            let src = schema(vec![("name", DataType::Utf8View)]);
+            let tgt = schema(vec![("name", DataType::LargeUtf8)]);
+
+            let batch = RecordBatch::try_new(
+                Arc::clone(&src),
+                vec![Arc::new(StringViewArray::from(vec!["hello", "world"]))],
+            )
+            .expect("valid batch");
+
+            let result = cast_view_columns(batch, &tgt).expect("cast should succeed");
+            assert_eq!(result.schema().field(0).data_type(), &DataType::LargeUtf8);
+
+            let col = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("LargeStringArray");
+            assert_eq!(col.value(0), "hello");
+            assert_eq!(col.value(1), "world");
+        }
+
+        #[test]
+        fn binaryview_cast_to_large_binary() {
+            let src = schema(vec![("data", DataType::BinaryView)]);
+            let tgt = schema(vec![("data", DataType::LargeBinary)]);
+
+            let batch = RecordBatch::try_new(
+                Arc::clone(&src),
+                vec![Arc::new(BinaryViewArray::from(vec![
+                    b"foo".as_ref(),
+                    b"bar".as_ref(),
+                ]))],
+            )
+            .expect("valid batch");
+
+            let result = cast_view_columns(batch, &tgt).expect("cast should succeed");
+            assert_eq!(result.schema().field(0).data_type(), &DataType::LargeBinary);
+
+            let col = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .expect("LargeBinaryArray");
+            assert_eq!(col.value(0), b"foo");
+            assert_eq!(col.value(1), b"bar");
+        }
+
+        #[test]
+        fn mixed_batch_only_view_columns_cast() {
+            let src = schema(vec![
+                ("id", DataType::Int32),
+                ("name", DataType::Utf8View),
+                ("raw", DataType::BinaryView),
+            ]);
+            let tgt = schema(vec![
+                ("id", DataType::Int32),
+                ("name", DataType::LargeUtf8),
+                ("raw", DataType::LargeBinary),
+            ]);
+
+            let batch = RecordBatch::try_new(
+                Arc::clone(&src),
+                vec![
+                    Arc::new(Int32Array::from(vec![42])),
+                    Arc::new(StringViewArray::from(vec!["alice"])),
+                    Arc::new(BinaryViewArray::from(vec![b"bytes".as_ref()])),
+                ],
+            )
+            .expect("valid batch");
+
+            let result = cast_view_columns(batch, &tgt).expect("cast should succeed");
+            assert_eq!(result.schema().field(0).data_type(), &DataType::Int32);
+            assert_eq!(result.schema().field(1).data_type(), &DataType::LargeUtf8);
+            assert_eq!(result.schema().field(2).data_type(), &DataType::LargeBinary);
+
+            let ids = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32Array");
+            assert_eq!(ids.value(0), 42);
+
+            let names = result
+                .column(1)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("LargeStringArray");
+            assert_eq!(names.value(0), "alice");
+        }
+
+        #[test]
+        fn non_view_utf8_passthrough() {
+            let src = schema(vec![("label", DataType::Utf8)]);
+            let batch = RecordBatch::try_new(
+                Arc::clone(&src),
+                vec![Arc::new(StringArray::from(vec!["x"]))],
+            )
+            .expect("valid batch");
+
+            let result = cast_view_columns(batch, &src).expect("cast should succeed");
+            assert_eq!(result.schema().field(0).data_type(), &DataType::Utf8);
+            assert_eq!(
+                result
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("StringArray")
+                    .value(0),
+                "x"
+            );
+        }
+
+        #[test]
+        fn null_values_preserved_through_cast() {
+            let src = schema(vec![("name", DataType::Utf8View)]);
+            let tgt = schema(vec![("name", DataType::LargeUtf8)]);
+
+            let arr: StringViewArray = vec![Some("hello"), None, Some("world")]
+                .into_iter()
+                .collect();
+            let batch =
+                RecordBatch::try_new(Arc::clone(&src), vec![Arc::new(arr)]).expect("valid batch");
+
+            let result = cast_view_columns(batch, &tgt).expect("cast should succeed");
+            let col = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("LargeStringArray");
+            assert_eq!(col.value(0), "hello");
+            assert!(col.is_null(1));
+            assert_eq!(col.value(2), "world");
+        }
     }
 }

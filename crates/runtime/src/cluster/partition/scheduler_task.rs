@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Periodic partition-management background task.
+//! Periodic partition-assignment background task.
 //!
-//! Core partition-management logic lives in
+//! Core partition-assignment logic lives in
 //! [`crate::cluster::partition::service::PartitionService`]; this file only
 //! contains the timer-driven driver that invokes the service on an interval
 //! and reports status.
@@ -28,11 +28,11 @@ use snafu::prelude::*;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
-use crate::CLUSTER_PARTITION_MANAGEMENT_TASK;
+use crate::CLUSTER_PARTITION_ASSIGNMENT_TASK;
 use crate::datafusion::DataFusion;
 use crate::status::{ComponentStatus, RuntimeStatus};
 
-pub use runtime_cluster::scheduler_task_config::{ConfigError, PartitionManagementConfig};
+pub use runtime_cluster::scheduler_task_config::{ConfigError, PartitionAssignmentConfig};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -49,18 +49,18 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// 2. Adding new partitions to the partition metadata (initially unassigned).
 /// 3. Removing partitions that no longer exist in the source and notifying executors to unload them.
 /// 4. Assigning unassigned partitions to executors.
-pub struct PartitionManagementTask {
+pub struct PartitionAssignmentTask {
     df: Arc<DataFusion>,
     status: Arc<RuntimeStatus>,
 
-    /// How often to run the management cycle
+    /// How often to run the assignment cycle
     interval: Duration,
 
     /// Cancellation token for graceful shutdown
     cancel: CancellationToken,
 }
 
-impl PartitionManagementTask {
+impl PartitionAssignmentTask {
     pub fn new(
         df: Arc<DataFusion>,
         status: Arc<RuntimeStatus>,
@@ -76,7 +76,7 @@ impl PartitionManagementTask {
     }
 
     pub async fn run(self) -> Result<()> {
-        tracing::debug!("Starting {CLUSTER_PARTITION_MANAGEMENT_TASK} in background");
+        tracing::debug!("Starting {CLUSTER_PARTITION_ASSIGNMENT_TASK} in background");
 
         // Seed partition metadata for tables that don't have it yet.
         // This runs once before the periodic loop and is cancellation-aware
@@ -107,28 +107,28 @@ impl PartitionManagementTask {
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
-            tracing::debug!("Starting {CLUSTER_PARTITION_MANAGEMENT_TASK} loop");
+            tracing::debug!("Starting {CLUSTER_PARTITION_ASSIGNMENT_TASK} loop");
             tokio::select! {
                 () = self.cancel.cancelled() => {
-                    tracing::info!("Partition management task shutting down");
+                    tracing::info!("Partition assignment task shutting down");
                     break;
                 }
                 _ = interval.tick() => {
                     let cycle_start = Instant::now();
 
-                    match self.run_management_cycle().await {
+                    match self.run_assignment_cycle().await {
                         Ok(()) => {
                             self.status.update_component_status("partition_metadata", ComponentStatus::Ready);
                         }
                         Err(e) => {
                             tracing::warn!(
                                 error = %e,
-                                "Partition management cycle failed"
+                                "Partition assignment cycle failed"
                             );
                             self.status.update_component_status(
                                 "partition_metadata",
                                 ComponentStatus::error_with_message(format!(
-                                    "Management cycle failed: {e}"
+                                    "Assignment cycle failed: {e}"
                                 )),
                             );
                         }
@@ -139,7 +139,7 @@ impl PartitionManagementTask {
                         tracing::warn!(
                             duration_ms = cycle_duration.as_millis(),
                             interval_ms = self.interval.as_millis(),
-                            "Partition management cycle took longer than interval"
+                            "Partition assignment cycle took longer than interval"
                         );
                     }
                 }
@@ -149,13 +149,29 @@ impl PartitionManagementTask {
         Ok(())
     }
 
-    /// Underlying logic for a single management cycle.
+    /// Underlying logic for a single assignment cycle.
     /// Delegates to [`super::service::PartitionService::reconcile_all`].
-    async fn run_management_cycle(&self) -> Result<()> {
+    async fn run_assignment_cycle(&self) -> Result<()> {
         let Some(service) = &self.df.partition_service else {
-            tracing::warn!("Partition service not initialized, skipping management cycle");
+            tracing::warn!("Partition service not initialized, skipping assignment cycle");
             return Ok(());
         };
+
+        // Defer the cycle while any accelerated table is still loading — the
+        // notify path inside reconcile_all calls partition_value_to_bytes,
+        // which needs each table's schema in the SessionContext. Skipping is
+        // safe: the next periodic tick will retry.
+        let app_snapshot = service.app.read().await.clone();
+        if let Some(app) = app_snapshot
+            && let Some(not_ready) =
+                super::first_unready_accelerated_table(&app, self.df.as_ref()).await
+        {
+            tracing::debug!(
+                table = %not_ready,
+                "Deferring partition assignment cycle: accelerated table not yet registered"
+            );
+            return Ok(());
+        }
 
         service
             .reconcile_all(self.df.as_ref())

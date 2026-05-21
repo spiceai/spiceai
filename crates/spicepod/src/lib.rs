@@ -29,8 +29,9 @@ use std::{fmt::Debug, path::PathBuf};
 use std::sync::Arc;
 
 use component::{
-    catalog::Catalog, dataset::Dataset, embeddings::Embeddings, model::Model, rerankers::Reranker,
-    runtime::Runtime, secret::Secret, snapshot::Snapshots, tool::Tool, view::View, worker::Worker,
+    catalog::Catalog, dataset::Dataset, embeddings::Embeddings, function::Function, model::Model,
+    rerankers::Reranker, runtime::Runtime, secret::Secret, snapshot::Snapshots, tool::Tool,
+    view::View, worker::Worker,
 };
 
 use crate::component::Nameable;
@@ -39,6 +40,7 @@ use spec::{SpicepodDefinition, SpicepodVersion};
 pub mod acceleration;
 pub mod component;
 pub mod extension;
+pub mod fts;
 mod keywords;
 pub mod metric;
 pub mod param;
@@ -99,6 +101,21 @@ pub enum Error {
         path: PathBuf,
     },
 
+    #[snafu(display(
+        "Not a valid Spicepod file: {}\n\n\
+        Expected 'kind: Spicepod' but found 'kind: {kind}'.\n\
+        Ensure the file is a valid Spicepod YAML file.",
+        path.display()
+    ))]
+    InvalidSpicepodKind { kind: String, path: PathBuf },
+
+    #[snafu(display(
+        "Unsupported Spicepod version in {}: '{version}'\n\n\
+        Supported versions are: v1, v2 (or full semver: v1.0.0, v2.0.0-rc.1, etc.)",
+        path.display()
+    ))]
+    InvalidSpicepodVersion { version: String, path: PathBuf },
+
     #[cfg(feature = "object-store")]
     #[snafu(display("Unable to parse S3 URL {}: {source}", path))]
     UnableToParseS3Url {
@@ -142,11 +159,37 @@ pub struct Spicepod {
 
     pub workers: Vec<Worker>,
 
+    pub functions: Vec<Function>,
+
     pub runtime: Runtime,
 
     pub management: Option<Management>,
 
     pub snapshots: Option<Snapshots>,
+}
+
+fn validate_spicepod_header(raw: &yaml::Value, path: &Path) -> Result<()> {
+    if let Some(kind) = raw.get("kind").and_then(yaml::Value::as_str)
+        && kind != "Spicepod"
+    {
+        return InvalidSpicepodKindSnafu {
+            kind: kind.to_string(),
+            path: path.to_path_buf(),
+        }
+        .fail();
+    }
+
+    if let Some(version_val) = raw.get("version")
+        && yaml::from_value::<SpicepodVersion>(version_val.clone()).is_err()
+    {
+        return InvalidSpicepodVersionSnafu {
+            version: version_val.as_str().unwrap_or("unknown").to_string(),
+            path: path.to_path_buf(),
+        }
+        .fail();
+    }
+
+    Ok(())
 }
 
 fn detect_duplicate_component_names(
@@ -227,8 +270,14 @@ impl Spicepod {
         path: impl Into<PathBuf>,
     ) -> Result<Spicepod> {
         let path = path.into();
-        let spicepod_definition: SpicepodDefinition =
+
+        let raw: yaml::Value =
             yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
+
+        validate_spicepod_header(&raw, &path)?;
+
+        let spicepod_definition: SpicepodDefinition =
+            yaml::from_value(raw).context(UnableToParseSpicepodSnafu)?;
 
         let resolved_datasets = component::resolve_component_references(
             fs,
@@ -294,6 +343,15 @@ impl Spicepod {
         .await
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
+        let resolved_functions = component::resolve_component_references(
+            fs,
+            &path,
+            &spicepod_definition.functions,
+            "functions",
+        )
+        .await
+        .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
+
         detect_duplicate_component_names("secrets", &spicepod_definition.secrets[..])?;
         detect_duplicate_component_names("dataset", &resolved_datasets[..])?;
         detect_duplicate_component_names("view", &resolved_views[..])?;
@@ -302,6 +360,7 @@ impl Spicepod {
         detect_duplicate_component_names("reranker", &resolved_rerankers[..])?;
         detect_duplicate_component_names("tool", &resolved_tools[..])?;
         detect_duplicate_component_names("worker", &resolved_workers[..])?;
+        detect_duplicate_component_names("function", &resolved_functions[..])?;
 
         check_for_reserved_keywords(&resolved_datasets[..])?;
 
@@ -315,6 +374,7 @@ impl Spicepod {
             resolved_tools,
             resolved_models,
             resolved_workers,
+            resolved_functions,
         ))
     }
 
@@ -336,14 +396,9 @@ impl Spicepod {
     ) -> Result<Spicepod> {
         let path = path.into();
 
-        let file_stem = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let is_file = is_file_path(&path);
 
-        let is_file = path.is_file() || path.extension().is_some();
-
-        let (spicepod_rdr, base_path) = if file_stem == "spicepod" && is_file {
+        let (spicepod_rdr, base_path) = if is_file {
             let spicepod_rdr = fs
                 .open_exact_yaml(path.clone())
                 .await
@@ -384,11 +439,24 @@ impl Spicepod {
 
     #[must_use]
     pub fn base_path(path: &Path) -> &Path {
-        if path.is_file() || path.extension().is_some() {
+        if is_file_path(path) {
             path.parent().unwrap_or(Path::new("."))
         } else {
             path
         }
+    }
+}
+
+/// Returns `true` if `path` points to a file rather than a directory.
+///
+/// If the path exists on disk, the filesystem metadata is authoritative.
+/// If the path does not exist locally or is not accessible (e.g. in-memory test fixtures
+/// via `SpicepodString`, or insufficient permissions), we fall back to checking whether
+/// the path has a file extension.
+fn is_file_path(path: &Path) -> bool {
+    match path.metadata() {
+        Ok(md) => md.is_file(),
+        Err(_) => path.extension().is_some(),
     }
 }
 
@@ -404,6 +472,7 @@ fn from_definition(
     tools: Vec<Tool>,
     models: Vec<Model>,
     workers: Vec<Worker>,
+    functions: Vec<Function>,
 ) -> Spicepod {
     Spicepod {
         name: spicepod_definition.name,
@@ -418,6 +487,7 @@ fn from_definition(
         rerankers,
         tools,
         workers,
+        functions,
         dependencies: spicepod_definition.dependencies,
         runtime: spicepod_definition.runtime,
         management: spicepod_definition.management,
@@ -447,6 +517,68 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_spicepod_with_functions_loads() {
+        let pod = Spicepod::load_exact(&PathBuf::from("./tests/spicepod_with_functions.yaml"))
+            .await
+            .expect("Should load spicepod with functions");
+        assert_eq!(pod.functions.len(), 6);
+        let names: Vec<&str> = pod.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "double_it",
+                "haversine_km",
+                "shout",
+                "classify_intent",
+                "internal_hash",
+                "duplicate_rows"
+            ]
+        );
+
+        let double_it = &pod.functions[0];
+        assert_eq!(double_it.from, "sql");
+        assert_eq!(double_it.signature.args.len(), 1);
+        assert_eq!(double_it.signature.args[0].name, "x");
+        assert_eq!(double_it.signature.args[0].arrow_type, "int64");
+        assert_eq!(double_it.signature.scalar_return_type(), Some("int64"));
+        assert_eq!(double_it.body.as_deref(), Some("x * 2"));
+        // Defaults to being exposed as a tool.
+        assert!(double_it.as_tool);
+
+        let classify = &pod.functions[3];
+        assert_eq!(classify.from, "http://classifier.internal/v1/classify");
+        assert!(classify.body.is_none());
+        assert_eq!(classify.params.len(), 2);
+
+        let internal = &pod.functions[4];
+        assert_eq!(internal.name, "internal_hash");
+        assert!(!internal.as_tool, "internal_hash should be SQL-only");
+
+        let duplicate_rows = &pod.functions[5];
+        assert_eq!(duplicate_rows.name, "duplicate_rows");
+        assert_eq!(
+            duplicate_rows.kind,
+            component::function::FunctionKind::Table
+        );
+        let columns = duplicate_rows
+            .signature
+            .table_return_columns()
+            .expect("table return columns");
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "value");
+        assert_eq!(columns[1].arrow_type, "int64");
+
+        // Tool with as_sql: true is visible on the resolved Spicepod.
+        assert_eq!(pod.tools.len(), 1);
+        let geocode = &pod.tools[0];
+        assert_eq!(geocode.name, "geocode");
+        assert!(geocode.as_sql);
+        let sig = geocode.signature.as_ref().expect("signature");
+        assert_eq!(sig.args.len(), 1);
+        assert_eq!(sig.args[0].arrow_type, "utf8");
+    }
+
     /// Verify that both v1 and v2 spicepod schemas are parsed correctly.
     #[tokio::test]
     async fn test_v1_and_v2_versions() {
@@ -472,7 +604,7 @@ mod tests {
 /// - v1 uses top-level `runtime.memory_limit`/`runtime.temp_directory`,
 ///   v2 uses `runtime.query.memory_limit`/`runtime.query.temp_directory`
 /// - v2 adds `runtime.ready_state`, `runtime.flight.do_put_rate_limit_enabled`,
-///   `runtime.scheduler.partition_management`
+///   `runtime.scheduler` partition assignment fields
 /// - v2 adds `read_write_create` access mode
 /// - v2 adds `stale_while_revalidate_ttl` and `encoding` to `SQLResultsCacheConfig`
 #[cfg(test)]
@@ -529,16 +661,139 @@ mod version_tests {
         assert_eq!(def.name, "test_pod");
     }
 
-    /// Unknown version strings produce a deserialization error.
+    /// Malformed version strings produce a deserialization error.
     #[test]
     fn test_invalid_version_rejected() {
         let yaml = r"
-            version: v3
+            version: not-a-version
             kind: Spicepod
             name: invalid
         ";
         let result: Result<SpicepodDefinition, _> = yaml::from_str(yaml);
-        assert!(result.is_err(), "Unknown version 'v3' should be rejected");
+        assert!(
+            result.is_err(),
+            "Malformed version 'not-a-version' should be rejected"
+        );
+    }
+
+    /// Partial and full version strings are accepted for supported majors (v1, v2).
+    #[test]
+    fn test_free_form_versions_accepted() {
+        let cases = [
+            "v1",
+            "v2",
+            "v1.0",
+            "v2.0",
+            "v1.0.0",
+            "v2.0.0",
+            "v2.0.0-rc.1",
+            "v1.10.20-beta-2",
+        ];
+        for case in cases {
+            let parsed: SpicepodVersion =
+                yaml::from_str(case).unwrap_or_else(|e| panic!("Should parse '{case}': {e}"));
+            assert_eq!(
+                parsed.to_string(),
+                case,
+                "Parsed version should round-trip to the same string"
+            );
+        }
+    }
+
+    /// Unsupported major versions (anything other than v1 or v2) are rejected
+    /// with an "unsupported spicepod version" error that names the major.
+    #[test]
+    fn test_unsupported_major_rejected() {
+        let cases = ["v0", "v3", "v3.0.0", "v100", "v4.5.6-rc.1"];
+        for case in cases {
+            let result: Result<SpicepodVersion, _> = yaml::from_str(case);
+            let err =
+                result.expect_err(&format!("'{case}' should be rejected as unsupported major"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("unsupported spicepod version") && msg.contains(case),
+                "Error for '{case}' should mention unsupported version, got: {msg}"
+            );
+        }
+    }
+
+    /// Malformed version strings produce errors with a friendly message.
+    #[test]
+    fn test_malformed_version_error_message() {
+        let cases = [
+            "v1beta1",
+            "1.0.0",
+            "vfoo",
+            "v",
+            "v1.",
+            "v1.0.0-",
+            "v1-rc.1",
+            "v1.0-rc.1",
+            "v1.0.0.0",
+            "v01",
+            "v2.01",
+            "v2.0.01",
+            "v02.0.0",
+        ];
+        for case in cases {
+            let result: Result<SpicepodVersion, _> = yaml::from_str(case);
+            let err = result.expect_err(&format!("'{case}' should be rejected"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("invalid spicepod version") && msg.contains(case),
+                "Error for '{case}' should be user-friendly, got: {msg}"
+            );
+        }
+    }
+
+    /// Partial and full version strings are structurally distinct.
+    #[test]
+    fn test_partial_versions_are_distinct() {
+        let v2: SpicepodVersion = yaml::from_str("v2").expect("v2");
+        let v2_0: SpicepodVersion = yaml::from_str("v2.0").expect("v2.0");
+        let v2_0_0: SpicepodVersion = yaml::from_str("v2.0.0").expect("v2.0.0");
+        assert_ne!(v2, v2_0);
+        assert_ne!(v2_0, v2_0_0);
+        assert_eq!(v2, SpicepodVersion::V2);
+    }
+
+    /// A full version string with pre-release roundtrips through YAML.
+    #[test]
+    fn test_prerelease_version_roundtrip() {
+        let original: SpicepodVersion = yaml::from_str("v2.0.0-rc.1").expect("Should parse");
+        let yaml_str = yaml::to_string(&original).expect("Should serialize");
+        let roundtripped: SpicepodVersion = yaml::from_str(&yaml_str).expect("Should deserialize");
+        assert_eq!(original, roundtripped);
+        assert_eq!(original.to_string(), "v2.0.0-rc.1");
+    }
+
+    /// End-to-end: a full `vMAJOR.MINOR.PATCH-PRERELEASE` tag in a complete
+    /// `SpicepodDefinition` YAML deserializes and round-trips through serialization.
+    #[test]
+    fn test_full_version_tag_in_spicepod_definition() {
+        let yaml = r"
+            version: v2.0.0-rc.1
+            kind: Spicepod
+            name: prerelease_pod
+        ";
+        let def: SpicepodDefinition =
+            yaml::from_str(yaml).expect("Should parse SpicepodDefinition with v2.0.0-rc.1");
+        assert_eq!(def.version.to_string(), "v2.0.0-rc.1");
+        assert_eq!(def.version.major(), 2);
+        assert_eq!(def.version.minor(), Some(0));
+        assert_eq!(def.version.patch(), Some(0));
+        assert_eq!(def.version.pre_release(), Some("rc.1"));
+        assert_eq!(def.name, "prerelease_pod");
+
+        // Round-trip through serialize → deserialize preserves the version tag exactly.
+        let serialized = yaml::to_string(&def).expect("Should serialize");
+        assert!(
+            serialized.contains("version: v2.0.0-rc.1"),
+            "Serialized YAML should preserve full version tag, got:\n{serialized}"
+        );
+        let reparsed: SpicepodDefinition =
+            yaml::from_str(&serialized).expect("Should re-parse round-tripped YAML");
+        assert_eq!(reparsed.version, def.version);
     }
 
     // ========================================================================
@@ -820,9 +1075,9 @@ mod version_tests {
         assert_eq!(sql_results.encoding, Encoding::Zstd);
     }
 
-    /// v2 scheduler with `partition_management`.
+    /// v2 scheduler with partition assignment fields.
     #[tokio::test]
-    async fn test_v2_scheduler_with_partition_management() {
+    async fn test_v2_scheduler_with_partition_assignment() {
         let pod = Spicepod::load_exact(&PathBuf::from("./tests/v2_with_scheduler.yaml"))
             .await
             .expect("Should load v2 scheduler spicepod");
@@ -834,15 +1089,10 @@ mod version_tests {
             .as_ref()
             .expect("scheduler should be present");
         assert_eq!(scheduler.state_location, "s3://my-bucket/scheduler-state");
-
-        let pm = scheduler
-            .partition_management
-            .as_ref()
-            .expect("partition_management should be present");
-        assert_eq!(pm.interval, "15s");
-        assert_eq!(pm.max_assignments_per_cycle, 50);
-        assert_eq!(pm.max_partitions_per_executor, 500);
-        assert_eq!(pm.discovery_timeout, "120s");
+        assert_eq!(scheduler.partition_assignment_interval, "15s");
+        assert_eq!(scheduler.max_partition_assignments_per_interval, 50);
+        assert_eq!(scheduler.max_partitions_per_executor, 500);
+        assert_eq!(scheduler.partition_discovery_timeout, "120s");
     }
 
     // ========================================================================
@@ -887,14 +1137,44 @@ mod version_tests {
         assert!(!flight.do_put_rate_limit_enabled);
     }
 
-    /// `partition_management` defaults.
+    /// Scheduler defaults for partition assignment fields.
     #[test]
-    fn test_partition_management_defaults() {
-        let pm = component::runtime::PartitionManagement::default();
-        assert_eq!(pm.interval, "30s");
-        assert_eq!(pm.max_assignments_per_cycle, 100);
-        assert_eq!(pm.max_partitions_per_executor, 1000);
-        assert_eq!(pm.discovery_timeout, "60s");
+    fn test_partition_assignment_defaults() {
+        let yaml = r"
+            state_location: s3://bucket/state
+        ";
+        let scheduler: component::runtime::Scheduler =
+            yaml::from_str(yaml).expect("Should parse Scheduler");
+        assert_eq!(scheduler.partition_assignment_interval, "30s");
+        assert_eq!(scheduler.max_partition_assignments_per_interval, 100);
+        assert_eq!(scheduler.max_partitions_per_executor, 1000);
+        assert_eq!(scheduler.partition_discovery_timeout, "60s");
+    }
+
+    #[test]
+    fn test_runtime_source_rate_control_deserializes() {
+        let yaml = r"
+            source_rate_control:
+              state_location: file:///tmp/spice-source-rate-control
+              refresh_interval: 15s
+              github_concurrent_connections_limit: 5
+              params:
+                allow_http: true
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
+        let source_rate_control = runtime
+            .source_rate_control
+            .expect("source_rate_control section should exist");
+        assert_eq!(
+            source_rate_control.state_location.as_deref(),
+            Some("file:///tmp/spice-source-rate-control")
+        );
+        assert_eq!(source_rate_control.refresh_interval, "15s");
+        assert_eq!(
+            source_rate_control.github_concurrent_connections_limit,
+            Some(5)
+        );
+        assert!(source_rate_control.params.is_some());
     }
 
     /// `read_write_create` access mode deserializes.
@@ -1046,6 +1326,109 @@ mod version_tests {
                 .unwrap_or_else(|e| panic!("Failed to load v1 fixture {file}: {e}"));
             assert_eq!(pod.version, SpicepodVersion::V1, "Expected V1 for {file}");
         }
+    }
+
+    /// `load_from` accepts any YAML file path, not just files named "spicepod".
+    #[tokio::test]
+    async fn test_load_from_accepts_arbitrary_filename() {
+        let pod = Spicepod::load_from(&reader::StdFileSystem, "./tests/basic_spicepod.yaml")
+            .await
+            .expect("load_from should accept a file path with a non-spicepod stem");
+        assert_eq!(pod.name, "basic_spicepod");
+    }
+
+    /// `load_from` with a directory still finds spicepod.yaml inside it.
+    #[tokio::test]
+    async fn test_load_from_directory_finds_spicepod_yaml() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let spicepod_content = "version: v1\nkind: Spicepod\nname: test_pod\n";
+        std::fs::write(dir.path().join("spicepod.yaml"), spicepod_content)
+            .expect("write spicepod.yaml");
+
+        let pod = Spicepod::load_from(&reader::StdFileSystem, dir.path())
+            .await
+            .expect("load_from should find spicepod.yaml in a directory");
+        assert_eq!(pod.name, "test_pod");
+    }
+
+    /// A directory with dots/dashes in its name (e.g. `my.app-sample`)
+    #[tokio::test]
+    async fn test_load_from_directory_with_dots_in_name() {
+        let parent = tempfile::tempdir().expect("create temp dir");
+        let dir = parent.path().join("my.app-sample");
+        std::fs::create_dir(&dir).expect("create dotted dir");
+        let spicepod_content = "version: v1\nkind: Spicepod\nname: dotted_dir_pod\n";
+        std::fs::write(dir.join("spicepod.yaml"), spicepod_content).expect("write spicepod.yaml");
+
+        let pod = Spicepod::load_from(&reader::StdFileSystem, &dir)
+            .await
+            .expect("load_from should treat a dotted directory as a directory, not a file");
+        assert_eq!(pod.name, "dotted_dir_pod");
+    }
+
+    /// `base_path` must return the directory itself when given a directory with dots in its name.
+    #[test]
+    fn test_base_path_directory_with_dots() {
+        let parent = tempfile::tempdir().expect("create temp dir");
+        let dir = parent.path().join("my.app-sample");
+        std::fs::create_dir(&dir).expect("create dotted dir");
+
+        assert_eq!(Spicepod::base_path(&dir), dir);
+    }
+
+    /// `base_path` returns the parent for an actual spicepod file
+    #[test]
+    fn test_base_path_file_returns_parent() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let file = dir.path().join("my-pod.yaml");
+        std::fs::write(&file, "").expect("write file");
+
+        assert_eq!(Spicepod::base_path(&file), dir.path());
+    }
+
+    /// `is_file_path` falls back to extension heuristic for a path that doesn't exist on disk.
+    #[test]
+    fn test_is_file_path_nonexistent_directory() {
+        let path = Path::new("/tmp/nonexistent_dir_abc123");
+        assert!(!is_file_path(path));
+
+        let path_with_ext = Path::new("/tmp/nonexistent_abc123.yaml");
+        assert!(is_file_path(path_with_ext));
+
+        let dotted_dir = Path::new("/tmp/nonexistent.app-sample");
+        assert!(is_file_path(dotted_dir));
+    }
+
+    /// A file with a wrong `kind` (e.g. a Kubernetes YAML) is rejected with a clear error.
+    #[tokio::test]
+    async fn test_load_from_rejects_wrong_kind() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("deployment.yaml");
+        std::fs::write(&path, "kind: Deployment\nname: my-app\nversion: v1\n").expect("write file");
+
+        let err = Spicepod::load_from(&reader::StdFileSystem, &path)
+            .await
+            .expect_err("should reject wrong kind");
+        assert!(
+            err.to_string().contains("kind: Deployment"),
+            "error should mention the wrong kind: {err}"
+        );
+    }
+
+    /// A file with an unrecognised version is rejected with a clear error.
+    #[tokio::test]
+    async fn test_load_from_rejects_unknown_version() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("spicepod.yaml");
+        std::fs::write(&path, "kind: Spicepod\nname: my-app\nversion: v99\n").expect("write file");
+
+        let err = Spicepod::load_from(&reader::StdFileSystem, &path)
+            .await
+            .expect_err("should reject unknown version");
+        assert!(
+            err.to_string().contains("v99"),
+            "error should mention the unsupported version: {err}"
+        );
     }
 
     /// All v2-versioned test spicepods load successfully.
@@ -1275,18 +1658,18 @@ mod version_tests {
         );
     }
 
-    /// v1 `Scheduler` works without `partition_management` (v2-only field).
+    /// v1 `Scheduler` works with only `state_location` (partition assignment fields default).
     #[test]
-    fn test_v1_scheduler_without_partition_management() {
+    fn test_v1_scheduler_without_partition_assignment() {
         let yaml = r"
             state_location: s3://bucket/state
         ";
         let scheduler: component::runtime::Scheduler =
             yaml::from_str(yaml).expect("Should parse Scheduler");
         assert_eq!(scheduler.state_location, "s3://bucket/state");
-        assert!(
-            scheduler.partition_management.is_none(),
-            "v1 scheduler should have no partition_management"
+        assert_eq!(
+            scheduler.max_partitions_per_executor, 1000,
+            "partition assignment fields should default when not specified"
         );
     }
 

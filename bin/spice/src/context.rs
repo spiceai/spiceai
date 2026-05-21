@@ -21,6 +21,7 @@ use crate::error::{
     RuntimeNotInstalledSnafu, RuntimeVersionSnafu, WindowsNativeRuntimeUnsupportedSnafu,
 };
 use snafu::ResultExt;
+use spice_cloud_client::endpoints::data_endpoint as spice_cloud_data_endpoint;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -107,8 +108,8 @@ impl RuntimeContext {
 
     /// Create a runtime context from CLI arguments.
     ///
-    /// `cloud` is `None` when `--cloud` is not passed, or `Some("region")` with the
-    /// cloud region name.
+    /// `cloud` is `None` when cloud mode is not enabled, or `Some("region")` with
+    /// the Cloud runtime endpoint region.
     pub fn with_args(
         http_endpoint: Option<String>,
         api_key: Option<String>,
@@ -122,7 +123,7 @@ impl RuntimeContext {
         }
 
         if let Some(region) = cloud {
-            ctx.http_endpoint = format!("https://{region}-prod-aws-data.spiceai.io");
+            ctx.http_endpoint = spice_cloud_data_endpoint(region);
             ctx.cloud_region = Some(region.to_string());
         }
 

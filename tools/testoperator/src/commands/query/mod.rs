@@ -49,7 +49,12 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         .clone()
         .map(test_framework::queries::QueryOverrides::from);
     let queries = query_set
-        .get_queries(query_overrides, Some(&spiced_instance), None)
+        .get_queries(
+            query_overrides,
+            Some(&spiced_instance),
+            None,
+            args.scale_factor,
+        )
         .await?;
 
     let mut test = NotStarted::new()

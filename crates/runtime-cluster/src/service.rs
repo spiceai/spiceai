@@ -48,7 +48,7 @@ use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 use crate::context::PartitionOperations;
 use crate::executor_registry::{self, ExecutorRegistry};
-use crate::scheduler_task_config::PartitionManagementConfig;
+use crate::scheduler_task_config::PartitionAssignmentConfig;
 use crate::{PartitionMetadata, PartitionStore, PartitionValue, partition_value_to_bytes, store};
 
 #[derive(Debug, Snafu)]
@@ -208,23 +208,18 @@ impl PartitionService {
     }
 
     fn config_from_app(app: &App) -> AssignmentConfig {
-        let Some(pm) = app
-            .runtime
-            .scheduler
-            .as_ref()
-            .and_then(|s| s.partition_management.clone())
-        else {
+        let Some(scheduler) = app.runtime.scheduler.clone() else {
             return AssignmentConfig::default();
         };
-        match PartitionManagementConfig::try_from(pm) {
-            Ok(pm_config) => AssignmentConfig {
-                max_assignments_per_cycle: pm_config.max_assignments_per_cycle,
-                max_partitions_per_executor: pm_config.max_partitions_per_executor,
-                discovery_timeout: pm_config.discovery_timeout,
+        match PartitionAssignmentConfig::try_from(scheduler) {
+            Ok(pa_config) => AssignmentConfig {
+                max_assignments_per_cycle: pa_config.max_assignments_per_interval,
+                max_partitions_per_executor: pa_config.max_partitions_per_executor,
+                discovery_timeout: pa_config.discovery_timeout,
             },
             Err(e) => {
                 tracing::warn!(
-                    "Invalid runtime.scheduler.partition_management config; using defaults: {e}"
+                    "Invalid runtime.scheduler partition assignment config; using defaults: {e}"
                 );
                 AssignmentConfig::default()
             }
@@ -460,12 +455,12 @@ impl PartitionService {
                 }
             };
 
-        let existing: HashSet<Vec<(String, String)>> = existing_partitions
+        let existing: HashSet<Vec<(String, Option<String>)>> = existing_partitions
             .iter()
             .map(|p| sorted_kv(&p.partition_value))
             .collect();
 
-        let source_set: HashSet<Vec<(String, String)>> =
+        let source_set: HashSet<Vec<(String, Option<String>)>> =
             source_partitions.iter().map(sorted_kv).collect();
 
         let new: Vec<PartitionValue> = source_partitions
@@ -590,7 +585,7 @@ fn resolved_equality(a: &TableReference, b: &TableReference) -> bool {
 }
 
 /// Sort a `PartitionValue` into a deterministic `Vec<(k, v)>` for equality comparisons.
-fn sorted_kv(p: &PartitionValue) -> Vec<(String, String)> {
+fn sorted_kv(p: &PartitionValue) -> Vec<(String, Option<String>)> {
     let mut v: Vec<_> = p.clone().into_iter().collect();
     v.sort();
     v
@@ -777,6 +772,9 @@ async fn notify_executor_to_unload(
                                 items: partitions_bytes,
                             },
                         )]),
+                        // Empty == no ack requested. This call site is the
+                        // unload path; switch to ack-based in a follow-up.
+                        request_id: String::new(),
                     },
                 )),
             },
@@ -1108,6 +1106,18 @@ async fn notify_executors(
     Ok(())
 }
 
+/// How long the scheduler waits for an executor to ack a single
+/// `UpdatePartitions` message before considering the attempt failed.
+const NOTIFY_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound on the per-attempt backoff between notify retries.
+const NOTIFY_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// Maximum number of retry attempts for a single executor notification.
+/// After exhaustion the assignment stays committed in the partition store;
+/// the next reconcile cycle will re-attempt notification.
+const NOTIFY_MAX_RETRIES: usize = 8;
+
 async fn notify_executor_of_assignments(
     registry: &ExecutorRegistry,
     ops: &dyn PartitionOperations,
@@ -1131,26 +1141,77 @@ async fn notify_executor_of_assignments(
             partitions_bytes.push(bytes.to_vec());
         }
 
-        let command = SchedulerControlMessage {
-            message: Some(SchedulerControlMessageEnum::UpdatePartitions(
-                UpdatePartitions {
-                    new_partitions: HashMap::from([(
-                        table.to_string(),
-                        BytesArray {
-                            items: partitions_bytes,
-                        },
-                    )]),
-                    removed_partitions: HashMap::new(),
-                },
-            )),
-        };
+        let mut backoff = FibonacciBackoffBuilder::new()
+            .max_duration(Some(NOTIFY_BACKOFF_MAX))
+            .max_retries(Some(NOTIFY_MAX_RETRIES))
+            .build();
+        let table_str = table.to_string();
 
-        registry
-            .send_command(executor_id, command)
-            .await
-            .context(SendCommandSnafu {
-                executor_id: executor_id.to_string(),
-            })?;
+        // Wrap the payload in an Arc so each attempt's closure-build clones a
+        // cheap Arc handle instead of the full Vec<Vec<u8>>. We still
+        // materialize an owned Vec inside the closure body when constructing
+        // the proto message — that deep copy is unavoidable because
+        // BytesArray/UpdatePartitions own their data over the wire — but the
+        // Arc keeps it limited to one materialization per actual send rather
+        // than two per loop iteration.
+        let payload = Arc::new(BytesArray {
+            items: partitions_bytes,
+        });
+        let table_str = Arc::new(table_str);
+
+        loop {
+            let payload = Arc::clone(&payload);
+            let table_str = Arc::clone(&table_str);
+            let send_result = registry
+                .send_command_with_ack(
+                    executor_id,
+                    move |request_id| SchedulerControlMessage {
+                        message: Some(SchedulerControlMessageEnum::UpdatePartitions(
+                            UpdatePartitions {
+                                new_partitions: HashMap::from([(
+                                    (*table_str).clone(),
+                                    (*payload).clone(),
+                                )]),
+                                removed_partitions: HashMap::new(),
+                                request_id,
+                            },
+                        )),
+                    },
+                    NOTIFY_ACK_TIMEOUT,
+                )
+                .await;
+
+            match send_result {
+                Ok(()) => break,
+                Err(err) if err.is_retryable() => {
+                    let Some(delay) = backoff.next_duration() else {
+                        tracing::warn!(
+                            executor = %executor_id,
+                            table = %table,
+                            error = %err,
+                            "Exhausted retries notifying executor of partition assignments; \
+                             assignment remains committed and will retry on next reconcile cycle"
+                        );
+                        return Err(err).context(SendCommandSnafu {
+                            executor_id: executor_id.to_string(),
+                        });
+                    };
+                    tracing::debug!(
+                        executor = %executor_id,
+                        table = %table,
+                        delay_ms = delay.as_millis(),
+                        error = %err,
+                        "Executor ack failed for partition update; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(err) => {
+                    return Err(err).context(SendCommandSnafu {
+                        executor_id: executor_id.to_string(),
+                    });
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1181,7 +1242,7 @@ mod tests {
     }
 
     fn pv(key: &str, val: &str) -> PartitionValue {
-        HashMap::from([(key.to_string(), val.to_string())])
+        HashMap::from([(key.to_string(), Some(val.to_string()))])
     }
 
     async fn setup_table(store: &PartitionStore, table: &str, partitions: Vec<PartitionMetadata>) {

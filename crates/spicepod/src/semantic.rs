@@ -22,7 +22,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::Error};
 use serde_json::Value;
 
-use crate::component::embeddings::{EmbeddingAggregation, EmbeddingChunkConfig};
+use crate::{
+    component::embeddings::{EmbeddingAggregation, EmbeddingChunkConfig},
+    param::Params,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -32,6 +35,20 @@ pub struct Column {
     /// Optional semantic details about the column
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+
+    /// Optional column data type. Accepts Postgres-style names (e.g.
+    /// `bigint`, `timestamptz`, `text[]`, `numeric(18,4)`) and Arrow display
+    /// forms (e.g. `Int64`, `Utf8`, `Map<Utf8, Int64>`).
+    ///
+    /// Stored as a raw string at the spicepod layer; parsed into an Arrow
+    /// `DataType` by the runtime via `parse_declared_type`.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "data_type")]
+    pub r#type: Option<String>,
+
+    /// Optional nullability for the column. When omitted, the runtime
+    /// defaults to nullable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nullable: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub embeddings: Vec<ColumnLevelEmbeddingConfig>,
@@ -49,6 +66,8 @@ impl Column {
         Self {
             name: name.to_string(),
             description: None,
+            r#type: None,
+            nullable: None,
             embeddings: Vec::new(),
             full_text_search: None,
             metadata: HashMap::new(),
@@ -58,6 +77,18 @@ impl Column {
     #[must_use]
     pub fn with_metadata(mut self, metadata: HashMap<String, Value>) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    #[must_use]
+    pub fn with_type(mut self, ty: impl Into<String>) -> Self {
+        self.r#type = Some(ty.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_nullable(mut self, nullable: bool) -> Self {
+        self.nullable = Some(nullable);
         self
     }
 
@@ -134,6 +165,14 @@ pub struct ColumnLevelEmbeddingConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_size: Option<usize>,
 
+    /// Optional search engine override for this embedding column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+
+    /// Optional engine parameters for this embedding column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
+
     /// Aggregation strategy for multi-vector embeddings. Only meaningful
     /// when the underlying column is list-typed. Defaults to `max`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -153,6 +192,8 @@ impl ColumnLevelEmbeddingConfig {
             chunking: None,
             row_ids: None,
             vector_size: None,
+            engine: None,
+            params: None,
             aggregation: None,
             max_elements_per_row: None,
         }
@@ -243,6 +284,14 @@ pub struct FullTextSearchConfig {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_directory: Option<String>,
+
+    /// Optional text search engine override for this column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+
+    /// Optional engine parameters for this text search column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -271,6 +320,8 @@ impl FullTextSearchConfig {
             row_ids: None,
             index_store: Some(IndexStore::default()),
             index_directory: None,
+            engine: None,
+            params: None,
         }
     }
 
@@ -281,6 +332,8 @@ impl FullTextSearchConfig {
             row_ids: None,
             index_store: Some(IndexStore::default()),
             index_directory: None,
+            engine: None,
+            params: None,
         }
     }
 

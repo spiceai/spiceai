@@ -63,6 +63,7 @@ pub enum Workflow {
     StreamingBench,
     StreamingCorrectness,
     Schema,
+    Htap,
 }
 
 impl From<Workflow> for TestType {
@@ -77,6 +78,7 @@ impl From<Workflow> for TestType {
             Workflow::StreamingBench => TestType::Streaming,
             Workflow::StreamingCorrectness => TestType::StreamingCorrectness,
             Workflow::Schema => TestType::Schema,
+            Workflow::Htap => TestType::Htap,
         }
     }
 }
@@ -109,6 +111,8 @@ pub struct DispatchTests {
     pub streaming_correctness: Vec<StreamingCorrectnessDispatchArgs>,
     #[serde(deserialize_with = "deserialize_single_or_vec", default)]
     pub schema: Vec<SchemaArgs>,
+    #[serde(deserialize_with = "deserialize_single_or_vec", default)]
+    pub htap: Vec<HtapDispatchArgs>,
 }
 
 /// Benchmark and throughput workflow arguments, defined in the test files
@@ -224,6 +228,8 @@ pub struct AppendArgs {
     pub query_overrides: Option<QueryOverridesArg>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load_interval: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -413,6 +419,27 @@ pub struct StreamingCorrectnessDispatchArgs {
     pub mutation_seed: Option<u64>,
 }
 
+/// HTAP workflow arguments.
+///
+/// Mirrors the inputs of `testoperator_run_htap.yml`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HtapDispatchArgs {
+    pub spicepod_path: PathBuf,
+    pub runner_type: RunnerType,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_scale_factor"
+    )]
+    pub scale_factor: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_wait: Option<u64>,
+    /// Override the number of OLTP terminals (default: `scale_factor` * 10).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminals: Option<usize>,
+}
+
 fn default_queryset() -> String {
     "tpch".to_string()
 }
@@ -438,19 +465,26 @@ mod tests {
     fn test_single_section_deserialization() {
         let yaml = "
 tests:
-  bench:
-    spicepod_path: s3[parquet]-turso[file].yaml
-    query_set: tpch
-    ready_wait: 300
-    runner_type: spiceai-dev-runners
-  load:
-    spicepod_path: s3[parquet]-turso[file].yaml
-    query_set: tpch
-    ready_wait: 300
-    runner_type: spiceai-dev-runners
-    concurrency: 128
-    duration: 1800
-    random_param_set_count: 1000
+    bench:
+        spicepod_path: s3[parquet]-turso[file].yaml
+        query_set: tpch
+        ready_wait: 300
+        runner_type: spiceai-dev-runners
+    load:
+        spicepod_path: s3[parquet]-turso[file].yaml
+        query_set: tpch
+        ready_wait: 300
+        runner_type: spiceai-dev-runners
+        concurrency: 128
+        duration: 1800
+        random_param_set_count: 1000
+    append:
+        spicepod_path: file[parquet]-cayenne[file]-append.yaml
+        query_set: tpch
+        duration: 720
+        concurrency: 4
+        load_interval: 30
+        load_steps: 20
 ";
 
         let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
@@ -478,6 +512,18 @@ tests:
         assert_eq!(test_file.tests.load[0].concurrency, Some(128));
         assert_eq!(test_file.tests.load[0].duration, Some(1800));
         assert_eq!(test_file.tests.load[0].random_param_set_count, Some(1000));
+
+        // Verify append section (single item becomes vec with one element)
+        assert_eq!(test_file.tests.append.len(), 1);
+        assert_eq!(
+            test_file.tests.append[0].spicepod_path.to_string_lossy(),
+            "file[parquet]-cayenne[file]-append.yaml"
+        );
+        assert_eq!(test_file.tests.append[0].query_set, QuerySet::Tpch);
+        assert_eq!(test_file.tests.append[0].duration, Some(720));
+        assert_eq!(test_file.tests.append[0].concurrency, Some(4));
+        assert_eq!(test_file.tests.append[0].load_interval, Some(30));
+        assert_eq!(test_file.tests.append[0].load_steps, Some(20));
 
         // Verify empty sections default to empty vectors
         assert_eq!(test_file.tests.throughput.len(), 0);
@@ -575,5 +621,67 @@ tests: {}
         assert_eq!(test_file.tests.bench.len(), 0);
         assert_eq!(test_file.tests.throughput.len(), 0);
         assert_eq!(test_file.tests.load.len(), 0);
+        assert_eq!(test_file.tests.htap.len(), 0);
+    }
+
+    #[test]
+    fn test_htap_section_deserialization() {
+        let yaml = "
+tests:
+  htap:
+    spicepod_path: accelerated/postgres-cayenne[file].yaml
+    runner_type: spiceai-dev-runners
+    scale_factor: 1
+    terminals: 100
+    duration: 300
+    ready_wait: 60
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert_eq!(test_file.tests.htap.len(), 1);
+        assert_eq!(
+            test_file.tests.htap[0].spicepod_path.to_string_lossy(),
+            "accelerated/postgres-cayenne[file].yaml"
+        );
+        assert!(matches!(
+            test_file.tests.htap[0].runner_type,
+            RunnerType::Dev
+        ));
+        assert_eq!(test_file.tests.htap[0].scale_factor, Some(1.0));
+        assert_eq!(test_file.tests.htap[0].terminals, Some(100));
+        assert_eq!(test_file.tests.htap[0].duration, Some(300));
+        assert_eq!(test_file.tests.htap[0].ready_wait, Some(60));
+
+        // Verify scale_factor serializes as integer 1 (not 1.0) for GitHub workflow inputs
+        let serialized =
+            serde_json::to_value(&test_file.tests.htap[0]).expect("Failed to serialize");
+        assert_eq!(serialized["scale_factor"], 1);
+        assert_eq!(serialized["terminals"], 100);
+    }
+
+    #[test]
+    fn test_htap_section_deserialization_without_terminals() {
+        let yaml = "
+tests:
+  htap:
+    spicepod_path: accelerated/postgres-arrow.yaml
+    runner_type: spiceai-dev-runners
+    scale_factor: 10
+    duration: 600
+    ready_wait: 120
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert_eq!(test_file.tests.htap[0].terminals, None);
+
+        // Verify terminals is omitted from serialized output when None
+        let serialized =
+            serde_json::to_value(&test_file.tests.htap[0]).expect("Failed to serialize");
+        assert!(
+            serialized.get("terminals").is_none(),
+            "terminals should be omitted when None"
+        );
     }
 }

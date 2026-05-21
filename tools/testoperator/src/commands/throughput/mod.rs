@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::get_app_and_start_request;
-use crate::{args::DatasetTestArgs, health::HealthMonitor, wait_test_and_memory};
+use super::{get_app_and_start_request, load_app};
+use crate::{args::DatasetTestArgs, health::HealthMonitor};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
+    app::App,
     arrow::util::pretty::print_batches,
     metrics::{MetricCollector, QueryMetrics, ThroughputMetrics},
     spiced::SpicedInstance,
@@ -37,9 +38,32 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         ));
     }
 
-    let (app, start_request) = get_app_and_start_request(&args.common).await?;
-    let mut spiced_instance = SpicedInstance::start(start_request).await?;
+    let (app, spiced_instance, system_adapter_session) = if args.common.is_system_adapter() {
+        let app = load_app(&args.common).await?;
+        let (instance, session) = crate::system_adapter::acquire(&args.common).await?;
+        (app, instance, Some(session))
+    } else {
+        let (app, start_request) = get_app_and_start_request(&args.common).await?;
+        let instance = SpicedInstance::start(start_request).await?;
+        (app, instance, None)
+    };
 
+    // Mirror bench's finally-block pattern so adapter teardown runs even if
+    // the inner flow bails on an error.
+    let result = run_inner(args, app, spiced_instance).await;
+
+    if let Some(session) = system_adapter_session {
+        session.teardown().await;
+    }
+
+    result
+}
+
+async fn run_inner(
+    args: &DatasetTestArgs,
+    app: App,
+    mut spiced_instance: SpicedInstance,
+) -> anyhow::Result<()> {
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
@@ -68,7 +92,12 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let test = baseline_test.wait().await?;
     let spiced_instance = test.end()?;
     let memory_token = CancellationToken::new();
-    let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
+    // Process-memory watching only applies to the local-spawn path. See
+    // bench/mod.rs for context.
+    let memory_readings = spiced_instance
+        .process()
+        .ok()
+        .map(|process| process.watch_memory(&memory_token));
 
     // throughput test
     println!("Running throughput test");
@@ -87,19 +116,37 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         .with_progress_bars(!args.common.disable_progress_bars)
         .start()?;
 
-    let test = wait_test_and_memory!(throughput_test, memory_token, memory_readings);
+    let test = match throughput_test.wait().await {
+        Ok(test) => test,
+        Err(e) => {
+            if let Some(handle) = memory_readings {
+                let _ = observe_memory(memory_token, handle).await;
+            }
+            return Err(e);
+        }
+    };
     let throughput_metric = test.get_throughput_metric(args.scale_factor.unwrap_or(1.0))?;
     let metrics: QueryMetrics<_, ThroughputMetrics> = test
         .collect(TestType::Throughput)?
         .with_run_metric(ThroughputMetrics::new(throughput_metric));
     let mut spiced_instance = test.end()?;
-    let (max_memory, _) = observe_memory(memory_token, memory_readings).await?;
+    // Leave as `None` when the SUT isn't local — recording 0 would skew
+    // memory dashboards.
+    let memory_usage = match memory_readings {
+        Some(handle) => Some(observe_memory(memory_token, handle).await?),
+        None => None,
+    };
 
     let records = metrics.build_records()?;
     print_batches(&records)?;
-    metrics.with_memory_usage(max_memory).show_run(None)?; // no additional test pass logic applies
+    let metrics = match memory_usage {
+        Some((max_memory, _)) => metrics.with_memory_usage(max_memory),
+        None => metrics,
+    };
+    metrics.show_run(None)?; // no additional test pass logic applies
     let health_report = health_monitor.stop().await;
     spiced_instance.stop()?;
+
     let health_report = health_report?;
 
     if let Some(message) = health_report.failure_message() {

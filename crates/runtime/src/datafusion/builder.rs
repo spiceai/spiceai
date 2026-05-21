@@ -24,11 +24,30 @@ use super::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
 };
+#[cfg(not(windows))]
+use crate::accelerated_table::AcceleratedTable;
 use crate::cluster::ExecutorRegistry;
 use crate::cluster::ResolvedClusterConfig;
+#[cfg(not(windows))]
+use crate::dataaccelerator::upsert_dedup::UpsertDedupTableProvider;
 use crate::{config::ClusterRole, metrics::telemetry::track_bytes_processed, status};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
+#[cfg(not(windows))]
+use cayenne::optimizer_rules::{
+    CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneOptimizerConfig,
+};
+#[cfg(not(windows))]
+use cayenne::{
+    CayenneTableProvider,
+    logical_optimizer::{CayenneInListToRangeRewrite, CayennePropagateFilterAcrossEquiJoinKeys},
+};
+#[cfg(not(windows))]
+use data_components::poly::PolyTableProvider;
+#[cfg(not(windows))]
+use datafusion::catalog::TableProvider;
+#[cfg(not(windows))]
+use datafusion::optimizer::{Optimizer, OptimizerRule};
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
@@ -67,12 +86,17 @@ use datafusion_optimizer_rules::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
     },
     physical_plan::{
-        EmptyHashJoinExecPhysicalOptimization,
+        EmptyHashJoinExecPhysicalOptimization, HttpParamsPushdown,
         flightsql::aggregate_pushdown::FlightSQLPartialAggregatePushdown,
     },
 };
+#[cfg(not(windows))]
+use runtime_datafusion::join_accumulator::clamp_maximum_shared_inlist_memory_bytes;
 use runtime_datafusion::{
-    extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
+    extension::{
+        ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer,
+        data_source_tree_display::DataSourceTreeDisplayOptimizer,
+    },
     schema_provider::SpiceSchemaProvider,
     url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
 };
@@ -118,11 +142,14 @@ pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock
     RwLock::new(df_config)
 });
 
+const EXACT_JOIN_FILTER_MEMORY_POOL_FRACTION_DENOMINATOR: u64 = 8;
+
 pub struct DataFusionBuilder {
     config: SessionConfig,
     status: Arc<status::RuntimeStatus>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     memory_limit: Option<u64>,
+    target_partitions: Option<usize>,
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     task_history_enabled: bool,
@@ -133,6 +160,10 @@ pub struct DataFusionBuilder {
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
     url_tables_enabled: bool,
+    cayenne_sort_merge_min_rows: Option<usize>,
+    cayenne_sort_merge_memory_pool_fraction: Option<f64>,
+    cayenne_footer_cache_mb: Option<usize>,
+    cayenne_filter_propagation_enabled: bool,
     /// Arbitrary additional analyzer rules.
     additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
     executor_registry: Option<Arc<ExecutorRegistry>>,
@@ -170,6 +201,7 @@ impl DataFusionBuilder {
             status,
             accelerator_engine_registry,
             memory_limit: None,
+            target_partitions: None,
             temp_directory: None,
             accelerated_refresh_semaphore: None,
             task_history_enabled: true,
@@ -180,6 +212,10 @@ impl DataFusionBuilder {
             io_runtime,
             resource_monitor: None,
             url_tables_enabled: false,
+            cayenne_sort_merge_min_rows: None,
+            cayenne_sort_merge_memory_pool_fraction: None,
+            cayenne_footer_cache_mb: None,
+            cayenne_filter_propagation_enabled: false,
             additional_analyzer_rules: vec![],
             executor_registry: None,
             partition_service: None,
@@ -207,6 +243,12 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn memory_limit(mut self, memory_limit: Option<u64>) -> Self {
         self.memory_limit = memory_limit;
+        self
+    }
+
+    #[must_use]
+    pub fn target_partitions(mut self, target_partitions: Option<usize>) -> Self {
+        self.target_partitions = target_partitions;
         self
     }
 
@@ -269,6 +311,30 @@ impl DataFusionBuilder {
         self
     }
 
+    #[must_use]
+    pub fn cayenne_sort_merge_min_rows(mut self, min_rows: Option<usize>) -> Self {
+        self.cayenne_sort_merge_min_rows = min_rows;
+        self
+    }
+
+    #[must_use]
+    pub fn cayenne_sort_merge_memory_pool_fraction(mut self, fraction: Option<f64>) -> Self {
+        self.cayenne_sort_merge_memory_pool_fraction = fraction;
+        self
+    }
+
+    #[must_use]
+    pub fn cayenne_footer_cache_mb(mut self, footer_cache_mb: Option<usize>) -> Self {
+        self.cayenne_footer_cache_mb = footer_cache_mb;
+        self
+    }
+
+    #[must_use]
+    pub fn cayenne_filter_propagation_enabled(mut self, enabled: bool) -> Self {
+        self.cayenne_filter_propagation_enabled = enabled;
+        self
+    }
+
     /// Adds additional analyzer rules to the `DataFusion` instance.
     #[must_use]
     pub fn with_analyzer_rules(mut self, rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>) -> Self {
@@ -298,9 +364,39 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
+        let effective_memory_limit = effective_query_memory_limit(self.memory_limit);
 
         if let Some(spill_compression) = self.spill_compression {
             config = config.with_spill_compression(spill_compression);
+        }
+
+        if let Some(target_partitions) = self.target_partitions {
+            if target_partitions > 0 {
+                config = config.with_target_partitions(target_partitions);
+                tracing::info!(target_partitions, "Applied runtime.query.target_partitions");
+            } else {
+                tracing::warn!(
+                    "Ignoring runtime.query.target_partitions=0; value must be greater than 0"
+                );
+            }
+        } else {
+            tracing::info!(
+                effective = config.options().execution.target_partitions,
+                "runtime.query.target_partitions not set; using DataFusion default"
+            );
+        }
+
+        let exact_join_filter_memory_limit =
+            configure_hash_join_memory_limits(&mut config, effective_memory_limit);
+
+        #[cfg(not(windows))]
+        {
+            config = config.with_option_extension(cayenne_optimizer_config(
+                self.cayenne_sort_merge_min_rows,
+                self.cayenne_sort_merge_memory_pool_fraction,
+                effective_memory_limit,
+                exact_join_filter_memory_limit,
+            ));
         }
 
         let datafusion_ref = super::iceberg_ddl::new_shared_datafusion_ref();
@@ -316,10 +412,12 @@ impl DataFusionBuilder {
                     self.io_runtime.clone(),
                 )),
             ))
-            .with_runtime_env(runtime_env(
-                self.memory_limit,
+            .with_runtime_env(runtime_env_with_effective_memory_limit(
+                effective_memory_limit,
                 self.temp_directory.clone(),
                 self.io_runtime.clone(),
+                self.cayenne_footer_cache_mb
+                    .map(|size_mb| size_mb.saturating_mul(1024 * 1024)),
             ));
 
         #[cfg(feature = "duckdb")]
@@ -344,10 +442,32 @@ impl DataFusionBuilder {
         }
 
         state = state
-            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
-            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
-                Arc::new(Box::new(track_bytes_processed)),
-            )));
+            .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
+            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}));
+
+        #[cfg(not(windows))]
+        {
+            // Cayenne is not built on Windows, so its exact join-filter rewrite
+            // and accumulator budget are only configured for supported targets.
+            // Windows keeps DataFusion's standard hash-join dynamic filters.
+            clamp_maximum_shared_inlist_memory_bytes(exact_join_filter_memory_limit);
+            if self.cayenne_filter_propagation_enabled {
+                state = with_cayenne_logical_optimizer(state);
+            }
+            state = state
+                .with_physical_optimizer_rule(Arc::new(CayenneDynamicFilterSharing::new()))
+                .with_physical_optimizer_rule(Arc::new(CayenneAntiJoinSortMergeRewriter::new()));
+        }
+        #[cfg(windows)]
+        {
+            let _ = exact_join_filter_memory_limit;
+        }
+
+        state = state
+            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
+                Box::new(track_bytes_processed),
+            ))))
+            .with_physical_optimizer_rule(Arc::new(DataSourceTreeDisplayOptimizer::new()));
 
         if matches!(
             self.cluster_config.as_ref().and_then(|cfg| cfg.role()),
@@ -383,17 +503,6 @@ impl DataFusionBuilder {
             Ok(_) => {}
             Err(e) => {
                 panic!("Unable to register spice runtime schema: {e}");
-            }
-        }
-
-        if cfg!(feature = "models") {
-            use super::SPICE_EVAL_SCHEMA;
-            let eval_schema = SpiceSchemaProvider::new();
-            match catalog.register_schema(SPICE_EVAL_SCHEMA, Arc::new(eval_schema)) {
-                Ok(_) => {}
-                Err(e) => {
-                    panic!("Unable to register spice eval schema: {e}");
-                }
             }
         }
 
@@ -519,6 +628,7 @@ impl DataFusionBuilder {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
+            data_update_broadcaster: crate::dataupdate::DataUpdateBroadcaster::new(),
             writable_catalogs: RwLock::new(HashSet::new()),
             ddl_enabled_catalogs,
             ddl_extension_store,
@@ -527,6 +637,9 @@ impl DataFusionBuilder {
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
             deferred_catalogs: TokioRwLock::new(HashMap::new()),
+            pending_initializations: TokioRwLock::new(HashMap::new()),
+            pending_initializations_count: std::sync::atomic::AtomicUsize::new(0),
+            query_cancel_registry: Arc::new(super::query::registry::QueryCancelRegistry::new()),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
@@ -546,6 +659,99 @@ impl DataFusionBuilder {
             cayenne_ddl_handler,
         }
     }
+}
+
+#[cfg(not(windows))]
+fn with_cayenne_logical_optimizer(mut state: SessionStateBuilder) -> SessionStateBuilder {
+    let trailing_rules = state.optimizer_rules().take().unwrap_or_default();
+    let mut optimizer_rules = state
+        .optimizer()
+        .take()
+        .map_or_else(|| Optimizer::new().rules, |optimizer| optimizer.rules);
+
+    insert_cayenne_logical_optimizer_rule(&mut optimizer_rules);
+    optimizer_rules.extend(trailing_rules);
+    state.with_optimizer_rules(optimizer_rules)
+}
+
+#[cfg(not(windows))]
+fn insert_cayenne_logical_optimizer_rule(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
+    if !rules
+        .iter()
+        .any(|rule| rule.name() == "cayenne_propagate_filter_across_equi_join_keys")
+    {
+        let insert_at = rules
+            .iter()
+            .position(|rule| rule.name() == "decorrelate_predicate_subquery")
+            .unwrap_or_else(|| {
+                rules
+                    .iter()
+                    .position(|rule| rule.name() == "push_down_filter")
+                    .unwrap_or(rules.len())
+            });
+        rules.insert(
+            insert_at,
+            Arc::new(
+                CayennePropagateFilterAcrossEquiJoinKeys::new_with_table_provider_predicate(
+                    is_cayenne_accelerated_table_provider,
+                ),
+            ),
+        );
+    }
+
+    // Run the IN-list → BETWEEN rewrite ahead of `simplify_expressions` so the
+    // downstream simplifier can fold the resulting `Expr::Between` the same way
+    // it folds a SQL-parsed BETWEEN.
+    if !rules
+        .iter()
+        .any(|rule| rule.name() == "cayenne_inlist_to_range_rewrite")
+    {
+        let insert_at = rules
+            .iter()
+            .position(|rule| rule.name() == "simplify_expressions")
+            .unwrap_or(rules.len());
+        rules.insert(insert_at, Arc::new(CayenneInListToRangeRewrite::new()));
+    }
+}
+
+#[cfg(not(windows))]
+fn is_cayenne_accelerated_table_provider(provider: &dyn TableProvider) -> bool {
+    if is_cayenne_table_provider(provider) {
+        return true;
+    }
+
+    provider
+        .as_any()
+        .downcast_ref::<AcceleratedTable>()
+        .is_some_and(|table| is_cayenne_table_provider(table.get_accelerator().as_ref()))
+}
+
+#[cfg(not(windows))]
+fn is_cayenne_table_provider(provider: &dyn TableProvider) -> bool {
+    if provider.as_any().is::<CayenneTableProvider>() || has_cayenne_accelerator_metadata(provider)
+    {
+        return true;
+    }
+
+    if let Some(poly) = provider.as_any().downcast_ref::<PolyTableProvider>() {
+        return is_cayenne_table_provider(poly.writer().as_ref())
+            || is_cayenne_table_provider(poly.get_federated_table_provider().as_ref());
+    }
+
+    if let Some(dedup) = provider.as_any().downcast_ref::<UpsertDedupTableProvider>() {
+        return is_cayenne_table_provider(dedup.inner().as_ref());
+    }
+
+    false
+}
+
+#[cfg(not(windows))]
+fn has_cayenne_accelerator_metadata(provider: &dyn TableProvider) -> bool {
+    provider
+        .schema()
+        .metadata()
+        .get("spice.accelerator")
+        .is_some_and(|accelerator| accelerator == "cayenne")
 }
 
 pub struct AnalyzerRulesBuilder {
@@ -602,22 +808,8 @@ impl Default for AnalyzerRulesBuilder {
     }
 }
 
-// This method uses unwrap_or_default, however it should never fail on the initialization. See
-// RuntimeEnv::default()
-pub(crate) fn runtime_env(
-    memory_limit: Option<u64>,
-    temp_directory: Option<String>,
-    io_runtime: Handle,
-) -> Arc<RuntimeEnv> {
-    let disk_manager_builder = if let Some(directory) = temp_directory {
-        let mode = DiskManagerMode::Directories(vec![directory.into()]);
-        DiskManager::builder().with_mode(mode)
-    } else {
-        DiskManager::builder()
-    };
-
-    // If no memory limit is specified, default to 90% of total memory (container-aware)
-    let effective_memory_limit = memory_limit.unwrap_or_else(|| {
+fn effective_query_memory_limit(memory_limit: Option<u64>) -> u64 {
+    memory_limit.unwrap_or_else(|| {
         let total_memory = crate::resource_monitor::get_total_memory();
         let default_limit = total_memory.saturating_mul(90) / 100;
 
@@ -627,7 +819,83 @@ pub(crate) fn runtime_env(
         );
 
         default_limit
+    })
+}
+
+#[cfg(not(windows))]
+fn cayenne_optimizer_config(
+    sort_merge_min_rows: Option<usize>,
+    sort_merge_memory_pool_fraction: Option<f64>,
+    effective_memory_limit: u64,
+    exact_join_filter_memory_limit: usize,
+) -> CayenneOptimizerConfig {
+    let mut config = CayenneOptimizerConfig::default();
+    if let Some(sort_merge_min_rows) = sort_merge_min_rows {
+        config.sort_merge_min_rows = sort_merge_min_rows;
+    }
+    if let Some(sort_merge_memory_pool_fraction) = sort_merge_memory_pool_fraction {
+        config.sort_merge_memory_pool_fraction = sort_merge_memory_pool_fraction;
+    }
+    config.sort_merge_memory_pool_bytes = Some(match usize::try_from(effective_memory_limit) {
+        Ok(limit) => limit,
+        Err(_) => usize::MAX,
     });
+    config.exact_join_filter_max_bytes = exact_join_filter_memory_limit;
+    config
+}
+
+fn exact_join_filter_memory_limit(effective_memory_limit: u64) -> usize {
+    let limit = effective_memory_limit / EXACT_JOIN_FILTER_MEMORY_POOL_FRACTION_DENOMINATOR;
+
+    match usize::try_from(limit) {
+        Ok(limit) => limit,
+        Err(_) => usize::MAX,
+    }
+}
+
+fn hash_join_inlist_memory_limit_per_partition(
+    effective_memory_limit: u64,
+    target_partitions: usize,
+) -> usize {
+    let target_partitions = target_partitions.max(1);
+    let target_partitions = u64::try_from(target_partitions).unwrap_or(u64::MAX);
+
+    match usize::try_from(effective_memory_limit / target_partitions) {
+        Ok(limit) => limit,
+        Err(_) => usize::MAX,
+    }
+}
+
+fn configure_hash_join_memory_limits(
+    config: &mut SessionConfig,
+    effective_memory_limit: u64,
+) -> usize {
+    let runtime_memory_limit_per_partition = hash_join_inlist_memory_limit_per_partition(
+        effective_memory_limit,
+        config.options().execution.target_partitions,
+    );
+    let exact_join_filter_memory_limit = exact_join_filter_memory_limit(effective_memory_limit);
+
+    let optimizer = &mut config.options_mut().optimizer;
+    optimizer.hash_join_inlist_pushdown_max_size = optimizer
+        .hash_join_inlist_pushdown_max_size
+        .min(runtime_memory_limit_per_partition);
+
+    exact_join_filter_memory_limit
+}
+
+fn runtime_env_with_effective_memory_limit(
+    effective_memory_limit: u64,
+    temp_directory: Option<String>,
+    io_runtime: Handle,
+    metadata_cache_limit_bytes: Option<usize>,
+) -> Arc<RuntimeEnv> {
+    let disk_manager_builder = if let Some(directory) = temp_directory {
+        let mode = DiskManagerMode::Directories(vec![directory.into()]);
+        DiskManager::builder().with_mode(mode)
+    } else {
+        DiskManager::builder()
+    };
 
     let Some(topn) = NonZeroUsize::new(5) else {
         unreachable!("Memory pool TopN must be greater than 0");
@@ -644,12 +912,16 @@ pub(crate) fn runtime_env(
         topn,
     ));
 
-    match RuntimeEnvBuilder::default()
+    let mut runtime_env_builder = RuntimeEnvBuilder::default()
         .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::new(io_runtime)))
         .with_memory_pool(memory_pool)
-        .with_disk_manager_builder(disk_manager_builder)
-        .build_arc()
-    {
+        .with_disk_manager_builder(disk_manager_builder);
+
+    if let Some(limit) = metadata_cache_limit_bytes {
+        runtime_env_builder = runtime_env_builder.with_metadata_cache_limit(limit);
+    }
+
+    match runtime_env_builder.build_arc() {
         Ok(runtime_env) => runtime_env,
         Err(e) => {
             unreachable!("Tests ensure this should never fail: {e}");
@@ -677,11 +949,25 @@ pub(crate) fn default_extension_planners(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(windows))]
+    use arrow::datatypes::{DataType, Field, Schema};
+    #[cfg(not(windows))]
+    use cayenne::optimizer_rules::CayenneOptimizerConfig;
+    #[cfg(not(windows))]
+    use datafusion::catalog::{MemTable, TableProvider};
     use datafusion::optimizer::Analyzer;
 
-    use super::DataFusionBuilder;
+    use super::{
+        DataFusionBuilder, configure_hash_join_memory_limits, exact_join_filter_memory_limit,
+        runtime_env_with_effective_memory_limit,
+    };
     use crate::dataaccelerator::AcceleratorEngineRegistry;
     use crate::status;
+    #[cfg(not(windows))]
+    use data_components::poly::PolyTableProvider;
+    use runtime_datafusion::join_accumulator::DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES;
+    #[cfg(not(windows))]
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     /// Verifies that the default analyzer rules are in the expected order.
@@ -703,6 +989,182 @@ mod tests {
                 "Default analyzer rule order has changed"
             );
         }
+    }
+
+    #[test]
+    fn test_exact_join_filter_memory_limit_respects_runtime_query_memory_limit() {
+        assert_eq!(
+            128,
+            exact_join_filter_memory_limit(1_024),
+            "Exact dynamic join filters should use a fraction of the shared runtime query memory budget"
+        );
+
+        let high_memory_limit = u64::try_from(DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES)
+            .expect("default in-list memory limit should fit in u64")
+            .saturating_mul(16);
+        assert_eq!(
+            DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES.saturating_mul(2),
+            exact_join_filter_memory_limit(high_memory_limit),
+            "Exact dynamic join filters should scale above the historical default on larger memory pools"
+        );
+        assert_eq!(
+            0,
+            exact_join_filter_memory_limit(1),
+            "Very small memory limits should not exceed the configured memory fraction"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_env_applies_metadata_cache_limit() {
+        let runtime_env = runtime_env_with_effective_memory_limit(
+            1024 * 1024,
+            None,
+            tokio::runtime::Handle::current(),
+            Some(8 * 1024 * 1024),
+        );
+
+        assert_eq!(
+            runtime_env.cache_manager.get_metadata_cache_limit(),
+            8 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn test_hash_join_inlist_pushdown_limit_respects_runtime_query_memory_limit() {
+        let mut config = datafusion::prelude::SessionConfig::new().with_target_partitions(4);
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_inlist_pushdown_max_size = 1_000;
+
+        let exact_join_filter_memory_limit = configure_hash_join_memory_limits(&mut config, 2_048);
+
+        assert_eq!(256, exact_join_filter_memory_limit);
+        assert_eq!(
+            512,
+            config
+                .options()
+                .optimizer
+                .hash_join_inlist_pushdown_max_size,
+            "DataFusion's built-in per-partition hash join in-list pushdown should stay within the query memory limit"
+        );
+
+        let mut config = datafusion::prelude::SessionConfig::new().with_target_partitions(4);
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_inlist_pushdown_max_size = 1_000;
+
+        let exact_join_filter_memory_limit =
+            configure_hash_join_memory_limits(&mut config, 1_000_000);
+
+        assert_eq!(
+            125_000, exact_join_filter_memory_limit,
+            "A larger runtime query memory limit should scale the shared exact join-filter budget"
+        );
+        assert_eq!(
+            1_000,
+            config
+                .options()
+                .optimizer
+                .hash_join_inlist_pushdown_max_size,
+            "A larger runtime query memory limit should not raise DataFusion's configured hash join in-list cap"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_registers_cayenne_optimizer_config() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .memory_limit(Some(1_024))
+        .cayenne_sort_merge_min_rows(Some(100_000_000))
+        .cayenne_sort_merge_memory_pool_fraction(Some(0.25))
+        .build();
+
+        let state = df.ctx.state();
+        let config = state
+            .config_options()
+            .extensions
+            .get::<CayenneOptimizerConfig>()
+            .expect("Cayenne optimizer config should be registered");
+
+        assert_eq!(config.sort_merge_min_rows, 100_000_000);
+        assert!((config.sort_merge_memory_pool_fraction - 0.25).abs() < f64::EPSILON);
+        assert_eq!(config.sort_merge_memory_pool_bytes, Some(1_024));
+        assert_eq!(config.exact_join_filter_max_bytes, 128);
+    }
+
+    #[test]
+    fn test_target_partitions_wires_through_to_session_config() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle.clone(),
+        )
+        .target_partitions(Some(4))
+        .build();
+
+        assert_eq!(
+            df.ctx
+                .state()
+                .config()
+                .options()
+                .execution
+                .target_partitions,
+            4,
+            "target_partitions wired through DataFusionBuilder should be visible on the session config"
+        );
+
+        // Sanity check the inverse — None leaves DataFusion's default in place.
+        let df_default = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .target_partitions(None)
+        .build();
+        assert_ne!(
+            df_default
+                .ctx
+                .state()
+                .config()
+                .options()
+                .execution
+                .target_partitions,
+            4,
+            "Without an override target_partitions should fall back to DataFusion's default"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_cayenne_provider_predicate_detects_poly_accelerator_metadata() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let table =
+            Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("memtable"));
+        let provider = PolyTableProvider::new_with_schema_metadata(
+            Arc::clone(&table) as Arc<dyn TableProvider>,
+            table,
+            HashMap::from([("spice.accelerator".to_string(), "cayenne".to_string())]),
+        );
+
+        assert!(super::is_cayenne_accelerated_table_provider(&provider));
     }
 
     /// Builds a full `DataFusion` instance and verifies the analyzer rules on
@@ -739,6 +1201,283 @@ mod tests {
                 "spice_ddl_rewrite",
             ],
             "Analyzer rule list or ordering has changed"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_does_not_register_cayenne_logical_rule_by_default() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .build();
+
+        let state = df.ctx.state();
+
+        assert!(
+            !state
+                .optimizers()
+                .iter()
+                .any(|r| r.name() == "cayenne_propagate_filter_across_equi_join_keys"),
+            "Cayenne logical filter propagation should be disabled by default"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_registers_cayenne_logical_rule_when_enabled() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .cayenne_filter_propagation_enabled(true)
+        .build();
+
+        let state = df.ctx.state();
+        let rule_names: Vec<&str> = state.optimizers().iter().map(|r| r.name()).collect();
+        let cayenne_position = rule_names
+            .iter()
+            .position(|name| *name == "cayenne_propagate_filter_across_equi_join_keys")
+            .expect("Cayenne logical filter propagation rule should be registered");
+        let decorrelate_position = rule_names
+            .iter()
+            .position(|name| *name == "decorrelate_predicate_subquery")
+            .expect("DataFusion decorrelate_predicate_subquery rule should be registered");
+        let push_down_position = rule_names
+            .iter()
+            .position(|name| *name == "push_down_filter")
+            .expect("DataFusion push_down_filter rule should be registered");
+
+        assert!(
+            cayenne_position < decorrelate_position,
+            "Cayenne logical filter propagation must run before decorrelate_predicate_subquery so generated InSubquery predicates cannot reach physical planning"
+        );
+        assert!(
+            decorrelate_position < push_down_position,
+            "DataFusion decorrelate_predicate_subquery must run before push_down_filter"
+        );
+        assert_eq!(
+            rule_names
+                .iter()
+                .filter(|name| **name == "cayenne_propagate_filter_across_equi_join_keys")
+                .count(),
+            1,
+            "Cayenne logical filter propagation rule should be registered exactly once"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_decorrelates_cayenne_propagated_subquery() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .cayenne_filter_propagation_enabled(true)
+        .build();
+
+        rt.block_on(async {
+            let nation_schema = Arc::new(Schema::new(vec![
+                Field::new("n_nationkey", DataType::Int64, false),
+                Field::new("n_name", DataType::Utf8, true),
+            ]));
+            let supplier_schema = Arc::new(Schema::new(vec![
+                Field::new("s_suppkey", DataType::Int64, false),
+                Field::new("s_nationkey", DataType::Int64, false),
+            ]));
+
+            df.ctx
+                .register_table(
+                    "nation",
+                    Arc::new(
+                        MemTable::try_new(Arc::clone(&nation_schema), vec![vec![]])
+                            .expect("nation mem table should be valid"),
+                    ),
+                )
+                .expect("nation table should register");
+            df.ctx
+                .register_table(
+                    "supplier",
+                    Arc::new(
+                        MemTable::try_new(Arc::clone(&supplier_schema), vec![vec![]])
+                            .expect("supplier mem table should be valid"),
+                    ),
+                )
+                .expect("supplier table should register");
+
+            let dataframe = df
+                .ctx
+                .sql(
+                    "SELECT s_suppkey FROM supplier, nation \
+                     WHERE s_nationkey = n_nationkey AND n_name = 'CHINA'",
+                )
+                .await
+                .expect("q21-shaped query should create a dataframe");
+            let optimized_plan = dataframe
+                .clone()
+                .into_optimized_plan()
+                .expect("q21-shaped query should optimize");
+            let optimized_plan = optimized_plan.to_string();
+
+            assert!(
+                !optimized_plan.contains("InSubquery"),
+                "Cayenne propagated subqueries must be decorrelated before physical planning: {optimized_plan}"
+            );
+
+            dataframe
+                .create_physical_plan()
+                .await
+                .expect("q21-shaped query should create a physical plan");
+        });
+    }
+
+    /// Regression test for the post-decorrelation re-propagation bug
+    /// (`cayenne::logical_optimizer`): after the rule wraps a Filter with
+    /// `InSubquery` and `DataFusion` decorrelates it to `LeftSemi`, the
+    /// optimizer iterates the rule pipeline to fixed point. Without the
+    /// cycle-detection fix in `analyze_logical_side`, the rule would re-fire
+    /// each pass and stack one redundant `LeftSemi` per iteration up to
+    /// `max_passes`. This integration test runs the full optimizer pipeline
+    /// and asserts the final plan has at most one `LeftSemi` for the q21
+    /// shape — proving the cycle guard holds across decorrelation.
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_does_not_stack_redundant_left_semi_after_decorrelation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .cayenne_filter_propagation_enabled(true)
+        .build();
+
+        rt.block_on(async {
+            let nation_schema = Arc::new(Schema::new(vec![
+                Field::new("n_nationkey", DataType::Int64, false),
+                Field::new("n_name", DataType::Utf8, true),
+            ]));
+            let supplier_schema = Arc::new(Schema::new(vec![
+                Field::new("s_suppkey", DataType::Int64, false),
+                Field::new("s_nationkey", DataType::Int64, false),
+            ]));
+
+            df.ctx
+                .register_table(
+                    "nation",
+                    Arc::new(
+                        MemTable::try_new(Arc::clone(&nation_schema), vec![vec![]])
+                            .expect("nation mem table should be valid"),
+                    ),
+                )
+                .expect("nation table should register");
+            df.ctx
+                .register_table(
+                    "supplier",
+                    Arc::new(
+                        MemTable::try_new(Arc::clone(&supplier_schema), vec![vec![]])
+                            .expect("supplier mem table should be valid"),
+                    ),
+                )
+                .expect("supplier table should register");
+
+            let dataframe = df
+                .ctx
+                .sql(
+                    "SELECT s_suppkey FROM supplier, nation \
+                     WHERE s_nationkey = n_nationkey AND n_name = 'CHINA'",
+                )
+                .await
+                .expect("q21-shaped query should create a dataframe");
+            let optimized_plan = dataframe
+                .into_optimized_plan()
+                .expect("q21-shaped query should optimize");
+            let plan_text = optimized_plan.to_string();
+
+            // The optimizer iterates rules to fixed point. Before the cycle
+            // guard, every iteration would add another `LeftSemi Join` on the
+            // fact side. With the guard in place we expect exactly one (the
+            // single decorrelated propagation).
+            let left_semi_count = plan_text.matches("LeftSemi Join").count();
+            assert!(
+                left_semi_count <= 1,
+                "post-decorrelation re-propagation is stacking redundant LeftSemi joins \
+                 (count={left_semi_count}); plan was:\n{plan_text}"
+            );
+        });
+    }
+
+    /// Cayenne physical optimizer rules must run after `DataFusion`'s built-in
+    /// physical optimizer rules.
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_registers_cayenne_rules_after_datafusion_rules() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .build();
+
+        let state = df.ctx.state();
+        let rule_names: Vec<&str> = state
+            .physical_optimizers()
+            .iter()
+            .map(|r| r.name())
+            .collect();
+        let sanity_check_position = rule_names
+            .iter()
+            .position(|name| *name == "SanityCheckPlan")
+            .expect("DataFusion sanity check rule should be registered");
+        let cayenne_filter_sharing_position = rule_names
+            .iter()
+            .position(|name| *name == "CayenneDynamicFilterSharing")
+            .expect("Cayenne dynamic filter sharing rule should be registered");
+        let cayenne_anti_sort_merge_position = rule_names
+            .iter()
+            .position(|name| *name == "CayenneAntiJoinSortMergeRewriter")
+            .expect("Cayenne anti join sort-merge rewriter should be registered");
+
+        assert!(
+            sanity_check_position < cayenne_filter_sharing_position,
+            "CayenneDynamicFilterSharing must run after DataFusion's built-in physical optimizer rules"
+        );
+        assert!(
+            cayenne_filter_sharing_position < cayenne_anti_sort_merge_position,
+            "CayenneDynamicFilterSharing must run before CayenneAntiJoinSortMergeRewriter so same-source joins can receive shared scan filters before any sort-merge rewrite"
         );
     }
 }

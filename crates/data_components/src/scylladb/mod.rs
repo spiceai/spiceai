@@ -207,7 +207,8 @@ impl Read for ScyllaDbTableFactory {
         let base_table = SqlTable::new("scylladb", &pool, table_reference.clone(), None)
             .await
             .context(UnableToConstructSQLTableSnafu)?
-            .with_dialect(Arc::new(CqlDialect::new()));
+            .with_dialect(Arc::new(CqlDialect::new()))
+            .with_allow_physical_filter_pushdown(false);
 
         // Wrap in ScyllaDbTable with schema for filter pushdown
         Ok(Arc::new(ScyllaDbTable {

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use clap::{Parser, Subcommand, ValueEnum};
+use spice_cloud_client::types::UpdateChannel;
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum BackendMode {
@@ -25,7 +26,11 @@ pub enum BackendMode {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Run spidapter as a newline-delimited JSON-RPC server over stdio
-    Stdio(StdioArgs),
+    Stdio(Box<StdioArgs>),
+    /// Run spidapter backed by a local spiced cluster (scheduler + executors)
+    LocalSpiced(Box<LocalSpicedArgs>),
+    /// Run spidapter backed by a local cayenne-flightsql instance
+    CayenneFlightsql(Box<CayenneFlightsqlArgs>),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -48,7 +53,7 @@ pub struct StdioArgs {
 
     /// Release channel for the spice.ai runtime image (stable, preview, nightly, internal).
     #[arg(long)]
-    pub channel: Option<String>,
+    pub channel: Option<UpdateChannel>,
 
     /// Custom container image tag (e.g. `spicebench-sf10`).
     /// When set, the app's image tag is updated before deploying.
@@ -144,4 +149,83 @@ pub struct StdioArgs {
     /// Query memory limit to apply to `runtime.query.memory_limit` spicepod configuration (e.g. `150Gi`).
     #[arg(long, env = "SPIDAPTER_QUERY_MEMORY_LIMIT")]
     pub query_memory_limit: Option<String>,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct LocalSpicedArgs {
+    /// Log received requests and child-command execution details to stderr.
+    #[arg(long)]
+    pub verbose: bool,
+
+    /// Timeout in seconds to wait for the local spiced cluster to become ready.
+    #[arg(long, default_value = "600")]
+    pub ready_wait: u64,
+
+    /// AWS region for S3 data sources and scheduler state (e.g. `us-east-1`).
+    /// Falls back to `AWS_DEFAULT_REGION` environment variable if not set.
+    #[arg(long, env = "AWS_REGION")]
+    pub aws_region: Option<String>,
+
+    /// Cayenne Catalog data directory.
+    #[arg(long, env = "SPIDAPTER_CAYENNE_DATA_DIR")]
+    pub cayenne_data_dir: Option<String>,
+
+    /// Cayenne Catalog metadata directory.
+    #[arg(long, env = "SPIDAPTER_CAYENNE_METADATA_DIR")]
+    pub cayenne_metadata_dir: Option<String>,
+
+    /// S3 URL prefix for the spiced scheduler state location (e.g. `s3://bucket/state`).
+    #[arg(long, env = "SCHEDULER_STATE_LOCATION")]
+    pub scheduler_state_location: Option<String>,
+
+    /// Query memory limit to apply to `runtime.query.memory_limit` spicepod configuration (e.g. `150Gi`).
+    #[arg(long, env = "SPIDAPTER_QUERY_MEMORY_LIMIT")]
+    pub query_memory_limit: Option<String>,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct CayenneFlightsqlArgs {
+    /// Log received requests to stderr.
+    #[arg(long)]
+    pub verbose: bool,
+
+    /// Directory for Cayenne Vortex data files.
+    #[arg(long, env = "CAYENNE_DATA_DIR")]
+    pub cayenne_data_dir: Option<String>,
+
+    /// Directory for Cayenne `SQLite` metadata files.
+    #[arg(long, env = "CAYENNE_METADATA_DIR")]
+    pub cayenne_metadata_dir: Option<String>,
+
+    /// `DataFusion` catalog name.
+    #[arg(long, env = "FLIGHTSQL_CATALOG", default_value = "cayenne")]
+    pub catalog: String,
+
+    /// Default schema for unqualified table references.
+    #[arg(long, env = "FLIGHTSQL_DEFAULT_SCHEMA", default_value = "public")]
+    pub default_schema: String,
+
+    /// Vortex footer cache size in MB.
+    #[arg(long, env = "CAYENNE_FOOTER_CACHE_MB")]
+    pub cayenne_footer_cache_mb: Option<usize>,
+
+    /// Vortex segment cache size in MB.
+    #[arg(long, env = "CAYENNE_SEGMENT_CACHE_MB")]
+    pub cayenne_segment_cache_mb: Option<usize>,
+
+    /// Target Vortex file size in MB.
+    #[arg(long, env = "CAYENNE_TARGET_FILE_SIZE_MB")]
+    pub cayenne_target_file_size_mb: Option<usize>,
+
+    /// Periodic catalog refresh interval (seconds). If omitted, refresh runs only at startup.
+    #[arg(long, env = "CAYENNE_REFRESH_INTERVAL_SECS")]
+    pub refresh_interval_secs: Option<u64>,
+
+    /// Timeout in seconds to wait for the Flight SQL server to become ready.
+    #[arg(long, default_value = "30")]
+    pub ready_wait: u64,
+
+    /// Name or path of the cayenne-flightsql binary to spawn.
+    #[arg(long, default_value = "cayenne-flightsql")]
+    pub cayenne_flightsql_binary: String,
 }

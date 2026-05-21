@@ -67,6 +67,9 @@ pub struct Runtime {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flight: Option<Flight>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpConfig>,
+
     /// Configures how long the runtime waits for connections to be gracefully drained
     /// and components to shut down cleanly during runtime termination
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,6 +92,12 @@ pub struct Runtime {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_rate_control: Option<SourceRateControl>,
+
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub functions: Functions,
 }
 
 impl Runtime {
@@ -123,6 +132,27 @@ pub enum RuntimeReadyState {
     OnRegistration,
 }
 
+/// Controls registration and execution surfaces for Spicepod user-defined functions.
+///
+/// Defaults to disabled. Operators must explicitly set
+/// `runtime.functions.enabled: true` before the runtime registers top-level
+/// `functions:` entries or exposes `tools:` entries as SQL functions via
+/// `as_sql: true`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct Functions {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Functions {
+    #[must_use]
+    pub fn enabled() -> Self {
+        Self { enabled: true }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -141,6 +171,71 @@ pub struct TlsConfig {
 
     /// A PEM encoded private key
     pub key: Option<String>,
+
+    /// Filesystem path to a PEM-encoded CA bundle used to verify client
+    /// certificates when `client_auth_mode` is `request` or `required`.
+    /// Eligible for hot-reload via the same watcher that picks up server
+    /// cert / key rotations.
+    pub client_auth_ca_file: Option<String>,
+
+    /// Inline PEM (or `${ secrets:... }`) form of the client CA bundle.
+    /// Mutually exclusive with `client_auth_ca_file`. Inline material is
+    /// not hot-reloaded.
+    pub client_auth_ca: Option<String>,
+
+    /// How the runtime treats client certificates on the public TLS
+    /// endpoints. Defaults to `none`, which preserves today's behavior
+    /// (the server does not request a client cert during the TLS
+    /// handshake). See [`ClientAuthMode`] for the full mode table.
+    pub client_auth_mode: Option<ClientAuthMode>,
+}
+
+/// How the runtime treats client certificates on the public TLS
+/// endpoints (HTTP, Flight, Metrics).
+///
+/// `None` is the out-of-the-box default and disables client-cert
+/// authentication entirely — the server runs `with_no_client_auth()`
+/// at the rustls layer and does not send a `CertificateRequest`. A
+/// non-conforming client that nonetheless presents a cert is rejected
+/// by rustls as a protocol violation.
+///
+/// `Request` opts in to *optional* mTLS: the server sends
+/// `CertificateRequest` and accepts both no-cert and cert-bearing
+/// handshakes. Presented certs must be signed by
+/// `client_auth_ca` / `client_auth_ca_file` (an invalid cert is still
+/// rejected at the handshake). When a cert is presented it is
+/// promoted to the request's auth principal under
+/// `IdentitySource::Channel`; when absent the request runs as the
+/// anonymous principal. Useful for migration windows and for
+/// audit-only deployments where every cert seen should be recorded
+/// but not enforced.
+///
+/// `Required` enables strict mTLS: the server demands a valid client
+/// cert (verified against `client_auth_ca` / `client_auth_ca_file`)
+/// for every connection on the Flight listener; on the HTTP and
+/// metrics listeners the TLS handshake admits no-cert connections so
+/// Kubernetes liveness / readiness probes and Prometheus scrapes work
+/// without a client cert, but the HTTP route layer 401s any
+/// non-probe request whose connection has no verified client cert.
+///
+/// Whether a presented cert *also* becomes the request's auth
+/// principal is determined separately by whether `runtime.auth` is
+/// configured — see the `IdentitySource` enum at the binary
+/// entrypoint. Briefly:
+///
+/// - `client_auth_mode: required` and no `runtime.auth`
+///   → mTLS-as-identity (the cert is the principal).
+/// - `client_auth_mode: required` plus `runtime.auth`
+///   → mTLS-as-channel (the cert protects the channel; the
+///   API key / OIDC token is the principal).
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub enum ClientAuthMode {
+    #[default]
+    None,
+    Request,
+    Required,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -369,6 +464,20 @@ impl Default for TelemetryConfig {
             otel_exporter: None,
         }
     }
+}
+
+/// Configuration for the MCP (Model Context Protocol) HTTP endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct McpConfig {
+    /// Hostnames (and optional ports) permitted in the `Host` header of incoming MCP requests.
+    /// Used to prevent DNS-rebinding attacks. Accepts bare hostnames (`example.com`),
+    /// host-port pairs (`example.com:8090`), or full origin URLs (`https://example.com`).
+    /// Set to `["*"]` to disable host checking entirely.
+    /// Defaults to rmcp defaults (`["localhost", "127.0.0.1", "::1"]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_hosts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -789,6 +898,10 @@ pub struct Query {
     /// Specifies the compression codec used when spilling data to disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spill_compression: Option<SpillCompression>,
+
+    /// Overrides `DataFusion`'s local query target partition count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_partitions: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -812,66 +925,78 @@ pub struct Scheduler {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
 
-    /// Partition management configuration
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partition_management: Option<PartitionManagement>,
-}
+    /// How often the scheduler assigns accelerated table partitions to executors.
+    #[serde(default = "default_partition_assignment_interval")]
+    pub partition_assignment_interval: String,
 
-impl Scheduler {
-    /// Returns the configured `max_partitions_per_executor`, falling back to
-    /// the default when no `partition_management` section is present.
-    #[must_use]
-    pub fn max_partitions_per_executor(&self) -> usize {
-        self.partition_management
-            .as_ref()
-            .map_or(default_max_partitions_per_executor(), |pm| {
-                pm.max_partitions_per_executor
-            })
-    }
+    /// Maximum number of partition assignments made per assignment interval.
+    #[serde(default = "default_max_partition_assignments_per_interval")]
+    pub max_partition_assignments_per_interval: usize,
+
+    /// Maximum partitions assigned to a single executor (soft limit).
+    #[serde(default = "default_max_partitions_per_executor")]
+    pub max_partitions_per_executor: usize,
+
+    /// How long to wait for partition discovery before timing out.
+    #[serde(default = "default_partition_discovery_timeout")]
+    pub partition_discovery_timeout: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-pub struct PartitionManagement {
-    #[serde(default = "default_partition_management_interval")]
-    pub interval: String,
+pub struct SourceRateControl {
+    /// Root URI for globally persisted source rate-control state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_location: Option<String>,
 
-    #[serde(default = "default_max_assignments_per_cycle")]
-    pub max_assignments_per_cycle: usize,
+    /// Optional object store params for source rate-control state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
 
-    #[serde(default = "default_max_partitions_per_executor")]
-    pub max_partitions_per_executor: usize,
+    /// How often each runtime refreshes and persists per-source rate-control state in object storage.
+    #[serde(default = "default_rate_control_refresh_interval")]
+    pub refresh_interval: String,
 
-    #[serde(default = "default_discovery_timeout")]
-    pub discovery_timeout: String,
+    /// Maximum number of concurrent GitHub HTTP requests for this authentication context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_concurrent_connections_limit: Option<usize>,
 }
 
-fn default_partition_management_interval() -> String {
+impl Default for SourceRateControl {
+    fn default() -> Self {
+        Self {
+            state_location: None,
+            params: None,
+            refresh_interval: default_rate_control_refresh_interval(),
+            github_concurrent_connections_limit: None,
+        }
+    }
+}
+
+#[must_use]
+pub fn default_partition_assignment_interval() -> String {
     "30s".to_string()
 }
 
-fn default_max_assignments_per_cycle() -> usize {
+#[must_use]
+pub fn default_max_partition_assignments_per_interval() -> usize {
     100
 }
 
-fn default_max_partitions_per_executor() -> usize {
+#[must_use]
+pub fn default_max_partitions_per_executor() -> usize {
     1000
 }
 
-fn default_discovery_timeout() -> String {
+#[must_use]
+pub fn default_partition_discovery_timeout() -> String {
     "60s".to_string()
 }
 
-impl Default for PartitionManagement {
-    fn default() -> Self {
-        Self {
-            interval: default_partition_management_interval(),
-            max_assignments_per_cycle: default_max_assignments_per_cycle(),
-            max_partitions_per_executor: default_max_partitions_per_executor(),
-            discovery_timeout: default_discovery_timeout(),
-        }
-    }
+#[must_use]
+pub fn default_rate_control_refresh_interval() -> String {
+    "30s".to_string()
 }
 
 /// Helper struct for deserializing Runtime with custom logic for handling `memory_limit`/`temp_directory` deprecation
@@ -904,6 +1029,8 @@ pub struct RuntimeDeserializer {
     pub cors: CorsConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flight: Option<Flight>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpConfig>,
     /// Configures where the runtime will store temporary files needed for operations like
     /// spilling to disk for queries & accelerations that are larger than memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -931,6 +1058,10 @@ pub struct RuntimeDeserializer {
     pub metrics: Option<Metrics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_rate_control: Option<SourceRateControl>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub functions: Functions,
 }
 
 #[expect(deprecated)]
@@ -998,6 +1129,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             auth: deserializer.auth,
             cors: deserializer.cors,
             flight: deserializer.flight,
+            mcp: deserializer.mcp,
             shutdown_timeout: deserializer.shutdown_timeout,
             ready_state: deserializer.ready_state,
             output_level: deserializer.output_level,
@@ -1008,6 +1140,8 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             },
             metrics: deserializer.metrics,
             scheduler: deserializer.scheduler,
+            source_rate_control: deserializer.source_rate_control,
+            functions: deserializer.functions,
         })
     }
 }
@@ -1144,6 +1278,41 @@ mod tests {
     }
 
     #[test]
+    fn test_deserialize_mcp_config_with_allowed_hosts() {
+        let yaml = r"
+        mcp:
+          allowed_hosts:
+            - localhost
+            - example.com:8090
+            - https://example.com
+        ";
+        let parsed: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let mcp = parsed.mcp.expect("mcp section should be present");
+        let hosts = mcp.allowed_hosts.expect("allowed_hosts should be set");
+        assert_eq!(
+            hosts,
+            vec![
+                "localhost".to_string(),
+                "example.com:8090".to_string(),
+                "https://example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_deserialize_mcp_config_unknown_field_rejected() {
+        let yaml = r"
+        mcp:
+          unknown_field: value
+        ";
+        let result: Result<Runtime, _> = yaml::from_str(yaml);
+        assert!(
+            result.is_err(),
+            "unknown fields in mcp section should be rejected due to deny_unknown_fields"
+        );
+    }
+
+    #[test]
     fn test_memory_limit_migration() {
         // Test when only memory_limit is present
         let yaml = r"
@@ -1155,7 +1324,8 @@ mod tests {
             Some(Query {
                 spill_compression: None,
                 temp_directory: None,
-                memory_limit: Some("100MiB".to_string())
+                memory_limit: Some("100MiB".to_string()),
+                target_partitions: None,
             })
         );
 
@@ -1170,7 +1340,8 @@ mod tests {
             Some(Query {
                 spill_compression: None,
                 temp_directory: None,
-                memory_limit: Some("200MiB".to_string())
+                memory_limit: Some("200MiB".to_string()),
+                target_partitions: None,
             })
         );
 
@@ -1186,7 +1357,8 @@ mod tests {
             Some(Query {
                 spill_compression: None,
                 temp_directory: None,
-                memory_limit: Some("200MiB".to_string())
+                memory_limit: Some("200MiB".to_string()),
+                target_partitions: None,
             })
         );
 
@@ -1209,7 +1381,8 @@ mod tests {
             Some(Query {
                 spill_compression: None,
                 temp_directory: Some("/foo".to_string()),
-                memory_limit: None
+                memory_limit: None,
+                target_partitions: None,
             })
         );
 
@@ -1224,7 +1397,8 @@ mod tests {
             Some(Query {
                 spill_compression: None,
                 temp_directory: Some("/bar".to_string()),
-                memory_limit: None
+                memory_limit: None,
+                target_partitions: None,
             })
         );
 
@@ -1240,7 +1414,8 @@ mod tests {
             Some(Query {
                 spill_compression: None,
                 temp_directory: Some("/bar".to_string()),
-                memory_limit: None
+                memory_limit: None,
+                target_partitions: None,
             })
         );
 
@@ -1249,6 +1424,45 @@ mod tests {
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.query, None);
+    }
+
+    #[test]
+    fn test_query_target_partitions_nested_in_full_spicepod() {
+        // Verifies that the nested `runtime.query.target_partitions` form used
+        // by real spicepods round-trips through serde into Spicepod itself
+        // (not just an isolated Runtime struct). This is the actual path the
+        // runtime takes at startup.
+        let yaml = r"
+version: v1
+kind: Spicepod
+name: test
+runtime:
+  query:
+    target_partitions: 4
+datasets:
+  - from: file:data/foo.parquet
+    name: foo
+";
+        let def: crate::spec::SpicepodDefinition =
+            yaml::from_str(yaml).expect("Failed to parse SpicepodDefinition");
+        assert_eq!(
+            def.runtime.query.as_ref().and_then(|q| q.target_partitions),
+            Some(4),
+            "target_partitions should round-trip from YAML into SpicepodDefinition.runtime.query"
+        );
+    }
+
+    #[test]
+    fn test_query_target_partitions() {
+        let yaml = r"
+            query:
+                target_partitions: 64
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(
+            runtime.query.unwrap_or_default().target_partitions,
+            Some(64)
+        );
     }
 
     #[test]
@@ -2128,5 +2342,182 @@ mod tests {
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.ready_state, RuntimeReadyState::OnRegistration);
+    }
+
+    #[test]
+    fn test_runtime_functions_disabled_by_default() {
+        let runtime: Runtime = yaml::from_str("{}").expect("Failed to parse Runtime");
+        assert!(!runtime.functions.enabled);
+    }
+
+    #[test]
+    fn test_runtime_functions_can_be_enabled() {
+        let yaml = r"
+            functions:
+                enabled: true
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert!(runtime.functions.enabled);
+    }
+
+    #[test]
+    fn test_deserialize_mcp_config_bare_hostnames() {
+        // Bare hostnames (default-like usage).
+        let yaml = r"
+            mcp:
+              allowed_hosts:
+                - localhost
+                - 127.0.0.1
+                - '::1'
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let mcp = runtime.mcp.expect("mcp section should be present");
+        let hosts = mcp.allowed_hosts.expect("allowed_hosts should be set");
+        assert_eq!(hosts, vec!["localhost", "127.0.0.1", "::1"]);
+    }
+
+    #[test]
+    fn test_deserialize_mcp_config_host_port_pairs() {
+        // host:port pair format.
+        let yaml = r"
+            mcp:
+              allowed_hosts:
+                - 'example.com:8090'
+                - 'localhost:9000'
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let mcp = runtime.mcp.expect("mcp section should be present");
+        let hosts = mcp.allowed_hosts.expect("allowed_hosts should be set");
+        assert_eq!(hosts, vec!["example.com:8090", "localhost:9000"]);
+    }
+
+    #[test]
+    fn test_deserialize_mcp_config_full_origin_urls() {
+        // Full origin URL format.
+        let yaml = r"
+            mcp:
+              allowed_hosts:
+                - 'https://example.com'
+                - 'http://app.internal:8080'
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let mcp = runtime.mcp.expect("mcp section should be present");
+        let hosts = mcp.allowed_hosts.expect("allowed_hosts should be set");
+        assert_eq!(
+            hosts,
+            vec!["https://example.com", "http://app.internal:8080"]
+        );
+    }
+
+    #[test]
+    fn test_deserialize_mcp_config_wildcard() {
+        // Wildcard disables host checking.
+        let yaml = r"
+            mcp:
+              allowed_hosts:
+                - '*'
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let mcp = runtime.mcp.expect("mcp section should be present");
+        let hosts = mcp.allowed_hosts.expect("allowed_hosts should be set");
+        assert_eq!(hosts, vec!["*"]);
+    }
+
+    #[test]
+    fn test_deserialize_tls_client_auth_default_none() {
+        // The bare TLS section omits `client_auth_mode` — it should
+        // deserialize to `None` and the default mode at use sites
+        // should be `ClientAuthMode::None`.
+        let yaml = r"
+            tls:
+              enabled: true
+              certificate_file: /etc/spice/tls/server.crt
+              key_file: /etc/spice/tls/server.key
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let tls = runtime.tls.expect("tls section should be present");
+        assert!(tls.client_auth_mode.is_none());
+        assert!(tls.client_auth_ca_file.is_none());
+        assert!(tls.client_auth_ca.is_none());
+        // Sanity: the enum's `Default` is `None`.
+        assert_eq!(ClientAuthMode::default(), ClientAuthMode::None);
+    }
+
+    #[test]
+    fn test_deserialize_tls_client_auth_required_with_ca() {
+        let yaml = r"
+            tls:
+              enabled: true
+              certificate_file: /etc/spice/tls/server.crt
+              key_file: /etc/spice/tls/server.key
+              client_auth_mode: required
+              client_auth_ca_file: /etc/spice/tls/client-ca.crt
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let tls = runtime.tls.expect("tls section should be present");
+        assert_eq!(tls.client_auth_mode, Some(ClientAuthMode::Required));
+        assert_eq!(
+            tls.client_auth_ca_file.as_deref(),
+            Some("/etc/spice/tls/client-ca.crt")
+        );
+    }
+
+    #[test]
+    fn test_deserialize_tls_client_auth_request_with_ca() {
+        let yaml = r"
+            tls:
+              enabled: true
+              certificate_file: /etc/spice/tls/server.crt
+              key_file: /etc/spice/tls/server.key
+              client_auth_mode: request
+              client_auth_ca_file: /etc/spice/tls/client-ca.crt
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let tls = runtime.tls.expect("tls section should be present");
+        assert_eq!(tls.client_auth_mode, Some(ClientAuthMode::Request));
+    }
+
+    #[test]
+    fn test_deserialize_tls_client_auth_inline_ca() {
+        let yaml = r"
+            tls:
+              enabled: true
+              certificate_file: /etc/spice/tls/server.crt
+              key_file: /etc/spice/tls/server.key
+              client_auth_mode: required
+              client_auth_ca: |
+                -----BEGIN CERTIFICATE-----
+                MIIBhTCCASug...
+                -----END CERTIFICATE-----
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let tls = runtime.tls.expect("tls section should be present");
+        assert_eq!(tls.client_auth_mode, Some(ClientAuthMode::Required));
+        assert!(
+            tls.client_auth_ca
+                .as_deref()
+                .is_some_and(|ca| ca.contains("BEGIN CERTIFICATE"))
+        );
+        assert!(tls.client_auth_ca_file.is_none());
+    }
+
+    #[test]
+    fn test_deserialize_tls_client_auth_unknown_mode_rejected() {
+        // Validates `#[serde(rename_all = "snake_case", deny_unknown_fields)]`
+        // by feeding a non-existent variant. This is the operator-typo
+        // guard that ensures `client_auth_mode: requuired` doesn't
+        // silently fall through to the default `none`.
+        let yaml = r"
+            tls:
+              enabled: true
+              certificate_file: /etc/spice/tls/server.crt
+              key_file: /etc/spice/tls/server.key
+              client_auth_mode: requuired
+        ";
+        let result: Result<Runtime, _> = yaml::from_str(yaml);
+        assert!(
+            result.is_err(),
+            "expected unknown client_auth_mode value to be rejected"
+        );
     }
 }

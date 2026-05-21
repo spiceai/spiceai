@@ -167,6 +167,7 @@ where
 /// 6. DROP TABLE and verify it is inaccessible, then re-create
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn test_distributed_cayenne_ddl_lifecycle() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -554,6 +555,7 @@ async fn ddl_lifecycle_drop(harness: &ClusterHarness) -> Result<(), anyhow::Erro
 /// - Aggregations over `JOINed` data are correct
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn test_distributed_cayenne_multi_table_join() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -715,6 +717,7 @@ async fn multi_table_join_verify(harness: &ClusterHarness) -> Result<(), anyhow:
 /// Also tests same-named tables in different schemas to verify namespace correctness.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn test_distributed_cayenne_schema_isolation() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -872,6 +875,7 @@ async fn schema_isolation_verify(harness: &ClusterHarness) -> Result<(), anyhow:
 /// - DELETE on PK tables works correctly
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn test_distributed_cayenne_primary_key_upsert() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -1073,6 +1077,7 @@ async fn pk_upsert_delete(harness: &ClusterHarness) -> Result<(), anyhow::Error>
 /// - WHERE IS NULL / IS NOT NULL filtering
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn test_distributed_cayenne_null_handling_and_aggregations() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -1127,6 +1132,7 @@ async fn test_distributed_cayenne_null_handling_and_aggregations() -> Result<(),
 // `cayenne_catalog_ddl/mod.rs`.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn test_distributed_cayenne_merge_basic() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -1261,6 +1267,7 @@ async fn test_distributed_cayenne_merge_basic() -> Result<(), anyhow::Error> {
 // must preserve unmatched rows the same way.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn test_distributed_cayenne_merge_composite_key_no_cross_product() -> Result<(), anyhow::Error>
 {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -1393,6 +1400,7 @@ async fn test_distributed_cayenne_merge_composite_key_no_cross_product() -> Resu
 // =============================================================================
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn test_distributed_cayenne_merge_zero_match() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -1505,6 +1513,7 @@ async fn test_distributed_cayenne_merge_zero_match() -> Result<(), anyhow::Error
 // `cayenne_catalog_merge_duplicate_source_keys_rejected` test.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn test_distributed_cayenne_merge_duplicate_source_keys_rejected() -> Result<(), anyhow::Error>
 {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -1614,6 +1623,7 @@ async fn test_distributed_cayenne_merge_duplicate_source_keys_rejected() -> Resu
 // =============================================================================
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn test_distributed_cayenne_string_partition_dml() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -1740,6 +1750,7 @@ async fn test_distributed_cayenne_string_partition_dml() -> Result<(), anyhow::E
 // yet support no-predicate delete-all on PK-less Cayenne tables.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn test_distributed_cayenne_dml_no_where() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -1832,6 +1843,7 @@ async fn test_distributed_cayenne_dml_no_where() -> Result<(), anyhow::Error> {
 // scheduler to forward the predicate to every partition/executor.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
+#[ignore = "Cayenne catalog connector removed from registry"]
 async fn test_distributed_cayenne_dml_non_partition_filter() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -2043,4 +2055,138 @@ async fn null_agg_filters(harness: &ClusterHarness) -> Result<(), anyhow::Error>
     );
 
     Ok(())
+}
+
+// =============================================================================
+// Test: Late-joining executor receives DDL-created tables
+// =============================================================================
+
+/// Tests that an executor joining after DDL (CREATE SCHEMA, CREATE TABLE)
+/// has already been executed on the cluster can serve queries against those tables.
+///
+/// Steps:
+/// 1. Start scheduler + 1 executor
+/// 2. CREATE SCHEMA and CREATE TABLE, INSERT rows
+/// 3. Start a 2nd executor (late join)
+/// 4. Verify the 2nd executor registered and the cluster can still query the table
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+#[ignore = "Cayenne catalog connector removed from registry"]
+async fn test_distributed_cayenne_late_join_ddl_replay() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let temp_dir = tempfile::tempdir()?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+
+            let catalog = make_cayenne_catalog(
+                "ljcat",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let mut harness = ClusterHarness::builder()
+                .scheduler(
+                    AppBuilder::new("distributed_cayenne_late_join")
+                        .with_catalog(catalog.clone())
+                        .build(),
+                )
+                .executor_with_app(
+                    AppBuilder::new("executor_late_join_0")
+                        .with_catalog(catalog.clone())
+                        .build(),
+                )
+                .start()
+                .await?;
+
+            harness.wait_for_executors(Duration::from_secs(15)).await?;
+
+            // DDL: create schema and table while only executor0 is connected.
+            harness.query("CREATE SCHEMA ljcat.ljs").await?;
+            harness
+                .query(
+                    "CREATE TABLE ljcat.ljs.items (
+                        id BIGINT NOT NULL,
+                        name VARCHAR NOT NULL,
+                        PRIMARY KEY (id)
+                    ) PARTITION BY id",
+                )
+                .await?;
+
+            // Insert data so we can verify the table is queryable.
+            harness
+                .query("INSERT INTO ljcat.ljs.items VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')")
+                .await?;
+            wait_for_row_count(&harness, "ljcat.ljs.items", 3, Duration::from_secs(30)).await?;
+
+            // Late-join: start a 2nd executor AFTER the DDL was already applied.
+            harness
+                .add_executor(Some(
+                    AppBuilder::new("executor_late_join_1")
+                        .with_catalog(catalog)
+                        .build(),
+                ))
+                .await?;
+
+            // Wait for the new executor to register.
+            harness
+                .wait_until_executor_count(2, Duration::from_secs(15))
+                .await?;
+
+            // Verify that the cluster still serves correct results.
+            // The late-joining executor should have replayed CREATE SCHEMA + CREATE TABLE.
+            let batches = harness
+                .query("SELECT id, name FROM ljcat.ljs.items ORDER BY id")
+                .await?;
+            assert_batches_eq!(
+                &[
+                    "+----+-------+",
+                    "| id | name  |",
+                    "+----+-------+",
+                    "| 1  | alpha |",
+                    "| 2  | beta  |",
+                    "| 3  | gamma |",
+                    "+----+-------+",
+                ],
+                &batches
+            );
+
+            // Verify the count still matches.
+            let count = scalar_i64(
+                &harness
+                    .query("SELECT COUNT(*) FROM ljcat.ljs.items")
+                    .await?,
+            )?;
+            assert_eq!(count, 3);
+
+            // Verify directly against the late-joining executor's DataFusion context
+            // that DDL replay actually registered the schema and table. Querying
+            // through the scheduler above is insufficient because the scheduler may
+            // route all reads to executor0 (which had the table pre-join); this
+            // check is immune to that routing decision.
+            let late_executor = harness
+                .executors
+                .last()
+                .expect("late-joining executor must exist");
+            let catalog = late_executor
+                .datafusion()
+                .ctx
+                .catalog("ljcat")
+                .expect("catalog 'ljcat' must be registered on late executor after DDL replay");
+            let schema = catalog
+                .schema("ljs")
+                .expect("schema 'ljs' must exist on late executor after DDL replay");
+            assert!(
+                schema.table_names().contains(&"items".to_string()),
+                "table 'items' must be in schema 'ljs' on late executor after DDL replay"
+            );
+
+            harness.shutdown().await;
+            Ok(())
+        })
+        .await
 }

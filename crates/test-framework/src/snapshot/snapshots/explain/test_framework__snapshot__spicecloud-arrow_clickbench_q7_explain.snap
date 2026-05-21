@@ -14,6 +14,6 @@ description: "Query: clickbench_q7"
 |               |       ProjectionExec: expr=[to_timestamp(CAST(EventDate@0 AS Int64) * 86400) as __common_expr_1]                                                                           |
 |               |         SchemaCastScanExec                                                                                                                                                 |
 |               |           BytesProcessedExec                                                                                                                                               |
-|               |             DataSourceExec: partitions=16, partition_sizes=[1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1519, 1587, 7343]                |
+|               |             DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                                                                                    |
 |               |                                                                                                                                                                            |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

@@ -126,7 +126,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         .help_link(POSTGRES_DOCS),
     ParameterSpec::component("sslrootcert")
         .description(
-            "Path to a PEM-encoded CA certificate used when sslmode is verify-ca/verify-full.",
+            "Path to, or inline PEM content for, a CA certificate used when sslmode is verify-ca/verify-full.",
         )
         .help_link(POSTGRES_DOCS),
     ParameterSpec::component("connection_pool_min_idle")
@@ -166,6 +166,12 @@ const PARAMETERS: &[ParameterSpec] = &[
              Default: 10s.",
         )
         .default("10s"),
+    ParameterSpec::component("replication_bootstrap_batch_size")
+        .description(
+            "Rows per emitted batch during the initial replication snapshot. \
+             Default: 8192. Maximum: 1048576.",
+        )
+        .default("8192"),
 ];
 
 impl DataConnectorFactory for PostgresFactory {
@@ -254,7 +260,6 @@ impl DataConnector for Postgres {
         self
     }
 
-    #[cfg(feature = "postgres-write")]
     async fn read_write_provider(
         &self,
         dataset: &Dataset,
@@ -355,6 +360,7 @@ impl DataConnector for Postgres {
         dataset: &Dataset,
         _accelerated_table_provider: Arc<dyn TableProvider>,
         _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
+        _cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(replication::build_changes_stream(
             &self.params,

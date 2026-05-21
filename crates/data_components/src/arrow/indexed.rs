@@ -164,7 +164,7 @@ impl IndexedMemTable {
                 .sum();
 
             // Always build the hash index when primary key is specified.
-            // IndexedMemTable is only created when hash_index is explicitly enabled,
+            // IndexedMemTable is only created when the runtime requests hash indexing,
             // so we should always create the index even if empty (it will be rebuilt
             // after data is inserted).
             Some(Arc::new(
@@ -482,6 +482,11 @@ impl IndexedMemTable {
         self.inner = self.inner.with_column_defaults(column_defaults);
         self
     }
+
+    /// Deletes one matching row for each row in `rows`, matching by the full Arrow row.
+    pub async fn delete_matching_rows(&self, rows: &RecordBatch) -> Result<u64> {
+        self.inner.delete_matching_rows(rows).await
+    }
 }
 
 /// Represents a primary key value for lookup.
@@ -566,6 +571,7 @@ impl PrimaryKeyValue {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for IndexedMemTable {
     fn as_any(&self) -> &dyn Any {
@@ -800,6 +806,47 @@ impl TableProvider for IndexedMemTable {
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         self.inner.delete_from(state, filters).await
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        self.inner.get_table_definition()
+    }
+
+    fn get_logical_plan(
+        &self,
+    ) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
+        self.inner.get_logical_plan()
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> Result<datafusion::catalog::ScanResult> {
+        let filters = args.filters().unwrap_or(&[]);
+        let projection = args.projection().map(<[usize]>::to_vec);
+        let limit = args.limit();
+        let plan = self
+            .scan(state, projection.as_ref(), filters, limit)
+            .await?;
+        Ok(datafusion::catalog::ScanResult::new(plan))
+    }
+
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        self.inner.statistics()
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.inner.update(state, assignments, filters).await
+    }
+
+    async fn truncate(&self, state: &dyn Session) -> Result<Arc<dyn ExecutionPlan>> {
+        self.inner.truncate(state).await
     }
 }
 
@@ -1135,7 +1182,7 @@ mod tests {
 
     /// Test that an index is always created when primary key is specified,
     /// regardless of row count. This is by design since `IndexedMemTable` is only
-    /// used when `hash_index=enabled` is explicitly specified by the user.
+    /// used when the runtime requests hash indexing.
     #[tokio::test]
     async fn test_always_creates_index_with_primary_key() {
         // Create a small table (only 100 rows)

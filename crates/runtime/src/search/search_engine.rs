@@ -248,7 +248,11 @@ impl SearchEngine {
                 _ => CacheKey::Search(&search_key),
             };
 
-            let raw_cache_key = cache_key.as_raw_key(cache_provider.hasher());
+            let raw_cache_key = {
+                let ns = request_context.cache_namespace();
+                let (ns_tag, ns_id) = ns.hash_inputs();
+                cache_key.as_raw_key_in_namespace(cache_provider.hasher(), ns_tag, ns_id)
+            };
 
             match (
                 cache_control,
@@ -317,6 +321,7 @@ impl SearchEngine {
             additional_columns,
             keywords,
         } = req;
+        let explicit_datasets_requested = data_source_opt.is_some();
 
         let tables = match data_source_opt {
             Some(ts) => ts.iter().map(TableReference::from).collect(),
@@ -365,6 +370,12 @@ impl SearchEngine {
                         generators.append(&mut fts);
                     }
 
+                    if explicit_datasets_requested && generators.is_empty() {
+                        return Err(Error::CannotSearchDataset {
+                            data_source: tbl.clone(),
+                        });
+                    }
+
                     // Ensure columns for a specific table aren't used on all tables.
                     let table_cols: Vec<_> = additional_columns
                         .iter()
@@ -379,7 +390,7 @@ impl SearchEngine {
                         &tbl,
                         get_filter_for_table(&self.df, &tbl, where_cond.as_ref()).await?,
                         table_cols,
-                        primary_keys.iter().map(|pk| Column::from_qualified_name(pk.clone()) ).collect::<Vec<Column>>(),
+                        primary_keys.iter().map(|pk| Column::from_name(pk.clone()) ).collect::<Vec<Column>>(),
                         keywords,
                         *limit
                     ).await.context(SearchPipelineSnafu)?;

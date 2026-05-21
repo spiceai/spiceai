@@ -36,6 +36,12 @@ use test_framework::{
 };
 
 pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
+    if args.test_args.common.concurrency == 0 {
+        return Err(anyhow::anyhow!(
+            "Concurrency should be greater than 0 for an append test"
+        ));
+    }
+
     let query_set = args.test_args.load_query_set()?;
     let query_overrides = args
         .test_args
@@ -57,9 +63,13 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
     let append_test = match SpiceTest::new(
         app.name.clone(),
         NotStarted::new()
-            .with_query_set(query_set.clone(), query_overrides)
+            .with_query_set(
+                query_set.clone(),
+                query_overrides,
+                args.test_args.scale_factor,
+            )
             .await?
-            .with_parallel_count(1)
+            .with_parallel_count(args.test_args.common.concurrency)
             .with_end_duration(Duration::from_secs(args.test_args.common.duration))
             .with_tempdir_path(start_request.get_tempdir_path())
             .with_load_interval(Duration::from_secs(args.load_interval))

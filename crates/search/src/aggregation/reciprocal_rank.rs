@@ -12,6 +12,7 @@ limitations under the License.
 */
 
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::sync::Arc;
 
 use crate::aggregation::from_single_input;
@@ -40,10 +41,58 @@ use snafu::ResultExt;
 /// The underlying score of the search results is not important, only the rank (per stream order).
 /// The rank, for a given entry (for some primary key `a`) is converted to a score using the formula:
 /// ```text
-/// score_a = 1 / (rank_i + offset) + 1 / (rank_j + offset) + ...
+/// score_a = 1 / (rank_i + k) + 1 / (rank_j + k) + ...
 /// ```
-/// Where `rank_i` is the rank of the i-th stream, and `offset` is a constant (e.g. 60).
+/// Where `rank_i` is the rank of the i-th stream, and `k` is a smoothing constant (e.g. 60).
 pub struct ReciprocalRankFusion;
+
+/// Default RRF smoothing parameter used across Spice hybrid search.
+pub const DEFAULT_RRF_K: f64 = 60.0;
+
+const USIZE_TO_F64_CHUNK_BITS: usize = 16;
+const USIZE_TO_F64_CHUNK_BASE: f64 = 65_536.0;
+const USIZE_TO_F64_CHUNK_MASK: usize = (1usize << USIZE_TO_F64_CHUNK_BITS) - 1;
+
+#[must_use]
+pub fn reciprocal_rank_score(rank: usize, k: f64) -> f64 {
+    1.0 / (usize_to_f64(rank) + k)
+}
+
+#[must_use]
+pub fn usize_to_f64(value: usize) -> f64 {
+    let mut remaining = value;
+    let mut multiplier = 1.0;
+    let mut converted = 0.0;
+
+    while remaining > 0 {
+        let chunk_bytes = (remaining & USIZE_TO_F64_CHUNK_MASK).to_le_bytes();
+        let chunk = u16::from_le_bytes([chunk_bytes[0], chunk_bytes[1]]);
+        converted += f64::from(chunk) * multiplier;
+        remaining >>= USIZE_TO_F64_CHUNK_BITS;
+        multiplier *= USIZE_TO_F64_CHUNK_BASE;
+    }
+
+    converted
+}
+
+#[must_use]
+pub fn reciprocal_rank_fusion_scores<K, L, I>(ranked_lists: I, k: f64) -> HashMap<K, f64>
+where
+    K: Eq + Hash,
+    L: IntoIterator<Item = K>,
+    I: IntoIterator<Item = L>,
+{
+    let mut scores = HashMap::new();
+    for ranked_list in ranked_lists {
+        for (rank_index, key) in ranked_list.into_iter().enumerate() {
+            scores
+                .entry(key)
+                .and_modify(|score| *score += reciprocal_rank_score(rank_index + 1, k))
+                .or_insert_with(|| reciprocal_rank_score(rank_index + 1, k));
+        }
+    }
+    scores
+}
 
 #[async_trait]
 impl CandidateAggregation for ReciprocalRankFusion {
@@ -142,7 +191,7 @@ impl CandidateAggregation for ReciprocalRankFusion {
             table_names.as_slice(),
             primary_key.as_slice(),
             additional_columns.as_slice(),
-            60,
+            DEFAULT_RRF_K,
             limit,
         )
         .await
@@ -214,7 +263,7 @@ fn additional_columns_of_schema(schema: &SchemaRef, primary_key: &[Column]) -> V
         .iter()
         .filter_map(|f| {
             let name = f.name();
-            let col = Column::from_qualified_name(f.name());
+            let col = Column::from_name(f.name());
             if [SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME].contains(&name.as_str())
                 || primary_key.contains(&col)
             {
@@ -306,13 +355,12 @@ fn are_types_compatible(t1: &DataType, t2: &DataType) -> bool {
 ///
 /// This function takes already-registered table names from a SessionContext and builds
 /// a logical plan that performs reciprocal rank fusion across them.
-#[expect(clippy::cast_precision_loss)]
 async fn reciprocal_rank_fusion_plan(
     ctx: &SessionContext,
     tables: &[TableReference],
     primary_key: &[Column],
     additional_columns: &[Column],
-    offset: usize,
+    k: f64,
     limit: usize,
 ) -> datafusion::error::Result<LogicalPlan> {
     // 1) Build CTEs that add explicit rank per table, ranking by SEARCH_SCORE_COLUMN_NAME
@@ -364,16 +412,16 @@ async fn reciprocal_rank_fusion_plan(
         )?;
     }
 
-    // 4) Build the RRF score: SUM(COALESCE(1.0/(rank + offset), 0)) across all tables
+    // 4) Build the RRF score: SUM(COALESCE(1.0/(rank + k), 0)) across all tables
     let rrf_score = ranked_plans
         .iter()
         .map(|(table_name, _)| {
             let rank_col = col(Column::new(Some(table_name.clone()), "rank"));
-            let offset_lit = lit(offset as f64);
+            let k_lit = lit(k);
             let score = binary_expr(
                 lit(1.0),
                 Operator::Divide,
-                binary_expr(rank_col, Operator::Plus, offset_lit),
+                binary_expr(rank_col, Operator::Plus, k_lit),
             );
             coalesce(vec![score, lit(0.0)])
         })
@@ -438,6 +486,40 @@ mod tests {
     // If snapshot testing is needed, consider using LogicalPlan's display_indent() or explain methods.
 
     #[test]
+    fn reciprocal_rank_fusion_scores_combines_ranked_lists() {
+        let scores = reciprocal_rank_fusion_scores(
+            vec![vec!["sql", "search"], vec!["search", "table_schema"]],
+            DEFAULT_RRF_K,
+        );
+
+        let search_score = scores
+            .get("search")
+            .expect("search should be present in fused scores");
+        let sql_score = scores
+            .get("sql")
+            .expect("sql should be present in fused scores");
+        let table_schema_score = scores
+            .get("table_schema")
+            .expect("table_schema should be present in fused scores");
+
+        assert!(search_score > sql_score);
+        assert!(sql_score > table_schema_score);
+    }
+
+    #[test]
+    fn reciprocal_rank_score_decreases_past_u32_max_rank() {
+        let u32_max_rank = usize::try_from(u32::MAX).expect("u32::MAX should fit in usize");
+        let larger_rank = u32_max_rank
+            .checked_add(1)
+            .expect("test requires usize wider than u32");
+
+        assert!(
+            reciprocal_rank_score(larger_rank, DEFAULT_RRF_K)
+                < reciprocal_rank_score(u32_max_rank, DEFAULT_RRF_K)
+        );
+    }
+
+    #[test]
     fn test_additional_columns_of_schema() {
         let schema = Arc::new(Schema::new(vec![
             Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Int8, false),
@@ -449,6 +531,34 @@ mod tests {
         assert_eq!(
             additional_columns_of_schema(&schema, primary_keys.as_slice()),
             vec![Column::from_name("additional")]
+        );
+    }
+
+    /// Regression test for #10631: mixed-case column names (e.g. `LocationID`) must
+    /// retain their original casing through `additional_columns_of_schema`. Using
+    /// `Column::from_qualified_name` here would lowercase the identifier and cause
+    /// downstream plan resolution to fail with `No field named locationid` against
+    /// a schema that registered the field as `"LocationID"`.
+    #[test]
+    fn test_additional_columns_of_schema_preserves_mixed_case() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Int8, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Int8, false),
+            Field::new("LocationID", DataType::Utf8, false),
+            Field::new("Borough", DataType::Utf8, false),
+            Field::new("service_zone", DataType::Utf8, false),
+        ]));
+        let primary_keys = vec![Column::from_name("LocationID")];
+        let additional = additional_columns_of_schema(&schema, primary_keys.as_slice());
+        let names: Vec<String> = additional.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["Borough".to_string(), "service_zone".to_string()]
+        );
+        // Make sure no column got lowercased on its way through.
+        assert!(
+            !names.iter().any(|n| n == "borough"),
+            "expected Borough to retain mixed case, got {names:?}"
         );
     }
 

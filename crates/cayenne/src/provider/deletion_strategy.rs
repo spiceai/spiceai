@@ -18,18 +18,184 @@ limitations under the License.
 //!
 //! Defines [`PkDeletionStrategy`] (the strategy kind) and [`PkDeletionStrategyWithCache`]
 //! (the strategy with its associated in-memory caches).
+//!
+//! Caches are held in [`ArcSwap`] cells so that scans probe a wait-free, immutable
+//! snapshot. Writers build a new index off the hot path and publish it via a single
+//! atomic swap; readers never block on a write lock.
 
+use super::deletion_index::{DeletionIndex, KeyDeletionIndex};
 use super::{Error, Result};
-use roaring::RoaringBitmap;
+use arc_swap::ArcSwap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::fmt;
+use std::sync::Arc;
+use vortex_datafusion::VortexAccessPlan;
+use vortex_scan::Selection;
+
+/// Position-based deletion state for a single data file.
+///
+/// Keeps the compact `RoaringBitmap` for write-side set operations and a
+/// prebuilt `VortexAccessPlan` for scan planning. Building the access plan
+/// converts the u32 bitmap into Vortex's u64 `RoaringTreemap`, so doing it once
+/// when a deletion snapshot is published avoids rebuilding the treemap for
+/// every file on every scan.
+pub(crate) struct PositionDeletionVector {
+    row_ids: RoaringBitmap,
+    access_plan: Arc<VortexAccessPlan>,
+}
+
+impl PositionDeletionVector {
+    #[must_use]
+    pub(crate) fn new(row_ids: RoaringBitmap) -> Self {
+        let exclude: RoaringTreemap = row_ids.iter().map(u64::from).collect();
+        let access_plan = Arc::new(
+            VortexAccessPlan::default().with_selection(Selection::ExcludeRoaring(exclude)),
+        );
+
+        Self {
+            row_ids,
+            access_plan,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.row_ids.is_empty()
+    }
+
+    #[must_use]
+    pub(crate) fn len(&self) -> u64 {
+        self.row_ids.len()
+    }
+
+    #[must_use]
+    pub(crate) fn contains(&self, row_id: u32) -> bool {
+        self.row_ids.contains(row_id)
+    }
+
+    #[must_use]
+    pub(crate) fn count_before_row(&self, row_count: usize) -> usize {
+        let deleted_rows = u32::try_from(row_count).map_or_else(
+            |_| self.row_ids.len(),
+            |row_count| self.row_ids.range_cardinality(0..row_count),
+        );
+
+        usize::try_from(deleted_rows).unwrap_or(usize::MAX)
+    }
+
+    #[must_use]
+    pub(crate) fn to_bitmap(&self) -> RoaringBitmap {
+        self.row_ids.clone()
+    }
+
+    #[must_use]
+    pub(crate) fn access_plan(&self) -> Arc<VortexAccessPlan> {
+        Arc::clone(&self.access_plan)
+    }
+}
+
+impl fmt::Debug for PositionDeletionVector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PositionDeletionVector")
+            .field("deleted_rows", &self.row_ids.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Position-based deletion cache keyed by data file path.
+///
+/// The per-file deletion state is `Arc`-wrapped so that publishing a fresh
+/// snapshot through `ArcSwap` only clones a `HashMap<String, Arc<…>>`
+/// (cheap — small string keys + 8-byte Arc pointers), not the bitmap/access-plan
+/// data itself. Without the inner `Arc`, every per-batch delete on a
+/// position-based table cloned every file's full bitmap on each commit,
+/// turning the write into O(total deleted rows) per call. The shared inner type
+/// lets readers and writers share unchanged entries for free; only entries that
+/// the writer actually updates allocate a new `Arc`.
+pub(crate) type PositionBitmap = HashMap<String, Arc<PositionDeletionVector>>;
+
+/// Atomically-published deletion state for single-column `Int64` primary keys.
+#[derive(Debug, Clone)]
+pub struct Int64PkDeletionSnapshot {
+    pub(crate) deleted_pk: Arc<DeletionIndex>,
+    pub(crate) insert_records: Arc<DeletionIndex>,
+}
+
+impl Int64PkDeletionSnapshot {
+    #[must_use]
+    pub(crate) fn empty() -> Self {
+        Self {
+            deleted_pk: Arc::new(DeletionIndex::empty()),
+            insert_records: Arc::new(DeletionIndex::empty()),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn from_arcs(
+        deleted_pk: Arc<DeletionIndex>,
+        insert_records: Arc<DeletionIndex>,
+    ) -> Self {
+        Self {
+            deleted_pk,
+            insert_records,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn from_indices(deleted_pk: DeletionIndex, insert_records: DeletionIndex) -> Self {
+        Self {
+            deleted_pk: Arc::new(deleted_pk),
+            insert_records: Arc::new(insert_records),
+        }
+    }
+}
+
+/// Atomically-published deletion state for row-converter primary keys.
+#[derive(Debug, Clone)]
+pub struct RowConverterDeletionSnapshot {
+    pub(crate) deleted_row_keys: Arc<KeyDeletionIndex>,
+    pub(crate) insert_records: Arc<KeyDeletionIndex>,
+}
+
+impl RowConverterDeletionSnapshot {
+    #[must_use]
+    pub(crate) fn empty() -> Self {
+        Self {
+            deleted_row_keys: Arc::new(KeyDeletionIndex::empty()),
+            insert_records: Arc::new(KeyDeletionIndex::empty()),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn from_arcs(
+        deleted_row_keys: Arc<KeyDeletionIndex>,
+        insert_records: Arc<KeyDeletionIndex>,
+    ) -> Self {
+        Self {
+            deleted_row_keys,
+            insert_records,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn from_indices(
+        deleted_row_keys: KeyDeletionIndex,
+        insert_records: KeyDeletionIndex,
+    ) -> Self {
+        Self {
+            deleted_row_keys: Arc::new(deleted_row_keys),
+            insert_records: Arc::new(insert_records),
+        }
+    }
+}
 
 /// Strategy for primary key-based deletion filtering.
 ///
 /// Determines which cache and filter execution plan to use at query time.
 /// Chosen based on the table's primary key configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PkDeletionStrategy {
+pub(crate) enum PkDeletionStrategy {
     /// No primary key - use position-based deletion with `RoaringBitmap`.
     /// Requires `CoalescePartitionsExec` to ensure consistent ordering.
     PositionBased,
@@ -47,33 +213,65 @@ pub enum PkDeletionStrategy {
 /// - Deletion caches track which rows should be filtered out during scans
 /// - Insert caches (for PK-based strategies) track inserted rows to prevent
 ///   resurrection of previously deleted keys during upserts
+///
+/// All caches are `Arc<ArcSwap<…>>`. Read paths take a wait-free `load_full()`; writers
+/// build a fresh snapshot and `store` it.
 #[derive(Debug, Clone)]
-#[expect(clippy::type_complexity)]
-pub enum PkDeletionStrategyWithCache {
+pub(crate) enum PkDeletionStrategyWithCache {
     /// Position-based deletion tracking using `RoaringBitmap` per file.
     PositionBased {
         /// Maps data file path -> `RoaringBitmap` of file-local row positions.
-        /// Uses Arc-wrapped `HashMap` for zero-copy sharing across concurrent operations.
-        cached_deleted_row_ids: Arc<RwLock<Arc<HashMap<String, RoaringBitmap>>>>,
+        cached_deleted_row_ids: Arc<ArcSwap<PositionBitmap>>,
     },
-    /// Int64 primary key deletion tracking with direct `HashMap<i64, i64>` lookup.
+    /// Int64 primary key deletion tracking with bloom-prefiltered hash index.
     Int64Pk {
-        /// Maps PK (i64) -> `delete_sequence_number` for sequence-based ordering.
-        cached_deleted_pk: Arc<RwLock<Arc<HashMap<i64, i64>>>>,
-        /// Maps PK (i64) -> `insert_sequence_number` for upsert tracking.
-        cached_insert_records: Arc<RwLock<Arc<HashMap<i64, i64>>>>,
+        /// Atomically-published deleted PK and insert-record indexes.
+        deletion_snapshot: Arc<ArcSwap<Int64PkDeletionSnapshot>>,
     },
     /// Composite/non-integer primary key deletion tracking using serialized row keys.
     RowConverterBased {
-        /// Maps PK bytes -> `delete_sequence_number` for sequence-based ordering.
-        cached_deleted_row_keys: Arc<RwLock<Arc<HashMap<Box<[u8]>, i64>>>>,
-        /// Maps PK bytes -> `insert_sequence_number` for upsert tracking.
-        cached_insert_records: Arc<RwLock<Arc<HashMap<Box<[u8]>, i64>>>>,
+        /// Atomically-published deleted row-key and insert-record indexes.
+        deletion_snapshot: Arc<ArcSwap<RowConverterDeletionSnapshot>>,
     },
 }
 
-#[expect(clippy::type_complexity)]
 impl PkDeletionStrategyWithCache {
+    /// Construct a position-based strategy with an empty cache.
+    #[must_use]
+    pub fn empty_position_based() -> Self {
+        Self::PositionBased {
+            cached_deleted_row_ids: Arc::new(ArcSwap::from_pointee(PositionBitmap::new())),
+        }
+    }
+
+    /// Construct an Int64 PK strategy with empty caches.
+    #[must_use]
+    pub fn empty_int64_pk() -> Self {
+        Self::Int64Pk {
+            deletion_snapshot: Arc::new(ArcSwap::from_pointee(Int64PkDeletionSnapshot::empty())),
+        }
+    }
+
+    /// Construct a row-converter-based strategy with empty caches.
+    #[must_use]
+    pub fn empty_row_converter() -> Self {
+        Self::RowConverterBased {
+            deletion_snapshot: Arc::new(ArcSwap::from_pointee(
+                RowConverterDeletionSnapshot::empty(),
+            )),
+        }
+    }
+
+    /// Construct an empty cache matching the given [`PkDeletionStrategy`].
+    #[must_use]
+    pub fn empty_for(strategy: PkDeletionStrategy) -> Self {
+        match strategy {
+            PkDeletionStrategy::PositionBased => Self::empty_position_based(),
+            PkDeletionStrategy::Int64Pk => Self::empty_int64_pk(),
+            PkDeletionStrategy::RowConverterBased => Self::empty_row_converter(),
+        }
+    }
+
     /// Returns the `PkDeletionStrategy` variant for this cache.
     #[must_use]
     pub const fn strategy(&self) -> PkDeletionStrategy {
@@ -98,9 +296,7 @@ impl PkDeletionStrategyWithCache {
 
     /// Returns the position-based deletion cache, if this is a `PositionBased` strategy.
     #[must_use]
-    pub fn position_based_cache(
-        &self,
-    ) -> Option<&Arc<RwLock<Arc<HashMap<String, RoaringBitmap>>>>> {
+    pub(crate) fn position_based_cache(&self) -> Option<&Arc<ArcSwap<PositionBitmap>>> {
         match self {
             Self::PositionBased {
                 cached_deleted_row_ids,
@@ -109,65 +305,32 @@ impl PkDeletionStrategyWithCache {
         }
     }
 
-    /// Returns the Int64 PK deletion cache, if this is an `Int64Pk` strategy.
+    /// Returns the Int64 PK deletion snapshot, if this is an `Int64Pk` strategy.
     #[must_use]
-    pub fn int64_pk_cache(&self) -> Option<&Arc<RwLock<Arc<HashMap<i64, i64>>>>> {
+    pub fn int64_pk_snapshot(&self) -> Option<&Arc<ArcSwap<Int64PkDeletionSnapshot>>> {
         match self {
-            Self::Int64Pk {
-                cached_deleted_pk, ..
-            } => Some(cached_deleted_pk),
+            Self::Int64Pk { deletion_snapshot } => Some(deletion_snapshot),
             _ => None,
         }
     }
 
-    /// Returns the row keys deletion cache, if this is a `RowConverterBased` strategy.
+    /// Returns the row keys deletion snapshot, if this is a `RowConverterBased` strategy.
     #[must_use]
-    pub fn row_keys_cache(&self) -> Option<&Arc<RwLock<Arc<HashMap<Box<[u8]>, i64>>>>> {
+    pub fn row_keys_snapshot(&self) -> Option<&Arc<ArcSwap<RowConverterDeletionSnapshot>>> {
         match self {
-            Self::RowConverterBased {
-                cached_deleted_row_keys,
-                ..
-            } => Some(cached_deleted_row_keys),
-            _ => None,
-        }
-    }
-
-    /// Returns the Int64 insert records cache, if this is an `Int64Pk` strategy.
-    #[must_use]
-    pub fn int64_insert_records_cache(&self) -> Option<&Arc<RwLock<Arc<HashMap<i64, i64>>>>> {
-        match self {
-            Self::Int64Pk {
-                cached_insert_records,
-                ..
-            } => Some(cached_insert_records),
-            _ => None,
-        }
-    }
-
-    /// Returns the row keys insert records cache, if this is a `RowConverterBased` strategy.
-    #[must_use]
-    pub fn row_keys_insert_records_cache(
-        &self,
-    ) -> Option<&Arc<RwLock<Arc<HashMap<Box<[u8]>, i64>>>>> {
-        match self {
-            Self::RowConverterBased {
-                cached_insert_records,
-                ..
-            } => Some(cached_insert_records),
+            Self::RowConverterBased { deletion_snapshot } => Some(deletion_snapshot),
             _ => None,
         }
     }
 
     /// Refresh this cache from a freshly-loaded source.
     ///
-    /// Copies data from `source` into `self`, updating the inner `Arc` values so that
-    /// shared references (e.g., held by `CayenneDeletionSink`) see the updated data.
+    /// Atomically swaps each `ArcSwap` cell to the snapshot held by `source`. Concurrent
+    /// readers see either the old or the new value but never an in-between state.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The strategies don't match (e.g., `Int64Pk` vs `RowConverterBased`)
-    /// - Any lock is poisoned
+    /// Returns an error if the strategies don't match (e.g., `Int64Pk` vs `RowConverterBased`).
     pub fn refresh_from(&self, source: &Self, table_name: &str) -> Result<()> {
         match (self, source) {
             (
@@ -177,32 +340,31 @@ impl PkDeletionStrategyWithCache {
                 Self::PositionBased {
                     cached_deleted_row_ids: fresh,
                 },
-            ) => copy_cache(existing, fresh, table_name),
+            ) => {
+                existing.store(fresh.load_full());
+                Ok(())
+            }
             (
                 Self::Int64Pk {
-                    cached_deleted_pk: existing_pk,
-                    cached_insert_records: existing_insert,
+                    deletion_snapshot: existing,
                 },
                 Self::Int64Pk {
-                    cached_deleted_pk: fresh_pk,
-                    cached_insert_records: fresh_insert,
+                    deletion_snapshot: fresh,
                 },
             ) => {
-                copy_cache(existing_pk, fresh_pk, table_name)?;
-                copy_cache(existing_insert, fresh_insert, table_name)
+                existing.store(fresh.load_full());
+                Ok(())
             }
             (
                 Self::RowConverterBased {
-                    cached_deleted_row_keys: existing_keys,
-                    cached_insert_records: existing_insert,
+                    deletion_snapshot: existing,
                 },
                 Self::RowConverterBased {
-                    cached_deleted_row_keys: fresh_keys,
-                    cached_insert_records: fresh_insert,
+                    deletion_snapshot: fresh,
                 },
             ) => {
-                copy_cache(existing_keys, fresh_keys, table_name)?;
-                copy_cache(existing_insert, fresh_insert, table_name)
+                existing.store(fresh.load_full());
+                Ok(())
             }
             _ => Err(Error::Internal {
                 table: table_name.to_string(),
@@ -214,27 +376,4 @@ impl PkDeletionStrategyWithCache {
             }),
         }
     }
-}
-
-/// Helper to copy data between two `Arc<RwLock<Arc<T>>>` caches.
-///
-/// Used for refreshing deletion/insert caches from freshly-loaded data.
-fn copy_cache<T: Clone>(
-    existing: &Arc<RwLock<Arc<T>>>,
-    fresh: &Arc<RwLock<Arc<T>>>,
-    table_name: &str,
-) -> Result<()> {
-    let fresh_data = {
-        let guard = fresh.read().map_err(|_| Error::LockPoisoned {
-            table: table_name.to_string(),
-            lock: "refresh deletion cache (read)",
-        })?;
-        Arc::clone(&*guard)
-    };
-    let mut guard = existing.write().map_err(|_| Error::LockPoisoned {
-        table: table_name.to_string(),
-        lock: "refresh deletion cache (write)",
-    })?;
-    *guard = fresh_data;
-    Ok(())
 }

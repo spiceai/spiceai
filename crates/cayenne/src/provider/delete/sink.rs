@@ -46,12 +46,14 @@ limitations under the License.
 //! 6. Update in-memory caches for immediate query consistency
 
 use super::super::Error;
-use super::super::constants::{DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED};
-use super::super::deletion_strategy::PkDeletionStrategyWithCache;
+use super::super::deletion_strategy::{
+    Int64PkDeletionSnapshot, PkDeletionStrategyWithCache, RowConverterDeletionSnapshot,
+};
 use super::super::utils::convert_to_u64_box;
 use super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use crate::catalog::MetadataCatalog;
 use crate::metadata::TableMetadata;
+use arc_swap::ArcSwap;
 use arrow::array::ArrayRef;
 use arrow_row::RowConverter;
 use arrow_schema::SchemaRef;
@@ -70,7 +72,7 @@ use datafusion_expr::Expr;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use futures::StreamExt;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
 // Position-based deletion methods implemented in sink/position_based.rs
@@ -89,7 +91,7 @@ pub(crate) mod file_based;
 pub struct CayenneDeletionSink {
     table_metadata: TableMetadata,
     catalog: Arc<dyn MetadataCatalog>,
-    listing_table: Arc<RwLock<Arc<ListingTable>>>,
+    listing_table: Arc<ArcSwap<ListingTable>>,
     schema: SchemaRef,
     filters: Vec<Expr>,
     /// Deletion strategy for this table, with embedded caches.
@@ -112,10 +114,10 @@ pub struct CayenneDeletionSink {
 impl CayenneDeletionSink {
     /// Create a new deletion sink.
     #[expect(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         table_metadata: TableMetadata,
         catalog: Arc<dyn MetadataCatalog>,
-        listing_table: Arc<RwLock<Arc<ListingTable>>>,
+        listing_table: Arc<ArcSwap<ListingTable>>,
         schema: SchemaRef,
         filters: &[Expr],
         pk_deletion_strategy: PkDeletionStrategyWithCache,
@@ -543,16 +545,15 @@ impl CayenneDeletionSink {
     ) -> super::super::Result<u64> {
         let table_name = &self.table_metadata.table_name;
 
-        // Get the row keys cache from the PkDeletionStrategy (only valid for RowConverterBased)
-        let cached_deleted_row_keys =
-            self.pk_deletion_strategy
-                .row_keys_cache()
-                .ok_or_else(|| Error::Internal {
-                    table: table_name.clone(),
-                    message:
-                        "persist_key_based_deletions called with incompatible PkDeletionStrategy"
-                            .to_string(),
-                })?;
+        // Get the row keys snapshot from the PkDeletionStrategy (only valid for RowConverterBased)
+        let deletion_snapshot = self
+            .pk_deletion_strategy
+            .row_keys_snapshot()
+            .ok_or_else(|| Error::Internal {
+                table: table_name.clone(),
+                message: "persist_key_based_deletions called with incompatible PkDeletionStrategy"
+                    .to_string(),
+            })?;
 
         if row_keys.is_empty() {
             return Ok(0);
@@ -560,18 +561,12 @@ impl CayenneDeletionSink {
 
         // Count how many keys are NEW deletions (not already in the cache).
         // This gives an accurate count of newly deleted rows for the return value.
-        let new_deletion_count = {
-            let guard = cached_deleted_row_keys
-                .read()
-                .map_err(|_| Error::LockPoisoned {
-                    table: table_name.clone(),
-                    lock: DELETION_CACHE_LOCK_POISONED,
-                })?;
-            row_keys
-                .iter()
-                .filter(|key| !guard.contains_key(key.as_ref()))
-                .count()
-        };
+        // ArcSwap load is wait-free; the snapshot is immutable for the lifetime of `current`.
+        let current = deletion_snapshot.load_full();
+        let new_deletion_count = row_keys
+            .iter()
+            .filter(|key| current.deleted_row_keys.get(key.as_ref()).is_none())
+            .count();
 
         // Create a temporary metadata with the delete sequence number
         let mut temp_metadata = self.table_metadata.clone();
@@ -599,26 +594,18 @@ impl CayenneDeletionSink {
             }
         };
 
-        // Update the cached deletion keys with sequence number
-        {
-            let mut guard = cached_deleted_row_keys
-                .write()
-                .map_err(|_| Error::LockPoisoned {
-                    table: table_name.clone(),
-                    lock: DELETION_CACHE_LOCK_POISONED,
-                })?;
-
-            let mut updated_map = (**guard).clone();
-            for key in written_row_keys {
-                // Update with max sequence if key already exists
-                updated_map
-                    .entry(key.clone())
-                    .and_modify(|seq| *seq = (*seq).max(delete_sequence))
-                    .or_insert(delete_sequence);
-            }
-
-            *guard = Arc::new(updated_map);
-        }
+        // Build a fresh snapshot with the new deletions and publish via ArcSwap.
+        // Writes are serialised by the per-table write lock so the load+rebuild+store
+        // sequence is race-free.
+        let updated = current.deleted_row_keys.extend_max(
+            written_row_keys
+                .iter()
+                .map(|key| (key.clone(), delete_sequence)),
+        );
+        deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_arcs(
+            Arc::new(updated),
+            Arc::clone(&current.insert_records),
+        )));
 
         let deleted_count =
             convert_to_u64_box(new_deletion_count, "deleted row count").map_err(|e| {
@@ -661,35 +648,27 @@ impl CayenneDeletionSink {
     ) -> super::super::Result<u64> {
         let table_name = &self.table_metadata.table_name;
 
-        // Get the int64 pk cache from the PkDeletionStrategy (only valid for Int64Pk)
-        let cached_deleted_pk_i64 =
-            self.pk_deletion_strategy
-                .int64_pk_cache()
-                .ok_or_else(|| Error::Internal {
-                    table: table_name.clone(),
-                    message:
-                        "persist_int64_pk_deletions called with incompatible PkDeletionStrategy"
-                            .to_string(),
-                })?;
+        // Get the int64 pk snapshot from the PkDeletionStrategy (only valid for Int64Pk)
+        let deletion_snapshot = self
+            .pk_deletion_strategy
+            .int64_pk_snapshot()
+            .ok_or_else(|| Error::Internal {
+                table: table_name.clone(),
+                message: "persist_int64_pk_deletions called with incompatible PkDeletionStrategy"
+                    .to_string(),
+            })?;
 
         if pk_values.is_empty() {
             return Ok(0);
         }
 
         // Count how many PKs are NEW deletions (not already in the cache).
-        // This gives an accurate count of newly deleted rows for the return value.
-        let new_deletion_count = {
-            let guard = cached_deleted_pk_i64
-                .read()
-                .map_err(|_| Error::LockPoisoned {
-                    table: table_name.clone(),
-                    lock: DELETION_CACHE_LOCK_POISONED,
-                })?;
-            pk_values
-                .iter()
-                .filter(|pk| !guard.contains_key(*pk))
-                .count()
-        };
+        // ArcSwap load is wait-free; the snapshot is immutable for the lifetime of `current`.
+        let current = deletion_snapshot.load_full();
+        let new_deletion_count = pk_values
+            .iter()
+            .filter(|pk| current.deleted_pk.get(**pk).is_none())
+            .count();
 
         // For Int64 PK deletions, we store them as key-based deletions
         // where each key is the 8-byte big-endian representation of the i64 value.
@@ -714,26 +693,16 @@ impl CayenneDeletionSink {
 
         self.catalog.add_delete_file(result.delete_file).await?;
 
-        // Update the cached Int64 PK deletion map with sequence number
-        {
-            let mut guard = cached_deleted_pk_i64
-                .write()
-                .map_err(|_| Error::LockPoisoned {
-                    table: table_name.clone(),
-                    lock: DELETION_CACHE_LOCK_POISONED,
-                })?;
-
-            let mut updated_map = (**guard).clone();
-            for &pk_value in &pk_values {
-                // Update with max sequence if key already exists
-                updated_map
-                    .entry(pk_value)
-                    .and_modify(|seq| *seq = (*seq).max(delete_sequence))
-                    .or_insert(delete_sequence);
-            }
-
-            *guard = Arc::new(updated_map);
-        }
+        // Build a fresh snapshot with the new deletions and publish via ArcSwap.
+        // Writes are serialised by the per-table write lock so the load+rebuild+store
+        // sequence is race-free.
+        let updated = current
+            .deleted_pk
+            .extend_max(pk_values.iter().map(|&pk| (pk, delete_sequence)));
+        deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_arcs(
+            Arc::new(updated),
+            Arc::clone(&current.insert_records),
+        )));
 
         let deleted_count =
             convert_to_u64_box(new_deletion_count, "deleted row count").map_err(|e| {
@@ -790,13 +759,11 @@ impl DeletionSink for CayenneDeletionSink {
             Arc::clone(&self.runtime_env),
         );
 
-        let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| Error::LockPoisoned {
-                table: self.table_metadata.table_name.clone(),
-                lock: LISTING_TABLE_LOCK_POISONED,
-            })?;
-            Arc::clone(&guard)
-        };
+        // Wait-free ArcSwap snapshot. Concurrent listing-table refreshes are
+        // serialized against this code path by `self.write_lock`, which the
+        // caller holds (or, for sub-sinks, is held by the orchestrating
+        // operation), so we never observe a torn swap here.
+        let listing_table = self.listing_table.load_full();
 
         // Collect all tables to scan: main listing table + protected snapshots
         let mut all_tables = vec![Arc::clone(&listing_table)];

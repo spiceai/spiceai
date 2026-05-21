@@ -14,38 +14,39 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::ClusterTlsConfig;
 use super::composite_flight_service::CompositeFlightService;
 use crate::auth::EndpointAuth;
 use crate::cluster::ExecutorRegistry;
 use crate::cluster::{ClusterServiceImpl, SchedulerPeers};
 use crate::flight::middleware::{RequestContextLayer, WriteRateLimitLayer};
 use crate::flight::{Error, Service as SpiceFlightService, is_address_in_use_error, session_auth};
+use crate::tls::flight_incoming::tls_incoming;
 use crate::{Runtime, metrics as runtime_metrics};
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 use governor::RateLimiter;
 use runtime_auth::layer::flight::BasicAuthLayer;
 use runtime_proto::cluster_service_server::ClusterServiceServer;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::{Server, ServerTlsConfig};
+use tonic::transport::Server;
 
 type ClusterServerResult<T> = std::result::Result<T, Error>;
 
-/// Configures a tonic server with mTLS using the cluster TLS configuration.
-///
-/// This enables mutual TLS: the server presents its certificate and requires
-/// clients to present valid certificates signed by the cluster CA.
-fn server_with_cluster_mtls(
-    server: Server,
-    tls_config: &ClusterTlsConfig,
-) -> Result<Server, tonic::transport::Error> {
-    let server_tls_config = ServerTlsConfig::new()
-        .identity(tls_config.server_identity.clone())
-        .client_ca_root(tls_config.ca_certificate.clone());
-
-    server.tls_config(server_tls_config)
+/// Bind a TCP listener for the cluster server, mapping `AddrInUse` to the
+/// dedicated error variant so the caller's logs stay consistent.
+async fn bind_cluster_listener(bind_address: SocketAddr) -> Result<TcpListener, Error> {
+    TcpListener::bind(bind_address).await.map_err(|source| {
+        if source.kind() == std::io::ErrorKind::AddrInUse {
+            Error::AddressAlreadyInUse {
+                addr: bind_address.to_string(),
+            }
+        } else {
+            Error::UnableToBindClusterListener { source }
+        }
+    })
 }
 
 /// Starts the internal cluster gRPC server for scheduler mode.
@@ -73,13 +74,11 @@ pub async fn start_internal_cluster_server(
         return Err(Error::ClusterSchedulerNotInitialized {});
     };
 
-    let tls_config = rt.df.cluster_config.tls_config();
-    let mtls_enabled = tls_config.is_some();
+    let cluster_server_config = rt.df.cluster_config.cluster_server_config();
+    let mtls_enabled = cluster_server_config.is_some();
     let mut server = Server::builder();
 
-    if let Some(tls_config) = tls_config {
-        server = server_with_cluster_mtls(server, tls_config)
-            .map_err(|source| Error::UnableToConfigureTls { source })?;
+    if mtls_enabled {
         tracing::info!("Cluster mTLS enabled for internal cluster server");
     } else if !rt.df.cluster_config.allow_insecure_connections() {
         return Err(Error::InsecureConfiguration {
@@ -135,22 +134,35 @@ pub async fn start_internal_cluster_server(
             mtls_enabled,
         )
     };
+
     let cluster_service_server = ClusterServiceServer::new(cluster_service);
 
     let server = server
         .add_service(scheduler_grpc_server)
         .add_service(cluster_service_server);
 
-    tracing::info!("Spice Runtime internal cluster server listening on {bind_address}");
-
-    if let Some(token) = shutdown_signal {
+    let serve_result = if let Some(server_config) = cluster_server_config {
+        let listener = bind_cluster_listener(bind_address).await?;
+        tracing::info!("Spice Runtime internal cluster server listening on {bind_address}");
+        let incoming = tls_incoming(listener, server_config);
+        if let Some(token) = shutdown_signal {
+            server
+                .serve_with_incoming_shutdown(incoming, token.cancelled())
+                .await
+        } else {
+            server.serve_with_incoming(incoming).await
+        }
+    } else if let Some(token) = shutdown_signal {
+        tracing::info!("Spice Runtime internal cluster server listening on {bind_address}");
         server
             .serve_with_shutdown(bind_address, token.cancelled())
             .await
     } else {
+        tracing::info!("Spice Runtime internal cluster server listening on {bind_address}");
         server.serve(bind_address).await
-    }
-    .map_err(|e| {
+    };
+
+    serve_result.map_err(|e| {
         if is_address_in_use_error(&e) {
             return Error::AddressAlreadyInUse {
                 addr: bind_address.to_string(),
@@ -177,22 +189,20 @@ pub async fn start_executor_flight_server(
     endpoint_auth: EndpointAuth,
     shutdown_signal: Option<CancellationToken>,
 ) -> ClusterServerResult<()> {
-    let tls_config = rt.df.cluster_config.tls_config();
+    let cluster_server_config = rt.df.cluster_config.cluster_server_config();
     let has_flight_auth = endpoint_auth.flight_basic_auth.is_some();
 
     // In executor mode, never allow unauthenticated Flight DoPut without mTLS.
     // Scheduler-trusted forwarding mode requires authenticated scheduler identity via mTLS.
-    if !has_flight_auth && tls_config.is_none() {
+    if !has_flight_auth && cluster_server_config.is_none() {
         return Err(Error::InsecureConfiguration {
             message: "Executor Flight server requires either API key auth or cluster mTLS. Configure endpoint auth or enable mTLS for scheduler-trusted forwarding.".to_string(),
         });
     }
 
-    let mut server = Server::builder();
+    let server = Server::builder();
 
-    if let Some(tls_config) = tls_config {
-        server = server_with_cluster_mtls(server, tls_config)
-            .map_err(|source| Error::UnableToConfigureTls { source })?;
+    if cluster_server_config.is_some() {
         tracing::info!("Cluster mTLS enabled for executor flight server");
     } else if !rt.df.cluster_config.allow_insecure_connections() {
         return Err(Error::InsecureConfiguration {
@@ -212,8 +222,10 @@ pub async fn start_executor_flight_server(
     }
 
     // Create composite Flight service that handles both Ballista and Spice protocols
-    let spice_service =
-        SpiceFlightService::new(endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone));
+    let spice_service = SpiceFlightService::new(
+        endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
+        rt.datafusion().data_update_broadcaster(),
+    );
     let session_store = spice_service.session_store();
     let composite_service = CompositeFlightService::new(spice_service);
 
@@ -269,17 +281,32 @@ pub async fn start_executor_flight_server(
         None => bind_address,
     };
 
-    tracing::info!("Spice Runtime executor Flight listening on {bind_address}");
-    runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
-
-    if let Some(token) = shutdown_signal {
+    let serve_result = if let Some(server_config) = cluster_server_config {
+        let listener = bind_cluster_listener(bind_address).await?;
+        // Bind succeeded — emit started log + metric only now.
+        tracing::info!("Spice Runtime executor Flight listening on {bind_address}");
+        runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
+        let incoming = tls_incoming(listener, server_config);
+        if let Some(token) = shutdown_signal {
+            server
+                .serve_with_incoming_shutdown(incoming, token.cancelled())
+                .await
+        } else {
+            server.serve_with_incoming(incoming).await
+        }
+    } else if let Some(token) = shutdown_signal {
+        tracing::info!("Spice Runtime executor Flight listening on {bind_address}");
+        runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
         server
             .serve_with_shutdown(bind_address, token.cancelled())
             .await
     } else {
+        tracing::info!("Spice Runtime executor Flight listening on {bind_address}");
+        runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
         server.serve(bind_address).await
-    }
-    .map_err(|e| {
+    };
+
+    serve_result.map_err(|e| {
         if is_address_in_use_error(&e) {
             return Error::AddressAlreadyInUse {
                 addr: bind_address.to_string(),

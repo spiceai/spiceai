@@ -59,6 +59,7 @@ use crate::{
     dataaccelerator::{
         FilePathError,
         snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
+        storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
     },
     datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
@@ -324,22 +325,80 @@ impl TursoAccelerator {
 
         let mut pools = self.pools.lock().await;
         if let Some(pool) = pools.get(&turso_file) {
-            Ok(Arc::clone(pool))
-        } else {
-            let pool = Arc::new(
-                TursoConnectionPool::new_with_timestamp_format(&turso_file, timestamp_format)
-                    .await
-                    .map_err(|e| match e {
-                        data_components::turso::Error::TursoDatabaseError { source } => {
-                            Error::TursoDatabaseError { source }
-                        }
-                        _ => Error::AccelerationCreationFailed {
-                            source: Box::new(e),
-                        },
-                    })?,
+            return Ok(Arc::clone(pool));
+        }
+
+        // Resolve storage profile so we can tune per-storage pragmas. Skip
+        // detection for in-memory databases; they have no on-disk footprint.
+        let storage = if source.is_file_accelerated() {
+            let configured = source
+                .acceleration()
+                .map(|a| a.storage_profile)
+                .unwrap_or_default();
+            let resolved = resolve_acceleration_storage_async(configured, &turso_file).await;
+            tracing::debug!(
+                target: "spiced::acceleration::turso",
+                configured = %configured,
+                resolved = ?resolved,
+                file = %turso_file,
+                "Resolved acceleration storage profile for Turso pool"
             );
-            pools.insert(turso_file, Arc::clone(&pool));
-            Ok(pool)
+            resolved
+        } else {
+            ResolvedAccelerationStorage::Unknown
+        };
+
+        let pool = Arc::new(
+            TursoConnectionPool::new_with_timestamp_format(&turso_file, timestamp_format)
+                .await
+                .map_err(|e| match e {
+                    data_components::turso::Error::TursoDatabaseError { source } => {
+                        Error::TursoDatabaseError { source }
+                    }
+                    _ => Error::AccelerationCreationFailed {
+                        source: Box::new(e),
+                    },
+                })?,
+        );
+
+        // Apply storage-aware pragmas after the pool's own MVCC initialization.
+        let pragmas = Self::storage_setup_pragmas(storage);
+        if !pragmas.is_empty() {
+            let conn = pool.connect().await.map_err(|e| match e {
+                data_components::turso::Error::TursoDatabaseError { source } => {
+                    Error::TursoDatabaseError { source }
+                }
+                _ => Error::AccelerationCreationFailed {
+                    source: Box::new(e),
+                },
+            })?;
+            for (name, value) in pragmas {
+                conn.pragma_update(name, value)
+                    .await
+                    .context(TursoDatabaseSnafu)?;
+            }
+        }
+
+        pools.insert(turso_file, Arc::clone(&pool));
+        Ok(pool)
+    }
+
+    /// Per-storage SQLite/Turso pragma overrides applied after pool creation.
+    ///
+    /// On EBS-class network-attached storage we bump the page cache and enable
+    /// mmap to absorb random I/O latency. Local SSD, tmpfs, and unknown
+    /// storage keep the engine defaults.
+    fn storage_setup_pragmas(
+        storage: ResolvedAccelerationStorage,
+    ) -> &'static [(&'static str, &'static str)] {
+        match storage {
+            // 200_000 KiB is about a 200 MiB page cache, plus a 256 MiB mmap window.
+            ResolvedAccelerationStorage::Ebs => {
+                &[("cache_size", "-200000"), ("mmap_size", "268435456")]
+            }
+            ResolvedAccelerationStorage::LocalSsd
+            | ResolvedAccelerationStorage::Tmpfs
+            | ResolvedAccelerationStorage::Unknown => &[],
         }
     }
 }
@@ -469,6 +528,7 @@ impl DataAccelerator for TursoAccelerator {
                         )),
                         AccelerationEngine::Turso,
                         Arc::new(arrow_schema::Schema::empty()),
+                        None,
                     )
                     .await;
 
@@ -487,6 +547,7 @@ impl DataAccelerator for TursoAccelerator {
                 source,
                 runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
                 AccelerationEngine::Turso,
+                None,
             )
             .await;
 
@@ -661,7 +722,7 @@ impl DataAccelerator for TursoAccelerator {
 
         let turso_provider = Arc::new(
             TursoTableProvider::new(schema, table_name, pool)
-                .with_function_support(deny_spice_specific_functions().clone()),
+                .with_function_support(deny_spice_specific_functions().as_ref().clone()),
         );
 
         // Wrap in PolyTableProvider for proper read/write separation
@@ -690,6 +751,42 @@ impl DataAccelerator for TursoAccelerator {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    fn supports_snapshot_reload(&self) -> bool {
+        true
+    }
+
+    /// Reloads the Turso-backed table provider from the snapshot file that
+    /// was just written to the primary path.
+    ///
+    /// Drops the previous provider, evicts the cached `TursoConnectionPool`
+    /// from the per-accelerator `pools` map (keyed by the on-disk file path),
+    /// and then re-runs the registry factory to build a fresh provider over
+    /// the new on-disk contents. Without the eviction step, the next
+    /// `provider_factory()` call would re-use the cached pool and its open
+    /// connections, which can continue to observe the prior file's pages.
+    async fn reload_from_snapshot(
+        &self,
+        source: &dyn AccelerationSource,
+        previous_provider: Arc<dyn TableProvider>,
+        provider_factory: super::ReloadProviderFactory,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        drop(previous_provider);
+
+        let turso_file = self
+            .turso_file_path(source)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+        // Drop the cached pool entry so the factory rebuild opens the file
+        // fresh. Existing `Arc<TursoConnectionPool>` clones held by the
+        // previous provider have already been dropped above; once the last
+        // strong reference is released the pool's connections are closed.
+        {
+            let mut pools = self.pools.lock().await;
+            pools.remove(&turso_file);
+        }
+
+        provider_factory().await
     }
 
     async fn drop_table(

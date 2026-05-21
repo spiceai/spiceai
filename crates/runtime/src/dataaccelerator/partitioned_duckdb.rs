@@ -36,10 +36,9 @@ use datafusion::{
     sql::unparser::expr_to_sql,
 };
 use datafusion_table_providers::{
-    duckdb::{DuckDBSettingsRegistry, DuckDBTableProviderFactory},
+    duckdb::DuckDBTableProviderFactory,
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
 };
-use duckdb::AccessMode;
 use runtime_table_partition::{
     Partition,
     creator::{
@@ -54,12 +53,11 @@ use tokio::{fs::create_dir_all, sync::Mutex};
 
 use super::{
     AccelerationSource, BootstrapStatus, DataAccelerator,
-    duckdb::{DuckDBAccelerator, create_table_provider, settings::OrderByNonIntegerLiteral},
+    duckdb::{DuckDBAccelerator, create_factory, create_table_provider},
 };
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
-    dataaccelerator::FilePathError,
-    datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_functions_for_duckdb},
+    dataaccelerator::{FilePathError, storage::resolve_acceleration_storage_async},
     parameters::ParameterSpec,
     register_data_accelerator, spice_data_base_path,
 };
@@ -194,8 +192,14 @@ impl PartitionedDuckDBAccelerator {
             .join("checkpoint.db")
             .display()
             .to_string();
+        let storage = match source.acceleration() {
+            Some(acceleration) => {
+                resolve_acceleration_storage_async(acceleration.storage_profile, &duckdb_path).await
+            }
+            None => super::storage::ResolvedAccelerationStorage::Unknown,
+        };
 
-        get_pool(&self.duckdb_factory, &duckdb_path)
+        get_pool(&self.duckdb_factory, &duckdb_path, storage)
             .await
             .context(FailedToCreateCheckpointingPoolSnafu)
     }
@@ -447,9 +451,13 @@ impl PartitionCreator for DuckDBPartitionCreator {
                 .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
             let duckdb_path = path.display().to_string();
-            get_pool(&self.duckdb_factory, &duckdb_path)
-                .await
-                .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
+            get_pool(
+                &self.duckdb_factory,
+                &duckdb_path,
+                super::storage::ResolvedAccelerationStorage::Unknown,
+            )
+            .await
+            .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
             let table_provider = create_table_provider(&self.duckdb_factory, &cmd, None)
                 .await
@@ -486,22 +494,19 @@ impl PartitionCreator for DuckDBPartitionCreator {
     }
 }
 
-fn create_factory() -> DuckDBTableProviderFactory {
-    DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
-        .with_dialect(new_duckdb_dialect())
-        .with_settings_registry(
-            DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
-        )
-        .with_function_support(deny_spice_functions_for_duckdb().clone())
-}
-
 async fn get_pool(
     duckdb_factory: &DuckDBTableProviderFactory,
     duckdb_path: &str,
+    storage: super::storage::ResolvedAccelerationStorage,
 ) -> Result<Arc<DuckDbConnectionPool>, datafusion_table_providers::duckdb::Error> {
-    let pool_builder = DuckDbConnectionPoolBuilder::file(duckdb_path)
-        .with_max_size(Some(10))
-        .with_min_idle(Some(10));
+    let max_size = DuckDBAccelerator::default_connection_pool_size(storage);
+    let min_idle = DuckDBAccelerator::get_pool_min_idle(storage, max_size);
+    let mut pool_builder = DuckDbConnectionPoolBuilder::file(duckdb_path)
+        .with_max_size(Some(max_size))
+        .with_min_idle(Some(min_idle));
+    for pragma in DuckDBAccelerator::storage_setup_queries(storage) {
+        pool_builder = pool_builder.with_connection_setup_query(*pragma);
+    }
     Ok(Arc::new(
         duckdb_factory
             .get_or_init_instance_with_builder(pool_builder)

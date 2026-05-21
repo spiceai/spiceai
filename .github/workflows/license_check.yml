@@ -44,7 +44,7 @@ jobs:
     name: Check Rust Licenses
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
 
@@ -52,7 +52,10 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny || true
+        run: cargo install cargo-deny --version 0.19.6 --locked --force
 
       - name: Check Rust Licenses
         run: cargo deny check licenses
+
+      - name: Check Rust Advisories
+        run: cargo deny check advisories

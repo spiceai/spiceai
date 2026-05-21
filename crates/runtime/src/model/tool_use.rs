@@ -46,6 +46,7 @@ use tracing::{Instrument, Span};
 
 use crate::Runtime;
 use crate::model::ModelContextExtension;
+use crate::tools::utils::tool_call_error_response;
 use llms::progress::Progress;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
@@ -107,10 +108,17 @@ impl ToolUsingChat {
         &self,
         list_datasets: &Arc<dyn SpiceModelTool>,
     ) -> Result<Vec<ChatCompletionRequestMessage>, OpenAIError> {
-        let t_resp = list_datasets
-            .call("")
-            .await
-            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+        let t_resp = match list_datasets.call("").await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let tool_name = list_datasets.name();
+                let error = e.to_string();
+                tracing::warn!(
+                    "Tool '{tool_name}' failed while creating initial tool-use messages: {error}"
+                );
+                tool_call_error_response(tool_name.as_ref(), error)
+            }
+        };
         Ok(vec![
             ChatCompletionRequestAssistantMessageArgs::default()
                 .tool_calls(vec![ChatCompletionMessageToolCalls::Function(
@@ -166,10 +174,7 @@ impl ToolUsingChat {
                             .content(e.to_string())
                             .to_jsonl(),
                     );
-                    Value::String(format!(
-                        "Failed to call the tool {}.\nAn error occurred: {e}",
-                        t.name()
-                    ))
+                    tool_call_error_response(t.name().as_ref(), e)
                 }
             },
             None => {
@@ -406,6 +411,7 @@ impl ToolUsingChat {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl Chat for ToolUsingChat {
     async fn run(&self, prompt: String) -> ChatResult<Option<String>> {

@@ -19,7 +19,7 @@ name = "connector-databricks"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "Databricks data and catalog connector for Spice.ai runtime"
 
 [dependencies]
@@ -32,6 +32,7 @@ linkme.workspace = true
 opentelemetry.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime", features = ["databricks"] }
+runtime-rate-control = { path = "../../runtime-rate-control" }
 runtime-secrets = { path = "../../runtime-secrets", default-features = false }
 secrecy.workspace = true
 snafu.workspace = true

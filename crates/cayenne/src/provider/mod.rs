@@ -34,18 +34,50 @@ limitations under the License.
 //!
 //! # Module Organization
 //!
-//! - [`table`]: Main `CayenneTableProvider` implementation
-//! - [`delete`]: Deletion vector handling and filtering
-//! - [`streaming`]: Streaming execution plan for write operations
-//! - [`utils`]: Numeric conversion utilities
-//! - [`constants`]: Shared constants
-//! - [`context`]: Shared context for Cayenne operations
-//! - [`staging_wal`]: Staging WAL for crash-safe staged appends
+//! - [`table`]: `CayenneTableProvider` implementation — schema, deletion strategy,
+//!   listing-fence, snapshot state, post-write maintenance scheduler, and the
+//!   `DataFusion` `TableProvider` impl.
+//! - [`scan`]: `CayenneAccelerationExec` wrapper and round-robin repartitioning
+//!   used to fan unsorted writes across multiple writer partitions.
+//! - [`vortex_format`]: `DeletionFilteringVortexFormat` wrapping
+//!   `vortex_datafusion::VortexFormat` to attach per-file position-based
+//!   deletion vectors and to gate decimal→float predicate pushdown.
+//! - [`sink`]: `CayenneDataSink` — `DataFusion` `DataSink` adapter that the
+//!   regular (non-CDC) write path uses for both append and overwrite modes.
+//! - [`mutation_writer`]: `AppendMutationWriter` — append-side write logic,
+//!   inline-memtable admission, and `write_cdc_pipelined` for the Stage A /
+//!   Stage B CDC path consumed by `runtime/src/accelerated_table/refresh_task`.
+//! - [`staging_wal`]: Staging WAL for crash-safe staged appends. Three-phase
+//!   commit lifecycle: `prepare` (write WAL) → `apply_under_barrier` (move +
+//!   listing-cache invalidation) → `finish` (drop write guard).
+//! - [`overwrite`]: Catalog-pointer-flip path for overwrite-mode writes.
+//! - [`delete`]: Deletion vector handling and filtering.
+//!   - [`delete::sink`]: position- and key-based deletion sinks for SQL `DELETE`.
+//!   - [`delete::filter_exec`]: `Int64PkDeletionFilterExec` and
+//!     `KeyBasedDeletionFilterExec` — per-row PK probes applied at scan time.
+//!   - [`delete::vector_io`]: Arrow IPC deletion-vector file writer / reader.
+//! - [`deletion_index`]: Bloom-prefiltered `DeletionIndex` (Int64 PKs) and
+//!   `KeyDeletionIndex` (composite byte keys) used by the filter execs.
+//! - [`deletion_strategy`]: `PkDeletionStrategyWithCache` — the per-table
+//!   deletion strategy and its atomically-published `ArcSwap<DeletionSnapshot>`.
+//! - [`compaction`]: Tiered small-files picker and `BackgroundCompactor`.
+//! - [`retention`]: Time-based retention filter builder + SQL retention DDL.
+//! - [`streaming`]: Streaming execution plan for write operations.
+//! - [`context`]: `CayenneContext` — shared Vortex format, upload semaphore,
+//!   `RuntimeEnv`, and config.
+//! - [`utils`]: Numeric conversion utilities.
+//! - [`constants`]: Staging-dir name, WAL filename, and other shared constants.
+//! - [`partitioned_wal`]: Cross-partition WAL for the partitioned-table
+//!   coordinator (feature-gated).
+pub(crate) mod compaction;
 pub(crate) mod constants;
 pub(crate) mod context;
 pub(crate) mod delete;
 pub mod deletion_index;
 pub(crate) mod deletion_strategy;
+pub(crate) mod mutation_writer;
+pub(crate) mod overwrite;
+pub mod partitioned_wal;
 pub(crate) mod retention;
 pub(crate) mod scan;
 pub(crate) mod sink;
@@ -57,12 +89,12 @@ pub(crate) mod vortex_format;
 
 // Re-export the main type at the module level for convenience
 pub use context::CayenneContext;
-pub use deletion_strategy::{PkDeletionStrategy, PkDeletionStrategyWithCache};
+pub use overwrite::PreparedOverwrite;
+pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
-pub use staging_wal::CayenneStagedAppend;
-pub use table::{CayenneTableProvider, CayenneTableProviderBuilder};
-pub use vortex_format::{DeletionFilteringVortexFormat, attach_deletion_vectors_to_config};
+pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
+pub use table::{CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder};
 
 // Re-export deletion utilities for advanced use cases
 pub use delete::CayenneDeletionSink;
@@ -741,6 +773,14 @@ mod tests {
             .await
             .expect("Failed to insert data");
 
+        // Ordinary writes are intentionally unsorted for throughput.
+        // Compaction (sort_and_rewrite_data) sorts the data and flushes inline
+        // rows to Vortex files with tight zone-map bounds.
+        table
+            .sort_and_rewrite_data(128 * 1024 * 1024)
+            .await
+            .expect("Failed to sort and rewrite data");
+
         // Verify data is sorted by timestamp, then by id
         let ctx = SessionContext::new();
         let scan_plan = table
@@ -999,12 +1039,23 @@ mod tests {
         .await
         .expect("Failed to create table for upsert restart test");
 
-        // Initial insert.
+        // Initial insert. Use enough rows to bypass inlining so this test keeps
+        // exercising the file-backed upsert path and its insert-record metadata.
+        let initial_row_count = table::INLINE_MAX_ROWS + 1;
+        let mut emails: Vec<String> = (0..initial_row_count)
+            .map(|idx| format!("user{idx}@sample.com"))
+            .collect();
+        emails[0] = "alice@sample.com".to_string();
+        let mut items_bought: Vec<i64> = (0..initial_row_count)
+            .map(|idx| i64::try_from(idx).expect("test row index fits in i64"))
+            .collect();
+        items_bought[0] = 100;
+
         let batch1 = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                Arc::new(StringArray::from(vec!["alice@sample.com"])),
-                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(emails)),
+                Arc::new(Int64Array::from(items_bought)),
             ],
         )
         .expect("to create initial batch");
@@ -1083,5 +1134,97 @@ mod tests {
             .expect("items_bought should be Int64")
             .value(0);
         assert_eq!(value, 101, "Latest upserted value should be visible");
+    }
+
+    /// Verifies that `CayenneDataSink::write_all` normalizes incoming batch schemas
+    /// to match the table schema. CDC (Debezium) batches can arrive with `NonNullable`
+    /// columns when the table schema declares them as `Nullable`, which would cause a
+    /// Vortex assertion failure without normalization.
+    #[tokio::test]
+    async fn test_insert_normalizes_nullable_schema_mismatch() {
+        let temp_dir = TempDir::new()
+            .expect("Failed to create temporary directory for schema normalization test");
+        let db_path = temp_dir.path().join("cayenne_schema_norm_test.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+
+        let catalog = Arc::new(
+            CayenneCatalog::new(&connection_string)
+                .expect("Failed to create CayenneCatalog instance"),
+        );
+        catalog.init().await.expect("to initialize catalog");
+
+        // Table schema: id NOT NULL, name NULLABLE
+        let table_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let table_options = CreateTableOptions {
+            table_name: "schema_norm_test".to_string(),
+            schema: Arc::clone(&table_schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: temp_dir.path().to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider =
+            CayenneTableProvider::create_table(catalog_trait, table_options, ctx.runtime_env())
+                .await
+                .expect("to create Cayenne table");
+
+        // Input schema: id NULLABLE (mismatches table's NOT NULL), name NULLABLE
+        // This simulates what CDC/Debezium sends — all columns as nullable.
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let input_batch = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+                Arc::new(StringArray::from(vec![Some("Alice"), Some("Bob")])),
+            ],
+        )
+        .expect("to create input batch");
+
+        // Insert with mismatched nullability — should succeed after normalization
+        let input_exec =
+            MemorySourceConfig::try_new_exec(&[vec![input_batch]], Arc::clone(&input_schema), None)
+                .expect("to create MemorySourceConfig");
+
+        let insert_plan = provider
+            .insert_into(&ctx.state(), input_exec, InsertOp::Append)
+            .await
+            .expect("to insert into table with mismatched nullability");
+
+        collect(insert_plan, ctx.task_ctx())
+            .await
+            .expect("to execute insert");
+        // Verify the data is readable and the output schema matches the table schema
+        let scan_plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("to create scan plan after normalized insert");
+
+        let result = collect(scan_plan, ctx.task_ctx())
+            .await
+            .expect("to collect scan results");
+
+        let total_rows: usize = result.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 2, "Expected 2 rows after insert");
+
+        // The output schema must match the table schema (Nullable for name),
+        // not the input schema
+        assert_eq!(
+            result[0].schema(),
+            table_schema,
+            "Output schema should match the table schema, not the input schema"
+        );
     }
 }

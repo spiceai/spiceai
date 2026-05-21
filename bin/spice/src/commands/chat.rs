@@ -18,9 +18,10 @@ limitations under the License.
 
 use crate::context::RuntimeContext;
 use crate::error::{
-    ConnectionFailedSnafu, InvalidResponseSnafu, ModelNotFoundSnafu, NoModelsConfiguredSnafu,
-    Result,
+    ConnectionFailedSnafu, InvalidArgumentSnafu, InvalidResponseSnafu, ModelNotFoundSnafu,
+    NoModelsConfiguredSnafu, Result,
 };
+use crate::output::{OutputFormat, write_json};
 use clap::Args;
 use futures::StreamExt;
 use repl::util::{Spinner, create_editor_with_history, save_history};
@@ -31,25 +32,54 @@ use std::time::Instant;
 
 /// Arguments for the `chat` command.
 #[derive(Args, Debug)]
+#[command(
+    about = "Chat with a configured LLM through the runtime's OpenAI-compatible API",
+    long_about = r#"Chat with an LLM hosted by the Spice runtime.
+
+With no message, opens an interactive REPL. With a positional message,
+streams a single response and exits (non-interactive mode). The model must be
+registered in `spicepod.yaml` under `models:` and reported by `spice models`.
+
+The `-p` and `-chat` forms are root-level shortcuts for one-shot prompts. Quote
+multi-word prompts so the shell passes them as one argument.
+
+EXAMPLES
+    spice -chat "Summarize loaded datasets"       # One-shot prompt with the only configured model
+    spice -p --model llm "Summarize TPC-H Q1"     # One-shot prompt with a specific model
+  spice chat                                    # Interactive REPL (prompts to pick a model)
+  spice chat --model llm                        # REPL with a specific model
+  spice chat --model llm "Summarize TPC-H Q1"  # One-shot non-interactive query
+  echo "What datasets are loaded?" | spice chat --model llm
+
+Docs: https://spiceai.org/docs"#
+)]
 pub struct ChatArgs {
-    /// Model to use for chat
+    /// Model id to use (must be registered under `models:` in `spicepod.yaml`).
     #[arg(long, short)]
     pub model: Option<String>,
 
-    /// Single message to send (non-interactive mode)
+    /// Require a prompt and auto-select only when exactly one model is configured.
+    #[arg(long, hide = true)]
+    pub direct_prompt: bool,
+
+    /// Single message to send (skip the REPL and exit after streaming the response).
     pub message: Option<String>,
 
-    /// Temperature for sampling (0.0 = deterministic, higher = more random)
+    /// Sampling temperature (0.0 = deterministic, higher = more random).
     #[arg(long)]
     pub temperature: Option<f32>,
 
-    /// Remote Spice instance HTTP endpoint (e.g., `http://localhost:8090`)
+    /// Override the runtime HTTP endpoint (e.g. `http://localhost:8090`).
     #[arg(long)]
     pub endpoint: Option<String>,
 
-    /// Custom HTTP headers in format 'Key:Value' (can be specified multiple times)
+    /// Custom HTTP headers in `Key:Value` form (repeatable).
     #[arg(long = "headers", value_name = "KEY:VALUE")]
     pub custom_headers: Vec<String>,
+
+    /// Output format for one-shot responses
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 /// Configuration for chat operations.
@@ -58,6 +88,11 @@ struct ChatConfig<'a> {
     temperature: Option<f32>,
     endpoint: Option<&'a str>,
     custom_headers: &'a [String],
+}
+
+enum ModelSelection {
+    Interactive,
+    SingleModelOrExplicit,
 }
 
 /// A chat message.
@@ -107,12 +142,12 @@ struct Delta {
 }
 
 /// Token usage statistics.
-#[derive(Deserialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(rename_all = "snake_case")]
 #[expect(clippy::struct_field_names)]
 struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
-    #[expect(dead_code)]
     total_tokens: u32,
 }
 
@@ -122,6 +157,29 @@ struct ChatResponse {
     total_duration: std::time::Duration,
     first_token_duration: Option<std::time::Duration>,
     usage: Option<Usage>,
+}
+
+#[derive(Serialize)]
+struct ChatJsonResponse<'a> {
+    model: &'a str,
+    content: &'a str,
+    duration_ms: u128,
+    first_token_ms: Option<u128>,
+    usage: Option<&'a Usage>,
+}
+
+impl<'a> ChatJsonResponse<'a> {
+    fn from_response(model: &'a str, response: &'a ChatResponse) -> Self {
+        Self {
+            model,
+            content: &response.content,
+            duration_ms: response.total_duration.as_millis(),
+            first_token_ms: response
+                .first_token_duration
+                .map(|duration| duration.as_millis()),
+            usage: response.usage.as_ref(),
+        }
+    }
 }
 
 impl ChatResponse {
@@ -158,6 +216,7 @@ async fn get_or_select_model(
     model: Option<&str>,
     endpoint: Option<&str>,
     custom_headers: &[String],
+    model_selection: ModelSelection,
 ) -> Result<String> {
     let base_endpoint = endpoint.unwrap_or_else(|| ctx.http_endpoint());
     let mut headers: Vec<(String, String)> = ctx.get_headers().into_iter().collect();
@@ -169,21 +228,65 @@ async fn get_or_select_model(
         }
     }
 
-    repl::util::get_or_select_model(ctx.http_client(), base_endpoint, &headers, model)
+    match model_selection {
+        ModelSelection::Interactive => {
+            repl::util::get_or_select_model(ctx.http_client(), base_endpoint, &headers, model)
+                .await
+                .map_err(map_model_error)
+        }
+        ModelSelection::SingleModelOrExplicit => {
+            get_or_require_explicit_model(ctx.http_client(), base_endpoint, &headers, model).await
+        }
+    }
+}
+
+async fn get_or_require_explicit_model(
+    client: &reqwest::Client,
+    base_endpoint: &str,
+    headers: &[(String, String)],
+    model: Option<&str>,
+) -> Result<String> {
+    if let Some(model_name) = model {
+        repl::util::validate_model(client, base_endpoint, headers, model_name)
+            .await
+            .map_err(map_model_error)?;
+        return Ok(model_name.to_string());
+    }
+
+    let models = repl::util::get_available_models(client, base_endpoint, headers)
         .await
-        .map_err(|e| match e {
-            repl::util::UtilError::ModelNotFound { model, available } => {
-                ModelNotFoundSnafu { model, available }.build()
-            }
-            repl::util::UtilError::NoModelsConfigured => NoModelsConfiguredSnafu.build(),
-            repl::util::UtilError::ConnectionFailed { endpoint, source } => InvalidResponseSnafu {
-                message: format!("Failed to connect to {endpoint}: {source}"),
-            }
-            .build(),
-            repl::util::UtilError::InvalidResponse { message } => {
-                InvalidResponseSnafu { message }.build()
-            }
-        })
+        .map_err(map_model_error)?;
+    select_single_available_model(&models)
+}
+
+fn select_single_available_model(models: &[String]) -> Result<String> {
+    match models {
+        [] => NoModelsConfiguredSnafu.fail(),
+        [model] => Ok(model.clone()),
+        _ => InvalidArgumentSnafu {
+            message: format!(
+                "Multiple models are configured: {}. Specify one with --model.",
+                models.join(", ")
+            ),
+        }
+        .fail(),
+    }
+}
+
+fn map_model_error(error: repl::util::UtilError) -> crate::error::Error {
+    match error {
+        repl::util::UtilError::ModelNotFound { model, available } => {
+            ModelNotFoundSnafu { model, available }.build()
+        }
+        repl::util::UtilError::NoModelsConfigured => NoModelsConfiguredSnafu.build(),
+        repl::util::UtilError::ConnectionFailed { endpoint, source } => InvalidResponseSnafu {
+            message: format!("Failed to connect to {endpoint}: {source}"),
+        }
+        .build(),
+        repl::util::UtilError::InvalidResponse { message } => {
+            InvalidResponseSnafu { message }.build()
+        }
+    }
 }
 
 /// Execute the `chat` command.
@@ -192,15 +295,6 @@ async fn get_or_select_model(
 ///
 /// Returns an error if the API requests fail or input/output fails.
 pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
-    // Get or select the model
-    let model = get_or_select_model(
-        ctx,
-        args.model.as_deref(),
-        args.endpoint.as_deref(),
-        &args.custom_headers,
-    )
-    .await?;
-
     // Check if running in a terminal (interactive) vs piped input
     let is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
 
@@ -226,6 +320,29 @@ pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
         (None, None) => None,
     };
 
+    if args.direct_prompt && message.is_none() {
+        return InvalidArgumentSnafu {
+            message: "A prompt is required. Pass one after -p or -chat, or pipe prompt text on stdin.",
+        }
+        .fail();
+    }
+
+    let model_selection = if args.direct_prompt {
+        ModelSelection::SingleModelOrExplicit
+    } else {
+        ModelSelection::Interactive
+    };
+
+    // Get or select the model
+    let model = get_or_select_model(
+        ctx,
+        args.model.as_deref(),
+        args.endpoint.as_deref(),
+        &args.custom_headers,
+        model_selection,
+    )
+    .await?;
+
     // Create chat config
     let config = ChatConfig {
         model: &model,
@@ -240,9 +357,19 @@ pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
             role: "user".to_string(),
             content: message,
         }];
-        let response = send_chat_streaming(ctx, &config, &messages, false).await?;
+        let response = send_chat_streaming(
+            ctx,
+            &config,
+            &messages,
+            false,
+            args.output != OutputFormat::Json,
+        )
+        .await?;
+        if args.output == OutputFormat::Json {
+            return write_json(&ChatJsonResponse::from_response(&model, &response));
+        }
         // Only show stats if running in a terminal
-        if is_terminal {
+        if is_terminal && !args.direct_prompt {
             println!("\n\n{}\n", response.format_stats());
         } else {
             println!();
@@ -332,7 +459,7 @@ async fn run_repl(ctx: &RuntimeContext, config: &ChatConfig<'_>) -> Result<()> {
         });
 
         // Send and stream response
-        match send_chat_streaming(ctx, config, &messages, true).await {
+        match send_chat_streaming(ctx, config, &messages, true, true).await {
             Ok(response) => {
                 // Print stats first before consuming content
                 println!("\n\n{}\n", response.format_stats());
@@ -364,6 +491,7 @@ async fn send_chat_streaming(
     config: &ChatConfig<'_>,
     messages: &[Message],
     interactive: bool,
+    emit_tokens: bool,
 ) -> Result<ChatResponse> {
     let start_time = Instant::now();
     let base_endpoint = config.endpoint.unwrap_or_else(|| ctx.http_endpoint());
@@ -462,8 +590,10 @@ async fn send_chat_streaming(
                                     s.stop().await;
                                 }
                             }
-                            print!("{content}");
-                            let _ = io::stdout().flush();
+                            if emit_tokens {
+                                print!("{content}");
+                                let _ = io::stdout().flush();
+                            }
                             full_response.push_str(content);
                         }
                     }
@@ -485,4 +615,45 @@ async fn send_chat_streaming(
         first_token_duration: first_token_time,
         usage,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_single_available_model_uses_only_model() {
+        let models = vec!["llm".to_string()];
+
+        let model = select_single_available_model(&models)
+            .expect("single configured model should be selected");
+
+        assert_eq!(model, "llm");
+    }
+
+    #[test]
+    fn select_single_available_model_requires_model_when_ambiguous() {
+        let models = vec!["llm-a".to_string(), "llm-b".to_string()];
+
+        let error = select_single_available_model(&models)
+            .expect_err("multiple configured models should require --model");
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid argument: Multiple models are configured: llm-a, llm-b. Specify one with --model."
+        );
+    }
+
+    #[test]
+    fn select_single_available_model_reports_no_models() {
+        let models = Vec::new();
+
+        let error = select_single_available_model(&models)
+            .expect_err("empty model list should report no configured models");
+
+        assert_eq!(
+            error.to_string(),
+            "No models found. Please configure a model in your Spicepod."
+        );
+    }
 }

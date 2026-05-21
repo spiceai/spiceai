@@ -51,6 +51,7 @@ use runtime_datafusion::execution_plan::{
     TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
     schema_cast::SchemaCastScanExec, wrap_with_filter,
 };
+
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
@@ -66,12 +67,12 @@ pub mod refresh_task;
 mod refresh_task_runner;
 mod retention;
 pub(crate) mod sink;
-mod snapshots;
+pub(crate) mod snapshots;
 mod synchronized_table;
 mod timestamp_metrics_utils;
-pub mod write_through;
+pub mod write;
 
-pub(crate) use write_through::WriteMode;
+pub(crate) use write::WriteMode;
 
 pub use refresh_task_runner::RefreshTaskRunner;
 pub use snapshots::SnapshotCreationConfig;
@@ -172,6 +173,11 @@ pub enum Error {
     ))]
     PrimaryKeyTypeNotYetSupported { data_type: String },
 
+    #[snafu(display(
+        "Primary key column '{field_name}' contains a NULL value in a CDC change record. NULL primary keys cannot be used for delete or upsert operations."
+    ))]
+    PrimaryKeyNullValue { field_name: String },
+
     #[snafu(display("Invalid time column format: {source}"))]
     InvalidTimeColumnTimeFormat { source: refresh::Error },
 
@@ -269,6 +275,11 @@ pub struct AcceleratedTable {
     /// Sender for batched cache writes. Only used in caching refresh mode.
     batch_write_tx: Option<caching::CacheWriteSender>,
     cluster_role: Option<ClusterRole>,
+    /// Schema exposed to user-facing query planning when it differs from the
+    /// underlying accelerator's storage schema. Currently set only in caching
+    /// mode, where the storage schema is augmented with a hidden
+    /// [`caching::CACHE_NAMESPACE_COLUMN`] for per-principal isolation.
+    user_facing_schema: Option<SchemaRef>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -332,11 +343,15 @@ pub struct Builder {
     disable_federation: bool,
     write_to_accelerator_only: bool,
     write_through: bool,
+    write_back: bool,
     refresh_semaphore: Option<Arc<Semaphore>>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
     initial_load_complete: bool,
     snapshot_creation_config: Option<SnapshotCreationConfig>,
+    /// Per-dataset state for `RefreshMode::Snapshot`. Required when the
+    /// refresh mode is Snapshot; ignored otherwise.
+    snapshot_refresh_state: Option<snapshots::SnapshotRefreshState>,
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
@@ -349,6 +364,7 @@ pub struct Builder {
     is_s3_express_acceleration: bool,
     acceleration_layout: Option<runtime_acceleration::snapshot::AccelerationLayout>,
     cluster_role: Option<ClusterRole>,
+    user_facing_schema: Option<SchemaRef>,
     accelerator_write_mutex: Arc<Mutex<()>>,
 }
 
@@ -381,9 +397,11 @@ impl Builder {
             disable_federation: false,
             write_to_accelerator_only: false,
             write_through: false,
+            write_back: false,
             initial_load_complete: false,
             refresh_semaphore: None,
             snapshot_creation_config: None,
+            snapshot_refresh_state: None,
             metrics: None,
             cpu_runtime: None,
             io_runtime,
@@ -396,7 +414,16 @@ impl Builder {
             is_s3_express_acceleration: false,
             cluster_role: None,
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
+            user_facing_schema: None,
         }
+    }
+
+    /// Override the schema reported by the resulting [`AcceleratedTable`] to
+    /// query planners. Used by caching mode to hide the internal namespace
+    /// storage column from users.
+    pub fn user_facing_schema(&mut self, schema: SchemaRef) -> &mut Self {
+        self.user_facing_schema = Some(schema);
+        self
     }
 
     pub fn cluster_role(&mut self, role: Option<ClusterRole>) -> &mut Self {
@@ -442,6 +469,20 @@ impl Builder {
         self
     }
 
+    /// Returns a clone of the accelerator `Arc`.
+    #[must_use]
+    pub fn get_accelerator(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.accelerator)
+    }
+
+    /// Replace the accelerator provider.
+    ///
+    /// This must be called **before** [`build`](Self::build) so that the
+    /// refresher (created during build) receives the updated provider.
+    pub fn set_accelerator(&mut self, accelerator: Arc<dyn TableProvider>) {
+        self.accelerator = accelerator;
+    }
+
     /// Set to only write to the accelerator (not replicate to federated source).
     /// This is used when `on_conflict` is configured - writes go only to the accelerator.
     pub fn write_to_accelerator_only(&mut self) -> &mut Self {
@@ -453,6 +494,13 @@ impl Builder {
     /// and the local Cayenne accelerator using staged append/commit/rollback semantics.
     pub fn write_through(&mut self) -> &mut Self {
         self.write_through = true;
+        self
+    }
+
+    /// Enable write-back mode: writes commit to the local accelerator first,
+    /// then asynchronously persist to the federated source.
+    pub fn write_back(&mut self) -> &mut Self {
+        self.write_back = true;
         self
     }
 
@@ -556,6 +604,16 @@ impl Builder {
         snapshot_config: Option<SnapshotCreationConfig>,
     ) -> &mut Self {
         self.snapshot_creation_config = snapshot_config;
+        self
+    }
+
+    /// Configure per-dataset state for `RefreshMode::Snapshot`. Required when
+    /// the refresh mode is Snapshot.
+    pub fn snapshot_refresh_state(
+        &mut self,
+        state: Option<snapshots::SnapshotRefreshState>,
+    ) -> &mut Self {
+        self.snapshot_refresh_state = state;
         self
     }
 
@@ -730,6 +788,16 @@ impl Builder {
                     Some(start_refresh),
                 )
             }
+            RefreshMode::Snapshot => {
+                // Snapshot mode is interval-driven and supports manual refresh triggers
+                // to force a poll of the snapshot store outside the regular cadence.
+                let (start_refresh, on_start_refresh) =
+                    mpsc::channel::<Option<RefreshOverrides>>(1);
+                (
+                    refresh::AccelerationRefreshMode::Snapshot(on_start_refresh),
+                    Some(start_refresh),
+                )
+            }
         };
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
@@ -772,6 +840,7 @@ impl Builder {
         }
 
         refresher.with_snapshot_creation_config(self.snapshot_creation_config);
+        refresher.with_snapshot_refresh_state(self.snapshot_refresh_state);
         refresher.set_bootstrap_status(self.bootstrap_status);
 
         if let Some(ref resource_monitor) = self.resource_monitor {
@@ -802,6 +871,24 @@ impl Builder {
         let mut handlers = vec![];
         if let Some(refresh_handle) = refresh_handle {
             handlers.push(refresh_handle);
+        }
+
+        // In caching mode, `on_zero_results` is effectively a no-op: the
+        // caching scan already treats a zero-row accelerator result (whether
+        // because the cache is empty or because the user's predicate
+        // eliminated every cached row) as a cache miss and fetches the source.
+        // That happens regardless of the configured `on_zero_results`, so the
+        // default `return_empty` is misleading -- we always fall back to
+        // source, not return empty. Warn so users don't reason about caching
+        // mode through the lens of `on_zero_results`.
+        if refresh_mode == RefreshMode::Caching {
+            tracing::warn!(
+                "Dataset {dataset}: `on_zero_results` is ignored when `refresh_mode: caching` is set. \
+                 Caching mode always queries the source on a cache miss. \
+                 Remove `on_zero_results` from the dataset configuration to silence this warning. \
+                 For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#refresh-modes",
+                dataset = self.dataset_name,
+            );
         }
 
         // For caching mode, create the batched write channel and spawn consumer task.
@@ -962,6 +1049,8 @@ impl Builder {
 
         let write_mode = if self.write_through {
             WriteMode::resolve_write_through(&self.accelerator, &self.federated)?
+        } else if self.write_back {
+            WriteMode::WriteBack
         } else if self.write_to_accelerator_only {
             WriteMode::AcceleratorOnly
         } else {
@@ -992,6 +1081,7 @@ impl Builder {
             last_updated_at,
             batch_write_tx,
             cluster_role: self.cluster_role,
+            user_facing_schema: self.user_facing_schema,
         })
     }
 }
@@ -1092,10 +1182,6 @@ impl AcceleratedTable {
     #[must_use]
     pub(crate) fn get_accelerator_ref(&self) -> &Arc<dyn TableProvider> {
         &self.accelerator
-    }
-
-    pub(crate) fn set_accelerator(&mut self, accelerator: Arc<dyn TableProvider>) {
-        self.accelerator = accelerator;
     }
 
     /// Add a child accelerator that should receive cached data when this parent stores new cache entries.
@@ -1220,11 +1306,18 @@ impl TableProvider for AcceleratedTable {
     }
 
     fn schema(&self) -> SchemaRef {
+        if let Some(s) = self.user_facing_schema.as_ref() {
+            return Arc::clone(s);
+        }
         self.accelerator.schema()
     }
 
     fn table_type(&self) -> TableType {
         self.accelerator.table_type()
+    }
+
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        self.accelerator.statistics()
     }
 
     fn supports_filters_pushdown(
@@ -1268,8 +1361,7 @@ impl TableProvider for AcceleratedTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Check if we're in caching mode
-        let is_caching_mode = self.refresh_params.read().await.mode == RefreshMode::Caching;
+        let is_caching_mode = self.refresh_mode == RefreshMode::Caching;
 
         if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
             // Accelerated tables aren't accelerated on scheduler. Just scan the federated source.
@@ -1303,10 +1395,24 @@ impl TableProvider for AcceleratedTable {
             }
         }
 
-        // For caching mode with filters, extend projection to include fetched_at for freshness checking if needed.
-        // Added columns will be automatically stripped by `SchemaCastScanExec`, similar to
-        // fallback-to-source on cache miss where results return all columns.
-        let extended_projection = if is_caching_mode && !filters.is_empty() {
+        // For caching mode, extend the accelerator scan projection to
+        // include the storage-only columns the caching pipeline needs:
+        // `fetched_at` (freshness check inside
+        // `CachingAccelerationScanExec`) and `__spice_cache_namespace`
+        // (per-principal isolation `FilterExec` applied below). The added
+        // columns are stripped from the user-facing output by
+        // `SchemaCastScanExec` on top of the plan, so they never leak
+        // into query results.
+        //
+        // Done unconditionally for caching mode (not gated on having
+        // user filters) because the namespace `FilterExec` is always
+        // applied and must always be able to resolve the namespace
+        // column. Without this, a caching-mode scan with a non-empty
+        // user projection but no user filters (e.g. `SELECT content FROM
+        // ds`) would push only the user's columns to the accelerator
+        // and the FilterExec on top would fail with `No field named
+        // __spice_cache_namespace`.
+        let extended_projection = if is_caching_mode {
             extend_projection_for_caching(projection, &self.accelerator.schema())
         } else {
             None
@@ -1314,6 +1420,50 @@ impl TableProvider for AcceleratedTable {
         let scan_projection = extended_projection.as_ref().or(projection);
         // For UseSource mode, the scan is handled inside the match arm below (with filter
         // splitting). For all other modes, perform the accelerator scan upfront.
+        // For caching mode, scope the accelerator scan to the current
+        // request's namespace by appending a `__spice_cache_namespace = $ns_id`
+        // predicate. The federated source still receives only the user's
+        // original filters via `CachingAccelerationScanExec`, since the
+        // namespace column does not exist on the source side. Skipped when
+        // the storage schema does not have the column (e.g. unit-test mocks).
+        //
+        // The originating request context is attached to the session as an
+        // extension by `Query::run_internal`. We must read it from there
+        // and NOT from `RequestContext::current()`, because DataFusion does
+        // not propagate Tokio task-locals across the `TableProvider::scan`
+        // await point. The task-local lookup would silently fall back to
+        // the global `INTERNAL_REQUEST_CONTEXT` (Protocol::Internal, no
+        // principal), collapsing every caller to `CacheNamespace::System`
+        // and defeating isolation.
+        let namespace_filter: Option<Expr> = if is_caching_mode
+            && self
+                .accelerator
+                .schema()
+                .column_with_name(caching::CACHE_NAMESPACE_COLUMN)
+                .is_some()
+        {
+            let ns = state
+                .config()
+                .get_extension::<runtime_request_context::RequestContext>()
+                .map_or(runtime_request_context::CacheNamespace::System, |ctx| {
+                    ctx.cache_namespace()
+                });
+            Some(caching::namespace_filter_expr(ns.storage_id()))
+        } else {
+            None
+        };
+        let storage_filters: Vec<Expr> = if let Some(ref nf) = namespace_filter {
+            let mut sf = filters.to_vec();
+            sf.push(nf.clone());
+            sf
+        } else {
+            filters.to_vec()
+        };
+        let scan_filters: &[Expr] = if is_caching_mode {
+            &storage_filters
+        } else {
+            filters
+        };
         let input = if matches!(
             (is_caching_mode, &self.zero_results_action),
             (false, ZeroResultsAction::UseSource)
@@ -1322,7 +1472,7 @@ impl TableProvider for AcceleratedTable {
         } else {
             Some(
                 self.accelerator
-                    .scan(state, scan_projection, filters, limit)
+                    .scan(state, scan_projection, scan_filters, limit)
                     .await?,
             )
         };
@@ -1341,9 +1491,45 @@ impl TableProvider for AcceleratedTable {
                     )
                 })?;
 
-                // Check which filters the accelerator doesn't fully support and need to be re-applied.
-                // This ensures correct results when the accelerator returns Inexact or Unsupported for some filters.
-                let filters_to_reapply = self.get_filters_to_reapply(filters)?;
+                // Check which user filters the accelerator doesn't fully
+                // support and need to be re-applied. This ensures correct
+                // results when the accelerator returns Inexact or
+                // Unsupported for some filters.
+                let mut filters_to_reapply = self.get_filters_to_reapply(filters)?;
+                // Re-apply the cache-namespace predicate as a hard
+                // FilterExec only if the accelerator does NOT report exact
+                // pushdown for it.
+                //
+                // The DataFusion contract for `supports_filters_pushdown`
+                // is: `Exact` means the provider guarantees the predicate
+                // will be applied (the caller does not have to re-apply);
+                // `Inexact` / `Unsupported` mean the caller MUST re-apply
+                // or rows that should be filtered may slip through. Cache
+                // isolation is a correctness invariant, so we re-apply
+                // whenever the accelerator does not give an exact
+                // guarantee.
+                //
+                // We deliberately do NOT wrap on `Exact`: the wrap is not
+                // just redundant, it is harmful. `FilterExec` coalesces
+                // its output through `BatchCoalescer`, which strictly
+                // compares `Field` metadata across consecutive batches.
+                // Some accelerator <-> source schema combinations (notably
+                // `Map` field naming round-tripped through DuckDB, which
+                // canonicalizes `keys`/`values` to `key`/`value`) trigger
+                // a false-positive panic in `BatchCoalescer` even though
+                // the data itself is well-formed. This bites the localpod
+                // chained-accelerator path in particular.
+                if let Some(nf) = namespace_filter {
+                    let nf_pushdown = self
+                        .accelerator
+                        .supports_filters_pushdown(&[&nf])?
+                        .into_iter()
+                        .next()
+                        .unwrap_or(TableProviderFilterPushDown::Unsupported);
+                    if !matches!(nf_pushdown, TableProviderFilterPushDown::Exact) {
+                        filters_to_reapply.push(nf);
+                    }
+                }
                 let input = if filters_to_reapply.is_empty() {
                     input
                 } else {
@@ -1433,6 +1619,19 @@ impl TableProvider for AcceleratedTable {
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // In `refresh_mode: snapshot`, the accelerator is a read-only mirror
+        // of the snapshot store. Accepting writes here would either be
+        // silently overwritten by the next snapshot reload (data loss) or
+        // race with the file replacement performed during refresh. Reject
+        // explicitly so callers fail loudly rather than observing surprising
+        // behavior.
+        if self.refresh_mode == RefreshMode::Snapshot {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "writes to accelerated table {} are not permitted when refresh_mode is 'snapshot'; the accelerator is driven exclusively from the snapshot store",
+                self.dataset_name
+            )));
+        }
+
         self.update_last_updated_at();
 
         match &self.write_mode {
@@ -1452,10 +1651,22 @@ impl TableProvider for AcceleratedTable {
                 let federated_table = self.federated.table_provider().await;
                 federated_table.insert_into(state, input, overwrite).await
             }
+            WriteMode::WriteBack => {
+                write::write_back::validate_insert_op(overwrite)?;
+                write::write_back::insert_write_back(
+                    state,
+                    input,
+                    overwrite,
+                    Arc::clone(&self.accelerator),
+                    Arc::clone(&self.federated),
+                    Arc::clone(&self.refresher),
+                    self.schema(),
+                )
+            }
             WriteMode::WriteThrough {
                 cayenne_target,
                 federated_provider,
-            } => write_through::insert_write_through(
+            } => write::write_through::insert_write_through(
                 input,
                 overwrite,
                 cayenne_target.as_ref(),
@@ -1465,24 +1676,165 @@ impl TableProvider for AcceleratedTable {
             ),
         }
     }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        if self.refresh_mode == RefreshMode::Snapshot {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "deletes on accelerated table {} are not permitted when refresh_mode is 'snapshot'; the accelerator is driven exclusively from the snapshot store",
+                self.dataset_name
+            )));
+        }
+
+        self.update_last_updated_at();
+
+        match &self.write_mode {
+            WriteMode::AcceleratorOnly => self.accelerator.delete_from(state, filters).await,
+            WriteMode::FederatedOnly => {
+                let federated_table = self.federated.table_provider().await;
+                federated_table.delete_from(state, filters).await
+            }
+            WriteMode::WriteBack => {
+                write::write_back::delete_write_back(
+                    state,
+                    filters,
+                    Arc::clone(&self.accelerator),
+                    Arc::clone(&self.federated),
+                )
+                .await
+            }
+            WriteMode::WriteThrough {
+                cayenne_target,
+                federated_provider,
+            } => {
+                write::write_through::delete_write_through(
+                    state,
+                    filters,
+                    cayenne_target.as_ref(),
+                    Arc::clone(federated_provider),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        if self.refresh_mode == RefreshMode::Snapshot {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "updates on accelerated table {} are not permitted when refresh_mode is 'snapshot'; the accelerator is driven exclusively from the snapshot store",
+                self.dataset_name
+            )));
+        }
+
+        self.update_last_updated_at();
+
+        match &self.write_mode {
+            WriteMode::AcceleratorOnly => {
+                self.accelerator.update(state, assignments, filters).await
+            }
+            WriteMode::FederatedOnly => {
+                let federated_table = self.federated.table_provider().await;
+                federated_table.update(state, assignments, filters).await
+            }
+            WriteMode::WriteBack => {
+                write::write_back::update_write_back(
+                    state,
+                    assignments,
+                    filters,
+                    Arc::clone(&self.accelerator),
+                    Arc::clone(&self.federated),
+                )
+                .await
+            }
+            WriteMode::WriteThrough {
+                cayenne_target,
+                federated_provider,
+            } => {
+                write::write_through::update_write_through(
+                    state,
+                    assignments,
+                    filters,
+                    cayenne_target.as_ref(),
+                    Arc::clone(federated_provider),
+                )
+                .await
+            }
+        }
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        self.accelerator.get_table_definition()
+    }
+
+    fn get_logical_plan(
+        &self,
+    ) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
+        self.accelerator.get_logical_plan()
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.accelerator.get_column_default(column)
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> DataFusionResult<datafusion::catalog::ScanResult> {
+        let plan = self
+            .scan(
+                state,
+                args.projection().map(<[usize]>::to_vec).as_ref(),
+                args.filters().unwrap_or(&[]),
+                args.limit(),
+            )
+            .await?;
+        Ok(plan.into())
+    }
+
+    async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.accelerator.truncate(state).await
+    }
 }
 
-/// Extends projection to include `fetched_at` column for cache freshness checking.
-/// Returns `Some(extended_projection)` if extension was needed,
-/// or `None` if no extension needed (projection already includes it or is None).
+/// Extends projection to include columns required by the caching pipeline
+/// for accelerator scans: `fetched_at` (freshness check) and
+/// `__spice_cache_namespace` (per-principal isolation filter applied as a
+/// hard `FilterExec` on top of the scan).
+///
+/// Returns `Some(extended_projection)` if any extension was needed, or
+/// `None` if both columns are already present (or `projection` is `None`,
+/// meaning the caller already wants the full schema).
 fn extend_projection_for_caching(
     projection: Option<&Vec<usize>>,
     schema: &SchemaRef,
 ) -> Option<Vec<usize>> {
     let proj = projection?;
-    let idx = schema.index_of(caching::CACHE_REFRESHED_AT_COLUMN).ok()?;
-    if proj.contains(&idx) {
-        return None;
+    let mut extended: Option<Vec<usize>> = None;
+    for col in [
+        caching::CACHE_REFRESHED_AT_COLUMN,
+        caching::CACHE_NAMESPACE_COLUMN,
+    ] {
+        let Ok(idx) = schema.index_of(col) else {
+            continue;
+        };
+        if proj.contains(&idx) {
+            continue;
+        }
+        let target = extended.get_or_insert_with(|| proj.clone());
+        if !target.contains(&idx) {
+            target.push(idx);
+        }
     }
-    // User projection doesn't include fetched_at - add it as last column
-    let mut extended = proj.clone();
-    extended.push(idx);
-    Some(extended)
+    extended
 }
 
 fn filters_for_accelerator_scan(
