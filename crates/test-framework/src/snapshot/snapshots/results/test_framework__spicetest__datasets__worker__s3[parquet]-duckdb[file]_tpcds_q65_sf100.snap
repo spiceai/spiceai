@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q65"
 ---
-+--------------+-------------+---------+-----------------+------------------+--------------------+
-| s_store_name | i_item_desc | revenue | i_current_price | i_wholesale_cost | i_brand            |
-+--------------+-------------+---------+-----------------+------------------+--------------------+
-| able         | A           | 0.00    | 1.44            | 0.59             | edu packamalg #1   |
-| able         | A           | 2.23    | 2.71            | 2.19             | amalgscholar #1    |
-| able         | A           | 2.35    | 8.44            | 2.70             | exportischolar #1  |
-| able         | A           | 0.91    | 1.11            | 0.87             | corpbrand #1       |
-| able         | A           | 6.10    | 6.89            | 4.27             | importonameless #4 |
-| able         | A           | 0.57    | 1.75            | 0.57             | importoedu pack #1 |
-| able         | A           | 9.64    | 3.35            | 2.34             | edu packexporti #2 |
-| able         | A           | 4.98    | 1.44            | 0.59             | edu packamalg #1   |
-| able         | A           | 7.57    | 3.54            | 1.23             | edu packscholar #1 |
-| able         | A           | 0.00    | 3.25            | 2.89             | importoamalg #1    |
-+--------------+-------------+---------+-----------------+------------------+--------------------+
++--------------+-------------+---------+-----------------+------------------+---------------------+
+| s_store_name | i_item_desc | revenue | i_current_price | i_wholesale_cost | i_brand             |
++--------------+-------------+---------+-----------------+------------------+---------------------+
+| able         | A           | 5.98    | 1.91            | 0.61             | edu packscholar #1  |
+| able         | A           | 6.96    | 6.64            | 2.19             | maxinameless #7     |
+| able         | A           | 7.74    | 2.47            | 1.13             | amalgedu pack #2    |
+| able         | A           | 7.57    | 3.54            | 1.23             | edu packscholar #1  |
+| able         | A           | 6.01    | 2.86            | 2.48             | amalgexporti #1     |
+| able         | A           | 0.57    | 1.75            | 0.57             | importoedu pack #1  |
+| able         | A           | 2.75    | 3.97            | 1.66             | amalgexporti #2     |
+| able         | A           | 7.47    | 4.79            | 2.63             | exportischolar #1   |
+| able         | A           | 6.92    | 3.50            | 1.26             | edu packedu pack #1 |
+| able         | A           | 0.91    | 1.11            | 0.87             | corpbrand #1        |
++--------------+-------------+---------+-----------------+------------------+---------------------+
