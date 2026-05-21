@@ -42,15 +42,12 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("metadata_dir").description(
         "Local directory for Cayenne SQLite metadata. Defaults to spice data directory.",
     ),
-    ParameterSpec::component("footer_cache_mb")
-        .description("Vortex footer cache size in MB. Default: 128.")
-        .default("128"),
     ParameterSpec::component("segment_cache_mb")
         .description("Vortex segment cache size in MB. Default: 256.")
         .default("256"),
     ParameterSpec::component("target_file_size_mb")
-        .description("Target Vortex file size in MB. Default: 128.")
-        .default("128"),
+        .description("Target Vortex file size in MB. Default: 256.")
+        .default("256"),
     ParameterSpec::component("compression_strategy")
         .description("Compression: 'btrblocks' (default) or 'zstd'.")
         .default("btrblocks"),
@@ -117,12 +114,6 @@ impl CayenneCatalogConnector {
             .ok()
             .map(ToOwned::to_owned);
 
-        let footer_cache_mb = self
-            .params
-            .get("footer_cache_mb")
-            .expose()
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok());
         let segment_cache_mb = self
             .params
             .get("segment_cache_mb")
@@ -209,7 +200,7 @@ impl CayenneCatalogConnector {
             data_dir,
             metadata_dir,
             spice_data_base_path: crate::spice_data_base_path(),
-            footer_cache_mb,
+            footer_cache_mb: None,
             segment_cache_mb,
             target_file_size_mb,
             compression_strategy,

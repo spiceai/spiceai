@@ -130,6 +130,8 @@ message ExecutorControlMessage {
         ExecutorHeartbeat heartbeat = 2;
         MetricsResponse metrics = 3;
         ExecutorShutdown shutdown = 4;
+        // Acknowledgement for a scheduler command (correlated by request_id).
+        Ack ack = 5;
     }
 }
 
@@ -149,6 +151,9 @@ message UpdatePartitions {
     map<string, BytesArray> new_partitions = 1;
     // Map of table name to list of REMOVED partition expressions to remove.
     map<string, BytesArray> removed_partitions = 2;
+    // Unique identifier for this request, used to correlate the executor's Ack.
+    // Empty string means "no ack expected" (legacy / fire-and-forget callers).
+    string request_id = 3;
 }
 
 // Request message for AllocateInitialPartitions RPC.
@@ -222,6 +227,18 @@ message MetricsResponse {
     string request_id = 1;
     // OTLP ExportMetricsServiceRequest protobuf-encoded metrics.
     bytes otlp_metrics = 2;
+}
+
+// Generic acknowledgement for a scheduler command that needs delivery
+// confirmation (e.g. UpdatePartitions). Correlated by request_id.
+//
+// On success the `error` field is unset. On failure, `error` carries a
+// short human-readable description; the scheduler decides whether to retry.
+message Ack {
+    // Request ID this ack corresponds to.
+    string request_id = 1;
+    // Optional error message. Absent/empty means the command applied successfully.
+    optional string error = 2;
 }
 
 // Physical plan — wrapper with oneof to unambiguously tag each node type.

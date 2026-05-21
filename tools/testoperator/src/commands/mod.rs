@@ -87,7 +87,9 @@ pub(crate) async fn build_test_with_validation(
         .query_overrides
         .clone()
         .map(test_framework::queries::QueryOverrides::from);
-    let queries = query_set.get_queries(query_overrides, None, None).await?;
+    let queries = query_set
+        .get_queries(query_overrides, None, None, args.scale_factor)
+        .await?;
 
     let mut test_builder = test_builder
         .with_query_set(queries)

@@ -156,7 +156,7 @@ fn bench_insert_batch(c: &mut Criterion) {
     let rt = Runtime::new().expect("Failed to create runtime");
     let mut group = c.benchmark_group("insert_batch");
 
-    let sizes = vec![10, 100];
+    let sizes = vec![10, 100, 1000, 10000];
 
     for size in sizes {
         group.bench_with_input(BenchmarkId::new("sqlite", size), &size, |b, &size| {
@@ -342,7 +342,7 @@ fn bench_query_batch(c: &mut Criterion) {
     let rt = Runtime::new().expect("Failed to create runtime");
     let mut group = c.benchmark_group("query_batch");
 
-    let sizes = vec![10, 100];
+    let sizes = vec![10, 100, 1000, 10000];
 
     for size in sizes {
         group.bench_with_input(BenchmarkId::new("sqlite", size), &size, |b, &size| {

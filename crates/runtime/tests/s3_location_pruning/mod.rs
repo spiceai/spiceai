@@ -16,6 +16,9 @@ limitations under the License.
 
 use std::sync::Arc;
 
+const RUSTFS_ACCESS_KEY: &str = "spiceadmin";
+const RUSTFS_SECRET_KEY: &str = "spiceintegrationsecret";
+
 use app::AppBuilder;
 use futures::StreamExt;
 use object_store::ObjectStore;
@@ -31,8 +34,8 @@ fn get_rustfs_hive_dataset_with_location(name: &str, endpoint: &str) -> Dataset 
             ("hive_partitioning_enabled".to_string(), "true".to_string()),
             ("s3_endpoint".to_string(), endpoint.to_string()),
             ("s3_region".to_string(), "us-west-2".to_string()),
-            ("s3_key".to_string(), "rustfsadmin".to_string()),
-            ("s3_secret".to_string(), "rustfsadmin".to_string()),
+            ("s3_key".to_string(), RUSTFS_ACCESS_KEY.to_string()),
+            ("s3_secret".to_string(), RUSTFS_SECRET_KEY.to_string()),
             ("s3_auth".to_string(), "key".to_string()),
             ("allow_http".to_string(), "true".to_string()),
         ]
@@ -71,6 +74,8 @@ async fn test_location_metadata_preserves_custom_s3_endpoint() -> Result<(), any
         let running_container = ContainerRunnerBuilder::new("spice_test_rustfs_location_pruning")
             .image("rustfs/rustfs:latest".to_string())
             .add_port_binding(9000, ENDPOINT_PORT)
+            .add_env_var("RUSTFS_ACCESS_KEY", RUSTFS_ACCESS_KEY)
+            .add_env_var("RUSTFS_SECRET_KEY", RUSTFS_SECRET_KEY)
             .command(["/data"])
             .healthcheck(HealthConfig {
                 test: Some(vec![
@@ -106,7 +111,7 @@ async fn test_location_metadata_preserves_custom_s3_endpoint() -> Result<(), any
             .build()?;
 
         // Create AWS SDK S3 client for destination (local rustfs) - needed for bucket creation
-        let creds = Credentials::new("rustfsadmin", "rustfsadmin", None, None, "test");
+        let creds = Credentials::new(RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY, None, None, "test");
         let config = aws_sdk_s3::Config::builder()
             .credentials_provider(creds)
             .region(Region::new("us-east-1"))

@@ -143,7 +143,7 @@ mod tests {
 
     fn make_partition(key: &str, value: &str) -> PartitionValue {
         let mut p = HashMap::new();
-        p.insert(key.to_string(), value.to_string());
+        p.insert(key.to_string(), Some(value.to_string()));
         p
     }
 
@@ -279,12 +279,12 @@ mod tests {
     #[test]
     fn test_select_executors_composite_partitions() {
         let mut part_a = HashMap::new();
-        part_a.insert("region".to_string(), "us-east".to_string());
-        part_a.insert("date".to_string(), "2024-01-01".to_string());
+        part_a.insert("region".to_string(), Some("us-east".to_string()));
+        part_a.insert("date".to_string(), Some("2024-01-01".to_string()));
 
         let mut part_b = HashMap::new();
-        part_b.insert("region".to_string(), "us-west".to_string());
-        part_b.insert("date".to_string(), "2024-01-01".to_string());
+        part_b.insert("region".to_string(), Some("us-west".to_string()));
+        part_b.insert("date".to_string(), Some("2024-01-01".to_string()));
 
         let required = vec![part_a.clone(), part_b.clone()];
 

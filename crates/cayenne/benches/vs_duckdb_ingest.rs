@@ -35,8 +35,9 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, 
 use tokio::runtime::Runtime;
 
 use common::{
-    capture_comparison_plans, capture_parquet_ingest_plans, cayenne_insert_from_parquet,
-    duckdb_insert_parquet, make_batch, schema, setup_cayenne, setup_duckdb, write_parquet,
+    CAYENNE_LANES, Metastore, capture_comparison_plans, capture_parquet_ingest_plans,
+    cayenne_insert_from_parquet, duckdb_insert_parquet, make_batch, schema, setup_cayenne_for,
+    setup_duckdb, write_parquet,
 };
 
 const ROW_COUNTS: &[usize] = &[1_024, 16_384, 131_072];
@@ -55,7 +56,8 @@ fn bench_bulk_ingest(c: &mut Criterion) {
         let batch = make_batch(schema(), 0, rows);
         write_parquet(&batch, &parquet_path);
 
-        let ingest_plan_cayenne_fixture = rt.block_on(setup_cayenne("ingest_bench"));
+        let ingest_plan_cayenne_fixture =
+            rt.block_on(setup_cayenne_for("ingest_bench", Metastore::Sqlite));
         let ingest_plan_duckdb_fixture = setup_duckdb("ingest_bench");
         rt.block_on(capture_parquet_ingest_plans(
             &format!("ingest/{rows}/parquet_insert"),
@@ -65,7 +67,8 @@ fn bench_bulk_ingest(c: &mut Criterion) {
             &parquet_path,
         ));
 
-        let plan_cayenne_fixture = rt.block_on(setup_cayenne("ingest_bench"));
+        let plan_cayenne_fixture =
+            rt.block_on(setup_cayenne_for("ingest_bench", Metastore::Sqlite));
         let _ = rt.block_on(cayenne_insert_from_parquet(
             &plan_cayenne_fixture.table,
             &parquet_path,
@@ -80,19 +83,22 @@ fn bench_bulk_ingest(c: &mut Criterion) {
             "SELECT COUNT(*) FROM ingest_bench",
         ));
 
-        let path = parquet_path.clone();
-        group.bench_with_input(BenchmarkId::new("cayenne", rows), &rows, |b, &_rows| {
-            b.iter_batched(
-                || rt.block_on(setup_cayenne("ingest_bench")),
-                |fixture| {
-                    rt.block_on(async {
-                        let written = cayenne_insert_from_parquet(&fixture.table, &path).await;
-                        black_box((fixture, written));
-                    });
-                },
-                BatchSize::PerIteration,
-            );
-        });
+        for &lane in CAYENNE_LANES {
+            let lane_label = lane.lane();
+            let path = parquet_path.clone();
+            group.bench_with_input(BenchmarkId::new(lane_label, rows), &rows, |b, &_rows| {
+                b.iter_batched(
+                    || rt.block_on(setup_cayenne_for("ingest_bench", lane)),
+                    |fixture| {
+                        rt.block_on(async {
+                            let written = cayenne_insert_from_parquet(&fixture.table, &path).await;
+                            black_box((fixture, written));
+                        });
+                    },
+                    BatchSize::PerIteration,
+                );
+            });
+        }
 
         let path = parquet_path.clone();
         group.bench_with_input(BenchmarkId::new("duckdb", rows), &rows, |b, &_rows| {
@@ -133,7 +139,8 @@ fn bench_incremental_append(c: &mut Criterion) {
     }
     let parquet_paths = Arc::new(parquet_paths);
 
-    let ingest_plan_cayenne_fixture = rt.block_on(setup_cayenne("incr_bench"));
+    let ingest_plan_cayenne_fixture =
+        rt.block_on(setup_cayenne_for("incr_bench", Metastore::Sqlite));
     let ingest_plan_duckdb_fixture = setup_duckdb("incr_bench");
     rt.block_on(capture_parquet_ingest_plans(
         "incremental_append/parquet_insert",
@@ -143,7 +150,7 @@ fn bench_incremental_append(c: &mut Criterion) {
         &parquet_paths[0],
     ));
 
-    let plan_cayenne_fixture = rt.block_on(setup_cayenne("incr_bench"));
+    let plan_cayenne_fixture = rt.block_on(setup_cayenne_for("incr_bench", Metastore::Sqlite));
     for path in parquet_paths.iter() {
         let _ = rt.block_on(cayenne_insert_from_parquet(
             &plan_cayenne_fixture.table,
@@ -162,22 +169,25 @@ fn bench_incremental_append(c: &mut Criterion) {
         "SELECT COUNT(*) FROM incr_bench",
     ));
 
-    let cayenne_paths = Arc::clone(&parquet_paths);
-    group.bench_function("cayenne", |b| {
-        let paths = Arc::clone(&cayenne_paths);
-        b.iter_batched(
-            || rt.block_on(setup_cayenne("incr_bench")),
-            |fixture| {
-                rt.block_on(async {
-                    for path in paths.iter() {
-                        let _ = cayenne_insert_from_parquet(&fixture.table, path).await;
-                    }
-                    black_box(fixture);
-                });
-            },
-            BatchSize::PerIteration,
-        );
-    });
+    for &lane in CAYENNE_LANES {
+        let lane_label = lane.lane();
+        let cayenne_paths = Arc::clone(&parquet_paths);
+        group.bench_function(lane_label, |b| {
+            let paths = Arc::clone(&cayenne_paths);
+            b.iter_batched(
+                || rt.block_on(setup_cayenne_for("incr_bench", lane)),
+                |fixture| {
+                    rt.block_on(async {
+                        for path in paths.iter() {
+                            let _ = cayenne_insert_from_parquet(&fixture.table, path).await;
+                        }
+                        black_box(fixture);
+                    });
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
 
     group.bench_function("duckdb", |b| {
         let paths = Arc::clone(&parquet_paths);

@@ -450,8 +450,8 @@ async fn compaction_collapses_tiny_protected_snapshots(
     Ok(())
 }
 
-test_with_backends!(current_snapshot_publish_preserves_protected_scan_listing_cache_entries);
-async fn current_snapshot_publish_preserves_protected_scan_listing_cache_entries(
+test_with_backends!(current_snapshot_publish_preserves_protected_snapshot_visibility);
+async fn current_snapshot_publish_preserves_protected_snapshot_visibility(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = pk_schema();
@@ -481,26 +481,11 @@ async fn current_snapshot_publish_preserves_protected_scan_listing_cache_entries
 
     let total = count_rows(&ctx, "scan_listing_cache").await;
     assert_eq!(total, batch_rows * 4);
-    assert_eq!(
-        table.scan_listing_table_cache_entry_count(),
-        protected_snapshot_count + 1,
-        "the first scan should cache current plus protected snapshot listing tables"
-    );
 
     table.publish_current_snapshot_files_changed().await;
-    assert_eq!(
-        table.scan_listing_table_cache_entry_count(),
-        protected_snapshot_count,
-        "publishing current snapshot changes should retain protected snapshot listing tables"
-    );
 
     let total = count_rows(&ctx, "scan_listing_cache").await;
     assert_eq!(total, batch_rows * 4);
-    assert_eq!(
-        table.scan_listing_table_cache_entry_count(),
-        protected_snapshot_count + 1,
-        "the next scan should rebuild only the current snapshot listing table"
-    );
 
     Ok(())
 }
