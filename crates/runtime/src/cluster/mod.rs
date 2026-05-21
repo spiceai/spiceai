@@ -1499,16 +1499,53 @@ pub async fn initialize_cluster_executor(
         // This also provides scheduler with executor_id to connect over FlightSQL to fetch partitions during SQL queries.
         //
         // This must be done after executor's flight service is ready to accept connections. Otherwise the scheduler will attempt to make connection and fail. Waiting until after `rx_ready` (which is done after the executor has established a network connection to the Scheduler's control plane), should give enough time for executor to bind locally for flight.
-        let initial_partitions = executor_request_initial_partitions(
-            cluster_client.clone(),
-            rt.datafusion().cluster_config.node_advertise_url(),
-            rt.datafusion().ctx.as_ref(),
-        )
-        .await
-        .map_err(|status| FailedToStartClusterExecutor {
-            source: format!("Failed to allocate initial partitions from scheduler: {status}")
-                .into(),
-        })?;
+        //
+        // The scheduler can legitimately return Unavailable during its own
+        // startup window — while load_datasets() is still registering the
+        // accelerated tables, partition expressions can't be serialized.
+        // Retry with fibonacci backoff on Unavailable; surface any other error.
+        let initial_partitions = {
+            let mut backoff = FibonacciBackoffBuilder::new()
+                .max_duration(Some(SCHEDULER_BACKOFF_MAX))
+                .build();
+            loop {
+                match executor_request_initial_partitions(
+                    cluster_client.clone(),
+                    rt.datafusion().cluster_config.node_advertise_url(),
+                    rt.datafusion().ctx.as_ref(),
+                )
+                .await
+                {
+                    Ok(p) => break p,
+                    Err(crate::cluster::partition::Error::PartitionAllocationRequest {
+                        source,
+                    }) if source.code() == tonic::Code::Unavailable => {
+                        let Some(delay) = backoff.next_duration() else {
+                            return Err(FailedToStartClusterExecutor {
+                                source: format!(
+                                    "Failed to allocate initial partitions from scheduler after exhausting retries: {source}"
+                                )
+                                .into(),
+                            });
+                        };
+                        tracing::debug!(
+                            delay_ms = delay.as_millis(),
+                            status = %source.message(),
+                            "Scheduler not ready for allocate_initial_partitions; retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(other) => {
+                        return Err(FailedToStartClusterExecutor {
+                            source: format!(
+                                "Failed to allocate initial partitions from scheduler: {other}"
+                            )
+                            .into(),
+                        });
+                    }
+                }
+            }
+        };
         tracing::debug!(
             "For executor={:?}, initial accelerated table partitions={:?}",
             rt.datafusion().cluster_config.node_advertise_url(),
