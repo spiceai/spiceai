@@ -89,7 +89,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Invalid Spice Cloud region: {region}. Specify a valid region, for example us-east-1. To list available regions, run: spice cloud regions"
+        "Invalid Spice Cloud region: {region}. Specify a valid region, for example 'spiceai_region: us-east-1'. To list available regions, run: 'spice cloud regions'"
     ))]
     InvalidRegion { region: String },
 
