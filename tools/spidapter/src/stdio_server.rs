@@ -418,16 +418,18 @@ impl Handler for SpidapterHandler {
                 ]);
                 let db_kwargs = pg.adbc_kwargs();
                 eprintln!("[stdio] ADBC db_kwargs: {:?}", db_kwargs);
+                let mut write_db_kwargs = db_kwargs;
+                write_db_kwargs.insert(
+                    "spicebench.write_schema".to_string(),
+                    serde_json::Value::String(pg.schema.clone()),
+                );
                 SetupResponse {
                     driver: AdbcDriver::Postgresql,
-                    db_kwargs,
+                    db_kwargs: write_db_kwargs,
                     catalog_namespace: None,
                     read_driver: Some((AdbcDriver::Flightsql, flight_kwargs)),
                     endpoints: HashMap::new(),
-                    table_name_map: datasets
-                        .keys()
-                        .map(|name| (name.clone(), format!("{}.{name}", pg.schema)))
-                        .collect(),
+                    table_name_map: HashMap::new(),
                 }
             }
             IngestionTarget::Cayenne => build_cayenne_setup_response(etl_sink_type, &state),
