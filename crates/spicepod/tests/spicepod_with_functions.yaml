@@ -15,7 +15,7 @@ functions:
       args:
         - { name: x, type: int64 }
       returns: int64
-    body: "x * 2"
+    body: 'x * 2'
 
   - name: haversine_km
     from: sql
@@ -43,7 +43,7 @@ functions:
       args:
         - { name: s, type: utf8 }
       returns: utf8
-    body: "upper(s)"
+    body: 'upper(s)'
 
   - name: classify_intent
     from: http://classifier.internal/v1/classify
@@ -65,7 +65,7 @@ functions:
     signature:
       args: [{ name: x, type: int64 }]
       returns: int64
-    body: "x * 2654435761"
+    body: 'x * 2654435761'
     as_tool: false
 
   - name: duplicate_rows

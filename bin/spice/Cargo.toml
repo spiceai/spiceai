@@ -4,6 +4,7 @@ exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
 name = "spice"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -50,8 +51,8 @@ semver = "1"
 chrono = { workspace = true, features = ["serde"] }
 
 # Duration parsing
-humantime = "2"
 fundu.workspace = true
+humantime = "2"
 
 # Terminal colors
 ansi_colors = { path = "../../crates/ansi_colors" }
@@ -83,7 +84,11 @@ rand = "0.10"
 open = "5"
 
 # Platform keyring for credential storage
-keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "linux-native"] }
+keyring = { version = "3.6.3", features = [
+    "apple-native",
+    "windows-native",
+    "linux-native",
+] }
 
 # URL encoding
 urlencoding = "2"
@@ -94,13 +99,13 @@ rcgen = { version = "0.14", features = ["x509-parser"] }
 time = "0.3"
 
 # Internal crates
-spice-cloud-client.workspace = true
-repl = { path = "../../crates/repl" }
-runtime-api-types = { path = "../../crates/runtime-api-types" }
-spicepod = { path = "../../crates/spicepod", default-features = false }
-spiceai = { workspace = true }
 arrow = { workspace = true, features = ["prettyprint"] }
 arrow-json.workspace = true
+repl = { path = "../../crates/repl" }
+runtime-api-types = { path = "../../crates/runtime-api-types" }
+spice-cloud-client.workspace = true
+spiceai = { workspace = true }
+spicepod = { path = "../../crates/spicepod", default-features = false }
 test-framework = { path = "../../crates/test-framework" }
 
 # Tracing/opentelemetry for trace ID handling

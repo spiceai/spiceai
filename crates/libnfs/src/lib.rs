@@ -52,6 +52,7 @@ mod sys {
     #![allow(dead_code)]
     // Allow deprecated items from generated bindings
     #![allow(deprecated)]
+    #![allow(dead_code)]
     #![allow(clippy::upper_case_acronyms)]
     #![allow(clippy::pub_underscore_fields)]
     #![allow(clippy::struct_field_names)]

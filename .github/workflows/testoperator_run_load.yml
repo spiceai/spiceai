@@ -1,86 +1,12 @@
-name: load tests
+# ============================================================================
+# DISABLED: This workflow comes from upstream (spiceai/spiceai).
+# The enterprise version is ent_testoperator_run_load.yml
+# This file is kept only to prevent merge conflicts with upstream.
+# ============================================================================
+name: "load tests (upstream - disabled)"
 run-name: load - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
 
-on:
-  workflow_dispatch:
-    inputs:
-      spiced_commit:
-        description: 'spiced build commit'
-        required: false
-        type: string
-      duration:
-        description: 'The test duration in seconds'
-        required: true
-        default: '28800'
-        type: string
-      spicepod_path:
-        description: 'The spicepod file to test with'
-        required: true
-        type: string
-      query_set:
-        description: 'Query set'
-        required: true
-        default: 'tpch'
-        type: choice
-        options:
-          - 'tpch'
-          - 'tpch[parameterized]'
-          - 'tpcds'
-          - 'clickbench'
-      query_overrides:
-        description: 'Query overrides'
-        required: false
-        type: choice
-        default: ''
-        options:
-          - ''
-          - 'sqlite'
-          - 'postgresql'
-          - 'mysql'
-          - 'dremio'
-          - 'odbc-athena'
-          - 'odbc-databricks'
-          - 'duckdb'
-          - 'duckdb-zero-results'
-          - 'duckdb-partitioned'
-          - 'snowflake'
-          - 'spark'
-          - 'iceberg-sf1'
-          - 'spicecloud-catalog'
-          - 'glue-catalog'
-          - 'databricks-catalog'
-          - 'spicecloud'
-          - 'iceberg-hadoop'
-          - 'postgres-catalog'
-          - 'mysql-catalog'
-          - 'mssql-catalog'
-      runner_type:
-        description: 'Runner type'
-        required: true
-        default: 'spiceai-dev-runners'
-        type: choice
-        options:
-          - 'spiceai-dev-runners'
-          - 'spiceai-dev-large-runners'
-      concurrency:
-        description: 'How many concurrent client connections to use?'
-        required: true
-        default: '8'
-        type: string
-      random_param_set_count:
-        description: 'Number of random parameter sets to generate for parameterized queries (optional)'
-        required: false
-        type: string
-      http_clients:
-        description: 'Use HTTP clients for the test?'
-        required: false
-        type: boolean
-        default: false
-      scrape_spiced_metrics:
-        description: 'Scrape Prometheus metrics from spiced during the test'
-        required: false
-        type: boolean
-        default: false
+on: [workflow_dispatch]
 
 jobs:
   run-load:

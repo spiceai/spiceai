@@ -1,10 +1,11 @@
 [package]
-name = "yaml"
 description = "Internal YAML serialization/deserialization library for Spice.ai"
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
+name = "yaml"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true

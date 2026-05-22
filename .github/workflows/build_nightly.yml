@@ -2,7 +2,7 @@ name: build_nightly
 
 on:
   schedule:
-    - cron: '0 9 * * *' # Runs the workflow at 9:00 AM UTC (1AM PT) every day
+    - cron: '0 13,19,3 * * *' # Runs at 6AM, 12PM, 8PM PT
 
   workflow_dispatch:
     inputs:
@@ -12,13 +12,13 @@ on:
         type: boolean
         default: false
       profile_option:
-        description: 'Which Rust build profile to use? (Default is release)'
+        description: 'Which Rust build profile to use? (Default is release-lto)'
         required: false
         type: choice
         options:
-          - 'release'
           - 'release-lto'
-        default: 'release'
+          - 'release'
+        default: 'release-lto'
 
 env:
   # CI performance optimizations
@@ -30,7 +30,7 @@ env:
 
 jobs:
   check_commits:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     outputs:
       has_new_commits: ${{ steps.check_commits.outputs.has_new_commits }}
 
@@ -63,7 +63,7 @@ jobs:
     needs: check_commits
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     outputs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
       nightly_label: ${{ steps.set_version.outputs.nightly_label }}
@@ -91,9 +91,10 @@ jobs:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: ubuntu-24.04
+    runs-on: spicehq-dev-runners
+    timeout-minutes: 180
     env:
-      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}
       CARGO_TERM_COLOR: always
 
     steps:
@@ -132,13 +133,13 @@ jobs:
 
       - name: tar spiced binary
         run: |
-          mv target/release/spiced spiced
+          mv target/${{ env.RUST_PROFILE }}/spiced spiced
           chmod +x spiced
           tar czf spiced_linux_x86_64.tar.gz spiced
 
       - name: tar spice CLI binary
         run: |
-          mv target/release/spice spice
+          mv target/${{ env.RUST_PROFILE }}/spice spice
           chmod +x spice
           tar czf spice_linux_x86_64.tar.gz spice
 
@@ -163,8 +164,9 @@ jobs:
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
     runs-on: hosted-linux-arm-runner
+    timeout-minutes: 180
     env:
-      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}
       CARGO_TERM_COLOR: always
 
     steps:
@@ -203,13 +205,13 @@ jobs:
 
       - name: tar spiced binary
         run: |
-          mv target/release/spiced spiced
+          mv target/${{ env.RUST_PROFILE }}/spiced spiced
           chmod +x spiced
           tar czf spiced_linux_aarch64.tar.gz spiced
 
       - name: tar spice CLI binary
         run: |
-          mv target/release/spice spice
+          mv target/${{ env.RUST_PROFILE }}/spice spice
           chmod +x spice
           tar czf spice_linux_aarch64.tar.gz spice
 
@@ -234,8 +236,9 @@ jobs:
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
     runs-on: spiceai-macos
+    timeout-minutes: 180
     env:
-      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}
       CARGO_TERM_COLOR: always
 
     steps:
@@ -273,13 +276,13 @@ jobs:
 
       - name: tar spiced binary
         run: |
-          mv target/release/spiced spiced
+          mv target/${{ env.RUST_PROFILE }}/spiced spiced
           chmod +x spiced
           tar czf spiced_darwin_aarch64.tar.gz spiced
 
       - name: tar spice CLI binary
         run: |
-          mv target/release/spice spice
+          mv target/${{ env.RUST_PROFILE }}/spice spice
           chmod +x spice
           tar czf spice_darwin_aarch64.tar.gz spice
 
@@ -376,7 +379,7 @@ jobs:
     needs: [check_commits, setup, build-linux-x64]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: ubuntu-24.04
+    runs-on: spicehq-dev-runners
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -427,7 +430,7 @@ jobs:
     needs: [check_commits, setup, build-docker-amd64, build-docker-arm64]
     if: needs.check_commits.outputs.has_new_commits == 'true' && (github.event_name == 'schedule' || inputs.publish)
 
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6

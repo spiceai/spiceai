@@ -4,17 +4,18 @@ edition.workspace = true
 homepage.workspace = true
 license-file.workspace = true
 name = "runtime-async"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-tracing.workspace = true
 futures.workspace = true
+num_cpus.workspace = true
+snafu.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tokio-util.workspace = true
-snafu.workspace = true
-num_cpus.workspace = true
+tracing.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -3,10 +3,10 @@ tests:
     spicepod_path: federated/oracle[catalog].yaml
     query_set: tpch
     query_overrides: oracle-catalog
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     # https://github.com/spiceai/spiceai/issues/6450
     validate_results: false
   schema:
     spicepod_path: federated/oracle[catalog].yaml
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     min_tables: 1

@@ -15,19 +15,23 @@
 ##
 
 [package]
-name = "connector-postgres"
-edition.workspace = true
-version.workspace = true
-rust-version.workspace = true
-license-file.workspace = true
 description = "PostgreSQL data connector for Spice.ai runtime"
+edition.workspace = true
+license-file.workspace = true
+name = "connector-postgres"
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 async-stream.workspace = true
 async-trait.workspace = true
 data_components = { path = "../../data_components", features = ["postgres"] }
 datafusion.workspace = true
-datafusion-table-providers = { workspace = true, features = ["postgres", "postgres-federation"] }
+datafusion-table-providers = { workspace = true, features = [
+    "postgres",
+    "postgres-federation",
+] }
 fundu.workspace = true
 futures.workspace = true
 opentelemetry.workspace = true

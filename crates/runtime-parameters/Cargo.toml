@@ -1,10 +1,11 @@
 [package]
-name = "runtime-parameters"
 description = "Runtime parameters management for the workspace."
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
+name = "runtime-parameters"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true

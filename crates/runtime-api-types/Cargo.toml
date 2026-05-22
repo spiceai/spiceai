@@ -1,12 +1,13 @@
 [package]
-name = "runtime-api-types"
+description = "Shared API types for Spice runtime HTTP endpoints and CLI"
 edition.workspace = true
 homepage.workspace = true
 license-file.workspace = true
+name = "runtime-api-types"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
-description = "Shared API types for Spice runtime HTTP endpoints and CLI"
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }

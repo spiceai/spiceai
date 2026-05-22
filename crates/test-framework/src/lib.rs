@@ -71,9 +71,9 @@ impl TestType {
     #[must_use]
     pub fn workflow(&self) -> &str {
         match self {
-            TestType::Throughput => "testoperator_run_throughput.yml",
-            TestType::Load => "testoperator_run_load.yml",
-            TestType::Benchmark => "testoperator_run_bench.yml",
+            TestType::Throughput => "ent_testoperator_run_throughput.yml",
+            TestType::Load => "ent_testoperator_run_load.yml",
+            TestType::Benchmark => "ent_testoperator_run_bench.yml",
             TestType::Append => "testoperator_run_append.yml",
             TestType::DataConsistency => "testoperator_run_data_consistency.yml",
             TestType::Search => "testoperator_run_search.yml",

@@ -18,7 +18,12 @@ use crate::{
     App,
     secrets::{ParamStr, Secrets},
 };
-use runtime_auth::{FlightBasicAuth, GrpcAuth, HttpAuth, IdentitySource, api_key::ApiKeyAuth};
+use runtime_auth::{
+    FlightBasicAuth, GrpcAuth, HttpAuth, IdentitySource,
+    api_key::ApiKeyAuth,
+    composite::CompositeAuth,
+    oidc::{ClaimMappings, OidcAuth},
+};
 use secrecy::ExposeSecret;
 use spicepod::component::runtime::{ApiKey, ApiKeyAuth as SpicepodApiKeyAuth};
 use std::sync::Arc;
@@ -46,32 +51,85 @@ pub struct EndpointAuth {
 }
 
 impl EndpointAuth {
-    #[must_use]
-    pub async fn new(secrets: Arc<RwLock<Secrets>>, app: &App) -> Self {
-        let secrets = &*secrets.read().await;
+    /// Build endpoint auth from the app configuration.
+    ///
+    /// Supports API key auth, OIDC auth, or both simultaneously. When both are
+    /// configured, a [`CompositeAuth`] dispatches to the appropriate provider
+    /// based on the request header.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if OIDC is configured but JWKS discovery/fetch fails.
+    pub async fn new(
+        secrets: Arc<RwLock<Secrets>>,
+        app: &App,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let Some(auth) = app.runtime.auth.as_ref() else {
-            return Self::no_auth();
+            return Ok(Self::no_auth());
         };
 
-        if let Some(api_key_auth_config) = auth.api_key.as_ref() {
-            if !api_key_auth_config.enabled {
-                return Self::no_auth();
+        let api_key = if let Some(cfg) = auth.api_key.as_ref().filter(|c| c.enabled) {
+            let secrets = secrets.read().await;
+            Some(api_key_auth(&secrets, cfg).await)
+        } else {
+            None
+        };
+
+        let oidc = if let Some(cfg) = auth.oidc.as_ref().filter(|c| c.enabled) {
+            tracing::info!(
+                issuer_url = %cfg.issuer_url,
+                audience = ?cfg.audience,
+                "Initializing OIDC authentication"
+            );
+            Some(Arc::new(
+                OidcAuth::new(
+                    cfg.issuer_url.clone(),
+                    cfg.audience.clone(),
+                    cfg.groups_claims.clone(),
+                    ClaimMappings {
+                        user_id: cfg.claims.user_id.clone(),
+                        org_id: cfg.claims.org_id.clone(),
+                        roles: cfg.claims.roles.clone(),
+                    },
+                )
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("Failed to initialize OIDC auth: {e}").into()
+                })?,
+            ))
+        } else {
+            None
+        };
+
+        match (&api_key, &oidc) {
+            (None, None) => Ok(Self::no_auth()),
+            (Some(ak), None) => {
+                tracing::info!("Enabled API key authentication");
+                Ok(Self::from_provider(Arc::clone(ak)))
             }
-
-            let api_key_auth = api_key_auth(secrets, api_key_auth_config).await;
-            let http_auth = Arc::clone(&api_key_auth) as Arc<dyn HttpAuth + Send + Sync>;
-            let flight_basic_auth =
-                Arc::clone(&api_key_auth) as Arc<dyn FlightBasicAuth + Send + Sync>;
-            let grpc_auth = Arc::clone(&api_key_auth) as Arc<dyn GrpcAuth + Send + Sync>;
-            return Self {
-                http_auth: Some(http_auth),
-                flight_basic_auth: Some(flight_basic_auth),
-                grpc_auth: Some(grpc_auth),
-                identity_source: IdentitySource::RuntimeAuth,
-            };
+            (None, Some(oc)) => {
+                tracing::info!("Enabled OIDC authentication");
+                Ok(Self::from_provider(Arc::clone(oc)))
+            }
+            (Some(ak), Some(oc)) => {
+                tracing::info!("Enabled API key + OIDC composite authentication");
+                Ok(Self::from_provider(Arc::new(CompositeAuth::new(
+                    Some(Arc::clone(ak)),
+                    Some(Arc::clone(oc)),
+                ))))
+            }
         }
+    }
 
-        Self::no_auth()
+    fn from_provider<T: HttpAuth + FlightBasicAuth + GrpcAuth + Send + Sync + 'static>(
+        provider: Arc<T>,
+    ) -> Self {
+        Self {
+            http_auth: Some(Arc::clone(&provider) as Arc<dyn HttpAuth + Send + Sync>),
+            flight_basic_auth: Some(Arc::clone(&provider) as Arc<dyn FlightBasicAuth + Send + Sync>),
+            grpc_auth: Some(provider as Arc<dyn GrpcAuth + Send + Sync>),
+            identity_source: IdentitySource::RuntimeAuth,
+        }
     }
 
     #[must_use]

@@ -4,6 +4,7 @@ edition.workspace = true
 homepage.workspace = true
 license-file.workspace = true
 name = "flight-cookie-server"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true

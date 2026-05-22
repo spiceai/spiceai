@@ -462,6 +462,16 @@
             }
           ]
         },
+        "authorization": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Authorization"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "cors": {
           "$ref": "#/$defs/CorsConfig"
         },
@@ -1067,6 +1077,16 @@
               "type": "null"
             }
           ]
+        },
+        "oidc": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OidcAuth"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -1134,6 +1154,222 @@
           "additionalProperties": false
         }
       ]
+    },
+    "OidcAuth": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "issuer_url": {
+          "description": "The OIDC issuer URL (e.g. `https://accounts.google.com`).\nUsed for discovery of the JWKS endpoint.",
+          "type": "string"
+        },
+        "audience": {
+          "description": "The accepted `aud` values in the JWT. A token is valid if its `aud` claim\nmatches any of these values.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "groups_claims": {
+          "description": "JWT claim names to extract group memberships from. Groups from all matching\nclaims are merged. Defaults to `[\"groups\"]`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "groups"
+          ]
+        },
+        "claims": {
+          "description": "Configurable claim mappings for extracting identity fields from JWT tokens.\nMaps JWT claim names to identity context fields (`user_id`, `org_id`, `roles`).",
+          "$ref": "#/$defs/OidcClaimMappings",
+          "default": {
+            "user_id": "",
+            "org_id": null,
+            "roles": []
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "issuer_url",
+        "audience"
+      ]
+    },
+    "OidcClaimMappings": {
+      "description": "Maps JWT claim names to identity context fields.\n\nExample YAML:\n```yaml\nclaims:\n  user_id: sub\n  org_id: \"https://myapp.com/org_id\"\n  roles:\n    - \"https://myapp.com/roles\"\n```",
+      "type": "object",
+      "properties": {
+        "user_id": {
+          "description": "JWT claim to use as the primary user identifier. Defaults to `\"sub\"`.",
+          "type": "string",
+          "default": "sub"
+        },
+        "org_id": {
+          "description": "JWT claim to extract the organization/tenant identifier from.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "roles": {
+          "description": "JWT claim names to extract role memberships from. Roles from all matching\nclaims are merged.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "Authorization": {
+      "description": "Cedar-based authorization configuration.\n\nExample YAML:\n```yaml\nauthorization:\n  enabled: true\n  default: allow\n  provider: local\n  policies:\n    - name: analysts-read-only\n      cedar: |\n        permit(\n          principal in Spice::Role::\"analyst\",\n          action == Spice::Action::\"query\",\n          resource\n        );\n    - name: block-pii\n      path: ./policies/block-pii.cedar\n```",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "default": {
+          "description": "Controls behavior when no policy matches: `allow` (default) or `deny`.",
+          "$ref": "#/$defs/AuthorizationDefault",
+          "default": "allow"
+        },
+        "provider": {
+          "description": "Policy source: `local` (inline/file), `operator`, or `cloud`.",
+          "$ref": "#/$defs/AuthorizationProvider",
+          "default": "local"
+        },
+        "policies": {
+          "description": "Inline and file-based Cedar policy definitions (used with `provider: local`).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PolicyDefinition"
+          },
+          "default": []
+        },
+        "operator": {
+          "description": "Configuration for fetching policies from the Spice K8s Operator.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OperatorPolicyConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cloud": {
+          "description": "Configuration for fetching policies from Spice Cloud.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CloudPolicyConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "AuthorizationDefault": {
+      "description": "Controls the default authorization decision when no policy matches.",
+      "oneOf": [
+        {
+          "description": "Permit requests that no policy explicitly matches (default).",
+          "type": "string",
+          "const": "allow"
+        },
+        {
+          "description": "Deny requests that no policy explicitly permits.",
+          "type": "string",
+          "const": "deny"
+        }
+      ]
+    },
+    "AuthorizationProvider": {
+      "description": "The source of Cedar authorization policies.",
+      "oneOf": [
+        {
+          "description": "Read policies from inline Cedar text and/or local `.cedar` files.",
+          "type": "string",
+          "const": "local"
+        },
+        {
+          "description": "Fetch policies from the Spice K8s Operator API.",
+          "type": "string",
+          "const": "operator"
+        },
+        {
+          "description": "Fetch policies from the Spice Cloud Management API.",
+          "type": "string",
+          "const": "cloud"
+        }
+      ]
+    },
+    "PolicyDefinition": {
+      "description": "A single Cedar policy definition in the spicepod configuration.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "A human-readable name for this policy.",
+          "type": "string"
+        },
+        "cedar": {
+          "description": "Inline Cedar policy text.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Path to a `.cedar` file (resolved relative to spicepod.yaml).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "OperatorPolicyConfig": {
+      "description": "Configuration for the K8s Operator policy provider.",
+      "type": "object",
+      "properties": {
+        "endpoint": {
+          "description": "The operator API endpoint for fetching policies.",
+          "type": "string"
+        },
+        "poll_interval": {
+          "description": "How often to poll for policy updates (e.g. `\"30s\"`).",
+          "type": "string",
+          "default": "30s"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "endpoint"
+      ]
+    },
+    "CloudPolicyConfig": {
+      "description": "Configuration for the Spice Cloud policy provider.",
+      "type": "object",
+      "properties": {
+        "poll_interval": {
+          "description": "How often to poll for policy updates (e.g. `\"60s\"`).",
+          "type": "string",
+          "default": "60s"
+        }
+      },
+      "additionalProperties": false
     },
     "CorsConfig": {
       "type": "object",

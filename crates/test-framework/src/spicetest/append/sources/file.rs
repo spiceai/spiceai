@@ -107,7 +107,7 @@ fn generate_tpch_setup_sql(
                     sql,
                     "UPDATE {name}_retention SET {pk_col} = {pk_col} + {TEMP_DATA_KEY_OFFSET}, {column} = {RETENTION_TIMESTAMP_EXPR};"
                 )
-                .ok();
+                    .ok();
             } else {
                 writeln!(
                     sql,
@@ -289,7 +289,7 @@ impl AppendableSource for FileAppendableSource {
                         // DuckDB's TPCDS generation doesn't support partitioning and generating in steps
                         // Instead, generate the whole dataset and load it with incrementally increasing OFFSET and LIMIT
                         write!(&mut setup_sql,
-                            "CREATE TABLE {name} AS SELECT * FROM {name}_gen WHERE 1=0;
+                               "CREATE TABLE {name} AS SELECT * FROM {name}_gen WHERE 1=0;
                              ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
                              INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column} FROM {name}_gen
                              LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen) OFFSET 0;
@@ -312,15 +312,18 @@ impl AppendableSource for FileAppendableSource {
 
                     dest_conn.execute_batch(setup_sql)?;
                 }
-                QuerySet::Scenario { .. } | QuerySet::ParameterizedTpch | QuerySet::ChBench => anyhow::bail!("Appendable file source is not implemented for Scenario, Parameterized TPC-H, or CH-benCH query sets"),
+                QuerySet::Scenario { .. }
+                | QuerySet::ParameterizedTpch
+                | QuerySet::ParameterizedSaffron
+                | QuerySet::ChBench => anyhow::bail!("Appendable file source is not implemented for Scenario, Parameterized TPC-H, Parameterized Saffron, or CH-benCH query sets"),
             }
 
             drop(dest_conn);
 
             Ok::<(), anyhow::Error>(())
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to spawn blocking task: {e}"))??;
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to spawn blocking task: {e}"))??;
 
         Ok(())
     }
@@ -361,8 +364,11 @@ impl AppendableSource for FileAppendableSource {
                 ),
                 QuerySet::Tpcds => generate_tpcds_sql(load_steps, load_index, &tables),
                 QuerySet::Clickbench => generate_clickbench_sql(load_steps, load_index),
-                QuerySet::Scenario { .. } | QuerySet::ParameterizedTpch | QuerySet::ChBench => {
-                    anyhow::bail!("Appendable file source is not implemented for Scenario, Parameterized, or CH-benCH query sets")
+                QuerySet::Scenario { .. }
+                | QuerySet::ParameterizedTpch
+                | QuerySet::ParameterizedSaffron
+                | QuerySet::ChBench => {
+                    anyhow::bail!("Appendable file source is not implemented for Scenario, Parameterized TPC-H, Parameterized Saffron, or CH-benCH query sets")
                 }
             };
 
@@ -370,8 +376,8 @@ impl AppendableSource for FileAppendableSource {
 
             Ok::<(), anyhow::Error>(())
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to spawn blocking task: {e}"))??;
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to spawn blocking task: {e}"))??;
 
         Ok(())
     }

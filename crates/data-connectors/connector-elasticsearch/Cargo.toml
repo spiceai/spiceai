@@ -15,16 +15,19 @@
 ##
 
 [package]
-name = "connector-elasticsearch"
-edition.workspace = true
-version.workspace = true
-rust-version.workspace = true
-license-file.workspace = true
 description = "Elasticsearch data connector for Spice.ai runtime"
+edition.workspace = true
+license-file.workspace = true
+name = "connector-elasticsearch"
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-data_components = { path = "../../data_components", features = ["elasticsearch"] }
+data_components = { path = "../../data_components", features = [
+    "elasticsearch",
+] }
 datafusion.workspace = true
 elasticsearch = { path = "../../elasticsearch" }
 linkme.workspace = true

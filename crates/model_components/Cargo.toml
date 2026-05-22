@@ -4,6 +4,7 @@ edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
+publish.workspace = true
 name = "model_components"
 repository.workspace = true
 rust-version.workspace = true

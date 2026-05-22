@@ -4,6 +4,7 @@ exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
 name = "telemetry"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -12,6 +13,7 @@ version.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
 flight_client = { path = "../flight_client" }
+futures.workspace = true
 hostname = "0.4.2"
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
@@ -22,7 +24,6 @@ snafu.workspace = true
 sysinfo.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-futures.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 
 [features]

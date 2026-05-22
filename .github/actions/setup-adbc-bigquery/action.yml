@@ -5,11 +5,11 @@ inputs:
   adbc_bigquery_commit:
     description: 'Git commit hash to build the driver from'
     required: false
-    default: 'fe83ac26d43bffeaf28844bcf5fef303b1bdf345'
+    default: 'feb542e756362a7203a7aa41b50af533427be5a6'
   go_version:
     description: 'Go version to use for building'
     required: false
-    default: '1.24.1'
+    default: '1.26.1'
 
 runs:
   using: 'composite'

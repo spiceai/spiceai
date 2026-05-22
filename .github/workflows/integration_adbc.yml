@@ -35,7 +35,7 @@ env:
 
 jobs:
   check_changes:
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
@@ -52,7 +52,7 @@ jobs:
     name: ADBC Integration Tests
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:

@@ -1,0 +1,10 @@
+version: v2
+kind: Spicepod
+name: auth_test_api_key
+
+runtime:
+  auth:
+    api_key:
+      enabled: true
+      keys:
+        - "${SPICE_API_KEY}"

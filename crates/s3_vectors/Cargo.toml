@@ -4,6 +4,7 @@ exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
 name = "s3_vectors"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true

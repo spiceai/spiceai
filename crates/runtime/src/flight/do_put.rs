@@ -163,6 +163,11 @@ pub(crate) async fn handle(
         }
     }
 
+    // Cedar policy authorization — if a policy engine is configured, per-table
+    // Cedar checks happen in the SQL query path when the DoPut executes DML.
+    // No general authorization check is performed here because the table name
+    // isn't known until the flight descriptor is parsed below.
+
     // Since it is not a prepared statement we can take from the stream
     let Some(Ok(first_message)) = streaming_flight.next().await else {
         let _start = metrics::track_flight_request("do_put", None);

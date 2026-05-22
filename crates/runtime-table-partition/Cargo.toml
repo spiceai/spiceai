@@ -4,6 +4,7 @@ exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
 name = "runtime-table-partition"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -31,5 +32,5 @@ insta = { workspace = true, features = ["json"] }
 tempfile.workspace = true
 
 [[bench]]
-name = "scan_benchmark"
 harness = false
+name = "scan_benchmark"

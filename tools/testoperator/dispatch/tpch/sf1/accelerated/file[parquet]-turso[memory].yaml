@@ -4,19 +4,19 @@ tests:
   #   spicepod_path: accelerated/file[parquet]-turso[memory].yaml
   #   query_set: tpch
   #   query_overrides: turso
-  #   runner_type: spiceai-dev-runners
+  #   runner_type: spicehq-dev-runners
   #   ready_wait: 900
   #   validate_results: true
   throughput:
     spicepod_path: accelerated/file[parquet]-turso[memory].yaml
     query_set: tpch
     query_overrides: turso
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     ready_wait: 900
   load:
     spicepod_path: accelerated/file[parquet]-turso[memory].yaml
     query_set: tpch
     query_overrides: turso
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     duration: 28800
     ready_wait: 900

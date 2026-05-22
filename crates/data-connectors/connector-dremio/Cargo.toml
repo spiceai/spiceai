@@ -1,10 +1,11 @@
 [package]
-name = "connector-dremio"
-edition.workspace = true
-version.workspace = true
-rust-version.workspace = true
-license-file.workspace = true
 description = "Dremio data connector for Spice.ai runtime"
+edition.workspace = true
+license-file.workspace = true
+name = "connector-dremio"
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 arrow.workspace = true

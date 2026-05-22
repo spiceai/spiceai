@@ -24,6 +24,11 @@ ENV CARGO_FEATURES=$CARGO_FEATURES \
     CARGO_NET_GIT_FETCH_WITH_CLI=$CARGO_NET_GIT_FETCH_WITH_CLI \
     RUST_PROFILE=$RUST_PROFILE
 
+# Install NFS development libraries only when nfs feature is requested (NAS variant)
+RUN if echo "${CARGO_FEATURES}" | grep -q "nfs"; then \
+      apt-get update && apt-get install --yes --no-install-recommends libnfs-dev && rm -rf /var/lib/{apt,dpkg,cache,log}; \
+    fi
+
 RUN \
     --mount=type=cache,id=spiceai_registry,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=spiceai_git,sharing=locked,target=/usr/local/cargo/git \
@@ -53,6 +58,9 @@ RUN apt update \
     && apt install --yes ca-certificates libssl3 findutils tzdata --no-install-recommends \
     && if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
     apt install --yes unixodbc --no-install-recommends; \
+    fi \
+    && if echo "$CARGO_FEATURES" | grep -q "nfs"; then \
+    apt install --yes libnfs13 --no-install-recommends; \
     fi \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
@@ -88,7 +96,9 @@ RUN find /lib /usr/lib -name 'libdl.so.2' -exec sh -c 'mkdir -p /spice_sandbox/$
 
 # Preinstall Oracle ODPI-C (if enabled)
 RUN if [ "$INSTALL_ORACLE_ODPIC" = "true" ]; then \
-    set -euo pipefail; \
+    # Use `set -eu` instead of `set -euo pipefail` because this stage runs on
+    # debian:bookworm-slim where /bin/sh is dash, which does not support pipefail.
+    set -eu; \
     apt-get update && apt-get install -y --no-install-recommends libaio1 unzip curl; \
     ARCH=$(dpkg --print-architecture); \
     if [ "$ARCH" = "amd64" ]; then \

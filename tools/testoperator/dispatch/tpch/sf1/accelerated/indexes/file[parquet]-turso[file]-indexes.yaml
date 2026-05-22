@@ -3,17 +3,17 @@ tests:
     spicepod_path: accelerated/indexes/file[parquet]-turso[file]-indexes.yaml
     query_set: tpch
     query_overrides: turso
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     ready_wait: 1500
     validate_results: true
   throughput:
     spicepod_path: accelerated/indexes/file[parquet]-turso[file]-indexes.yaml
     query_set: tpch
     query_overrides: turso
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
   load:
     spicepod_path: accelerated/indexes/file[parquet]-turso[file]-indexes.yaml
     query_set: tpch
     query_overrides: turso
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     duration: 28800

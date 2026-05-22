@@ -1,4 +1,4 @@
-select 
+select
     "L_RETURNFLAG",
     "L_LINESTATUS",
     sum("L_QUANTITY") as sum_qty,

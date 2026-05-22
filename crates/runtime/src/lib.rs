@@ -556,6 +556,10 @@ pub struct Runtime {
 
     config: Arc<Config>,
 
+    /// Cedar-based authorization policy engine. `None` when no authorization
+    /// is configured — all authorization checks are skipped (current behavior).
+    policy_engine: Option<Arc<runtime_policy::PolicyEngine>>,
+
     /// Shared semaphore that bounds concurrent dataset schema inference
     /// (`read_provider`) calls so that startup loads and on-demand loads both
     /// honor `runtime.dataset_load_parallelism`.
@@ -594,6 +598,11 @@ impl Runtime {
     #[must_use]
     pub fn config(&self) -> Arc<Config> {
         Arc::clone(&self.config)
+    }
+
+    #[must_use]
+    pub fn policy_engine(&self) -> Option<Arc<runtime_policy::PolicyEngine>> {
+        self.policy_engine.as_ref().map(Arc::clone)
     }
 
     #[must_use]

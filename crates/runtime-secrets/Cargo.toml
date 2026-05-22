@@ -1,9 +1,10 @@
 [package]
-name = "runtime-secrets"
 description = "Secrets management utilities for the Spice.ai runtime"
 edition.workspace = true
 homepage.workspace = true
 license-file.workspace = true
+name = "runtime-secrets"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -12,18 +13,18 @@ version.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 dotenvy.workspace = true
+futures.workspace = true
 indexmap.workspace = true
 logos.workspace = true
+percent-encoding.workspace = true
 reqwest.workspace = true
+runtime-parameter-spec = { path = "../runtime-parameter-spec" }
 secrecy.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
-runtime-parameter-spec = { path = "../runtime-parameter-spec" }
-tracing.workspace = true
 tokio = { workspace = true, features = ["sync"] }
-percent-encoding.workspace = true
-futures.workspace = true
+tracing.workspace = true
 
 # Optional dependencies for feature-gated secret stores
 aws-config = { workspace = true, optional = true }
@@ -41,17 +42,22 @@ azure_security_keyvault_secrets = { version = "0.10.0", optional = true }
 # `url` is used by `resolve_vault_url` (Azure KeyVault) and `build_base_url`
 # (HashiCorp Vault) to enforce a well-formed URL with a host. Pulled in only
 # under either of those features via the feature block below.
-url = { workspace = true, optional = true }
 keyring = { version = "3.6.3", features = [
     "apple-native",
     "windows-native",
     "linux-native",
 ], optional = true }
+url = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "time",
+    "test-util",
+] }
 
 [features]
 aws-secrets-manager = [

@@ -54,7 +54,13 @@ use runtime_datafusion_udfs::{
         L2_DISTANCE_UDF_NAME, L2_SQUARED_DISTANCE_UDF_NAME, L2Distance, L2SquaredDistance,
     },
     l2_norm::{L2_NORM_UDF_NAME, L2Norm},
+    org::{ORG_UDF_NAME, OrgUdf},
+    role::{ROLE_UDF_NAME, RoleUdf},
+    role_check::CurrentUserHasRoleUdf,
+    session_property::{SESSION_PROPERTY_UDF_NAME, SessionPropertyUdf},
     truncate::{TRUNCATE_SCALAR_UDF_NAME, Truncate},
+    user::{USER_UDF_NAME, UserUdf},
+    user_functions::BuiltFunction,
 };
 use serde_json::Value;
 use spicepod::component::function::{Function, FunctionKind, Volatility};
@@ -74,11 +80,19 @@ pub fn register_core_scalar_udfs(ctx: &SessionContext) {
     ctx.register_udf(L2Norm::new().into());
     ctx.register_udf(Truncate::new().into());
     ctx.register_udf(INSTANCE.clone());
+    ctx.register_udf(UserUdf::new().into());
+    ctx.register_udf(OrgUdf::new().into());
+    ctx.register_udf(RoleUdf::new().into());
+    ctx.register_udf(SessionPropertyUdf::new().into());
 }
 
 pub async fn register_udfs(runtime: &crate::Runtime) {
     let ctx = &runtime.df.ctx;
     register_core_scalar_udfs(ctx);
+
+    if runtime.df.policy_engine().is_some() {
+        ctx.register_udf(CurrentUserHasRoleUdf::new().into());
+    }
 
     ctx.register_udf(TextSearchTableFunc::new(Arc::downgrade(&runtime.df)).into());
     ctx.register_udtf(
@@ -223,7 +237,7 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
     let mut functions_to_expose_as_tools = Vec::new();
     for (decl, built) in built {
         match built {
-            runtime_datafusion_udfs::user_functions::BuiltFunction::Scalar(udf) => {
+            BuiltFunction::Scalar(udf) => {
                 if let Some(existing_name) = registered_scalar_udf_name(ctx, &decl.name) {
                     tracing::error!(name = %decl.name, existing_name = %existing_name, "Failed to register user function because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
                     continue;
@@ -245,7 +259,7 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
                 );
                 functions_to_expose_as_tools.push(decl);
             }
-            runtime_datafusion_udfs::user_functions::BuiltFunction::Table(udtf) => {
+            BuiltFunction::Table(udtf) => {
                 if let Some(existing_name) = registered_scalar_udf_name(ctx, &decl.name) {
                     tracing::error!(name = %decl.name, existing_name = %existing_name, "Failed to register user table function because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
                     continue;
@@ -268,6 +282,9 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
                 if decl.as_tool {
                     tracing::warn!(name = %decl.name, "User table functions cannot be exposed as tools; skipping tool exposure");
                 }
+            }
+            _ => {
+                tracing::error!(name = %decl.name, "Failed to register user function because its UDF kind is not supported by this runtime");
             }
         }
     }
@@ -504,7 +521,7 @@ pub async fn apply_function_diff(
     let mut functions_to_expose_as_tools = Vec::new();
     for (next, built) in built {
         match built {
-            runtime_datafusion_udfs::user_functions::BuiltFunction::Scalar(udf) => {
+            BuiltFunction::Scalar(udf) => {
                 warn_beta_once();
                 if let Some(existing_name) = registered_scalar_udf_name(ctx, &next.name) {
                     tracing::error!(name = %next.name, existing_name = %existing_name, "Failed to register user function because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
@@ -523,7 +540,7 @@ pub async fn apply_function_diff(
                 tracing::info!(name = %next.name, from = %next.from, "Registered user function");
                 functions_to_expose_as_tools.push(next);
             }
-            runtime_datafusion_udfs::user_functions::BuiltFunction::Table(udtf) => {
+            BuiltFunction::Table(udtf) => {
                 warn_beta_once();
                 if let Some(existing_name) = registered_scalar_udf_name(ctx, &next.name) {
                     tracing::error!(name = %next.name, existing_name = %existing_name, "Failed to register user table function because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
@@ -543,6 +560,9 @@ pub async fn apply_function_diff(
                 if next.as_tool {
                     tracing::warn!(name = %next.name, "User table functions cannot be exposed as tools; skipping tool exposure");
                 }
+            }
+            _ => {
+                tracing::error!(name = %next.name, "Failed to register user function because its UDF kind is not supported by this runtime");
             }
         }
     }
@@ -572,6 +592,10 @@ fn denied_spice_function_names() -> Vec<String> {
         FLATTEN_JSON_UDTF_NAME,
         JSON_TREE_UDTF_NAME,
         RERANK_UDTF_NAME,
+        USER_UDF_NAME,
+        ORG_UDF_NAME,
+        ROLE_UDF_NAME,
+        SESSION_PROPERTY_UDF_NAME,
     ]
     .iter()
     .map(ToString::to_string)

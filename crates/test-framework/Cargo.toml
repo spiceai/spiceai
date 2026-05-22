@@ -4,6 +4,7 @@ exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
 name = "test-framework"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -12,9 +13,9 @@ version.workspace = true
 anyhow.workspace = true
 app = { path = "../app" }
 arrow = { workspace = true, features = ["prettyprint", "chrono-tz"] }
-arrow_tools = { path = "../arrow_tools" }
 arrow-json.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
+arrow_tools = { path = "../arrow_tools" }
 async-channel = "2.3"
 async-openai.workspace = true
 async-trait.workspace = true
@@ -46,7 +47,6 @@ rustls.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-yaml = { path = "../yaml" }
 spiceai = { workspace = true }
 spicepod = { path = "../spicepod" }
 sysinfo = "0.38.4"
@@ -58,6 +58,7 @@ tokio-util.workspace = true
 tonic.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 uuid = { workspace = true, features = ["v4"] }
+yaml = { path = "../yaml" }
 
 [target.'cfg(not(windows))'.dependencies]
 nix = { version = "0.30", features = ["signal"] }

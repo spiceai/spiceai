@@ -1,9 +1,10 @@
 [package]
-name = "hash-index"
 description = "SIMD-optimized hash index for fast point lookups in Arrow-based accelerators"
 edition.workspace = true
 homepage.workspace = true
 license-file.workspace = true
+name = "hash-index"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -30,5 +31,5 @@ rand.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [[bench]]
-name = "lookup"
 harness = false
+name = "lookup"

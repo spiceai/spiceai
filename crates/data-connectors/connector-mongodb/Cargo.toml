@@ -15,12 +15,13 @@
 ##
 
 [package]
-name = "connector-mongodb"
-edition.workspace = true
-version.workspace = true
-rust-version.workspace = true
-license-file.workspace = true
 description = "MongoDB data connector for Spice.ai runtime"
+edition.workspace = true
+license-file.workspace = true
+name = "connector-mongodb"
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 async-stream.workspace = true

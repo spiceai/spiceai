@@ -15,12 +15,13 @@
 ##
 
 [package]
-name = "connector-smb"
-edition.workspace = true
-version.workspace = true
-rust-version.workspace = true
-license-file.workspace = true
 description = "SMB data connector for Spice.ai runtime"
+edition.workspace = true
+license-file.workspace = true
+name = "connector-smb"
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 linkme.workspace = true

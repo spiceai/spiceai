@@ -4,6 +4,7 @@ exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
 name = "arrow_tools"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -12,13 +13,13 @@ version.workspace = true
 arrow.workspace = true
 arrow-cast.workspace = true
 arrow-schema.workspace = true
-snafu.workspace = true
 datafusion.workspace = true
+snafu.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-insta = {workspace = true, features = ["json"]}
 arrow-json.workspace = true
+insta = { workspace = true, features = ["json"] }
 serde_json.workspace = true
 criterion = { version = "0.7", features = ["html_reports"] }
 

@@ -163,7 +163,7 @@ impl CacheKey<'_> {
     }
 }
 
-#[derive(Hash, Eq, PartialEq, Clone, Copy)]
+#[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
 pub struct RawCacheKey(u64);
 
 impl RawCacheKey {
@@ -175,6 +175,19 @@ impl RawCacheKey {
     #[must_use]
     pub fn as_u64(&self) -> u64 {
         self.0
+    }
+
+    /// Returns a new cache key scoped to the given identity string.
+    ///
+    /// Use this to produce per-user cache keys for queries that reference
+    /// identity-dependent UDFs like `current_user_id()`, ensuring cached
+    /// results are never shared across different users.
+    #[must_use]
+    pub fn scoped(&self, scope: &str) -> Self {
+        let mut hasher = std::hash::DefaultHasher::new();
+        self.0.hash(&mut hasher);
+        scope.hash(&mut hasher);
+        Self(hasher.finish())
     }
 }
 
@@ -250,5 +263,27 @@ mod tests {
         let hash2 = hasher2.finish();
 
         assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_scoped_cache_key_differs_by_scope() {
+        let base = RawCacheKey::new(12345);
+
+        let scoped_alice = base.scoped("alice");
+        let scoped_bob = base.scoped("bob");
+
+        assert_ne!(
+            scoped_alice, scoped_bob,
+            "Different scopes should produce different cache keys"
+        );
+        assert_ne!(base, scoped_alice, "Scoped key should differ from base key");
+    }
+
+    #[test]
+    fn test_scoped_cache_key_deterministic() {
+        let base = RawCacheKey::new(12345);
+        let s1 = base.scoped("alice");
+        let s2 = base.scoped("alice");
+        assert_eq!(s1, s2, "Same scope should produce the same cache key");
     }
 }

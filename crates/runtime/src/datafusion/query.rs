@@ -84,6 +84,7 @@ use super::{
 use super::managed_runtime;
 use crate::datafusion::{
     DataFusion,
+    policy_enforcer::enforce_query_plan,
     query::cache::RequestCacheManager,
     sql_validator::{validate_sql_query_operations, validate_sql_query_read_only},
 };
@@ -373,90 +374,125 @@ impl Query {
         let session = session_ctx.state();
 
         // Get logical plan and cache key, reusing existing cache infrastructure
-        let (plan, mut tracker, cache_key) = match &self.sql {
-            QueryMethod::Text {
-                sql,
-                parameters,
-                pre_parsed_plan,
-                ..
-            } => {
-                // Use the existing get_plan_or_cached which handles all cache
-                // control, stale-while-revalidate, and query tracking. The
-                // cache itself is namespaced per principal and refuses to
-                // store write-capable plans, so a read-only caller cannot
-                // observe a cached entry produced by a write-capable plan.
-                match Query::get_plan_or_cached(
-                    &self.df,
-                    &session,
-                    Arc::clone(&request_context),
+        let (mut plan, mut tracker, cache_key, policy_engine) = if let Some(policy_engine) =
+            self.df.policy_engine().cloned()
+        {
+            let (plan, tracker, cache_key) = match &self.sql {
+                QueryMethod::Text {
                     sql,
-                    parameters.clone(),
-                    tracker,
-                    pre_parsed_plan.clone(),
-                )
-                .await?
-                {
-                    cache::PlanOrCached::Cached(cached_result) => {
-                        tracing::debug!(job_id, "Returning cached result for distributed query");
-                        // Return a QueryHandle with cached results
-                        let schema = cached_result.data.schema();
-                        return Ok(QueryHandle::new_with_cached_result(
-                            job_id.to_string(),
-                            schema,
-                            Arc::clone(&self.df),
-                            None, // Cache key already used for lookup
-                            cached_result.data,
-                            Arc::clone(&request_context),
-                        ));
-                    }
-                    cache::PlanOrCached::Plan(plan, tracker, cache_manager) => {
-                        // Plan needs execution - cache_manager contains the raw cache key for storing results
-                        let cache_key = if cache_manager.should_cache_results() {
-                            Some(cache_manager.raw_cache_key)
-                        } else {
-                            None
-                        };
-                        (*plan, tracker, cache_key)
-                    }
+                    parameters,
+                    pre_parsed_plan,
+                    ..
+                } => {
+                    let raw_cache_key = Self::raw_sql_plan_cache_key(
+                        &self.df,
+                        &request_context,
+                        sql,
+                        parameters.as_ref(),
+                    );
+                    let plan = if let Some(plan) = pre_parsed_plan {
+                        plan.as_ref().clone()
+                    } else {
+                        Query::get_plan(&self.df, &session, sql, &raw_cache_key, parameters.clone())
+                            .await?
+                    };
+                    (plan, tracker, None)
                 }
-            }
-            QueryMethod::Plan(logical_plan) => {
-                // For direct plan submission, compute cache key and check cache
-                let plan_cache_key =
-                    CacheKey::LogicalPlan(logical_plan).as_raw_key(Self::plan_hasher(&self.df));
-
-                // Check for cached results using the standard cache lookup
-                if let Some(cache_provider) = self.df.results_cache_provider()
-                    && let Ok(Some(cached_result)) =
-                        cache_provider.get_raw_key(&plan_cache_key).await
-                {
-                    let ttl = cache_provider.ttl();
-                    let now = std::time::Instant::now();
-                    if !cached_result.is_stale(ttl, now)
-                        && let Ok(records) = cached_result.records().await
+                QueryMethod::Plan(logical_plan) => (logical_plan.as_ref().clone(), tracker, None),
+            };
+            (plan, tracker, cache_key, Some(policy_engine))
+        } else {
+            let (plan, tracker, cache_key) = match &self.sql {
+                QueryMethod::Text {
+                    sql,
+                    parameters,
+                    pre_parsed_plan,
+                    ..
+                } => {
+                    // Use the existing get_plan_or_cached which handles all cache
+                    // control, stale-while-revalidate, and query tracking. The
+                    // cache itself is namespaced per principal and refuses to
+                    // store write-capable plans, so a read-only caller cannot
+                    // observe a cached entry produced by a write-capable plan.
+                    match Query::get_plan_or_cached(
+                        &self.df,
+                        &session,
+                        Arc::clone(&request_context),
+                        sql,
+                        parameters.clone(),
+                        tracker,
+                        pre_parsed_plan.clone(),
+                    )
+                    .await?
                     {
-                        tracing::debug!(
-                            job_id,
-                            cache_key = plan_cache_key.as_u64(),
-                            "Returning cached result for distributed query (plan)"
-                        );
-                        let stream = ::cache::result::query::CachedStream::new(
-                            Arc::new(records),
-                            cached_result.schema,
-                        );
-                        return Ok(QueryHandle::new_with_cached_result(
-                            job_id.to_string(),
-                            Arc::clone(logical_plan.schema().inner()),
-                            Arc::clone(&self.df),
-                            None,
-                            Box::pin(stream),
-                            Arc::clone(&request_context),
-                        ));
+                        cache::PlanOrCached::Cached(cached_result) => {
+                            tracing::debug!(
+                                job_id,
+                                "Returning cached result for distributed query"
+                            );
+                            // Return a QueryHandle with cached results
+                            let schema = cached_result.data.schema();
+                            return Ok(QueryHandle::new_with_cached_result(
+                                job_id.to_string(),
+                                schema,
+                                Arc::clone(&self.df),
+                                None, // Cache key already used for lookup
+                                cached_result.data,
+                                Arc::clone(&request_context),
+                            ));
+                        }
+                        cache::PlanOrCached::Plan(plan, tracker, cache_manager) => {
+                            // Plan needs execution - cache_manager contains the raw cache key for storing results
+                            let cache_key = if cache_manager.should_cache_results() {
+                                Some(cache_manager.raw_cache_key)
+                            } else {
+                                None
+                            };
+                            (*plan, tracker, cache_key)
+                        }
                     }
                 }
+                QueryMethod::Plan(logical_plan) => {
+                    // For direct plan submission, compute cache key and check cache
+                    let plan_cache_key = Self::scope_raw_cache_key_for_request(
+                        CacheKey::LogicalPlan(logical_plan).as_raw_key(Self::plan_hasher(&self.df)),
+                        &request_context,
+                    );
 
-                (logical_plan.as_ref().clone(), tracker, Some(plan_cache_key))
-            }
+                    // Check for cached results using the standard cache lookup
+                    if let Some(cache_provider) = self.df.results_cache_provider()
+                        && let Ok(Some(cached_result)) =
+                            cache_provider.get_raw_key(&plan_cache_key).await
+                    {
+                        let ttl = cache_provider.ttl();
+                        let now = std::time::Instant::now();
+                        if !cached_result.is_stale(ttl, now)
+                            && let Ok(records) = cached_result.records().await
+                        {
+                            tracing::debug!(
+                                job_id,
+                                cache_key = plan_cache_key.as_u64(),
+                                "Returning cached result for distributed query (plan)"
+                            );
+                            let stream = ::cache::result::query::CachedStream::new(
+                                Arc::new(records),
+                                cached_result.schema,
+                            );
+                            return Ok(QueryHandle::new_with_cached_result(
+                                job_id.to_string(),
+                                Arc::clone(logical_plan.schema().inner()),
+                                Arc::clone(&self.df),
+                                None,
+                                Box::pin(stream),
+                                Arc::clone(&request_context),
+                            ));
+                        }
+                    }
+
+                    (logical_plan.as_ref().clone(), tracker, Some(plan_cache_key))
+                }
+            };
+            (plan, tracker, cache_key, None)
         };
 
         // Validate query operations
@@ -469,6 +505,17 @@ impl Query {
         {
             let e = find_datafusion_root(e);
             return Err(Error::UnableToExecuteQuery { source: e });
+        }
+
+        // Cedar policy authorization and fine-grained read enforcement.
+        if let Some(policy_engine) = policy_engine.as_ref() {
+            match enforce_query_plan(plan, policy_engine, &session).await {
+                Ok(enforced_plan) => plan = enforced_plan,
+                Err(e) => {
+                    let e = find_datafusion_root(e);
+                    return Err(Error::UnableToExecuteQuery { source: e });
+                }
+            }
         }
 
         // Get the schema from the logical plan
@@ -638,104 +685,238 @@ impl Query {
                     .set_extension(Arc::clone(&request_context));
 
                 // Get the `LogicalPlan` or cached results
-                let (plan, mut tracker, cache_manager) = match &ctx.sql {
-                    QueryMethod::Text {
-                        sql,
-                        parameters,
-                        table_allowlist: Some(allowlist),
-                        pre_parsed_plan,
-                    } => {
-                        let raw_cache_key = CacheKey::Query(sql, parameters.as_ref())
-                            .as_raw_key(Query::plan_hasher(&ctx.df));
-                        let plan = if let Some(plan) = pre_parsed_plan {
-                            plan.clone()
-                        } else {
-                            Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
-                            match Self::get_plan(
-                                &ctx.df,
-                                &session,
+                let (mut plan, mut tracker, cache_manager, policy_engine) =
+                    if let Some(policy_engine) = ctx.df.policy_engine().cloned() {
+                        let (plan, tracker, cache_manager) = match &ctx.sql {
+                            QueryMethod::Text {
                                 sql,
-                                &raw_cache_key,
-                                parameters.clone(),
-                            )
-                            .await
-                            {
-                                Ok(plan) => Box::new(plan),
-                                Err(e) => match e {
-                                    Error::UnableToExecuteQuery { source } => {
-                                        let code = ErrorCode::from(&source);
-                                        let snafu_err = Error::UnableToExecuteQuery { source };
-                                        if let Some(t) = tracker {
-                                            t.finish_with_error(
-                                                &request_context,
-                                                snafu_err.to_string(),
-                                                code,
-                                            );
-                                        }
-                                        return Err(snafu_err);
+                                parameters,
+                                table_allowlist: Some(allowlist),
+                                pre_parsed_plan,
+                            } => {
+                                let raw_cache_key = Self::raw_sql_plan_cache_key(
+                                    &ctx.df,
+                                    &request_context,
+                                    sql,
+                                    parameters.as_ref(),
+                                );
+                                let plan = if let Some(plan) = pre_parsed_plan {
+                                    plan.clone()
+                                } else {
+                                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                                    match Self::get_plan(
+                                        &ctx.df,
+                                        &session,
+                                        sql,
+                                        &raw_cache_key,
+                                        parameters.clone(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(plan) => Box::new(plan),
+                                        Err(e) => match e {
+                                            Error::UnableToExecuteQuery { source } => {
+                                                let code = ErrorCode::from(&source);
+                                                let snafu_err =
+                                                    Error::UnableToExecuteQuery { source };
+                                                if let Some(t) = tracker {
+                                                    t.finish_with_error(
+                                                        &request_context,
+                                                        snafu_err.to_string(),
+                                                        code,
+                                                    );
+                                                }
+                                                return Err(snafu_err);
+                                            }
+                                            _ => return Err(e),
+                                        },
                                     }
-                                    _ => return Err(e),
-                                },
+                                };
+                                let tables_referenced = plan.as_table_refs();
+                                if let Some(disallowed_table) = tables_referenced
+                                    .iter()
+                                    .find(|&t| !allowlist.table_is_allowed(t))
+                                {
+                                    return Err(Error::TableAccessDisallowed {
+                                        table: disallowed_table.to_string(),
+                                    });
+                                }
+
+                                (
+                                    plan,
+                                    tracker,
+                                    RequestCacheManager::new(
+                                        CacheStatus::CacheDisabled,
+                                        raw_cache_key,
+                                    ),
+                                )
+                            }
+                            QueryMethod::Text {
+                                sql,
+                                parameters,
+                                table_allowlist: None,
+                                pre_parsed_plan,
+                            } => {
+                                let raw_cache_key = Self::raw_sql_plan_cache_key(
+                                    &ctx.df,
+                                    &request_context,
+                                    sql,
+                                    parameters.as_ref(),
+                                );
+                                let plan = if let Some(plan) = pre_parsed_plan {
+                                    plan.clone()
+                                } else {
+                                    Box::new(
+                                        Self::get_plan(
+                                            &ctx.df,
+                                            &session,
+                                            sql,
+                                            &raw_cache_key,
+                                            parameters.clone(),
+                                        )
+                                        .await?,
+                                    )
+                                };
+                                (
+                                    plan,
+                                    tracker,
+                                    RequestCacheManager::new(
+                                        CacheStatus::CacheDisabled,
+                                        raw_cache_key,
+                                    ),
+                                )
+                            }
+                            QueryMethod::Plan(logical_plan) => {
+                                let cache_manager = RequestCacheManager::new(
+                                    CacheStatus::CacheDisabled,
+                                    Self::scope_raw_cache_key_for_request(
+                                        CacheKey::LogicalPlan(logical_plan)
+                                            .as_raw_key(Query::plan_hasher(&ctx.df)),
+                                        &request_context,
+                                    ),
+                                );
+                                (logical_plan.clone(), None, cache_manager)
                             }
                         };
-                        Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
-                        let tables_referenced = plan.as_table_refs();
-                        if let Some(disallowed_table) = tables_referenced
-                            .iter()
-                            .find(|&t| !allowlist.table_is_allowed(t))
-                        {
-                            return Err(Error::TableAccessDisallowed {
-                                table: disallowed_table.to_string(),
-                            });
-                        }
+                        (plan, tracker, cache_manager, Some(policy_engine))
+                    } else {
+                        let (plan, tracker, cache_manager) = match &ctx.sql {
+                            QueryMethod::Text {
+                                sql,
+                                parameters,
+                                table_allowlist: Some(allowlist),
+                                pre_parsed_plan,
+                            } => {
+                                let raw_cache_key = Self::raw_sql_plan_cache_key(
+                                    &ctx.df,
+                                    &request_context,
+                                    sql,
+                                    parameters.as_ref(),
+                                );
+                                let plan = if let Some(plan) = pre_parsed_plan {
+                                    plan.clone()
+                                } else {
+                                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                                    match Self::get_plan(
+                                        &ctx.df,
+                                        &session,
+                                        sql,
+                                        &raw_cache_key,
+                                        parameters.clone(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(plan) => Box::new(plan),
+                                        Err(e) => match e {
+                                            Error::UnableToExecuteQuery { source } => {
+                                                let code = ErrorCode::from(&source);
+                                                let snafu_err =
+                                                    Error::UnableToExecuteQuery { source };
+                                                if let Some(t) = tracker {
+                                                    t.finish_with_error(
+                                                        &request_context,
+                                                        snafu_err.to_string(),
+                                                        code,
+                                                    );
+                                                }
+                                                return Err(snafu_err);
+                                            }
+                                            _ => return Err(e),
+                                        },
+                                    }
+                                };
+                                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                                let tables_referenced = plan.as_table_refs();
+                                if let Some(disallowed_table) = tables_referenced
+                                    .iter()
+                                    .find(|&t| !allowlist.table_is_allowed(t))
+                                {
+                                    return Err(Error::TableAccessDisallowed {
+                                        table: disallowed_table.to_string(),
+                                    });
+                                }
 
-                        (
-                            plan,
-                            tracker,
-                            RequestCacheManager::new(CacheStatus::CacheDisabled, raw_cache_key),
-                        )
-                    }
-                    QueryMethod::Text {
-                        sql,
-                        parameters,
-                        table_allowlist: None,
-                        pre_parsed_plan,
-                    } => {
-                        match Self::get_plan_or_cached(
-                            &ctx.df,
-                            &session,
-                            Arc::clone(&request_context),
-                            sql,
-                            parameters.clone(),
-                            tracker,
-                            pre_parsed_plan.clone(),
-                        )
-                        .await?
-                        {
-                            PlanOrCached::Plan(plan, tracker, cache_manager) => {
-                                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
-                                (plan, tracker, cache_manager)
+                                (
+                                    plan,
+                                    tracker,
+                                    RequestCacheManager::new(
+                                        CacheStatus::CacheDisabled,
+                                        raw_cache_key,
+                                    ),
+                                )
                             }
-                            PlanOrCached::Cached(query_result) => {
-                                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
-                                return Ok(attach_cancellation_to_query_result(
-                                    query_result,
-                                    query_cancel_token.clone(),
-                                    query_id_str.clone(),
-                                    active_query_guard,
-                                ));
+                            QueryMethod::Text {
+                                sql,
+                                parameters,
+                                table_allowlist: None,
+                                pre_parsed_plan,
+                            } => {
+                                match Self::get_plan_or_cached(
+                                    &ctx.df,
+                                    &session,
+                                    Arc::clone(&request_context),
+                                    sql,
+                                    parameters.clone(),
+                                    tracker,
+                                    pre_parsed_plan.clone(),
+                                )
+                                .await?
+                                {
+                                    PlanOrCached::Plan(plan, tracker, cache_manager) => {
+                                        Self::ensure_not_cancelled(
+                                            &query_cancel_token,
+                                            &query_id_str,
+                                        )?;
+                                        (plan, tracker, cache_manager)
+                                    }
+                                    PlanOrCached::Cached(query_result) => {
+                                        Self::ensure_not_cancelled(
+                                            &query_cancel_token,
+                                            &query_id_str,
+                                        )?;
+                                        return Ok(attach_cancellation_to_query_result(
+                                            query_result,
+                                            query_cancel_token.clone(),
+                                            query_id_str.clone(),
+                                            active_query_guard,
+                                        ));
+                                    }
+                                }
                             }
-                        }
-                    }
-                    QueryMethod::Plan(logical_plan) => {
-                        let cache_manager = RequestCacheManager::new(
-                            CacheStatus::CacheMiss,
-                            CacheKey::LogicalPlan(logical_plan)
-                                .as_raw_key(Query::plan_hasher(&ctx.df)),
-                        );
-                        (logical_plan.clone(), None, cache_manager)
-                    }
-                };
+                            QueryMethod::Plan(logical_plan) => {
+                                let cache_manager = RequestCacheManager::new(
+                                    CacheStatus::CacheMiss,
+                                    Self::scope_raw_cache_key_for_request(
+                                        CacheKey::LogicalPlan(logical_plan)
+                                            .as_raw_key(Query::plan_hasher(&ctx.df)),
+                                        &request_context,
+                                    ),
+                                );
+                                (logical_plan.clone(), None, cache_manager)
+                            }
+                        };
+                        (plan, tracker, cache_manager, None)
+                    };
 
                 Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
 
@@ -761,6 +942,23 @@ impl Query {
                         e,
                         UnableToExecuteQuery
                     )
+                }
+
+                // Cedar policy authorization and fine-grained read enforcement.
+                if let Some(policy_engine) = policy_engine.as_ref() {
+                    match enforce_query_plan(*plan, policy_engine, &session).await {
+                        Ok(enforced_plan) => *plan = enforced_plan,
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            handle_error!(
+                                tracker,
+                                &request_context,
+                                ErrorCode::QueryPlanningError,
+                                e,
+                                UnableToExecuteQuery
+                            )
+                        }
+                    }
                 }
 
                 // Proactively invalidate cached query state for tables affected by

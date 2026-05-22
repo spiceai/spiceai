@@ -4,6 +4,7 @@ exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
 name = "spidapter"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -17,16 +18,16 @@ clap.workspace = true
 dirs = "6"
 reqwest.workspace = true
 runtime-secrets = { path = "../../crates/runtime-secrets", default-features = false }
-spice-cloud-client.workspace = true
+rustls.workspace = true
 serde_json.workspace = true
+spice-cloud-client.workspace = true
 spicepod = { path = "../../crates/spicepod", default-features = false }
 system-adapter-protocol.workspace = true
-uuid.workspace = true
-yaml = { path = "../../crates/yaml" }
-rustls.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 url.workspace = true
+uuid.workspace = true
+yaml = { path = "../../crates/yaml" }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -3,8 +3,8 @@ tests:
     spicepod_path: federated/mssql[catalog].yaml
     query_set: tpch
     query_overrides: mssql-catalog
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
   schema:
     spicepod_path: federated/mssql[catalog].yaml
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     min_tables: 1

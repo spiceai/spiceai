@@ -3,15 +3,15 @@ tests:
     spicepod_path: accelerated/s3[parquet]-arrow.yaml
     query_set: tpcds
     ready_wait: 600
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
   throughput:
     spicepod_path: accelerated/s3[parquet]-arrow.yaml
     query_set: tpcds
     ready_wait: 600
-    runner_type: spiceai-dev-large-runners
+    runner_type: spicehq-dev-large-runners
   load:
     spicepod_path: accelerated/s3[parquet]-arrow.yaml
     query_set: tpcds
     ready_wait: 600
-    runner_type: spiceai-dev-large-runners
+    runner_type: spicehq-dev-large-runners
     duration: 28800

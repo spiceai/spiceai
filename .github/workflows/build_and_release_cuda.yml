@@ -1,68 +1,16 @@
-name: build_and_release_cuda
+# ============================================================================
+# DISABLED: This workflow comes from upstream (spiceai/spiceai).
+# The enterprise version is ent_build_and_release_cuda.yml
+# This file is kept only to prevent merge conflicts with upstream.
+# ============================================================================
+name: "build_and_release_cuda (upstream - disabled)"
 
-on:
-  pull_request:
-    branches:
-      - trunk
-    paths:
-      - 'crates/llms/Cargo.toml'
-  push:
-    tags:
-      - v*
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'README.md'
-      - 'Makefile'
-      - 'CONTRIBUTING.md'
-      - 'SECURITY.md'
-      - 'LICENSE'
-      - '.github/**'
-      - 'version.txt'
-      - '.schema/**'
-      - '.vscode/**'
-      - 'deploy/**'
-      - 'install/**'
-      - 'media/**'
-      - 'monitoring/**'
-      - 'acknowledgements.md'
-      - 'Dockerfile*'
-
-  workflow_dispatch:
-    inputs:
-      platform_option:
-        description: 'Which platform do you want to run on? (Default is ALL)'
-        required: false
-        type: choice
-        options:
-          - 'all'
-          - 'Linux x64'
-        default: 'all'
-      compute_cap:
-        description: 'Which CUDA compute capability to build for? (Default is ALL)'
-        required: false
-        type: choice
-        options:
-          - 'all'
-          - '80'
-          - '86'
-          - '87'
-          - '89'
-          - '90'
-        default: 'all'
-      profile_option:
-        description: 'Which Rust build profile to use? (Default is release)'
-        required: false
-        type: choice
-        options:
-          - 'release'
-          - 'release-lto'
-        default: 'release'
+on: [workflow_dispatch]
 
 jobs:
   setup-matrix:
     name: Setup CUDA matrix
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -72,37 +20,34 @@ jobs:
         id: setup-matrix
         with:
           script: |
-            const isTaggedRelease = context.ref.startsWith('refs/tags/v');
-            const runner = isTaggedRelease ? "ubuntu-24.04-16core" : "spiceai-dev-large-runners";
-
             const matrix = [
               {
                 compute_cap: "80",
-                runner: runner,
+                runner: "spicehq-dev-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "86",
-                runner: runner,
+                runner: "spicehq-dev-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "87",
-                runner: runner,
+                runner: "spicehq-dev-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "89",
-                runner: runner,
+                runner: "spicehq-dev-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "90",
-                runner: runner,
+                runner: "spicehq-dev-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               }
@@ -127,12 +72,8 @@ jobs:
               return filtered;
             }
 
-            // For `on.pull_request`, only build 90 compute capability on Linux.
-            if (context.eventName === 'pull_request') {
-              return matrix.filter(m => m.compute_cap === "90" && m.target_os === "linux");
-            }
-
-            return matrix;
+            // Non-manual (push/PR): Linux 90 cap only
+            return matrix.filter(m => m.compute_cap === "90" && m.target_os === "linux");
 
   build:
     name: Build CUDA ${{ matrix.target.compute_cap }} binaries
@@ -185,13 +126,13 @@ jobs:
 
   publish-minio:
     name: Publish linux-x86_64 CUDA binaries to Minio
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     needs: build
     env:
       ARTIFACT_DIR: ./release
-      MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
-      MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
-      MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+      MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+      MINIO_ACCESS_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+      MINIO_SECRET_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
       COMMIT_SHA: ${{ github.sha }}
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
@@ -234,7 +175,7 @@ jobs:
       ARTIFACT_DIR: ./release
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 

@@ -577,6 +577,39 @@ impl QueryResultsCacheProvider {
     }
 }
 
+/// Returns `true` if the logical plan references a scalar UDF with the given name.
+///
+/// Walks the entire plan tree, inspecting all expressions at each node for
+/// `ScalarFunction` calls whose `func.name()` matches `udf_name`.
+#[must_use]
+pub fn plan_references_udf(plan: &LogicalPlan, udf_name: &str) -> bool {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::Expr;
+
+    let mut plan_stack = vec![plan];
+
+    while let Some(current_plan) = plan_stack.pop() {
+        for expr in current_plan.expressions() {
+            let mut found = false;
+            let _ = expr.apply(|e| {
+                if let Expr::ScalarFunction(func) = e
+                    && func.func.name() == udf_name
+                {
+                    found = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            });
+            if found {
+                return true;
+            }
+        }
+        plan_stack.extend(current_plan.inputs());
+    }
+
+    false
+}
+
 impl Display for QueryResultsCacheProvider {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -733,5 +766,70 @@ mod tests {
         (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
             .then_some(())
             .expect("cache should be disabled for COPY");
+    }
+
+    #[tokio::test]
+    async fn test_plan_references_udf_detects_named_udf() {
+        use arrow::datatypes::DataType;
+        use datafusion::common::DataFusionError;
+        use datafusion::logical_expr::{
+            ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+        };
+        use datafusion::prelude::SessionContext;
+
+        #[derive(Debug, Hash, PartialEq, Eq)]
+        struct DummyUdf;
+
+        impl ScalarUDFImpl for DummyUdf {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn name(&self) -> &'static str {
+                "test_identity_udf"
+            }
+            fn signature(&self) -> &Signature {
+                // Leak is fine in tests
+                Box::leak(Box::new(Signature::exact(vec![], Volatility::Volatile)))
+            }
+            fn return_type(&self, _: &[DataType]) -> Result<DataType, DataFusionError> {
+                Ok(DataType::Utf8)
+            }
+            fn invoke_with_args(
+                &self,
+                _: ScalarFunctionArgs,
+            ) -> Result<ColumnarValue, DataFusionError> {
+                Ok(ColumnarValue::Scalar(
+                    datafusion::scalar::ScalarValue::Utf8(Some("u".to_string())),
+                ))
+            }
+        }
+
+        let ctx = SessionContext::new();
+        ctx.register_udf(ScalarUDF::new_from_impl(DummyUdf));
+
+        let plan = ctx
+            .sql("SELECT test_identity_udf()")
+            .await
+            .expect("parse SQL")
+            .into_optimized_plan()
+            .expect("optimize plan");
+
+        assert!(
+            plan_references_udf(&plan, "test_identity_udf"),
+            "Plan should detect the named UDF"
+        );
+        assert!(
+            !plan_references_udf(&plan, "nonexistent_udf"),
+            "Plan should not detect a different UDF name"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_references_udf_false_for_ordinary_query() {
+        let plan = parse_sql_to_logical_plan("SELECT 1").await;
+        assert!(
+            !plan_references_udf(&plan, "current_user_id"),
+            "Plan without current_user_id() should return false"
+        );
     }
 }

@@ -39,18 +39,18 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[cfg(feature = "alloc-system")]
+#[cfg(feature = "alloc-snmalloc")]
 #[global_allocator]
-static ALLOC: std::alloc::System = std::alloc::System;
+static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
-// snmalloc is the default allocator if no other allocator is selected
+// sysalloc is the default allocator if no other allocator is selected
 #[cfg(not(any(
     feature = "alloc-jemalloc",
     feature = "alloc-mimalloc",
-    feature = "alloc-system"
+    feature = "alloc-snmalloc"
 )))]
 #[global_allocator]
-static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+static ALLOC: std::alloc::System = std::alloc::System;
 
 // Function to determine the allocator name at compile time
 const fn get_allocator_name() -> Option<&'static str> {
@@ -58,8 +58,8 @@ const fn get_allocator_name() -> Option<&'static str> {
         Some("jemalloc")
     } else if cfg!(feature = "alloc-mimalloc") {
         Some("mimalloc")
-    } else if cfg!(feature = "alloc-system") {
-        Some("system")
+    } else if cfg!(feature = "alloc-snmalloc") {
+        Some("snmalloc")
     } else {
         None
     }

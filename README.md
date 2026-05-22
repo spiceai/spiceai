@@ -4,7 +4,7 @@
 <div align="center">
 
 [![CodeQL](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml?query=branch%3Atrunk+event%3Apush)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![License: Commercial](https://img.shields.io/badge/License-Commercial-blue.svg)](LICENSE)
 [![Slack](https://img.shields.io/badge/Slack-Join%20Us-4A154B?logo=slack)](https://spice.ai/slack)
 [![Follow on X](https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=x)](https://x.com/intent/follow?screen_name=spice_ai)
 [![GitHub stars](https://img.shields.io/github/stars/spiceai/spiceai?style=social)](https://github.com/spiceai/spiceai/stargazers)
@@ -231,46 +231,46 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 ## Supported Data Connectors
 
-| Name                               | Description                           | Status            | Protocol/Format              |
-| ---------------------------------- | ------------------------------------- | ----------------- | ---------------------------- |
-| `databricks (mode: delta_lake)`    | [Databricks][databricks]              | Stable            | S3/Delta Lake                |
-| `delta_lake`                       | Delta Lake                            | Stable            | Delta Lake                   |
-| `dremio`                           | [Dremio][dremio]                      | Stable            | Arrow Flight                 |
-| `duckdb`                           | DuckDB                                | Stable            | Embedded                     |
-| `file`                             | File                                  | Stable            | Parquet, CSV                 |
-| `github`                           | GitHub                                | Stable            | GitHub API                   |
-| `postgres`                         | PostgreSQL (with native WAL CDC)      | Stable            |                              |
-| `s3`                               | [S3][s3]                              | Stable            | Parquet, CSV                 |
-| `mysql`                            | MySQL                                 | Stable            |                              |
-| `spice.ai`                         | [Spice.ai][spiceai]                   | Stable            | Arrow Flight                 |
-| `graphql`                          | GraphQL                               | Release Candidate | JSON                         |
-| `dynamodb`                         | Amazon DynamoDB (with Streams)        | Release Candidate |                              |
-| `cosmosdb`                         | Azure Cosmos DB (NoSQL)               | Release Candidate |                              |
-| `git`                              | Git repositories                      | Release Candidate |                              |
-| `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
-| `ducklake`                         | [DuckLake][ducklake]                  | Beta              | Parquet                      |
-| `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
-| `iceberg`                          | [Apache Iceberg][iceberg] (read+write) | Beta              | Parquet                      |
-| `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
-| `odbc`                             | ODBC                                  | Beta              | ODBC                         |
-| `snowflake`                        | Snowflake                             | Beta              | Arrow                        |
-| `spark`                            | Spark                                 | Beta              | [Spark Connect][spark]       |
-| `sharepoint`                       | Microsoft SharePoint                  | Beta              | Object-store listing         |
-| `oracle`                           | Oracle                                | Alpha             | [Oracle ODPI-C][ODPIC]       |
-| `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
-| `clickhouse`                       | ClickHouse                            | Alpha             |                              |
-| `debezium`                         | Debezium CDC                          | Alpha             | Kafka + JSON                 |
-| `elasticsearch`                    | Elasticsearch (BM25 + kNN + RRF)      | Alpha             |                              |
-| `gcs`, `gs`                        | [Google Cloud Storage][gcs]           | Alpha             | Parquet, CSV, JSON           |
-| `kafka`                            | Kafka                                 | Alpha             | Kafka + JSON                 |
-| `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
-| `glue`                             | [AWS Glue][glue]                      | Alpha             | Iceberg, Parquet, CSV        |
-| `http`, `https`                    | HTTP(s) (dynamic headers, pagination) | Alpha             | Parquet, CSV, JSON           |
-| `imap`                             | IMAP                                  | Alpha             | IMAP Emails                  |
-| `localpod`                         | [Local dataset replication][localpod] | Alpha             |                              |
-| `mongodb`                          | MongoDB                               | Alpha             |                              |
-| `scylladb`                         | ScyllaDB                              | Alpha             |                              |
-| `smb`                              | SMB 3.1.1                             | Alpha             | SMB                          |
+| Name                               | Description                            | Status            | Protocol/Format           |
+| ---------------------------------- | -------------------------------------- | ----------------- | ------------------------- |
+| `databricks (mode: delta_lake)`    | [Databricks][databricks]               | Stable            | S3/Delta Lake             |
+| `delta_lake`                       | Delta Lake                             | Stable            | Delta Lake                |
+| `dremio`                           | [Dremio][dremio]                       | Stable            | Arrow Flight              |
+| `duckdb`                           | DuckDB                                 | Stable            | Embedded                  |
+| `file`                             | File                                   | Stable            | Parquet, CSV              |
+| `github`                           | GitHub                                 | Stable            | GitHub API                |
+| `postgres`                         | PostgreSQL (with native WAL CDC)       | Stable            |                           |
+| `s3`                               | [S3][s3]                               | Stable            | Parquet, CSV              |
+| `mysql`                            | MySQL                                  | Stable            |                           |
+| `spice.ai`                         | [Spice.ai][spiceai]                    | Stable            | Arrow Flight              |
+| `graphql`                          | GraphQL                                | Release Candidate | JSON                      |
+| `dynamodb`                         | Amazon DynamoDB (with Streams)         | Release Candidate |                           |
+| `cosmosdb`                         | Azure Cosmos DB (NoSQL)                | Release Candidate |                           |
+| `git`                              | Git repositories                       | Release Candidate |                           |
+| `databricks (mode: spark_connect)` | [Databricks][databricks]               | Beta              | [Spark Connect][spark]    |
+| `ducklake`                         | [DuckLake][ducklake]                   | Beta              | Parquet                   |
+| `flightsql`                        | FlightSQL                              | Beta              | Arrow Flight SQL          |
+| `iceberg`                          | [Apache Iceberg][iceberg] (read+write) | Beta              | Parquet                   |
+| `mssql`                            | Microsoft SQL Server                   | Beta              | Tabular Data Stream (TDS) |
+| `odbc`                             | ODBC                                   | Beta              | ODBC                      |
+| `snowflake`                        | Snowflake                              | Beta              | Arrow                     |
+| `spark`                            | Spark                                  | Beta              | [Spark Connect][spark]    |
+| `sharepoint`                       | Microsoft SharePoint                   | Beta              | Object-store listing      |
+| `oracle`                           | Oracle                                 | Alpha             | [Oracle ODPI-C][ODPIC]    |
+| `abfs`                             | Azure BlobFS                           | Alpha             | Parquet, CSV              |
+| `clickhouse`                       | ClickHouse                             | Alpha             |                           |
+| `debezium`                         | Debezium CDC                           | Alpha             | Kafka + JSON              |
+| `elasticsearch`                    | Elasticsearch (BM25 + kNN + RRF)       | Alpha             |                           |
+| `gcs`, `gs`                        | [Google Cloud Storage][gcs]            | Alpha             | Parquet, CSV, JSON        |
+| `kafka`                            | Kafka                                  | Alpha             | Kafka + JSON              |
+| `ftp`, `sftp`                      | FTP/SFTP                               | Alpha             | Parquet, CSV              |
+| `glue`                             | [AWS Glue][glue]                       | Alpha             | Iceberg, Parquet, CSV     |
+| `http`, `https`                    | HTTP(s) (dynamic headers, pagination)  | Alpha             | Parquet, CSV, JSON        |
+| `imap`                             | IMAP                                   | Alpha             | IMAP Emails               |
+| `localpod`                         | [Local dataset replication][localpod]  | Alpha             |                           |
+| `mongodb`                          | MongoDB                                | Alpha             |                           |
+| `scylladb`                         | ScyllaDB                               | Alpha             |                           |
+| `smb`                              | SMB 3.1.1                              | Alpha             | SMB                       |
 
 [databricks]: https://github.com/spiceai/cookbook/blob/trunk/databricks/README.md
 [ducklake]: https://ducklake.select/
@@ -315,24 +315,24 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 ## Supported Embeddings Providers
 
-| Name          | Description                                  | Status            | ML Format(s) | LLM Format(s)                          |
-| ------------- | -------------------------------------------- | ----------------- | ------------ | -------------------------------------- |
-| `openai`      | OpenAI (or compatible) embeddings endpoint   | Release Candidate | -            | OpenAI-compatible embeddings endpoint  |
-| `file`        | Local filesystem                             | Release Candidate | ONNX         | GGUF, GGML, SafeTensor                 |
-| `huggingface` | Models hosted on HuggingFace                 | Release Candidate | ONNX         | GGUF, GGML, SafeTensor                 |
-| `model2vec`   | Static embeddings (500x faster)              | Release Candidate | Model2Vec    | -                                      |
-| `azure`       | Azure OpenAI                                 | Alpha             | -            | OpenAI-compatible HTTP endpoint        |
-| `bedrock`     | AWS Bedrock (Titan, Cohere, Nova, Nova 2)    | Alpha             | -            | OpenAI-compatible HTTP endpoint        |
+| Name          | Description                                | Status            | ML Format(s) | LLM Format(s)                         |
+| ------------- | ------------------------------------------ | ----------------- | ------------ | ------------------------------------- |
+| `openai`      | OpenAI (or compatible) embeddings endpoint | Release Candidate | -            | OpenAI-compatible embeddings endpoint |
+| `file`        | Local filesystem                           | Release Candidate | ONNX         | GGUF, GGML, SafeTensor                |
+| `huggingface` | Models hosted on HuggingFace               | Release Candidate | ONNX         | GGUF, GGML, SafeTensor                |
+| `model2vec`   | Static embeddings (500x faster)            | Release Candidate | Model2Vec    | -                                     |
+| `azure`       | Azure OpenAI                               | Alpha             | -            | OpenAI-compatible HTTP endpoint       |
+| `bedrock`     | AWS Bedrock (Titan, Cohere, Nova, Nova 2)  | Alpha             | -            | OpenAI-compatible HTTP endpoint       |
 
 ## Supported Vector Engines
 
 Configured as `.vectors.engine` on a column-level embedding.
 
-| Name            | Description                                                          | Status |
-| --------------- | -------------------------------------------------------------------- | ------ |
-| `s3_vectors`    | Amazon S3 Vectors for petabyte-scale vector storage and querying     | Alpha  |
-| `duckdb`        | DuckDB with HNSW vector index                                        | Alpha  |
-| `elasticsearch` | Elasticsearch with kNN                                               | Alpha  |
+| Name            | Description                                                      | Status |
+| --------------- | ---------------------------------------------------------------- | ------ |
+| `s3_vectors`    | Amazon S3 Vectors for petabyte-scale vector storage and querying | Alpha  |
+| `duckdb`        | DuckDB with HNSW vector index                                    | Alpha  |
+| `elasticsearch` | Elasticsearch with kNN                                           | Alpha  |
 
 ## Supported Catalogs
 

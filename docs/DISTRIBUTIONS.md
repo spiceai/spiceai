@@ -35,22 +35,27 @@ The Spice open source project provides multiple distribution variants to support
 
 ## Default Distribution
 
-The default distribution includes the standard data and AI/ML feature set. This is the recommended distribution for most users.
+The default distribution includes the standard data feature set (without AI/ML model inference). Use the [Models distribution](#models-distribution) when you also need LLM/embedding inference.
 
 **Included Features:**
 
-- All standard data connectors (PostgreSQL, MySQL, DuckDB, SQLite, ClickHouse, etc.)
-- Embedded data accelerators (Spice Cayenne, DuckDB, SQLite)
-- AI/ML model inference (LLMs, embeddings)
+- All standard data connectors (PostgreSQL, MySQL, DuckDB, SQLite, ClickHouse, Elasticsearch, MongoDB, ScyllaDB, Oracle, etc.)
+- Embedded data accelerators (Spice Cayenne, DuckDB, SQLite, Turso, PostgreSQL)
+- Acceleration snapshots (`snapshots` feature)
 - Search capabilities (Vector and BM-25 Full-Text-Search)
 - Inline SQL user-defined scalar and table functions
+- HTTP-backed function servers (`http-functions` feature)
+- WebAssembly user-defined functions (`wasm-functions` feature; Rust source compilation additionally requires `wasm-functions-compile`)
+- ODBC connector (`odbc` feature)
+- SMB data connector
 - Default memory allocator (snmalloc)
 
 **Not included by default:**
 
-- Acceleration snapshots (`snapshots` feature)
-- HTTP-backed function servers (`http-functions` feature)
-- WebAssembly user-defined functions (`wasm-functions` feature; Rust source compilation additionally requires `wasm-functions-compile`)
+- AI/ML model inference, LLMs, embedding models (`models` feature) — see the Models distribution.
+- MCP support (`mcp` feature) — implied by `models`.
+- NFS data connector (`nfs` feature) — see the NAS distribution.
+- Metal / CUDA GPU acceleration — see the Metal and CUDA distributions.
 
 > **Note:** The PostgreSQL data accelerator is only available in nightly builds. The PostgreSQL data connector is included in all distributions.
 
@@ -70,15 +75,16 @@ docker pull spiceai/spiceai:latest
 
 ## Data Distribution
 
-The data distribution excludes AI/ML model support, resulting in a smaller binary size and reduced attack surface. Use this when you only need data federation and acceleration capabilities without AI features.
+The data distribution is the default Spice distribution; it excludes AI/ML model support, resulting in a smaller binary size and reduced attack surface. Use this when you only need data federation, acceleration, and search capabilities without AI features. As of the current Enterprise build, **Data is the default distribution** \u2014 `make install` (no extra flags) and the `default` Docker tag both produce a Data build.
 
 > **Open Source:** Available in nightly builds only. **[Cloud Platform](https://spice.ai/pricing) & [Enterprise](https://docs.spice.ai/docs/enterprise):** Production-ready data distribution available.
 
 **Included Features:**
 
-- All data connectors
-- All data accelerators
-- Acceleration snapshots in Cloud Platform and Enterprise distributions; local open source builds can enable this with the `snapshots` feature
+- All data connectors (including Elasticsearch, MongoDB, ScyllaDB, Oracle, ODBC, etc.)
+- All data accelerators (Cayenne, DuckDB, SQLite, Turso, PostgreSQL)
+- Acceleration snapshots
+- HTTP-backed function servers and WASM user functions
 - Default memory allocator (snmalloc)
 
 **Excluded Features:**
@@ -86,6 +92,7 @@ The data distribution excludes AI/ML model support, resulting in a smaller binar
 - AI/ML model inference
 - LLM support
 - Embedding models
+- MCP support (implied by `models`)
 
 **Docker (Nightly):**
 
@@ -96,7 +103,23 @@ docker pull ghcr.io/spiceai/spiceai-nightly:latest-data
 **Local Build:**
 
 ```bash
-make install-data-only
+make install-data-only   # equivalent to `make install` in the Enterprise build
+```
+
+## Models Distribution
+
+The Models distribution adds AI/ML inference (LLMs, embeddings) on top of the Default (Data) distribution. It also enables MCP support.
+
+**Included Features:**
+
+- All Default (Data) features
+- AI/ML model inference (LLMs, embeddings)
+- MCP support (`mcp` feature; implied by `models`)
+
+**Local Build:**
+
+```bash
+make install-models
 ```
 
 ## GPU-Accelerated Distributions

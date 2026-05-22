@@ -161,8 +161,8 @@ impl DuckLakeCatalogProvider {
 
             // Query the global information_schema, filtering by catalog name.
             // DuckLake catalogs don't expose information_schema under their own catalog prefix.
-            let sql = r"SELECT DISTINCT schema_name 
-                   FROM information_schema.schemata 
+            let sql = r"SELECT DISTINCT schema_name
+                     FROM information_schema.schemata
                    WHERE catalog_name = ?
                    ORDER BY schema_name";
 
@@ -492,8 +492,8 @@ impl DuckLakeSchemaProvider {
 
             // Query the global information_schema, filtering by catalog and schema name.
             // DuckLake catalogs don't expose information_schema under their own catalog prefix.
-            let sql = r"SELECT DISTINCT table_name 
-                   FROM information_schema.tables 
+            let sql = r"SELECT DISTINCT table_name
+                     FROM information_schema.tables
                    WHERE table_catalog = ?
                      AND table_schema = ?
                    ORDER BY table_name";

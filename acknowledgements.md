@@ -6,10 +6,10 @@ Spice.ai acknowledges the following open source projects for making this project
 
 ## Rust Crates
 
-- adbc_core 0.21.0, Apache-2.0 
+- adbc_core 0.23.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-adbc
 
-- adbc_driver_manager 0.21.0, Apache-2.0 
+- adbc_driver_manager 0.23.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-adbc
 
 - aegis 0.9.7, MIT 
@@ -677,6 +677,9 @@ Spice.ai acknowledges the following open source projects for making this project
 
 - r2d2 0.8.10, Apache-2.0 OR MIT 
   <br/>https://github.com/sfackler/r2d2
+
+- r2d2_adbc 0.3.0, Apache-2.0 
+  <br/>https://github.com/adbc-drivers/r2d2-adbc
 
 - rand 0.7.3, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-random/rand

@@ -440,6 +440,18 @@ impl RuntimeBuilder {
             callback(&mut df);
         }
 
+        // Initialize Cedar policy engine from authorization config, if present.
+        // Fail startup if authorization is enabled but the engine cannot be initialized
+        // (fail-closed: never silently skip authorization).
+        let policy_engine = match Self::init_policy_engine(&spicepod_rt).await {
+            Ok(engine) => engine,
+            Err(e) => {
+                eprintln!("FATAL: Failed to initialize Cedar policy engine: {e}");
+                std::process::exit(1);
+            }
+        };
+        df.set_policy_engine(policy_engine.clone());
+
         let df = Arc::new(df);
         df.set_self_ref();
 
@@ -485,6 +497,7 @@ impl RuntimeBuilder {
             distributed,
             resource_monitor,
             config: Arc::clone(&self.runtime_config),
+            policy_engine,
             dataset_load_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 dataset_parallelism.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
             )),
@@ -506,6 +519,74 @@ impl RuntimeBuilder {
         register_udfs(&rt).await;
 
         rt
+    }
+
+    /// Initialize the Cedar policy engine from spicepod authorization config.
+    ///
+    /// Returns `None` when no authorization is configured — in that case all
+    /// authorization checks are skipped (backward-compatible behavior).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the policy engine cannot be initialized (e.g. invalid
+    /// policies, missing files). When authorization is enabled, initialization
+    /// failures are fatal to prevent fail-open.
+    async fn init_policy_engine(
+        spicepod_rt: &SpicepodRuntime,
+    ) -> Result<Option<Arc<runtime_policy::PolicyEngine>>, Box<dyn std::error::Error>> {
+        use runtime_policy::provider::{
+            PolicyProvider,
+            cloud::CloudPolicyProvider,
+            local::{LocalPolicyProvider, PolicyDefinition as LocalPolicyDef},
+            operator::OperatorPolicyProvider,
+        };
+        use spicepod::component::runtime::{AuthorizationDefault, AuthorizationProvider};
+
+        let authz = spicepod_rt.authorization.as_ref().filter(|a| a.enabled);
+        let Some(authz) = authz else {
+            return Ok(None);
+        };
+
+        let default_allow = authz.default == AuthorizationDefault::Allow;
+
+        let policy_set = match authz.provider {
+            AuthorizationProvider::Local => {
+                let defs: Vec<LocalPolicyDef> = authz
+                    .policies
+                    .iter()
+                    .map(|p| LocalPolicyDef {
+                        name: p.name.clone(),
+                        cedar: p.cedar.clone(),
+                        path: p.path.as_ref().map(std::path::PathBuf::from),
+                    })
+                    .collect();
+                let provider = LocalPolicyProvider::new(defs, default_allow);
+                provider.fetch_policies().await?
+            }
+            AuthorizationProvider::Operator => {
+                let endpoint = authz
+                    .operator
+                    .as_ref()
+                    .map(|o| o.endpoint.clone())
+                    .unwrap_or_default();
+                let provider = OperatorPolicyProvider::new(endpoint);
+                provider.fetch_policies().await?
+            }
+            AuthorizationProvider::Cloud => {
+                let provider = CloudPolicyProvider::new();
+                provider.fetch_policies().await?
+            }
+        };
+
+        let engine = runtime_policy::PolicyEngine::new(policy_set)?;
+
+        tracing::info!(
+            provider = ?authz.provider,
+            default = ?authz.default,
+            "Cedar authorization policy engine initialized"
+        );
+
+        Ok(Some(Arc::new(engine)))
     }
 
     async fn load_secrets(app: Option<&Arc<App>>) -> Secrets {

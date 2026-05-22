@@ -1,10 +1,11 @@
 [package]
-name = "runtime-parameter-spec"
 description = "Parameter spec types shared between runtime parameter and secret-store crates."
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
+name = "runtime-parameter-spec"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true

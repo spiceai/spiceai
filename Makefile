@@ -40,6 +40,14 @@ build-testoperator-dev:
 build-testoperator:
 	cargo build --release -p testoperator --all-features
 
+.PHONY: build-distributed-dev
+build-distributed-dev:
+	cargo build -p distributed
+
+.PHONY: build-distributed
+build-distributed:
+	cargo build --release -p distributed
+
 .PHONY: build-spidapter-dev
 build-spidapter-dev:
 	cargo build -p spidapter --all-features
@@ -106,8 +114,8 @@ lint: lint-rust
 
 lint-rust:
 	cargo fmt --all -- --check
-	## All except metal, cuda, nfs (nfs requires system libnfs library)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control --workspace --exclude libnfs -- \
+	## Default variant: covers all default-distribution features (no models, no mcp, no nfs)
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,odbc,release,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions,rate-control --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -122,7 +130,77 @@ lint-rust:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --keep-going --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control --workspace --exclude libnfs -- \
+	cargo clippy $(CARGO_PROFILE) --keep-going --tests --features adbc,aws-secrets-manager,keyring-secret-store,odbc,release,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions,rate-control --workspace --exclude libnfs -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Aclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes \
+		-Aunfulfilled_lint_expectations
+
+.PHONY: lint-rust-models
+lint-rust-models:
+	## Models variant lint (default distribution + models)
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions,rate-control --workspace --exclude libnfs -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Dclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
+	cargo clippy $(CARGO_PROFILE) --keep-going --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions,rate-control --workspace --exclude libnfs -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Aclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes \
+		-Aunfulfilled_lint_expectations
+
+.PHONY: lint-rust-nas
+lint-rust-nas:
+	## NAS variant lint (default distribution + nfs; requires system libnfs library)
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,nfs,release,mcp,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions,rate-control --workspace -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Dclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
+	cargo clippy $(CARGO_PROFILE) --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,nfs,release,mcp,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions,rate-control --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -141,7 +219,7 @@ lint-rust:
 
 ## Optional: PACKAGES="pkg1 pkg2" to lint specific packages instead of the whole workspace
 ## Optional: FEATURES="feat1,feat2" to override features
-## Feature defaults: when FEATURES is unset, uses aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control for workspace (unless PACKAGES is set, then uses package defaults)
+## Feature defaults: when FEATURES is unset, uses aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions,rate-control for workspace (unless PACKAGES is set, then uses package defaults)
 ## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="duckdb,postgres"
 PACKAGES ?=
 FEATURES ?=
@@ -159,12 +237,12 @@ _FEATURES_FLAGS := --features $(FEATURES)
 else ifdef PACKAGES
 _FEATURES_FLAGS :=
 else
-_FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control
+_FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,mongodb,scylladb,oracle,turso,postgres-accel,http-functions,wasm-functions,rate-control
 endif
 
 lint-rust-fix:
 	cargo fmt $(_FMT_FLAGS)
-	## All except metal, cuda, nfs (nfs requires system libnfs library)
+	## All except metal, cuda, nfs (nfs requires system libnfs library, use lint-rust-fix with FEATURES=...nfs)
 	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --fix --allow-dirty $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
@@ -266,7 +344,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # Default install includes models. Use -data suffix variants to build without models.
 # Data-only features (default features minus models)
 # Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
-SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,pingora,scylladb
+SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,elasticsearch,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,pingora,scylladb,http-functions,wasm-functions
 
 .PHONY: install
 install: build
@@ -280,23 +358,30 @@ install-dev: build-dev
 	install -m 755 $(TARGET_DIR)/debug/spice ~/.spice/bin/spice
 	install -m 755 $(TARGET_DIR)/debug/spiced ~/.spice/bin/spiced
 
-# Data-only variants (without models)
+# Data-only variants (default install is now data-only; this is a backwards-compatible alias)
 .PHONY: install-data-only
-install-data-only:
-	make install SPICED_CUSTOM_FEATURES="$(SPICED_DATA_FEATURES)"
+install-data-only: install
 
 .PHONY: install-data-only-dev
-install-data-only-dev:
-	make install-dev SPICED_CUSTOM_FEATURES="$(SPICED_DATA_FEATURES)"
+install-data-only-dev: install-dev
 
-# Metal variants (with GPU acceleration)
+# Models variant (default + AI/ML model inference)
+.PHONY: install-models
+install-models:
+	make install SPICED_NON_DEFAULT_FEATURES="models"
+
+.PHONY: install-models-dev
+install-models-dev:
+	make install-dev SPICED_NON_DEFAULT_FEATURES="models"
+
+# Metal variants (with GPU acceleration; implies models)
 .PHONY: install-metal
 install-metal:
-	make install SPICED_NON_DEFAULT_FEATURES="metal"
+	make install SPICED_NON_DEFAULT_FEATURES="models,metal"
 
 .PHONY: install-metal-dev
 install-metal-dev:
-	make install-dev SPICED_NON_DEFAULT_FEATURES="metal"
+	make install-dev SPICED_NON_DEFAULT_FEATURES="models,metal"
 
 .PHONY: install-data-only-metal
 install-data-only-metal:
@@ -306,10 +391,10 @@ install-data-only-metal:
 install-data-only-metal-dev:
 	make install-dev SPICED_CUSTOM_FEATURES="$(SPICED_DATA_FEATURES),metal"
 
-# CUDA variants
+# CUDA variants (implies models)
 .PHONY: install-cuda
 install-cuda:
-	make install SPICED_NON_DEFAULT_FEATURES="cuda"
+	make install SPICED_NON_DEFAULT_FEATURES="models,cuda"
 
 .PHONY: install-data-only-cuda
 install-data-only-cuda:
@@ -324,6 +409,28 @@ install-odbc:
 .PHONY: install-nfs
 install-nfs:
 	make install SPICED_NON_DEFAULT_FEATURES="nfs"
+
+# NAS variants (NFS + SMB; SMB is in default features so this is equivalent to install-nfs)
+.PHONY: install-nas
+install-nas:
+	make install SPICED_NON_DEFAULT_FEATURES="nfs"
+
+.PHONY: install-nas-dev
+install-nas-dev:
+	make install-dev SPICED_NON_DEFAULT_FEATURES="nfs"
+
+# NAS + models variant
+.PHONY: install-nas-models
+install-nas-models:
+	make install SPICED_NON_DEFAULT_FEATURES="models,nfs"
+
+.PHONY: install-nas-models-dev
+install-nas-models-dev:
+	make install-dev SPICED_NON_DEFAULT_FEATURES="models,nfs"
+
+# Data-only NAS variant (NFS + SMB without models, alias of install-nas)
+.PHONY: install-data-only-nas
+install-data-only-nas: install-nas
 
 # Install from a CI build artifact (branch or commit SHA)
 # Usage:
@@ -345,6 +452,16 @@ install-testoperator-dev: build-testoperator-dev
 install-testoperator: build-testoperator
 	mkdir -p ~/.spice/bin
 	install -m 755 $(TARGET_DIR)/release/testoperator ~/.spice/bin/testoperator
+
+.PHONY: install-distributed-dev
+install-distributed-dev: build-distributed-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/debug/distributed ~/.spice/bin/distributed
+
+.PHONY: install-distributed
+install-distributed: build-distributed
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/distributed ~/.spice/bin/distributed
 
 .PHONY: install-spidapter-dev
 install-spidapter-dev: build-spidapter-dev

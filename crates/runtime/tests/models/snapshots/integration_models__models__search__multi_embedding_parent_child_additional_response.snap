@@ -2,6 +2,12 @@
 source: crates/runtime/tests/models/search.rs
 expression: "normalize_search_response_json(resp, true, round_scores)"
 ---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "_score": "0.03",
+      "data": {
         "cp_catalog_number": 1
       },
       "dataset": "multiple_columns",
@@ -14,6 +20,16 @@ expression: "normalize_search_response_json(resp, true, round_scores)"
         ]
       },
       "primary_key": {
+        "cp_catalog_page_sk": 11
+      }
+    },
+    {
+      "_score": "0.03",
+      "data": {
+        "cp_catalog_number": 1
+      },
+      "dataset": "multiple_columns",
+      "matches": {
         "cp_department": [
           "DEPARTMENT"
         ],

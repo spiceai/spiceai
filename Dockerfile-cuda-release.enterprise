@@ -1,0 +1,105 @@
+#syntax=docker/dockerfile:1.7
+
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
+
+FROM ${CUDA_RUNTIME_IMAGE} AS binary
+
+ARG REL_VERSION
+ARG CUDA_COMPUTE_CAP=80
+ARG GITHUB_REPOSITORY=spiceai/spiceai
+ARG GITHUB_TOKEN
+
+RUN if [ -z "$REL_VERSION" ]; then echo "REL_VERSION build-arg is required" >&2; exit 1; fi
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates curl tar jq \
+    && rm -rf /var/lib/{apt,dpkg,cache,log}
+
+ENV REL_VERSION=${REL_VERSION}
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
+
+RUN set -eux; \
+    download_asset_url() { \
+      if [ -n "${GITHUB_TOKEN:-}" ]; then \
+        curl -fSL -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/octet-stream" "$1" -o /tmp/spiced.tar.gz; \
+      else \
+        curl -fSL -H "Accept: application/octet-stream" "$1" -o /tmp/spiced.tar.gz; \
+      fi; \
+    }; \
+    fetch_release_json() { \
+      if [ -n "${GITHUB_TOKEN:-}" ]; then \
+        curl -fSs -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" "$1" -o /tmp/release.json; \
+      else \
+        curl -fSs -H "Accept: application/vnd.github+json" "$1" -o /tmp/release.json; \
+      fi; \
+    }; \
+    download_via_api() { \
+      asset_id="$1"; \
+      asset_api_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"; \
+      if [ -n "${GITHUB_TOKEN:-}" ]; then \
+        curl -fSL -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/octet-stream" "${asset_api_url}" -o /tmp/spiced.tar.gz; \
+      else \
+        curl -fSL -H "Accept: application/octet-stream" "${asset_api_url}" -o /tmp/spiced.tar.gz; \
+      fi; \
+    }; \
+    asset="spiced_cuda_${CUDA_COMPUTE_CAP}_linux_x86_64.tar.gz"; \
+    release_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/v${REL_VERSION}"; \
+    asset_downloaded=false; \
+    if fetch_release_json "${release_url}"; then \
+      asset_id=$(jq -e --arg name "${asset}" '.assets[] | select(.name == $name) | .id' /tmp/release.json 2>/dev/null || true); \
+      if [ -n "${asset_id}" ]; then \
+        download_via_api "${asset_id}"; \
+        asset_downloaded=true; \
+      fi; \
+    else \
+      echo "Failed to query GitHub release API for v${REL_VERSION}, falling back to direct download URL." >&2; \
+    fi; \
+    if [ "${asset_downloaded}" = false ]; then \
+      if [ -f /tmp/release.json ]; then \
+        echo "Available assets for v${REL_VERSION}:" >&2; \
+        jq -r '.assets[].name' /tmp/release.json >&2 || true; \
+      fi; \
+      base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${REL_VERSION}/${asset}"; \
+      echo "Attempting direct asset URL ${base_url}" >&2; \
+      if ! download_asset_url "${base_url}"; then \
+        echo "Failed to download release asset ${asset} from GitHub releases" >&2; \
+        exit 1; \
+      fi; \
+    fi; \
+    rm -f /tmp/release.json 2>/dev/null || true; \
+    tar -C /root -xzf /tmp/spiced.tar.gz; \
+    chmod +x /root/spiced; \
+    rm -f /tmp/spiced.tar.gz
+
+FROM ${CUDA_RUNTIME_IMAGE} AS runtime
+
+ENV CUDA_NVCC_FLAGS=-fPIE
+
+ARG CARGO_FEATURES=default
+ARG CUDA_COMPUTE_CAP=80
+
+# Allow DuckDB to load extensions
+RUN mkdir /.duckdb/ && chmod 777 /.duckdb/
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates libssl3 tzdata \
+    && rm -rf /var/lib/{apt,dpkg,cache,log}
+
+RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
+    apt-get update \
+    && apt-get install --yes --no-install-recommends unixodbc \
+    && rm -rf /var/lib/{apt,dpkg,cache,log}; \
+  fi
+
+COPY --from=binary /root/spiced /usr/local/bin/spiced
+
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
+
+WORKDIR /app
+
+EXPOSE 8090
+EXPOSE 9090
+EXPOSE 50051
+
+ENTRYPOINT ["/usr/local/bin/spiced"]
+CMD ["--http","0.0.0.0:8090","--metrics","0.0.0.0:9090","--flight","0.0.0.0:50051"]

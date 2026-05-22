@@ -4,17 +4,17 @@ tests:
     query_set: tpcds
     query_overrides: duckdb
     ready_wait: 60
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
   throughput:
     spicepod_path: accelerated/file[parquet]-duckdb[file].yaml
     query_set: tpcds
     query_overrides: duckdb
     ready_wait: 60
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
   load:
     spicepod_path: accelerated/file[parquet]-duckdb[file].yaml
     query_set: tpcds
     query_overrides: duckdb
     ready_wait: 60
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     duration: 28800

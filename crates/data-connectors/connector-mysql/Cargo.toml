@@ -15,18 +15,22 @@
 ##
 
 [package]
-name = "connector-mysql"
-edition.workspace = true
-version.workspace = true
-rust-version.workspace = true
-license-file.workspace = true
 description = "MySQL data connector for Spice.ai runtime"
+edition.workspace = true
+license-file.workspace = true
+name = "connector-mysql"
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
 datafusion.workspace = true
-datafusion-table-providers = { workspace = true, features = ["mysql", "mysql-federation"] }
+datafusion-table-providers = { workspace = true, features = [
+    "mysql",
+    "mysql-federation",
+] }
 linkme.workspace = true
 mysql_async.workspace = true
 opentelemetry.workspace = true

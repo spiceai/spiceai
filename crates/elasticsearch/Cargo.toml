@@ -15,12 +15,13 @@
 ##
 
 [package]
-name = "elasticsearch"
-edition.workspace = true
-version.workspace = true
-rust-version.workspace = true
-license-file.workspace = true
 description = "Elasticsearch client for Spice.ai runtime"
+edition.workspace = true
+license-file.workspace = true
+name = "elasticsearch"
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 async-trait.workspace = true

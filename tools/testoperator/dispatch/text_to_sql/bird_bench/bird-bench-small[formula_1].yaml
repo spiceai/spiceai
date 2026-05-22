@@ -2,23 +2,23 @@ tests:
   text_to_sql:
     - model_name: grok420
       benchmark_queryset: bird-bench-small[formula_1]
-      runner_type: spiceai-dev-runners
+      runner_type: spicehq-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
       configuration_name: formula_1
     - model_name: claude-haiku-3-5
       benchmark_queryset: bird-bench-small[formula_1]
-      runner_type: spiceai-dev-runners
+      runner_type: spicehq-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
       configuration_name: formula_1
     - model_name: grok420
       benchmark_queryset: bird-bench-small[formula_1]
-      runner_type: spiceai-dev-runners
+      runner_type: spicehq-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
       configuration_name: formula_1-evidence
       use_evidence: true
     - model_name: claude-haiku-3-5
       benchmark_queryset: bird-bench-small[formula_1]
-      runner_type: spiceai-dev-runners
+      runner_type: spicehq-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
       configuration_name: formula_1-evidence
       use_evidence: true

@@ -762,7 +762,13 @@ pub async fn run(args: Args) -> Result<()> {
 
     let cloned_rt = Arc::clone(&rt);
     let endpoint_auth = match app.as_ref() {
-        Some(app) => EndpointAuth::new(rt.secrets(), app).await,
+        Some(app) => {
+            EndpointAuth::new(rt.secrets(), app)
+                .await
+                .map_err(|e| Error::GenericError {
+                    reason: e.to_string(),
+                })?
+        }
         None => EndpointAuth::no_auth(),
     };
 

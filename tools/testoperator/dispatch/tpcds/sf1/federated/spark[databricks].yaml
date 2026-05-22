@@ -3,5 +3,5 @@ tests:
     spicepod_path: federated/spark[databricks].yaml
     query_set: tpcds
     query_overrides: spark
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     ready_wait: 600

@@ -83,7 +83,7 @@ on:
 jobs:
   run-append:
     name: Run append test
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     timeout-minutes: 600
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6

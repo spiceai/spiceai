@@ -1,19 +1,20 @@
 [package]
-name = "document_parse"
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
+name = "document_parse"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+bytes.workspace = true
 calamine = "0.28"
-docx-rs = { git = "https://github.com/spiceai/docx-rs", rev="2a85dce57d0128e2cd7c369545516c347cb8c529"}
+docx-rs = { git = "https://github.com/spiceai/docx-rs", rev = "2a85dce57d0128e2cd7c369545516c347cb8c529" }
 pdf-extract = { git = "https://github.com/spiceai/pdf-extract", rev = "3ca5e2c904cdf5897f3d671e3b2c4b62b1612b0c" }
 quick-xml = "0.38"
 snafu.workspace = true
-bytes.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 zip = "7.2"

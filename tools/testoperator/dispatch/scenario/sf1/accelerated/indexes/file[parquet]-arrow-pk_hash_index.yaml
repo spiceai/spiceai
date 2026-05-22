@@ -3,6 +3,6 @@ tests:
     spicepod_path: accelerated/indexes/file[parquet]-arrow-pk_hash_index.yaml
     query_set: scenario
     scenario_query_file: hash_index/primary_key_lookup.yaml
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     ready_wait: 300
     validate_results: true

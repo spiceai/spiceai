@@ -1,9 +1,10 @@
 [package]
-name = "spice-cloud-client"
 description = "HTTP client for the Spice Cloud API"
 edition.workspace = true
 homepage.workspace = true
 license-file.workspace = true
+name = "spice-cloud-client"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true

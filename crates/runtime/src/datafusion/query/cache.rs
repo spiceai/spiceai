@@ -31,6 +31,7 @@ use datafusion::{
     sql::TableReference,
 };
 use futures::TryStreamExt;
+use runtime_auth::{AuthRequestContext as _, identity::claim_value_to_string};
 use runtime_request_context::{
     CacheControl, CacheKeyType, CacheNamespace, Protocol, RequestContext,
 };
@@ -96,7 +97,77 @@ enum CacheResult {
     WrongCacheKeyType,
 }
 
+fn push_scope_part(scope: &mut String, key: &str, value: &str) {
+    scope.push_str(key);
+    scope.push(':');
+    scope.push_str(&value.len().to_string());
+    scope.push(':');
+    scope.push_str(value);
+    scope.push(';');
+}
+
 impl Query {
+    pub(super) fn request_identity_cache_scope(request_context: &RequestContext) -> Option<String> {
+        let principal = request_context.auth_principal()?;
+        let mut scope = String::new();
+
+        if let Some(stable_id) = principal.stable_id() {
+            push_scope_part(&mut scope, "stable_id", stable_id.as_ref());
+        } else {
+            push_scope_part(&mut scope, "username", principal.username());
+        }
+
+        if let Some(identity) = principal.identity_context() {
+            push_scope_part(&mut scope, "user_id", &identity.user_id);
+            push_scope_part(
+                &mut scope,
+                "org_id",
+                identity.org_id.as_deref().unwrap_or_default(),
+            );
+            for role in &identity.roles {
+                push_scope_part(&mut scope, "role", role);
+            }
+
+            let mut claims: Vec<_> = identity.claims.iter().collect();
+            claims.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+            for (key, value) in claims {
+                push_scope_part(&mut scope, "claim_key", key);
+                push_scope_part(&mut scope, "claim_value", &claim_value_to_string(value));
+            }
+        } else {
+            for group in principal.groups() {
+                push_scope_part(&mut scope, "group", group);
+            }
+        }
+
+        Some(scope)
+    }
+
+    pub(super) fn scope_raw_cache_key_for_request(
+        raw_key: RawCacheKey,
+        request_context: &RequestContext,
+    ) -> RawCacheKey {
+        Self::request_identity_cache_scope(request_context)
+            .as_deref()
+            .map_or(raw_key, |scope| raw_key.scoped(scope))
+    }
+
+    pub(super) fn raw_sql_plan_cache_key(
+        df: &DataFusion,
+        request_context: &RequestContext,
+        sql: &str,
+        parameters: Option<&ParamValues>,
+    ) -> RawCacheKey {
+        let cache_namespace = request_context.cache_namespace();
+        let (ns_tag, ns_id) = cache_namespace.hash_inputs();
+        let raw_key = CacheKey::Query(sql, parameters).as_raw_key_in_namespace(
+            Self::plan_hasher(df),
+            ns_tag,
+            ns_id,
+        );
+        Self::scope_raw_cache_key_for_request(raw_key, request_context)
+    }
+
     /// Returns a `LogicalPlan` if the result is not cached and needs to be executed, otherwise returns a cached `QueryResult`.
     ///
     /// Cache lookups and population are *not* gated on read-only mode. The two
@@ -125,6 +196,7 @@ impl Query {
         let cache_control = request_context.cache_control();
         let cache_namespace = request_context.cache_namespace();
         let (ns_tag, ns_id) = cache_namespace.hash_inputs();
+        let identity_scope = Self::request_identity_cache_scope(&request_context);
         let sql_cache_key = CacheKey::Query(sql, parameters.as_ref());
         let scoped_user_cache_key =
             if cache_control.cache_key_type() == Some(CacheKeyType::ClientSupplied) {
@@ -148,6 +220,7 @@ impl Query {
             tracker,
             &sql_or_user_cache_key,
             sql,
+            identity_scope.as_deref(),
         )
         .await?
         {
@@ -158,8 +231,10 @@ impl Query {
             response => response,
         };
 
-        let sql_raw_cache_key =
-            sql_cache_key.as_raw_key_in_namespace(Self::plan_hasher(df), ns_tag, ns_id);
+        let sql_raw_cache_key = Self::scope_raw_cache_key_for_request(
+            sql_cache_key.as_raw_key_in_namespace(Self::plan_hasher(df), ns_tag, ns_id),
+            &request_context,
+        );
         let plan: Box<LogicalPlan> = if let Some(plan) = pre_parsed_plan {
             // Reuse the pre-parsed plan to avoid re-parsing. Parameters are
             // already bound from `check_read_only_sql`.
@@ -193,6 +268,7 @@ impl Query {
             tracker,
             &CacheKey::LogicalPlan(&plan),
             sql,
+            identity_scope.as_deref(),
         )
         .await?
         {
@@ -266,6 +342,7 @@ impl Query {
         mut tracker: Option<QueryTracker>,
         key: &'a CacheKey<'a>,
         sql: &str,
+        identity_scope: Option<&str>,
     ) -> super::Result<CacheResponse> {
         let Some(cache_provider) = df.results_cache_provider() else {
             return Ok(
@@ -321,6 +398,14 @@ impl Query {
             key.as_raw_key_in_namespace(cache_provider.hasher(), ns_tag, ns_id)
         };
 
+        // When an identity scope is provided (for identity-dependent queries like
+        // those using current_user_id()), scope the cache key per-user so that
+        // results are never shared across different authenticated users.
+        let raw_key = match identity_scope {
+            Some(scope) => raw_key.scoped(scope),
+            None => raw_key,
+        };
+
         let cached_result = match cache_provider.get_raw_key(&raw_key).await {
             Ok(Some(result)) => result,
             Ok(None) => {
@@ -366,6 +451,22 @@ impl Query {
 
             // If stale (beyond TTL but within stale-while-revalidate window), trigger background revalidation
             if cached_result.is_stale(ttl, now) {
+                // Skip SWR for identity-scoped cache entries: the background
+                // revalidation task runs without a user auth context, so UDFs
+                // like current_user_id() would resolve to "anonymous" and
+                // produce incorrect results stored under the user-scoped key.
+                if identity_scope.is_some() {
+                    tracing::debug!(
+                        "Cache entry is stale but skipping SWR for identity-scoped query"
+                    );
+                    return Ok(CacheResponse::from(
+                        CacheResult::MissOrSkipped,
+                        CacheStatus::CacheMiss,
+                    )
+                    .with_query_tracker(tracker)
+                    .with_raw_key(Some(raw_key)));
+                }
+
                 tracing::debug!(
                     "Cache entry is stale (beyond TTL), triggering background revalidation for stale-while-revalidate"
                 );
@@ -715,6 +816,7 @@ mod tests {
     use cache::{
         Caching, QueryResultsCacheProvider, SimpleCache, key::CacheKey, result::CacheStatus,
     };
+    use runtime_auth::AuthPrincipal;
     use spicepod::component::caching::SQLResultsCacheConfig;
     use tokio::runtime::Handle;
 
@@ -753,6 +855,20 @@ mod tests {
                 .with_cache_namespace(namespace)
                 .build(),
         )
+    }
+
+    struct CacheTestPrincipal {
+        name: &'static str,
+    }
+
+    impl AuthPrincipal for CacheTestPrincipal {
+        fn username(&self) -> &str {
+            self.name
+        }
+
+        fn groups(&self) -> &[&str] {
+            &[]
+        }
     }
 
     async fn prepare_runtime(
@@ -798,6 +914,30 @@ mod tests {
 
         let manager = RequestCacheManager::new(cache_status, raw_cache_key);
         assert!(manager.should_cache_results());
+    }
+
+    #[test]
+    fn test_request_identity_scope_uses_username_without_stable_id() {
+        let alice = Arc::new(RequestContext::builder(Protocol::Http).build());
+        alice
+            .set_auth_principal(Arc::new(CacheTestPrincipal { name: "alice" }))
+            .expect("set alice principal");
+
+        let bob = Arc::new(RequestContext::builder(Protocol::Http).build());
+        bob.set_auth_principal(Arc::new(CacheTestPrincipal { name: "bob" }))
+            .expect("set bob principal");
+
+        let raw_cache_key = RawCacheKey::new(42);
+        assert_eq!(
+            Query::scope_raw_cache_key_for_request(raw_cache_key, &alice),
+            Query::scope_raw_cache_key_for_request(raw_cache_key, &alice),
+            "same fallback identity should be stable"
+        );
+        assert_ne!(
+            Query::scope_raw_cache_key_for_request(raw_cache_key, &alice),
+            Query::scope_raw_cache_key_for_request(raw_cache_key, &bob),
+            "different fallback identities must not share identity-dependent cache entries"
+        );
     }
 
     /// SWR background revalidation must run under the originating user's
@@ -1935,5 +2075,68 @@ mod tests {
             .await;
 
         tracing::info!("Single-in-flight test completed successfully");
+    }
+
+    /// Verify that authenticated users get plan-level cache hits for
+    /// non-identity queries (i.e., queries that don't use `current_user_id()`).
+    #[tokio::test]
+    async fn test_authenticated_user_non_identity_query_uses_plan_cache() {
+        use runtime_auth::{AuthPrincipal, AuthRequestContext as _};
+
+        struct TestPrincipal(&'static str);
+        impl AuthPrincipal for TestPrincipal {
+            fn username(&self) -> &str {
+                self.0
+            }
+            fn groups(&self) -> &[&str] {
+                &[]
+            }
+        }
+
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("10m".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Plan,
+            ..Default::default()
+        }))
+        .await;
+
+        // Build a request context with an auth principal but a non-identity query.
+        let request_context = Arc::new(
+            RequestContext::builder(Protocol::Http)
+                .with_cache_control(CacheControl::Cache(CacheKeyType::Default))
+                .build(),
+        );
+        request_context
+            .set_auth_principal(Arc::new(TestPrincipal("alice")))
+            .expect("set alice principal");
+
+        // First request should be a cache miss.
+        let query_builder = QueryBuilder::new("SELECT 42", Arc::clone(&df));
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheMiss);
+                let _ = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+            })
+            .await;
+
+        // Same query from the same authenticated user should hit the plan cache.
+        let query_builder = QueryBuilder::new("SELECT 42", Arc::clone(&df));
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(
+                    result.cache_status,
+                    CacheStatus::CacheHit,
+                    "Non-identity queries from authenticated users should be cached at plan level"
+                );
+            })
+            .await;
     }
 }

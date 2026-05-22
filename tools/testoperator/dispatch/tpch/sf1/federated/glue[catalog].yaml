@@ -3,9 +3,9 @@ tests:
     spicepod_path: federated/glue[catalog].yaml
     query_set: tpch
     query_overrides: glue-catalog
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     validate_results: true
   schema:
     spicepod_path: federated/glue[catalog].yaml
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     min_tables: 1

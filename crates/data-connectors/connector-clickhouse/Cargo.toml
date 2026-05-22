@@ -15,12 +15,13 @@
 ##
 
 [package]
-name = "connector-clickhouse"
-edition.workspace = true
-version.workspace = true
-rust-version.workspace = true
-license-file.workspace = true
 description = "ClickHouse data connector for Spice.ai runtime"
+edition.workspace = true
+license-file.workspace = true
+name = "connector-clickhouse"
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
@@ -28,7 +29,9 @@ clickhouse-rs.workspace = true
 data_components = { path = "../../data_components", features = ["clickhouse"] }
 datafusion.workspace = true
 datafusion-table-providers.workspace = true
-db_connection_pool = { path = "../../db_connection_pool", features = ["clickhouse"] }
+db_connection_pool = { path = "../../db_connection_pool", features = [
+    "clickhouse",
+] }
 linkme.workspace = true
 ns_lookup = { path = "../../ns_lookup" }
 paste.workspace = true

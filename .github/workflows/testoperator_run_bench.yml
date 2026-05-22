@@ -1,4 +1,9 @@
-name: benchmark e2e tests
+# ============================================================================
+# DISABLED: This workflow comes from upstream (spiceai/spiceai).
+# The enterprise version is ent_testoperator_run_bench.yml
+# This file is kept only to prevent merge conflicts with upstream.
+# ============================================================================
+name: "benchmark e2e tests (upstream - disabled)"
 run-name: bench - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
 
 on:
@@ -74,11 +79,11 @@ on:
       runner_type:
         description: 'Runner type'
         required: true
-        default: 'spiceai-dev-runners'
+        default: 'spicehq-dev-runners'
         type: choice
         options:
-          - 'spiceai-dev-runners'
-          - 'spiceai-dev-large-runners'
+          - 'spicehq-dev-runners'
+          - 'spicehq-dev-large-runners'
       scale_factor:
         description: 'Scale factor for the benchmark'
         required: false

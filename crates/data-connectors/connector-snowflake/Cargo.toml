@@ -15,25 +15,28 @@
 ##
 
 [package]
-name = "connector-snowflake"
-edition.workspace = true
-version.workspace = true
-rust-version.workspace = true
-license-file.workspace = true
 description = "Snowflake data connector for Spice.ai runtime"
+edition.workspace = true
+license-file.workspace = true
+name = "connector-snowflake"
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
 data_components = { path = "../../data_components", features = ["snowflake"] }
 datafusion.workspace = true
 datafusion-table-providers.workspace = true
-db_connection_pool = { path = "../../db_connection_pool", features = ["snowflake"] }
+db_connection_pool = { path = "../../db_connection_pool", features = [
+    "snowflake",
+] }
 itertools.workspace = true
 linkme.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime" }
-snowflake-api.workspace = true
 snafu.workspace = true
+snowflake-api.workspace = true
 
 [features]
 default = []

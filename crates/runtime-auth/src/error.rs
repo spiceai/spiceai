@@ -18,6 +18,8 @@ limitations under the License.
 pub enum Error {
     InvalidCredentials,
     HttpAuthError(Box<dyn std::error::Error + Send + Sync>),
+    JwksDiscoveryFailed(String),
+    JwksRefreshFailed(String),
 }
 
 impl std::fmt::Display for Error {
@@ -25,6 +27,8 @@ impl std::fmt::Display for Error {
         match self {
             Error::HttpAuthError(e) => write!(f, "Error validating HTTP request: {e}"),
             Error::InvalidCredentials => write!(f, "Invalid credentials"),
+            Error::JwksDiscoveryFailed(msg) => write!(f, "JWKS discovery failed: {msg}"),
+            Error::JwksRefreshFailed(msg) => write!(f, "JWKS refresh failed: {msg}"),
         }
     }
 }
@@ -33,7 +37,9 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::HttpAuthError(e) => Some(e.as_ref()),
-            Error::InvalidCredentials => None,
+            Error::InvalidCredentials
+            | Error::JwksDiscoveryFailed(_)
+            | Error::JwksRefreshFailed(_) => None,
         }
     }
 }

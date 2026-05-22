@@ -4,6 +4,7 @@ exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
 name = "aws-sdk-credential-bridge"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -26,8 +27,8 @@ secrecy.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-util = { workspace = true, default-features = false, features = [] }
 url.workspace = true
+util = { workspace = true, default-features = false, features = [] }
 
 [dev-dependencies]
 aws-sdk-cognitoidentity.workspace = true

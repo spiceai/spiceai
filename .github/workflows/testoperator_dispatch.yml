@@ -1,47 +1,16 @@
-name: testoperator dispatch
+# ============================================================================
+# DISABLED: This workflow comes from upstream (spiceai/spiceai).
+# The enterprise version is ent_testoperator_dispatch.yml
+# This file is kept only to prevent merge conflicts with upstream.
+# ============================================================================
+name: 'testoperator dispatch (upstream - disabled)'
 
-on:
-  schedule:
-    # Every day, at 0900 UTC (0200 PDT)
-    - cron: '0 9 * * *'
-
-  workflow_dispatch:
-    inputs:
-      spiced_commit:
-        description: 'An optional commit hash to use for spiced'
-        required: false
-        type: string
-      workflow_type:
-        description: 'the workflow to execute (bench, throughput, load, etc)'
-        required: true
-        default: 'bench'
-        type: choice
-        options:
-          - 'bench'
-          - 'load'
-          - 'throughput'
-          - 'append'
-          - 'http-consistency'
-          - 'nas'
-          - 'text-to-sql'
-          - 'streaming-bench'
-          - 'streaming-correctness'
-          - 'htap'
-      update_snapshots:
-        description: 'Update snapshots?'
-        required: false
-        type: boolean
-        default: false
-      scheduled:
-        description: 'Run schedule?'
-        required: false
-        type: boolean
-        default: false
+on: [workflow_dispatch]
 
 jobs:
   dispatch-scheduled:
     name: Dispatch tests - Scheduled
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.scheduled == 'true') }}
     strategy:
       fail-fast: false
@@ -214,7 +183,7 @@ jobs:
 
   dispatch-input:
     name: Dispatch tests - Input
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     if: ${{ github.event_name == 'workflow_dispatch' }}
     concurrency:
       group: testoperator-dispatch-${{ github.event.ref }}

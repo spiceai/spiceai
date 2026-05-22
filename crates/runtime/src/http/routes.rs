@@ -30,6 +30,7 @@ use crate::http::v1::{
     Format,
     datasets::{DatasetFilter, DatasetQueryParams},
 };
+use runtime_auth::AuthRequestContext;
 use runtime_request_context::{Protocol, RequestContext};
 
 #[cfg(feature = "mcp")]
@@ -68,7 +69,7 @@ use axum::{
     response::IntoResponse,
     routing::{Router, get, post},
 };
-use runtime_auth::{AuthRequestContext, layer::http::AuthLayer};
+use runtime_auth::layer::http::AuthLayer;
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -76,6 +77,12 @@ use tower_http::limit::RequestBodyLimitLayer;
 #[cfg(feature = "openapi")]
 #[derive(OpenApi)]
 #[openapi(
+    info(
+        license(
+            name = "Spice AI Commercial License",
+            url = "https://spice.ai"
+        )
+    ),
     servers(
         (url = "http://localhost:8090", description = "Local development server. Configure with `--http`."),
     ),

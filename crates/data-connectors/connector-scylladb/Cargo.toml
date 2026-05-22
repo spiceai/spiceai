@@ -15,18 +15,21 @@
 ##
 
 [package]
-name = "connector-scylladb"
-edition.workspace = true
-version.workspace = true
-rust-version.workspace = true
-license-file.workspace = true
 description = "ScyllaDB data connector for Spice.ai runtime"
+edition.workspace = true
+license-file.workspace = true
+name = "connector-scylladb"
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
 data_components = { path = "../../data_components", features = ["scylladb"] }
 datafusion.workspace = true
-db_connection_pool = { path = "../../db_connection_pool", features = ["scylladb"] }
+db_connection_pool = { path = "../../db_connection_pool", features = [
+    "scylladb",
+] }
 linkme.workspace = true
 ns_lookup = { path = "../../ns_lookup" }
 paste.workspace = true

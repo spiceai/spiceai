@@ -1,10 +1,11 @@
 [package]
-name = "connector-imap"
-edition.workspace = true
-version.workspace = true
-rust-version.workspace = true
-license-file.workspace = true
 description = "IMAP data connector for Spice.ai runtime"
+edition.workspace = true
+license-file.workspace = true
+name = "connector-imap"
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 async-trait.workspace = true

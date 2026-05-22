@@ -1,38 +1,46 @@
+# ============================================================================
+# DISABLED: This workflow comes from upstream (spiceai/spiceai).
+# The enterprise version is ent_pr.yml
+# This file is kept only to prevent merge conflicts with upstream.
+# ============================================================================
 ---
-name: pr
+name: 'pr (upstream - disabled)'
 
-on:
-  pull_request:
-    branches:
-      - trunk
-      - release-*
-      - release/*
-      - feature-*
-  merge_group:
-    branches:
-      - trunk
-      - release-*
-      - release/*
-      - feature-*
-  workflow_dispatch:
-    inputs:
-      profile_option:
-        description: 'Which Rust build profile to use? (Default is lint)'
-        required: false
-        type: choice
-        options:
-          - 'lint'
-          - 'release'
-          - 'release-lto'
-        default: 'lint'
-      update_snapshots:
-        description: 'Update the snapshots?'
-        required: false
-        default: 'no'
-        type: choice
-        options:
-          - 'always'
-          - 'no'
+on: [workflow_dispatch]
+
+# Original triggers and inputs preserved below for merge-conflict avoidance:
+# on:
+#   pull_request:
+#     branches:
+#       - trunk
+#       - release-*
+#       - release/*
+#       - feature-*
+#   merge_group:
+#     branches:
+#       - trunk
+#       - release-*
+#       - release/*
+#       - feature-*
+#   workflow_dispatch:
+#     inputs:
+#       profile_option:
+#         description: 'Which Rust build profile to use? (Default is lint)'
+#         required: false
+#         type: choice
+#         options:
+#           - 'lint'
+#           - 'release'
+#     - 'release-lto'
+#   default: 'lint'
+# update_snapshots:
+#   description: 'Update the snapshots?'
+#   required: false
+#   default: 'no'
+#   type: choice
+#   options:
+#     - 'always'
+#     - 'no'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -170,10 +178,8 @@ jobs:
   # Build and test
   build-test:
     name: Build and Test
-    runs-on: spiceai-macos
+    runs-on: spicehq-dev-runners
     needs: [check_changes]
-    env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -201,23 +207,21 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-nextest
 
-      - name: Set up spiceio
-        if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
-        id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@e31c63cbe88a6e284fc187875261106a05034775 # v0.5.4
-        with:
-          smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
-          token: ${{ github.token }}
-          bucket: sccache
-          region: us-west-1
+      - name: Check if sccache can be set up
+        run: |
+          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
+            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
+          else
+            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+          fi
 
       - name: Set up sccache
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -261,6 +265,17 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: cargo build -p testoperator --all-features --locked
+
+      # The install-* targets hardcode target/debug/ and target/release/ paths, so the workflow-level
+      # RUST_PROFILE=lint must be overridden to match (otherwise binaries land in target/lint/).
+      - name: make install-dev
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          RUST_PROFILE: dev
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+        run: make install-dev
 
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
@@ -369,24 +384,22 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: make install-spiced
 
-      - name: Cancel workflow on failure
-        if: failure()
-        run: gh run cancel ${{ github.run_id }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
 
-      - name: Kill spiceio
-        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
-        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+      - name: Check if Cargo.lock is updated
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          if git diff --exit-code Cargo.lock; then
+            echo "Cargo.lock is up to date"
+          else
+            echo "Update Cargo.lock"
+            exit 1
+          fi
 
-      - name: Upload spiceio logs
-        if: always() && needs.check_changes.outputs.relevant_changes == 'true' && steps.setup-spiceio.outputs.pid != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - name: Push snapshots to branch
+        if: github.event.inputs.update_snapshots == 'always'
+        uses: ./.github/actions/push-snap-changes
         with:
-          name: spiceio-build-install-release-logs
-          path: ${{ runner.temp }}/spiceio.log
-          if-no-files-found: ignore
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -15,12 +15,13 @@
 ##
 
 [package]
-name = "connector-databricks"
-edition.workspace = true
-version.workspace = true
-rust-version.workspace = true
-license-file.workspace = true
 description = "Databricks data and catalog connector for Spice.ai runtime"
+edition.workspace = true
+license-file.workspace = true
+name = "connector-databricks"
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
@@ -48,4 +49,10 @@ spark = []
 [dev-dependencies]
 app = { path = "../../app" }
 spicepod = { path = "../../spicepod" }
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+] }

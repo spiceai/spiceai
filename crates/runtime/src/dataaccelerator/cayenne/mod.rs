@@ -1454,9 +1454,9 @@ impl DataAccelerator for CayenneAccelerator {
 
         // Cayenne requires a source for file mode with directory-based storage
         let source = source.ok_or_else(|| {
-            Box::new(Error::InvalidConfiguration {
+            Box::<dyn std::error::Error + Send + Sync>::from(Error::InvalidConfiguration {
                 detail: Arc::from("Source required for Cayenne accelerator"),
-            }) as Box<dyn std::error::Error + Send + Sync>
+            })
         })?;
 
         let dir_path = self.resolve_storage_config(source).boxed()?;
@@ -1956,7 +1956,6 @@ impl CayennePartitionCreator {
         let partition_dir = to_hive_partition_dir(&pairings)
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
-
         Ok(self.base_path.join(partition_dir))
     }
 }

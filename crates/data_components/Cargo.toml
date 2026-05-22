@@ -4,6 +4,7 @@ exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
 name = "data_components"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -56,6 +57,7 @@ duckdb = { workspace = true, features = [
     "appender-arrow",
 ], optional = true }
 dynamodb-streams = { path = "../dynamodb-streams", optional = true }
+elasticsearch = { path = "../elasticsearch", optional = true }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
 git2 = { workspace = true }
@@ -66,20 +68,20 @@ hash-index = { path = "../hash-index", features = ["metrics"] }
 http.workspace = true
 httpdate.workspace = true
 iceberg.workspace = true
-parquet = { workspace = true }
 iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true
 imap = { workspace = true, optional = true }
 indexmap.workspace = true
 logos.workspace = true
-mysql_async = { workspace = true, optional = true }
 mongodb = { workspace = true, optional = true }
 mailparse = { workspace = true, optional = true }
+mysql_async = { workspace = true, optional = true }
+native-tls = { workspace = true, optional = true }
 num_cpus = "1.16"
 object_store = { workspace = true }
 opendal.workspace = true
 oracle = { version = "0.6", optional = true }
-native-tls = { workspace = true, optional = true }
+parquet = { workspace = true }
 percent-encoding.workspace = true
 pgwire-replication = { workspace = true, optional = true }
 postgres-native-tls = { workspace = true, optional = true }
@@ -90,7 +92,6 @@ reqwest.workspace = true
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 rusqlite = { workspace = true, optional = true }
-elasticsearch = { path = "../elasticsearch", optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 s3_vectors_metadata_filter = { path = "../s3_vectors_metadata_filter", optional = true }
 scylla = { workspace = true, optional = true }
@@ -110,6 +111,7 @@ tokio.workspace = true
 tokio-postgres = { workspace = true, features = [
     "with-chrono-0_4",
 ], optional = true }
+tokio-stream.workspace = true
 tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true }
 tracing.workspace = true
@@ -120,14 +122,13 @@ url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 uuid.workspace = true
 zip = "8.3.0"
-tokio-stream.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 
 [features]
-bench = [] # Feature for benchmarking that exposes internal functions
 adbc = ["datafusion-table-providers/adbc-federation"]
+bench = [] # Feature for benchmarking that exposes internal functions
 clickhouse = ["dep:clickhouse-rs", "datafusion-table-providers/federation"]
 cosmosdb = ["dep:azure_core", "dep:azure_data_cosmos"]
 databricks = [
@@ -138,7 +139,6 @@ databricks = [
 debezium = ["dep:rdkafka"]
 default = []
 delta_lake = ["dep:delta_kernel"]
-elasticsearch = ["dep:elasticsearch"]
 duckdb = [
     "dep:duckdb",
     "db_connection_pool/duckdb",
@@ -152,6 +152,7 @@ dynamodb = [
     "dep:aws-smithy-async",
     "dep:dynamodb-streams",
 ]
+elasticsearch = ["dep:elasticsearch"]
 flightsql = []
 imap = ["dep:charset", "dep:imap", "dep:mailparse"]
 kafka = ["dep:rdkafka"]
@@ -178,14 +179,22 @@ sharepoint = ["dep:graph-rs-sdk"]
 # Enables graph-rs-sdk's `test-util` feature so `GraphClient::use_test_endpoint`
 # accepts non-Microsoft hosts (e.g. localhost mocks). Intended for tests only.
 sharepoint-mock-host = ["sharepoint", "graph-rs-sdk/test-util"]
-snowflake = ["dep:snowflake-api", "datafusion-table-providers/federation", "db_connection_pool/snowflake"]
+snowflake = [
+    "dep:snowflake-api",
+    "datafusion-table-providers/federation",
+    "db_connection_pool/snowflake",
+]
 spark_connect = ["dep:spark-connect-rs"]
 sqlite = [
     "dep:rusqlite",
     "datafusion-table-providers/sqlite",
     "datafusion-table-providers/sqlite-federation",
 ]
-turso = ["dep:turso", "dep:turso-shared", "datafusion-table-providers/sqlite-federation"]
+turso = [
+    "dep:turso",
+    "dep:turso-shared",
+    "datafusion-table-providers/sqlite-federation",
+]
 
 test_hadoop_catalog_docker = []
 

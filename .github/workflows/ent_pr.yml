@@ -1,0 +1,312 @@
+---
+name: pr
+
+on:
+  merge_group:
+    types: [checks_requested]
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+  workflow_dispatch:
+    inputs:
+      profile_option:
+        description: 'Which Rust build profile to use? (Default is lint)'
+        required: false
+        type: choice
+        options:
+          - 'lint'
+          - 'release'
+          - 'release-lto'
+        default: 'lint'
+      update_snapshots:
+        description: 'Update the snapshots?'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'always'
+          - 'no'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
+env:
+  IGNORED_PATHS: '(^./docs/|^README.md$|^version.txt$|^acknowledgements.md$)'
+  RUST_PROFILE: ${{ github.event.inputs.profile_option || 'lint' }}
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  # Use fast linkers for PR builds (mold for x86_64, lld for aarch64)
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: clang
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=lld
+
+jobs:
+  # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via
+  # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
+  # a success when skipped).
+  check_changes:
+    runs-on: spiceai-macos
+    outputs:
+      relevant_changes: ${{ steps.check.outputs.relevant_changes }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          # Use fetch-depth 2 for PR change detection (dorny/paths-filter only needs base + head)
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+
+      - name: Check for code changes
+        id: check
+        uses: ./.github/actions/check-code-changes
+
+  lint-rust:
+    name: ${{ matrix.variant.name }}
+    runs-on: spiceai-macos
+    needs: check_changes
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - name: Rust Lint
+            command: lint-rust
+            spiceio_bind: 127.0.0.1:8333
+            sccache_server_port: 4233
+          - name: Rust Lint (Models)
+            command: lint-rust-models
+            spiceio_bind: 127.0.0.1:8334
+            sccache_server_port: 4234
+          - name: Rust Lint (NAS)
+            command: lint-rust-nas
+            spiceio_bind: 127.0.0.1:8335
+            sccache_server_port: 4235
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        with:
+          fetch-depth: 1
+
+      - name: Cache Cargo registry
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Set up Rust
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-rust
+
+      - name: Reap orphan spiceio
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          # Self-hosted runners can leak spiceio processes from prior jobs whose
+          # setup failed before producing a pid output (skipping the cleanup step).
+          # Clear only the port this matrix variant owns so concurrent variants
+          # on the same host keep their spiceio endpoints alive.
+          PORT="${BIND##*:}"
+          if command -v lsof >/dev/null 2>&1; then
+            PIDS="$(lsof -ti tcp:"$PORT" 2>/dev/null || true)"
+            if [[ -n "$PIDS" ]]; then
+              echo "Killing leftover listeners on tcp:$PORT: $PIDS"
+              kill -9 $PIDS 2>/dev/null || true
+            fi
+          fi
+        env:
+          BIND: ${{ matrix.variant.spiceio_bind }}
+
+      - name: Set up spiceio
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+          bind: ${{ matrix.variant.spiceio_bind }}
+
+      - name: Set up sccache
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-sccache
+        with:
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+          server_port: ${{ matrix.variant.sccache_server_port }}
+
+      - name: Install Protoc
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up make
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-cc
+
+      - name: Run ${{ matrix.variant.name }}
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: make ${{ matrix.variant.command }}
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          RUST_PROFILE: ${{ env.RUST_PROFILE }}
+
+      - name: Validate datafusion-table-providers commit
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.variant.command == 'lint-rust'
+        run: bash .github/scripts/validate_table_providers_commit.sh
+        env:
+          BRANCH: spiceai-52
+
+      - name: Show sccache stats
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        run: sccache --show-stats
+
+      - name: Stop sccache
+        if: always() && needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          if [ -n "${SCCACHE_SERVER_PORT:-}" ]; then
+            sccache --stop-server || true
+          fi
+
+      - name: Kill spiceio
+        if: always() && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Upload spiceio logs
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: spiceio-lint-${{ matrix.variant.command }}-logs
+          path: ${{ runner.temp }}/spiceio.log
+          if-no-files-found: ignore
+
+  # Build and test runs concurrently with linting
+  build-test:
+    name: Build and Test
+    runs-on: spicehq-dev-runners
+    needs: [check_changes]
+    env:
+      GOVER: 1.25.5
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        with:
+          fetch-depth: 1
+
+      - name: Cache Cargo registry
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Set up Go
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
+        with:
+          go-version: ${{ env.GOVER }}
+          cache: false
+
+      - name: Set up Rust
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-nextest
+
+      - name: Check if sccache can be set up
+        run: |
+          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
+            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
+          else
+            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+          fi
+
+      - name: Set up sccache
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+
+      - name: Install Protoc
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up make
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-cc
+
+      - name: Build CLI and run nextest
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: make build-cli nextest
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          RUST_PROFILE: ${{ env.RUST_PROFILE }}
+          AWS_S3_CLIENT_ID: ${{ secrets.AWS_S3_CLIENT_ID }}
+          AWS_S3_IDENTITY_POOL_ID: ${{ secrets.AWS_S3_IDENTITY_POOL_ID }}
+          AWS_S3_USERNAME: ${{ secrets.AWS_S3_USERNAME }}
+          AWS_S3_PASSWORD: ${{ secrets.AWS_S3_PASSWORD }}
+          AWS_COGNITO_IDP_URI: ${{ vars.AWS_COGNITO_IDP_URI }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots || 'no' }}
+
+      - name: Build testoperator
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: cargo build -p testoperator --all-features --locked
+
+      - name: Show sccache stats
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        run: sccache --show-stats
+
+      - name: Check if Cargo.lock is updated
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          if git diff --exit-code Cargo.lock; then
+            echo "Cargo.lock is up to date"
+          else
+            echo "Update Cargo.lock"
+            exit 1
+          fi
+
+      - name: Push snapshots to branch
+        if: github.event.inputs.update_snapshots == 'always'
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

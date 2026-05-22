@@ -7,7 +7,7 @@ FROM nvidia/cuda:13.2.1-cudnn-devel-ubuntu24.04 AS build
 USER root
 
 RUN apt update \
-    && apt install --yes pkg-config libssl-dev build-essential libsqlite3-dev cmake protobuf-compiler unixodbc-dev curl \
+    && apt install --yes pkg-config libssl-dev build-essential libsqlite3-dev cmake protobuf-compiler unixodbc-dev curl clang lld \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 RUN curl https://sh.rustup.rs -sSf | bash -s -- -y \
@@ -28,10 +28,12 @@ WORKDIR /build
 ARG CARGO_FEATURES=default
 ARG CARGO_INCREMENTAL=yes
 ARG CARGO_NET_GIT_FETCH_WITH_CLI=false
+ARG RUST_PROFILE=release
 ARG TARGETARCH
 ENV CARGO_FEATURES=$CARGO_FEATURES \
     CARGO_INCREMENTAL=$CARGO_INCREMENTAL \
-    CARGO_NET_GIT_FETCH_WITH_CLI=$CARGO_NET_GIT_FETCH_WITH_CLI
+    CARGO_NET_GIT_FETCH_WITH_CLI=$CARGO_NET_GIT_FETCH_WITH_CLI \
+    RUST_PROFILE=$RUST_PROFILE
 
 RUN \
     --mount=type=cache,id=spiceai_registry,sharing=locked,target=/usr/local/cargo/registry \
@@ -42,8 +44,8 @@ RUN \
       amd64) export CFLAGS="-O3 -ffunction-sections -fdata-sections -fPIC -march=x86-64" ;; \
       *) export CFLAGS="-O3 -ffunction-sections -fdata-sections -fPIC" ;; \
     esac && \
-    cargo build --release --features ${CARGO_FEATURES:-default} && \
-    cp /build/target/release/spiced /root/spiced
+    cargo build --profile ${RUST_PROFILE} --features ${CARGO_FEATURES:-default} && \
+    cp /build/target/${RUST_PROFILE}/spiced /root/spiced
 
 FROM nvidia/cuda:13.2.1-cudnn-runtime-ubuntu24.04 AS runtime
 ENV CUDA_NVCC_FLAGS=-fPIE

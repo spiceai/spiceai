@@ -18,6 +18,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::error::Error;
+use crate::identity::IdentityContext;
 use app::spicepod::component::runtime::ApiKey;
 use axum::http;
 use sha2::{Digest, Sha256};
@@ -27,6 +28,13 @@ pub type AuthPrincipalRef = Arc<dyn AuthPrincipal + Sync + Send>;
 pub trait AuthPrincipal {
     fn username(&self) -> &str; // The username as presented during auth
     fn groups(&self) -> &[&str]; // Group memberships
+
+    /// Returns the rich identity context for this principal, if available.
+    ///
+    /// Default implementation returns `None` for backward compatibility.
+    fn identity_context(&self) -> Option<&IdentityContext> {
+        None
+    }
 
     /// A stable, opaque identifier for this principal, suitable for use as
     /// a cache namespace key. Returning `None` means the principal is
@@ -77,6 +85,10 @@ impl AuthPrincipal for ApiKey {
             ApiKey::ReadOnly { .. } => &["read"],
             ApiKey::ReadWrite { .. } => &["read_write"],
         }
+    }
+
+    fn identity_context(&self) -> Option<&IdentityContext> {
+        None
     }
 
     /// Stable opaque id derived from the SHA-256 of the API key material,

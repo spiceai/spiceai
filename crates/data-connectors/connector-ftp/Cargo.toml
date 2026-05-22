@@ -1,10 +1,11 @@
 [package]
-name = "connector-ftp"
-edition.workspace = true
-version.workspace = true
-rust-version.workspace = true
-license-file.workspace = true
 description = "FTP data connector for Spice.ai runtime"
+edition.workspace = true
+license-file.workspace = true
+name = "connector-ftp"
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 linkme.workspace = true

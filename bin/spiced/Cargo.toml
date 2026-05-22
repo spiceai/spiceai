@@ -4,6 +4,7 @@ edition.workspace = true
 homepage.workspace = true
 license-file.workspace = true
 name = "spiced"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -21,22 +22,20 @@ connector-flightsql = { path = "../../crates/data-connectors/connector-flightsql
 connector-ftp = { path = "../../crates/data-connectors/connector-ftp", optional = true }
 connector-graphql = { path = "../../crates/data-connectors/connector-graphql" }
 connector-imap = { path = "../../crates/data-connectors/connector-imap", optional = true }
-connector-sftp = { path = "../../crates/data-connectors/connector-sftp", optional = true }
 connector-mongodb = { path = "../../crates/data-connectors/connector-mongodb", optional = true }
 connector-mssql = { path = "../../crates/data-connectors/connector-mssql", optional = true }
 connector-mysql = { path = "../../crates/data-connectors/connector-mysql", optional = true }
-# connector-nfs requires system libnfs library - build separately with `nfs` feature
 connector-nfs = { path = "../../crates/data-connectors/connector-nfs", optional = true }
 connector-odbc = { path = "../../crates/data-connectors/connector-odbc", optional = true }
 connector-oracle = { path = "../../crates/data-connectors/connector-oracle", optional = true }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
 connector-scylladb = { path = "../../crates/data-connectors/connector-scylladb", optional = true }
+connector-sftp = { path = "../../crates/data-connectors/connector-sftp", optional = true }
 connector-sharepoint = { path = "../../crates/data-connectors/connector-sharepoint", optional = true }
 connector-smb = { path = "../../crates/data-connectors/connector-smb", optional = true }
 connector-snowflake = { path = "../../crates/data-connectors/connector-snowflake", optional = true }
 connector-spark = { path = "../../crates/data-connectors/connector-spark", optional = true }
 event_stream = { path = "../../crates/event_stream" }
-repl = { path = "../../crates/repl" }
 futures.workspace = true
 mimalloc = { version = "0.1.48", optional = true }
 opentelemetry.workspace = true
@@ -46,14 +45,14 @@ opentelemetry-zipkin.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../../crates/otel-arrow" }
 prometheus.workspace = true
+repl = { path = "../../crates/repl" }
 reqwest.workspace = true
 runtime = { path = "../../crates/runtime" }
 runtime-auth = { path = "../../crates/runtime-auth" }
 runtime-async = { path = "../../crates/runtime-async" }
 rustls.workspace = true
-yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
-snmalloc-rs = { version = "0.3.6" }
+snmalloc-rs = { version = "0.3.6", optional = true }
 spice-cloud = { path = "../../crates/spice_cloud" }
 telemetry = { path = "../../crates/telemetry" }
 tikv-jemallocator = { version = "0.6.0", optional = true }
@@ -63,19 +62,19 @@ tracing.workspace = true
 tracing-log = "0.2.0"
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
-util = { path = "../../crates/util"}
+util = { path = "../../crates/util" }
+yaml = { path = "../../crates/yaml" }
 
 # Non-default features should be added to `lint-rust` make target.
 [features]
 adbc = ["runtime/adbc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
 alloc-mimalloc = ["dep:mimalloc"]
-alloc-snmalloc = []
+alloc-snmalloc = ["dep:snmalloc-rs"]
 alloc-system = []
 anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 azure-keyvault = ["runtime/azure-keyvault"]
-hashicorp_vault = ["runtime/hashicorp_vault"]
 clickhouse = ["connector-clickhouse", "runtime/clickhouse"]
 cosmosdb = ["runtime/cosmosdb"]
 cuda = ["runtime/cuda"]
@@ -85,7 +84,9 @@ default = [
     "adbc",
     "duckdb",
     "postgres",
+    "postgres-accel",
     "sqlite",
+    "turso",
     "mysql",
     "flightsql",
     "delta_lake",
@@ -93,8 +94,10 @@ default = [
     "dremio",
     "clickhouse",
     "cosmosdb",
+    "elasticsearch",
     "sharepoint",
     "snowflake",
+    "snapshots",
     "spark",
     "ftp",
     "sftp",
@@ -104,25 +107,27 @@ default = [
     "mssql",
     "dynamodb",
     "imap",
-    "alloc-snmalloc",
     "oracle",
     "runtime/s3_vectors",
     "mongodb",
     "iceberg-write",
-    "turso",
     "smb",
     "pingora",
     "scylladb",
-    "models",
+    "odbc",
+    "vortex",
+    "http-functions",
+    "wasm-functions",
 ]
 delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
 dev = ["runtime/dev"]
 dremio = ["connector-dremio", "runtime/dremio"]
-elasticsearch = ["connector-elasticsearch", "runtime/elasticsearch"]
 duckdb = ["connector-duckdb", "runtime/duckdb"]
 dynamodb = ["runtime/dynamodb"]
+elasticsearch = ["connector-elasticsearch", "runtime/elasticsearch"]
 flightsql = ["connector-flightsql", "runtime/flightsql"]
 ftp = ["connector-ftp", "runtime/ftp"]
+hashicorp_vault = ["runtime/hashicorp_vault"]
 geo = ["runtime/geo"]
 http-functions = ["runtime/http-functions"]
 rate-control = ["runtime/rate-control"]
@@ -134,11 +139,10 @@ kafka = ["runtime/kafka"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
 mcp = ["runtime/mcp"]
 metal = ["runtime/metal"]
-models = ["runtime/models"]
+models = ["runtime/models", "mcp"]
 mongodb = ["connector-mongodb", "runtime/mongodb"]
 mssql = ["connector-mssql", "runtime/mssql"]
 mysql = ["connector-mysql", "runtime/mysql"]
-# nfs feature requires system libnfs library and connector-nfs crate
 nfs = ["connector-nfs", "runtime/nfs"]
 odbc = ["connector-odbc"]
 oracle = ["connector-oracle", "runtime/oracle"]

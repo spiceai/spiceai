@@ -193,7 +193,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         // If github token is none, `--dry-run true` is forced by `clap`'s `required_if_eq` constraint.
         let Some(gh_token) = github_token.as_deref() else {
             let url = format!(
-                "https://api.github.com/repos/spiceai/spiceai/actions/workflows/{}/dispatches",
+                "https://api.github.com/repos/spicehq/spiceai/actions/workflows/{}/dispatches",
                 test_type.workflow()
             );
 
@@ -216,7 +216,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
 
         let octo_client = octocrab::instance().user_access_token(gh_token)?;
         let workflow =
-            GitHubWorkflow::new("spiceai", "spiceai", test_type.workflow(), &workflow_commit);
+            GitHubWorkflow::new("spicehq", "spiceai", test_type.workflow(), &workflow_commit);
 
         let result = match max_concurrent {
             Some(max_concurrent) => {

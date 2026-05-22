@@ -1,77 +1,16 @@
-name: spiced_docker
+# ============================================================================
+# DISABLED: This workflow comes from upstream (spiceai/spiceai).
+# The enterprise version is ent_spiced_docker.yml
+# This file is kept only to prevent merge conflicts with upstream.
+# ============================================================================
+name: "spiced_docker (upstream - disabled)"
 
-on:
-  release:
-    types:
-      # 'published' fires when a release (including a pre-release / RC) is
-      # first published, so RC tags still get pushed to DockerHub / GHCR even
-      # though they aren't marked as "latest" on GitHub.
-      - published
-      # 'edited' fires when an existing release is edited — we use this to
-      # re-run the workflow when a release is flipped to 'latest' so the
-      # :latest tag can be updated without re-publishing all images.
-      - edited
-  workflow_dispatch:
-    inputs:
-      release_tag:
-        description: Git tag to source binaries from (for example v1.4.0)
-        required: false
-        type: string
-      publish:
-        description: Publish the Docker images to registries
-        required: false
-        type: boolean
-        default: false
-      tag_latest:
-        description: "Tag as 'latest' (auto = only if the GitHub release is marked 'latest')"
-        required: false
-        type: choice
-        options:
-          - auto
-          - 'true'
-          - 'false'
-        default: auto
-      target:
-        description: Build docker images for specific target(s)
-        required: false
-        type: choice
-        options:
-          - all
-          - amd64
-          - arm64
-          - cuda
-        default: all
+on: [workflow_dispatch]
 
 jobs:
   setup:
-    # Run on:
-    #   - workflow_dispatch (manual runs)
-    #   - release 'published' ONLY for stable releases (vX.Y.Z) or RC tags
-    #     (vX.Y.Z-rc.N / vX.Y.Z-rc-N). Other pre-releases (nightly, beta,
-    #     alpha, dev, etc.) are intentionally excluded so they never get
-    #     published to DockerHub / GHCR via this workflow.
-    #   - release 'edited' only when the release is flipped to 'latest', so the
-    #     ':latest' tag can be moved without re-publishing on every edit.
-    #
-    # Draft releases are NEVER published from release events — the
-    # 'github.event.release.draft' guard ensures unpublished drafts can't
-    # reach DockerHub / GHCR even if 'edited' fires while in draft state.
-    if: >-
-      ${{
-        github.event_name != 'release'
-        || (
-          github.event.action == 'published'
-          && !github.event.release.draft
-          && contains(github.event.release.tag_name, '-rc.')
-        )
-        || (
-          github.event.action == 'edited'
-          && !github.event.release.draft
-          && github.event.changes.make_latest
-          && github.event.changes.make_latest.to == 'true'
-        )
-      }}
-    runs-on: ubuntu-24.04
+    if: ${{ github.event_name != 'release' || (github.event.action == 'edited' && github.event.changes.make_latest && github.event.changes.make_latest.to == 'true') }}
+    runs-on: ubuntu-22.04
     outputs:
       rel_version: ${{ steps.resolve.outputs.rel_version }}
       release_tag: ${{ steps.resolve.outputs.release_tag }}
@@ -123,17 +62,6 @@ jobs:
 
           rel_version="${release_tag#v}"
 
-          # Refuse to publish draft releases. Drafts have no tag in the git
-          # repo and should never be pushed to DockerHub / GHCR. We check
-          # GitHub's release metadata directly so this guards both
-          # release-event runs (defense in depth) and workflow_dispatch
-          # runs that supply a draft release's tag.
-          is_draft=$(gh release view "${release_tag}" --repo "${GITHUB_REPOSITORY}" --json isDraft -q .isDraft 2>/dev/null || echo "false")
-          if [ "$is_draft" = "true" ]; then
-            echo "Release ${release_tag} is a draft; refusing to publish." >&2
-            exit 1
-          fi
-
           run_amd64=false
           run_arm64=false
           run_cuda=false
@@ -165,12 +93,7 @@ jobs:
               ;;
           esac
 
-          # Determine if this release should be tagged as 'latest'.
-          #
-          # Rule: ONLY apply the ':latest' Docker tag when the GitHub release
-          # itself is marked as the repository's "latest" release. We no
-          # longer infer this from the version string — RCs, stable releases
-          # published out-of-order, etc. all respect GitHub's latest flag.
+          # Determine if this release should be tagged as 'latest'
           if [ "$event_name" = "workflow_dispatch" ]; then
             tag_latest_input="${{ github.event.inputs.tag_latest }}"
           else
@@ -179,14 +102,13 @@ jobs:
           fi
 
           if [ "$tag_latest_input" = "auto" ]; then
-            # Query GitHub for whether this tag is currently the 'latest' release.
-            is_latest=$(gh release view "${release_tag}" --repo "${GITHUB_REPOSITORY}" --json isLatest -q .isLatest 2>/dev/null || echo "false")
-            if [ "$is_latest" = "true" ]; then
-              should_tag_latest="true"
-              echo "Release ${release_tag} is marked as 'latest' on GitHub, will tag as 'latest'"
-            else
+            # Auto-detect: stable versions get 'latest', pre-releases don't
+            if [[ "${rel_version}" == *-rc* || "${rel_version}" == *-beta* || "${rel_version}" == *-alpha* ]]; then
               should_tag_latest="false"
-              echo "Release ${release_tag} is not marked as 'latest' on GitHub, skipping 'latest' tag"
+              echo "Auto-detected pre-release version (${rel_version}), skipping 'latest' tag"
+            else
+              should_tag_latest="true"
+              echo "Auto-detected stable version (${rel_version}), will tag as 'latest'"
             fi
           elif [ "$tag_latest_input" = "true" ]; then
             should_tag_latest="true"
@@ -207,7 +129,7 @@ jobs:
 
   build-amd64:
     needs: setup
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     steps:
       - name: Skip AMD64 build
         if: ${{ needs.setup.outputs.run_amd64 != 'true' }}
@@ -233,7 +155,7 @@ jobs:
         run: |
           echo "IMAGE_TAG=default" >> $GITHUB_ENV
           echo "BINARY_VARIANT=default" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,nfs,odbc,vortex" >> $GITHUB_ENV
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
       - &build-amd64-image
         name: Package AMD64 ${{ env.IMAGE_TAG }} image
@@ -314,7 +236,7 @@ jobs:
         run: |
           echo "IMAGE_TAG=default" >> $GITHUB_ENV
           echo "BINARY_VARIANT=default" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,nfs,odbc,vortex" >> $GITHUB_ENV
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
       - &build-arm64-image
         name: Package ARM64 ${{ env.IMAGE_TAG }} image
@@ -348,7 +270,7 @@ jobs:
 
   build-cuda:
     needs: setup
-    runs-on: 'spiceai-dev-runners'
+    runs-on: 'spicehq-dev-runners'
     env:
       CUDA_COMPUTE_CAP: 80
     steps:
@@ -376,7 +298,7 @@ jobs:
         run: |
           echo "IMAGE_TAG=cuda" >> $GITHUB_ENV
           echo "BINARY_VARIANT=cuda" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,cuda" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,cuda,nfs,odbc,vortex" >> $GITHUB_ENV
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Package CUDA image
@@ -411,7 +333,7 @@ jobs:
   publish:
     if: ${{ needs.setup.outputs.run_amd64 == 'true' || needs.setup.outputs.run_arm64 == 'true' }}
     needs: [setup, build-amd64, build-arm64]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     env:
       REL_VERSION: ${{ needs.setup.outputs.rel_version }}
       PUBLISH: ${{ needs.setup.outputs.publish }}
@@ -537,7 +459,7 @@ jobs:
   publish-cuda:
     needs: [setup, build-cuda]
     if: ${{ needs.setup.outputs.run_cuda == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: 'ubuntu-gpu-t4-4-core'
     env:
       REL_VERSION: ${{ needs.setup.outputs.rel_version }}
       PUBLISH: ${{ needs.setup.outputs.publish }}

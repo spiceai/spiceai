@@ -5,6 +5,7 @@ exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
 name = "runtime-cluster"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -30,12 +31,12 @@ futures.workspace = true
 object_store.workspace = true
 object_store_occ = { path = "../object_store_occ" }
 parking_lot.workspace = true
-serde_json.workspace = true
 runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-proto = { path = "../runtime-proto" }
 runtime-request-context = { path = "../runtime-request-context" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tokio = { workspace = true, features = ["full"] }

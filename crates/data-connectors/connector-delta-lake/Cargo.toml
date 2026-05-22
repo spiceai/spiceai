@@ -1,10 +1,11 @@
 [package]
-name = "connector-delta-lake"
-edition.workspace = true
-version.workspace = true
-rust-version.workspace = true
-license-file.workspace = true
 description = "Delta Lake data connector for Spice.ai runtime"
+edition.workspace = true
+license-file.workspace = true
+name = "connector-delta-lake"
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 async-trait.workspace = true

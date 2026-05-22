@@ -66,7 +66,7 @@ allow = [
   "bzip2-1.0.6", # https://spdx.org/licenses/bzip2-1.0.6.html
   "NCSA" # University of Illinois/NCSA Open Source License (OSI-approved, FSF Free/Libre)
 ]
-private = { ignore = false }
+private = { ignore = true }
 unused-allowed-license = "deny"
 
 [sources]

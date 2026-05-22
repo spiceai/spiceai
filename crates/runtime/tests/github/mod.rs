@@ -906,6 +906,7 @@ async fn test_github_stargazers() -> Result<(), String> {
 }
 
 #[tokio::test]
+#[ignore = "Temporarily disabled due to The API returned a 'FORBIDDEN' error."]
 async fn test_github_org_members() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     if !org_github_secret_available("test_github_org_members").await {

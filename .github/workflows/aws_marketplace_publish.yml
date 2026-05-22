@@ -1,0 +1,444 @@
+name: Publish to AWS Marketplace
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g., 2.0.0-rc.3)'
+        required: true
+        type: string
+      variants:
+        description: 'Comma-separated variants to publish (e.g., enterprise,enterprise-models)'
+        required: true
+        default: 'enterprise,enterprise-models'
+        type: string
+      repositories:
+        description: 'Target ECR repositories'
+        required: true
+        type: choice
+        options:
+          - 'spice-ai/spiceai-enterprise-byol'
+          - 'spice-ai/spiceai-enterprise-plan'
+          - 'spice-ai/spiceai-enterprise-byol,spice-ai/spiceai-enterprise-plan'
+      platforms:
+        description: 'Platforms to publish (comma separated)'
+        required: false
+        default: 'linux/amd64,linux/arm64'
+        type: string
+      publish_docker:
+        description: 'Publish Docker images'
+        required: false
+        default: true
+        type: boolean
+      publish_helm:
+        description: 'Publish Helm chart'
+        required: false
+        default: true
+        type: boolean
+      version_suffix:
+        description: 'Optional suffix appended to all published tags (e.g., .1 produces 2.0.0-rc.4-enterprise.1). Use to publish corrected images when the original immutable tags are occupied.'
+        required: false
+        default: ''
+        type: string
+      allowed_account_ids:
+        description: 'Comma-separated AWS account IDs to grant read-only pull access'
+        required: false
+        default: '334818252477,155422166461,414415349098,623717348230,297512042063,100458166471,328738246330,782858285006,903332016402,058264185180'
+        type: string
+
+env:
+  ECR_REGISTRY: 709825985650.dkr.ecr.us-east-1.amazonaws.com
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: 903332016402
+
+permissions:
+  id-token: write
+  contents: read
+  packages: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      repositories: ${{ steps.parse.outputs.repositories }}
+      tags: ${{ steps.parse.outputs.tags }}
+    steps:
+      - name: Parse repository list
+        id: parse
+        run: |
+          # Convert comma-separated repositories into a compact JSON array for matrix strategy
+          REPOS="${{ inputs.repositories }}"
+          REPOS_JSON=$(echo "${REPOS}" | jq -cR 'split(",") | map(ltrimstr(" ") | rtrimstr(" "))')
+          echo "repositories=${REPOS_JSON}" >> "$GITHUB_OUTPUT"
+          echo "Repositories to publish: ${REPOS_JSON}"
+
+          # Build the list of tags from version + variants (tag = {version}-{variant}{suffix})
+          VERSION="${{ inputs.version }}"
+          VARIANTS="${{ inputs.variants }}"
+          SUFFIX="${{ inputs.version_suffix }}"
+          TAGS_JSON=$(echo "${VARIANTS}" | jq -cR --arg v "${VERSION}" --arg s "${SUFFIX}" '
+            split(",")
+            | map(ltrimstr(" ") | rtrimstr(" "))
+            | map(select(length > 0))
+            | map($v + "-" + . + $s)
+          ')
+          if ! echo "${TAGS_JSON}" | jq -e 'length > 0' >/dev/null; then
+            echo "::error title=Invalid variants input::No publishable tags were produced from inputs.variants='${VARIANTS}'. Provide at least one non-empty variant."
+            exit 1
+          fi
+          echo "tags=${TAGS_JSON}" >> "$GITHUB_OUTPUT"
+          echo "Tags to publish: ${TAGS_JSON}"
+
+  publish-docker:
+    needs: prepare
+    environment: production
+    if: ${{ inputs.publish_docker }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repository: ${{ fromJson(needs.prepare.outputs.repositories) }}
+        tag: ${{ fromJson(needs.prepare.outputs.tags) }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/EnterpriseImageMarketplaceUpload
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR with Docker
+        run: |
+          set -e  # Exit on error
+          echo "Logging into ECR registry with Docker..."
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Login to GitHub Package Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull, tag and push images
+        env:
+          TAG: ${{ matrix.tag }}
+          # Source image from GHCR uses the unsuffixed tag (the original build tag)
+          SUFFIX: ${{ inputs.version_suffix }}
+          NEW_TAG: ${{ env.ECR_REGISTRY }}/${{ matrix.repository }}:${{ matrix.tag }}
+        run: |
+          set -e  # Exit on error
+
+          # Parse platforms (trim whitespace and drop empty entries)
+          IFS=',' read -ra RAW_PLATFORMS <<< "${{ inputs.platforms }}"
+          PLATFORMS=()
+          for RP in "${RAW_PLATFORMS[@]}"; do
+            TRIMMED=$(echo "${RP}" | xargs)
+            if [ -n "${TRIMMED}" ]; then
+              PLATFORMS+=("${TRIMMED}")
+            fi
+          done
+
+          # Validate that we have platforms
+          if [ ${#PLATFORMS[@]} -eq 0 ]; then
+            echo "Error: No platforms specified"
+            exit 1
+          fi
+
+          # Derive the GHCR source tag by stripping the version suffix (source images are unsuffixed)
+          if [ -n "${SUFFIX}" ]; then
+            OLD_TAG="ghcr.io/spicehq/spiceai-enterprise:${TAG%"${SUFFIX}"}"
+          else
+            OLD_TAG="ghcr.io/spicehq/spiceai-enterprise:${TAG}"
+          fi
+
+          echo "Publishing tag: ${TAG}"
+          echo "Source image: ${OLD_TAG}"
+          echo "Target image: ${NEW_TAG}"
+          echo "Target repository: ${{ matrix.repository }}"
+          echo "Platforms: ${PLATFORMS[*]}"
+
+          # Helper: returns 0 if the given tag already exists in the ECR repository, 1 otherwise.
+          ecr_tag_exists() {
+            local repo="$1"
+            local tag="$2"
+            aws ecr describe-images \
+              --repository-name "${repo}" \
+              --image-ids "imageTag=${tag}" \
+              --region "${{ env.AWS_REGION }}" \
+              >/dev/null 2>&1
+          }
+
+          # Create manifest arguments array
+          MANIFEST_ARGS=""
+
+          # Process each platform
+          for PLATFORM in "${PLATFORMS[@]}"; do
+            ARCH=$(echo "${PLATFORM}" | cut -d'/' -f2) # linux/amd64 -> amd64
+            ARCH_TAG_ONLY="${TAG}-${ARCH}"
+            ARCH_TAG="${{ env.ECR_REGISTRY }}/${{ matrix.repository }}:${ARCH_TAG_ONLY}"
+            
+            echo "Processing platform: ${PLATFORM}, arch: ${ARCH}"
+            
+            if ecr_tag_exists "${{ matrix.repository }}" "${ARCH_TAG_ONLY}"; then
+              echo "Tag ${ARCH_TAG_ONLY} already exists in ${{ matrix.repository }}; skipping pull/push for this platform."
+            else
+              # Pull the image for specific platform
+              echo "Pulling ${OLD_TAG} for platform ${PLATFORM}..."
+              docker pull --platform "${PLATFORM}" "${OLD_TAG}"
+              
+              # Tag for ECR
+              echo "Tagging as ${ARCH_TAG}..."
+              docker tag "${OLD_TAG}" "${ARCH_TAG}"
+              
+              # Push architecture-specific image; tolerate ImmutableTag races by treating as success
+              echo "Pushing ${ARCH_TAG}..."
+              if ! PUSH_OUTPUT=$(docker push "${ARCH_TAG}" 2>&1); then
+                echo "${PUSH_OUTPUT}"
+                if echo "${PUSH_OUTPUT}" | grep -qiE "ImageTagAlreadyExistsException|cannot be overwritten because the repository is immutable"; then
+                  echo "Tag already exists in ECR; continuing."
+                else
+                  exit 1
+                fi
+              fi
+            fi
+            
+            # Add to manifest arguments
+            MANIFEST_ARGS="${MANIFEST_ARGS} --amend ${ARCH_TAG}"
+          done
+
+          echo "Creating manifest with args: ${MANIFEST_ARGS}"
+
+          # Create and push manifest. Tolerate ImmutableTag if the manifest tag already exists.
+          if ecr_tag_exists "${{ matrix.repository }}" "${TAG}"; then
+            echo "Manifest tag ${TAG} already exists in ${{ matrix.repository }}; skipping manifest push."
+          else
+            docker manifest create "${NEW_TAG}" ${MANIFEST_ARGS}
+            if ! PUSH_OUTPUT=$(docker manifest push "${NEW_TAG}" 2>&1); then
+              echo "${PUSH_OUTPUT}"
+              if echo "${PUSH_OUTPUT}" | grep -qiE "ImageTagAlreadyExistsException|cannot be overwritten because the repository is immutable"; then
+                echo "Manifest tag already exists in ECR; continuing."
+              else
+                exit 1
+              fi
+            fi
+          fi
+
+          # Verify manifest
+          echo "Verifying manifest:"
+          docker manifest inspect "${NEW_TAG}"
+
+  publish-helm:
+    needs: prepare
+    environment: production
+    if: ${{ inputs.publish_helm }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repository: ${{ fromJson(needs.prepare.outputs.repositories) }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/EnterpriseImageMarketplaceUpload
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+        with:
+          version: 'latest'
+
+      - name: Modify Helm chart for enterprise
+        working-directory: deploy/chart
+        run: |
+          set -e  # Exit on error
+
+          echo "Original Chart.yaml:"
+          cat Chart.yaml
+          echo ""
+          echo "Original values.yaml (image section):"
+          grep -A 2 "image:" values.yaml
+          echo ""
+
+          # Extract chart name from repository (e.g., spice-ai/spiceai-enterprise -> spiceai-enterprise)
+          CHART_NAME=$(echo "${{ matrix.repository }}" | cut -d'/' -f2)
+          echo "Chart name extracted from repository: ${CHART_NAME}"
+
+          # Resolve the variant/tag used for both the chart version and the default image tag.
+          FIRST_VARIANT=$(echo "${{ inputs.variants }}" | cut -d',' -f1 | xargs)
+          if [ -z "${FIRST_VARIANT}" ]; then
+            echo "Error: inputs.variants is empty; cannot determine chart version."
+            exit 1
+          fi
+          SUFFIX="${{ inputs.version_suffix }}"
+          FIRST_TAG="${{ inputs.version }}-${FIRST_VARIANT}${SUFFIX}"
+          HELM_TAG="${{ inputs.version }}-${FIRST_VARIANT}-helm${SUFFIX}"
+
+          # Update Chart.yaml: rename chart to match target repository and align version
+          # with the dispatched release so the published chart and image stay in sync.
+          # The chart version uses a -helm suffix to avoid colliding with runtime image tags.
+          sed -i "s/^name: spiceai-enterprise$/name: ${CHART_NAME}/" Chart.yaml
+          sed -i "s/^version: .*/version: ${HELM_TAG}/" Chart.yaml
+          if grep -q '^appVersion:' Chart.yaml; then
+            sed -i "s/^appVersion: .*/appVersion: ${FIRST_TAG}/" Chart.yaml
+          fi
+
+          # Update values.yaml to use ECR image. When multiple variants are provided, use the first.
+          # The image tag in values.yaml stays as FIRST_TAG (the runtime image tag, not the helm tag).
+          echo "Using image tag for Helm chart: ${FIRST_TAG}"
+          echo "Helm chart OCI tag: ${HELM_TAG}"
+          sed -i 's|repository: ghcr.io/spicehq/spiceai-enterprise|repository: ${{ env.ECR_REGISTRY }}/${{ matrix.repository }}|' values.yaml
+          sed -i "s/tag: .*/tag: ${FIRST_TAG}/" values.yaml
+
+          echo "Modified Chart.yaml:"
+          cat Chart.yaml
+          echo ""
+          echo "Modified values.yaml (image section):"
+          grep -A 2 "image:" values.yaml
+
+      - name: Login to Amazon ECR with Helm
+        run: |
+          set -e  # Exit on error
+          echo "Logging into ECR registry with Helm..."
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | helm registry login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+
+      - name: Package and push Helm chart
+        working-directory: deploy/chart
+        run: |
+          set -e  # Exit on error
+
+          # Extract chart name from repository (e.g., spice-ai/spiceai-enterprise -> spiceai-enterprise)
+          CHART_NAME=$(echo "${{ matrix.repository }}" | cut -d'/' -f2)
+
+          # Package the chart
+          echo "Packaging Helm chart..."
+          helm package .
+
+          # List generated package
+          echo "Generated packages:"
+          ls -la *.tgz
+
+          # Validate package exists
+          CHART_PACKAGE=$(ls ${CHART_NAME}-*.tgz | head -1)
+          if [ -z "${CHART_PACKAGE}" ]; then
+            echo "Error: No chart package found"
+            exit 1
+          fi
+
+          echo "Pushing chart package: ${CHART_PACKAGE}"
+
+          # Push to ECR; tolerate the case where this chart version is already published.
+          if ! PUSH_OUTPUT=$(helm push "${CHART_PACKAGE}" oci://${{ env.ECR_REGISTRY }}/spice-ai/ 2>&1); then
+            echo "${PUSH_OUTPUT}"
+            if echo "${PUSH_OUTPUT}" | grep -qiE "ImageTagAlreadyExistsException|cannot be overwritten because the repository is immutable|already exists"; then
+              echo "Chart version already exists in ECR; continuing."
+            else
+              exit 1
+            fi
+          else
+            echo "${PUSH_OUTPUT}"
+          fi
+
+          echo "Successfully pushed Helm chart: ${CHART_PACKAGE}"
+
+  set-ecr-pull-policy:
+    needs: [prepare, publish-docker]
+    environment: production
+    if: ${{ inputs.allowed_account_ids != '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repository: ${{ fromJson(needs.prepare.outputs.repositories) }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/EnterpriseImageMarketplaceUpload
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set ECR repository policy for pull access
+        env:
+          REPO_NAME: ${{ matrix.repository }}
+          ALLOWED_ACCOUNTS: ${{ inputs.allowed_account_ids }}
+        run: |
+          set -euo pipefail
+
+          # Extract registry ID from ECR_REGISTRY URL
+          REGISTRY_ID=$(echo "${{ env.ECR_REGISTRY }}" | cut -d'.' -f1)
+
+          # Build the principals array from comma-separated account IDs
+          IFS=',' read -ra ACCOUNTS <<< "${ALLOWED_ACCOUNTS}"
+
+          if [ ${#ACCOUNTS[@]} -eq 0 ]; then
+            echo "Error: No account IDs specified"
+            exit 1
+          fi
+
+          PRINCIPALS=""
+          for ACCOUNT in "${ACCOUNTS[@]}"; do
+            ACCOUNT=$(echo "${ACCOUNT}" | xargs) # trim whitespace
+
+            # Validate account ID is a 12-digit number
+            if ! [[ "${ACCOUNT}" =~ ^[0-9]{12}$ ]]; then
+              echo "Error: Invalid AWS account ID '${ACCOUNT}'. Must be a 12-digit number."
+              exit 1
+            fi
+
+            if [ -n "${PRINCIPALS}" ]; then
+              PRINCIPALS="${PRINCIPALS},"
+            fi
+            PRINCIPALS="${PRINCIPALS}\"arn:aws:iam::${ACCOUNT}:root\""
+          done
+
+          POLICY=$(cat <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "AllowCrossAccountPull",
+                "Effect": "Allow",
+                "Principal": {
+                  "AWS": [${PRINCIPALS}]
+                },
+                "Action": [
+                  "ecr:GetDownloadUrlForLayer",
+                  "ecr:BatchGetImage",
+                  "ecr:BatchCheckLayerAvailability",
+                  "ecr:DescribeImages"
+                ]
+              }
+            ]
+          }
+          EOF
+          )
+
+          # Merge with any existing repository policy to preserve other statements
+          EXISTING_POLICY=$(aws ecr get-repository-policy \
+            --registry-id "${REGISTRY_ID}" \
+            --repository-name "${REPO_NAME}" \
+            --query 'policyText' --output text 2>/dev/null || echo '')
+
+          if [ -n "${EXISTING_POLICY}" ]; then
+            echo "Merging with existing repository policy..."
+            # Remove our Sid from existing, then append our new statement
+            MERGED_POLICY=$(echo "${EXISTING_POLICY}" | jq --argjson new "${POLICY}" '
+              .Statement = ([.Statement[] | select(.Sid != "AllowCrossAccountPull")] + $new.Statement)
+            ')
+            POLICY="${MERGED_POLICY}"
+          fi
+
+          echo "Setting repository policy for ${REPO_NAME} in registry ${REGISTRY_ID}..."
+          echo "Granting pull access to: ${ALLOWED_ACCOUNTS}"
+
+          aws ecr set-repository-policy \
+            --registry-id "${REGISTRY_ID}" \
+            --repository-name "${REPO_NAME}" \
+            --policy-text "${POLICY}"
+
+          echo "Repository policy set successfully for ${REPO_NAME}"

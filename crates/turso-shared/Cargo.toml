@@ -5,6 +5,7 @@ edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
+publish.workspace = true
 name = "turso-shared"
 repository.workspace = true
 rust-version.workspace = true

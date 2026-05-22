@@ -1,0 +1,485 @@
+name: build_and_release
+
+on:
+  push:
+    branches:
+      - trunk
+    tags:
+      - v*
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'README.md'
+      - 'Makefile'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/**'
+      - 'version.txt'
+      - '.schema/**'
+      - '.vscode/**'
+      - 'deploy/**'
+      - 'install/**'
+      - 'media/**'
+      - 'monitoring/**'
+      - 'acknowledgements.md'
+      - 'Dockerfile*'
+
+  workflow_dispatch:
+    inputs:
+      platform_option:
+        description: 'Which option do you want to run on? (Default is ALL)'
+        required: false
+        type: choice
+        options:
+          - 'all'
+          - 'Linux x64'
+          - 'Linux aarch64'
+          - 'macOS aarch64 (Apple Silicon)'
+          - 'macOS x64 (Intel)'
+        default: 'all'
+      tag_option:
+        description: 'Which build tag to include? (Default is all available tags per platform)'
+        required: false
+        type: choice
+        options:
+          - 'all'
+          - 'default'
+          - 'metal'
+        default: 'all'
+      profile_option:
+        description: 'Which Rust build profile to use? (Default is release-lto)'
+        required: false
+        type: choice
+        options:
+          - 'release-lto'
+          - 'release'
+        default: 'release-lto'
+
+permissions:
+  contents: write
+
+env:
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  setup-matrix:
+    name: Setup strategy matrix
+    runs-on: spicehq-dev-runners
+    outputs:
+      matrix: ${{ steps.setup-matrix.outputs.result }}
+
+    steps:
+      - name: Set up matrix
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        id: setup-matrix
+        with:
+          script: |
+            // Check if this is a tagged release (uses GitHub hosted runners, no minio)
+            const isTaggedRelease = context.ref.startsWith('refs/tags/v');
+
+            // Check if this is a release branch (uses spiceai runners with minio)
+            const isReleaseBranch = context.ref.startsWith('refs/heads/release-') ||
+                                    context.ref.startsWith('refs/heads/release/');
+
+            // Check if this is a manual workflow dispatch
+            const isManualDispatch = context.eventName === 'workflow_dispatch';
+
+            // Include Linux ARM only for tagged releases, release branches, or manual dispatch (exclude trunk pushes)
+            const includeLinuxArm = isTaggedRelease || isReleaseBranch || isManualDispatch;
+
+            // Tagged releases use GitHub hosted runners, release branches use spicehq-dev-large-runners, others use spicehq-dev-runners
+            const macosRunner = isTaggedRelease ? "macos-latest-xlarge" : "spiceai-macos";
+            let linuxRunner;
+            if (isTaggedRelease) {
+              linuxRunner = "ubuntu-22.04-16core";
+            } else if (isReleaseBranch) {
+              linuxRunner = "spicehq-dev-large-runners";
+            } else {
+              linuxRunner = "spicehq-dev-runners";
+            }
+
+            // Use minio for spiceai runners (trunk, release branches, manual dispatch on non-tagged)
+            const useMinio = !isTaggedRelease;
+
+            const matrix = [
+              {
+                name: "Linux x64",
+                runner: linuxRunner,
+                target_os: "linux",
+                target_arch: "x86_64",
+                target_arch_go: "amd64",
+                tags: ["default"],
+                use_minio: useMinio,
+                is_tagged_release: isTaggedRelease,
+              }, {
+                name: "macOS aarch64 (Apple Silicon)",
+                runner: macosRunner,
+                target_os: "darwin",
+                target_arch: "aarch64",
+                target_arch_go: "arm64",
+                tags: ["default", "metal"],
+                use_minio: false,
+                is_tagged_release: isTaggedRelease,
+              }
+            ];
+
+            // Add Linux ARM only for tagged releases, release branches, or manual dispatch
+            if (includeLinuxArm) {
+              matrix.push({
+                name: "Linux aarch64",
+                runner: "ubuntu-22.04-arm-16core",
+                target_os: "linux",
+                target_arch: "aarch64",
+                target_arch_go: "arm64",
+                tags: ["default"],
+                use_minio: false,
+                is_tagged_release: isTaggedRelease,
+              });
+            }
+
+            // If running via workflow_dispatch, filter based on inputs
+            if (isManualDispatch) {
+              const platform_option = context.payload.inputs.platform_option;
+              const tag_option = context.payload.inputs.tag_option;
+
+              // Filter by platform
+              let filtered = matrix;
+              if (platform_option !== 'all') {
+                filtered = filtered.filter(m => m.name === platform_option);
+              }
+
+              // Filter by tag
+              if (tag_option !== 'all') {
+                filtered = filtered.map(m => ({
+                  ...m,
+                  tags: m.tags.filter(t => t === tag_option)
+                }));
+                // Remove entries that have no matching tags
+                filtered = filtered.filter(m => m.tags.length > 0);
+              }
+
+              return filtered;
+            }
+
+            return matrix;
+
+  build:
+    name: Build ${{ matrix.target.name }} (${{ matrix.flavor.name }})
+    runs-on: ${{ matrix.target.runner }}
+    needs: setup-matrix
+    timeout-minutes: 300
+    env:
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+        flavor:
+          - name: default
+            features: 'release,odbc'
+            suffix: ''
+          - name: models
+            features: 'release,models,odbc'
+            suffix: '_models'
+          - name: nas
+            features: 'release,models,odbc,nfs,smb'
+            suffix: '_nas'
+        exclude:
+          # NAS variant only for Linux x64
+          - flavor:
+              name: nas
+            target:
+              target_arch: aarch64
+          - flavor:
+              name: nas
+            target:
+              target_os: darwin
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Set REL_VERSION from version.txt
+        run: python3 ./.github/scripts/get_release_version.py
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up make
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/setup-make
+        with:
+          os: ${{ matrix.target.target_os }}
+
+      - name: Set up cc
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/setup-cc
+
+      # The aarch64 runner does not have any tools pre-installed
+      - name: Install missing tools (Linux aarch64)
+        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install build-essential libssl-dev pkg-config cmake unixodbc unixodbc-dev libnfs-dev unzip -y
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=clang" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C link-arg=-fuse-ld=lld" >> $GITHUB_ENV
+
+      # The x86_64 runner does not have unixodbc or libnfs pre-installed
+      - name: Install missing tools (Linux x86_64)
+        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64'
+        run: |
+          sudo apt-get install unixodbc unixodbc-dev libnfs-dev -y
+
+      - name: Install missing tools (Mac)
+        if: matrix.target.target_os == 'darwin'
+        run: |
+          brew update
+          brew list cmake || brew install cmake
+          brew install unixodbc libnfs
+          echo "RUSTFLAGS=-L /opt/homebrew/lib" >> $GITHUB_ENV
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      ## Build spiced and spice CLI
+      # Non-release builds include postgres-accel for benchmark testing
+      - name: Build spiced and spice CLI
+        if: ${{ !matrix.target.is_tagged_release }}
+        working-directory: bin/spiced
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features ${{ matrix.flavor.features }},postgres-accel -p spiced -p spice --target-dir ../../target
+
+      # Release builds exclude optional accelerators from the distributed binary
+      - name: Build spiced and spice CLI (release)
+        if: ${{ matrix.target.is_tagged_release }}
+        working-directory: bin/spiced
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features ${{ matrix.flavor.features }} -p spiced -p spice --target-dir ../../target
+
+      - name: tar spiced binary
+        run: |
+          mv target/${{ env.RUST_PROFILE }}/spiced spiced
+          chmod +x spiced
+          tar czf spiced${{ matrix.flavor.suffix }}_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced
+
+      - name: Print spiced version
+        run: ./spiced --version
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: spiced${{ matrix.flavor.suffix }}_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: spiced${{ matrix.flavor.suffix }}_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
+
+      - name: Upload spiced to Minio
+        if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64'
+        uses: ./.github/actions/upload-to-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          source_path: spiced${{ matrix.flavor.suffix }}_linux_x86_64.tar.gz
+          destination_path: spice-minio/artifacts/spiced${{ matrix.flavor.suffix }}/linux-x86_64/${{ github.sha }}/
+
+      ## Metal variant (macOS with Metal GPU acceleration)
+      - name: Build spiced (metal)
+        if: matrix.target.target_os == 'darwin' && matrix.flavor.name == 'models'
+        working-directory: bin/spiced
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features ${{ matrix.flavor.features }},metal --target-dir ../../target
+
+      - name: tar binary (metal)
+        if: matrix.target.target_os == 'darwin' && matrix.flavor.name == 'models'
+        run: |
+          mv target/${{ env.RUST_PROFILE }}/spiced spiced
+          chmod +x spiced
+          tar czf spiced_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced
+
+      - name: Print version (metal)
+        if: matrix.target.target_os == 'darwin' && matrix.flavor.name == 'models'
+        run: ./spiced --version
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        if: matrix.target.target_os == 'darwin' && matrix.flavor.name == 'models'
+        with:
+          name: spiced_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: spiced_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
+
+      ## CLI - package the CLI binary (only once per platform, from default flavor)
+      - name: tar CLI binary
+        if: matrix.flavor.name == 'default'
+        run: |
+          mv target/${{ env.RUST_PROFILE }}/spice spice
+          chmod +x spice
+          tar czf spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spice
+
+      - name: Print CLI version
+        if: matrix.flavor.name == 'default'
+        run: ./spice version
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        if: matrix.flavor.name == 'default'
+        with:
+          name: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
+
+      - name: Upload spice CLI to Minio
+        if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && matrix.flavor.name == 'default'
+        uses: ./.github/actions/upload-to-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          source_path: spice_linux_x86_64.tar.gz
+          destination_path: spice-minio/artifacts/spice/linux-x86_64/${{ github.sha }}/
+
+  build-windows-cli:
+    name: Build Windows CLI
+    runs-on: windows-latest
+    needs: setup-matrix
+    timeout-minutes: 300
+    if: >-
+      startswith(github.ref, 'refs/tags/v') ||
+      startswith(github.ref, 'refs/heads/release-') ||
+      startswith(github.ref, 'refs/heads/release/') ||
+      github.event_name == 'workflow_dispatch'
+    env:
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Install Visual Studio Build Tools
+        uses: ./.github/actions/install-vs-buildtools
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build spice CLI
+        run: cargo build --profile ${{ env.RUST_PROFILE }} -p spice --target-dir target
+
+      - name: tar CLI binary
+        run: |
+          mv target/${{ env.RUST_PROFILE }}/spice.exe spice.exe
+          tar czf spice.exe_windows_x86_64.tar.gz spice.exe
+
+      - name: Print CLI version
+        run: ./spice.exe version
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: spice.exe_windows_x86_64
+          path: spice.exe_windows_x86_64.tar.gz
+
+  publish:
+    name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
+    needs: [build, build-windows-cli]
+    if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
+    env:
+      ARTIFACT_DIR: ./release
+
+    strategy:
+      matrix:
+        include:
+          - target_os: linux
+            target_arch: x86_64
+          - target_os: linux
+            target_arch: aarch64
+          - target_os: darwin
+            target_arch: aarch64
+
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Set REL_VERSION from version.txt
+        run: python3 ./.github/scripts/get_release_version.py
+
+      - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+
+      # Windows CLI
+      - name: download artifacts - spice.exe_windows_x86_64
+        if: matrix.target_os == 'linux' && matrix.target_arch == 'x86_64'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: spice.exe_windows_x86_64
+          path: ${{ env.ARTIFACT_DIR }}
+
+      # Default (non-models) runtime
+      - name: download artifacts - spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+
+      # Models runtime
+      - name: download artifacts - spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+
+      # NAS variant (Linux x64 only)
+      - name: download artifacts - spiced_nas_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        if: matrix.target_os == 'linux' && matrix.target_arch == 'x86_64'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: spiced_nas_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+
+      # macOS metal variant
+      - name: download artifacts - spiced_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        if: matrix.target_os == 'darwin'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: spiced_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+
+      - name: lists artifacts
+        run: ls -l ${{ env.ARTIFACT_DIR }}
+
+      - name: publish ${{ matrix.target_os }}/${{ matrix.target_arch }} binaries to github
+        run: |
+          # Parse repository to get owner and repo names
+          OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+          # Get the list of files
+          RELEASE_ARTIFACT=(${ARTIFACT_DIR}/*)
+          # Delete existing release artifact
+          python ./.github/scripts/github_release.py delete \
+            --owner $OWNER_NAME --repo $REPO_NAME \
+            --tag "v${{ env.REL_VERSION }}" \
+            ${RELEASE_ARTIFACT[*]}
+          if [ "$LATEST_RELEASE" = "true" ]; then
+            export RELEASE_BODY=`cat ./docs/release_notes/v${{ env.REL_VERSION }}.md`
+          else
+            export RELEASE_BODY="This is the release candidate ${{ env.REL_VERSION }}"
+          fi
+          echo "Uploading Spice.ai Binaries to GitHub Release"
+          python ./.github/scripts/github_release.py upload \
+            --owner $OWNER_NAME --repo $REPO_NAME \
+            --tag "v${{ env.REL_VERSION }}" \
+            --release-name "v${{ env.REL_VERSION }}" \
+            --body "${RELEASE_BODY}" \
+            --prerelease "$PRE_RELEASE" \
+            ${RELEASE_ARTIFACT[*]}

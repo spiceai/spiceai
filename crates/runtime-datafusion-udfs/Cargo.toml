@@ -4,6 +4,7 @@ exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
 name = "runtime-datafusion-udfs"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -22,7 +23,7 @@ futures.workspace = true
 blake3 = { workspace = true, optional = true }
 llms = { path = "../llms", default-features = false, optional = true }
 reqwest = { workspace = true, optional = true }
-runtime-auth = { path = "../runtime-auth", optional = true }
+runtime-auth = { path = "../runtime-auth" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 opentelemetry.workspace = true
@@ -49,7 +50,7 @@ wat.workspace = true
 
 [features]
 default = []
-http-functions = ["dep:reqwest", "dep:runtime-auth", "dep:url"]
+http-functions = ["dep:reqwest", "dep:url"]
 models = ["dep:llms"]
 wasm-functions = ["dep:arrow-ipc", "dep:wasmtime"]
 wasm-functions-compile = ["wasm-functions", "dep:blake3"]

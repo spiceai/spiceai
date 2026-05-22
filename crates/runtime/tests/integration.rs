@@ -148,6 +148,7 @@ mod view;
 mod management;
 // MySQL is required for the rehydration tests
 mod podswatcher;
+mod policy;
 #[cfg(all(feature = "mysql", feature = "duckdb"))]
 mod rehydration;
 mod shutdown;

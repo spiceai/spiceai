@@ -52,7 +52,12 @@ pub mod wasm;
 /// What a factory produces once a [`Function`] declaration has been
 /// compiled and validated.
 ///
+/// Today only [`BuiltFunction::Scalar`] is produced; aggregate, window,
+/// table, and higher-order variants will land alongside their tier-specific
+/// factories. Marked `#[non_exhaustive]` so adding variants is not a breaking
+/// change for downstream callers — they must already use a wildcard arm.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum BuiltFunction {
     Scalar(Arc<ScalarUDF>),
     Table(Arc<dyn TableFunctionImpl>),
@@ -761,6 +766,11 @@ mod tests {
         });
 
         // Declare + build the remote UDF.
+        let mut params = HashMap::default();
+        params.insert(
+            "allowed_endpoint_ranges".into(),
+            serde_json::Value::Array(vec![serde_json::Value::String("127.0.0.1/32".into())]),
+        );
         let decl = Function {
             name: "remote_double".into(),
             from: format!("http://{addr}/double"),
@@ -779,7 +789,7 @@ mod tests {
             body: None,
             body_ref: None,
             metadata: HashMap::default(),
-            params: HashMap::default(),
+            params,
             depends_on: vec![],
             metrics: None,
             as_tool: true,

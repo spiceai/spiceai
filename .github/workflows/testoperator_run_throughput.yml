@@ -1,78 +1,12 @@
-name: throughput tests
+# ============================================================================
+# DISABLED: This workflow comes from upstream (spiceai/spiceai).
+# The enterprise version is ent_testoperator_run_throughput.yml
+# This file is kept only to prevent merge conflicts with upstream.
+# ============================================================================
+name: 'throughput tests (upstream - disabled)'
 run-name: throughput - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
 
-on:
-  workflow_dispatch:
-    inputs:
-      spiced_commit:
-        description: 'spiced build commit'
-        required: false
-        type: string
-      spicepod_path:
-        description: 'The spicepod file to test with'
-        required: true
-        type: string
-      query_set:
-        description: 'Query set'
-        required: true
-        default: 'tpch'
-        type: choice
-        options:
-          - 'tpch'
-          - 'tpch[parameterized]'
-          - 'tpcds'
-          - 'clickbench'
-      query_overrides:
-        description: 'Query overrides'
-        required: false
-        type: choice
-        default: ''
-        options:
-          - ''
-          - 'sqlite'
-          - 'postgresql'
-          - 'mysql'
-          - 'dremio'
-          - 'odbc-athena'
-          - 'odbc-databricks'
-          - 'duckdb'
-          - 'duckdb-zero-results'
-          - 'duckdb-partitioned'
-          - 'snowflake'
-          - 'spark'
-          - 'iceberg-sf1'
-          - 'spicecloud-catalog'
-          - 'glue-catalog'
-          - 'databricks-catalog'
-          - 'spicecloud'
-          - 'iceberg-hadoop'
-          - 'dynamodb'
-          - 'postgres-catalog'
-          - 'mysql-catalog'
-          - 'mssql-catalog'
-      ready_wait:
-        description: 'How long (in seconds) to wait for spiced to start'
-        required: true
-        default: '300'
-        type: string
-      concurrency_count:
-        description: 'How many concurrent client connections to use?'
-        required: true
-        default: '10'
-        type: string
-      runner_type:
-        description: 'Runner type'
-        required: true
-        default: 'spiceai-dev-runners'
-        type: choice
-        options:
-          - 'spiceai-dev-runners'
-          - 'spiceai-dev-large-runners'
-      scale_factor:
-        description: 'Scale factor for the benchmark'
-        required: false
-        type: string
-        default: '1'
+on: [workflow_dispatch]
 
 jobs:
   run-throughput:

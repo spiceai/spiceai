@@ -124,6 +124,14 @@ runtime:
             key: read-only-api-key-12345
         - ReadWrite:
             key: read-write-api-key-67890
+    oidc:
+      enabled: true
+      issuer_url: https://accounts.google.com
+      audience:
+        - my-spice-app
+      groups_claims:
+        - groups
+        - roles
 
   # CORS configuration
   cors:

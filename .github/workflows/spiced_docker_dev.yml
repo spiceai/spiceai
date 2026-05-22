@@ -1,29 +1,11 @@
-name: spiced_docker_dev
+# ============================================================================
+# DISABLED: This workflow comes from upstream (spiceai/spiceai).
+# The enterprise version is ent_spiced_docker_dev.yml
+# This file is kept only to prevent merge conflicts with upstream.
+# ============================================================================
+name: "spiced_docker_dev (upstream - disabled)"
 
-on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Image tag (e.g., my-feature). Will be published as ghcr.io/spiceai/spiceai-dev:<tag>'
-        required: true
-        type: string
-      variant:
-        description: 'Which image variant to build'
-        required: false
-        type: choice
-        options:
-          - 'models'
-          - 'default'
-        default: 'models'
-      target:
-        description: 'Build for specific architecture(s)'
-        required: false
-        type: choice
-        options:
-          - 'all'
-          - 'amd64'
-          - 'arm64'
-        default: 'all'
+on: [workflow_dispatch]
 
 jobs:
   setup:
@@ -127,9 +109,9 @@ jobs:
         run: |
           variant="${{ inputs.variant }}"
           if [ "$variant" = "models" ]; then
-            echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
+            echo "CARGO_FEATURES=release,models,nfs,odbc,vortex" >> $GITHUB_ENV
           else
-            echo "CARGO_FEATURES=release" >> $GITHUB_ENV
+            echo "CARGO_FEATURES=release,nfs,odbc,vortex" >> $GITHUB_ENV
           fi
 
       - name: Build ARM64 image
@@ -159,7 +141,7 @@ jobs:
   build-amd64:
     needs: setup
     if: needs.setup.outputs.run_amd64 == 'true'
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     env:
       RUST_PROFILE: release
 
@@ -195,9 +177,9 @@ jobs:
         run: |
           variant="${{ inputs.variant }}"
           if [ "$variant" = "models" ]; then
-            echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
+            echo "CARGO_FEATURES=release,models,nfs,odbc,vortex" >> $GITHUB_ENV
           else
-            echo "CARGO_FEATURES=release" >> $GITHUB_ENV
+            echo "CARGO_FEATURES=release,nfs,odbc,vortex" >> $GITHUB_ENV
           fi
 
       - name: Build AMD64 image

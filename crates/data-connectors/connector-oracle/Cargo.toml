@@ -15,12 +15,13 @@
 ##
 
 [package]
-name = "connector-oracle"
-edition.workspace = true
-version.workspace = true
-rust-version.workspace = true
-license-file.workspace = true
 description = "Oracle data connector for Spice.ai runtime"
+edition.workspace = true
+license-file.workspace = true
+name = "connector-oracle"
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 async-trait.workspace = true

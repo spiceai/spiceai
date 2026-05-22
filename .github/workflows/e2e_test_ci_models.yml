@@ -1,0 +1,269 @@
+name: E2E Test CI (models)
+
+on:
+  workflow_run:
+    workflows:
+      - E2E Test CI
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'ID of the E2E Test CI workflow run to reuse artifacts from'
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.run_id || github.event.workflow_run.id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  resolve-run:
+    name: Resolve parent workflow run
+    runs-on: ubuntu-22.04
+    outputs:
+      run_id: ${{ steps.resolve.outputs.run_id }}
+      head_sha: ${{ steps.resolve.outputs.head_sha }}
+      event: ${{ steps.resolve.outputs.event }}
+      conclusion: ${{ steps.resolve.outputs.conclusion }}
+      is_pr: ${{ steps.resolve.outputs.is_pr }}
+    steps:
+      - name: Resolve run metadata
+        id: resolve
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          INPUT_RUN_ID: ${{ inputs.run_id }}
+        with:
+          script: |
+            let run;
+            if (context.eventName === 'workflow_dispatch') {
+              const inputRunId = core.getInput('run_id', { required: true });
+              const runId = Number(inputRunId);
+              if (!Number.isFinite(runId)) {
+                core.setFailed(`Invalid run_id: ${inputRunId}`);
+                return;
+              }
+              const runResponse = await github.rest.actions.getWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: runId,
+              });
+              run = runResponse.data;
+            } else {
+              run = context.payload.workflow_run;
+            }
+
+            if (!run) {
+              core.setFailed('Unable to resolve parent workflow run.');
+              return;
+            }
+
+            if (run.status !== 'completed') {
+              core.setFailed(`Parent workflow run ${run.id} is not completed (status: ${run.status}).`);
+              return;
+            }
+
+            core.setOutput('run_id', String(run.id));
+            core.setOutput('head_sha', run.head_sha);
+            core.setOutput('event', run.event);
+            core.setOutput('conclusion', run.conclusion ?? '');
+            core.setOutput('is_pr', run.event === 'pull_request' ? 'true' : 'false');
+
+  setup-matrix:
+    name: Setup strategy matrix
+    runs-on: ubuntu-22.04
+    needs:
+      - resolve-run
+    if: ${{ needs.resolve-run.outputs.conclusion == 'success' }}
+    outputs:
+      matrix: ${{ steps.setup.outputs.result }}
+    steps:
+      - name: Set up matrix
+        id: setup
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          IS_PR: ${{ needs.resolve-run.outputs.is_pr }}
+        with:
+          script: |
+            const targets = [
+              {
+                name: "Linux x64",
+                runner: "spicehq-dev-runners",
+                target_os: "linux",
+                target_arch: "x86_64",
+                target_arch_go: "amd64"
+              },
+              {
+                name: "macOS aarch64 (Apple Silicon)",
+                runner: "spiceai-macos",
+                target_os: "darwin",
+                target_arch: "aarch64",
+                target_arch_go: "arm64"
+              }
+            ];
+
+            const isPr = process.env.IS_PR === 'true';
+            if (isPr) {
+              return [targets[0]];
+            }
+            return targets;
+
+  test_openai_model:
+    name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    timeout-minutes: 5
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - resolve-run
+      - setup-matrix
+    if: ${{ needs.resolve-run.outputs.conclusion == 'success' && needs.setup-matrix.outputs.matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          ref: ${{ needs.resolve-run.outputs.head_sha }}
+          fetch-depth: 1
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: dawidd6/action-download-artifact@2536c51d3d126276eb39f74d6bc9c72ac6ef30d3 # v16
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          run_id: ${{ needs.resolve-run.outputs.run_id }}
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Init spice app
+        run: |
+          cp ./test/models/spicepod_openai.yml ./spicepod.yaml
+          cat ./spicepod.yaml
+
+      - name: Start spice runtime
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          spice run &> spice.log &
+
+      - name: Wait for Spice runtime is ready
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Install expect (linux)
+        if: matrix.target.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y expect
+
+      - name: Install expect (macOS)
+        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
+        run: |
+          brew install expect
+
+      - name: Test vector search
+        run: |
+          ./test/models/search_01.exp
+
+      - name: Test chat
+        run: |
+          ./test/models/chat_01.exp
+
+      - name: Stop spice and check logs
+        if: always()
+        run: |
+          killall spice || true
+          cat spice.log
+
+  test_hf_model:
+    name: 'huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    timeout-minutes: 10
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - resolve-run
+      - setup-matrix
+    if: ${{ needs.resolve-run.outputs.conclusion == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: 'macOS aarch64 (Apple Silicon)'
+            runner: 'spiceai-macos'
+            target_os: 'darwin'
+            target_arch: 'aarch64'
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          ref: ${{ needs.resolve-run.outputs.head_sha }}
+          fetch-depth: 1
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: dawidd6/action-download-artifact@2536c51d3d126276eb39f74d6bc9c72ac6ef30d3 # v16
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          run_id: ${{ needs.resolve-run.outputs.run_id }}
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Init spice app
+        run: |
+          cp ./test/models/spicepod_hf.yml ./spicepod.yaml
+          cat ./spicepod.yaml
+
+      - name: Start spice runtime
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          spice run &> spice.log &
+
+      - name: Wait for Spice runtime is ready
+        timeout-minutes: 5
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Install expect (linux)
+        if: matrix.target.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y expect
+
+      - name: Install expect (macOS)
+        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
+        run: |
+          brew install expect
+
+      - name: Test vector search
+        run: |
+          ./test/models/search_01.exp
+
+      # Local model does not support tools so we check that it can respond only
+      - name: Test chat
+        run: |
+          ./test/models/chat_01_simple.exp
+
+      - name: Stop spice and check logs
+        if: always()
+        run: |
+          killall spice || true
+          cat spice.log

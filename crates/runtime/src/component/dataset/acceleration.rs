@@ -499,11 +499,11 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         }
 
         let disable_federation = parse_is_query_federation_disabled(&mut params)?;
+        let caching_stale_if_error = parse_caching_stale_if_error(&mut params)?;
 
         let caching_ttl = parse_caching_ttl(&mut params)?;
         let caching_stale_while_revalidate_ttl =
             parse_caching_stale_while_revalidate_ttl(&mut params)?;
-        let caching_stale_if_error = parse_caching_stale_if_error(&mut params)?;
 
         let refresh_check_interval = try_parse_duration(
             "refresh_check_interval",

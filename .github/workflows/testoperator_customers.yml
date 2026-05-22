@@ -1,0 +1,104 @@
+name: testoperator customer datasets
+
+on:
+  workflow_dispatch:
+    inputs:
+      spiced_commit:
+        description: 'An optional commit hash to use for spiced'
+        required: false
+        type: string
+      workflow_type:
+        description: 'the workflow to execute (bench or load)'
+        required: true
+        default: 'bench'
+        type: choice
+        options:
+          - 'bench'
+          - 'load'
+      update_snapshots:
+        description: 'Update snapshots?'
+        required: false
+        type: boolean
+        default: false
+      max_concurrent:
+        description: 'Allowed concurrency for workflow runs'
+        required: false
+        type: number
+        default: 2
+  schedule:
+    # Run every 4 hours at minute 0
+    - cron: '0 */4 * * *'
+
+jobs:
+  dispatch-customers:
+    name: Dispatch Customer Tests
+    runs-on: spicehq-dev-runners
+    strategy:
+      fail-fast: false
+      matrix:
+        branch:
+          - 'trunk'
+    concurrency:
+      # the new run waits for in-progress runs to complete
+      group: testoperator-customers-${{ matrix.branch }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ matrix.branch }}
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        id: setup-spiced
+        with:
+          spiced_commit: ${{ github.event.inputs.spiced_commit || '' }}
+          ref: refs/heads/${{ matrix.branch }}
+
+      - name: Display spiced commit
+        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      # Scheduled runs (every 4 hours) - run both bench and load tests
+      - name: Scheduled Bench Run - Saffron - SF1
+        if: ${{ github.event_name == 'schedule' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/customers/saffron/sf1 --workflow bench --max-concurrent 2
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      - name: Scheduled Load Run - Saffron - SF1
+        if: ${{ github.event_name == 'schedule' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/customers/saffron/sf1 --workflow load --max-concurrent 2
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      # Manual dispatch - run specified workflow type
+      - name: Manual - Saffron - SF1
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/customers/saffron/sf1 \
+            --workflow ${{ github.event.inputs.workflow_type }} \
+            --update-snapshots ${{ github.event.inputs.update_snapshots }} \
+            --max-concurrent ${{ github.event.inputs.max_concurrent || 2 }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}

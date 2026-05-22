@@ -4,17 +4,18 @@ exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
 name = "package"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-object_store.workspace = true
-tracing.workspace = true
-snafu.workspace = true
-serde.workspace = true
-yaml = { path = "../yaml" }
-spicepod = { path = "../spicepod" }
-zip = "7.2.0"
 bytes.workspace = true
 futures.workspace = true
+object_store.workspace = true
+serde.workspace = true
+snafu.workspace = true
+spicepod = { path = "../spicepod" }
+tracing.workspace = true
+yaml = { path = "../yaml" }
+zip = "7.2.0"

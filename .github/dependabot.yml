@@ -5,8 +5,8 @@
 
 version: 2
 updates:
-  - package-ecosystem: 'cargo' # See documentation for possible values
-    directory: '/' # Location of package manifests
+  - package-ecosystem: 'cargo'
+    directory: '/'
     schedule:
       interval: 'weekly'
     labels:
@@ -20,8 +20,8 @@ updates:
         patterns:
           - '*'
 
-  - package-ecosystem: 'github-actions' # See documentation for possible values
-    directory: '/' # Location of package manifests
+  - package-ecosystem: 'github-actions'
+    directory: '/'
     schedule:
       interval: 'weekly'
     labels:
@@ -32,8 +32,8 @@ updates:
         patterns:
           - '*'
 
-  - package-ecosystem: 'docker' # See documentation for possible values
-    directory: '/' # Location of package manifests
+  - package-ecosystem: 'docker'
+    directory: '/'
     schedule:
       interval: 'weekly'
     labels:

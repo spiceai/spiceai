@@ -15,16 +15,19 @@
 ##
 
 [package]
-name = "connector-spark"
-edition.workspace = true
-version.workspace = true
-rust-version.workspace = true
-license-file.workspace = true
 description = "Spark Connect data connector for Spice.ai runtime"
+edition.workspace = true
+license-file.workspace = true
+name = "connector-spark"
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-data_components = { path = "../../data_components", features = ["spark_connect"] }
+data_components = { path = "../../data_components", features = [
+    "spark_connect",
+] }
 datafusion.workspace = true
 linkme.workspace = true
 paste.workspace = true

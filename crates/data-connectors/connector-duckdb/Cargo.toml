@@ -15,12 +15,13 @@
 ##
 
 [package]
-name = "connector-duckdb"
-edition.workspace = true
-version.workspace = true
-rust-version.workspace = true
-license-file.workspace = true
 description = "DuckDB data connector for Spice.ai runtime"
+edition.workspace = true
+license-file.workspace = true
+name = "connector-duckdb"
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 async-trait.workspace = true

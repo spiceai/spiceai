@@ -1,0 +1,573 @@
+name: Enterprise Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Release version (e.g., 1.10.0 or 1.10.0-rc.1)'
+        required: true
+        type: string
+      previous_release_tag:
+        description: 'Previous release tag for changelog (e.g., v1.9.0-enterprise)'
+        required: true
+        type: string
+      skip_tests:
+        description: 'Skip test validation (emergency releases only)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+  packages: write
+  id-token: write
+
+env:
+  RELEASE_VERSION: ${{ inputs.release_version }}
+  RELEASE_TAG: v${{ inputs.release_version }}-enterprise
+  PREVIOUS_RELEASE_TAG: ${{ inputs.previous_release_tag }}
+
+jobs:
+  # ============================================================================
+  # STAGE 1: Validation & Setup
+  # ============================================================================
+  validate-inputs:
+    name: Validate Release Inputs
+    runs-on: spiceai-macos
+    outputs:
+      release_version: ${{ steps.outputs.outputs.release_version }}
+      release_branch: ${{ steps.outputs.outputs.release_branch }}
+      release_tag: ${{ steps.outputs.outputs.release_tag }}
+      is_rc: ${{ steps.outputs.outputs.is_rc }}
+    steps:
+      - name: Validate inputs and compute branch
+        id: validate
+        run: |
+          set -euo pipefail
+
+          # Validate version format
+          VERSION="${{ inputs.release_version }}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "::error::Invalid version format. Expected X.Y.Z or X.Y.Z-rc.N"
+            exit 1
+          fi
+
+          # Extract major.minor to compute release branch
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          BRANCH="release/${MAJOR}.${MINOR}"
+
+          # Check if RC release
+          IS_RC="false"
+          if [[ "$VERSION" =~ -rc\. ]]; then
+            IS_RC="true"
+          fi
+
+          echo "release_branch=$BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Checkout repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ steps.validate.outputs.release_branch }}
+          fetch-depth: 0
+
+      - name: Validate branch exists
+        run: |
+          set -euo pipefail
+          BRANCH="${{ steps.validate.outputs.release_branch }}"
+          if ! git rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
+            echo "::error::Release branch '$BRANCH' does not exist"
+            exit 1
+          fi
+
+      - name: Validate version and generate summary
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.release_version }}"
+          BRANCH="${{ steps.validate.outputs.release_branch }}"
+          IS_RC="${{ steps.validate.outputs.is_rc }}"
+
+          # Validate version.txt matches
+          CURRENT_VERSION=$(cat version.txt | tr -d '\n')
+          EXPECTED_VERSION="${VERSION}-enterprise"
+          if [ "$CURRENT_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "::warning::version.txt contains '$CURRENT_VERSION', expected '$EXPECTED_VERSION'"
+          fi
+
+          echo "## Release Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | $VERSION |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | $BRANCH |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | v${VERSION}-enterprise |" >> $GITHUB_STEP_SUMMARY
+          echo "| Is RC | $IS_RC |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Set outputs
+        id: outputs
+        run: |
+          echo "release_version=${{ inputs.release_version }}" >> $GITHUB_OUTPUT
+          echo "release_branch=${{ steps.validate.outputs.release_branch }}" >> $GITHUB_OUTPUT
+          echo "release_tag=v${{ inputs.release_version }}-enterprise" >> $GITHUB_OUTPUT
+          echo "is_rc=${{ steps.validate.outputs.is_rc }}" >> $GITHUB_OUTPUT
+
+  # ============================================================================
+  # STAGE 2: Pre-Release Testing (Parallel Matrix)
+  # ============================================================================
+  run-tests:
+    name: ${{ matrix.test.name }}
+    needs: validate-inputs
+    if: ${{ !inputs.skip_tests }}
+    runs-on: spiceai-macos
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - name: Integration Tests
+            workflow: ent_integration.yml
+            params: '-f run_all_tests=true'
+            required: true
+          - name: E2E Tests (Core)
+            workflow: ent_e2e_test_ci.yml
+            params: ''
+            required: true
+          - name: E2E Tests (Models)
+            workflow: e2e_test_ci_models.yml
+            params: ''
+            required: true
+          - name: TestOperator Benchmarks
+            workflow: ent_testoperator_dispatch.yml
+            params: '-f workflow_type=bench'
+            required: false
+          - name: TestOperator Throughput
+            workflow: ent_testoperator_dispatch.yml
+            params: '-f workflow_type=throughput'
+            required: false
+          - name: Customer Dataset Benchmarks
+            workflow: testoperator_customers.yml
+            params: '-f workflow_type=bench'
+            required: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ needs.validate-inputs.outputs.release_branch }}
+
+      - name: Trigger ${{ matrix.test.name }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run ${{ matrix.test.workflow }} \
+            --ref "${{ needs.validate-inputs.outputs.release_branch }}" \
+            ${{ matrix.test.params }}
+
+      - name: Wait for ${{ matrix.test.name }}
+        id: wait
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Waiting for workflow to start..."
+          sleep 30
+
+          RUN_ID=$(gh run list --workflow=${{ matrix.test.workflow }} --branch="${{ needs.validate-inputs.outputs.release_branch }}" --limit=1 --json databaseId -q '.[0].databaseId')
+
+          if [ -n "$RUN_ID" ]; then
+            echo "Waiting for run $RUN_ID to complete..."
+            if gh run watch "$RUN_ID" --exit-status; then
+              echo "status=success" >> $GITHUB_OUTPUT
+            else
+              if [ "${{ matrix.test.required }}" == "true" ]; then
+                echo "::error::${{ matrix.test.name }} failed"
+                exit 1
+              else
+                echo "::warning::${{ matrix.test.name }} did not complete successfully"
+                echo "status=warning" >> $GITHUB_OUTPUT
+              fi
+            fi
+          fi
+
+  # ============================================================================
+  # STAGE 3: Generate Release Artifacts (Parallel)
+  # ============================================================================
+  generate-artifacts:
+    name: ${{ matrix.artifact.name }}
+    needs: [validate-inputs]
+    runs-on: spiceai-macos
+    strategy:
+      fail-fast: false
+      matrix:
+        artifact:
+          - name: Generate Changelog
+            type: changelog
+          - name: Generate JSON Schema
+            type: schema
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ needs.validate-inputs.outputs.release_branch }}
+          fetch-depth: 0
+
+      - name: Generate changelog
+        if: matrix.artifact.type == 'changelog'
+        id: changelog
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 ./scripts/generate_changelog.py "${{ inputs.previous_release_tag }}" "${{ needs.validate-inputs.outputs.release_branch }}"
+
+      - name: Upload changelog artifact
+        if: matrix.artifact.type == 'changelog'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: changelog
+          path: |
+            docs/release_notes/
+
+      - name: Install Rust toolchain
+        if: matrix.artifact.type == 'schema'
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Build schema generator
+        if: matrix.artifact.type == 'schema'
+        run: cargo build --manifest-path tools/spicepodschema/Cargo.toml
+
+      - name: Generate schema
+        if: matrix.artifact.type == 'schema'
+        run: cargo run --manifest-path tools/spicepodschema/Cargo.toml -- .schema/spicepod.schema.json
+
+      - name: Upload schema artifact
+        if: matrix.artifact.type == 'schema'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: json-schema
+          path: .schema/spicepod.schema.json
+
+  # ============================================================================
+  # STAGE 4: Pre-Release Approval Gate
+  # ============================================================================
+  test-summary:
+    name: Test Summary & QA Sign-off
+    needs:
+      - validate-inputs
+      - run-tests
+      - generate-artifacts
+    if: ${{ always() && !cancelled() }}
+    runs-on: spiceai-macos
+    steps:
+      - name: Generate test summary
+        run: |
+          echo "## Pre-Release Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Test Suite | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| All Tests (Matrix) | ${{ needs.run-tests.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Artifacts | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| Changelog & Schema | ${{ needs.generate-artifacts.result }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Check for failures
+        if: ${{ !inputs.skip_tests }}
+        run: |
+          if [ "${{ needs.run-tests.result }}" == "failure" ]; then
+            echo "::error::One or more required test suites failed. Review results before proceeding."
+            exit 1
+          fi
+
+  # ============================================================================
+  # STAGE 5: Create Release (Requires Approval)
+  # ============================================================================
+  create-release:
+    name: Create GitHub Release
+    needs: [validate-inputs, test-summary]
+    runs-on: spiceai-macos
+    environment:
+      name: release-approval
+      url: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.validate-inputs.outputs.release_tag }}
+    outputs:
+      release_url: ${{ steps.create-release.outputs.url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ needs.validate-inputs.outputs.release_branch }}
+
+      - name: Download changelog artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: changelog
+          path: docs/release_notes/
+
+      - name: Create pre-release
+        id: create-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create the release as a pre-release
+          RELEASE_URL=$(gh release create "${{ needs.validate-inputs.outputs.release_tag }}" \
+            --target "${{ needs.validate-inputs.outputs.release_branch }}" \
+            --title "v${{ inputs.release_version }}-enterprise" \
+            --prerelease \
+            --generate-notes)
+
+          echo "url=$RELEASE_URL" >> $GITHUB_OUTPUT
+          echo "## Release Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Pre-release created: $RELEASE_URL" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================================
+  # STAGE 6: Build & Release Binaries (Parallel Matrix)
+  # ============================================================================
+  trigger-builds:
+    name: Build ${{ matrix.build.name }}
+    needs: [validate-inputs, create-release]
+    runs-on: spiceai-macos
+    strategy:
+      fail-fast: false
+      matrix:
+        build:
+          - name: Release Binaries
+            workflow: ent_build_and_release.yml
+          - name: CUDA Release Binaries
+            workflow: ent_build_and_release_cuda.yml
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ needs.validate-inputs.outputs.release_branch }}
+
+      - name: Trigger ${{ matrix.build.name }} workflow
+        id: trigger
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run ${{ matrix.build.workflow }} \
+            --ref "${{ needs.validate-inputs.outputs.release_tag }}"
+
+          sleep 10
+
+          RUN_ID=$(gh run list --workflow=${{ matrix.build.workflow }} --limit=1 --json databaseId -q '.[0].databaseId')
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for ${{ matrix.build.name }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ steps.trigger.outputs.run_id }}" ]; then
+            echo "Waiting for ${{ matrix.build.name }} (run ${{ steps.trigger.outputs.run_id }})..."
+            gh run watch "${{ steps.trigger.outputs.run_id }}" --exit-status
+          fi
+
+  # ============================================================================
+  # STAGE 7: Build Docker Images
+  # ============================================================================
+  build-docker-images:
+    name: Build Enterprise Docker Images
+    needs: [validate-inputs, trigger-builds]
+    runs-on: spiceai-macos
+    outputs:
+      docker_run_id: ${{ steps.trigger.outputs.run_id }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ needs.validate-inputs.outputs.release_branch }}
+
+      - name: Trigger spiced_docker_enterprise workflow
+        id: trigger
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run spiced_docker_enterprise.yml \
+            -f release_tag="${{ needs.validate-inputs.outputs.release_tag }}" \
+            -f publish=true \
+            -f target=all
+
+          sleep 10
+
+          RUN_ID=$(gh run list --workflow=spiced_docker_enterprise.yml --limit=1 --json databaseId -q '.[0].databaseId')
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for Docker build completion
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ steps.trigger.outputs.run_id }}" ]; then
+            echo "Waiting for Docker build (run ${{ steps.trigger.outputs.run_id }})..."
+            gh run watch "${{ steps.trigger.outputs.run_id }}" --exit-status
+          fi
+
+  # ============================================================================
+  # STAGE 8: Deploy to Dev Environment (Requires Approval)
+  # ============================================================================
+  deploy-dev:
+    name: Deploy to Dev Environment
+    needs: [validate-inputs, build-docker-images]
+    runs-on: spiceai-macos
+    environment:
+      name: dev
+      url: https://dev.spice.ai
+    steps:
+      - name: Deployment instructions
+        run: |
+          echo "## Dev Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Docker image \`${{ inputs.release_version }}-enterprise-models\` is ready for deployment." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Manual Steps Required:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. Update [SCP Config in Vercel](https://vercel.com/spice/~/stores/edge-config/ecfg_pbglo8zol8rij7koia8ijd6t2fwe/items) for **dev**:" >> $GITHUB_STEP_SUMMARY
+          echo "   - Add \`${{ inputs.release_version }}-enterprise-models\` to \`versions\`" >> $GITHUB_STEP_SUMMARY
+          echo "   - Update \`default_tag\` to \`${{ inputs.release_version }}-enterprise-models\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "2. Deploy to dev apps and verify:" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] SQL Query" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] AI Chat" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] Search" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://dev.spice.ai/spicehq/scp-synthetics-test-app" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://dev.spice.ai/spicehq/scp-synthetics-test-app-stateful" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://dev.spice.ai/spicehq/scp-synthetics-test-app-aws" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================================
+  # STAGE 9: Deploy to Production Environment (Requires Approval)
+  # ============================================================================
+  deploy-production:
+    name: Deploy to Production Environment
+    needs: [validate-inputs, deploy-dev]
+    runs-on: spiceai-macos
+    environment:
+      name: production
+      url: https://spice.ai
+    steps:
+      - name: Deployment instructions
+        run: |
+          echo "## Production Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Manual Steps Required:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. Update [SCP Config in Vercel](https://vercel.com/spice/~/stores/edge-config/ecfg_pbglo8zol8rij7koia8ijd6t2fwe/items) for **prod**:" >> $GITHUB_STEP_SUMMARY
+          echo "   - Add \`${{ inputs.release_version }}-enterprise-models\` to \`versions\`" >> $GITHUB_STEP_SUMMARY
+          echo "   - Update \`default_tag\` to \`${{ inputs.release_version }}-enterprise-models\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "2. Deploy to production apps and verify each:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### Core Functionality:" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] SQL Query" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] AI Chat" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] Search" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### spicehq Apps:" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spicehq/s3-vectors-demo" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spicehq/s3-ai-database" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spicehq/team-app" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spicehq/marketing" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spicehq/nginx-demo" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spicehq/databricks-demo" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spicehq/iceberg-ai-demo" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spicehq/ai-platform" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spicehq/embedding-server" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spicehq/scp-synthetics-test-app" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spicehq/scp-synthetics-test-app-stateful" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spicehq/scp-synthetics-test-app-aws" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spicehq/scp-synthetics-test-app-aws-stateful" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### spiceai Apps:" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spiceai/react" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spiceai/tpch" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spiceai/spiceai" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spiceai/vercel-ai-sdk" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spiceai/nginx" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spiceai/nextjs" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spiceai/dremio" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spiceai/fed-demo" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spiceai/docs" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spiceai/quickstart" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] https://spice.ai/spiceai/tailwindcss" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================================
+  # STAGE 10: AWS Marketplace Publishing (Requires Approval)
+  # ============================================================================
+  publish-aws-marketplace:
+    name: Publish to AWS Marketplace
+    needs: [validate-inputs, deploy-production]
+    runs-on: spiceai-macos
+    environment:
+      name: aws-marketplace
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ needs.validate-inputs.outputs.release_branch }}
+
+      - name: Trigger AWS Marketplace publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run aws_marketplace_publish.yml \
+            -f tag="${{ inputs.release_version }}-enterprise-models" \
+            -f repositories="spice-ai/spiceai-enterprise-byol,spice-ai/spiceai-enterprise-plan" \
+            -f platforms="linux/amd64,linux/arm64" \
+            -f publish_docker=true \
+            -f publish_helm=true
+
+          echo "## AWS Marketplace" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Docker image publishing to AWS Marketplace initiated." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Additional Manual Steps:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. Build AMI using [(production) Build AMI from Enterprise release](https://github.com/spicehq/spiceai-ami/actions/workflows/build-ami-enterprise-release-production.yml)" >> $GITHUB_STEP_SUMMARY
+          echo "   - Release tag: \`${{ needs.validate-inputs.outputs.release_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "   - Asset name: \`spiced_models_linux_x86_64\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "2. Update AWS Marketplace listings:" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] Activate Marketplace Admins JIT access in Azure PIM portal" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] Log into AWS Console using Marketplace Admins SSO" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] Update [Spice.ai Enterprise (BYOL)](https://aws.amazon.com/marketplace/management/products/prod-pkjfmapef2dlu/overview)" >> $GITHUB_STEP_SUMMARY
+          echo "   - [ ] Update [Spice.ai Enterprise for AWS](https://aws.amazon.com/marketplace/management/products/prod-qfzcrwtpve3ho/overview)" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================================
+  # STAGE 11: Finalize Release
+  # ============================================================================
+  finalize-release:
+    name: Finalize Release
+    needs: [validate-inputs, publish-aws-marketplace]
+    runs-on: spiceai-macos
+    environment:
+      name: release-finalization
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ needs.validate-inputs.outputs.release_branch }}
+
+      - name: Mark release as latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Remove pre-release flag and mark as latest
+          gh release edit "${{ needs.validate-inputs.outputs.release_tag }}" \
+            --prerelease=false \
+            --latest
+
+          echo "## Release Finalized" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Release ${{ needs.validate-inputs.outputs.release_tag }} has been marked as the latest release." >> $GITHUB_STEP_SUMMARY
+
+      - name: Generate final summary
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Post-Release Checklist" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] Bump \`version.txt\` and \`Cargo.toml\` in \`trunk\` to the next planned minor release" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] Update supported version in \`SECURITY.md\` if necessary" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] Trigger [Platform OpenAPI Spec generation](https://github.com/spicehq/ai-platform/actions/workflows/generate-openapi.yml)" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] Update HTTP API Reference in https://docs.spice.ai if needed" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] Notify release coordination channel that Enterprise and Cloud releases are complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🎉 **Enterprise Release ${{ inputs.release_version }} Complete!**" >> $GITHUB_STEP_SUMMARY
