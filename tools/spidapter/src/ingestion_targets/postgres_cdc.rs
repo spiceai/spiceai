@@ -22,11 +22,10 @@ use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{Runtime, TelemetryConfig};
 use spicepod::param::Params;
 use spicepod::spec::SpicepodDefinition;
-use system_adapter_protocol::{AdbcDriver, DatasetConfig, SetupResponse};
+use system_adapter_protocol::DatasetConfig;
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 
-use super::super::RunState;
 use crate::args::StdioArgs;
 
 #[expect(dead_code)]
