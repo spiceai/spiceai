@@ -495,24 +495,19 @@ async fn init_kafka_consumer(
         );
     }
 
-    let kafka_consumer =
-        KafkaConsumer::create_with_existing_group_id(&metadata.consumer_group_id, kafka_config)
-            .boxed()
-            .context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "kafka",
-                connector_component: ConnectorComponent::from(dataset),
-            })?;
+    let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
+        &metadata.consumer_group_id,
+        kafka_config,
+        &metadata.offsets,
+    )
+    .boxed()
+    .context(super::UnableToGetReadProviderSnafu {
+        dataconnector: "kafka",
+        connector_component: ConnectorComponent::from(dataset),
+    })?;
 
     kafka_consumer
         .subscribe(topic)
-        .boxed()
-        .context(super::UnableToGetReadProviderSnafu {
-            dataconnector: "kafka",
-            connector_component: ConnectorComponent::from(dataset),
-        })?;
-
-    kafka_consumer
-        .restore_offsets(&metadata.offsets)
         .boxed()
         .context(super::UnableToGetReadProviderSnafu {
             dataconnector: "kafka",
