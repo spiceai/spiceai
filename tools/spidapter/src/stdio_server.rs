@@ -1085,11 +1085,12 @@ async fn generate_initial_spicepod(
                 }
                 _ => generate_hive_spicepod(run_id, setup_config, datasets)?,
             },
-            FederatedStorageConfig::DynamoDB { table_names, .. } => generate_dynamodb_spicepod(
+            FederatedStorageConfig::DynamoDB { table_names, acceleration, .. } => generate_dynamodb_spicepod(
                 run_id,
                 setup_config,
                 datasets,
                 table_names,
+                acceleration_engine_str(*acceleration),
             ),
             FederatedStorageConfig::Mongo {
                 connection_string,

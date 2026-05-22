@@ -198,7 +198,7 @@ pub struct StdioArgs {
     pub pg_database: Option<String>,
 
     /// Acceleration engine for federated datasets (`cayenne` or `duckdb`).
-    #[arg(long, env = "SPIDAPTER_ACCELERATION", default_value = "cayenne")]
+    #[arg(long, env = "SPICE_ACCELERATION", default_value = "cayenne")]
     pub acceleration: AccelerationEngine,
 
     /// EC2 subnet ID for provisioning a `PostgreSQL` instance. When set together with

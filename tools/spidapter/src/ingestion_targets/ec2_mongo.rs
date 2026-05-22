@@ -30,7 +30,6 @@ const MONGO_PORT: u16 = 27017;
 /// A provisioned EC2 instance running MongoDB.
 pub(crate) struct Ec2MongoInstance {
     pub(crate) instance_id: String,
-    pub(crate) host: String,
     pub(crate) connection_string: String,
     pub(crate) database: String,
     pub(crate) region: String,
@@ -167,7 +166,6 @@ pub(crate) async fn launch_mongo_ec2(
 
     Ok(Ec2MongoInstance {
         instance_id,
-        host,
         connection_string,
         database: "spicebench".to_string(),
         region,

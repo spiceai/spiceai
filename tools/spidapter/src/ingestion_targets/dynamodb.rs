@@ -424,6 +424,7 @@ pub(crate) fn generate_dynamodb_spicepod(
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
     dynamodb_table_names: &HashMap<String, String>,
+    acceleration_engine: &str,
 ) -> SpicepodDefinition {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
@@ -474,7 +475,7 @@ pub(crate) fn generate_dynamodb_spicepod(
         dataset.params = Some(Params::from_string_map(param_map));
         dataset.acceleration = Some(Acceleration {
             enabled: true,
-            engine: Some("duckdb".to_string()),
+            engine: Some(acceleration_engine.to_string()),
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Changes),
             ..Acceleration::default()
