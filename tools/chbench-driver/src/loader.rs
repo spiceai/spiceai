@@ -768,7 +768,7 @@ async fn load_region(client: &Client) -> Result<()> {
     sink.flush(client, "region").await
 }
 
-/// Load 10,000 supplier rows (matching BenchBase CH-Benchmark reference).
+/// Load 10,000 supplier rows (matching `BenchBase` CH-Benchmark reference).
 async fn load_supplier(client: &Client, rng: &mut impl Rng) -> Result<()> {
     const SUPPLIER_COUNT: i64 = 10_000;
     println!("  loading supplier ({SUPPLIER_COUNT} rows)");
