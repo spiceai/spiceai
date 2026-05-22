@@ -206,6 +206,10 @@ impl MetadataEnrichedTableProvider {
         let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
         Self { inner, schema }
     }
+
+    pub fn get_inner_ref(&self) -> &Arc<dyn TableProvider> {
+        &self.inner
+    }
 }
 
 /// Wrap `provider` with schema metadata while preserving federation pushdown when possible.
