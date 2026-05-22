@@ -100,13 +100,22 @@ pub(crate) fn build_dynamodb_setup_response(
 /// without needing to set the `partition_key` statement option.
 ///
 /// Returns a mapping from logical dataset name → physical `DynamoDB` table name.
+// Validated, self-contained spec for one DynamoDB table — all data extracted before spawning.
+struct TableSpec {
+    dataset_name: String,
+    physical_name: String,
+    partition_key: String,
+    pk_type: aws_sdk_dynamodb::types::ScalarAttributeType,
+    sort_key: Option<(String, aws_sdk_dynamodb::types::ScalarAttributeType)>,
+}
+
 pub(crate) async fn create_dynamodb_tables(
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
 ) -> anyhow::Result<HashMap<String, String>> {
     use aws_sdk_dynamodb::types::{
         AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ProvisionedThroughput,
-        ScalarAttributeType, StreamSpecification, StreamViewType, Tag,
+        StreamSpecification, StreamViewType, Tag,
     };
 
     let region = resolve_aws_region(setup_config);
@@ -117,15 +126,6 @@ pub(crate) async fn create_dynamodb_tables(
         "[stdio] DynamoDB: pre-creating {} table(s) in region {region} (prefix: {prefix})",
         datasets.len(),
     );
-
-    // Validated, self-contained spec for one table — all data extracted before spawning.
-    struct TableSpec {
-        dataset_name: String,
-        physical_name: String,
-        partition_key: String,
-        pk_type: ScalarAttributeType,
-        sort_key: Option<(String, ScalarAttributeType)>,
-    }
 
     // Validate schemas synchronously before spawning any tasks.
     let specs: Vec<TableSpec> = datasets
@@ -367,7 +367,6 @@ pub(crate) fn dynamodb_scan_segments(table_name: &str) -> usize {
     match table_name {
         "lineitem" => 48,
         "orders" | "partsupp" => 16,
-        "customer" | "part" => 8,
         "supplier" => 4,
         "nation" | "region" => 1,
         _ => 8,
@@ -382,7 +381,7 @@ pub(crate) fn dynamodb_table_prefix() -> String {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let short = format!("{:x}", ts % 0xFFFFFF);
+    let short = format!("{:x}", ts % 0x00FF_FFFF);
     format!("sb_{short}_")
 }
 
@@ -524,8 +523,8 @@ pub(crate) async fn seed_dynamodb_rows(
 
         let mut row_count = 0usize;
         for batch_result in reader {
-            let batch =
-                batch_result.map_err(|e| anyhow::anyhow!("Arrow batch error '{dataset_name}': {e}"))?;
+            let batch = batch_result
+                .map_err(|e| anyhow::anyhow!("Arrow batch error '{dataset_name}': {e}"))?;
             let schema = batch.schema();
 
             for row in 0..batch.num_rows() {
@@ -547,9 +546,7 @@ pub(crate) async fn seed_dynamodb_rows(
                     .send()
                     .await
                     .map_err(|e| {
-                        anyhow::anyhow!(
-                            "DynamoDB PutItem failed for table '{physical_name}': {e}"
-                        )
+                        anyhow::anyhow!("DynamoDB PutItem failed for table '{physical_name}': {e}")
                     })?;
 
                 row_count += 1;
@@ -573,29 +570,76 @@ fn arrow_scalar_to_attribute_value(
             let v = col.as_boolean().value(row);
             AttributeValue::Bool(v)
         }
-        DataType::Int8 => AttributeValue::N(col.as_primitive::<arrow::datatypes::Int8Type>().value(row).to_string()),
-        DataType::Int16 => AttributeValue::N(col.as_primitive::<arrow::datatypes::Int16Type>().value(row).to_string()),
-        DataType::Int32 => AttributeValue::N(col.as_primitive::<arrow::datatypes::Int32Type>().value(row).to_string()),
-        DataType::Int64 => AttributeValue::N(col.as_primitive::<Int64Type>().value(row).to_string()),
-        DataType::UInt8 => AttributeValue::N(col.as_primitive::<arrow::datatypes::UInt8Type>().value(row).to_string()),
-        DataType::UInt16 => AttributeValue::N(col.as_primitive::<arrow::datatypes::UInt16Type>().value(row).to_string()),
-        DataType::UInt32 => AttributeValue::N(col.as_primitive::<arrow::datatypes::UInt32Type>().value(row).to_string()),
-        DataType::UInt64 => AttributeValue::N(col.as_primitive::<arrow::datatypes::UInt64Type>().value(row).to_string()),
-        DataType::Float32 => AttributeValue::N(col.as_primitive::<arrow::datatypes::Float32Type>().value(row).to_string()),
-        DataType::Float64 => AttributeValue::N(col.as_primitive::<Float64Type>().value(row).to_string()),
+        DataType::Int8 => AttributeValue::N(
+            col.as_primitive::<arrow::datatypes::Int8Type>()
+                .value(row)
+                .to_string(),
+        ),
+        DataType::Int16 => AttributeValue::N(
+            col.as_primitive::<arrow::datatypes::Int16Type>()
+                .value(row)
+                .to_string(),
+        ),
+        DataType::Int32 => AttributeValue::N(
+            col.as_primitive::<arrow::datatypes::Int32Type>()
+                .value(row)
+                .to_string(),
+        ),
+        DataType::Int64 => {
+            AttributeValue::N(col.as_primitive::<Int64Type>().value(row).to_string())
+        }
+        DataType::UInt8 => AttributeValue::N(
+            col.as_primitive::<arrow::datatypes::UInt8Type>()
+                .value(row)
+                .to_string(),
+        ),
+        DataType::UInt16 => AttributeValue::N(
+            col.as_primitive::<arrow::datatypes::UInt16Type>()
+                .value(row)
+                .to_string(),
+        ),
+        DataType::UInt32 => AttributeValue::N(
+            col.as_primitive::<arrow::datatypes::UInt32Type>()
+                .value(row)
+                .to_string(),
+        ),
+        DataType::UInt64 => AttributeValue::N(
+            col.as_primitive::<arrow::datatypes::UInt64Type>()
+                .value(row)
+                .to_string(),
+        ),
+        DataType::Float32 => AttributeValue::N(
+            col.as_primitive::<arrow::datatypes::Float32Type>()
+                .value(row)
+                .to_string(),
+        ),
+        DataType::Float64 => {
+            AttributeValue::N(col.as_primitive::<Float64Type>().value(row).to_string())
+        }
         DataType::Decimal128(_, scale) => {
-            let raw = col.as_primitive::<arrow::datatypes::Decimal128Type>().value(row);
+            let raw = col
+                .as_primitive::<arrow::datatypes::Decimal128Type>()
+                .value(row);
+            #[expect(clippy::cast_sign_loss)]
             let scale = *scale as u32;
             let divisor = 10i128.pow(scale);
-            AttributeValue::N(format!("{}.{:0>width$}", raw / divisor, (raw % divisor).abs(), width = scale as usize))
+            AttributeValue::N(format!(
+                "{}.{:0>width$}",
+                raw / divisor,
+                (raw % divisor).abs(),
+                width = scale as usize
+            ))
         }
         DataType::Utf8 => AttributeValue::S(col.as_string::<i32>().value(row).to_string()),
         DataType::LargeUtf8 => AttributeValue::S(col.as_string::<i64>().value(row).to_string()),
-        DataType::Binary => AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(col.as_binary::<i32>().value(row).to_vec())),
-        DataType::LargeBinary => AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(col.as_binary::<i64>().value(row).to_vec())),
-        DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) | DataType::Time32(_) | DataType::Time64(_) => {
-            AttributeValue::S(arrow::util::display::array_value_to_string(col, row).unwrap_or_default())
-        }
-        _ => AttributeValue::S(arrow::util::display::array_value_to_string(col, row).unwrap_or_default()),
+        DataType::Binary => AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(
+            col.as_binary::<i32>().value(row).to_vec(),
+        )),
+        DataType::LargeBinary => AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(
+            col.as_binary::<i64>().value(row).to_vec(),
+        )),
+        _ => AttributeValue::S(
+            arrow::util::display::array_value_to_string(col, row).unwrap_or_default(),
+        ),
     }
 }

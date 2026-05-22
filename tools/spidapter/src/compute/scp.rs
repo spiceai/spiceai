@@ -21,7 +21,7 @@ use system_adapter_protocol::DatasetConfig;
 use uuid::Uuid;
 
 use super::{
-    FederatedStorageConfig, RunState, SetupConfig, generate_initial_spicepod,
+    FederatedStorageConfig, RunState, ScpRunState, SetupConfig, generate_initial_spicepod,
     post_setup_sink_action, serialize_spicepod,
 };
 use crate::args::{DeploymentMode, StdioArgs};
@@ -67,7 +67,9 @@ pub(super) async fn provision_scp_app(
         ephemeral_storage_limit_gb: args.ephemeral_storage_limit_gb.clone(),
         organization_tag: args.organization_tag.clone(),
     };
-    let app_id = commands::ensure_spice_cloud_app(&cloud, &app_name, &app_create_config, deployment_mode).await?;
+    let app_id =
+        commands::ensure_spice_cloud_app(&cloud, &app_name, &app_create_config, deployment_mode)
+            .await?;
 
     // Fetch API key from the dedicated api-keys endpoint
     let api_keys = cloud
@@ -102,14 +104,18 @@ pub(super) async fn provision_scp_app(
     }
 
     // Set storage-specific secrets
-    match &setup_config.storage {
-        FederatedStorageConfig::Mongo { connection_string, .. } => {
-            eprintln!("[stdio] Setting MONGODB_CONNECTION_STRING secret...");
-            commands::secrets::set_secret(&cloud, app_id, "MONGODB_CONNECTION_STRING", connection_string)
-                .await?;
-            eprintln!("[stdio] MONGODB_CONNECTION_STRING secret set");
-        }
-        _ => {}
+    if let FederatedStorageConfig::Mongo {
+            connection_string, ..
+        } = &setup_config.storage {
+        eprintln!("[stdio] Setting MONGODB_CONNECTION_STRING secret...");
+        commands::secrets::set_secret(
+            &cloud,
+            app_id,
+            "MONGODB_CONNECTION_STRING",
+            connection_string,
+        )
+        .await?;
+        eprintln!("[stdio] MONGODB_CONNECTION_STRING secret set");
     }
 
     // Apply custom image configuration if any image-related overrides are provided.
@@ -171,14 +177,14 @@ pub(super) async fn provision_scp_app(
     let sql_url = format!("https://{cname}.spiceai.io/v1/sql");
     post_setup_sink_action(setup_config, datasets, &sql_url, Some(&api_key)).await?;
 
-    Ok(RunState::Scp {
+    Ok(RunState::Scp(Box::new(ScpRunState {
         app_id,
         api_key,
         flight_url,
         sql_url,
         cloud,
         storage: FederatedStorageConfig::Cayenne, // will be replaced by setup() caller
-    })
+    })))
 }
 
 #[expect(dead_code)]

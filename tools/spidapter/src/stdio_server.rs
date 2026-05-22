@@ -36,8 +36,8 @@ use uuid::Uuid;
 use crate::args::{AccelerationEngine, DeploymentMode, FederatedStorage, SpiceCompute, StdioArgs};
 use crate::commands;
 
-#[path = "ingestion_targets/mod.rs"]
-mod ingestion_targets;
+#[path = "sources/mod.rs"]
+mod sources;
 
 #[path = "compute/scp.rs"]
 mod compute_scp;
@@ -45,74 +45,70 @@ mod compute_scp;
 #[path = "compute/local.rs"]
 mod compute_local;
 
-use ingestion_targets::cayenne::{
-    build_cayenne_setup_response, generate_cayenne_sink_spicepod, generate_hive_spicepod,
-};
-use ingestion_targets::dynamodb::{
-    DynamoDbTeardownInfo, build_dynamodb_setup_response, create_dynamodb_tables,
-    delete_dynamodb_tables, generate_dynamodb_spicepod, seed_dynamodb_rows,
-};
-use ingestion_targets::ec2_postgres::{
-    Ec2PostgresInstance, is_ec2_mode, launch_postgres_ec2, terminate_ec2_instance,
-};
-use ingestion_targets::mongo::{
-    build_mongodb_setup_response, generate_mongodb_spicepod, seed_mongodb_rows,
-};
-use ingestion_targets::postgres_cdc::{
-    PgConfig, generate_postgres_wal_spicepod, pg_create_table_ddl, pg_error_message,
-    setup_postgres_for_wal, teardown_postgres, tpch_schema_name,
-};
 use compute_local::{
     provision_local_single_node, provision_local_spiced_cluster, teardown_local_run,
 };
 use compute_scp::provision_scp_app;
+use sources::cayenne::{
+    build_cayenne_setup_response, generate_cayenne_sink_spicepod, generate_hive_spicepod,
+};
+use sources::dynamodb::{
+    DynamoDbTeardownInfo, build_dynamodb_setup_response, create_dynamodb_tables,
+    delete_dynamodb_tables, generate_dynamodb_spicepod, seed_dynamodb_rows,
+};
+use sources::ec2_postgres::{
+    Ec2PostgresInstance, is_ec2_mode, launch_postgres_ec2, terminate_ec2_instance,
+};
+use sources::mongo::{
+    build_mongodb_setup_response, generate_mongodb_spicepod, seed_mongodb_rows,
+};
+use sources::postgres_cdc::{
+    PgConfig, generate_postgres_wal_spicepod, pg_create_table_ddl, pg_error_message,
+    setup_postgres_for_wal, teardown_postgres, tpch_schema_name,
+};
 
 const POST_SETUP_SQL_MAX_RETRIES: u64 = 5;
 
+struct ScpRunState {
+    app_id: i64,
+    api_key: String,
+    flight_url: String,
+    sql_url: String,
+    cloud: CloudClient,
+    storage: FederatedStorageConfig,
+}
+
 /// State for an active benchmark run provisioned via `setup`.
 enum RunState {
-    Scp {
-        /// Spice Cloud app ID.
-        app_id: i64,
-        /// API key for the app (used for Flight SQL authentication).
-        api_key: String,
-        /// Flight SQL endpoint URL derived from the cname.
-        flight_url: String,
-        /// SQL endpoint URL for DDL execution.
-        sql_url: String,
-        /// Cloud client used during provisioning (reused for teardown).
-        cloud: CloudClient,
-        /// Federated storage backend for this run.
-        storage: FederatedStorageConfig,
-    },
+    Scp(Box<ScpRunState>),
     Local(Box<LocalRunState>),
 }
 
 impl RunState {
     fn flight_url(&self) -> &str {
         match self {
-            Self::Scp { flight_url, .. } => flight_url.as_str(),
+            Self::Scp(scp) => scp.flight_url.as_str(),
             Self::Local(state) => state.flight_url.as_str(),
         }
     }
 
     fn password(&self) -> &str {
         match self {
-            Self::Scp { api_key, .. } => api_key.as_str(),
+            Self::Scp(scp) => scp.api_key.as_str(),
             Self::Local(_) => "",
         }
     }
 
     fn sql_url(&self) -> &str {
         match self {
-            Self::Scp { sql_url, .. } => sql_url.as_str(),
+            Self::Scp(scp) => scp.sql_url.as_str(),
             Self::Local(state) => state.sql_url.as_str(),
         }
     }
 
     fn api_key(&self) -> Option<&str> {
         match self {
-            Self::Scp { api_key, .. } => Some(api_key.as_str()),
+            Self::Scp(scp) => Some(scp.api_key.as_str()),
             Self::Local(state) => state.flight_api_key.as_deref(),
         }
     }
@@ -212,7 +208,7 @@ struct SetupConfig {
     spicepod_path: Option<String>,
     storage: FederatedStorageConfig,
     /// Explicit AWS region from CLI args — overrides `region` (from `etl_region` metadata)
-    /// for the DynamoDB write path so the benchmark source region doesn't bleed through.
+    /// for the `DynamoDB` write path so the benchmark source region doesn't bleed through.
     aws_region_override: Option<String>,
 }
 
@@ -380,13 +376,13 @@ impl Handler for SpidapterHandler {
                 // WAL CDC setup before provisioning Spice
                 if let Err(e) = setup_postgres_for_wal(&pg, &datasets).await {
                     // Terminate EC2 if we provisioned one and WAL setup fails.
-                    if let Some(ref ec2) = ec2_instance {
-                        if let Err(te) =
-                            terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
+                    if let Some(ref ec2) = ec2_instance
+                        && let Err(te) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
                         {
-                            eprintln!("[stdio] warning: failed to terminate EC2 instance after WAL setup failure: {te}");
+                            eprintln!(
+                                "[stdio] warning: failed to terminate EC2 instance after WAL setup failure: {te}"
+                            );
                         }
-                    }
                     return Err(format!("Failed to set up PostgreSQL for WAL CDC: {e}"));
                 }
 
@@ -405,9 +401,12 @@ impl Handler for SpidapterHandler {
                 let ec2_mongo_instance = if is_ec2_mode(&self.args) {
                     let run_id_str = run_id.to_string();
                     let short_id = run_id_str.split('-').next().unwrap_or_default();
-                    let instance = ingestion_targets::ec2_mongo::launch_mongo_ec2(&self.args, short_id)
-                        .await
-                        .map_err(|e| format!("Failed to provision EC2 MongoDB instance: {e}"))?;
+                    let instance =
+                        sources::ec2_mongo::launch_mongo_ec2(&self.args, short_id)
+                            .await
+                            .map_err(|e| {
+                                format!("Failed to provision EC2 MongoDB instance: {e}")
+                            })?;
                     Some(instance)
                 } else {
                     None
@@ -420,7 +419,11 @@ impl Handler for SpidapterHandler {
                         .or_else(|| std::env::var("MONGODB_CONNECTION_STRING").ok().filter(|s| !s.is_empty()))
                         .ok_or_else(|| "Mongo storage requires mongodb_connection_string in metadata or MONGODB_CONNECTION_STRING env".to_string())?;
                     let db = metadata_string(&metadata, "mongodb_database")
-                        .or_else(|| std::env::var("MONGODB_DATABASE").ok().filter(|s| !s.is_empty()))
+                        .or_else(|| {
+                            std::env::var("MONGODB_DATABASE")
+                                .ok()
+                                .filter(|s| !s.is_empty())
+                        })
                         .unwrap_or_else(|| "spicebench".to_string());
                     (cs, db)
                 };
@@ -486,20 +489,24 @@ impl Handler for SpidapterHandler {
             ref database,
             ..
         } = setup_config.storage
-        {
-            if !seed_data.is_empty() {
+            && !seed_data.is_empty() {
                 seed_mongodb_rows(connection_string, database, &seed_data)
                     .await
                     .map_err(|e| format!("Failed to seed MongoDB rows: {e}"))?;
             }
-        }
 
         let deployment_mode = setup_config.storage.deployment_mode();
 
         let provision_result = match self.args.compute {
             SpiceCompute::Cloud => {
-                provision_scp_app(run_id, &self.args, &setup_config, &datasets, &deployment_mode)
-                    .await
+                provision_scp_app(
+                    run_id,
+                    &self.args,
+                    &setup_config,
+                    &datasets,
+                    &deployment_mode,
+                )
+                .await
             }
             SpiceCompute::Local => match deployment_mode {
                 DeploymentMode::SingleNode => {
@@ -534,18 +541,19 @@ impl Handler for SpidapterHandler {
                     FederatedStorageConfig::Mongo { ec2, .. } => ec2.as_ref(),
                     _ => None,
                 };
-                if let Some(ec2) = ec2 {
-                    if let Err(te) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await {
-                        eprintln!("[stdio] warning: failed to terminate EC2 instance on setup failure: {te}");
+                if let Some(ec2) = ec2
+                    && let Err(te) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await {
+                        eprintln!(
+                            "[stdio] warning: failed to terminate EC2 instance on setup failure: {te}"
+                        );
                     }
-                }
                 return Err(format!("Setup failed: {e}"));
             }
         };
 
         // Attach storage config to the run state.
         match &mut state {
-            RunState::Scp { storage: s, .. } => *s = setup_config.storage.clone(),
+            RunState::Scp(scp) => scp.storage = setup_config.storage.clone(),
             RunState::Local(local) => local.storage = setup_config.storage.clone(),
         }
 
@@ -566,7 +574,7 @@ impl Handler for SpidapterHandler {
                     ),
                 ]);
                 let db_kwargs = pg.adbc_kwargs();
-                eprintln!("[stdio] ADBC db_kwargs: {:?}", db_kwargs);
+                eprintln!("[stdio] ADBC db_kwargs: {db_kwargs:?}");
                 let mut write_db_kwargs = db_kwargs;
                 write_db_kwargs.insert(
                     "spicebench.write_schema".to_string(),
@@ -581,15 +589,12 @@ impl Handler for SpidapterHandler {
                     table_name_map: HashMap::new(),
                 }
             }
-            FederatedStorageConfig::Cayenne => {
-                build_cayenne_setup_response(etl_sink_type, &state)
-            }
+            FederatedStorageConfig::Cayenne => build_cayenne_setup_response(etl_sink_type, &state),
             FederatedStorageConfig::DynamoDB { table_names, .. } => {
                 build_dynamodb_setup_response(&setup_config, &state, &datasets, table_names)
             }
             FederatedStorageConfig::Mongo {
-                connection_string,
-                ..
+                connection_string, ..
             } => build_mongodb_setup_response(connection_string, &state),
         };
 
@@ -610,9 +615,10 @@ impl Handler for SpidapterHandler {
             .ok_or_else(|| format!("No active run found for {run_id}"))?;
 
         match state {
-            RunState::Scp { app_id, cloud, .. } => {
-                let cloud_metrics = cloud
-                    .get_app_metrics(*app_id, None)
+            RunState::Scp(scp) => {
+                let cloud_metrics = scp
+                    .cloud
+                    .get_app_metrics(scp.app_id, None)
                     .await
                     .map_err(|e| format!("Failed to fetch metrics: {e}"))?;
 
@@ -663,20 +669,21 @@ impl Handler for SpidapterHandler {
         let run_datasets = self.run_datasets.remove(&run_id).unwrap_or_default();
 
         let storage = match &state {
-            RunState::Scp { storage, .. } => storage.clone(),
+            RunState::Scp(scp) => scp.storage.clone(),
             RunState::Local(local) => local.storage.clone(),
         };
 
         match state {
-            RunState::Scp { app_id, cloud, .. } => {
+            RunState::Scp(scp) => {
                 eprintln!(
-                    "[stdio] teardown: deleting app {app_id} at {}",
-                    cloud.base_url()
+                    "[stdio] teardown: deleting app {} at {}",
+                    scp.app_id,
+                    scp.cloud.base_url()
                 );
-                commands::delete_app(&cloud, app_id)
+                commands::delete_app(&scp.cloud, scp.app_id)
                     .await
-                    .map_err(|e| format!("Failed to delete app {app_id}: {e}"))?;
-                eprintln!("[stdio] teardown: app {app_id} deleted");
+                    .map_err(|e| format!("Failed to delete app {}: {e}", scp.app_id))?;
+                eprintln!("[stdio] teardown: app {} deleted", scp.app_id);
             }
             RunState::Local(mut local_state) => {
                 teardown_local_run(&mut local_state)
@@ -690,18 +697,22 @@ impl Handler for SpidapterHandler {
                 teardown_postgres(&pg, &run_datasets)
                     .await
                     .map_err(|e| format!("Failed to teardown PostgreSQL: {e}"))?;
-                if let Some(ec2) = ec2 {
-                    if let Err(e) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await {
-                        eprintln!("[stdio] warning: failed to terminate EC2 Postgres instance {}: {e}", ec2.instance_id);
+                if let Some(ec2) = ec2
+                    && let Err(e) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await {
+                        eprintln!(
+                            "[stdio] warning: failed to terminate EC2 Postgres instance {}: {e}",
+                            ec2.instance_id
+                        );
                     }
-                }
             }
             FederatedStorageConfig::Mongo { ec2, .. } => {
-                if let Some(ec2) = ec2 {
-                    if let Err(e) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await {
-                        eprintln!("[stdio] warning: failed to terminate EC2 Mongo instance {}: {e}", ec2.instance_id);
+                if let Some(ec2) = ec2
+                    && let Err(e) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await {
+                        eprintln!(
+                            "[stdio] warning: failed to terminate EC2 Mongo instance {}: {e}",
+                            ec2.instance_id
+                        );
                     }
-                }
             }
             FederatedStorageConfig::DynamoDB {
                 table_names,
@@ -735,13 +746,13 @@ impl Handler for SpidapterHandler {
                 .get(&run_id)
                 .ok_or_else(|| format!("No active run found for {run_id}"))?;
             let storage = match state {
-                RunState::Scp { storage, .. } => storage.clone(),
+                RunState::Scp(scp) => scp.storage.clone(),
                 RunState::Local(local) => local.storage.clone(),
             };
             (
                 storage,
                 state.sql_url().to_string(),
-                state.api_key().map(|s| s.to_string()),
+                state.api_key().map(std::string::ToString::to_string),
             )
         };
 
@@ -764,21 +775,21 @@ impl Handler for SpidapterHandler {
                 .ok_or_else(|| {
                     format!("Source dataset '{source_dataset}' not found in run {run_id}")
                 })?;
-            let ddl = pg_create_table_ddl(&pg.schema, staging_table_name, source_config)
-                .map_err(|e| {
-                    format!(
-                        "Failed to generate staging table DDL for '{staging_table_name}': {e}"
-                    )
-                })?;
-            eprintln!(
-                "[stdio] create_staging_table (postgres): source={source_dataset}, staging={staging_table_name}, sql={ddl}"
-            );
+            let ddl = pg_create_table_ddl(&pg.schema, staging_table_name, source_config).map_err(
+                |e| format!("Failed to generate staging table DDL for '{staging_table_name}': {e}"),
+            )?;
+            // eprintln!(
+            //     "[stdio] create_staging_table (postgres): source={source_dataset}, staging={staging_table_name}, sql={ddl}"
+            // );
             let client = pg
                 .connect()
                 .await
                 .map_err(|e| format!("Failed to connect to PostgreSQL: {e}"))?;
             client
-                .execute(ddl.as_str(), &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)])
+                .execute(
+                    ddl.as_str(),
+                    &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
+                )
                 .await
                 .map_err(|e| {
                     format!(
@@ -1071,21 +1082,25 @@ async fn generate_initial_spicepod(
         load_spicepod_from_path(path, run_id).await?
     } else {
         match &setup_config.storage {
-            FederatedStorageConfig::Postgres { pg, acceleration, .. } => {
-                generate_postgres_wal_spicepod(
-                    run_id,
-                    pg,
-                    datasets,
-                    acceleration_engine_str(*acceleration),
-                )
-            }
+            FederatedStorageConfig::Postgres {
+                pg, acceleration, ..
+            } => generate_postgres_wal_spicepod(
+                run_id,
+                pg,
+                datasets,
+                acceleration_engine_str(*acceleration),
+            ),
             FederatedStorageConfig::Cayenne => match setup_config.sink_type {
                 Some(EtlSinkType::Adbc) => {
                     generate_cayenne_sink_spicepod(run_id, flight_api_key, args)
                 }
                 _ => generate_hive_spicepod(run_id, setup_config, datasets)?,
             },
-            FederatedStorageConfig::DynamoDB { table_names, acceleration, .. } => generate_dynamodb_spicepod(
+            FederatedStorageConfig::DynamoDB {
+                table_names,
+                acceleration,
+                ..
+            } => generate_dynamodb_spicepod(
                 run_id,
                 setup_config,
                 datasets,
@@ -1097,7 +1112,14 @@ async fn generate_initial_spicepod(
                 database,
                 acceleration,
                 ..
-            } => generate_mongodb_spicepod(run_id, connection_string, database, acceleration_engine_str(*acceleration), setup_config, datasets)?,
+            } => generate_mongodb_spicepod(
+                run_id,
+                connection_string,
+                database,
+                acceleration_engine_str(*acceleration),
+                setup_config,
+                datasets,
+            ),
         }
     };
 
@@ -1145,7 +1167,6 @@ async fn generate_initial_spicepod(
 
     Ok(spicepod)
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -338,7 +338,6 @@ pub(crate) async fn setup_postgres_for_wal(
     Ok(())
 }
 
-
 pub(crate) async fn teardown_postgres(
     pg: &PgConfig,
     datasets: &HashMap<String, DatasetConfig>,
@@ -496,20 +495,50 @@ mod tests {
 
     #[test]
     fn pg_type_maps_integer_types() {
-        assert_eq!(pg_type_for_arrow(&DataType::Int8).expect("Int8"), "SMALLINT");
-        assert_eq!(pg_type_for_arrow(&DataType::UInt8).expect("UInt8"), "SMALLINT");
-        assert_eq!(pg_type_for_arrow(&DataType::Int16).expect("Int16"), "SMALLINT");
-        assert_eq!(pg_type_for_arrow(&DataType::UInt16).expect("UInt16"), "SMALLINT");
-        assert_eq!(pg_type_for_arrow(&DataType::Int32).expect("Int32"), "INTEGER");
-        assert_eq!(pg_type_for_arrow(&DataType::UInt32).expect("UInt32"), "INTEGER");
-        assert_eq!(pg_type_for_arrow(&DataType::Int64).expect("Int64"), "BIGINT");
-        assert_eq!(pg_type_for_arrow(&DataType::UInt64).expect("UInt64"), "BIGINT");
+        assert_eq!(
+            pg_type_for_arrow(&DataType::Int8).expect("Int8"),
+            "SMALLINT"
+        );
+        assert_eq!(
+            pg_type_for_arrow(&DataType::UInt8).expect("UInt8"),
+            "SMALLINT"
+        );
+        assert_eq!(
+            pg_type_for_arrow(&DataType::Int16).expect("Int16"),
+            "SMALLINT"
+        );
+        assert_eq!(
+            pg_type_for_arrow(&DataType::UInt16).expect("UInt16"),
+            "SMALLINT"
+        );
+        assert_eq!(
+            pg_type_for_arrow(&DataType::Int32).expect("Int32"),
+            "INTEGER"
+        );
+        assert_eq!(
+            pg_type_for_arrow(&DataType::UInt32).expect("UInt32"),
+            "INTEGER"
+        );
+        assert_eq!(
+            pg_type_for_arrow(&DataType::Int64).expect("Int64"),
+            "BIGINT"
+        );
+        assert_eq!(
+            pg_type_for_arrow(&DataType::UInt64).expect("UInt64"),
+            "BIGINT"
+        );
     }
 
     #[test]
     fn pg_type_maps_float_and_decimal_types() {
-        assert_eq!(pg_type_for_arrow(&DataType::Float16).expect("Float16"), "REAL");
-        assert_eq!(pg_type_for_arrow(&DataType::Float32).expect("Float32"), "REAL");
+        assert_eq!(
+            pg_type_for_arrow(&DataType::Float16).expect("Float16"),
+            "REAL"
+        );
+        assert_eq!(
+            pg_type_for_arrow(&DataType::Float32).expect("Float32"),
+            "REAL"
+        );
         assert_eq!(
             pg_type_for_arrow(&DataType::Float64).expect("Float64"),
             "DOUBLE PRECISION"
@@ -527,17 +556,38 @@ mod tests {
     #[test]
     fn pg_type_maps_text_and_binary_types() {
         assert_eq!(pg_type_for_arrow(&DataType::Utf8).expect("Utf8"), "TEXT");
-        assert_eq!(pg_type_for_arrow(&DataType::LargeUtf8).expect("LargeUtf8"), "TEXT");
-        assert_eq!(pg_type_for_arrow(&DataType::Utf8View).expect("Utf8View"), "TEXT");
-        assert_eq!(pg_type_for_arrow(&DataType::Binary).expect("Binary"), "BYTEA");
-        assert_eq!(pg_type_for_arrow(&DataType::LargeBinary).expect("LargeBinary"), "BYTEA");
-        assert_eq!(pg_type_for_arrow(&DataType::BinaryView).expect("BinaryView"), "BYTEA");
+        assert_eq!(
+            pg_type_for_arrow(&DataType::LargeUtf8).expect("LargeUtf8"),
+            "TEXT"
+        );
+        assert_eq!(
+            pg_type_for_arrow(&DataType::Utf8View).expect("Utf8View"),
+            "TEXT"
+        );
+        assert_eq!(
+            pg_type_for_arrow(&DataType::Binary).expect("Binary"),
+            "BYTEA"
+        );
+        assert_eq!(
+            pg_type_for_arrow(&DataType::LargeBinary).expect("LargeBinary"),
+            "BYTEA"
+        );
+        assert_eq!(
+            pg_type_for_arrow(&DataType::BinaryView).expect("BinaryView"),
+            "BYTEA"
+        );
     }
 
     #[test]
     fn pg_type_maps_temporal_types() {
-        assert_eq!(pg_type_for_arrow(&DataType::Date32).expect("Date32"), "DATE");
-        assert_eq!(pg_type_for_arrow(&DataType::Date64).expect("Date64"), "DATE");
+        assert_eq!(
+            pg_type_for_arrow(&DataType::Date32).expect("Date32"),
+            "DATE"
+        );
+        assert_eq!(
+            pg_type_for_arrow(&DataType::Date64).expect("Date64"),
+            "DATE"
+        );
         assert_eq!(
             pg_type_for_arrow(&DataType::Time32(TimeUnit::Second)).expect("Time32"),
             "TIME"
@@ -547,7 +597,8 @@ mod tests {
             "TIME"
         );
         assert_eq!(
-            pg_type_for_arrow(&DataType::Timestamp(TimeUnit::Microsecond, None)).expect("Timestamp"),
+            pg_type_for_arrow(&DataType::Timestamp(TimeUnit::Microsecond, None))
+                .expect("Timestamp"),
             "TIMESTAMP"
         );
     }
@@ -576,7 +627,8 @@ mod tests {
             ],
             vec!["id"],
         );
-        let ddl = pg_create_table_ddl("tpch_abc12345", "orders", &dataset).expect("ddl should generate");
+        let ddl =
+            pg_create_table_ddl("tpch_abc12345", "orders", &dataset).expect("ddl should generate");
 
         assert!(ddl.starts_with("CREATE TABLE IF NOT EXISTS tpch_abc12345.orders ("));
         assert!(ddl.contains("id BIGINT NOT NULL"));
@@ -594,7 +646,8 @@ mod tests {
             ],
             vec!["pk1", "pk2"],
         );
-        let ddl = pg_create_table_ddl("myschema", "mytable", &dataset).expect("ddl should generate");
+        let ddl =
+            pg_create_table_ddl("myschema", "mytable", &dataset).expect("ddl should generate");
         assert!(ddl.contains("PRIMARY KEY (pk1, pk2)"));
     }
 
@@ -707,7 +760,9 @@ mod tests {
         let kwargs = pg.adbc_kwargs();
         let uri = kwargs.get("uri").expect("uri key should be present");
         assert!(
-            uri.as_str().expect("uri should be a string").starts_with("postgresql://"),
+            uri.as_str()
+                .expect("uri should be a string")
+                .starts_with("postgresql://"),
             "uri should be a postgresql:// URL: {uri}"
         );
     }

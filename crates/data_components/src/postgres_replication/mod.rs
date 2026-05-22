@@ -47,7 +47,7 @@ pub use slot::{SlotInfo, SlotSetupOutcome};
 /// Extracts a human-readable message from a `tokio_postgres::Error`.
 ///
 /// `tokio_postgres::Error`'s `Display` impl for DB errors outputs the opaque
-/// string "db error", hiding the actual PostgreSQL server message. This helper
+/// string "db error", hiding the actual `PostgreSQL` server message. This helper
 /// surfaces the severity + message (and detail, if present) from the underlying
 /// `DbError` so that log lines contain actionable text.
 pub(crate) fn pg_error_detail(e: &tokio_postgres::Error) -> String {
@@ -65,7 +65,10 @@ pub(crate) fn pg_error_detail(e: &tokio_postgres::Error) -> String {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to establish setup connection to Postgres: {}", pg_error_detail(source)))]
+    #[snafu(display(
+        "Failed to establish setup connection to Postgres: {}",
+        pg_error_detail(source)
+    ))]
     SetupConnect { source: tokio_postgres::Error },
 
     #[snafu(display("Failed to execute setup SQL: {}", pg_error_detail(source)))]

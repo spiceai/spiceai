@@ -22,24 +22,35 @@ use aws_sdk_ec2::types::{
     VolumeType,
 };
 use base64::Engine as _;
+use tokio_postgres::NoTls;
 
 use crate::args::StdioArgs;
 
-const MONGO_PORT: u16 = 27017;
+const DEFAULT_PG_USER: &str = "postgres";
+const DEFAULT_PG_DATABASE: &str = "spicebench";
+const PG_PORT: u16 = 5432;
 
-/// A provisioned EC2 instance running MongoDB.
-pub(crate) struct Ec2MongoInstance {
+/// A provisioned EC2 instance running `PostgreSQL`.
+pub(crate) struct Ec2PostgresInstance {
     pub(crate) instance_id: String,
-    pub(crate) connection_string: String,
-    pub(crate) database: String,
+    pub(crate) host: String,
+    pub(crate) pg_user: String,
+    pub(crate) pg_password: String,
+    pub(crate) pg_database: String,
+    pub(crate) pg_port: u16,
     pub(crate) region: String,
 }
 
-/// Launch an EC2 instance, install MongoDB 7.0, and wait until it accepts connections.
-pub(crate) async fn launch_mongo_ec2(
+/// Returns true when EC2 provisioning mode is requested (subnet + security group both set).
+pub(crate) fn is_ec2_mode(args: &StdioArgs) -> bool {
+    args.ec2_subnet_id.is_some() && args.ec2_security_group_id.is_some()
+}
+
+/// Launch an EC2 instance, install `PostgreSQL`, and wait until it accepts connections.
+pub(crate) async fn launch_postgres_ec2(
     args: &StdioArgs,
     run_id_short: &str,
-) -> anyhow::Result<Ec2MongoInstance> {
+) -> anyhow::Result<Ec2PostgresInstance> {
     let region = args
         .aws_region
         .clone()
@@ -67,14 +78,14 @@ pub(crate) async fn launch_mongo_ec2(
         .ok_or_else(|| anyhow::anyhow!("EC2_AMI_ID is required for EC2 mode"))?;
     let instance_type = InstanceType::from(args.ec2_instance_type.as_str());
 
-    let mongo_password = uuid::Uuid::new_v4().to_string().replace('-', "");
+    let pg_password = uuid::Uuid::new_v4().to_string().replace('-', "");
 
-    let user_data = mongo_user_data(&mongo_password);
+    let user_data = postgres_user_data(&pg_password);
     let user_data_b64 = base64::engine::general_purpose::STANDARD.encode(user_data.as_bytes());
 
-    let instance_name = format!("spidapter-mongo-{run_id_short}");
+    let instance_name = format!("spidapter-postgres-{run_id_short}");
     eprintln!(
-        "[stdio] EC2: launching MongoDB instance \
+        "[stdio] EC2: launching PostgreSQL instance \
          (name={instance_name}, ami={ami_id}, type={}, subnet={subnet_id})",
         args.ec2_instance_type
     );
@@ -107,9 +118,13 @@ pub(crate) async fn launch_mongo_ec2(
 
     if let Some(profile) = &args.ec2_iam_instance_profile {
         let spec = if profile.starts_with("arn:") {
-            IamInstanceProfileSpecification::builder().arn(profile).build()
+            IamInstanceProfileSpecification::builder()
+                .arn(profile)
+                .build()
         } else {
-            IamInstanceProfileSpecification::builder().name(profile).build()
+            IamInstanceProfileSpecification::builder()
+                .name(profile)
+                .build()
         };
         run_req = run_req.iam_instance_profile(spec);
     }
@@ -156,118 +171,118 @@ pub(crate) async fn launch_mongo_ec2(
         );
     }
 
-    let connection_string = format!(
-        "mongodb://spidapter:{mongo_password}@{host}:{MONGO_PORT}/spicebench?authSource=admin&replicaSet=rs0&directConnection=true"
-    );
+    eprintln!("[stdio] EC2: waiting for PostgreSQL at {host}:{PG_PORT}...");
+    wait_for_postgres(
+        &host,
+        PG_PORT,
+        DEFAULT_PG_USER,
+        &pg_password,
+        DEFAULT_PG_DATABASE,
+    )
+    .await?;
+    eprintln!("[stdio] EC2: PostgreSQL ready");
 
-    eprintln!("[stdio] EC2: waiting for MongoDB at {host}:{MONGO_PORT}...");
-    wait_for_mongo(&connection_string).await?;
-    eprintln!("[stdio] EC2: MongoDB ready");
-
-    Ok(Ec2MongoInstance {
+    Ok(Ec2PostgresInstance {
         instance_id,
-        connection_string,
-        database: "spicebench".to_string(),
+        host,
+        pg_user: DEFAULT_PG_USER.to_string(),
+        pg_password,
+        pg_database: DEFAULT_PG_DATABASE.to_string(),
+        pg_port: PG_PORT,
         region,
     })
 }
 
-/// Build the cloud-init user-data script that installs and configures MongoDB 7.0.
-///
-/// Replica set `rs0` is required for change streams.
-fn mongo_user_data(mongo_password: &str) -> String {
+/// Terminate a previously provisioned EC2 instance.
+pub(crate) async fn terminate_ec2_instance(region: &str, instance_id: &str) -> anyhow::Result<()> {
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(Region::new(region.to_string()))
+        .load()
+        .await;
+    let ec2 = Ec2Client::new(&config);
+
+    eprintln!("[stdio] EC2: terminating instance {instance_id}...");
+    ec2.terminate_instances()
+        .instance_ids(instance_id)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to terminate EC2 instance {instance_id}: {e}"))?;
+
+    eprintln!("[stdio] EC2: instance {instance_id} termination requested");
+    Ok(())
+}
+
+/// Build the cloud-init user-data script that installs and configures `PostgreSQL`.
+fn postgres_user_data(pg_password: &str) -> String {
     format!(
         r#"#!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
-MONGO_PASSWORD='{mongo_password}'
+PG_PASSWORD='{pg_password}'
 
-# Install MongoDB 7.0 from official repo
 apt-get update -y
-apt-get install -y gnupg curl ca-certificates
-curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc \
-    | gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg
-echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" \
-    > /etc/apt/sources.list.d/mongodb-org-7.0.list
+apt-get install -y curl ca-certificates gnupg lsb-release
+curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    | gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] \
+    https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+    > /etc/apt/sources.list.d/pgdg.list
 apt-get update -y
-apt-get install -y mongodb-org
+apt-get install -y postgresql-15
 
-# Configure: bind all interfaces, enable replication (required for change streams), no auth yet
-cat > /etc/mongod.conf << 'MONGODCONF'
-storage:
-  dbPath: /var/lib/mongodb
-systemLog:
-  destination: file
-  logAppend: true
-  path: /var/log/mongodb/mongod.log
-net:
-  port: 27017
-  bindIp: 0.0.0.0
-replication:
-  replSetName: "rs0"
-MONGODCONF
+PG_CONF=$(find /etc/postgresql -name postgresql.conf | head -1)
+PG_HBA=$(find /etc/postgresql -name pg_hba.conf | head -1)
 
-systemctl start mongod
-systemctl enable mongod
+# Ensure wal_level = logical (remove any existing setting first for idempotency)
+sed -i '/^[[:space:]]*wal_level/d' "$PG_CONF"
+echo 'wal_level = logical' >> "$PG_CONF"
 
-# Wait for mongod to start (up to 60s)
-for i in $(seq 1 60); do
-    mongosh --quiet --eval 'db.adminCommand({{ping: 1}})' > /dev/null 2>&1 && break || true
-    sleep 2
-done
+# Listen on all interfaces
+sed -i '/^[[:space:]]*listen_addresses/d' "$PG_CONF"
+echo "listen_addresses = '*'" >> "$PG_CONF"
 
-# Initiate single-node replica set and wait for primary election
-mongosh --quiet --eval 'rs.initiate({{_id: "rs0", members: [{{_id: 0, host: "localhost:27017"}}]}})'
-sleep 15
+# Generous replication slot / sender limits
+sed -i '/^[[:space:]]*max_replication_slots/d' "$PG_CONF"
+echo 'max_replication_slots = 100' >> "$PG_CONF"
+sed -i '/^[[:space:]]*max_wal_senders/d' "$PG_CONF"
+echo 'max_wal_senders = 100' >> "$PG_CONF"
 
-# Create admin user (no auth enforced yet)
-mongosh --quiet admin --eval 'db.createUser({{user: "admin", pwd: "{mongo_password}", roles: ["root"]}})'
+# Allow remote connections for all users and replication
+echo "host all             all        0.0.0.0/0 md5" >> "$PG_HBA"
+echo "host replication     all        0.0.0.0/0 md5" >> "$PG_HBA"
 
-# Enable authentication and restart
-cat > /etc/mongod.conf << 'MONGODCONF'
-storage:
-  dbPath: /var/lib/mongodb
-systemLog:
-  destination: file
-  logAppend: true
-  path: /var/log/mongodb/mongod.log
-net:
-  port: 27017
-  bindIp: 0.0.0.0
-security:
-  authorization: enabled
-replication:
-  replSetName: "rs0"
-MONGODCONF
+systemctl restart postgresql
 
-systemctl restart mongod
-sleep 10
-
-# Create application database and user
-mongosh --quiet -u admin -p '{mongo_password}' --authenticationDatabase admin admin --eval '
-db.getSiblingDB("spicebench").createUser({{
-  user: "spidapter",
-  pwd: "{mongo_password}",
-  roles: [{{role: "readWrite", db: "spicebench"}}]
-}});
-'
+sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';"
+sudo -u postgres psql -c "CREATE DATABASE {DEFAULT_PG_DATABASE};"
 "#
     )
 }
 
 async fn wait_for_instance_running(ec2: &Ec2Client, instance_id: &str) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+
     loop {
         if tokio::time::Instant::now() > deadline {
-            anyhow::bail!("Timed out waiting for EC2 instance {instance_id} to reach running state");
+            anyhow::bail!(
+                "Timed out waiting for EC2 instance {instance_id} to reach running state"
+            );
         }
-        let result = ec2.describe_instances().instance_ids(instance_id).send().await;
+
+        let result = ec2
+            .describe_instances()
+            .instance_ids(instance_id)
+            .send()
+            .await;
+
         match result {
             Err(e) => {
+                // EC2 has eventual consistency — the instance may not be visible
+                // immediately after RunInstances returns. Retry on NotFound.
                 let is_not_found = e
                     .as_service_error()
-                    .and_then(|se| se.meta().code())
-                    .map_or(false, |c| c == "InvalidInstanceID.NotFound");
+                    .and_then(|se| se.meta().code()) == Some("InvalidInstanceID.NotFound");
+
                 if !is_not_found {
                     return Err(anyhow::anyhow!(
                         "Failed to describe EC2 instance {instance_id}: {e:#?}"
@@ -283,15 +298,19 @@ async fn wait_for_instance_running(ec2: &Ec2Client, instance_id: &str) -> anyhow
                     .and_then(|i| i.state())
                     .and_then(|s| s.name())
                     .map(|n| n.as_str().to_string());
+
                 match state_name.as_deref() {
                     Some("running") => return Ok(()),
-                    Some("terminated") | Some("shutting-down") => {
-                        anyhow::bail!("EC2 instance {instance_id} reached terminal state unexpectedly");
+                    Some("terminated" | "shutting-down") => {
+                        anyhow::bail!(
+                            "EC2 instance {instance_id} reached terminal state unexpectedly"
+                        );
                     }
                     _ => {}
                 }
             }
         }
+
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
@@ -303,6 +322,7 @@ async fn get_instance_public_ip(ec2: &Ec2Client, instance_id: &str) -> anyhow::R
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to describe EC2 instance {instance_id}: {e:#?}"))?;
+
     desc.reservations()
         .first()
         .and_then(|r| r.instances().first())
@@ -318,6 +338,7 @@ async fn get_instance_private_ip(ec2: &Ec2Client, instance_id: &str) -> anyhow::
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to describe EC2 instance {instance_id}: {e:#?}"))?;
+
     desc.reservations()
         .first()
         .and_then(|r| r.instances().first())
@@ -326,25 +347,36 @@ async fn get_instance_private_ip(ec2: &Ec2Client, instance_id: &str) -> anyhow::
         .ok_or_else(|| anyhow::anyhow!("EC2 instance {instance_id} has no private IP address"))
 }
 
-async fn wait_for_mongo(connection_string: &str) -> anyhow::Result<()> {
+async fn wait_for_postgres(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    database: &str,
+) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+
     loop {
         if tokio::time::Instant::now() > deadline {
-            anyhow::bail!("Timed out waiting for MongoDB");
+            anyhow::bail!("Timed out waiting for PostgreSQL at {host}:{port}");
         }
-        match mongodb::Client::with_uri_str(connection_string).await {
-            Ok(client) => {
-                match client
-                    .database("admin")
-                    .run_command(mongodb::bson::doc! {"ping": 1})
-                    .await
-                {
-                    Ok(_) => return Ok(()),
-                    Err(e) => eprintln!("[stdio] EC2: MongoDB not ready yet ({e}), retrying..."),
-                }
+
+        let config_str = format!(
+            "host={host} port={port} user={user} password={password} dbname={database} connect_timeout=5"
+        );
+
+        match tokio_postgres::connect(&config_str, NoTls).await {
+            Ok((client, conn)) => {
+                tokio::spawn(async move {
+                    drop(conn);
+                });
+                drop(client);
+                return Ok(());
             }
-            Err(e) => eprintln!("[stdio] EC2: MongoDB client error ({e}), retrying..."),
+            Err(e) => {
+                eprintln!("[stdio] EC2: PostgreSQL not ready yet ({e}), retrying...");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
         }
-        tokio::time::sleep(Duration::from_secs(10)).await;
     }
 }

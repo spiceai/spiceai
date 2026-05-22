@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::BTreeMap, time::Duration};
 
+use crate::args::DeploymentMode;
 use reqwest::Client;
 use spice_cloud_client::{
     CloudClient,
@@ -24,7 +25,6 @@ use spice_cloud_client::{
         CreateDeploymentRequest, UpdateAppRequest, UpdateChannel,
     },
 };
-use crate::args::DeploymentMode;
 
 pub(crate) mod secrets;
 
@@ -202,7 +202,7 @@ pub(crate) async fn ensure_spice_cloud_app(
         storage_size_gb: None,
     };
 
-    eprintln!("[stdio] CreateAppRequest: {:?}", create_app_request);
+    eprintln!("[stdio] CreateAppRequest: {create_app_request:?}");
 
     let create_result = cloud.create_app(&create_app_request).await;
 

@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use super::super::{RunState, SetupConfig};
 
-/// Appends query parameters to a MongoDB URI, preserving any existing query string.
+/// Appends query parameters to a `MongoDB` URI, preserving any existing query string.
 fn append_uri_params(uri: &str, params: &[(&str, &str)]) -> String {
     let sep = if uri.contains('?') { "&" } else { "?" };
     let qs: String = params
@@ -78,7 +78,7 @@ pub(crate) fn generate_mongodb_spicepod(
     acceleration_engine: &str,
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
-) -> anyhow::Result<SpicepodDefinition> {
+) -> SpicepodDefinition {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
 
@@ -99,10 +99,8 @@ pub(crate) fn generate_mongodb_spicepod(
     for dataset_name in datasets.keys() {
         // Connection string is written literally into the spicepod — ${env:...} substitution
         // is unreliable for this parameter in the current runtime.
-        let mut param_map = HashMap::from([(
-            "mongodb_connection_string".to_string(),
-            conn_str.clone(),
-        )]);
+        let mut param_map =
+            HashMap::from([("mongodb_connection_string".to_string(), conn_str.clone())]);
 
         if let Some(endpoint) = &setup_config.endpoint {
             param_map.insert("mongodb_host".to_string(), endpoint.clone());
@@ -112,10 +110,7 @@ pub(crate) fn generate_mongodb_spicepod(
         // `acceleration.primary_key: _id` regardless of the logical dataset schema.
         let primary_key = Some("_id".to_string());
 
-        let mut dataset = Dataset::new(
-            format!("mongodb:{dataset_name}"),
-            dataset_name.as_str(),
-        );
+        let mut dataset = Dataset::new(format!("mongodb:{dataset_name}"), dataset_name.as_str());
         dataset.params = Some(Params::from_string_map(param_map));
         dataset.acceleration = Some(Acceleration {
             enabled: true,
@@ -132,10 +127,10 @@ pub(crate) fn generate_mongodb_spicepod(
             .push(ComponentOrReference::Component(dataset));
     }
 
-    Ok(spicepod)
+    spicepod
 }
 
-/// Write seed rows (base64-encoded Arrow IPC streams) into MongoDB collections before
+/// Write seed rows (base64-encoded Arrow IPC streams) into `MongoDB` collections before
 /// the spicepod starts. This allows schema inference to succeed and primes the
 /// change-stream position so Spice receives subsequent ingested rows as CDC events.
 pub(crate) async fn seed_mongodb_rows(
@@ -181,8 +176,8 @@ pub(crate) async fn seed_mongodb_rows(
         let mut row_count = 0usize;
 
         for batch_result in reader {
-            let batch =
-                batch_result.map_err(|e| anyhow::anyhow!("Arrow batch error '{dataset_name}': {e}"))?;
+            let batch = batch_result
+                .map_err(|e| anyhow::anyhow!("Arrow batch error '{dataset_name}': {e}"))?;
             let schema = batch.schema();
             let mut docs: Vec<Document> = Vec::with_capacity(batch.num_rows());
 
@@ -201,10 +196,9 @@ pub(crate) async fn seed_mongodb_rows(
 
             row_count += docs.len();
             if !docs.is_empty() {
-                collection
-                    .insert_many(docs)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("MongoDB insert_many failed for '{dataset_name}': {e}"))?;
+                collection.insert_many(docs).await.map_err(|e| {
+                    anyhow::anyhow!("MongoDB insert_many failed for '{dataset_name}': {e}")
+                })?;
             }
         }
 
@@ -220,20 +214,54 @@ fn arrow_scalar_to_bson(col: &dyn Array, row: usize) -> mongodb::bson::Bson {
 
     match col.data_type() {
         DataType::Boolean => Bson::Boolean(col.as_boolean().value(row)),
-        DataType::Int8 => Bson::Int32(col.as_primitive::<arrow::datatypes::Int8Type>().value(row).into()),
-        DataType::Int16 => Bson::Int32(col.as_primitive::<arrow::datatypes::Int16Type>().value(row).into()),
-        DataType::Int32 => Bson::Int32(col.as_primitive::<arrow::datatypes::Int32Type>().value(row)),
+        DataType::Int8 => Bson::Int32(
+            col.as_primitive::<arrow::datatypes::Int8Type>()
+                .value(row)
+                .into(),
+        ),
+        DataType::Int16 => Bson::Int32(
+            col.as_primitive::<arrow::datatypes::Int16Type>()
+                .value(row)
+                .into(),
+        ),
+        DataType::Int32 => {
+            Bson::Int32(col.as_primitive::<arrow::datatypes::Int32Type>().value(row))
+        }
         DataType::Int64 => Bson::Int64(col.as_primitive::<Int64Type>().value(row)),
-        DataType::UInt8 => Bson::Int32(col.as_primitive::<arrow::datatypes::UInt8Type>().value(row).into()),
-        DataType::UInt16 => Bson::Int32(col.as_primitive::<arrow::datatypes::UInt16Type>().value(row).into()),
-        DataType::UInt32 => Bson::Int64(col.as_primitive::<arrow::datatypes::UInt32Type>().value(row).into()),
-        DataType::UInt64 => Bson::Int64(col.as_primitive::<arrow::datatypes::UInt64Type>().value(row) as i64),
-        DataType::Float32 => Bson::Double(col.as_primitive::<arrow::datatypes::Float32Type>().value(row).into()),
+        DataType::UInt8 => Bson::Int32(
+            col.as_primitive::<arrow::datatypes::UInt8Type>()
+                .value(row)
+                .into(),
+        ),
+        DataType::UInt16 => Bson::Int32(
+            col.as_primitive::<arrow::datatypes::UInt16Type>()
+                .value(row)
+                .into(),
+        ),
+        DataType::UInt32 => Bson::Int64(
+            col.as_primitive::<arrow::datatypes::UInt32Type>()
+                .value(row)
+                .into(),
+        ),
+        DataType::UInt64 => Bson::Int64(
+            col.as_primitive::<arrow::datatypes::UInt64Type>()
+                .value(row)
+                .cast_signed(),
+        ),
+        DataType::Float32 => Bson::Double(
+            col.as_primitive::<arrow::datatypes::Float32Type>()
+                .value(row)
+                .into(),
+        ),
         DataType::Float64 => Bson::Double(col.as_primitive::<Float64Type>().value(row)),
         DataType::Decimal128(_, scale) => {
-            let raw = col.as_primitive::<arrow::datatypes::Decimal128Type>().value(row);
+            let raw = col
+                .as_primitive::<arrow::datatypes::Decimal128Type>()
+                .value(row);
+            #[expect(clippy::cast_sign_loss)]
             let scale = *scale as u32;
             let divisor = 10i128.pow(scale);
+            #[expect(clippy::cast_precision_loss)]
             let f = (raw as f64) / (divisor as f64);
             Bson::Double(f)
         }
@@ -250,29 +278,43 @@ fn arrow_scalar_to_bson(col: &dyn Array, row: usize) -> mongodb::bson::Bson {
         // Temporal types must be stored as Bson::DateTime so that datafusion-table-providers
         // infers the correct Arrow type (Date32 or Timestamp) rather than Utf8/VARCHAR.
         DataType::Date32 => {
-            let days = col.as_primitive::<arrow::datatypes::Date32Type>().value(row) as i64;
+            let days = i64::from(col
+                .as_primitive::<arrow::datatypes::Date32Type>()
+                .value(row));
             Bson::DateTime(mongodb::bson::DateTime::from_millis(days * 86_400 * 1_000))
         }
         DataType::Date64 => {
-            let millis = col.as_primitive::<arrow::datatypes::Date64Type>().value(row);
+            let millis = col
+                .as_primitive::<arrow::datatypes::Date64Type>()
+                .value(row);
             Bson::DateTime(mongodb::bson::DateTime::from_millis(millis))
         }
         DataType::Timestamp(TimeUnit::Second, _) => {
-            let secs = col.as_primitive::<arrow::datatypes::TimestampSecondType>().value(row);
+            let secs = col
+                .as_primitive::<arrow::datatypes::TimestampSecondType>()
+                .value(row);
             Bson::DateTime(mongodb::bson::DateTime::from_millis(secs * 1_000))
         }
         DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let millis = col.as_primitive::<arrow::datatypes::TimestampMillisecondType>().value(row);
+            let millis = col
+                .as_primitive::<arrow::datatypes::TimestampMillisecondType>()
+                .value(row);
             Bson::DateTime(mongodb::bson::DateTime::from_millis(millis))
         }
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            let micros = col.as_primitive::<arrow::datatypes::TimestampMicrosecondType>().value(row);
+            let micros = col
+                .as_primitive::<arrow::datatypes::TimestampMicrosecondType>()
+                .value(row);
             Bson::DateTime(mongodb::bson::DateTime::from_millis(micros / 1_000))
         }
         DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            let nanos = col.as_primitive::<arrow::datatypes::TimestampNanosecondType>().value(row);
+            let nanos = col
+                .as_primitive::<arrow::datatypes::TimestampNanosecondType>()
+                .value(row);
             Bson::DateTime(mongodb::bson::DateTime::from_millis(nanos / 1_000_000))
         }
-        _ => Bson::String(arrow::util::display::array_value_to_string(col, row).unwrap_or_default()),
+        _ => {
+            Bson::String(arrow::util::display::array_value_to_string(col, row).unwrap_or_default())
+        }
     }
 }

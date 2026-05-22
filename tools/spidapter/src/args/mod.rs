@@ -176,24 +176,24 @@ pub struct StdioArgs {
     #[arg(long, env = "SPIDAPTER_STORAGE", default_value = "cayenne")]
     pub storage: FederatedStorage,
 
-    /// PostgreSQL host for WAL CDC mode. When set, spidapter writes via the PostgreSQL
+    /// `PostgreSQL` host for WAL CDC mode. When set, spidapter writes via the `PostgreSQL`
     /// ADBC driver and configures Spice to read via WAL CDC.
     #[arg(long, env = "PG_HOST")]
     pub pg_host: Option<String>,
 
-    /// PostgreSQL port for WAL CDC mode.
+    /// `PostgreSQL` port for WAL CDC mode.
     #[arg(long, env = "PG_PORT", default_value = "5432")]
     pub pg_port: u16,
 
-    /// PostgreSQL username for WAL CDC mode.
+    /// `PostgreSQL` username for WAL CDC mode.
     #[arg(long, env = "PG_USER")]
     pub pg_user: Option<String>,
 
-    /// PostgreSQL password for WAL CDC mode.
+    /// `PostgreSQL` password for WAL CDC mode.
     #[arg(long, env = "PG_PASSWORD", default_value = "")]
     pub pg_password: String,
 
-    /// PostgreSQL database name for WAL CDC mode.
+    /// `PostgreSQL` database name for WAL CDC mode.
     #[arg(long, env = "PG_DATABASE")]
     pub pg_database: Option<String>,
 
