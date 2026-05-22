@@ -3085,7 +3085,7 @@ mod tests {
             "SQL should reference full_data_type: {stmt_full}"
         );
         assert!(
-            !stmt_full.contains(", data_type,"),
+            !stmt_full.contains(", c.data_type,"),
             "SQL should not reference plain data_type: {stmt_full}"
         );
         let payload_plain = api
@@ -3095,7 +3095,7 @@ mod tests {
             .as_str()
             .expect("statement should be string");
         assert!(
-            stmt_plain.contains(", data_type,"),
+            stmt_plain.contains(", c.data_type,"),
             "SQL should reference data_type: {stmt_plain}"
         );
         assert!(
