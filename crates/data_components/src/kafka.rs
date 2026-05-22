@@ -330,7 +330,7 @@ impl rdkafka::consumer::ConsumerContext for KafkaConsumerContext {
     fn post_rebalance(&self, base_consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
         if let Rebalance::Assign(_) = rebalance {
             // On first assignment after subscribe, seek to sidecar offsets if available.
-            // Take the offsets so this only fires once.
+            // Take the offsets so this only fires once on success.
             let offsets = self
                 .restore_offsets
                 .lock()
@@ -338,12 +338,17 @@ impl rdkafka::consumer::ConsumerContext for KafkaConsumerContext {
                 .take();
 
             if let Some(tpl) = offsets {
-                match base_consumer.seek_partitions(tpl, Duration::from_secs(5)) {
+                match base_consumer.seek_partitions(tpl.clone(), Duration::from_secs(5)) {
                     Ok(_) => {
                         tracing::info!("Restored Kafka consumer offsets from sidecar");
                     }
                     Err(e) => {
                         tracing::error!("Failed to seek to restored offsets: {e}");
+                        // Re-insert offsets so the next rebalance retries the seek.
+                        *self
+                            .restore_offsets
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tpl);
                     }
                 }
             }
