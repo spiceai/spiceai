@@ -777,8 +777,7 @@ async fn load_supplier(client: &Client, rng: &mut impl Rng) -> Result<()> {
     );
     let mut row = String::new();
 
-    let nation_count =
-        i64::try_from(NATIONS.len() + EXTRA_NATIONS.len()).unwrap_or(62);
+    let nation_count = i64::try_from(NATIONS.len() + EXTRA_NATIONS.len()).unwrap_or(62);
 
     for i in 1..=SUPPLIER_COUNT {
         let s_name = tpcc_rand::rand_chars(rng, 25, 25);
