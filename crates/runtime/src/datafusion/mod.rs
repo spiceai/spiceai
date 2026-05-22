@@ -2429,16 +2429,16 @@ impl DataFusion {
                 spicepod::acceleration::WriteMode::WriteBack => {
                     accelerated_table_builder.write_back();
                 }
-                spicepod::acceleration::WriteMode::WriteThrough
-                    if acceleration_settings.engine == Engine::Cayenne =>
-                {
-                    // write_through with staged commit/rollback is only supported for Cayenne.
-                    // For other engines (e.g. DuckDB + CDC), writes fall through to FederatedOnly:
-                    // the write goes directly to the federated source and CDC propagates it back.
-                    accelerated_table_builder.write_through();
-                }
                 spicepod::acceleration::WriteMode::WriteThrough => {
-                    // FederatedOnly is the default for non-Cayenne engines.
+                    // Source-sync write; the accelerator catches up through the refresh
+                    // mechanism (WAL replication for `refresh_mode: changes`, periodic
+                    // refresh otherwise). `WriteMode::WriteThrough` is the default builder
+                    // state, so no method call is required here.
+                    //
+                    // Note: this is intentionally *not* the dual atomic write path
+                    // (`builder.dual_write()`). That path is reserved for the Iceberg
+                    // federated catalog cache use case where no refresh stream propagates
+                    // writes to the accelerator. See spiceai/spiceai#10960.
                 }
             }
         }
