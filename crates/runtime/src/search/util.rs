@@ -19,10 +19,10 @@ use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc};
 
 use app::App;
+use data_components::MetadataEnrichedTableProvider;
 use datafusion::common::Column;
 use datafusion::error::DataFusionError;
 use datafusion::{datasource::TableProvider, sql::TableReference};
-use data_components::MetadataEnrichedTableProvider;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use search::generation::CandidateGeneration;
