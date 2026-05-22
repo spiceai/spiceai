@@ -17,8 +17,9 @@ use std::time::Duration;
 use aws_config::Region;
 use aws_sdk_ec2::Client as Ec2Client;
 use aws_sdk_ec2::types::{
-    IamInstanceProfileSpecification, InstanceNetworkInterfaceSpecification, InstanceType,
-    ResourceType, Tag, TagSpecification,
+    BlockDeviceMapping, EbsBlockDevice, IamInstanceProfileSpecification,
+    InstanceNetworkInterfaceSpecification, InstanceType, ResourceType, Tag, TagSpecification,
+    VolumeType,
 };
 use base64::Engine as _;
 use tokio_postgres::NoTls;
@@ -99,6 +100,18 @@ pub(crate) async fn launch_postgres_ec2(
         .min_count(1)
         .max_count(1)
         .user_data(user_data_b64)
+        .block_device_mappings(
+            BlockDeviceMapping::builder()
+                .device_name("/dev/sda1")
+                .ebs(
+                    EbsBlockDevice::builder()
+                        .volume_size(100)
+                        .volume_type(VolumeType::Gp3)
+                        .delete_on_termination(true)
+                        .build(),
+                )
+                .build(),
+        )
         .tag_specifications(
             TagSpecification::builder()
                 .resource_type(ResourceType::Instance)
