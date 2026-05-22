@@ -28,7 +28,7 @@ use futures::Stream;
 use rdkafka::{
     ClientConfig, Message, Offset,
     config::RDKafkaLogLevel,
-    consumer::{CommitMode, Consumer, StreamConsumer},
+    consumer::{BaseConsumer, CommitMode, Consumer, Rebalance, StreamConsumer},
     message::BorrowedMessage,
     topic_partition_list::TopicPartitionList,
     util::get_rdkafka_version,
@@ -217,11 +217,17 @@ pub struct KafkaMetrics {
 
 struct KafkaConsumerContext {
     metrics: Arc<KafkaMetrics>,
+    /// Offsets to seek to on first partition assignment (restored from sidecar).
+    /// Wrapped in a Mutex so the callback can take them (consumed once).
+    restore_offsets: std::sync::Mutex<Option<TopicPartitionList>>,
 }
 
 impl KafkaConsumerContext {
     fn new(metrics: Arc<KafkaMetrics>) -> Self {
-        Self { metrics }
+        Self {
+            metrics,
+            restore_offsets: std::sync::Mutex::new(None),
+        }
     }
 }
 
@@ -320,7 +326,30 @@ impl rdkafka::ClientContext for KafkaConsumerContext {
     }
 }
 
-impl rdkafka::consumer::ConsumerContext for KafkaConsumerContext {}
+impl rdkafka::consumer::ConsumerContext for KafkaConsumerContext {
+    fn post_rebalance(&self, base_consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
+        if let Rebalance::Assign(_) = rebalance {
+            // On first assignment after subscribe, seek to sidecar offsets if available.
+            // Take the offsets so this only fires once.
+            let offsets = self
+                .restore_offsets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+
+            if let Some(tpl) = offsets {
+                match base_consumer.seek_partitions(tpl, Duration::from_secs(5)) {
+                    Ok(_) => {
+                        tracing::info!("Restored Kafka consumer offsets from sidecar");
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to seek to restored offsets: {e}");
+                    }
+                }
+            }
+        }
+    }
+}
 
 pub struct KafkaConsumer {
     group_id: String,
@@ -426,11 +455,18 @@ impl KafkaConsumer {
                 })?;
         }
 
-        self.consumer
-            .commit(&topic_partition_list, CommitMode::Sync)
-            .context(UnableToRestoreOffsetsSnafu {
-                message: "Failed to commit sidecar offsets to Kafka".to_string(),
-            })
+        // Store offsets in the consumer context. On the next rebalance (partition
+        // assignment after subscribe), the post_rebalance callback will seek to
+        // these offsets. This avoids committing to the group coordinator (which
+        // fails with UnknownMemberId on restart) while keeping group membership
+        // intact for rebalancing and offset commits during normal operation.
+        let context = self.consumer.context();
+        *context
+            .restore_offsets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(topic_partition_list);
+
+        Ok(())
     }
 
     pub fn restart_topic(&self, topic: &str) -> Result<()> {
