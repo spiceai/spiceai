@@ -33,7 +33,7 @@ use futures::StreamExt;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
 use runtime_proto::scheduler_control_message::Message as SchedulerMessage;
 use runtime_proto::{
-    ExecutorControlMessage, ExecutorHeartbeat, ExecutorShutdown, MetricsResponse,
+    Ack, ExecutorControlMessage, ExecutorHeartbeat, ExecutorShutdown, MetricsResponse,
     executor_control_message::Message as ExecutorMessage,
 };
 use tokio::sync::{Notify, RwLock, mpsc};
@@ -52,11 +52,15 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// The handler takes two arguments:
 /// 1. `new_partitions`: A map of dataset names to a list of partition values (as byte vectors) that have been assigned.
 /// 2. `removed_partitions`: A map of dataset names to a list of partition values (as byte vectors) that should be unloaded.
+///
+/// The handler returns `Ok(())` on success or `Err(message)` if the update
+/// could not be applied. The message is forwarded to the scheduler as an
+/// [`Ack`] so it can decide whether to retry.
 pub type PartitionUpdateHandler = Arc<
     dyn Fn(
             HashMap<String, Vec<Vec<u8>>>,
             HashMap<String, Vec<Vec<u8>>>,
-        ) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
         + Send
         + Sync,
 >;
@@ -375,23 +379,51 @@ async fn handle_scheduler_message(
         }
         SchedulerMessage::UpdatePartitions(update) => {
             tracing::debug!(
-                "Received UpdatePartitions from scheduler {scheduler_address}: {} new, {} removed",
+                "Received UpdatePartitions from scheduler {scheduler_address}: {} new, {} removed, request_id={}",
                 update.new_partitions.len(),
-                update.removed_partitions.len()
+                update.removed_partitions.len(),
+                update.request_id,
             );
 
-            if let Some(handler) = partition_update_handler {
-                let new_partitions = update
-                    .new_partitions
-                    .into_iter()
-                    .map(|(k, v)| (k, v.items))
-                    .collect();
-                let removed_partitions = update
-                    .removed_partitions
-                    .into_iter()
-                    .map(|(k, v)| (k, v.items))
-                    .collect();
-                handler(new_partitions, removed_partitions).await;
+            let request_id = update.request_id.clone();
+            let new_partitions = update
+                .new_partitions
+                .into_iter()
+                .map(|(k, v)| (k, v.items))
+                .collect();
+            let removed_partitions = update
+                .removed_partitions
+                .into_iter()
+                .map(|(k, v)| (k, v.items))
+                .collect();
+
+            let result = if let Some(handler) = partition_update_handler {
+                handler(new_partitions, removed_partitions).await
+            } else {
+                // No handler configured (e.g. scheduler-role process). Nothing
+                // to apply locally; report success to the sender.
+                Ok(())
+            };
+
+            if let Err(ref e) = result {
+                tracing::error!("Failed to apply partition update from {scheduler_address}: {e}");
+            }
+
+            // Send an Ack only if the scheduler asked for one (non-empty
+            // request_id). Empty == legacy fire-and-forget send_command.
+            if !request_id.is_empty() {
+                let ack = ExecutorControlMessage {
+                    executor_id: executor_id.to_string(),
+                    message: Some(ExecutorMessage::Ack(Ack {
+                        request_id,
+                        error: result.err(),
+                    })),
+                };
+                if let Err(e) = outbound_tx.send(ack).await {
+                    tracing::warn!(
+                        "Failed to send partition-update ack to {scheduler_address}: {e}"
+                    );
+                }
             }
         }
         SchedulerMessage::CancelTasks(cmd) => {

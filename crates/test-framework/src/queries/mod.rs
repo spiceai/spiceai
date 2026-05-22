@@ -391,10 +391,11 @@ impl QuerySet {
         overrides: Option<QueryOverrides>,
         instance: Option<&SpicedInstance>,
         random_param_set_count: Option<usize>,
+        scale_factor: Option<f64>,
     ) -> anyhow::Result<Vec<Query>> {
         match self {
             QuerySet::Tpch => Ok(get_tpch_test_queries(overrides)),
-            QuerySet::Tpcds => Ok(get_tpcds_test_queries(overrides)),
+            QuerySet::Tpcds => Ok(get_tpcds_test_queries(overrides, scale_factor)),
             QuerySet::Clickbench => Ok(get_clickbench_test_queries(overrides)),
             QuerySet::ChBench => Ok(get_chbench_test_queries(overrides)),
             QuerySet::Scenario { queries, .. } => Ok(queries.clone()),
@@ -715,6 +716,7 @@ pub enum QueryOverrides {
     SaffronDuckdbCTE,
     DynamoDB,
     Arrow,
+    Cayenne,
     Turso,
     BigQuery,
     ScyllaDB,
@@ -733,6 +735,7 @@ impl QueryOverrides {
             "duckdb" => Some(Self::DuckDB),
             "dynamodb" => Some(Self::DynamoDB),
             "arrow" => Some(Self::Arrow),
+            "cayenne" => Some(Self::Cayenne),
             "turso" => Some(Self::Turso),
             "bigquery" => Some(Self::BigQuery),
             "scylladb" => Some(Self::ScyllaDB),
@@ -1127,7 +1130,10 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
 }
 
 #[must_use]
-pub fn get_tpcds_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
+pub fn get_tpcds_test_queries(
+    overrides: Option<QueryOverrides>,
+    scale_factor: Option<f64>,
+) -> Vec<Query> {
     let queries = generate_tpcds_queries!(
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 25, 26, 27, 28,
         29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
@@ -1219,6 +1225,14 @@ pub fn get_tpcds_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
         Some(QueryOverrides::Arrow) => remove_tpcds_query!(
             queries, 72 // 'offset overflow' https://github.com/spiceai/spiceai/issues/4216
         ),
+        Some(QueryOverrides::Cayenne)
+            if scale_factor.is_some_and(|sf| (sf - 100.0).abs() < f64::EPSILON) =>
+        {
+            remove_tpcds_query!(
+                queries,
+                78 // SF100 Resources exhausted error https://github.com/spiceai/spiceai/issues/10965
+            )
+        }
         Some(_) | None => queries,
     }
 }

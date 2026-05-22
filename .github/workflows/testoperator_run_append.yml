@@ -55,6 +55,7 @@ on:
           - 'spicecloud'
           - 'iceberg-hadoop'
           - 'dynamodb'
+          - 'arrow'
           - 'postgres-catalog'
           - 'mysql-catalog'
           - 'mssql-catalog'

@@ -21,8 +21,12 @@ use crate::cluster::PartitionStore;
 use crate::cluster::ResolvedClusterConfig;
 use crate::cluster::SchedulerHeartbeatStore;
 use crate::cluster::partition::service::PartitionService;
+#[cfg(not(windows))]
+use crate::component::dataset::acceleration::Engine;
 use crate::config::ClusterRole;
 use crate::config::Config;
+#[cfg(not(windows))]
+use crate::dataaccelerator::cayenne::CayenneAccelerator;
 use crate::datafusion::udf::register_udfs;
 use crate::metrics_reader::MetricsReader;
 use crate::{
@@ -50,6 +54,8 @@ use tokio::sync::{Mutex, RwLock};
 use util::{in_tracing_context, in_tracing_context_async};
 
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
+
+const CAYENNE_FOOTER_CACHE_MB_PARAM: &str = "cayenne_footer_cache_mb";
 
 pub struct RuntimeBuilder {
     app: Option<Arc<app::App>>,
@@ -242,8 +248,22 @@ impl RuntimeBuilder {
             &spicepod_rt.params,
             "cayenne_sort_merge_memory_pool_fraction",
         );
+        let cayenne_footer_cache_mb =
+            parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_FOOTER_CACHE_MB_PARAM);
         let cayenne_filter_propagation_enabled =
             parse_cayenne_filter_propagation(&spicepod_rt.params).is_enabled();
+
+        #[cfg(not(windows))]
+        if cayenne_footer_cache_mb.is_some() {
+            self.accelerator_engine_registry
+                .register_accelerator_engine(
+                    Engine::Cayenne,
+                    Arc::new(CayenneAccelerator::with_footer_cache_mb(
+                        cayenne_footer_cache_mb,
+                    )),
+                )
+                .await;
+        }
 
         let caching = Runtime::init_caching(Some(&spicepod_rt.caching));
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
@@ -392,6 +412,7 @@ impl RuntimeBuilder {
         .with_url_tables(url_tables_enabled)
         .cayenne_sort_merge_min_rows(cayenne_sort_merge_min_rows)
         .cayenne_sort_merge_memory_pool_fraction(cayenne_sort_merge_memory_pool_fraction)
+        .cayenne_footer_cache_mb(cayenne_footer_cache_mb)
         .cayenne_filter_propagation_enabled(cayenne_filter_propagation_enabled);
 
         if let Some(DistributedNode::Scheduler {

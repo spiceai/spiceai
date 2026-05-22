@@ -38,7 +38,10 @@ use cayenne::optimizer_rules::{
     CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneOptimizerConfig,
 };
 #[cfg(not(windows))]
-use cayenne::{CayenneTableProvider, logical_optimizer::CayennePropagateFilterAcrossEquiJoinKeys};
+use cayenne::{
+    CayenneTableProvider,
+    logical_optimizer::{CayenneInListToRangeRewrite, CayennePropagateFilterAcrossEquiJoinKeys},
+};
 #[cfg(not(windows))]
 use data_components::poly::PolyTableProvider;
 #[cfg(not(windows))]
@@ -159,6 +162,7 @@ pub struct DataFusionBuilder {
     url_tables_enabled: bool,
     cayenne_sort_merge_min_rows: Option<usize>,
     cayenne_sort_merge_memory_pool_fraction: Option<f64>,
+    cayenne_footer_cache_mb: Option<usize>,
     cayenne_filter_propagation_enabled: bool,
     /// Arbitrary additional analyzer rules.
     additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
@@ -210,6 +214,7 @@ impl DataFusionBuilder {
             url_tables_enabled: false,
             cayenne_sort_merge_min_rows: None,
             cayenne_sort_merge_memory_pool_fraction: None,
+            cayenne_footer_cache_mb: None,
             cayenne_filter_propagation_enabled: false,
             additional_analyzer_rules: vec![],
             executor_registry: None,
@@ -319,6 +324,12 @@ impl DataFusionBuilder {
     }
 
     #[must_use]
+    pub fn cayenne_footer_cache_mb(mut self, footer_cache_mb: Option<usize>) -> Self {
+        self.cayenne_footer_cache_mb = footer_cache_mb;
+        self
+    }
+
+    #[must_use]
     pub fn cayenne_filter_propagation_enabled(mut self, enabled: bool) -> Self {
         self.cayenne_filter_propagation_enabled = enabled;
         self
@@ -362,11 +373,17 @@ impl DataFusionBuilder {
         if let Some(target_partitions) = self.target_partitions {
             if target_partitions > 0 {
                 config = config.with_target_partitions(target_partitions);
+                tracing::info!(target_partitions, "Applied runtime.query.target_partitions");
             } else {
                 tracing::warn!(
                     "Ignoring runtime.query.target_partitions=0; value must be greater than 0"
                 );
             }
+        } else {
+            tracing::info!(
+                effective = config.options().execution.target_partitions,
+                "runtime.query.target_partitions not set; using DataFusion default"
+            );
         }
 
         let exact_join_filter_memory_limit =
@@ -399,6 +416,8 @@ impl DataFusionBuilder {
                 effective_memory_limit,
                 self.temp_directory.clone(),
                 self.io_runtime.clone(),
+                self.cayenne_footer_cache_mb
+                    .map(|size_mb| size_mb.saturating_mul(1024 * 1024)),
             ));
 
         #[cfg(feature = "duckdb")]
@@ -484,17 +503,6 @@ impl DataFusionBuilder {
             Ok(_) => {}
             Err(e) => {
                 panic!("Unable to register spice runtime schema: {e}");
-            }
-        }
-
-        if cfg!(feature = "models") {
-            use super::SPICE_EVAL_SCHEMA;
-            let eval_schema = SpiceSchemaProvider::new();
-            match catalog.register_schema(SPICE_EVAL_SCHEMA, Arc::new(eval_schema)) {
-                Ok(_) => {}
-                Err(e) => {
-                    panic!("Unable to register spice eval schema: {e}");
-                }
             }
         }
 
@@ -669,30 +677,42 @@ fn with_cayenne_logical_optimizer(mut state: SessionStateBuilder) -> SessionStat
 
 #[cfg(not(windows))]
 fn insert_cayenne_logical_optimizer_rule(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
-    if rules
+    if !rules
         .iter()
         .any(|rule| rule.name() == "cayenne_propagate_filter_across_equi_join_keys")
     {
-        return;
+        let insert_at = rules
+            .iter()
+            .position(|rule| rule.name() == "decorrelate_predicate_subquery")
+            .unwrap_or_else(|| {
+                rules
+                    .iter()
+                    .position(|rule| rule.name() == "push_down_filter")
+                    .unwrap_or(rules.len())
+            });
+        rules.insert(
+            insert_at,
+            Arc::new(
+                CayennePropagateFilterAcrossEquiJoinKeys::new_with_table_provider_predicate(
+                    is_cayenne_accelerated_table_provider,
+                ),
+            ),
+        );
     }
 
-    let insert_at = rules
+    // Run the IN-list → BETWEEN rewrite ahead of `simplify_expressions` so the
+    // downstream simplifier can fold the resulting `Expr::Between` the same way
+    // it folds a SQL-parsed BETWEEN.
+    if !rules
         .iter()
-        .position(|rule| rule.name() == "decorrelate_predicate_subquery")
-        .unwrap_or_else(|| {
-            rules
-                .iter()
-                .position(|rule| rule.name() == "push_down_filter")
-                .unwrap_or(rules.len())
-        });
-    rules.insert(
-        insert_at,
-        Arc::new(
-            CayennePropagateFilterAcrossEquiJoinKeys::new_with_table_provider_predicate(
-                is_cayenne_accelerated_table_provider,
-            ),
-        ),
-    );
+        .any(|rule| rule.name() == "cayenne_inlist_to_range_rewrite")
+    {
+        let insert_at = rules
+            .iter()
+            .position(|rule| rule.name() == "simplify_expressions")
+            .unwrap_or(rules.len());
+        rules.insert(insert_at, Arc::new(CayenneInListToRangeRewrite::new()));
+    }
 }
 
 #[cfg(not(windows))]
@@ -869,6 +889,7 @@ fn runtime_env_with_effective_memory_limit(
     effective_memory_limit: u64,
     temp_directory: Option<String>,
     io_runtime: Handle,
+    metadata_cache_limit_bytes: Option<usize>,
 ) -> Arc<RuntimeEnv> {
     let disk_manager_builder = if let Some(directory) = temp_directory {
         let mode = DiskManagerMode::Directories(vec![directory.into()]);
@@ -892,12 +913,16 @@ fn runtime_env_with_effective_memory_limit(
         topn,
     ));
 
-    match RuntimeEnvBuilder::default()
+    let mut runtime_env_builder = RuntimeEnvBuilder::default()
         .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::new(io_runtime)))
         .with_memory_pool(memory_pool)
-        .with_disk_manager_builder(disk_manager_builder)
-        .build_arc()
-    {
+        .with_disk_manager_builder(disk_manager_builder);
+
+    if let Some(limit) = metadata_cache_limit_bytes {
+        runtime_env_builder = runtime_env_builder.with_metadata_cache_limit(limit);
+    }
+
+    match runtime_env_builder.build_arc() {
         Ok(runtime_env) => runtime_env,
         Err(e) => {
             unreachable!("Tests ensure this should never fail: {e}");
@@ -935,6 +960,7 @@ mod tests {
 
     use super::{
         DataFusionBuilder, configure_hash_join_memory_limits, exact_join_filter_memory_limit,
+        runtime_env_with_effective_memory_limit,
     };
     use crate::dataaccelerator::AcceleratorEngineRegistry;
     use crate::status;
@@ -986,6 +1012,21 @@ mod tests {
             0,
             exact_join_filter_memory_limit(1),
             "Very small memory limits should not exceed the configured memory fraction"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_env_applies_metadata_cache_limit() {
+        let runtime_env = runtime_env_with_effective_memory_limit(
+            1024 * 1024,
+            None,
+            tokio::runtime::Handle::current(),
+            Some(8 * 1024 * 1024),
+        );
+
+        assert_eq!(
+            runtime_env.cache_manager.get_metadata_cache_limit(),
+            8 * 1024 * 1024
         );
     }
 
@@ -1062,6 +1103,54 @@ mod tests {
         assert!((config.sort_merge_memory_pool_fraction - 0.25).abs() < f64::EPSILON);
         assert_eq!(config.sort_merge_memory_pool_bytes, Some(1_024));
         assert_eq!(config.exact_join_filter_max_bytes, 128);
+    }
+
+    #[test]
+    fn test_target_partitions_wires_through_to_session_config() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle.clone(),
+        )
+        .target_partitions(Some(4))
+        .build();
+
+        assert_eq!(
+            df.ctx
+                .state()
+                .config()
+                .options()
+                .execution
+                .target_partitions,
+            4,
+            "target_partitions wired through DataFusionBuilder should be visible on the session config"
+        );
+
+        // Sanity check the inverse — None leaves DataFusion's default in place.
+        let df_default = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .target_partitions(None)
+        .build();
+        assert_ne!(
+            df_default
+                .ctx
+                .state()
+                .config()
+                .options()
+                .execution
+                .target_partitions,
+            4,
+            "Without an override target_partitions should fall back to DataFusion's default"
+        );
     }
 
     #[test]

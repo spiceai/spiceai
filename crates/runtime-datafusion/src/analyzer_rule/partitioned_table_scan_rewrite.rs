@@ -50,7 +50,7 @@ use parking_lot::RwLock;
 /// {"date": "2024-01-01", "region": "us-west"}
 /// {"date": "2024-01-02", "region": "us-east"}
 /// ```
-pub type PartitionValue = HashMap<String, String>;
+pub type PartitionValue = HashMap<String, Option<String>>;
 
 /// Define how to get partitions for a given table, and how they are partitioned.
 pub trait TablePartitionProvider: Send + Sync + Debug {
@@ -378,7 +378,7 @@ fn partition_value_to_expr(
 ) -> Result<Option<Expr>, DataFusionError> {
     let mut expr: Option<Expr> = None;
     for (partition_expr_str, val) in pv {
-        let new_expr = state
+        let col_expr = state
             .upgrade()
             .ok_or_else(|| {
                 DataFusionError::Plan(
@@ -386,8 +386,11 @@ fn partition_value_to_expr(
                 )
             })?
             .read()
-            .create_logical_expr(partition_expr_str, df_schema)?
-            .eq(lit(val.clone()));
+            .create_logical_expr(partition_expr_str, df_schema)?;
+        let new_expr = match val {
+            None => col_expr.is_null(),
+            Some(v) => col_expr.eq(lit(v.clone())),
+        };
         expr = match expr {
             Some(existing) => Some(existing.and(new_expr)),
             None => Some(new_expr),
@@ -426,14 +429,14 @@ mod tests {
                     p1,
                     vec![HashMap::from([(
                         "partition_id".to_string(),
-                        "0".to_string(),
+                        Some("0".to_string()),
                     )])],
                 ),
                 (
                     p2,
                     vec![HashMap::from([(
                         "partition_id".to_string(),
-                        "1".to_string(),
+                        Some("1".to_string()),
                     )])],
                 ),
             ]

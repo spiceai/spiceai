@@ -84,6 +84,70 @@ params:
         Ok(())
     }
 
+    /// Test that spiced can connect to an auth-enabled Streamable HTTP MCP server using
+    /// `params.mcp_auth_token`, which is mounted as `Authorization: Bearer <token>`.
+    #[tokio::test]
+    async fn test_mcp_streamable_http_with_auth_token() -> Result<(), anyhow::Error> {
+        let http_server_url = start_spiced_with_mcp_config(McpConfig {
+            allowed_hosts: Some(vec!["*".to_string()]),
+        })
+        .await
+        .expect("Failed to start auth-enabled spiced MCP server");
+
+        let tool_yaml = format!(
+            "name: mcp_from_spiced\nfrom: mcp:{http_server_url}/v1/mcp\nparams:\n  mcp_auth_token: {TEST_API_KEY}"
+        );
+        let http_client_url = start_spiced_with_tools(vec![
+            yaml::from_str(tool_yaml.as_str())
+                .expect("Tool spicepod component is not in expected format"),
+        ])
+        .await
+        .expect("Failed to start spiced with MCP tool");
+
+        let tools_list = call_tool_list(http_client_url.as_str()).await?;
+        assert!(
+            tools_list.iter().any(|tool| tool
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name == "mcp_from_spiced/get_readiness")),
+            "expected proxied MCP tools from auth-enabled Spice server: {tools_list:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Test that spiced can connect to an auth-enabled Streamable HTTP MCP server using
+    /// custom headers in the same format as the HTTP connector's `http_headers` param.
+    #[tokio::test]
+    async fn test_mcp_streamable_http_with_custom_headers() -> Result<(), anyhow::Error> {
+        let http_server_url = start_spiced_with_mcp_config(McpConfig {
+            allowed_hosts: Some(vec!["*".to_string()]),
+        })
+        .await
+        .expect("Failed to start auth-enabled spiced MCP server");
+
+        let tool_yaml = format!(
+            "name: mcp_from_spiced\nfrom: mcp:{http_server_url}/v1/mcp\nparams:\n  mcp_headers: 'X-API-Key: {TEST_API_KEY}'"
+        );
+        let http_client_url = start_spiced_with_tools(vec![
+            yaml::from_str(tool_yaml.as_str())
+                .expect("Tool spicepod component is not in expected format"),
+        ])
+        .await
+        .expect("Failed to start spiced with MCP tool");
+
+        let tools_list = call_tool_list(http_client_url.as_str()).await?;
+        assert!(
+            tools_list.iter().any(|tool| tool
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name == "mcp_from_spiced/get_readiness")),
+            "expected proxied MCP tools from auth-enabled Spice server: {tools_list:?}"
+        );
+
+        Ok(())
+    }
+
     /// Test the MCP Streamable HTTP server endpoint directly via JSON-RPC,
     /// without going through the rmcp client. This verifies the wire format
     /// (`POST /v1/mcp` with `Accept: application/json, text/event-stream`)

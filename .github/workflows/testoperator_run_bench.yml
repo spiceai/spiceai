@@ -62,6 +62,7 @@ on:
           - 'iceberg-hadoop'
           - 'dynamodb'
           - 'arrow'
+          - 'cayenne'
           - 'postgres-catalog'
           - 'mysql-catalog'
           - 'mssql-catalog'

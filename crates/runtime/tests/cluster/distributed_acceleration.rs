@@ -223,7 +223,9 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
                     scheduler: Some(
                         make_named_scheduler_config_with_max_partitions_per_executor(
                             "test_distributed_acceleration_multi_executor",
-                            2,
+                            // bucket(4, id) makes 5 partitions.
+                            // max_partitions = 3 will assign 3 & 2 partitons to executors.
+                            3,
                         ),
                     ),
                     ..SpicepodRuntime::default()
@@ -386,7 +388,7 @@ async fn test_distributed_acceleration_order_by_limit_pushdown() -> Result<(), a
                 .with_dataset(make_memory_accelerated_dataset(
                     format!("file://{}", csv_path.display()),
                     "test_data",
-                    4,
+                    3,
                     "id",
                 ))
                 .with_runtime(SpicepodRuntime {
@@ -488,7 +490,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
                 .with_dataset(make_memory_accelerated_dataset(
                     format!("file://{}", csv_path.display()),
                     "test_data",
-                    4,
+                    3,
                     "id",
                 ))
                 .with_runtime(SpicepodRuntime {
@@ -585,13 +587,13 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                 .with_dataset(make_memory_accelerated_dataset(
                     format!("file://{}", data_path.display()),
                     "test_data",
-                    4,
+                    3,
                     "id",
                 ))
                 .with_dataset(make_memory_accelerated_dataset(
                     format!("file://{}", cat_path.display()),
                     "categories",
-                    4,
+                    3,
                     "id",
                 ))
                 .with_runtime(SpicepodRuntime {
@@ -892,7 +894,9 @@ async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow:
                         .is_some_and(|m| {
                             m.partitions.len() == 11
                                 && m.partitions.iter().any(|p| {
-                                    p.partition_value.values().any(|v| v == "Seattle")
+                                    p.partition_value
+                                        .values()
+                                        .any(|v| v.as_deref() == Some("Seattle"))
                                         && p.is_assigned()
                                 })
                         })

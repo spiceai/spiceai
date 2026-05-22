@@ -192,6 +192,8 @@ pub enum QueryOverridesArg {
     DynamoDB,
     #[serde(rename = "arrow")]
     Arrow,
+    #[serde(rename = "cayenne")]
+    Cayenne,
     #[serde(rename = "turso")]
     Turso,
     #[serde(rename = "bigquery")]
@@ -318,6 +320,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::SaffronDuckdbCTE => QueryOverrides::SaffronDuckdbCTE,
             QueryOverridesArg::DynamoDB => QueryOverrides::DynamoDB,
             QueryOverridesArg::Arrow => QueryOverrides::Arrow,
+            QueryOverridesArg::Cayenne => QueryOverrides::Cayenne,
             QueryOverridesArg::PostgresCatalog => QueryOverrides::PostgresCatalog,
             QueryOverridesArg::MysqlCatalog => QueryOverrides::MysqlCatalog,
             QueryOverridesArg::MsSqlCatalog => QueryOverrides::MSSqlCatalog,

@@ -33,8 +33,8 @@ pub use runtime_cluster::{
 pub use runtime_cluster::{executor_selection, service, store, write_through};
 
 pub use startup::{
-    accelerated_tables, executor_request_initial_partitions, initialize_partition_metadata,
-    validate_partition_keys,
+    accelerated_tables, executor_request_initial_partitions, first_unready_accelerated_table,
+    initialize_partition_metadata, validate_partition_keys,
 };
 
 #[derive(Debug, Snafu)]
