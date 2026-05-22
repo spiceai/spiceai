@@ -18,33 +18,38 @@ limitations under the License.
 //!
 //! This module defines [`WriteMode`], the enum that controls where an
 //! accelerated table sends write operations (INSERT INTO), and exposes
-//! per-mode executors in the [`write_back`] and [`write_through`] submodules.
+//! per-mode executors in the [`write_back`] and [`dual_write`] submodules.
 //!
 //! The currently supported modes are:
 //!
-//! - [`WriteMode::FederatedOnly`]: writes go to the federated source only;
-//!   the accelerator is updated through the normal refresh cycle. Default.
+//! - [`WriteMode::WriteThrough`]: writes go to the federated source only; the
+//!   accelerator is updated through the normal refresh cycle (WAL replication
+//!   for `refresh_mode: changes`, periodic refresh otherwise). This is the
+//!   default and matches the user-facing `write_mode: write_through` contract.
 //! - [`WriteMode::AcceleratorOnly`]: writes go only to the local accelerator
-//!   (used when `on_conflict` upserts into the accelerator).
+//!   (used when `on_conflict` upserts into the accelerator without CDC).
 //! - [`WriteMode::WriteBack`]: writes commit to the local accelerator first,
 //!   then asynchronously persist the same mutation to the federated source.
 //!   Source persistence failures are logged rather than returned to the caller,
 //!   and `replication.enabled` is required as the caller's opt-in to those
 //!   asynchronous durability semantics.
-//! - [`WriteMode::WriteThrough`]: writes go to both the Cayenne accelerator
-//!   and the federated source simultaneously with staged commit/rollback.
+//! - [`WriteMode::DualWrite`]: writes go to both the Cayenne accelerator and
+//!   the federated source simultaneously with staged commit/rollback. This is
+//!   *not* exposed via spicepod `write_mode` — it is reserved for the Iceberg
+//!   federated catalog cache path, where Cayenne acts as a write-through cache
+//!   in front of an Iceberg catalog that has no CDC stream to propagate writes.
 //!
 //! [`AcceleratedTable`]: super::AcceleratedTable
 
+pub(crate) mod dual_write;
 pub(crate) mod write_back;
-pub(crate) mod write_through;
 
 use std::sync::Arc;
 
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 
-pub(crate) use write_through::CayenneWriteTarget;
+pub(crate) use dual_write::CayenneWriteTarget;
 
 use crate::federated_table::FederatedTable;
 
@@ -52,8 +57,9 @@ use crate::federated_table::FederatedTable;
 #[derive(Debug, Clone)]
 pub(crate) enum WriteMode {
     /// Writes go to the federated source only. The acceleration refresh mechanism
-    /// picks up new data on its next cycle. This is the default.
-    FederatedOnly,
+    /// picks up new data on its next cycle. This is the default and matches the
+    /// user-facing `write_mode: write_through` contract.
+    WriteThrough,
     /// Writes go only to the local accelerator (not replicated to the source).
     /// Used when `on_conflict` is configured or for internal tables.
     AcceleratorOnly,
@@ -61,35 +67,36 @@ pub(crate) enum WriteMode {
     /// the same mutation to the federated source.
     WriteBack,
     /// Writes go simultaneously to both the federated source and the local Cayenne
-    /// accelerator using staged append/commit/rollback semantics.
-    WriteThrough {
+    /// accelerator using staged append/commit/rollback semantics. Reserved for
+    /// the Iceberg federated catalog cache path.
+    DualWrite {
         cayenne_target: Box<CayenneWriteTarget>,
         federated_provider: Arc<dyn TableProvider>,
     },
 }
 
 impl WriteMode {
-    /// Returns `true` if this is a write-through mode.
+    /// Returns `true` if this is the dual-write mode (Iceberg catalog cache path).
     #[must_use]
-    pub fn is_write_through(&self) -> bool {
-        matches!(self, Self::WriteThrough { .. })
+    pub fn is_dual_write(&self) -> bool {
+        matches!(self, Self::DualWrite { .. })
     }
 
-    /// Resolves a write-through mode from the accelerator and federated table.
+    /// Resolves the dual-write mode from the accelerator and federated table.
     ///
-    /// Write-through requires:
+    /// Dual-write requires:
     /// 1. A Cayenne-backed accelerator (staged append/commit/rollback).
     /// 2. An immediately available federated table provider.
-    pub(crate) fn resolve_write_through(
+    pub(crate) fn resolve_dual_write(
         accelerator: &Arc<dyn TableProvider>,
         federated: &Arc<FederatedTable>,
     ) -> Result<Self, super::AcceleratedTableBuilderError> {
         let cayenne_target =
-            write_through::extract_cayenne_write_target(accelerator).ok_or_else(|| {
+            dual_write::extract_cayenne_write_target(accelerator).ok_or_else(|| {
                 super::AcceleratedTableBuilderError::AcceleratedTableError {
                     source: super::Error::FailedToWriteData {
                         source: DataFusionError::Execution(
-                            "Write-through acceleration currently requires the Cayenne accelerator"
+                            "Dual-write acceleration currently requires the Cayenne accelerator"
                                 .to_string(),
                         ),
                     },
@@ -100,14 +107,14 @@ impl WriteMode {
             super::AcceleratedTableBuilderError::AcceleratedTableError {
                 source: super::Error::FailedToWriteData {
                     source: DataFusionError::Execution(
-                        "Write-through acceleration requires an immediately available federated table provider"
+                        "Dual-write acceleration requires an immediately available federated table provider"
                             .to_string(),
                     ),
                 },
             }
         })?;
 
-        Ok(Self::WriteThrough {
+        Ok(Self::DualWrite {
             cayenne_target: Box::new(cayenne_target),
             federated_provider,
         })

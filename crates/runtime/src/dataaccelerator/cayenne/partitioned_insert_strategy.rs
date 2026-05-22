@@ -225,7 +225,7 @@ struct CayennePartitionedOverwriteSink {
 /// Per-partition writer-task channel depth. Bounds in-flight backpressure on
 /// the slowest partition; larger values trade memory for throughput tolerance
 /// when partitions write at different speeds. Matches the value used by
-/// `accelerated_table::write::write_through.rs` for the same shape.
+/// `accelerated_table::write::dual_write.rs` for the same shape.
 const PARTITION_WRITER_CHANNEL_DEPTH: usize = 8;
 
 impl std::fmt::Debug for CayennePartitionedOverwriteSink {
