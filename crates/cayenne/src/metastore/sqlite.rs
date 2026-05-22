@@ -502,19 +502,22 @@ fn convert_sqlite_value(value: rusqlite::types::ValueRef<'_>) -> MetastoreValue 
             MetastoreValue::Null
         }
         rusqlite::types::ValueRef::Text(t) => {
-            MetastoreValue::Text(String::from_utf8_lossy(t).to_string())
+            // `into_owned()` on a `Cow::Owned` (invalid UTF-8 fallback) keeps the
+            // already-allocated String. `.to_string()` would clone it again.
+            MetastoreValue::Text(String::from_utf8_lossy(t).into_owned())
         }
         rusqlite::types::ValueRef::Blob(b) => MetastoreValue::Blob(b.to_vec()),
     }
 }
 
-/// Convert `MetastoreValue` to a `rusqlite::types::Value`.
-fn to_sqlite_value(value: &MetastoreValue) -> rusqlite::types::Value {
+/// Convert `MetastoreValue` to a `rusqlite::types::Value`, consuming the
+/// source so Text/Blob payloads move without an extra heap copy.
+fn to_sqlite_value(value: MetastoreValue) -> rusqlite::types::Value {
     match value {
-        MetastoreValue::Integer(i) => rusqlite::types::Value::Integer(*i),
-        MetastoreValue::Text(s) => rusqlite::types::Value::Text(s.clone()),
-        MetastoreValue::Bool(b) => rusqlite::types::Value::Integer(i64::from(*b)),
-        MetastoreValue::Blob(b) => rusqlite::types::Value::Blob(b.clone()),
+        MetastoreValue::Integer(i) => rusqlite::types::Value::Integer(i),
+        MetastoreValue::Text(s) => rusqlite::types::Value::Text(s),
+        MetastoreValue::Bool(b) => rusqlite::types::Value::Integer(i64::from(b)),
+        MetastoreValue::Blob(b) => rusqlite::types::Value::Blob(b),
         MetastoreValue::Null => rusqlite::types::Value::Null,
     }
 }
@@ -603,7 +606,7 @@ impl MetastoreBackend for SqliteMetastore {
         let guard = self.pool().await?.acquire().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
-            params.params.iter().map(to_sqlite_value).collect();
+            params.params.into_iter().map(to_sqlite_value).collect();
 
         guard
             .call(move |conn| {
@@ -668,7 +671,7 @@ impl MetastoreBackend for SqliteMetastore {
         let guard = self.pool().await?.acquire().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
-            params.params.iter().map(to_sqlite_value).collect();
+            params.params.into_iter().map(to_sqlite_value).collect();
 
         // Execute query and extract row values inside the closure
         let row_values = guard
@@ -711,7 +714,7 @@ impl MetastoreBackend for SqliteMetastore {
         let guard = self.pool().await?.acquire().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
-            params.params.iter().map(to_sqlite_value).collect();
+            params.params.into_iter().map(to_sqlite_value).collect();
 
         // Execute query and collect all row values inside the closure
         let all_row_values = guard
@@ -880,7 +883,7 @@ impl MetastoreTransaction for SqliteTransaction {
         })?;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
-            params.params.iter().map(to_sqlite_value).collect();
+            params.params.into_iter().map(to_sqlite_value).collect();
 
         conn.call(move |conn| {
             let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
@@ -907,7 +910,7 @@ impl MetastoreTransaction for SqliteTransaction {
         })?;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
-            params.params.iter().map(to_sqlite_value).collect();
+            params.params.into_iter().map(to_sqlite_value).collect();
 
         conn.call(move |conn| {
             let params_refs: Vec<&dyn rusqlite::ToSql> = param_values

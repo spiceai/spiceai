@@ -397,7 +397,7 @@ impl Spicepod {
     ) -> Result<Spicepod> {
         let path = path.into();
 
-        let is_file = path.is_file() || path.extension().is_some();
+        let is_file = is_file_path(&path);
 
         let (spicepod_rdr, base_path) = if is_file {
             let spicepod_rdr = fs
@@ -440,11 +440,24 @@ impl Spicepod {
 
     #[must_use]
     pub fn base_path(path: &Path) -> &Path {
-        if path.is_file() || path.extension().is_some() {
+        if is_file_path(path) {
             path.parent().unwrap_or(Path::new("."))
         } else {
             path
         }
+    }
+}
+
+/// Returns `true` if `path` points to a file rather than a directory.
+///
+/// If the path exists on disk, the filesystem metadata is authoritative.
+/// If the path does not exist locally or is not accessible (e.g. in-memory test fixtures
+/// via `SpicepodString`, or insufficient permissions), we fall back to checking whether
+/// the path has a file extension.
+fn is_file_path(path: &Path) -> bool {
+    match path.metadata() {
+        Ok(md) => md.is_file(),
+        Err(_) => path.extension().is_some(),
     }
 }
 
@@ -1337,6 +1350,54 @@ mod version_tests {
             .await
             .expect("load_from should find spicepod.yaml in a directory");
         assert_eq!(pod.name, "test_pod");
+    }
+
+    /// A directory with dots/dashes in its name (e.g. `my.app-sample`)
+    #[tokio::test]
+    async fn test_load_from_directory_with_dots_in_name() {
+        let parent = tempfile::tempdir().expect("create temp dir");
+        let dir = parent.path().join("my.app-sample");
+        std::fs::create_dir(&dir).expect("create dotted dir");
+        let spicepod_content = "version: v1\nkind: Spicepod\nname: dotted_dir_pod\n";
+        std::fs::write(dir.join("spicepod.yaml"), spicepod_content).expect("write spicepod.yaml");
+
+        let pod = Spicepod::load_from(&reader::StdFileSystem, &dir)
+            .await
+            .expect("load_from should treat a dotted directory as a directory, not a file");
+        assert_eq!(pod.name, "dotted_dir_pod");
+    }
+
+    /// `base_path` must return the directory itself when given a directory with dots in its name.
+    #[test]
+    fn test_base_path_directory_with_dots() {
+        let parent = tempfile::tempdir().expect("create temp dir");
+        let dir = parent.path().join("my.app-sample");
+        std::fs::create_dir(&dir).expect("create dotted dir");
+
+        assert_eq!(Spicepod::base_path(&dir), dir);
+    }
+
+    /// `base_path` returns the parent for an actual spicepod file
+    #[test]
+    fn test_base_path_file_returns_parent() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let file = dir.path().join("my-pod.yaml");
+        std::fs::write(&file, "").expect("write file");
+
+        assert_eq!(Spicepod::base_path(&file), dir.path());
+    }
+
+    /// `is_file_path` falls back to extension heuristic for a path that doesn't exist on disk.
+    #[test]
+    fn test_is_file_path_nonexistent_directory() {
+        let path = Path::new("/tmp/nonexistent_dir_abc123");
+        assert!(!is_file_path(path));
+
+        let path_with_ext = Path::new("/tmp/nonexistent_abc123.yaml");
+        assert!(is_file_path(path_with_ext));
+
+        let dotted_dir = Path::new("/tmp/nonexistent.app-sample");
+        assert!(is_file_path(dotted_dir));
     }
 
     /// A file with a wrong `kind` (e.g. a Kubernetes YAML) is rejected with a clear error.
