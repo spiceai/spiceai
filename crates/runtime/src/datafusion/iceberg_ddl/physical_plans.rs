@@ -846,7 +846,7 @@ async fn create_accelerated_iceberg_table(
         refresh,
         df.io_runtime.clone(),
     );
-    builder.write_through();
+    builder.dual_write();
     let accelerated_table = builder.build().await.map_err(|e| {
         DataFusionError::Execution(format!("Failed to build accelerated table: {e}"))
     })?;
