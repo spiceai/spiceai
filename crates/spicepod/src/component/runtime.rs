@@ -1427,6 +1427,32 @@ mod tests {
     }
 
     #[test]
+    fn test_query_target_partitions_nested_in_full_spicepod() {
+        // Verifies that the nested `runtime.query.target_partitions` form used
+        // by real spicepods round-trips through serde into Spicepod itself
+        // (not just an isolated Runtime struct). This is the actual path the
+        // runtime takes at startup.
+        let yaml = r"
+version: v1
+kind: Spicepod
+name: test
+runtime:
+  query:
+    target_partitions: 4
+datasets:
+  - from: file:data/foo.parquet
+    name: foo
+";
+        let def: crate::spec::SpicepodDefinition =
+            yaml::from_str(yaml).expect("Failed to parse SpicepodDefinition");
+        assert_eq!(
+            def.runtime.query.as_ref().and_then(|q| q.target_partitions),
+            Some(4),
+            "target_partitions should round-trip from YAML into SpicepodDefinition.runtime.query"
+        );
+    }
+
+    #[test]
     fn test_query_target_partitions() {
         let yaml = r"
             query:

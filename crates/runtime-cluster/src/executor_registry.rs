@@ -29,11 +29,11 @@ use datafusion::{catalog::TableProvider, sql::TableReference};
 use datafusion_expr::{Expr, TableScan};
 use flight_client::cookie::CookieStore;
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;
-use runtime_proto::{MetricsRequest, MetricsResponse, SchedulerControlMessage};
+use runtime_proto::{Ack, MetricsRequest, MetricsResponse, SchedulerControlMessage};
 use snafu::prelude::*;
-use tokio::sync::{RwLock, mpsc, oneshot};
-use uuid::Uuid;
+use tokio::sync::{RwLock, mpsc};
 
+use crate::correlated::{CorrelatedResponses, CorrelationError, send_correlated};
 use crate::{PartitionStore, PartitionValue, executor_selection};
 
 /// Error type for executor registry operations.
@@ -45,8 +45,30 @@ pub enum Error {
     #[snafu(display("Failed to receive metrics response from executor {executor_id}: {reason}"))]
     ReceiveFailed { executor_id: String, reason: String },
 
+    #[snafu(display("Timed out waiting for ack from executor {executor_id} after {duration:?}"))]
+    AckTimeout {
+        executor_id: String,
+        duration: std::time::Duration,
+    },
+
+    #[snafu(display("Executor {executor_id} reported failure applying command: {error}"))]
+    AckFailed { executor_id: String, error: String },
+
+    #[snafu(display("Executor {executor_id} not registered"))]
+    ExecutorNotRegistered { executor_id: String },
+
     #[snafu(display("Metrics collection failed for executors: [{failed_executors}]"))]
     PartialFailure { failed_executors: String },
+}
+
+impl Error {
+    /// Returns true if this error indicates a transient condition where the
+    /// caller should retry (e.g. executor not yet ready). Returns false for
+    /// permanent failures (e.g. executor unregistered).
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Error::AckTimeout { .. } | Error::AckFailed { .. })
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -54,10 +76,14 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Represents a single executor's control stream connection.
 #[derive(Debug)]
 pub struct ExecutorConnection {
-    /// Channel to send control messages to this executor
+    /// Channel to send control messages to this executor.
     request_tx: mpsc::Sender<SchedulerControlMessage>,
-    /// Pending metrics requests awaiting responses
-    pending_requests: Arc<RwLock<HashMap<String, oneshot::Sender<MetricsResponse>>>>,
+    /// Pending metrics requests awaiting responses, keyed by `request_id`.
+    pending_metrics: CorrelatedResponses<MetricsResponse>,
+    /// Pending control-command acks awaiting responses, keyed by `request_id`.
+    /// Used by commands (e.g. `UpdatePartitions`) that need delivery
+    /// confirmation rather than fire-and-forget.
+    pending_acks: CorrelatedResponses<Ack>,
 }
 
 impl ExecutorConnection {
@@ -66,56 +92,67 @@ impl ExecutorConnection {
     pub fn new(request_tx: mpsc::Sender<SchedulerControlMessage>) -> Self {
         Self {
             request_tx,
-            pending_requests: Arc::new(RwLock::new(HashMap::new())),
+            pending_metrics: CorrelatedResponses::new(),
+            pending_acks: CorrelatedResponses::new(),
         }
     }
 
-    /// Returns a clone of the pending requests map for handling responses.
+    /// Returns a cheap clone of the pending-metrics registry. Used by the
+    /// control-stream inbound handler to deliver `MetricsResponse` messages.
     #[must_use]
-    pub fn pending_requests(
-        &self,
-    ) -> Arc<RwLock<HashMap<String, oneshot::Sender<MetricsResponse>>>> {
-        Arc::clone(&self.pending_requests)
+    pub fn pending_metrics(&self) -> CorrelatedResponses<MetricsResponse> {
+        self.pending_metrics.clone()
+    }
+
+    /// Returns a cheap clone of the pending-acks registry. Used by the
+    /// control-stream inbound handler to deliver `Ack` messages, and by
+    /// notify-with-ack call sites to await delivery confirmation.
+    #[must_use]
+    pub fn pending_acks(&self) -> CorrelatedResponses<Ack> {
+        self.pending_acks.clone()
     }
 
     /// Sends a metrics request to this executor and waits for the response.
     async fn request_metrics(&self, executor_id: &str) -> Result<MetricsResponse> {
-        let request_id = Uuid::new_v4().to_string();
-        let (response_tx, response_rx) = oneshot::channel();
-
-        // Register the pending request
-        {
-            let mut pending = self.pending_requests.write().await;
-            pending.insert(request_id.clone(), response_tx);
-        }
-
-        // Send the metrics request
-        let message = SchedulerControlMessage {
-            message: Some(
-                runtime_proto::scheduler_control_message::Message::RequestMetrics(MetricsRequest {
-                    request_id: request_id.clone(),
-                }),
-            ),
-        };
-
-        if self.request_tx.send(message).await.is_err() {
-            // Clean up the pending request on send failure
-            let mut pending = self.pending_requests.write().await;
-            pending.remove(&request_id);
-            return Err(Error::SendFailed {
+        send_correlated(
+            &self.request_tx,
+            &self.pending_metrics,
+            |request_id| SchedulerControlMessage {
+                message: Some(
+                    runtime_proto::scheduler_control_message::Message::RequestMetrics(
+                        MetricsRequest { request_id },
+                    ),
+                ),
+            },
+            None,
+        )
+        .await
+        .map_err(|e| match e {
+            CorrelationError::SendFailed => Error::SendFailed {
                 executor_id: executor_id.to_string(),
-            });
-        }
-
-        // Wait for the response
-        response_rx.await.map_err(|_| Error::ReceiveFailed {
-            executor_id: executor_id.to_string(),
-            reason: "response channel closed".to_string(),
+            },
+            CorrelationError::Cancelled => Error::ReceiveFailed {
+                executor_id: executor_id.to_string(),
+                reason: "response channel closed".to_string(),
+            },
+            CorrelationError::Timeout { duration } => Error::ReceiveFailed {
+                executor_id: executor_id.to_string(),
+                reason: format!("timed out after {duration:?}"),
+            },
         })
     }
 }
 
 pub type TablePartitions = HashMap<TableReference, Vec<Expr>>;
+
+/// Cheap-to-clone handles returned to the control-stream inbound dispatcher
+/// at registration time. Routes correlated executor→scheduler messages
+/// (metrics responses, command acks) to whoever is awaiting them.
+#[derive(Debug, Clone)]
+pub struct RegisteredHandles {
+    pub pending_metrics: CorrelatedResponses<MetricsResponse>,
+    pub pending_acks: CorrelatedResponses<Ack>,
+}
 
 /// Append-only log of DDL SQL statements applied to the cluster.
 ///
@@ -241,9 +278,12 @@ impl ExecutorRegistry {
         &self,
         executor_id: String,
         request_tx: mpsc::Sender<SchedulerControlMessage>,
-    ) -> Arc<RwLock<HashMap<String, oneshot::Sender<MetricsResponse>>>> {
+    ) -> RegisteredHandles {
         let connection = ExecutorConnection::new(request_tx);
-        let pending_requests = connection.pending_requests();
+        let handles = RegisteredHandles {
+            pending_metrics: connection.pending_metrics(),
+            pending_acks: connection.pending_acks(),
+        };
 
         let mut connections = self.connections.write().await;
         if connections.contains_key(&executor_id) {
@@ -253,7 +293,7 @@ impl ExecutorRegistry {
         }
         connections.insert(executor_id, connection);
 
-        pending_requests
+        handles
     }
 
     /// Unregisters an executor and removes it from all three tracking maps.
@@ -328,7 +368,61 @@ impl ExecutorRegistry {
         connections.keys().cloned().collect()
     }
 
-    /// Sends a control message to a specific executor.
+    /// Sends a control message to a specific executor and waits for an Ack
+    /// correlated by `request_id`.
+    ///
+    /// `build_command` is given a freshly generated `request_id` and must
+    /// place it onto the underlying message payload (e.g. into
+    /// `UpdatePartitions::request_id`). The executor's message handler is
+    /// expected to send a matching `ExecutorMessage::Ack` back via the
+    /// control stream.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ExecutorNotRegistered`] if the target is not in the registry.
+    /// - [`Error::SendFailed`] if delivery to the control stream channel fails.
+    /// - [`Error::AckTimeout`] if no ack arrives within `timeout`.
+    /// - [`Error::AckFailed`] if the executor reports an application error.
+    pub async fn send_command_with_ack(
+        &self,
+        executor_id: &str,
+        build_command: impl FnOnce(String) -> SchedulerControlMessage + Send,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        let (request_tx, pending_acks) = {
+            let connections = self.connections.read().await;
+            let Some(connection) = connections.get(executor_id) else {
+                return Err(Error::ExecutorNotRegistered {
+                    executor_id: executor_id.to_string(),
+                });
+            };
+            (connection.request_tx.clone(), connection.pending_acks())
+        };
+
+        match send_correlated(&request_tx, &pending_acks, build_command, Some(timeout)).await {
+            Ok(ack) => match ack.error {
+                Some(error) if !error.is_empty() => Err(Error::AckFailed {
+                    executor_id: executor_id.to_string(),
+                    error,
+                }),
+                _ => Ok(()),
+            },
+            Err(CorrelationError::SendFailed) => Err(Error::SendFailed {
+                executor_id: executor_id.to_string(),
+            }),
+            Err(CorrelationError::Cancelled) => Err(Error::ReceiveFailed {
+                executor_id: executor_id.to_string(),
+                reason: "ack channel closed".to_string(),
+            }),
+            Err(CorrelationError::Timeout { duration }) => Err(Error::AckTimeout {
+                executor_id: executor_id.to_string(),
+                duration,
+            }),
+        }
+    }
+
+    /// Sends a control message to a specific executor without waiting for
+    /// acknowledgement.
     ///
     /// # Errors
     ///
@@ -381,12 +475,13 @@ impl ExecutorRegistry {
         for (executor_id, connection) in connections.iter() {
             let executor_id = executor_id.clone();
             let request_tx = connection.request_tx.clone();
-            let pending_requests = connection.pending_requests();
+            let pending_metrics = connection.pending_metrics();
 
             handles.push(tokio::spawn(async move {
                 let temp_connection = ExecutorConnection {
                     request_tx,
-                    pending_requests,
+                    pending_metrics,
+                    pending_acks: CorrelatedResponses::new(),
                 };
                 let result = temp_connection.request_metrics(&executor_id).await;
                 (executor_id, result)
@@ -497,7 +592,7 @@ pub(crate) fn get_partitions_from_store(
     };
 
     // All required partitions (future: filter by query predicates)
-    let required_partitions: Vec<HashMap<String, String>> = table_metadata
+    let required_partitions: Vec<HashMap<String, Option<String>>> = table_metadata
         .partitions
         .iter()
         .map(|p| p.partition_value.clone())
@@ -818,5 +913,134 @@ mod tests {
         assert!(registry.ddl_statements_since(3).await.is_empty());
         // Beyond end returns empty
         assert!(registry.ddl_statements_since(100).await.is_empty());
+    }
+
+    /// Spawn a tiny fake executor: receives `SchedulerControlMessage`s from
+    /// `rx`, extracts the `request_id` from `UpdatePartitions`, and delivers
+    /// an `Ack` (with the provided error, if any) via `pending_acks`.
+    fn spawn_fake_executor_ack(
+        mut rx: mpsc::Receiver<SchedulerControlMessage>,
+        pending_acks: CorrelatedResponses<Ack>,
+        responder_error: Option<String>,
+    ) {
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if let Some(runtime_proto::scheduler_control_message::Message::UpdatePartitions(
+                    up,
+                )) = msg.message
+                {
+                    let request_id = up.request_id;
+                    if request_id.is_empty() {
+                        continue; // legacy fire-and-forget
+                    }
+                    pending_acks.deliver(
+                        &request_id,
+                        Ack {
+                            request_id: request_id.clone(),
+                            error: responder_error.clone(),
+                        },
+                    );
+                }
+            }
+        });
+    }
+
+    fn empty_update_partitions(request_id: String) -> SchedulerControlMessage {
+        SchedulerControlMessage {
+            message: Some(
+                runtime_proto::scheduler_control_message::Message::UpdatePartitions(
+                    runtime_proto::UpdatePartitions {
+                        new_partitions: HashMap::new(),
+                        removed_partitions: HashMap::new(),
+                        request_id,
+                    },
+                ),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_command_with_ack_success() {
+        let registry = make_registry().await;
+        let (tx, rx) = mpsc::channel(8);
+        let handles = registry.register("e1".to_string(), tx).await;
+        spawn_fake_executor_ack(rx, handles.pending_acks.clone(), None);
+
+        let result = registry
+            .send_command_with_ack(
+                "e1",
+                empty_update_partitions,
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn send_command_with_ack_propagates_application_error() {
+        let registry = make_registry().await;
+        let (tx, rx) = mpsc::channel(8);
+        let handles = registry.register("e1".to_string(), tx).await;
+        spawn_fake_executor_ack(
+            rx,
+            handles.pending_acks.clone(),
+            Some("table not yet loaded".to_string()),
+        );
+
+        let err = registry
+            .send_command_with_ack(
+                "e1",
+                empty_update_partitions,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .expect_err("ack with error should fail");
+
+        match err {
+            Error::AckFailed { executor_id, error } => {
+                assert_eq!(executor_id, "e1");
+                assert_eq!(error, "table not yet loaded");
+            }
+            other => panic!("expected AckFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_command_with_ack_times_out_when_no_response() {
+        let registry = make_registry().await;
+        let (tx, _rx) = mpsc::channel(8); // _rx kept alive but never read
+        let _handles = registry.register("e1".to_string(), tx).await;
+
+        let err = registry
+            .send_command_with_ack(
+                "e1",
+                empty_update_partitions,
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .expect_err("missing ack should time out");
+
+        assert!(matches!(err, Error::AckTimeout { .. }), "got {err:?}");
+        assert!(err.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn send_command_with_ack_unknown_executor() {
+        let registry = make_registry().await;
+        let err = registry
+            .send_command_with_ack(
+                "ghost",
+                empty_update_partitions,
+                std::time::Duration::from_millis(10),
+            )
+            .await
+            .expect_err("unknown executor should fail");
+
+        assert!(
+            matches!(err, Error::ExecutorNotRegistered { .. }),
+            "got {err:?}"
+        );
+        assert!(!err.is_retryable());
     }
 }

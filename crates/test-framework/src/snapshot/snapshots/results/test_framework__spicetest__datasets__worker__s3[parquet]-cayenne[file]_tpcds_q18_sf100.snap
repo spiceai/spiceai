@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q18"
+---
++------------------+---------------+----------+--------------+------+--------+---------+--------+----------+--------+------+
+| i_item_id        | ca_country    | ca_state | ca_county    | agg1 | agg2   | agg3    | agg4   | agg5     | agg6   | agg7 |
++------------------+---------------+----------+--------------+------+--------+---------+--------+----------+--------+------+
+| AAAAAAAAAAHLBAAA | United States | CO       | Adams County | 41.0 | 97.51  | 3126.04 | 89.7   | -866.12  | 1986.0 | 4.0  |
+| AAAAAAAAAAIBBAAA | United States | CO       | Adams County | 4.0  | 98.16  | 190.03  | 86.38  | -8.11    | 1940.0 | 5.0  |
+| AAAAAAAAAANNCAAA | United States | CO       | Adams County | 75.0 | 175.01 | 0.0     | 17.5   | -3531.0  | 1982.0 | 2.0  |
+| AAAAAAAAABKGAAAA | United States | CO       | Adams County | 97.0 | 56.87  | 0.0     | 3.98   | -3243.68 | 1971.0 | 5.0  |
+| AAAAAAAAACOAAAAA | United States | CO       | Adams County | 73.0 | 70.12  | 0.0     | 16.82  | -2968.18 | 1957.0 | 1.0  |
+| AAAAAAAAACODBAAA | United States | CO       | Adams County | 3.0  | 101.3  | 0.0     | 25.32  | -99.72   | 1971.0 | 5.0  |
+| AAAAAAAAADOBBAAA | United States | CO       | Adams County | 45.0 | 169.67 | 4402.88 | 134.03 | -1720.43 | 1981.0 | 3.0  |
+| AAAAAAAAADOECAAA | United States | CO       | Adams County | 26.0 | 40.53  | 0.0     | 22.29  | 177.32   | 1958.0 | 6.0  |
+| AAAAAAAAADPDBAAA | United States | CO       | Adams County | 69.0 | 19.78  | 0.0     | 9.89   | -321.54  | 1980.0 | 4.0  |
+| AAAAAAAAAFIDBAAA | United States | CO       | Adams County | 46.0 | 101.08 | 0.0     | 65.7   | 1355.62  | 1959.0 | 2.0  |
++------------------+---------------+----------+--------------+------+--------+---------+--------+----------+--------+------+

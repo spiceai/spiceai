@@ -63,10 +63,19 @@ pub fn retry_backoff_delay(attempt: u32) -> Duration {
 #[must_use]
 pub fn is_retryable_write_conflict_message(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
+    // SQLite engine-level busy/locked indicators (rusqlite / WAL).
     message.contains("sqlite_busy")
         || message.contains("sqlite_locked")
         || message.contains("database is busy")
         || message.contains("database is locked")
+        // Turso BEGIN CONCURRENT MVCC raises this on commit when another
+        // transaction has already written to overlapping rows. Cayenne's
+        // existing retry-on-conflict loops (in `commit_inlined_mutation`,
+        // `commit_on_conflict_deletions`, snapshot publish, etc.) need to
+        // back off and retry these the same way they do for sqlite_busy,
+        // otherwise sustained-writes workloads against Turso panic on the
+        // first cross-transaction conflict instead of converging.
+        || message.contains("write-write conflict")
 }
 
 #[cfg(test)]
@@ -106,6 +115,10 @@ mod tests {
             "Some prefix SQLITE_BUSY some suffix",
             "some SQLITE_LOCKED error",
             "database is locked by another transaction",
+            // Turso BEGIN CONCURRENT commit-time MVCC failure.
+            "Failed to commit transaction: Write-write conflict",
+            "write-write conflict",
+            "Write-Write Conflict",
         ];
 
         for message in messages {

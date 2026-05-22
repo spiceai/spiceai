@@ -261,6 +261,17 @@ impl ClusterServiceImpl {
         self.executor_streams.broadcast_poll_now(reason);
     }
 
+    /// Returns the first accelerated table that hasn't yet been registered in
+    /// the local `SessionContext`, or `None` if every accelerated table is
+    /// ready. Snapshots the app under the read lock and releases it before
+    /// the per-table `get_table` lookups so no async guard is held across
+    /// `.await`.
+    async fn first_unready_accelerated_table(&self) -> Option<TableReference> {
+        let app = self.app.read().await.clone();
+        let app = app?;
+        super::partition::first_unready_accelerated_table(&app, self.datafusion.as_ref()).await
+    }
+
     /// Returns the executor registry for use by other components.
     #[must_use]
     pub fn executor_registry(&self) -> Arc<ExecutorRegistry> {
@@ -526,7 +537,7 @@ impl ClusterService for ClusterServiceImpl {
             };
 
             // Register the executor with the registry.
-            let pending_requests = executor_registry
+            let handles = executor_registry
                 .register(executor_id.clone(), outbound_tx_for_registry)
                 .await;
 
@@ -547,24 +558,39 @@ impl ClusterService for ClusterServiceImpl {
                         match result {
                             Some(Ok(msg)) => {
                                 if let Some(message) = msg.message {
-                                    // Handle metrics responses by completing pending requests.
-                                    if let ExecutorMessage::Metrics(response) = &message {
-                                        let mut pending = pending_requests.write().await;
-                                        if let Some(sender) = pending.remove(&response.request_id) {
-                                            let _ = sender.send(response.clone());
-                                        } else {
-                                            tracing::warn!(
-                                                "Received metrics response for unknown request_id: {}",
-                                                response.request_id
-                                            );
+                                    // Route correlated responses (metrics, acks) to their waiters;
+                                    // anything else goes to the general handler.
+                                    match &message {
+                                        ExecutorMessage::Metrics(response) => {
+                                            if !handles
+                                                .pending_metrics
+                                                .deliver(&response.request_id, response.clone())
+                                            {
+                                                tracing::warn!(
+                                                    "Received metrics response for unknown request_id: {}",
+                                                    response.request_id
+                                                );
+                                            }
                                         }
-                                    } else {
-                                        handle_executor_message(
-                                            &executor_id,
-                                            &message,
-                                            &datafusion,
-                                        )
-                                        .await;
+                                        ExecutorMessage::Ack(ack) => {
+                                            if !handles
+                                                .pending_acks
+                                                .deliver(&ack.request_id, ack.clone())
+                                            {
+                                                tracing::warn!(
+                                                    "Received ack for unknown request_id: {}",
+                                                    ack.request_id
+                                                );
+                                            }
+                                        }
+                                        _ => {
+                                            handle_executor_message(
+                                                &executor_id,
+                                                &message,
+                                                &datafusion,
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
                             }
@@ -616,6 +642,22 @@ impl ClusterService for ClusterServiceImpl {
         } else {
             &executor_url
         };
+
+        // Gate on dataset readiness. Partition-expression serialization needs
+        // every accelerated table's schema to be in the SessionContext; if a
+        // dataset is still loading from its source, `partition_value_to_bytes`
+        // would fail with "Table not found when parsing expression" — return
+        // a transient `Unavailable` so the executor retries with backoff.
+        if let Some(not_ready) = self.first_unready_accelerated_table().await {
+            tracing::debug!(
+                executor = %executor_id,
+                table = %not_ready,
+                "Deferring allocate_initial_partitions: accelerated table not yet registered"
+            );
+            return Err(Status::unavailable(format!(
+                "partition metadata not ready: accelerated table {not_ready} still loading"
+            )));
+        }
 
         let tls_config_opt = self.datafusion.cluster_config.client_tls_config();
         match create_executor_flight_client(&executor_url, tls_config_opt) {
@@ -682,9 +724,17 @@ impl ClusterService for ClusterServiceImpl {
                             {
                                 Ok(bytes) => items.push(bytes.to_vec()),
                                 Err(e) => {
+                                    // The readiness gate above should make this
+                                    // path unreachable for the dataset-not-ready
+                                    // case. Anything that lands here is a real
+                                    // bug (corrupt expression, etc.) — fail loud
+                                    // rather than silently dropping the partition.
                                     tracing::error!(
                                         "Failed to serialize partition expression for table {table_ref}: {e}"
                                     );
+                                    return Err(Status::internal(format!(
+                                        "Failed to serialize partition expression for table {table_ref}: {e}"
+                                    )));
                                 }
                             }
                         }
@@ -804,6 +854,11 @@ async fn handle_executor_message(
             tracing::warn!(
                 "Unexpected metrics response in handle_executor_message for {executor_id}"
             );
+        }
+        ExecutorMessage::Ack(_) => {
+            // Acks are handled separately in the stream handler via pending_acks.
+            // This shouldn't be reached, but log if it is.
+            tracing::warn!("Unexpected ack in handle_executor_message for {executor_id}");
         }
         ExecutorMessage::Shutdown(shutdown) => {
             let reason = if shutdown.reason.is_empty() {

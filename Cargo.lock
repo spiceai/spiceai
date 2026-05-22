@@ -6257,7 +6257,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=b798c391b6566c172d44361f8acc8472c958ca75#b798c391b6566c172d44361f8acc8472c958ca75"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=29f66085875f1d4d7b80fc1947e68c6835302241#29f66085875f1d4d7b80fc1947e68c6835302241"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -16121,6 +16121,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "bytes",
+ "dashmap",
  "data_components",
  "datafusion",
  "datafusion-expr",
@@ -21387,11 +21388,12 @@ dependencies = [
 
 [[package]]
 name = "vortex-datafusion"
-version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=86cc337cb133fc54ec45bd665e348453a84785a6#86cc337cb133fc54ec45bd665e348453a84785a6"
+version = "2.0.0-unstable"
 dependencies = [
+ "anyhow",
  "arrow-schema",
  "async-trait",
+ "datafusion",
  "datafusion-catalog",
  "datafusion-common",
  "datafusion-common-runtime",
@@ -21405,11 +21407,16 @@ dependencies = [
  "datafusion-physical-plan",
  "datafusion-pruning",
  "futures",
+ "insta",
  "itertools 0.14.0",
+ "moka",
  "object_store",
+ "rstest 0.26.1",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tracing",
+ "url",
  "uuid 1.21.0",
  "vortex",
  "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=86cc337cb133fc54ec45bd665e348453a84785a6)",

@@ -31,6 +31,49 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
 
 const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_delete_file_table_path ON cayenne_delete_file(table_id, path)";
+const SQLITE_PRAGMA_RETRY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 200];
+
+fn is_sqlite_lock_error(error: &tokio_rusqlite::Error<rusqlite::Error>) -> bool {
+    matches!(
+        error,
+        tokio_rusqlite::Error::Error(rusqlite::Error::SqliteFailure(err, _))
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+async fn configure_sqlite_connection(
+    conn: &tokio_rusqlite::Connection,
+) -> Result<(), tokio_rusqlite::Error<rusqlite::Error>> {
+    let mut retry_delays = SQLITE_PRAGMA_RETRY_DELAYS_MS.iter();
+    loop {
+        let result = conn
+            .call(|conn| {
+                conn.busy_timeout(std::time::Duration::from_secs(5))?;
+                conn.pragma_update(None, "journal_mode", "WAL")?;
+                conn.pragma_update(None, "synchronous", "NORMAL")?;
+                conn.pragma_update(None, "cache_size", -32000)?;
+                conn.pragma_update(None, "foreign_keys", true)?;
+                conn.pragma_update(None, "temp_store", "memory")?;
+
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await;
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if is_sqlite_lock_error(&error) => {
+                let Some(delay_ms) = retry_delays.next() else {
+                    return Err(error);
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 /// Round-robin connection pool for the [`SqliteMetastore`].
 ///
@@ -40,8 +83,18 @@ const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXI
 /// for N > K callers share proportionally, reducing the per-table wait from
 /// O(N·RTT) to O(⌈N/K⌉·RTT).
 ///
-/// Pool size is `min(available_parallelism, 8)` (minimum 2). Beyond 8,
-/// `SQLite`'s WAL write serialization is typically the limiting factor anyway.
+/// Pool size is `min(available_parallelism, 32)` (minimum 2). If
+/// `available_parallelism()` fails (rare — e.g. seccomp-restricted
+/// environments), K falls back to 4. `SQLite` WAL mode allows many
+/// concurrent readers per database file (read-only operations don't take
+/// the WAL write lock), so a larger pool lifts the read-side concurrency
+/// ceiling for metadata-heavy workloads — e.g. 64-core deployments running
+/// concurrent scans against many tables, where every scan pays one or more
+/// metastore reads (table metadata, snapshot file lists, deletion-vector
+/// loads, stats lookups). Writes still serialize at the WAL layer
+/// regardless of pool size; this is fine because writes are
+/// O(commits-per-second) while reads are
+/// O(queries-per-second × per-query-metadata-fanout).
 struct SqliteConnectionPool {
     conns: Vec<Arc<Mutex<tokio_rusqlite::Connection>>>,
     next: AtomicUsize,
@@ -76,9 +129,12 @@ pub struct SqliteMetastore {
     /// Round-robin pool of K independent connections shared across all
     /// operations (reads, writes, and transactions).
     ///
-    /// K = `min(available_parallelism, 8)` (minimum 2). Lazily initialised on
-    /// first use. `begin_transaction` holds an [`OwnedMutexGuard`] on one pool
-    /// slot for the full transaction lifetime.
+    /// K = `min(available_parallelism, 32)` (or 4 if
+    /// `available_parallelism()` fails, with a minimum of 2 — see the
+    /// [`SqliteConnectionPool`] doc comment for the rationale). Lazily
+    /// initialised on first use. `begin_transaction` holds an
+    /// [`OwnedMutexGuard`] on one pool slot for the full transaction
+    /// lifetime.
     pool: OnceCell<Arc<SqliteConnectionPool>>,
 }
 
@@ -176,18 +232,7 @@ impl SqliteMetastore {
                 message: format!("Failed to open SQLite database: {e}"),
             })?;
 
-        conn.call(|conn| {
-            conn.pragma_update(None, "journal_mode", "WAL")?;
-            conn.busy_timeout(std::time::Duration::from_secs(5))?;
-            conn.pragma_update(None, "synchronous", "NORMAL")?;
-            conn.pragma_update(None, "cache_size", -32000)?;
-            conn.pragma_update(None, "foreign_keys", true)?;
-            conn.pragma_update(None, "temp_store", "memory")?;
-
-            Ok::<_, rusqlite::Error>(())
-        })
-        .await
-        .map_err(
+        configure_sqlite_connection(&conn).await.map_err(
             |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
                 message: format!("Failed to configure SQLite pragmas: {e}"),
             },
@@ -198,15 +243,18 @@ impl SqliteMetastore {
 
     /// Return the connection pool, initialising it lazily on first call.
     ///
-    /// Opens K = `min(available_parallelism, 8)` (minimum 2) connections once
-    /// and reuses them for the lifetime of the metastore. All operations draw
-    /// from the same pool; `begin_transaction` holds an [`OwnedMutexGuard`]
-    /// on the acquired slot for the full transaction lifetime.
+    /// Opens K = `min(available_parallelism, 32)` connections once and reuses
+    /// them for the lifetime of the metastore. If `available_parallelism()`
+    /// fails (rare — e.g. seccomp-restricted environments), K falls back to
+    /// 4. K is then clamped to a minimum of 2 so single-core systems still
+    /// have one slot reserved for read-while-write. All operations draw from
+    /// the same pool; `begin_transaction` holds an [`OwnedMutexGuard`] on
+    /// the acquired slot for the full transaction lifetime.
     async fn pool(&self) -> CatalogResult<&Arc<SqliteConnectionPool>> {
         self.pool
             .get_or_try_init(|| async {
                 let k = std::thread::available_parallelism()
-                    .map_or(4, |n| n.get().min(8))
+                    .map_or(4, |n| n.get().min(32))
                     .max(2);
                 let mut conns = Vec::with_capacity(k);
                 for _ in 0..k {
@@ -454,19 +502,22 @@ fn convert_sqlite_value(value: rusqlite::types::ValueRef<'_>) -> MetastoreValue 
             MetastoreValue::Null
         }
         rusqlite::types::ValueRef::Text(t) => {
-            MetastoreValue::Text(String::from_utf8_lossy(t).to_string())
+            // `into_owned()` on a `Cow::Owned` (invalid UTF-8 fallback) keeps the
+            // already-allocated String. `.to_string()` would clone it again.
+            MetastoreValue::Text(String::from_utf8_lossy(t).into_owned())
         }
         rusqlite::types::ValueRef::Blob(b) => MetastoreValue::Blob(b.to_vec()),
     }
 }
 
-/// Convert `MetastoreValue` to a `rusqlite::types::Value`.
-fn to_sqlite_value(value: &MetastoreValue) -> rusqlite::types::Value {
+/// Convert `MetastoreValue` to a `rusqlite::types::Value`, consuming the
+/// source so Text/Blob payloads move without an extra heap copy.
+fn to_sqlite_value(value: MetastoreValue) -> rusqlite::types::Value {
     match value {
-        MetastoreValue::Integer(i) => rusqlite::types::Value::Integer(*i),
-        MetastoreValue::Text(s) => rusqlite::types::Value::Text(s.clone()),
-        MetastoreValue::Bool(b) => rusqlite::types::Value::Integer(i64::from(*b)),
-        MetastoreValue::Blob(b) => rusqlite::types::Value::Blob(b.clone()),
+        MetastoreValue::Integer(i) => rusqlite::types::Value::Integer(i),
+        MetastoreValue::Text(s) => rusqlite::types::Value::Text(s),
+        MetastoreValue::Bool(b) => rusqlite::types::Value::Integer(i64::from(b)),
+        MetastoreValue::Blob(b) => rusqlite::types::Value::Blob(b),
         MetastoreValue::Null => rusqlite::types::Value::Null,
     }
 }
@@ -555,7 +606,7 @@ impl MetastoreBackend for SqliteMetastore {
         let guard = self.pool().await?.acquire().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
-            params.params.iter().map(to_sqlite_value).collect();
+            params.params.into_iter().map(to_sqlite_value).collect();
 
         guard
             .call(move |conn| {
@@ -620,7 +671,7 @@ impl MetastoreBackend for SqliteMetastore {
         let guard = self.pool().await?.acquire().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
-            params.params.iter().map(to_sqlite_value).collect();
+            params.params.into_iter().map(to_sqlite_value).collect();
 
         // Execute query and extract row values inside the closure
         let row_values = guard
@@ -663,7 +714,7 @@ impl MetastoreBackend for SqliteMetastore {
         let guard = self.pool().await?.acquire().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
-            params.params.iter().map(to_sqlite_value).collect();
+            params.params.into_iter().map(to_sqlite_value).collect();
 
         // Execute query and collect all row values inside the closure
         let all_row_values = guard
@@ -832,7 +883,7 @@ impl MetastoreTransaction for SqliteTransaction {
         })?;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
-            params.params.iter().map(to_sqlite_value).collect();
+            params.params.into_iter().map(to_sqlite_value).collect();
 
         conn.call(move |conn| {
             let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
@@ -859,7 +910,7 @@ impl MetastoreTransaction for SqliteTransaction {
         })?;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
-            params.params.iter().map(to_sqlite_value).collect();
+            params.params.into_iter().map(to_sqlite_value).collect();
 
         conn.call(move |conn| {
             let params_refs: Vec<&dyn rusqlite::ToSql> = param_values

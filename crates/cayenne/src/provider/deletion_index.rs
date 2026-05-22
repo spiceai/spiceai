@@ -34,7 +34,7 @@ limitations under the License.
 
 use hash_index::{BloomFilter, hash_key};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 /// Bloom filter capacity floor: keep some signal even for empty / tiny sets so that the
 /// "probably-not-present" path stays useful when a fresh index is constructed.
@@ -83,6 +83,17 @@ impl DeletionIndex {
             max_sequence_number: None,
             bloom_capacity: MIN_BLOOM_CAPACITY,
         }
+    }
+
+    /// Process-wide shared empty index. Use this instead of
+    /// `Arc::new(Self::empty())` from per-scan hot paths — the bloom
+    /// allocation is amortized across every caller. See
+    /// `apply_partial_filter_empty_alloc` bench.
+    #[must_use]
+    pub fn shared_empty() -> Arc<Self> {
+        static EMPTY: LazyLock<Arc<DeletionIndex>> =
+            LazyLock::new(|| Arc::new(DeletionIndex::empty()));
+        Arc::clone(&EMPTY)
     }
 
     /// Build a frozen index from an owned `HashMap` of `pk -> delete_sequence`.
@@ -180,9 +191,11 @@ impl DeletionIndex {
         let mut entries_arc = Arc::clone(&self.entries);
         let entries = Arc::make_mut(&mut entries_arc);
         let mut max_sequence_number = self.max_sequence_number;
+        let additions = additions.into_iter();
         // Track newly-inserted keys so the bloom can be updated incrementally
-        // without re-iterating the entire entry set.
-        let mut new_keys: Vec<i64> = Vec::new();
+        // without re-iterating the entire entry set. Pre-size from the
+        // iterator's hint to skip Vec growth reallocations.
+        let mut new_keys: Vec<i64> = Vec::with_capacity(additions.size_hint().0);
         for (pk, seq) in additions {
             let stored_sequence = match entries.entry(pk) {
                 std::collections::hash_map::Entry::Occupied(mut e) => {
@@ -286,6 +299,15 @@ impl KeyDeletionIndex {
         }
     }
 
+    /// Process-wide shared empty index. Use this instead of
+    /// `Arc::new(Self::empty())` from per-scan hot paths.
+    #[must_use]
+    pub fn shared_empty() -> Arc<Self> {
+        static EMPTY: LazyLock<Arc<KeyDeletionIndex>> =
+            LazyLock::new(|| Arc::new(KeyDeletionIndex::empty()));
+        Arc::clone(&EMPTY)
+    }
+
     /// Build a frozen index from an owned `HashMap` of `pk_bytes -> delete_sequence`.
     #[must_use]
     pub fn from_map(entries: HashMap<Box<[u8]>, i64>) -> Self {
@@ -366,9 +388,12 @@ impl KeyDeletionIndex {
         let mut entries_arc = Arc::clone(&self.entries);
         let entries = Arc::make_mut(&mut entries_arc);
         let mut max_sequence_number = self.max_sequence_number;
-        // Track newly-inserted keys so the bloom can be updated incrementally
-        // without re-iterating the entire entry set.
-        let mut new_keys: Vec<Box<[u8]>> = Vec::new();
+        let additions = additions.into_iter();
+        // Hash newly-inserted keys inline so the bloom can be updated
+        // incrementally without paying for a `Box<[u8]>` clone per key (the
+        // bloom only needs the hash, not the byte slice). Pre-size from the
+        // iterator's hint to skip Vec growth reallocations.
+        let mut new_hashes: Vec<u64> = Vec::with_capacity(additions.size_hint().0);
         for (key, seq) in additions {
             let stored_sequence = match entries.entry(key) {
                 std::collections::hash_map::Entry::Occupied(mut e) => {
@@ -381,9 +406,8 @@ impl KeyDeletionIndex {
                     }
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    let key_clone: Box<[u8]> = e.key().clone();
+                    new_hashes.push(hash_key(&e.key().as_ref()));
                     e.insert(seq);
-                    new_keys.push(key_clone);
                     seq
                 }
             };
@@ -410,8 +434,8 @@ impl KeyDeletionIndex {
         }
 
         let mut bloom = self.bloom.clone();
-        for key in &new_keys {
-            bloom.insert(hash_key(&key.as_ref()));
+        for h in new_hashes {
+            bloom.insert(h);
         }
         Self {
             entries: entries_arc,
