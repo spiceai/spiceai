@@ -823,7 +823,12 @@ impl TableProvider for EmbeddingTable {
     }
 
     fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
-        self.base_table.get_logical_plan()
+        // EmbeddingTable augments the base table's schema with computed
+        // embedding columns. The base table's logical plan does not represent
+        // those columns, so forwarding it would cause `LogicalPlanBuilder::scan`
+        // to inline a plan whose schema is missing the embedding columns —
+        // any subsequent projection of those columns then fails.
+        None
     }
 
     fn schema(&self) -> SchemaRef {
