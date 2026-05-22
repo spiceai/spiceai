@@ -130,8 +130,6 @@ pub(crate) fn generate_postgres_wal_spicepod(
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
 
-    eprintln!("[stdio] datasets: {:?}", datasets);
-
     let mut spicepod = SpicepodDefinition::new(format!("spidapter-{short_id}"));
     spicepod.runtime = Runtime {
         telemetry: TelemetryConfig {
