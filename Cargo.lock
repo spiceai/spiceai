@@ -6257,7 +6257,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=b798c391b6566c172d44361f8acc8472c958ca75#b798c391b6566c172d44361f8acc8472c958ca75"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=29f66085875f1d4d7b80fc1947e68c6835302241#29f66085875f1d4d7b80fc1947e68c6835302241"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -16121,6 +16121,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "bytes",
+ "dashmap",
  "data_components",
  "datafusion",
  "datafusion-expr",
