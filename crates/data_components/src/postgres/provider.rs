@@ -33,7 +33,8 @@ use globset::GlobSet;
 use snafu::prelude::*;
 
 use crate::{
-    FOREIGN_KEYS_METADATA_KEY, MetadataEnrichedTableProvider, Read, RefreshableCatalogProvider,
+    COMMENT_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, FieldMetadata, Read,
+    RefreshableCatalogProvider, SOURCE_TYPE_METADATA_KEY, metadata_enriched_table_provider,
 };
 
 #[derive(Debug, Snafu)]
@@ -66,6 +67,18 @@ struct ForeignKeyConstraint {
 
 /// FK constraints grouped by source table name within a schema.
 type ForeignKeyMap = HashMap<String, Vec<ForeignKeyConstraint>>;
+
+#[derive(Debug, Clone, Default)]
+struct TableComments {
+    table_comment: Option<String>,
+    column_comments: HashMap<String, String>,
+    column_source_types: HashMap<String, String>,
+}
+
+pub type PostgresTableMetadataRow = (Option<String>, String, Option<String>, String);
+
+/// Comment metadata grouped by source table name within a schema.
+type CommentMap = HashMap<String, TableComments>;
 
 /// A catalog provider for `PostgreSQL` that discovers schemas and tables
 /// by querying `information_schema`.
@@ -117,6 +130,17 @@ impl PostgresCatalogProvider {
                     HashMap::new()
                 }
             };
+            let comments = match self.list_comments(schema_name).await {
+                Ok(comments) => comments,
+                Err(e) => {
+                    tracing::warn!(
+                        schema = %schema_name,
+                        error = %e,
+                        "Failed to query comments for schema, continuing without comment metadata"
+                    );
+                    HashMap::new()
+                }
+            };
 
             let schema_provider = PostgresSchemaProvider::new(
                 Arc::clone(&self.pool),
@@ -124,7 +148,9 @@ impl PostgresCatalogProvider {
                 Arc::clone(&self.table_creator),
                 self.include.clone(),
             );
-            schema_provider.refresh_tables(&foreign_keys).await?;
+            schema_provider
+                .refresh_tables(&foreign_keys, &comments)
+                .await?;
             schemas.insert(schema_name.clone(), Arc::new(schema_provider));
         }
 
@@ -216,6 +242,70 @@ impl PostgresCatalogProvider {
             .collect();
 
         Ok(fk_map)
+    }
+
+    /// Query table and column comments for tables in the given schema.
+    async fn list_comments(&self, schema_name: &str) -> Result<CommentMap> {
+        let conn = self
+            .pool
+            .connect_direct()
+            .await
+            .context(ConnectionFailedSnafu)?;
+
+        let rows = conn
+            .conn
+            .query(
+                "SELECT \
+                     c.relname AS table_name, \
+                     obj_description(c.oid, 'pg_class') AS table_comment, \
+                     a.attname AS column_name, \
+                     col_description(c.oid, a.attnum) AS column_comment, \
+                     format_type(a.atttypid, a.atttypmod) AS column_source_type \
+                 FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 LEFT JOIN pg_catalog.pg_attribute a \
+                     ON a.attrelid = c.oid \
+                     AND a.attnum > 0 \
+                     AND NOT a.attisdropped \
+                 WHERE n.nspname = $1 \
+                 AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+                 ORDER BY c.relname, a.attnum",
+                &[&schema_name],
+            )
+            .await
+            .context(QueryFailedSnafu)?;
+
+        let mut comments_by_table = HashMap::new();
+        for row in &rows {
+            let table_name: String = row.get(0);
+            let table_comment: Option<String> = row.get(1);
+            let column_name: Option<String> = row.get(2);
+            let column_comment: Option<String> = row.get(3);
+            let column_source_type: Option<String> = row.get(4);
+
+            let comments: &mut TableComments = comments_by_table.entry(table_name).or_default();
+            if comments.table_comment.is_none()
+                && let Some(comment) = table_comment.filter(|comment| !comment.is_empty())
+            {
+                comments.table_comment = Some(comment);
+            }
+            if let Some(column_name) = column_name {
+                if let Some(comment) = column_comment.filter(|comment| !comment.is_empty()) {
+                    comments
+                        .column_comments
+                        .insert(column_name.clone(), comment);
+                }
+                if let Some(source_type) =
+                    column_source_type.filter(|source_type| !source_type.is_empty())
+                {
+                    comments
+                        .column_source_types
+                        .insert(column_name, source_type);
+                }
+            }
+        }
+
+        Ok(comments_by_table)
     }
 
     async fn list_schemas(&self) -> Result<Vec<String>> {
@@ -316,7 +406,11 @@ impl PostgresSchemaProvider {
         }
     }
 
-    async fn refresh_tables(&self, foreign_keys: &ForeignKeyMap) -> Result<()> {
+    async fn refresh_tables(
+        &self,
+        foreign_keys: &ForeignKeyMap,
+        comments: &CommentMap,
+    ) -> Result<()> {
         let table_names = self.list_tables().await?;
 
         let tables = build_table_providers_for_schema(
@@ -325,6 +419,7 @@ impl PostgresSchemaProvider {
             &self.table_creator,
             self.include.as_deref(),
             foreign_keys,
+            comments,
         )
         .await;
 
@@ -374,6 +469,7 @@ async fn build_table_providers_for_schema(
     table_creator: &Arc<dyn Read>,
     include: Option<&GlobSet>,
     foreign_keys: &ForeignKeyMap,
+    comments: &CommentMap,
 ) -> HashMap<String, Arc<dyn TableProvider>> {
     let mut tables = HashMap::new();
 
@@ -388,13 +484,11 @@ async fn build_table_providers_for_schema(
 
         match table_creator.table_provider(table_ref).await {
             Ok(provider) => {
-                let provider = if let Some(fks) = foreign_keys.get(&table_name) {
+                let mut table_metadata = HashMap::new();
+                if let Some(fks) = foreign_keys.get(&table_name) {
                     match serde_json::to_string(fks) {
                         Ok(fk_json) => {
-                            let extra =
-                                HashMap::from([(FOREIGN_KEYS_METADATA_KEY.to_string(), fk_json)]);
-                            Arc::new(MetadataEnrichedTableProvider::new(provider, extra))
-                                as Arc<dyn TableProvider>
+                            table_metadata.insert(FOREIGN_KEYS_METADATA_KEY.to_string(), fk_json);
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -403,11 +497,24 @@ async fn build_table_providers_for_schema(
                                 error = %e,
                                 "Failed to serialize foreign key metadata for table {schema_name}.{table_name}; registering without FK metadata"
                             );
-                            provider
                         }
                     }
-                } else {
+                }
+
+                let field_metadata =
+                    comments
+                        .get(&table_name)
+                        .map_or_else(HashMap::new, |comments| {
+                            let (comment_metadata, field_metadata) =
+                                table_comments_metadata(comments);
+                            table_metadata.extend(comment_metadata);
+                            field_metadata
+                        });
+
+                let provider = if table_metadata.is_empty() && field_metadata.is_empty() {
                     provider
+                } else {
+                    metadata_enriched_table_provider(provider, table_metadata, field_metadata)
                 };
                 tables.insert(table_name, provider);
             }
@@ -423,6 +530,55 @@ async fn build_table_providers_for_schema(
     }
 
     tables
+}
+
+fn table_comments_metadata(comments: &TableComments) -> (HashMap<String, String>, FieldMetadata) {
+    let mut table_metadata = HashMap::new();
+    if let Some(comment) = &comments.table_comment {
+        table_metadata.insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
+    }
+
+    let mut field_metadata = FieldMetadata::new();
+    for (column, source_type) in &comments.column_source_types {
+        field_metadata
+            .entry(column.clone())
+            .or_default()
+            .insert(SOURCE_TYPE_METADATA_KEY.to_string(), source_type.clone());
+    }
+    for (column, comment) in &comments.column_comments {
+        field_metadata
+            .entry(column.clone())
+            .or_default()
+            .insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
+    }
+
+    (table_metadata, field_metadata)
+}
+
+#[must_use]
+pub fn postgres_metadata_from_rows(
+    rows: impl IntoIterator<Item = PostgresTableMetadataRow>,
+) -> (HashMap<String, String>, FieldMetadata) {
+    let mut comments = TableComments::default();
+    for (table_comment, column_name, column_comment, column_source_type) in rows {
+        if comments.table_comment.is_none()
+            && let Some(comment) = table_comment.filter(|comment| !comment.is_empty())
+        {
+            comments.table_comment = Some(comment);
+        }
+        if let Some(comment) = column_comment.filter(|comment| !comment.is_empty()) {
+            comments
+                .column_comments
+                .insert(column_name.clone(), comment);
+        }
+        if !column_source_type.is_empty() {
+            comments
+                .column_source_types
+                .insert(column_name, column_source_type);
+        }
+    }
+
+    table_comments_metadata(&comments)
 }
 
 #[async_trait]
@@ -459,9 +615,10 @@ impl SchemaProvider for PostgresSchemaProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        ForeignKeyConstraint, ForeignKeyMap, build_table_providers_for_schema, is_table_included,
+        CommentMap, ForeignKeyConstraint, ForeignKeyMap, TableComments,
+        build_table_providers_for_schema, is_table_included,
     };
-    use crate::{FOREIGN_KEYS_METADATA_KEY, Read};
+    use crate::{COMMENT_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, Read, SOURCE_TYPE_METADATA_KEY};
     use async_trait::async_trait;
     use datafusion::catalog::Session;
     use datafusion::datasource::{TableProvider, TableType};
@@ -484,7 +641,13 @@ mod tests {
         }
 
         fn schema(&self) -> arrow::datatypes::SchemaRef {
-            Arc::new(arrow::datatypes::Schema::empty())
+            Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new(
+                    "customer_id",
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ),
+            ]))
         }
 
         fn table_type(&self) -> TableType {
@@ -573,6 +736,7 @@ mod tests {
         let include = make_include(&["public.orders"]);
         let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
         let no_fks: ForeignKeyMap = HashMap::new();
+        let no_comments: CommentMap = HashMap::new();
 
         let tables = build_table_providers_for_schema(
             "public",
@@ -580,6 +744,7 @@ mod tests {
             &table_creator,
             Some(&include),
             &no_fks,
+            &no_comments,
         )
         .await;
 
@@ -595,6 +760,7 @@ mod tests {
         let read = Arc::new(MockRead::new(fail_tables));
         let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
         let no_fks: ForeignKeyMap = HashMap::new();
+        let no_comments: CommentMap = HashMap::new();
 
         let tables = build_table_providers_for_schema(
             "public",
@@ -602,6 +768,7 @@ mod tests {
             &table_creator,
             None,
             &no_fks,
+            &no_comments,
         )
         .await;
 
@@ -622,6 +789,7 @@ mod tests {
         let read = Arc::new(MockRead::new(fail_tables));
         let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
         let no_fks: ForeignKeyMap = HashMap::new();
+        let no_comments: CommentMap = HashMap::new();
 
         let tables: HashMap<String, Arc<dyn TableProvider>> = build_table_providers_for_schema(
             "public",
@@ -629,6 +797,7 @@ mod tests {
             &table_creator,
             None,
             &no_fks,
+            &no_comments,
         )
         .await;
 
@@ -639,6 +808,7 @@ mod tests {
     async fn test_build_table_providers_injects_foreign_key_metadata() {
         let read = Arc::new(MockRead::new(HashSet::new()));
         let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
+        let no_comments: CommentMap = HashMap::new();
 
         let mut fk_map: ForeignKeyMap = HashMap::new();
         fk_map.insert(
@@ -656,6 +826,7 @@ mod tests {
             &table_creator,
             None,
             &fk_map,
+            &no_comments,
         )
         .await;
 
@@ -688,6 +859,7 @@ mod tests {
     async fn test_build_table_providers_injects_composite_foreign_key() {
         let read = Arc::new(MockRead::new(HashSet::new()));
         let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
+        let no_comments: CommentMap = HashMap::new();
 
         let mut fk_map: ForeignKeyMap = HashMap::new();
         fk_map.insert(
@@ -705,6 +877,7 @@ mod tests {
             &table_creator,
             None,
             &fk_map,
+            &no_comments,
         )
         .await;
 
@@ -727,6 +900,66 @@ mod tests {
         assert_eq!(
             fks[0]["foreign_columns"],
             serde_json::json!(["id", "line_num"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_table_providers_injects_comment_metadata() {
+        let read = Arc::new(MockRead::new(HashSet::new()));
+        let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
+        let no_fks: ForeignKeyMap = HashMap::new();
+
+        let mut comments: CommentMap = HashMap::new();
+        comments.insert(
+            "orders".to_string(),
+            TableComments {
+                table_comment: Some("order facts".to_string()),
+                column_comments: HashMap::from([(
+                    "customer_id".to_string(),
+                    "customer dimension key".to_string(),
+                )]),
+                column_source_types: HashMap::from([(
+                    "customer_id".to_string(),
+                    "bigint".to_string(),
+                )]),
+            },
+        );
+
+        let tables = build_table_providers_for_schema(
+            "public",
+            vec!["orders".to_string()],
+            &table_creator,
+            None,
+            &no_fks,
+            &comments,
+        )
+        .await;
+
+        let provider = tables.get("orders").expect("orders table should exist");
+        let schema = provider.schema();
+        assert_eq!(
+            schema
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .map(String::as_str),
+            Some("order facts")
+        );
+        let field = schema
+            .field_with_name("customer_id")
+            .expect("customer_id field should exist");
+        assert_eq!(
+            field
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .map(String::as_str),
+            Some("customer dimension key")
+        );
+        assert_eq!(
+            field
+                .metadata()
+                .get(SOURCE_TYPE_METADATA_KEY)
+                .map(String::as_str),
+            Some("bigint")
         );
     }
 }
