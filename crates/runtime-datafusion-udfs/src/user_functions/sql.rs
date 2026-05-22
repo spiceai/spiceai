@@ -65,7 +65,7 @@ use spicepod::component::function::{
 };
 use util::session_state::builder_from_existing;
 
-const SQL_TABLE_ARGS_TABLE_NAME: &str = "args";
+pub(crate) const SQL_TABLE_ARGS_TABLE_NAME: &str = "args";
 
 /// Monotonic identifier for built SQL UDFs — used as the basis for
 /// [`Hash`] / [`Eq`] since physical expressions cannot derive them.
@@ -514,6 +514,15 @@ impl TableProvider for SqlTableProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // Inline literal args into the body SQL so that filter pushdown
+        // can see concrete values (e.g. for HTTP connector's request_path).
+        let body = super::args_inliner::inline_args_into_body(
+            &self.body,
+            self.arg_schema.as_ref(),
+            &self.args,
+        )
+        .unwrap_or_else(|| self.body.clone());
+
         let ctx = context_with_args_and_tables(
             Some(state),
             Arc::clone(&self.arg_schema),
@@ -522,7 +531,7 @@ impl TableProvider for SqlTableProvider {
             &self.name,
         )
         .await?;
-        let mut df = ctx.sql(&self.body).await?;
+        let mut df = ctx.sql(&body).await?;
         validate_output_schema(&self.name, df.schema().as_arrow(), self.schema.as_ref())
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
         if let Some(limit) = limit {
