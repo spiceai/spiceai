@@ -216,6 +216,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     match oltp_result {
         Ok(Ok(report)) => {
             report.print_summary();
+            crate::metrics::OLTP_TPMC.record(report.tpmc, &[]);
         }
         Ok(Err(e)) => {
             eprintln!("OLTP workload error: {e}");
