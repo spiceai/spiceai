@@ -207,7 +207,7 @@ impl MetadataEnrichedTableProvider {
         Self { inner, schema }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn get_inner_ref(&self) -> &Arc<dyn TableProvider> {
         &self.inner
     }
