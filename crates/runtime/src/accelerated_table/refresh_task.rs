@@ -47,6 +47,7 @@ use arrow::{
 use arrow_schema::SchemaRef;
 use async_stream::stream;
 use data_components::poly::PolyTableProvider;
+use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use datafusion::catalog::MemoryCatalogProvider;
 use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::execution::SessionStateBuilder;
@@ -103,6 +104,27 @@ const NANOS_TO_MILLIS: u128 = 1_000_000;
 // Callback which is called after each batch of streaming data is processed by the `RefreshTask`.
 type StreamBatchProcessCallback =
     Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>;
+
+fn table_provider_with_existing_metadata(
+    provider: Arc<dyn TableProvider>,
+) -> Arc<dyn TableProvider> {
+    let schema = provider.schema();
+    let table_metadata = schema.metadata().clone();
+    let field_metadata = schema
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            let metadata = field.metadata().clone();
+            (!metadata.is_empty()).then(|| (field.name().clone(), metadata))
+        })
+        .collect::<FieldMetadata>();
+
+    if table_metadata.is_empty() && field_metadata.is_empty() {
+        return provider;
+    }
+
+    metadata_enriched_table_provider(provider, table_metadata, field_metadata)
+}
 
 #[derive(Debug, Clone, Default)]
 struct RefreshStat {
@@ -1526,6 +1548,7 @@ impl RefreshTask {
             );
         }
 
+        let federated_provider = table_provider_with_existing_metadata(federated_provider);
         if let Err(e) = ctx.register_table(dataset_name.clone(), federated_provider) {
             tracing::error!("Unable to register federated table: {e}");
         }

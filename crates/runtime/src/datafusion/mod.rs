@@ -68,7 +68,7 @@ use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
 use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
-use data_components::poly::PolyTableProvider;
+use data_components::{FieldMetadata, metadata_enriched_table_provider, poly::PolyTableProvider};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::common::{Constraint, Constraints, ToDFSchema};
@@ -104,7 +104,7 @@ use runtime_table_partition::provider::PartitionTableProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
 use spicepod::acceleration::SnapshotsTrigger;
-use spicepod::metric::Metrics;
+use spicepod::{metric::Metrics, semantic::Column};
 use tokio::runtime::Handle;
 use tokio::spawn;
 use tokio::sync::{Mutex, Notify};
@@ -618,6 +618,29 @@ pub enum Table {
     },
 }
 
+fn table_provider_with_spicepod_metadata(
+    provider: Arc<dyn TableProvider>,
+    table_metadata: &HashMap<String, String>,
+    columns: &[Column],
+) -> Arc<dyn TableProvider> {
+    let field_metadata = field_metadata_from_columns(columns);
+    if table_metadata.is_empty() && field_metadata.is_empty() {
+        return provider;
+    }
+
+    metadata_enriched_table_provider(provider, table_metadata.clone(), field_metadata)
+}
+
+fn field_metadata_from_columns(columns: &[Column]) -> FieldMetadata {
+    columns
+        .iter()
+        .filter_map(|column| {
+            let metadata = column.metadata();
+            (!metadata.is_empty()).then(|| (column.name.clone(), metadata))
+        })
+        .collect()
+}
+
 struct PendingSinkRegistration {
     dataset: Arc<Dataset>,
     secrets: Arc<TokioRwLock<Secrets>>,
@@ -969,11 +992,13 @@ impl DataFusion {
                         "Registering dataset {dataset:?} with preloaded accelerated table"
                     );
                     let notifier = accelerated_table.refresher().on_complete_notification();
+                    let table_provider = table_provider_with_spicepod_metadata(
+                        accelerated_table.table_provider(),
+                        &dataset.metadata,
+                        &dataset.columns,
+                    );
                     self.ctx
-                        .register_table(
-                            dataset_table_ref.clone(),
-                            accelerated_table.table_provider(),
-                        )
+                        .register_table(dataset_table_ref.clone(), table_provider)
                         .map_err(find_datafusion_root)
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
                     notifier
@@ -1938,6 +1963,11 @@ impl DataFusion {
                     .build()
                 })?
                 .context(UnableToResolveTableProviderSnafu)?;
+            let read_write_provider = table_provider_with_spicepod_metadata(
+                read_write_provider,
+                &dataset.metadata,
+                &dataset.columns,
+            );
             Arc::new(FederatedTable::new_unchecked(read_write_provider))
         } else {
             Arc::new(federated_read_table)
@@ -2660,11 +2690,14 @@ impl DataFusion {
             .await
             .context(AccelerationRegistrationSnafu)?;
 
+        let table_provider = table_provider_with_spicepod_metadata(
+            Arc::new(accelerated_table).table_provider(),
+            &dataset.metadata,
+            &dataset.columns,
+        );
+
         self.ctx
-            .register_table(
-                dataset.name.clone(),
-                Arc::new(accelerated_table).table_provider(),
-            )
+            .register_table(dataset.name.clone(), table_provider)
             .map_err(find_datafusion_root)
             .context(UnableToRegisterTableToDataFusionSnafu)?;
 
@@ -2924,6 +2957,12 @@ impl DataFusion {
         self.register_metadata_table(dataset, Arc::clone(&source))
             .await?;
 
+        let source_table_provider = table_provider_with_spicepod_metadata(
+            source_table_provider,
+            &dataset.metadata,
+            &dataset.columns,
+        );
+
         self.ctx
             .register_table(dataset.name.clone(), source_table_provider)
             .map_err(find_datafusion_root)
@@ -3072,6 +3111,8 @@ impl DataFusion {
             }
 
             // non-accelerated view
+            let tbl_provider =
+                table_provider_with_spicepod_metadata(tbl_provider, &view.metadata, &view.columns);
             if let Err(e) = ctx.register_table(table.clone(), tbl_provider) {
                 tracing::error!("Failed to create view {table}: {e}");
                 status.update_view(
@@ -3104,6 +3145,8 @@ impl DataFusion {
                     name: table.to_string(),
                 })?;
 
+        let view_table =
+            table_provider_with_spicepod_metadata(view_table, &view.metadata, &view.columns);
         let schema = view_table.schema();
 
         // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
@@ -3208,10 +3251,16 @@ impl DataFusion {
 
         let is_ready = accelerated_table.refresher().on_complete_notification();
 
+        let table_provider = table_provider_with_spicepod_metadata(
+            Arc::new(accelerated_table).table_provider(),
+            &view.metadata,
+            &view.columns,
+        );
+
         self.ctx
-            .register_table(table.clone(), Arc::new(accelerated_table).table_provider())
+            .register_table(table.clone(), table_provider)
             .map_err(|e| Error::UnableToCreateView {
-                reason: format!("Failed to registed view: {e}"),
+                reason: format!("Failed to register view: {e}"),
             })?;
 
         tracing::info!("{}", view_registered_trace(table, Some(acceleration)));
@@ -4057,6 +4106,89 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![value])) as arrow::array::ArrayRef],
         )
         .expect("test record batch should be valid")
+    }
+
+    async fn registered_schema_with_metadata(
+        table_name: &str,
+        table_metadata: &HashMap<String, String>,
+        columns: &[Column],
+    ) -> SchemaRef {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let table_provider =
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("mem table should be created"))
+                as Arc<dyn TableProvider>;
+
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            TableReference::bare(table_name),
+            table_provider_with_spicepod_metadata(table_provider, table_metadata, columns),
+        )
+        .expect("table should register");
+
+        ctx.table_provider(table_name)
+            .await
+            .expect("registered table should resolve")
+            .schema()
+    }
+
+    #[tokio::test]
+    async fn dataset_spicepod_metadata_is_registered_on_schema_and_fields() {
+        let mut dataset = spicepod::component::dataset::Dataset::new("test", "dataset_meta");
+        dataset.description = Some("dataset description".to_string());
+        dataset.metadata.insert(
+            "source_owner".to_string(),
+            serde_json::Value::String("analytics".to_string()),
+        );
+
+        let mut id_column = Column::new("id");
+        id_column.description = Some("stable row id".to_string());
+        dataset.columns.push(id_column);
+
+        let metadata = dataset.metadata();
+        let schema =
+            registered_schema_with_metadata("dataset_meta", &metadata, &dataset.columns).await;
+
+        assert_eq!(
+            schema.metadata().get("comment").map(String::as_str),
+            Some("dataset description")
+        );
+        assert_eq!(
+            schema.metadata().get("source_owner").map(String::as_str),
+            Some("analytics")
+        );
+        let id_field = schema.field_with_name("id").expect("id field should exist");
+        assert_eq!(
+            id_field.metadata().get("comment").map(String::as_str),
+            Some("stable row id")
+        );
+    }
+
+    #[tokio::test]
+    async fn view_spicepod_metadata_is_registered_on_schema_and_fields() {
+        let mut view = spicepod::component::view::View::new("view_meta".to_string());
+        view.description = Some("view description".to_string());
+
+        let mut name_column = Column::new("name");
+        name_column.description = Some("display name".to_string());
+        view.columns.push(name_column);
+
+        let metadata = view.metadata();
+        let schema = registered_schema_with_metadata("view_meta", &metadata, &view.columns).await;
+
+        assert_eq!(
+            schema.metadata().get("comment").map(String::as_str),
+            Some("view description")
+        );
+        let name_field = schema
+            .field_with_name("name")
+            .expect("name field should exist");
+        assert_eq!(
+            name_field.metadata().get("comment").map(String::as_str),
+            Some("display name")
+        );
     }
 
     #[test]
