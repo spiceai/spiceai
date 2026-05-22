@@ -1062,6 +1062,29 @@ impl RefreshTask {
 
         let info = match download_result {
             Ok(Some(info)) => info,
+            Ok(None) if current_local_id.is_none() => {
+                // No snapshot has ever been loaded and none is available at the configured location.
+                tracing::warn!(
+                    dataset = %self.dataset_name,
+                    snapshot_location = %state.manager.snapshot_location(),
+                    "refresh_mode: snapshot - no snapshot found at the configured location. Ensure the snapshot location is correct and that a snapshot has been created."
+                );
+                self.set_refresh_status(
+                    None,
+                    status::ComponentStatus::error_with_message(
+                        "no snapshot available".to_string(),
+                    ),
+                )
+                .await;
+                return Err(RetryError::transient(
+                    super::Error::FailedToRefreshDataset {
+                        source: datafusion::error::DataFusionError::Internal(
+                            "refresh_mode: snapshot - no snapshot found at the configured location"
+                                .to_string(),
+                        ),
+                    },
+                ));
+            }
             Ok(None) => {
                 tracing::debug!(
                     dataset = %self.dataset_name,
