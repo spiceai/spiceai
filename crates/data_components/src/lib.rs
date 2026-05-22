@@ -223,6 +223,10 @@ impl TableProvider for MetadataEnrichedTableProvider {
         self.inner.update(state, assignments, filters).await
     }
 
+    async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.inner.truncate(state).await
+    }
+
     fn statistics(&self) -> Option<Statistics> {
         self.inner.statistics()
     }
