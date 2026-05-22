@@ -52,8 +52,8 @@ use ingestion_targets::ec2_postgres::{
     Ec2PostgresInstance, is_ec2_mode, launch_postgres_ec2, terminate_ec2_instance,
 };
 use ingestion_targets::postgres_cdc::{
-    PgConfig, generate_postgres_wal_spicepod, setup_postgres_for_wal, teardown_postgres,
-    tpch_schema_name,
+    PgConfig, generate_postgres_wal_spicepod, pg_create_table_ddl, pg_error_message,
+    setup_postgres_for_wal, teardown_postgres, tpch_schema_name,
 };
 use provision_local::{
     provision_local_single_node, provision_local_spiced_cluster, teardown_local_run,
@@ -554,10 +554,23 @@ impl Handler for SpidapterHandler {
         source_dataset: &str,
         staging_table_name: &str,
     ) -> std::result::Result<system_adapter_protocol::CreateStagingTableResponse, String> {
-        let state = self
-            .runs
-            .get(&run_id)
-            .ok_or_else(|| format!("No active run found for {run_id}"))?;
+        // Extract state fields upfront, cloning to release the borrow before async ops.
+        let (pg_config, sql_url, api_key) = {
+            let state = self
+                .runs
+                .get(&run_id)
+                .ok_or_else(|| format!("No active run found for {run_id}"))?;
+            let pg_config: Option<PgConfig> = match state {
+                RunState::Scp { pg_config, .. } => *pg_config.clone(),
+                RunState::Local(local) => local.pg_config.clone(),
+            };
+            (
+                pg_config,
+                state.sql_url().to_string(),
+                state.api_key().map(|s| s.to_string()),
+            )
+        };
+
         if !self
             .run_datasets
             .get(&run_id)
@@ -568,21 +581,53 @@ impl Handler for SpidapterHandler {
             ));
         }
 
-        // Use CREATE TABLE ... LIKE ... to copy schema, partition expression,
-        // AND partition-to-executor assignments from the source table.
-        let quoted_staging = quote_identifier(staging_table_name);
-        let quoted_source = quote_identifier(source_dataset);
-        let ddl = format!(
-            "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_staging} LIKE spicebench.bench.{quoted_source}"
-        );
-
-        eprintln!(
-            "[stdio] create_staging_table: source={source_dataset}, staging={staging_table_name}, sql={ddl}"
-        );
-
-        execute_sql_statement(state.sql_url(), state.api_key(), &ddl)
-            .await
-            .map_err(|e| format!("Failed to execute staging table DDL: {e}"))?;
+        if let Some(ref pg) = pg_config {
+            // PostgresCdc: create staging table directly in PostgreSQL.
+            let source_config = self
+                .run_datasets
+                .get(&run_id)
+                .and_then(|ds| ds.get(source_dataset))
+                .ok_or_else(|| {
+                    format!("Source dataset '{source_dataset}' not found in run {run_id}")
+                })?;
+            let ddl = pg_create_table_ddl(&pg.schema, staging_table_name, source_config)
+                .map_err(|e| {
+                    format!(
+                        "Failed to generate staging table DDL for '{staging_table_name}': {e}"
+                    )
+                })?;
+            eprintln!(
+                "[stdio] create_staging_table (postgres): source={source_dataset}, staging={staging_table_name}, sql={ddl}"
+            );
+            let client = pg
+                .connect()
+                .await
+                .map_err(|e| format!("Failed to connect to PostgreSQL: {e}"))?;
+            client
+                .execute(ddl.as_str(), &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)])
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Failed to create staging table '{staging_table_name}': {}",
+                        pg_error_message(&e)
+                    )
+                })?;
+        } else {
+            // Cayenne: copy schema from source via Spice SQL.
+            // Use CREATE TABLE ... LIKE ... to copy schema, partition expression,
+            // and partition-to-executor assignments from the source table.
+            let quoted_staging = quote_identifier(staging_table_name);
+            let quoted_source = quote_identifier(source_dataset);
+            let ddl = format!(
+                "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_staging} LIKE spicebench.bench.{quoted_source}"
+            );
+            eprintln!(
+                "[stdio] create_staging_table: source={source_dataset}, staging={staging_table_name}, sql={ddl}"
+            );
+            execute_sql_statement(&sql_url, api_key.as_deref(), &ddl)
+                .await
+                .map_err(|e| format!("Failed to execute staging table DDL: {e}"))?;
+        }
 
         Ok(system_adapter_protocol::CreateStagingTableResponse { ok: true })
     }
@@ -964,6 +1009,8 @@ mod tests {
             ec2_security_group_id: None,
             ec2_ami_id: None,
             ec2_instance_type: "m5.large".to_string(),
+            ec2_associate_public_ip: false,
+            ec2_iam_instance_profile: None,
             spiced_binary: "spiced".to_string(),
         }
     }
