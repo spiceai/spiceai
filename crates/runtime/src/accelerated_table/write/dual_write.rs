@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Write-through execution path for [`WriteMode::WriteThrough`].
+//! Dual-write execution path for [`WriteMode::DualWrite`].
 //!
 //! Writes are applied simultaneously to the Cayenne accelerator (via staged
 //! append) and the federated source. On success both sides commit; on
@@ -22,6 +22,13 @@ limitations under the License.
 //! synchronously. Supports both non-partitioned and partitioned Cayenne
 //! accelerators.
 //!
+//! This path is reserved for the Iceberg federated catalog cache use case
+//! where Cayenne acts as a write-through cache in front of an Iceberg catalog
+//! that has no CDC stream to propagate writes. It is *not* exposed through the
+//! spicepod `write_mode: write_through` setting — that maps to
+//! [`WriteMode::WriteThrough`] (source-sync, accelerator via refresh).
+//!
+//! [`WriteMode::DualWrite`]: super::WriteMode::DualWrite
 //! [`WriteMode::WriteThrough`]: super::WriteMode::WriteThrough
 
 use std::any::Any;
@@ -60,7 +67,7 @@ use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_table_partition::insert::partition_batch_composite;
 use runtime_table_partition::provider::PartitionTableProvider;
 
-/// Target for Cayenne-based write-through operations.
+/// Target for Cayenne-based dual-write operations.
 #[derive(Debug)]
 pub(crate) enum CayenneWriteTarget {
     Staged(Box<CayenneTableProvider>),
@@ -76,10 +83,10 @@ impl Clone for CayenneWriteTarget {
     }
 }
 
-/// Creates a `DataSinkExec` plan for write-through inserts.
+/// Creates a `DataSinkExec` plan for dual-write inserts.
 ///
-/// Called from `AcceleratedTable::insert_into` when the write mode is `WriteThrough`.
-pub(crate) fn insert_write_through(
+/// Called from `AcceleratedTable::insert_into` when the write mode is `DualWrite`.
+pub(crate) fn insert_dual_write(
     input: Arc<dyn ExecutionPlan>,
     overwrite: InsertOp,
     cayenne_target: &CayenneWriteTarget,
@@ -90,7 +97,7 @@ pub(crate) fn insert_write_through(
     match overwrite {
         InsertOp::Append => Ok(Arc::new(DataSinkExec::new(
             input,
-            Arc::new(WriteThroughDataSink::new(
+            Arc::new(DualWriteDataSink::new(
                 cayenne_target.clone(),
                 federated_provider,
                 Arc::clone(refresher),
@@ -99,20 +106,20 @@ pub(crate) fn insert_write_through(
             None,
         ))),
         InsertOp::Overwrite | InsertOp::Replace => Err(DataFusionError::Plan(
-            "Write-through accelerated catalog tables currently support append writes only"
+            "Dual-write accelerated catalog tables currently support append writes only"
                 .to_string(),
         )),
     }
 }
 
-struct WriteThroughDataSink {
+struct DualWriteDataSink {
     accelerator: CayenneWriteTarget,
     federated: Arc<dyn TableProvider>,
     refresher: Arc<refresh::Refresher>,
     schema: SchemaRef,
 }
 
-impl WriteThroughDataSink {
+impl DualWriteDataSink {
     fn new(
         accelerator: CayenneWriteTarget,
         federated: Arc<dyn TableProvider>,
@@ -128,21 +135,20 @@ impl WriteThroughDataSink {
     }
 }
 
-impl std::fmt::Debug for WriteThroughDataSink {
+impl std::fmt::Debug for DualWriteDataSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WriteThroughDataSink")
-            .finish_non_exhaustive()
+        f.debug_struct("DualWriteDataSink").finish_non_exhaustive()
     }
 }
 
-impl DisplayAs for WriteThroughDataSink {
+impl DisplayAs for DualWriteDataSink {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "WriteThroughDataSink")
+        write!(f, "DualWriteDataSink")
     }
 }
 
 #[async_trait]
-impl DataSink for WriteThroughDataSink {
+impl DataSink for DualWriteDataSink {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -190,7 +196,12 @@ impl DataSink for WriteThroughDataSink {
             target_partitions,
         );
 
+        // `upstream_error` captures real upstream failures (`data.next()` yielding `Err`).
+        // `channels_closed_early` records the *symptom* of a downstream task aborting
+        // (its receiver got dropped). The real cause then lives in `staged_result` /
+        // `source_result`; using the channel-close sentinel here would mask it.
         let mut upstream_error: Option<DataFusionError> = None;
+        let mut channels_closed_early = false;
 
         while let Some(batch_result) = data.next().await {
             match batch_result {
@@ -198,10 +209,7 @@ impl DataSink for WriteThroughDataSink {
                     if source_tx.send(Ok(batch.clone())).await.is_err()
                         || accelerator_tx.send(Ok(batch)).await.is_err()
                     {
-                        upstream_error = Some(DataFusionError::Execution(
-                            "Write-through insert stream terminated before both write paths completed"
-                                .to_string(),
-                        ));
+                        channels_closed_early = true;
                         break;
                     }
                 }
@@ -227,6 +235,15 @@ impl DataSink for WriteThroughDataSink {
 
         match (staged_result, source_result, upstream_error) {
             (Ok(staged), Ok(()), None) => {
+                if channels_closed_early {
+                    if let Err(error) = staged.rollback().await {
+                        tracing::error!("Failed to roll back staged Cayenne write: {error}");
+                    }
+                    return Err(DataFusionError::Execution(
+                        "Dual-write insert stream terminated before both write paths completed"
+                            .to_string(),
+                    ));
+                }
                 let row_count = staged.commit().await?;
                 self.refresher.set_initial_load_completed(true);
                 Ok(row_count)
@@ -247,12 +264,10 @@ impl DataSink for WriteThroughDataSink {
                     Err(error) => Err(error),
                 }
             }
-            (Err(staged_error), Ok(()), upstream_error) => Err(upstream_error.unwrap_or(staged_error)),
-            (Err(staged_error), Err(source_error), upstream_error) => {
-                Err(upstream_error.unwrap_or_else(|| DataFusionError::Execution(format!(
-                    "Write-through insert failed for both accelerator and federated source: accelerator={staged_error}; source={source_error}"
-                ))))
-            }
+            (Err(staged_error), Ok(()), _) => Err(staged_error),
+            (Err(staged_error), Err(source_error), _) => Err(DataFusionError::Execution(format!(
+                "Dual-write insert failed for both accelerator and federated source: accelerator={staged_error}; source={source_error}"
+            ))),
         }
     }
 }
@@ -269,8 +284,7 @@ async fn write_all_with_partitioned_cayenne(
         .downcast_ref::<PartitionTableProvider>()
         .ok_or_else(|| {
             DataFusionError::Execution(
-                "Write-through partitioned Cayenne path requires a PartitionTableProvider"
-                    .to_string(),
+                "Dual-write partitioned Cayenne path requires a PartitionTableProvider".to_string(),
             )
         })?;
 
@@ -280,7 +294,11 @@ async fn write_all_with_partitioned_cayenne(
     let source_task =
         spawn_federated_insert(Arc::clone(&federated), Arc::clone(&schema), source_rx);
 
+    // See note in the non-partitioned path. `upstream_error` is for real upstream
+    // failures; `channels_closed_early` is the downstream-abort symptom and must not
+    // mask the underlying `staged_error` / `source_error`.
     let mut upstream_error: Option<DataFusionError> = None;
+    let mut channels_closed_early = false;
     let mut partition_senders =
         HashMap::<String, mpsc::Sender<datafusion::common::Result<RecordBatch>>>::new();
     let mut partition_handles = Vec::new();
@@ -299,7 +317,7 @@ async fn write_all_with_partitioned_cayenne(
                         let cayenne = downcast_to_cayenne(&partition_provider)
                             .ok_or_else(|| {
                                 DataFusionError::Execution(
-                                    "Write-through partitioned Cayenne path requires Cayenne-backed partition providers"
+                                    "Dual-write partitioned Cayenne path requires Cayenne-backed partition providers"
                                         .to_string(),
                                 )
                             })?;
@@ -316,29 +334,17 @@ async fn write_all_with_partitioned_cayenne(
                     };
 
                     if sender.send(Ok(partition_batch)).await.is_err() {
-                        upstream_error = Some(DataFusionError::Execution(
-                            "Write-through partitioned accelerator stream terminated before staging completed"
-                                .to_string(),
-                        ));
+                        channels_closed_early = true;
                         break;
                     }
                 }
 
-                if upstream_error.is_some() {
-                    let _ = source_tx
-                        .send(Err(DataFusionError::Execution(
-                            "Write-through partitioned accelerator stream terminated before staging completed"
-                                .to_string(),
-                        )))
-                        .await;
+                if channels_closed_early {
                     break;
                 }
 
                 if source_tx.send(Ok(batch)).await.is_err() {
-                    upstream_error = Some(DataFusionError::Execution(
-                        "Write-through insert stream terminated before the federated write completed"
-                            .to_string(),
-                    ));
+                    channels_closed_early = true;
                     break;
                 }
             }
@@ -366,6 +372,17 @@ async fn write_all_with_partitioned_cayenne(
 
     match (staged_result, source_result, upstream_error) {
         (Ok(staged), Ok(()), None) => {
+            if channels_closed_early {
+                if let Err(error) = staged.rollback().await {
+                    tracing::error!(
+                        "Failed to roll back staged partitioned Cayenne write: {error}"
+                    );
+                }
+                return Err(DataFusionError::Execution(
+                    "Dual-write partitioned insert stream terminated before both write paths completed"
+                        .to_string(),
+                ));
+            }
             let row_count = staged.commit().await?;
             refresher.set_initial_load_completed(true);
             Ok(row_count)
@@ -386,12 +403,10 @@ async fn write_all_with_partitioned_cayenne(
                 Err(error) => Err(error),
             }
         }
-        (Err(staged_error), Ok(()), upstream_error) => Err(upstream_error.unwrap_or(staged_error)),
-        (Err(staged_error), Err(source_error), upstream_error) => {
-            Err(upstream_error.unwrap_or_else(|| DataFusionError::Execution(format!(
-                "Write-through insert failed for both partitioned accelerator and federated source: accelerator={staged_error}; source={source_error}"
-            ))))
-        }
+        (Err(staged_error), Ok(()), _) => Err(staged_error),
+        (Err(staged_error), Err(source_error), _) => Err(DataFusionError::Execution(format!(
+            "Dual-write insert failed for both partitioned accelerator and federated source: accelerator={staged_error}; source={source_error}"
+        ))),
     }
 }
 
@@ -555,7 +570,7 @@ async fn join_source_task(
     match handle.await {
         Ok(result) => result,
         Err(error) => Err(DataFusionError::Execution(format!(
-            "Federated write-through task failed: {error}"
+            "Federated dual-write task failed: {error}"
         ))),
     }
 }
@@ -572,16 +587,16 @@ async fn join_staged_task(
 }
 
 // ---------------------------------------------------------------------------
-// Write-through delete and update
+// Dual-write delete and update
 // ---------------------------------------------------------------------------
 
-/// Creates a `DeletionExec` plan for write-through deletes.
+/// Creates a `DeletionExec` plan for dual-write deletes.
 ///
 /// Federated delete runs first; if it succeeds the accelerator delete follows.
 /// Both must succeed — if the accelerator delete fails the error is surfaced so
 /// the caller knows the operation did not fully complete (the next refresh cycle
 /// will reconcile, but the caller should be aware).
-pub(crate) async fn delete_write_through(
+pub(crate) async fn delete_dual_write(
     state: &dyn Session,
     filters: Vec<Expr>,
     cayenne_target: &CayenneWriteTarget,
@@ -597,12 +612,12 @@ pub(crate) async fn delete_write_through(
         .downcast_ref::<SessionState>()
         .ok_or_else(|| {
             DataFusionError::Internal(
-                "Session is not a SessionState in delete_write_through".to_string(),
+                "Session is not a SessionState in delete_dual_write".to_string(),
             )
         })?
         .clone();
     Ok(Arc::new(DeletionExec::new(Arc::new(
-        WriteThroughDeletionSink {
+        DualWriteDeletionSink {
             federated_plan,
             accelerator_plan,
             session_state,
@@ -610,14 +625,14 @@ pub(crate) async fn delete_write_through(
     ))))
 }
 
-struct WriteThroughDeletionSink {
+struct DualWriteDeletionSink {
     federated_plan: Arc<dyn ExecutionPlan>,
     accelerator_plan: Arc<dyn ExecutionPlan>,
     session_state: SessionState,
 }
 
 #[async_trait]
-impl DeletionSink for WriteThroughDeletionSink {
+impl DeletionSink for DualWriteDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let task_ctx = self.session_state.task_ctx();
 
@@ -634,10 +649,10 @@ impl DeletionSink for WriteThroughDeletionSink {
     }
 }
 
-/// Creates a `DeletionExec` plan for write-through updates.
+/// Creates a `DeletionExec` plan for dual-write updates.
 ///
 /// Federated update runs first; if it succeeds the accelerator update follows.
-pub(crate) async fn update_write_through(
+pub(crate) async fn update_dual_write(
     state: &dyn Session,
     assignments: Vec<(String, Expr)>,
     filters: Vec<Expr>,
@@ -654,27 +669,25 @@ pub(crate) async fn update_write_through(
         .downcast_ref::<SessionState>()
         .ok_or_else(|| {
             DataFusionError::Internal(
-                "Session is not a SessionState in update_write_through".to_string(),
+                "Session is not a SessionState in update_dual_write".to_string(),
             )
         })?
         .clone();
-    Ok(Arc::new(DeletionExec::new(Arc::new(
-        WriteThroughUpdateSink {
-            federated_plan,
-            accelerator_plan,
-            session_state,
-        },
-    ))))
+    Ok(Arc::new(DeletionExec::new(Arc::new(DualWriteUpdateSink {
+        federated_plan,
+        accelerator_plan,
+        session_state,
+    }))))
 }
 
-struct WriteThroughUpdateSink {
+struct DualWriteUpdateSink {
     federated_plan: Arc<dyn ExecutionPlan>,
     accelerator_plan: Arc<dyn ExecutionPlan>,
     session_state: SessionState,
 }
 
 #[async_trait]
-impl DeletionSink for WriteThroughUpdateSink {
+impl DeletionSink for DualWriteUpdateSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let task_ctx = self.session_state.task_ctx();
 
@@ -700,7 +713,7 @@ fn cayenne_target_as_provider(target: &CayenneWriteTarget) -> Arc<dyn TableProvi
 
 #[cfg(test)]
 mod tests {
-    use super::{WriteThroughDeletionSink, WriteThroughUpdateSink};
+    use super::{DualWriteDeletionSink, DualWriteUpdateSink};
     use arrow::array::UInt64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -803,11 +816,11 @@ mod tests {
         }
     }
 
-    // ── WriteThroughDeletionSink ─────────────────────────────────────────
+    // ── DualWriteDeletionSink ─────────────────────────────────────────
 
     #[tokio::test]
-    async fn write_through_deletion_count_comes_from_federated() {
-        let sink = WriteThroughDeletionSink {
+    async fn dual_write_deletion_count_comes_from_federated() {
+        let sink = DualWriteDeletionSink {
             federated_plan: count_exec(5),
             accelerator_plan: count_exec(0),
             session_state: SessionContext::new().state(),
@@ -818,8 +831,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_through_deletion_federated_error_propagates() {
-        let sink = WriteThroughDeletionSink {
+    async fn dual_write_deletion_federated_error_propagates() {
+        let sink = DualWriteDeletionSink {
             federated_plan: ErrorExec::new_arc("federated delete failed"),
             accelerator_plan: count_exec(0),
             session_state: SessionContext::new().state(),
@@ -830,8 +843,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_through_deletion_accelerator_error_propagates() {
-        let sink = WriteThroughDeletionSink {
+    async fn dual_write_deletion_accelerator_error_propagates() {
+        let sink = DualWriteDeletionSink {
             federated_plan: count_exec(5),
             accelerator_plan: ErrorExec::new_arc("accelerator delete failed"),
             session_state: SessionContext::new().state(),
@@ -841,11 +854,11 @@ mod tests {
         assert!(err.to_string().contains("accelerator delete failed"));
     }
 
-    // ── WriteThroughUpdateSink ───────────────────────────────────────────
+    // ── DualWriteUpdateSink ───────────────────────────────────────────
 
     #[tokio::test]
-    async fn write_through_update_count_comes_from_federated() {
-        let sink = WriteThroughUpdateSink {
+    async fn dual_write_update_count_comes_from_federated() {
+        let sink = DualWriteUpdateSink {
             federated_plan: count_exec(3),
             accelerator_plan: count_exec(0),
             session_state: SessionContext::new().state(),
@@ -856,8 +869,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_through_update_federated_error_propagates() {
-        let sink = WriteThroughUpdateSink {
+    async fn dual_write_update_federated_error_propagates() {
+        let sink = DualWriteUpdateSink {
             federated_plan: ErrorExec::new_arc("federated update failed"),
             accelerator_plan: count_exec(0),
             session_state: SessionContext::new().state(),
@@ -868,8 +881,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_through_update_accelerator_error_propagates() {
-        let sink = WriteThroughUpdateSink {
+    async fn dual_write_update_accelerator_error_propagates() {
+        let sink = DualWriteUpdateSink {
             federated_plan: count_exec(3),
             accelerator_plan: ErrorExec::new_arc("accelerator update failed"),
             session_state: SessionContext::new().state(),
