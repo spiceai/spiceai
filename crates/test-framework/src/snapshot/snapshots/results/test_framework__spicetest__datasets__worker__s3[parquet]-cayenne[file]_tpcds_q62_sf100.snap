@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q62"
+---
++-------------------------------------------------------+----------+----------+---------+------------+------------+-------------+-----------+
+| substr(warehouse.w_warehouse_name,Int64(1),Int64(20)) | sm_type  | web_name | 30 days | 31-60 days | 61-90 days | 91-120 days | >120 days |
++-------------------------------------------------------+----------+----------+---------+------------+------------+-------------+-----------+
+| Certainly fede                                        | EXPRESS  | site_0   | 11954   | 11994      | 11978      | 11797       | 0         |
+| Certainly fede                                        | EXPRESS  | site_1   | 12278   | 12115      | 12243      | 12014       | 0         |
+| Certainly fede                                        | EXPRESS  | site_2   | 11870   | 12148      | 12025      | 11915       | 0         |
+| Certainly fede                                        | EXPRESS  | site_3   | 12095   | 12105      | 12216      | 11910       | 0         |
+| Certainly fede                                        | LIBRARY  | site_0   | 9187    | 9093       | 8823       | 9059        | 0         |
+| Certainly fede                                        | LIBRARY  | site_1   | 8908    | 8916       | 9169       | 9115        | 0         |
+| Certainly fede                                        | LIBRARY  | site_2   | 8927    | 9245       | 8969       | 9078        | 0         |
+| Certainly fede                                        | LIBRARY  | site_3   | 9058    | 8986       | 8832       | 9083        | 0         |
+| Certainly fede                                        | NEXT DAY | site_0   | 11962   | 11841      | 12280      | 12015       | 0         |
+| Certainly fede                                        | NEXT DAY | site_1   | 12291   | 11908      | 12110      | 11980       | 0         |
++-------------------------------------------------------+----------+----------+---------+------------+------------+-------------+-----------+
