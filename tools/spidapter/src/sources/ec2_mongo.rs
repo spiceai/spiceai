@@ -227,6 +227,11 @@ sleep 15
 # Create admin user (no auth enforced yet)
 mongosh --quiet admin --eval 'db.createUser({{user: "admin", pwd: "{mongo_password}", roles: ["root"]}})'
 
+# Generate keyfile required for auth + replica set
+openssl rand -base64 756 > /etc/mongodb-keyfile
+chmod 400 /etc/mongodb-keyfile
+chown mongodb:mongodb /etc/mongodb-keyfile
+
 # Enable authentication and restart
 cat > /etc/mongod.conf << 'MONGODCONF'
 storage:
@@ -240,6 +245,7 @@ net:
   bindIp: 0.0.0.0
 security:
   authorization: enabled
+  keyFile: /etc/mongodb-keyfile
 replication:
   replSetName: "rs0"
 MONGODCONF
