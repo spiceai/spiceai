@@ -195,10 +195,6 @@ impl TaskHistoryExporter {
         task.starts_with("policy_") || task.starts_with("audit_")
     }
 
-    fn should_include_task_span(task_span: &TaskSpan, min_sql_duration_ms: Option<f64>) -> bool {
-        Self::passes_base_retention(task_span, min_sql_duration_ms)
-    }
-
     fn process_context_payload(
         captured_context: &TaskHistoryCapturedContext,
         task: &str,
@@ -649,15 +645,15 @@ mod tests {
         let audit_span = task_span("audit_export", 1.0, HashMap::new());
         let sql_span = task_span("sql_query", 1.0, HashMap::new());
 
-        assert!(TaskHistoryExporter::should_include_task_span(
+        assert!(TaskHistoryExporter::passes_base_retention(
             &policy_span,
             Some(1_000.0)
         ));
-        assert!(TaskHistoryExporter::should_include_task_span(
+        assert!(TaskHistoryExporter::passes_base_retention(
             &audit_span,
             Some(1_000.0)
         ));
-        assert!(!TaskHistoryExporter::should_include_task_span(
+        assert!(!TaskHistoryExporter::passes_base_retention(
             &sql_span,
             Some(1_000.0)
         ));
@@ -669,7 +665,7 @@ mod tests {
         labels.insert(Arc::<str>::from("plan_capture"), Arc::<str>::from("true"));
         let span = task_span("plan", 1.0, labels);
 
-        assert!(TaskHistoryExporter::should_include_task_span(
+        assert!(TaskHistoryExporter::passes_base_retention(
             &span,
             Some(1_000.0)
         ));
