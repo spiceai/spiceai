@@ -18,9 +18,31 @@ use clap::{Parser, Subcommand, ValueEnum};
 use spice_cloud_client::types::UpdateChannel;
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
-pub enum BackendMode {
-    Scp,
+pub enum SpiceCompute {
+    Cloud,
     Local,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum AccelerationEngine {
+    Cayenne,
+    Duckdb,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum FederatedStorage {
+    Cayenne,
+    Postgres,
+    Mongo,
+    DynamoDB,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub(crate) enum DeploymentMode {
+    /// Single spiced process (no scheduler/executor split).
+    SingleNode,
+    /// Scheduler + N executor processes with mTLS.
+    Cluster,
 }
 
 #[derive(Subcommand)]
@@ -65,9 +87,9 @@ pub struct StdioArgs {
     #[arg(long, env = "SPICEAI_API_KEY")]
     pub api_key: Option<String>,
 
-    /// Backend mode for provisioning: `scp` (Spice Cloud Platform, default) or `local`.
-    #[arg(long, env = "SPIDAPTER_BACKEND", default_value = "scp")]
-    pub backend: BackendMode,
+    /// Compute mode for provisioning: `cloud` (Spice Cloud Platform, default) or `local`.
+    #[arg(long, env = "SPIDAPTER_COMPUTE", default_value = "cloud")]
+    pub compute: SpiceCompute,
 
     /// Override the Flight SQL endpoint URL instead of deriving it from the deployment cname.
     #[arg(long, env = "SPIDAPTER_FLIGHT_URL")]
@@ -149,6 +171,68 @@ pub struct StdioArgs {
     /// Query memory limit to apply to `runtime.query.memory_limit` spicepod configuration (e.g. `150Gi`).
     #[arg(long, env = "SPIDAPTER_QUERY_MEMORY_LIMIT")]
     pub query_memory_limit: Option<String>,
+
+    /// Federated storage: `cayenne` (default), `postgres`, `mongo`, or `dynamodb`.
+    #[arg(long, env = "SPIDAPTER_STORAGE", default_value = "cayenne")]
+    pub storage: FederatedStorage,
+
+    /// PostgreSQL host for WAL CDC mode. When set, spidapter writes via the PostgreSQL
+    /// ADBC driver and configures Spice to read via WAL CDC.
+    #[arg(long, env = "PG_HOST")]
+    pub pg_host: Option<String>,
+
+    /// PostgreSQL port for WAL CDC mode.
+    #[arg(long, env = "PG_PORT", default_value = "5432")]
+    pub pg_port: u16,
+
+    /// PostgreSQL username for WAL CDC mode.
+    #[arg(long, env = "PG_USER")]
+    pub pg_user: Option<String>,
+
+    /// PostgreSQL password for WAL CDC mode.
+    #[arg(long, env = "PG_PASSWORD", default_value = "")]
+    pub pg_password: String,
+
+    /// PostgreSQL database name for WAL CDC mode.
+    #[arg(long, env = "PG_DATABASE")]
+    pub pg_database: Option<String>,
+
+    /// Acceleration engine for federated datasets (`cayenne` or `duckdb`).
+    #[arg(long, env = "SPIDAPTER_ACCELERATION", default_value = "cayenne")]
+    pub acceleration: AccelerationEngine,
+
+    /// EC2 subnet ID for provisioning a `PostgreSQL` instance. When set together with
+    /// `EC2_SECURITY_GROUP_ID`, spidapter launches an EC2 instance instead of using
+    /// an existing `PostgreSQL` host.
+    #[arg(long, env = "EC2_SUBNET_ID")]
+    pub ec2_subnet_id: Option<String>,
+
+    /// EC2 security group ID for the provisioned `PostgreSQL` instance.
+    #[arg(long, env = "EC2_SECURITY_GROUP_ID")]
+    pub ec2_security_group_id: Option<String>,
+
+    /// AMI ID for the EC2 `PostgreSQL` instance (Ubuntu 22.04 recommended).
+    #[arg(long, env = "EC2_AMI_ID")]
+    pub ec2_ami_id: Option<String>,
+
+    /// EC2 instance type for the `PostgreSQL` instance.
+    #[arg(long, env = "EC2_INSTANCE_TYPE", default_value = "m5.large")]
+    pub ec2_instance_type: String,
+
+    /// Assign a public IP to the provisioned EC2 `PostgreSQL` instance.
+    /// Required when running spidapter outside the target VPC (e.g. local development).
+    #[arg(long, env = "EC2_ASSOCIATE_PUBLIC_IP", default_value_t = false)]
+    pub ec2_associate_public_ip: bool,
+
+    /// IAM instance profile name or ARN to attach to the provisioned EC2 instance.
+    /// Required for AWS Systems Manager Session Manager access (connect via AWS console).
+    /// The profile must include the `AmazonSSMManagedInstanceCore` managed policy.
+    #[arg(long, env = "EC2_IAM_INSTANCE_PROFILE")]
+    pub ec2_iam_instance_profile: Option<String>,
+
+    /// Name or path of the spiced binary to spawn (local backend only).
+    #[arg(long, default_value = "spiced")]
+    pub spiced_binary: String,
 }
 
 #[derive(Parser, Debug, Clone)]

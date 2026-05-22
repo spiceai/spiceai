@@ -128,6 +128,7 @@ aws-sdk-bedrockruntime = "1.130.0"
 aws-sdk-cognitoidentity = "1.99.0"
 aws-sdk-cognitoidentityprovider = "1.116.0"
 aws-sdk-dynamodb = "1.111.0"
+aws-sdk-ec2 = "1.113.0"
 aws-sdk-dynamodbstreams = "1.99.0"
 aws-sdk-glue = "1.145.1"
 aws-sdk-s3 = "1.132.0"
@@ -298,7 +299,7 @@ sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
 sysinfo = "0.38.4"
-system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "0152edc7ba5a6c0fd471c0ef6ef074cce8b8f830", features = ["client", "server"] }
+system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "d00700353822309a047a220c855493ac96ddc5a2", features = ["client", "server"] }
 tantivy = "0.26.0"
 tempfile = "3"
 tiberius = { version = "0.12.3", default-features = false, features = [

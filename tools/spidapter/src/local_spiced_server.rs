@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::args::{BackendMode, LocalSpicedArgs, StdioArgs};
+use crate::args::{AccelerationEngine, FederatedStorage, LocalSpicedArgs, SpiceCompute, StdioArgs};
 use crate::stdio_server;
 
 /// Construct a [`StdioArgs`] pinned to the local backend from the minimal
@@ -25,7 +25,9 @@ pub async fn run_local_spiced_server(args: &LocalSpicedArgs) -> anyhow::Result<(
 fn to_stdio_args(args: &LocalSpicedArgs) -> StdioArgs {
     StdioArgs {
         verbose: args.verbose,
-        backend: BackendMode::Local,
+        compute: SpiceCompute::Local,
+        storage: FederatedStorage::Cayenne,
+        acceleration: AccelerationEngine::Cayenne,
         ready_wait: args.ready_wait,
         aws_region: args.aws_region.clone(),
         cayenne_data_dir: args.cayenne_data_dir.clone(),
@@ -52,5 +54,18 @@ fn to_stdio_args(args: &LocalSpicedArgs) -> StdioArgs {
         executor_storage_size_gb: None,
         ephemeral_storage_limit_gb: None,
         organization_tag: None,
+        pg_host: None,
+        pg_port: 5432,
+        pg_user: None,
+        pg_password: String::new(),
+        pg_database: None,
+        // EC2 provisioning is SCP-only
+        ec2_subnet_id: None,
+        ec2_security_group_id: None,
+        ec2_ami_id: None,
+        ec2_instance_type: "m5.large".to_string(),
+        ec2_associate_public_ip: false,
+        ec2_iam_instance_profile: None,
+        spiced_binary: "spiced".to_string(),
     }
 }

@@ -102,7 +102,7 @@ pub async fn acquire(args: &CommonArgs) -> anyhow::Result<(SpicedInstance, Syste
     println!("System adapter setup ({transport}, run_id={run_id})");
 
     let response = client
-        .setup(run_id, metadata, HashMap::new(), None)
+        .setup(run_id, metadata, HashMap::new(), None, HashMap::new())
         .await
         .map_err(|e| anyhow::anyhow!("system adapter setup failed: {e}"))?;
 

@@ -44,12 +44,31 @@ pub use config::ReplicationParams;
 pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
 pub use slot::{SlotInfo, SlotSetupOutcome};
 
+/// Extracts a human-readable message from a `tokio_postgres::Error`.
+///
+/// `tokio_postgres::Error`'s `Display` impl for DB errors outputs the opaque
+/// string "db error", hiding the actual PostgreSQL server message. This helper
+/// surfaces the severity + message (and detail, if present) from the underlying
+/// `DbError` so that log lines contain actionable text.
+pub(crate) fn pg_error_detail(e: &tokio_postgres::Error) -> String {
+    if let Some(db) = e.as_db_error() {
+        let mut msg = format!("{}: {}", db.severity(), db.message());
+        if let Some(detail) = db.detail() {
+            msg.push_str(" — ");
+            msg.push_str(detail);
+        }
+        msg
+    } else {
+        e.to_string()
+    }
+}
+
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to establish setup connection to Postgres: {source}"))]
+    #[snafu(display("Failed to establish setup connection to Postgres: {}", pg_error_detail(source)))]
     SetupConnect { source: tokio_postgres::Error },
 
-    #[snafu(display("Failed to execute setup SQL: {source}"))]
+    #[snafu(display("Failed to execute setup SQL: {}", pg_error_detail(source)))]
     SetupExec { source: tokio_postgres::Error },
 
     #[snafu(display(
@@ -87,7 +106,7 @@ pub enum Error {
     #[snafu(display("Schema mismatch: {message}"))]
     SchemaMismatch { message: String },
 
-    #[snafu(display("Bootstrap stream error: {source}"))]
+    #[snafu(display("Bootstrap stream error: {}", pg_error_detail(source)))]
     Bootstrap { source: tokio_postgres::Error },
 
     #[snafu(display("Invalid Postgres LSN string `{lsn}`: expected `XXXXXXXX/YYYYYYYY`"))]
