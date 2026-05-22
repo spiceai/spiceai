@@ -34,6 +34,7 @@ pub enum FederatedStorage {
     Cayenne,
     Postgres,
     Mongo,
+    #[serde(rename = "dynamodb")]
     DynamoDB,
 }
 
