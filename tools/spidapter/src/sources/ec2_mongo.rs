@@ -247,9 +247,9 @@ MONGODCONF
 systemctl restart mongod
 sleep 10
 
-# Create application database and user
+# Create application user in admin database (authSource=admin in connection string)
 mongosh --quiet -u admin -p '{mongo_password}' --authenticationDatabase admin admin --eval '
-db.getSiblingDB("spicebench").createUser({{
+db.createUser({{
   user: "spidapter",
   pwd: "{mongo_password}",
   roles: [{{role: "readWrite", db: "spicebench"}}]
