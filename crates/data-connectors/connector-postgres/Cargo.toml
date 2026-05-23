@@ -36,6 +36,7 @@ secrecy.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
+tracing.workspace = true
 
 [features]
 default = []

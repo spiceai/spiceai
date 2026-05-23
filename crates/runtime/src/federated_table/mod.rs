@@ -34,6 +34,7 @@ use std::sync::{
 
 use arrow::datatypes::SchemaRef;
 use arrow_tools::schema::schema_difference;
+use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use datafusion::catalog::TableProvider;
 use datafusion::common::DataFusionError;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
@@ -150,6 +151,28 @@ impl DeferredTableProvider {
     }
 }
 
+fn table_provider_with_dataset_metadata(
+    dataset: &Dataset,
+    provider: Arc<dyn TableProvider>,
+) -> Arc<dyn TableProvider> {
+    let field_metadata = field_metadata_from_columns(&dataset.columns);
+    if dataset.metadata.is_empty() && field_metadata.is_empty() {
+        return provider;
+    }
+
+    metadata_enriched_table_provider(provider, dataset.metadata.clone(), field_metadata)
+}
+
+fn field_metadata_from_columns(columns: &[spicepod::semantic::Column]) -> FieldMetadata {
+    columns
+        .iter()
+        .filter_map(|column| {
+            let metadata = column.metadata();
+            (!metadata.is_empty()).then(|| (column.name.clone(), metadata))
+        })
+        .collect()
+}
+
 impl FederatedTable {
     /// Creates a federated table without checking if the schema matches the existing acceleration checkpoint.
     pub fn new_unchecked(table_provider: Arc<dyn TableProvider>) -> Self {
@@ -164,6 +187,8 @@ impl FederatedTable {
         shutdown_token: CancellationToken,
         allow_schema_mismatch: bool,
     ) -> Self {
+        let table_provider = table_provider_with_dataset_metadata(&dataset, table_provider);
+
         // When `allow_schema_mismatch` is `true`, schema differences are ignored and the
         // table provider is returned immediately. The caller is responsible for handling
         // schema evolution (e.g. `file_update` mode detects changes and recreates the acceleration).
@@ -373,6 +398,8 @@ impl FederatedTable {
 
             match table_provider_result {
                 Ok(table_provider) => {
+                    let table_provider =
+                        table_provider_with_dataset_metadata(&dataset, table_provider);
                     if tx.send(table_provider).is_err() {
                         tracing::error!(
                             "Failed to send deferred table provider for dataset '{}': Channel closed.",
