@@ -244,11 +244,15 @@ impl Service {
 
     /// Construct a stream of [`FlightData`] for a given sql statement.
     ///
-    /// To enforce read-only protections, provide a prevalidated `read_only_plan`
-    ///  (see [`check_read_only_sql`]). In this case, `sql` is used for caching,
-    /// tracing and observability.
-    ///
-    /// Otherwise `sql` will be used, and could be a DDL/DML statement.
+    /// This function does not perform any read-only validation itself. Callers
+    /// are responsible for gating access:
+    /// - For read-only principals, callers must pre-validate the SQL via
+    ///   [`check_read_only_sql`] and pass the resulting plan as `read_only_plan`.
+    ///   The original `sql` is then used only for caching, tracing, and
+    ///   observability.
+    /// - When `read_only_plan` is `None`, `sql` is executed directly and may be a
+    ///   DDL/DML statement. Only callers that have already determined the
+    ///   request is allowed to execute write statements should use this path.
     async fn sql_to_flight_stream(
         datafusion: Arc<DataFusion>,
         sql: &str,
