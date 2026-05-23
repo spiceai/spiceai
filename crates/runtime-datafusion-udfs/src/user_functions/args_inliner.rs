@@ -17,7 +17,7 @@ limitations under the License.
 //! Inline literal table-function arguments into a [`LogicalPlan`].
 //!
 //! SQL table functions expose their scalar arguments via a one-row `args`
-//! MemTable.  Because the MemTable is only populated at execution time,
+//! `MemTable`. Because the `MemTable` is only populated at execution time,
 //! the planner sees column references rather than literals, which prevents
 //! filter pushdown for connectors that need concrete values (e.g. the HTTP
 //! connector's `request_path`).
@@ -29,7 +29,7 @@ limitations under the License.
 //! `Expr::Literal`.  The optimizer then sees constants and can fold /
 //! push down as usual.
 //!
-//! This follows the same pattern as DataFusion's own
+//! This follows the same pattern as `DataFusion`'s own
 //! [`LogicalPlan::replace_params_with_values`], which replaces
 //! `Expr::Placeholder` with `Expr::Literal`.
 
@@ -64,7 +64,7 @@ fn try_extract_literal_from_args_subquery(plan: &LogicalPlan) -> Option<Expr> {
         // Single projected expression over a TableScan on `args`.
         && let [expr] = expr.as_slice()
         && let LogicalPlan::TableScan(TableScan { table_name, .. }) = input.as_ref()
-        && is_args_table_ref(&table_name)
+        && is_args_table_ref(table_name)
     {
         let inner = match expr {
             Expr::Alias(Alias { expr, .. }) => expr,
@@ -80,7 +80,7 @@ fn try_extract_literal_from_args_subquery(plan: &LogicalPlan) -> Option<Expr> {
 /// Recursively collapse `Expr::ScalarSubquery` nodes whose inner plan
 /// is `Projection([literal], TableScan("args"))`.
 ///
-/// DataFusion's `Expr::transform_up` explicitly skips `ScalarSubquery`
+/// `DataFusion`'s `Expr::transform_up` explicitly skips `ScalarSubquery`
 /// children, so we must walk the expression tree manually to find and
 /// replace them.
 fn collapse_args_subqueries(expr: Expr) -> Expr {
@@ -154,7 +154,7 @@ fn collapse_args_subqueries(expr: Expr) -> Expr {
 ///
 /// This operates on the plan produced *before* optimization, so the
 /// optimizer's filter-pushdown passes see concrete literal values instead
-/// of column references to a MemTable.
+/// of column references to a `MemTable`.
 pub(super) fn inline_args_into_plan(
     plan: LogicalPlan,
     schema: &Schema,
@@ -188,10 +188,8 @@ pub(super) fn inline_args_into_plan(
                             Some(r) => is_args_table_ref(r) && arg_map.contains_key(&key),
                             None => arg_map.contains_key(&key),
                         };
-                        if should_replace {
-                            if let Some(value) = arg_map.get(&key) {
-                                return Ok(Transformed::yes(Expr::Literal(value.clone(), None)));
-                            }
+                        if should_replace && let Some(value) = arg_map.get(&key) {
+                            return Ok(Transformed::yes(Expr::Literal(value.clone(), None)));
                         }
                     }
                     Ok(Transformed::no(e))
