@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "ansi_colors"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 
 [[package]]
 name = "anstream"
@@ -395,7 +395,7 @@ checksum = "fca387cdc0a1f9c7a7c26556d584aa2d07fc529843082e4861003cde4ab914ed"
 
 [[package]]
 name = "app"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "serde",
  "snafu",
@@ -740,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "arrow-cast",
@@ -1550,7 +1550,7 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-credential-bridge"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2600,7 +2600,7 @@ dependencies = [
  "bitflags 2.11.1",
  "cexpr",
  "clang-sys",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2620,7 +2620,7 @@ dependencies = [
  "bitflags 2.11.1",
  "cexpr",
  "clang-sys",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "regex",
@@ -3113,7 +3113,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -3404,7 +3404,7 @@ dependencies = [
 
 [[package]]
 name = "cayenne"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "aegis",
  "arc-swap",
@@ -3472,7 +3472,7 @@ dependencies = [
 
 [[package]]
 name = "cayenne-flightsql"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "cayenne",
@@ -3644,7 +3644,7 @@ dependencies = [
 
 [[package]]
 name = "chbench-driver"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3725,7 +3725,7 @@ dependencies = [
 
 [[package]]
 name = "chunking"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "criterion 0.7.0",
  "snafu",
@@ -4021,7 +4021,7 @@ checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
 
 [[package]]
 name = "connector-clickhouse"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "clickhouse-rs",
@@ -4040,7 +4040,7 @@ dependencies = [
 
 [[package]]
 name = "connector-databricks"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "app",
  "async-trait",
@@ -4065,7 +4065,7 @@ dependencies = [
 
 [[package]]
 name = "connector-delta-lake"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
@@ -4083,7 +4083,7 @@ dependencies = [
 
 [[package]]
 name = "connector-dremio"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4101,7 +4101,7 @@ dependencies = [
 
 [[package]]
 name = "connector-duckdb"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4116,7 +4116,7 @@ dependencies = [
 
 [[package]]
 name = "connector-elasticsearch"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4132,7 +4132,7 @@ dependencies = [
 
 [[package]]
 name = "connector-flightsql"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4148,7 +4148,7 @@ dependencies = [
 
 [[package]]
 name = "connector-ftp"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "linkme",
  "paste",
@@ -4160,7 +4160,7 @@ dependencies = [
 
 [[package]]
 name = "connector-graphql"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "app",
  "async-trait",
@@ -4178,7 +4178,7 @@ dependencies = [
 
 [[package]]
 name = "connector-imap"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4194,7 +4194,7 @@ dependencies = [
 
 [[package]]
 name = "connector-mongodb"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4217,7 +4217,7 @@ dependencies = [
 
 [[package]]
 name = "connector-mssql"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4231,7 +4231,7 @@ dependencies = [
 
 [[package]]
 name = "connector-mysql"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4261,7 +4261,7 @@ dependencies = [
 
 [[package]]
 name = "connector-odbc"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4276,7 +4276,7 @@ dependencies = [
 
 [[package]]
 name = "connector-oracle"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4292,7 +4292,7 @@ dependencies = [
 
 [[package]]
 name = "connector-postgres"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4311,7 +4311,7 @@ dependencies = [
 
 [[package]]
 name = "connector-scylladb"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4329,7 +4329,7 @@ dependencies = [
 
 [[package]]
 name = "connector-sftp"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "linkme",
  "paste",
@@ -4341,7 +4341,7 @@ dependencies = [
 
 [[package]]
 name = "connector-sharepoint"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4361,7 +4361,7 @@ dependencies = [
 
 [[package]]
 name = "connector-smb"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "linkme",
  "paste",
@@ -4373,7 +4373,7 @@ dependencies = [
 
 [[package]]
 name = "connector-snowflake"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4390,7 +4390,7 @@ dependencies = [
 
 [[package]]
 name = "connector-spark"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "data_components",
@@ -5366,7 +5366,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "data_components"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -5479,7 +5479,7 @@ dependencies = [
 
 [[package]]
 name = "dataformat-json"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5762,7 +5762,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-ddl"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5772,7 +5772,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-dml"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6047,7 +6047,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-optimizer-rules"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -6308,7 +6308,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=846d4de245e919bf3c3c1729c85f50a3564d7949#846d4de245e919bf3c3c1729c85f50a3564d7949"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=29f66085875f1d4d7b80fc1947e68c6835302241#29f66085875f1d4d7b80fc1947e68c6835302241"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -6372,7 +6372,7 @@ checksum = "c286de4e81ea2590afc24d754e0f83810c566f50a1388fa75ebd57928c0d9745"
 
 [[package]]
 name = "db_connection_pool"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -6793,7 +6793,7 @@ checksum = "aeda16ab4059c5fd2a83f2b9c9e9c981327b18aa8e3b313f7e6563799d4f093e"
 
 [[package]]
 name = "distributed"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "ansi_colors",
  "anyhow",
@@ -6835,7 +6835,7 @@ checksum = "c2db04e74f0a9a93103b50e90b96024c9b2bdca8bce6a632ec71b88736d3d359"
 
 [[package]]
 name = "document_parse"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "bytes",
  "calamine",
@@ -6954,7 +6954,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "duration-parse"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "snafu",
 ]
@@ -6989,7 +6989,7 @@ checksum = "e1d926b4d407d372f141f93bb444696142c29d32962ccbd3531117cf3aa0bfa9"
 
 [[package]]
 name = "dynamodb-streams"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "aws-config",
  "aws-sdk-dynamodb",
@@ -7093,7 +7093,7 @@ dependencies = [
 
 [[package]]
 name = "elasticsearch"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "bytes",
@@ -7403,7 +7403,7 @@ dependencies = [
 
 [[package]]
 name = "event_stream"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "futures",
  "snafu",
@@ -7706,7 +7706,7 @@ dependencies = [
 
 [[package]]
 name = "flight-cookie-server"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow-array",
  "arrow-flight",
@@ -7724,7 +7724,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -7745,7 +7745,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -7758,7 +7758,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -8345,8 +8345,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.2.1",
- "windows-result 0.4.1",
+ "windows-link 0.1.3",
+ "windows-result 0.3.4",
 ]
 
 [[package]]
@@ -8656,7 +8656,7 @@ dependencies = [
 
 [[package]]
 name = "google-genai"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "bytes",
  "futures",
@@ -8934,7 +8934,7 @@ dependencies = [
 
 [[package]]
 name = "hash-index"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -9565,7 +9565,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -9643,7 +9643,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -11070,7 +11070,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -11952,7 +11952,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "anyhow",
  "arrow",
@@ -12506,7 +12506,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "hickory-resolver",
  "snafu",
@@ -13513,7 +13513,7 @@ dependencies = [
 
 [[package]]
 name = "otel-arrow"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -13525,7 +13525,7 @@ dependencies = [
 
 [[package]]
 name = "otelpublisher"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "clap",
  "opentelemetry-proto",
@@ -13624,7 +13624,7 @@ dependencies = [
 
 [[package]]
 name = "package"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "bytes",
  "futures",
@@ -13747,7 +13747,7 @@ dependencies = [
 
 [[package]]
 name = "parsley"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "bytes",
  "chunking",
@@ -14138,9 +14138,9 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3aa964c4e12e6328388b7059c93aac37b052be7962bbb70dd239b515532be4bf"
 dependencies = [
- "arrayvec 0.7.6",
- "hashbrown 0.17.0",
- "parking_lot 0.12.5",
+ "arrayvec 0.5.2",
+ "hashbrown 0.5.0",
+ "parking_lot 0.11.2",
  "rand 0.8.6",
 ]
 
@@ -14420,7 +14420,7 @@ dependencies = [
 
 [[package]]
 name = "pr-builds"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "anyhow",
  "clap",
@@ -14643,7 +14643,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck 0.4.1",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -14677,7 +14677,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -14988,7 +14988,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls 0.23.40",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -15026,7 +15026,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -15637,7 +15637,7 @@ dependencies = [
 
 [[package]]
 name = "repl"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "ansi_colors",
  "arrow",
@@ -16078,7 +16078,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -16305,7 +16305,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-acceleration"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "anyhow",
  "arrow",
@@ -16344,7 +16344,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-api-types"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "serde",
  "serde_json",
@@ -16353,7 +16353,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-async"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "futures",
  "libc",
@@ -16366,7 +16366,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-auth"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "app",
  "axum",
@@ -16388,7 +16388,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-cluster"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "app",
  "arrow",
@@ -16428,7 +16428,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -16468,7 +16468,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion-index"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow_tools",
  "async-trait",
@@ -16482,7 +16482,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion-udfs"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -16523,7 +16523,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-object-store"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -16553,11 +16553,11 @@ dependencies = [
 
 [[package]]
 name = "runtime-parameter-spec"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 
 [[package]]
 name = "runtime-parameters"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "itertools 0.14.0",
  "runtime-parameter-spec",
@@ -16571,7 +16571,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-policy"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "cedar-policy",
@@ -16585,7 +16585,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-proto"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "datafusion",
  "datafusion-common",
@@ -16600,7 +16600,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-rate-control"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "futures",
  "governor",
@@ -16616,7 +16616,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-request-context"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "app",
  "async-trait",
@@ -16638,7 +16638,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-secrets"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -16671,7 +16671,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-table-partition"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -17058,7 +17058,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "s3_vectors"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -17070,7 +17070,7 @@ dependencies = [
 
 [[package]]
 name = "s3_vectors_metadata_filter"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "aws-smithy-types",
  "datafusion",
@@ -17194,7 +17194,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "chrono",
@@ -17406,7 +17406,7 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "search"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -18067,7 +18067,7 @@ checksum = "ef784004ca8777809dcdad6ac37629f0a97caee4c685fcea805278d81dd8b857"
 
 [[package]]
 name = "smb"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "aes 0.8.4",
  "bytes",
@@ -18298,7 +18298,7 @@ dependencies = [
 
 [[package]]
 name = "spice"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "ansi_colors",
  "arrow",
@@ -18352,7 +18352,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -18367,7 +18367,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud-client"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "reqwest 0.12.24",
  "serde",
@@ -18408,7 +18408,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "app",
  "clap",
@@ -18468,7 +18468,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
@@ -18492,7 +18492,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod-validator"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "app",
  "clap",
@@ -18502,7 +18502,7 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "connector-clickhouse",
  "connector-delta-lake",
@@ -18534,7 +18534,7 @@ dependencies = [
 
 [[package]]
 name = "spiceschema"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "clap",
  "runtime",
@@ -18544,7 +18544,7 @@ dependencies = [
 
 [[package]]
 name = "spidapter"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "anyhow",
  "arrow",
@@ -19374,7 +19374,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "telemetry"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "async-trait",
@@ -19485,7 +19485,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "test-framework"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "anyhow",
  "app",
@@ -19569,7 +19569,7 @@ dependencies = [
 
 [[package]]
 name = "testoperator"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -19930,7 +19930,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "token_provider"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "secrecy",
  "snafu",
@@ -20360,7 +20360,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "rmcp",
@@ -20437,7 +20437,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tpc-extension"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "duckdb",
@@ -20789,7 +20789,7 @@ dependencies = [
 
 [[package]]
 name = "turso-shared"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 
 [[package]]
 name = "turso_core"
@@ -21433,7 +21433,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -21805,7 +21805,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-datafusion"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "anyhow",
  "arrow-schema",
@@ -22898,7 +22898,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -23571,7 +23571,7 @@ dependencies = [
 
 [[package]]
 name = "workers"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-openai",
  "async-trait",
@@ -23702,7 +23702,7 @@ checksum = "7a5a4b21e1a62b67a2970e6831bc091d7b87e119e7f9791aef9702e3bef04448"
 
 [[package]]
 name = "yaml"
-version = "2.0.0-enterprise-beta"
+version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "indexmap 2.14.0",
  "serde",
