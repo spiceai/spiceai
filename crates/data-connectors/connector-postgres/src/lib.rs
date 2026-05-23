@@ -40,6 +40,7 @@ use runtime::parameters::ParameterSpec;
 use secrecy::SecretBox;
 use snafu::prelude::*;
 use std::any::Any;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -55,6 +56,7 @@ pub enum Error {
 /// `PostgreSQL` data connector.
 pub struct Postgres {
     factory: PostgresTableFactory,
+    pool: Arc<PostgresConnectionPool>,
     params: runtime::parameters::Parameters,
     replication_metrics:
         std::sync::Arc<data_components::postgres_replication::ReplicationMetricsCollector>,
@@ -200,9 +202,11 @@ impl DataConnectorFactory for PostgresFactory {
                         .unwrap_or(datafusion_table_providers::UnsupportedTypeAction::String);
                     let pool = pool.with_unsupported_type_action(unsupported_type_action);
 
-                    let factory = PostgresTableFactory::new(Arc::new(pool));
+                    let pool = Arc::new(pool);
+                    let factory = PostgresTableFactory::new(Arc::clone(&pool));
                     Ok(Arc::new(Postgres {
                         factory,
+                        pool,
                         params: params_for_replication,
                         replication_metrics:
                             data_components::postgres_replication::ReplicationMetricsCollector::new(
@@ -254,6 +258,68 @@ impl DataConnectorFactory for PostgresFactory {
     }
 }
 
+async fn postgres_comment_metadata(
+    pool: &Arc<PostgresConnectionPool>,
+    table_path: &str,
+) -> std::result::Result<
+    (HashMap<String, String>, data_components::FieldMetadata),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let conn = pool.connect_direct().await?;
+    let rows = conn
+        .conn
+        .query(
+            "SELECT \
+                 obj_description(c.oid, 'pg_class') AS table_comment, \
+                 a.attname AS column_name, \
+                 col_description(c.oid, a.attnum) AS column_comment, \
+                 format_type(a.atttypid, a.atttypmod) AS column_source_type \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_attribute a \
+                 ON a.attrelid = c.oid \
+                 AND a.attnum > 0 \
+                 AND NOT a.attisdropped \
+             WHERE c.oid = to_regclass($1) \
+             ORDER BY a.attnum",
+            &[&table_path],
+        )
+        .await?;
+    let rows = rows
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)));
+
+    Ok(data_components::postgres::provider::postgres_metadata_from_rows(rows))
+}
+
+async fn enrich_with_postgres_comments(
+    pool: &Arc<PostgresConnectionPool>,
+    dataset: &Dataset,
+    provider: Arc<dyn TableProvider>,
+) -> Arc<dyn TableProvider> {
+    match postgres_comment_metadata(pool, dataset.path()).await {
+        Ok((table_metadata, field_metadata)) => {
+            if table_metadata.is_empty() && field_metadata.is_empty() {
+                provider
+            } else {
+                data_components::metadata_enriched_table_provider(
+                    provider,
+                    table_metadata,
+                    field_metadata,
+                )
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                dataset = %dataset.name,
+                source = %dataset.path(),
+                error = %error,
+                "Failed to query PostgreSQL comments; registering without comment metadata"
+            );
+            provider
+        }
+    }
+}
+
 #[async_trait]
 impl DataConnector for Postgres {
     fn as_any(&self) -> &dyn Any {
@@ -269,7 +335,10 @@ impl DataConnector for Postgres {
             .read_write_table_provider(dataset.path().into())
             .await
         {
-            Ok(provider) => Some(Ok(provider)),
+            Ok(provider) => Some(Ok(enrich_with_postgres_comments(
+                &self.pool, dataset, provider,
+            )
+            .await)),
             Err(e) => {
                 if let Some(err_source) = e.source() {
                     match err_source.downcast_ref::<dbconnection::Error>() {
@@ -298,7 +367,7 @@ impl DataConnector for Postgres {
                     }
                 }
 
-                Some(Err(DataConnectorError::UnableToGetReadProvider {
+                Some(Err(DataConnectorError::UnableToGetReadWriteProvider {
                     dataconnector: "postgres".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     source: e,
@@ -312,7 +381,7 @@ impl DataConnector for Postgres {
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match self.factory.table_provider(dataset.path().into()).await {
-            Ok(provider) => Ok(provider),
+            Ok(provider) => Ok(enrich_with_postgres_comments(&self.pool, dataset, provider).await),
             Err(e) => {
                 if let Some(err_source) = e.source() {
                     match err_source.downcast_ref::<dbconnection::Error>() {
