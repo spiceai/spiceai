@@ -80,17 +80,6 @@ datasets:
       on_conflict:
         (ol_w_id, ol_d_id, ol_o_id, ol_number): upsert
 
-  - from: postgres:item
-    name: item
-    params:
-      <<: *postgres_params
-      pg_replication_slot: spice_item
-    acceleration:
-      <<: *cayenne_accel
-      primary_key: i_id
-      on_conflict:
-        i_id: upsert
-
   - from: postgres:stock
     name: stock
     params:
@@ -102,13 +91,30 @@ datasets:
       on_conflict:
         (s_w_id, s_i_id): upsert
 
+  # ---- Static reference tables (no OLTP mutations, full refresh) ----
+
+  - from: postgres:item
+    name: item
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: i_id
+      on_conflict:
+        i_id: upsert
+
   - from: postgres:region
     name: region
     params:
       <<: *postgres_params
-      pg_replication_slot: spice_region
     acceleration:
-      <<: *cayenne_accel
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
       primary_key: r_regionkey
       on_conflict:
         r_regionkey: upsert
@@ -117,9 +123,11 @@ datasets:
     name: nation
     params:
       <<: *postgres_params
-      pg_replication_slot: spice_nation
     acceleration:
-      <<: *cayenne_accel
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
       primary_key: n_nationkey
       on_conflict:
         n_nationkey: upsert
@@ -128,9 +136,11 @@ datasets:
     name: supplier
     params:
       <<: *postgres_params
-      pg_replication_slot: spice_supplier
     acceleration:
-      <<: *cayenne_accel
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
       primary_key: su_suppkey
       on_conflict:
         su_suppkey: upsert

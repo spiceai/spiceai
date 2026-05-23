@@ -168,16 +168,19 @@ datasets:
         cayenne_upload_concurrency: '4'
         cayenne_segment_cache_mb: '64'
 
+  # ------------------------------------------------------------------
+  # Static reference tables (no OLTP mutations, full refresh).
+  # ------------------------------------------------------------------
+
   - from: postgres:item
     name: item
     params:
       <<: *pg_base
-      pg_replication_slot: spice_item
     acceleration:
       enabled: true
       engine: cayenne
       mode: file
-      refresh_mode: changes
+      refresh_mode: full
       primary_key: i_id
       on_conflict:
         i_id: upsert
@@ -185,20 +188,15 @@ datasets:
         <<: *accel_medium
         cayenne_file_path: ./spice/cayenne/item
 
-  # ------------------------------------------------------------------
-  # Tiny TPC-H tables.
-  # ------------------------------------------------------------------
-
   - from: postgres:region
     name: region
     params:
       <<: *pg_base
-      pg_replication_slot: spice_region
     acceleration:
       enabled: true
       engine: cayenne
       mode: file
-      refresh_mode: changes
+      refresh_mode: full
       primary_key: r_regionkey
       on_conflict:
         r_regionkey: upsert
@@ -213,12 +211,11 @@ datasets:
     name: nation
     params:
       <<: *pg_base
-      pg_replication_slot: spice_nation
     acceleration:
       enabled: true
       engine: cayenne
       mode: file
-      refresh_mode: changes
+      refresh_mode: full
       primary_key: n_nationkey
       on_conflict:
         n_nationkey: upsert
@@ -230,12 +227,11 @@ datasets:
     name: supplier
     params:
       <<: *pg_base
-      pg_replication_slot: spice_supplier
     acceleration:
       enabled: true
       engine: cayenne
       mode: file
-      refresh_mode: changes
+      refresh_mode: full
       primary_key: su_suppkey
       on_conflict:
         su_suppkey: upsert
