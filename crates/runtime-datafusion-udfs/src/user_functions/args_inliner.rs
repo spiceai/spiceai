@@ -225,7 +225,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use std::sync::Arc;
 
-    /// Register a one-row `args` MemTable and plan the body SQL, returning
+    /// Register a one-row `args` `MemTable` and plan the body SQL, returning
     /// the unoptimized plan.
     async fn plan_body(body: &str, schema: &Schema, values: &[ScalarValue]) -> LogicalPlan {
         let ctx = SessionContext::new();
