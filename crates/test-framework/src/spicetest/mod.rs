@@ -42,6 +42,7 @@ pub struct SpiceTest<S: TestState> {
     api_key: Option<String>,
     explain_plan_snapshot: bool,
     results_snapshot_predicate: Option<fn(&str) -> bool>,
+    validate_row_count: bool,
 
     state: S,
 }
@@ -73,6 +74,7 @@ impl<S: TestNotStarted> SpiceTest<S> {
             api_key: None,
             explain_plan_snapshot: false,
             results_snapshot_predicate: None,
+            validate_row_count: true,
             state,
         }
     }
@@ -104,6 +106,12 @@ impl<S: TestNotStarted> SpiceTest<S> {
     #[must_use]
     pub fn with_progress_bars(mut self, use_progress_bars: bool) -> Self {
         self.use_progress_bars = use_progress_bars;
+        self
+    }
+
+    #[must_use]
+    pub fn with_validate_row_count(mut self, validate_row_count: bool) -> Self {
+        self.validate_row_count = validate_row_count;
         self
     }
 }
