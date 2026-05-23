@@ -65,6 +65,8 @@ use spicepod::component::function::{
 };
 use util::session_state::builder_from_existing;
 
+use crate::user_functions::args_inliner::inline_args_into_plan;
+
 pub(crate) const SQL_TABLE_ARGS_TABLE_NAME: &str = "args";
 
 /// Monotonic identifier for built SQL UDFs — used as the basis for
@@ -514,15 +516,6 @@ impl TableProvider for SqlTableProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Inline literal args into the body SQL so that filter pushdown
-        // can see concrete values (e.g. for HTTP connector's request_path).
-        let body = super::args_inliner::inline_args_into_body(
-            &self.body,
-            self.arg_schema.as_ref(),
-            &self.args,
-        )
-        .unwrap_or_else(|| self.body.clone());
-
         let ctx = context_with_args_and_tables(
             Some(state),
             Arc::clone(&self.arg_schema),
@@ -531,7 +524,10 @@ impl TableProvider for SqlTableProvider {
             &self.name,
         )
         .await?;
-        let mut df = ctx.sql(&body).await?;
+
+        let (session_state, plan) = ctx.sql(&self.body).await?.into_parts();
+        let inlined_plan = inline_args_into_plan(plan, self.arg_schema.as_ref(), &self.args)?;
+        let mut df = DataFrame::new(session_state, inlined_plan);
         validate_output_schema(&self.name, df.schema().as_arrow(), self.schema.as_ref())
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
         if let Some(limit) = limit {

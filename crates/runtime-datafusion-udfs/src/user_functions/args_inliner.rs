@@ -14,303 +14,261 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Inline literal table-function arguments into body SQL before planning.
+//! Inline literal table-function arguments into a [`LogicalPlan`].
 //!
-//! When all table-function arguments are literals (enforced by
-//! [`super::sql::literal_arg`]), we can replace `(SELECT col FROM args)`
-//! scalar subqueries with the literal value directly.  This makes the
-//! literal visible to the logical planner so that filter pushdown (e.g.
-//! HTTP connector's `request_path`) works correctly.
+//! SQL table functions expose their scalar arguments via a one-row `args`
+//! MemTable.  Because the MemTable is only populated at execution time,
+//! the planner sees column references rather than literals, which prevents
+//! filter pushdown for connectors that need concrete values (e.g. the HTTP
+//! connector's `request_path`).
+//!
+//! Since all scalar args are guaranteed to be literals (enforced by
+//! [`super::sql::literal_arg`]), this module walks the *unoptimized*
+//! [`LogicalPlan`] produced by `ctx.sql(body)` and replaces every
+//! `Expr::Column` that references the `args` table with the corresponding
+//! `Expr::Literal`.  The optimizer then sees constants and can fold /
+//! push down as usual.
+//!
+//! This follows the same pattern as DataFusion's own
+//! [`LogicalPlan::replace_params_with_values`], which replaces
+//! `Expr::Placeholder` with `Expr::Literal`.
 
 use std::collections::HashMap;
-use std::ops::ControlFlow;
 
 use arrow::datatypes::Schema;
-use datafusion::scalar::ScalarValue;
-use datafusion::sql::{
-    parser::DFParser,
-    sqlparser::{
-        ast::{self, VisitMut, VisitorMut},
-        dialect::PostgreSqlDialect,
+use datafusion::{
+    common::{
+        Column, Result as DataFusionResult,
+        tree_node::{Transformed, TreeNode},
     },
+    logical_expr::{LogicalPlan, Projection, TableScan, expr::Alias},
+    prelude::Expr,
+    scalar::ScalarValue,
 };
 
 use super::sql::SQL_TABLE_ARGS_TABLE_NAME;
 
-/// Convert a [`ScalarValue`] to a `sqlparser` AST expression.
+/// Returns `true` if `table_name` refers to the `args` table.
+fn is_args_table_ref(table_name: &datafusion::sql::TableReference) -> bool {
+    table_name
+        .table()
+        .eq_ignore_ascii_case(SQL_TABLE_ARGS_TABLE_NAME)
+}
+
+/// If `plan` is `Projection([single_expr], TableScan("args"))` and
+/// `single_expr` is a literal, return that literal.  This detects the
+/// pattern left behind after column→literal replacement inside scalar
+/// subqueries.
+fn try_extract_literal_from_args_subquery(plan: &LogicalPlan) -> Option<Expr> {
+    if let LogicalPlan::Projection(Projection { expr, input, .. }) = plan
+        // Single projected expression over a TableScan on `args`.
+        && let [expr] = expr.as_slice()
+        && let LogicalPlan::TableScan(TableScan { table_name, .. }) = input.as_ref()
+        && is_args_table_ref(&table_name)
+    {
+        let inner = match expr {
+            Expr::Alias(Alias { expr, .. }) => expr,
+            other => other,
+        };
+        if matches!(inner, Expr::Literal(..)) {
+            return Some(inner.clone());
+        }
+    }
+    None
+}
+
+/// Recursively collapse `Expr::ScalarSubquery` nodes whose inner plan
+/// is `Projection([literal], TableScan("args"))`.
 ///
-/// Returns `None` for types that cannot be cleanly represented as a SQL
-/// literal — the caller should fall back to the `args` MemTable path.
-fn scalar_value_to_ast_expr(value: &ScalarValue) -> Option<ast::Expr> {
-    let val = match value {
-        ScalarValue::Null => ast::Value::Null,
-        ScalarValue::Boolean(Some(b)) => ast::Value::Boolean(*b),
-        ScalarValue::Int8(Some(n)) => ast::Value::Number(n.to_string(), false),
-        ScalarValue::Int16(Some(n)) => ast::Value::Number(n.to_string(), false),
-        ScalarValue::Int32(Some(n)) => ast::Value::Number(n.to_string(), false),
-        ScalarValue::Int64(Some(n)) => ast::Value::Number(n.to_string(), false),
-        ScalarValue::UInt8(Some(n)) => ast::Value::Number(n.to_string(), false),
-        ScalarValue::UInt16(Some(n)) => ast::Value::Number(n.to_string(), false),
-        ScalarValue::UInt32(Some(n)) => ast::Value::Number(n.to_string(), false),
-        ScalarValue::UInt64(Some(n)) => ast::Value::Number(n.to_string(), false),
-        ScalarValue::Float32(Some(f)) => ast::Value::Number(f.to_string(), false),
-        ScalarValue::Float64(Some(f)) => ast::Value::Number(f.to_string(), false),
-        ScalarValue::Utf8(Some(s))
-        | ScalarValue::LargeUtf8(Some(s))
-        | ScalarValue::Utf8View(Some(s)) => ast::Value::SingleQuotedString(s.clone()),
-        // For any other type (Option<None> variants, timestamps, decimals,
-        // etc.) we cannot produce a safe literal — fall back.
-        _ => return None,
-    };
-    Some(ast::Expr::Value(val.into()))
-}
-
-/// Visitor that replaces `(SELECT expr FROM args)` scalar subqueries with
-/// the args' literal values inlined into `expr`.
-struct ArgsInliner {
-    /// Column name (lower-cased) → literal AST expression.
-    arg_map: HashMap<String, ast::Expr>,
-    /// Set to `true` when an unsupported pattern is encountered, signalling
-    /// the caller to fall back to the MemTable path.
-    failed: bool,
-}
-
-impl ArgsInliner {
-    /// Return `true` if `table` in a `FROM` clause refers to the `args`
-    /// virtual table (single, unqualified identifier, case-insensitive).
-    fn is_args_table(table: &ast::TableFactor) -> bool {
-        if let ast::TableFactor::Table { name, .. } = table {
-            let parts: Vec<_> = name
-                .0
-                .iter()
-                .filter_map(|p| match p {
-                    ast::ObjectNamePart::Identifier(ident) => Some(ident.value.as_str()),
-                    _ => None,
+/// DataFusion's `Expr::transform_up` explicitly skips `ScalarSubquery`
+/// children, so we must walk the expression tree manually to find and
+/// replace them.
+fn collapse_args_subqueries(expr: Expr) -> Expr {
+    match expr {
+        Expr::ScalarSubquery(ref subquery) => {
+            if let Some(literal) = try_extract_literal_from_args_subquery(&subquery.subquery) {
+                literal
+            } else {
+                expr
+            }
+        }
+        // Recurse into expression types that can contain ScalarSubquery.
+        Expr::BinaryExpr(mut bin) => {
+            *bin.left = collapse_args_subqueries(*bin.left);
+            *bin.right = collapse_args_subqueries(*bin.right);
+            Expr::BinaryExpr(bin)
+        }
+        Expr::Not(inner) => Expr::Not(Box::new(collapse_args_subqueries(*inner))),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(collapse_args_subqueries(*inner))),
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(collapse_args_subqueries(*inner))),
+        Expr::IsTrue(inner) => Expr::IsTrue(Box::new(collapse_args_subqueries(*inner))),
+        Expr::IsFalse(inner) => Expr::IsFalse(Box::new(collapse_args_subqueries(*inner))),
+        Expr::Negative(inner) => Expr::Negative(Box::new(collapse_args_subqueries(*inner))),
+        Expr::Cast(mut cast) => {
+            *cast.expr = collapse_args_subqueries(*cast.expr);
+            Expr::Cast(cast)
+        }
+        Expr::TryCast(mut cast) => {
+            *cast.expr = collapse_args_subqueries(*cast.expr);
+            Expr::TryCast(cast)
+        }
+        Expr::Alias(mut alias) => {
+            *alias.expr = collapse_args_subqueries(*alias.expr);
+            Expr::Alias(alias)
+        }
+        Expr::ScalarFunction(mut func) => {
+            func.args = func
+                .args
+                .into_iter()
+                .map(collapse_args_subqueries)
+                .collect();
+            Expr::ScalarFunction(func)
+        }
+        Expr::Case(mut case) => {
+            case.expr = case.expr.map(|o| Box::new(collapse_args_subqueries(*o)));
+            case.when_then_expr = case
+                .when_then_expr
+                .into_iter()
+                .map(|(w, t)| {
+                    (
+                        Box::new(collapse_args_subqueries(*w)),
+                        Box::new(collapse_args_subqueries(*t)),
+                    )
                 })
                 .collect();
-            parts.len() == 1 && parts[0].eq_ignore_ascii_case(SQL_TABLE_ARGS_TABLE_NAME)
-        } else {
-            false
+            case.else_expr = case
+                .else_expr
+                .map(|e| Box::new(collapse_args_subqueries(*e)));
+            Expr::Case(case)
         }
-    }
-
-    /// Check if a `FROM` clause consists of exactly the `args` table with
-    /// no joins.
-    fn is_single_args_from(from: &[ast::TableWithJoins]) -> bool {
-        from.len() == 1 && from[0].joins.is_empty() && Self::is_args_table(&from[0].relation)
-    }
-
-    /// Replace bare column identifiers that match an arg name with the
-    /// corresponding literal value.  Returns `true` if any replacement
-    /// was made.
-    fn inline_columns_in_expr(&self, expr: &mut ast::Expr) -> bool {
-        let mut replaced = false;
-        match expr {
-            // Unqualified identifier: `col`
-            ast::Expr::Identifier(ident) => {
-                if let Some(replacement) = self.arg_map.get(&ident.value.to_ascii_lowercase()) {
-                    *expr = replacement.clone();
-                    replaced = true;
-                }
-            }
-            // Qualified identifier: `args.col`
-            ast::Expr::CompoundIdentifier(parts) => {
-                if parts.len() == 2
-                    && parts[0]
-                        .value
-                        .eq_ignore_ascii_case(SQL_TABLE_ARGS_TABLE_NAME)
-                {
-                    if let Some(replacement) =
-                        self.arg_map.get(&parts[1].value.to_ascii_lowercase())
-                    {
-                        *expr = replacement.clone();
-                        replaced = true;
-                    }
-                }
-            }
-            _ => {}
-        }
-        replaced
-    }
-
-    /// Recursively walk an AST expression and replace all arg column
-    /// references with their literal values.
-    fn inline_columns_recursive(&self, expr: &mut ast::Expr) {
-        // First try a direct replacement at this node.
-        if self.inline_columns_in_expr(expr) {
-            return; // replaced the whole node
-        }
-        // Otherwise recurse into children.
-        match expr {
-            ast::Expr::Function(func) => {
-                if let ast::FunctionArguments::List(arg_list) = &mut func.args {
-                    for arg in &mut arg_list.args {
-                        if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
-                        | ast::FunctionArg::Named {
-                            arg: ast::FunctionArgExpr::Expr(e),
-                            ..
-                        } = arg
-                        {
-                            self.inline_columns_recursive(e);
-                        }
-                    }
-                }
-            }
-            ast::Expr::BinaryOp { left, right, .. } => {
-                self.inline_columns_recursive(left);
-                self.inline_columns_recursive(right);
-            }
-            ast::Expr::UnaryOp { expr: inner, .. } => {
-                self.inline_columns_recursive(inner);
-            }
-            ast::Expr::Nested(inner) => {
-                self.inline_columns_recursive(inner);
-            }
-            ast::Expr::Cast { expr: inner, .. } => {
-                self.inline_columns_recursive(inner);
-            }
-            ast::Expr::Case {
-                operand,
-                conditions,
-                else_result,
-                ..
-            } => {
-                if let Some(op) = operand {
-                    self.inline_columns_recursive(op);
-                }
-                for cw in conditions {
-                    self.inline_columns_recursive(&mut cw.condition);
-                    self.inline_columns_recursive(&mut cw.result);
-                }
-                if let Some(e) = else_result {
-                    self.inline_columns_recursive(e);
-                }
-            }
-            ast::Expr::IsFalse(e)
-            | ast::Expr::IsTrue(e)
-            | ast::Expr::IsNull(e)
-            | ast::Expr::IsNotNull(e) => {
-                self.inline_columns_recursive(e);
-            }
-            _ => {
-                // For any expression type we don't explicitly recurse
-                // into, leave it as-is.  The outer `post_visit_expr`
-                // will still handle `Subquery` nodes at the top level.
-            }
-        }
+        // For any other expression type, return as-is.
+        other => other,
     }
 }
 
-impl VisitorMut for ArgsInliner {
-    type Break = ();
-
-    fn post_visit_expr(&mut self, expr: &mut ast::Expr) -> ControlFlow<Self::Break> {
-        if self.failed {
-            return ControlFlow::Continue(());
-        }
-
-        // Match `(SELECT expr FROM args)` scalar subqueries.
-        let ast::Expr::Subquery(query) = expr else {
-            return ControlFlow::Continue(());
-        };
-
-        // Only handle simple `SELECT expr FROM args` — no CTEs, no LIMIT,
-        // no GROUP BY, no HAVING, no DISTINCT, no WINDOW.
-        let ast::SetExpr::Select(select) = query.body.as_ref() else {
-            return ControlFlow::Continue(());
-        };
-
-        if !Self::is_single_args_from(&select.from) {
-            return ControlFlow::Continue(());
-        }
-
-        // Only a single projection item.
-        if select.projection.len() != 1 {
-            self.failed = true;
-            return ControlFlow::Continue(());
-        }
-
-        // Guard against complex subqueries we can't safely rewrite.
-        if select.group_by != ast::GroupByExpr::Expressions(vec![], vec![])
-            || select.having.is_some()
-            || select.distinct.is_some()
-            || !select.sort_by.is_empty()
-            || query.limit_clause.is_some()
-        {
-            return ControlFlow::Continue(());
-        }
-
-        // Extract the single SELECT expression.
-        let proj = &select.projection[0];
-        let mut select_expr = match proj {
-            ast::SelectItem::UnnamedExpr(e) => e.clone(),
-            ast::SelectItem::ExprWithAlias { expr: e, .. } => e.clone(),
-            _ => {
-                // Wildcard or qualified wildcard — can't inline.
-                self.failed = true;
-                return ControlFlow::Continue(());
-            }
-        };
-
-        // Inline all arg column references in the expression.
-        self.inline_columns_recursive(&mut select_expr);
-
-        // Replace the entire subquery with the rewritten expression.
-        *expr = select_expr;
-
-        ControlFlow::Continue(())
-    }
-}
-
-/// Attempt to inline literal scalar args into the body SQL by rewriting
-/// `(SELECT expr FROM args)` scalar subqueries.
+/// Walk an unoptimized [`LogicalPlan`] and replace every `Expr::Column`
+/// referencing the `args` table with the corresponding `Expr::Literal`.
 ///
-/// Returns `Some(rewritten_sql)` on success, or `None` if any pattern
-/// could not be safely inlined (the caller should use the MemTable path).
-pub(super) fn inline_args_into_body(
-    body: &str,
+/// Also collapses `Expr::ScalarSubquery` nodes that, after column
+/// replacement, reduce to a single literal projected from `args`.
+///
+/// This operates on the plan produced *before* optimization, so the
+/// optimizer's filter-pushdown passes see concrete literal values instead
+/// of column references to a MemTable.
+pub(super) fn inline_args_into_plan(
+    plan: LogicalPlan,
     schema: &Schema,
     values: &[ScalarValue],
-) -> Option<String> {
+) -> DataFusionResult<LogicalPlan> {
     if schema.fields().is_empty() {
-        return None;
+        return Ok(plan);
     }
 
-    // Build the arg_map: column_name -> AST literal.
-    let mut arg_map = HashMap::with_capacity(schema.fields().len());
-    for (field, value) in schema.fields().iter().zip(values) {
-        let ast_expr = scalar_value_to_ast_expr(value)?;
-        arg_map.insert(field.name().to_ascii_lowercase(), ast_expr);
-    }
+    let arg_map: HashMap<String, ScalarValue> = schema
+        .fields()
+        .iter()
+        .zip(values)
+        .map(|(field, value)| (field.name().to_ascii_lowercase(), value.clone()))
+        .collect();
 
-    // Parse the body SQL.
-    let statements = DFParser::parse_sql_with_dialect(body, &PostgreSqlDialect {}).ok()?;
-    if statements.len() != 1 {
-        return None;
-    }
+    // Pass 1: replace `Expr::Column` refs to `args` with literals inside
+    // all plans (including subquery plans).
+    let plan = plan
+        .transform_up_with_subqueries(|plan| {
+            plan.map_expressions(|expr| {
+                expr.transform_up(|e| {
+                    if let Expr::Column(Column {
+                        ref relation,
+                        ref name,
+                        ..
+                    }) = e
+                    {
+                        let key = name.to_ascii_lowercase();
+                        let should_replace = match relation {
+                            Some(r) => is_args_table_ref(r) && arg_map.contains_key(&key),
+                            None => arg_map.contains_key(&key),
+                        };
+                        if should_replace {
+                            if let Some(value) = arg_map.get(&key) {
+                                return Ok(Transformed::yes(Expr::Literal(value.clone(), None)));
+                            }
+                        }
+                    }
+                    Ok(Transformed::no(e))
+                })
+            })
+        })?
+        .data;
 
-    let mut statement = match statements.into_iter().next()? {
-        datafusion::sql::parser::Statement::Statement(s) => *s,
-        _ => return None,
-    };
-
-    let mut inliner = ArgsInliner {
-        arg_map,
-        failed: false,
-    };
-    let _ = statement.visit(&mut inliner);
-
-    if inliner.failed {
-        return None;
-    }
-
-    Some(statement.to_string())
+    // Pass 2: collapse `Expr::ScalarSubquery` nodes whose inner plan is
+    // now `Projection([literal], TableScan("args"))`.  This turns the
+    // subquery into a bare literal so the optimizer can push it down.
+    //
+    // We use a manual expression walk because DataFusion's
+    // `Expr::transform_up` explicitly skips `ScalarSubquery` children.
+    plan.transform_up_with_subqueries(|plan| {
+        plan.map_expressions(|expr| {
+            let collapsed = collapse_args_subqueries(expr.clone());
+            if collapsed == expr {
+                Ok(Transformed::no(expr))
+            } else {
+                Ok(Transformed::yes(collapsed))
+            }
+        })
+    })
+    .map(|res| res.data)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::datatypes::Field as ArrowField;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use std::sync::Arc;
+
+    /// Register a one-row `args` MemTable and plan the body SQL, returning
+    /// the unoptimized plan.
+    async fn plan_body(body: &str, schema: &Schema, values: &[ScalarValue]) -> LogicalPlan {
+        let ctx = SessionContext::new();
+        let schema_ref = Arc::new(schema.clone());
+
+        // Build the one-row args MemTable.
+        let arrays: Vec<_> = values
+            .iter()
+            .map(|v| v.to_array().expect("to_array"))
+            .collect();
+        let batch = arrow::record_batch::RecordBatch::try_new(Arc::clone(&schema_ref), arrays)
+            .expect("batch");
+        let table = MemTable::try_new(schema_ref, vec![vec![batch]]).expect("memtable");
+        ctx.register_table("args", Arc::new(table))
+            .expect("register");
+
+        // Also register a dummy `raw_users` table so body SQL can reference it.
+        let users_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            ArrowField::new("content", arrow::datatypes::DataType::Utf8, true),
+            ArrowField::new("request_path", arrow::datatypes::DataType::Utf8, true),
+        ]));
+        let users_table = MemTable::try_new(users_schema, vec![vec![]]).expect("users memtable");
+        ctx.register_table("raw_users", Arc::new(users_table))
+            .expect("register users");
+
+        // Also register a dummy `t` table.
+        let t_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            ArrowField::new("id", arrow::datatypes::DataType::Int64, true),
+            ArrowField::new("name", arrow::datatypes::DataType::Utf8, true),
+            ArrowField::new("active", arrow::datatypes::DataType::Boolean, true),
+            ArrowField::new("col", arrow::datatypes::DataType::Utf8, true),
+        ]));
+        let t_table = MemTable::try_new(t_schema, vec![vec![]]).expect("t memtable");
+        ctx.register_table("t", Arc::new(t_table))
+            .expect("register t");
+
+        ctx.sql(body)
+            .await
+            .expect("plan body")
+            .into_unoptimized_plan()
+    }
 
     fn utf8_schema(names: &[&str]) -> Schema {
         Schema::new(
@@ -321,149 +279,61 @@ mod tests {
         )
     }
 
-    #[test]
-    fn inline_args_replaces_scalar_subquery() {
+    /// Format the plan to a string for assertion.
+    fn plan_str(plan: &LogicalPlan) -> String {
+        format!("{plan}")
+    }
+
+    #[tokio::test]
+    async fn inline_replaces_scalar_subquery() {
         let schema = utf8_schema(&["username"]);
         let values = vec![ScalarValue::Utf8(Some("pg".into()))];
-        let body =
-            "SELECT content FROM raw_users WHERE request_path = (SELECT username FROM args)";
-        let result = inline_args_into_body(body, &schema, &values).expect("should inline");
+        let body = "SELECT content FROM raw_users WHERE request_path = (SELECT username FROM args)";
+        let plan = plan_body(body, &schema, &values).await;
+        let rewritten = inline_args_into_plan(plan, &schema, &values).expect("rewrite");
+        let s = plan_str(&rewritten);
         assert!(
-            result.contains("'pg'"),
-            "Expected inlined literal 'pg' in: {result}"
-        );
-        assert!(
-            !result.contains("FROM args"),
-            "Should not contain FROM args after inlining: {result}"
+            s.contains("Utf8(\"pg\")"),
+            "Expected inlined literal in plan: {s}"
         );
     }
 
-    #[test]
-    fn inline_args_replaces_expression_over_args() {
+    #[tokio::test]
+    async fn inline_replaces_expression_over_args() {
         let schema = utf8_schema(&["username"]);
         let values = vec![ScalarValue::Utf8(Some("pg".into()))];
         let body = "SELECT content FROM raw_users WHERE request_path = (SELECT concat('/users/', username) FROM args)";
-        let result = inline_args_into_body(body, &schema, &values).expect("should inline");
+        let plan = plan_body(body, &schema, &values).await;
+        let rewritten = inline_args_into_plan(plan, &schema, &values).expect("rewrite");
+        let s = plan_str(&rewritten);
         assert!(
-            result.contains("'pg'"),
-            "Expected inlined literal 'pg' in: {result}"
+            s.contains("Utf8(\"pg\")"),
+            "Expected inlined literal in plan: {s}"
         );
-        assert!(
-            !result.contains("FROM args"),
-            "Should not contain FROM args: {result}"
-        );
-        assert!(
-            result.to_lowercase().contains("concat"),
-            "Should still contain concat call: {result}"
-        );
+        assert!(s.contains("concat"), "Should still contain concat: {s}");
     }
 
-    #[test]
-    fn inline_args_handles_qualified_reference() {
-        let schema = utf8_schema(&["username"]);
-        let values = vec![ScalarValue::Utf8(Some("pg".into()))];
-        let body = "SELECT content FROM raw_users WHERE request_path = (SELECT args.username FROM args)";
-        let result = inline_args_into_body(body, &schema, &values).expect("should inline");
-        assert!(
-            result.contains("'pg'"),
-            "Expected inlined literal: {result}"
-        );
-        assert!(
-            !result.contains("FROM args"),
-            "Should not contain FROM args: {result}"
-        );
-    }
-
-    #[test]
-    fn inline_args_handles_numeric_types() {
+    #[tokio::test]
+    async fn inline_replaces_from_args_direct() {
+        // Body uses `FROM args` directly — columns should still be replaced.
         let schema = Schema::new(vec![ArrowField::new(
             "x",
             arrow::datatypes::DataType::Int64,
             true,
         )]);
         let values = vec![ScalarValue::Int64(Some(42))];
-        let body = "SELECT x AS value, x * 2 AS doubled FROM t WHERE id = (SELECT x FROM args)";
-        let result = inline_args_into_body(body, &schema, &values).expect("should inline");
+        let body = "SELECT x AS value, x * 2 AS doubled FROM args";
+        let plan = plan_body(body, &schema, &values).await;
+        let rewritten = inline_args_into_plan(plan, &schema, &values).expect("rewrite");
+        let s = plan_str(&rewritten);
         assert!(
-            result.contains("42"),
-            "Expected inlined literal 42 in: {result}"
-        );
-        assert!(
-            !result.contains("FROM args"),
-            "Should not contain FROM args: {result}"
+            s.contains("Int64(42)"),
+            "Expected inlined literal 42 in plan: {s}"
         );
     }
 
-    #[test]
-    fn inline_args_handles_boolean_and_null() {
-        let schema = Schema::new(vec![ArrowField::new(
-            "flag",
-            arrow::datatypes::DataType::Boolean,
-            true,
-        )]);
-        let values = vec![ScalarValue::Boolean(Some(true))];
-        let body = "SELECT * FROM t WHERE active = (SELECT flag FROM args)";
-        let result = inline_args_into_body(body, &schema, &values).expect("should inline");
-        assert!(
-            result.to_lowercase().contains("true"),
-            "Expected inlined boolean: {result}"
-        );
-
-        let null_values = vec![ScalarValue::Null];
-        let schema_null = utf8_schema(&["val"]);
-        let body_null = "SELECT * FROM t WHERE col = (SELECT val FROM args)";
-        let result_null =
-            inline_args_into_body(body_null, &schema_null, &null_values).expect("should inline");
-        assert!(
-            result_null.contains("NULL"),
-            "Expected inlined NULL: {result_null}"
-        );
-    }
-
-    #[test]
-    fn inline_args_escapes_strings_safely() {
-        let schema = utf8_schema(&["name"]);
-        // Value with single quotes and semicolons — must not cause SQL injection.
-        let values = vec![ScalarValue::Utf8(Some("O'Reilly; DROP TABLE".into()))];
-        let body = "SELECT * FROM t WHERE name = (SELECT name FROM args)";
-        let result = inline_args_into_body(body, &schema, &values).expect("should inline");
-        // sqlparser escapes single quotes by doubling them.
-        assert!(
-            result.contains("O''Reilly"),
-            "Expected escaped quote in: {result}"
-        );
-        assert!(
-            !result.contains("FROM args"),
-            "Should not contain FROM args: {result}"
-        );
-    }
-
-    #[test]
-    fn inline_args_returns_none_for_empty_schema() {
-        let schema = Schema::empty();
-        let values = vec![];
-        let body = "SELECT * FROM t";
-        assert!(
-            inline_args_into_body(body, &schema, &values).is_none(),
-            "Should return None for empty schema"
-        );
-    }
-
-    #[test]
-    fn inline_args_no_subquery_returns_original() {
-        // Body that uses `FROM args` directly (not a scalar subquery) —
-        // the inliner doesn't touch it but still returns the SQL.
-        let schema = utf8_schema(&["x"]);
-        let values = vec![ScalarValue::Utf8(Some("val".into()))];
-        let body = "SELECT x AS value FROM args";
-        let result = inline_args_into_body(body, &schema, &values);
-        // No scalar subquery to inline, so the SQL is returned as-is
-        // (modulo re-serialization by sqlparser).
-        assert!(result.is_some(), "Should still return Some for valid SQL");
-    }
-
-    #[test]
-    fn inline_args_multiple_subqueries() {
+    #[tokio::test]
+    async fn inline_handles_multiple_args() {
         let schema = Schema::new(vec![
             ArrowField::new("a", arrow::datatypes::DataType::Utf8, true),
             ArrowField::new("b", arrow::datatypes::DataType::Int64, true),
@@ -474,15 +344,52 @@ mod tests {
         ];
         let body =
             "SELECT * FROM t WHERE name = (SELECT a FROM args) AND id = (SELECT b FROM args)";
-        let result = inline_args_into_body(body, &schema, &values).expect("should inline");
+        let plan = plan_body(body, &schema, &values).await;
+        let rewritten = inline_args_into_plan(plan, &schema, &values).expect("rewrite");
+        let s = plan_str(&rewritten);
         assert!(
-            result.contains("'hello'"),
-            "Expected inlined 'hello': {result}"
+            s.contains("Utf8(\"hello\")"),
+            "Expected inlined 'hello': {s}"
         );
-        assert!(result.contains("99"), "Expected inlined 99: {result}");
-        assert!(
-            !result.contains("FROM args"),
-            "Should not contain FROM args: {result}"
-        );
+        assert!(s.contains("Int64(99)"), "Expected inlined 99: {s}");
+    }
+
+    #[tokio::test]
+    async fn inline_empty_schema_is_noop() {
+        let schema = Schema::empty();
+        let values: Vec<ScalarValue> = vec![];
+        // With an empty schema, just plan against `t` directly (no args table).
+        let ctx = SessionContext::new();
+        let t_schema = Arc::new(Schema::new(vec![ArrowField::new(
+            "id",
+            arrow::datatypes::DataType::Int64,
+            true,
+        )]));
+        let t_table = MemTable::try_new(t_schema, vec![vec![]]).expect("t memtable");
+        ctx.register_table("t", Arc::new(t_table))
+            .expect("register t");
+        let plan = ctx
+            .sql("SELECT * FROM t")
+            .await
+            .expect("plan")
+            .into_unoptimized_plan();
+        let original = plan_str(&plan);
+        let rewritten = inline_args_into_plan(plan, &schema, &values).expect("rewrite");
+        assert_eq!(original, plan_str(&rewritten));
+    }
+
+    #[tokio::test]
+    async fn inline_handles_boolean_and_null() {
+        let schema = Schema::new(vec![ArrowField::new(
+            "flag",
+            arrow::datatypes::DataType::Boolean,
+            true,
+        )]);
+        let values = vec![ScalarValue::Boolean(Some(true))];
+        let body = "SELECT * FROM t WHERE active = (SELECT flag FROM args)";
+        let plan = plan_body(body, &schema, &values).await;
+        let rewritten = inline_args_into_plan(plan, &schema, &values).expect("rewrite");
+        let s = plan_str(&rewritten);
+        assert!(s.contains("Boolean(true)"), "Expected inlined boolean: {s}");
     }
 }
