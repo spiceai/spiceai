@@ -8,7 +8,16 @@ spawn spice chat
 proc chat {message}  {
     global timeout
 
-     send "$message\r"
+    # Wait for the chat prompt to be ready before sending
+    expect {
+        "chat> " {}
+        timeout {
+            send_user "Timeout waiting for chat prompt\n"
+            exit 1
+        }
+    }
+
+    send "$message\r"
 
     expect {
         " ERROR " {
@@ -29,10 +38,7 @@ proc chat {message}  {
     send_user "Model returned expected response\n"
 }
 
-expect "chat>"
-
 chat "What datasets you have access to?"
-sleep 1
 
 chat "How many issues stored in database?"
 

@@ -66,6 +66,7 @@ use crate::schema_discovery::{
     DatasetPermissions, NoPermissionsCheck, PermissionCheckResult, SchemaProbeResult,
     discover_schema,
 };
+use crate::{COMMENT_METADATA_KEY, PARTITION_METADATA_KEY, SOURCE_TYPE_METADATA_KEY};
 use tracing::Instrument;
 use util::retry_strategy::BackoffMethod;
 
@@ -722,7 +723,10 @@ impl SqlWarehouseApi {
             })?;
 
             result.log_warnings(table);
-            Ok(result.schema)
+            let token = self.token_provider.get_token();
+            Ok(self
+                .enrich_schema_with_partition_columns(&token, table, result.schema)
+                .await)
         }
         .instrument(tracing::info_span!(
             target: "task_history",
@@ -898,10 +902,65 @@ impl SqlWarehouseApi {
         let escaped_schema = table_schema.replace('\'', "''");
         let escaped_catalog = table_catalog.replace('\'', "''");
         let sql = format!(
-            "SELECT column_name, {data_type_column}, is_nullable FROM information_schema.columns WHERE table_name = '{escaped_table}' AND table_schema = '{escaped_schema}' AND table_catalog = '{escaped_catalog}'"
+            "SELECT c.column_name, c.{data_type_column}, c.is_nullable, c.comment, t.comment FROM information_schema.columns c LEFT JOIN information_schema.tables t ON c.table_catalog = t.table_catalog AND c.table_schema = t.table_schema AND c.table_name = t.table_name WHERE c.table_name = '{escaped_table}' AND c.table_schema = '{escaped_schema}' AND c.table_catalog = '{escaped_catalog}' ORDER BY c.ordinal_position"
         );
         // Databricks SQL Statements API max wait_timeout is 50s.
         // https://docs.databricks.com/api/workspace/statementexecution/executestatement
+        Ok(json!({
+            "warehouse_id": self.sql_warehouse_id,
+            "catalog": table_catalog,
+            "schema": table_schema,
+            "statement": sql,
+            "format": "JSON_ARRAY",
+            "disposition": "INLINE",
+            "wait_timeout": "50s",
+            "on_wait_timeout": "CONTINUE",
+        }))
+    }
+
+    async fn enrich_schema_with_partition_columns(
+        &self,
+        token: &str,
+        table: &TableReference,
+        schema: SchemaRef,
+    ) -> SchemaRef {
+        match self.get_partition_columns(token, table).await {
+            Ok(partition_columns) => schema_with_partition_metadata(schema, &partition_columns),
+            Err(error) => {
+                tracing::warn!(
+                    table = %table,
+                    error = %error,
+                    "Failed to query Databricks partition columns; registering without partition metadata"
+                );
+                schema
+            }
+        }
+    }
+
+    async fn get_partition_columns(
+        &self,
+        token: &str,
+        table: &TableReference,
+    ) -> Result<Vec<String>, Error> {
+        let payload = self.create_describe_detail_payload(table)?;
+        let response = self.execute_sql_statement(token, &payload).await?;
+        let response = self.wait_for_statement_completion(token, response).await?;
+        partition_columns_from_describe_detail_json(&response, &table.to_string())
+    }
+
+    fn create_describe_detail_payload(&self, table: &TableReference) -> Result<Value, Error> {
+        let table_schema = table.schema().ok_or_else(|| Error::FullyQualifiedPath {
+            reason: "missing schema".into(),
+        })?;
+        let table_catalog = table.catalog().ok_or_else(|| Error::FullyQualifiedPath {
+            reason: "missing catalog".into(),
+        })?;
+        let sql = format!(
+            "DESCRIBE DETAIL `{}`.`{}`.`{}`",
+            table_catalog.replace('`', "``"),
+            table_schema.replace('`', "``"),
+            table.table().replace('`', "``"),
+        );
         Ok(json!({
             "warehouse_id": self.sql_warehouse_id,
             "catalog": table_catalog,
@@ -1530,6 +1589,7 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
     }
 
     let mut fields = Vec::new();
+    let mut schema_metadata = HashMap::new();
 
     for (i, row) in data_array.iter().enumerate() {
         let row_array = row
@@ -1579,7 +1639,17 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
                 reason: format!("data_array[{i}][2] (is_nullable) is not a string"),
             })?;
 
-        let field: Field = Field::new(col_name, data_type, nullable);
+        if let Some(table_comment) = optional_string(row_array.get(4)) {
+            schema_metadata
+                .entry(COMMENT_METADATA_KEY.to_string())
+                .or_insert_with(|| table_comment.to_string());
+        }
+
+        let field = field_with_optional_metadata(
+            Field::new(col_name, data_type, nullable),
+            optional_string(row_array.get(3)),
+            Some(data_type_str),
+        );
 
         fields.push(field);
     }
@@ -1590,7 +1660,7 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
         });
     }
 
-    Ok(Arc::new(Schema::new(fields)))
+    Ok(Arc::new(Schema::new_with_metadata(fields, schema_metadata)))
 }
 
 /// Parses a schema from a `DESCRIBE TABLE` response.
@@ -1666,7 +1736,11 @@ fn schema_from_describe_json(json_value: &Value, dataset_name: &str) -> Result<S
             .map_err(|reason| Error::ParseError { reason })?;
 
         // DESCRIBE TABLE does not report nullability; default to nullable.
-        fields.push(Field::new(col_name, data_type, true));
+        fields.push(field_with_optional_metadata(
+            Field::new(col_name, data_type, true),
+            optional_string(row_array.get(2)),
+            Some(data_type_str),
+        ));
     }
 
     if fields.is_empty() {
@@ -1676,6 +1750,138 @@ fn schema_from_describe_json(json_value: &Value, dataset_name: &str) -> Result<S
     }
 
     Ok(Arc::new(Schema::new(fields)))
+}
+
+fn optional_string(value: Option<&Value>) -> Option<&str> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn field_with_optional_metadata(
+    field: Field,
+    comment: Option<&str>,
+    source_type: Option<&str>,
+) -> Field {
+    let mut metadata = HashMap::new();
+    if let Some(comment) = comment {
+        metadata.insert(COMMENT_METADATA_KEY.to_string(), comment.to_string());
+    }
+    if let Some(source_type) = source_type.map(str::trim).filter(|value| !value.is_empty()) {
+        metadata.insert(
+            SOURCE_TYPE_METADATA_KEY.to_string(),
+            source_type.to_string(),
+        );
+    }
+
+    if metadata.is_empty() {
+        return field;
+    }
+
+    field.with_metadata(metadata)
+}
+
+fn schema_with_partition_metadata(schema: SchemaRef, partition_columns: &[String]) -> SchemaRef {
+    if partition_columns.is_empty() {
+        return schema;
+    }
+
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if partition_columns
+                .iter()
+                .any(|partition_column| partition_column == field.name())
+            {
+                let mut metadata = field.metadata().clone();
+                metadata.insert(PARTITION_METADATA_KEY.to_string(), "true".to_string());
+                Arc::new(field.as_ref().clone().with_metadata(metadata))
+            } else {
+                Arc::clone(field)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+fn partition_columns_from_describe_detail_json(
+    json_value: &Value,
+    dataset_name: &str,
+) -> Result<Vec<String>, Error> {
+    SqlWarehouseApi::verify_response_status(json_value)?;
+
+    let result = json_value
+        .get("result")
+        .ok_or_else(|| Error::UnexpectedSchemaResponse {
+            dataset_name: dataset_name.to_string(),
+            reason: "missing result object in DESCRIBE DETAIL response".to_string(),
+        })?;
+
+    let data_array = result
+        .get("data_array")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::UnexpectedSchemaResponse {
+            dataset_name: dataset_name.to_string(),
+            reason: "missing or invalid data_array in DESCRIBE DETAIL response".to_string(),
+        })?;
+
+    let Some(row) = data_array.first() else {
+        return Ok(Vec::new());
+    };
+
+    let row_array = row
+        .as_array()
+        .ok_or_else(|| Error::UnexpectedSchemaResponse {
+            dataset_name: dataset_name.to_string(),
+            reason: "DESCRIBE DETAIL row is not an array".to_string(),
+        })?;
+
+    let Some(partition_columns) = row_array.get(7) else {
+        return Ok(Vec::new());
+    };
+
+    partition_column_names(partition_columns).ok_or_else(|| Error::UnexpectedSchemaResponse {
+        dataset_name: dataset_name.to_string(),
+        reason: "DESCRIBE DETAIL partitionColumns is not a string array".to_string(),
+    })
+}
+
+fn partition_column_names(value: &Value) -> Option<Vec<String>> {
+    match value {
+        Value::Array(values) => Some(
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect(),
+        ),
+        Value::String(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Some(Vec::new());
+            }
+            serde_json::from_str::<Vec<String>>(trimmed)
+                .ok()
+                .or_else(|| {
+                    Some(
+                        trimmed
+                            .trim_matches(['[', ']'])
+                            .split(',')
+                            .map(|value| value.trim().trim_matches('"'))
+                            .filter(|value| !value.is_empty())
+                            .map(ToString::to_string)
+                            .collect(),
+                    )
+                })
+        }
+        Value::Null => Some(Vec::new()),
+        _ => None,
+    }
 }
 
 struct SqlWarehouseConnection {
@@ -1907,6 +2113,78 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_from_json_preserves_comment_metadata() {
+        let response = make_schema_response(&json!([
+            ["id", "int", "NO", "stable identifier", "customer dimension"],
+            [
+                "name",
+                "string",
+                "YES",
+                "display name",
+                "customer dimension"
+            ],
+            ["amount", "double", "NO", "", "customer dimension"]
+        ]));
+
+        let schema = schema_from_json(&response, "test_table").expect("should parse schema");
+
+        assert_eq!(
+            schema
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .map(String::as_str),
+            Some("customer dimension")
+        );
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .map(String::as_str),
+            Some("stable identifier")
+        );
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get(SOURCE_TYPE_METADATA_KEY)
+                .map(String::as_str),
+            Some("int")
+        );
+        assert_eq!(
+            schema
+                .field(1)
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .map(String::as_str),
+            Some("display name")
+        );
+        assert_eq!(
+            schema
+                .field(1)
+                .metadata()
+                .get(SOURCE_TYPE_METADATA_KEY)
+                .map(String::as_str),
+            Some("string")
+        );
+        assert!(
+            schema
+                .field(2)
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .is_none()
+        );
+        assert_eq!(
+            schema
+                .field(2)
+                .metadata()
+                .get(SOURCE_TYPE_METADATA_KEY)
+                .map(String::as_str),
+            Some("double")
+        );
+    }
+
+    #[test]
     fn test_schema_from_json_many_types() {
         let response = make_schema_response(&json!([
             ["col_bigint", "bigint", "NO"],
@@ -1932,6 +2210,51 @@ mod tests {
         );
         assert_eq!(schema.field(6).data_type(), &DataType::Binary);
         assert_eq!(schema.field(7).data_type(), &DataType::Decimal128(10, 2));
+    }
+
+    #[test]
+    fn test_partition_columns_from_describe_detail_metadata() {
+        let response = make_schema_response(&json!([[
+            "delta",
+            "table-id",
+            "customers",
+            null,
+            "s3://bucket/customers",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+            ["event_date", "region"]
+        ]]));
+
+        let partition_columns = partition_columns_from_describe_detail_json(&response, "customers")
+            .expect("should parse partition columns");
+
+        assert_eq!(partition_columns, vec!["event_date", "region"]);
+    }
+
+    #[test]
+    fn test_schema_with_partition_metadata_marks_fields() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_date", DataType::Date32, true),
+            Field::new("value", DataType::Int64, true),
+        ]));
+
+        let schema = schema_with_partition_metadata(schema, &["event_date".to_string()]);
+
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get(PARTITION_METADATA_KEY)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(
+            schema
+                .field(1)
+                .metadata()
+                .get(PARTITION_METADATA_KEY)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2762,7 +3085,7 @@ mod tests {
             "SQL should reference full_data_type: {stmt_full}"
         );
         assert!(
-            !stmt_full.contains(", data_type,"),
+            !stmt_full.contains(", c.data_type,"),
             "SQL should not reference plain data_type: {stmt_full}"
         );
         let payload_plain = api
@@ -2772,7 +3095,7 @@ mod tests {
             .as_str()
             .expect("statement should be string");
         assert!(
-            stmt_plain.contains(", data_type,"),
+            stmt_plain.contains(", c.data_type,"),
             "SQL should reference data_type: {stmt_plain}"
         );
         assert!(
@@ -4349,6 +4672,14 @@ mod tests {
 
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .map(String::as_str),
+            Some("primary key")
+        );
         assert!(
             schema.field(0).is_nullable(),
             "DESCRIBE TABLE defaults to nullable"
@@ -4356,10 +4687,25 @@ mod tests {
 
         assert_eq!(schema.field(1).name(), "name");
         assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(
+            schema
+                .field(1)
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .map(String::as_str),
+            Some("user name")
+        );
         assert!(schema.field(1).is_nullable());
 
         assert_eq!(schema.field(2).name(), "amount");
         assert_eq!(schema.field(2).data_type(), &DataType::Float64);
+        assert!(
+            schema
+                .field(2)
+                .metadata()
+                .get(COMMENT_METADATA_KEY)
+                .is_none()
+        );
     }
 
     /// DESCRIBE TABLE with metadata rows (partition info) after a blank separator.

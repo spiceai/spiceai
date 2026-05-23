@@ -1049,10 +1049,8 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
         Some(QueryOverrides::Turso) => remove_tpch_query!(
             queries,
             2, // Correlated scalar subquery not supported; DF limitation, Turso tests are not cross-table federated
-            4, // Federation fails for cross-provider EXISTS subquery filters; https://github.com/spiceai/spiceai/issues/10167
             17, // Correlated scalar subquery not supported
-            21, // Correlated scalar subquery not supported
-            22 // Federation fails for cross-provider EXISTS subquery filters; https://github.com/spiceai/spiceai/issues/10167
+            21  // Correlated scalar subquery not supported
         ),
         Some(QueryOverrides::BigQuery) => {
             let mut queries: Vec<Query> = remove_tpch_query!(
@@ -1230,8 +1228,10 @@ pub fn get_clickbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Que
 #[must_use]
 pub fn get_chbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
     let queries = generate_chbench_queries!(
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22
     );
+
+    // Q21 is excluded due to https://github.com/spiceai/spiceai/issues/11010; https://github.com/spiceai/spiceai/issues/11011
 
     match overrides {
         // No engine-specific overrides yet

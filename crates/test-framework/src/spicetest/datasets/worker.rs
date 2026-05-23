@@ -58,6 +58,8 @@ pub(crate) struct SpiceTestQueryWorker {
     reference_schema: Option<String>,
     /// Queries to skip row count validation for (e.g., queries that legitimately return 0 rows)
     skip_row_count_validation: HashSet<String>,
+    /// Whether to validate that queries return at least one row (default: true)
+    validate_row_count: bool,
     shutdown_token: CancellationToken,
     /// Optional sender for streaming query metrics to OTLP
     streaming_metrics_sender: Option<mpsc::Sender<QueryMetricEvent>>,
@@ -123,6 +125,7 @@ impl SpiceTestQueryWorker {
             validation_data: None,
             reference_schema: None,
             skip_row_count_validation: default_row_count_validation_skip_queries(),
+            validate_row_count: true,
             shutdown_token: CancellationToken::new(),
             streaming_metrics_sender: None,
             query_duration_threshold: None,
@@ -190,6 +193,11 @@ impl SpiceTestQueryWorker {
         queries: impl IntoIterator<Item = String>,
     ) -> Self {
         self.skip_row_count_validation = queries.into_iter().collect();
+        self
+    }
+
+    pub fn with_validate_row_count(mut self, enabled: bool) -> Self {
+        self.validate_row_count = enabled;
         self
     }
 
@@ -705,9 +713,10 @@ impl SpiceTestQueryWorker {
         }
 
         // Check for zero row count if not in skip list
-        if !self
-            .skip_row_count_validation
-            .contains(&query.name.to_string())
+        if self.validate_row_count
+            && !self
+                .skip_row_count_validation
+                .contains(&query.name.to_string())
             && result.row_count == 0
         {
             eprintln!(

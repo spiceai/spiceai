@@ -545,3 +545,11 @@ pub static REPLICATION_LAG_MS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .with_unit("ms")
         .build()
 });
+
+pub static OLTP_TPMC: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("tpmc")
+        .with_description("TPC-C NewOrder transactions per minute (tpmC).")
+        .with_unit("txn/min")
+        .build()
+});
