@@ -129,6 +129,7 @@ pub mod iceberg_ddl;
 pub mod job_executor_context_extension;
 pub use runtime_datafusion::managed_runtime;
 pub use runtime_datafusion::param_utils;
+pub mod pg_catalog;
 #[cfg(not(windows))]
 pub mod planner;
 pub mod refresh_sql;
