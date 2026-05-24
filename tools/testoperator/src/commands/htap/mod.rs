@@ -152,6 +152,8 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         .with_spiced_instance(spiced_instance)
         .with_results_snapshot(|_| false) // No snapshots for HTAP — results change under OLTP
         .with_progress_bars(!test_args.common.disable_progress_bars)
+        // Concurrent OLTP mutations make row counts non-deterministic; 0 rows is expected.
+        .with_validate_row_count(false)
         .start()?;
 
     let test = wait_test_and_memory!(benchmark_test, memory_token, memory_readings);
@@ -216,6 +218,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     match oltp_result {
         Ok(Ok(report)) => {
             report.print_summary();
+            crate::metrics::OLTP_TPMC.record(report.tpmc, &[]);
         }
         Ok(Err(e)) => {
             eprintln!("OLTP workload error: {e}");

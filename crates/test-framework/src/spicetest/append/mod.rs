@@ -188,6 +188,7 @@ impl SpiceTest<NotStarted> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
+            validate_row_count: self.validate_row_count,
             state: AppendStarted {
                 queries: self.state.queries.clone(),
                 append_worker,
@@ -230,7 +231,8 @@ impl SpiceTest<AppendStarted> {
                     executor.clone(),
                 )
                 .with_explain_plan_snapshot(self.explain_plan_snapshot)
-                .with_results_snapshot(self.results_snapshot_predicate);
+                .with_results_snapshot(self.results_snapshot_predicate)
+                .with_validate_row_count(self.validate_row_count);
 
                 if let Some(multi) = &multi {
                     worker.with_progress_bar(multi.add(self.get_new_progress_bar()))
@@ -249,6 +251,7 @@ impl SpiceTest<AppendStarted> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
+            validate_row_count: self.validate_row_count,
             state: Running {
                 start_time: Instant::now(),
                 query_workers,
@@ -340,6 +343,7 @@ impl SpiceTest<Running> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
+            validate_row_count: self.validate_row_count,
             state: datasets::Completed {
                 query_durations,
                 query_iteration_durations,
