@@ -28,6 +28,7 @@ use super::TerminalAssignment;
 use super::prepared::NewOrderStmts;
 use crate::Result;
 use crate::rand as tpcc_rand;
+use std::fmt::Write;
 
 /// # Errors
 ///
@@ -38,6 +39,18 @@ pub async fn run(
     assignment: &TerminalAssignment,
     stmts: &NewOrderStmts,
 ) -> Result<()> {
+    // Collected write data from Phase 1.
+    struct LineWrite {
+        s_quantity: i32,
+        ol_quantity: i32,
+        remote: i32,
+        ol_i_id: i32,
+        ol_supply_w_id: i32,
+        ol_number: i32,
+        ol_amount: f64,
+        ol_dist_info: String,
+    }
+
     let w_id = assignment.home_w_id;
     let d_id = rng.random_range(assignment.district_lo..=assignment.district_hi);
     let c_id = tpcc_rand::rand_customer_id(rng);
@@ -139,18 +152,6 @@ pub async fn run(
     //   Phase 1: Sequential reads (SELECT item + SELECT stock FOR UPDATE)
     //   Phase 2: Single batch_execute for all writes (UPDATE stock + INSERT order_line)
 
-    // Collected write data from Phase 1.
-    struct LineWrite {
-        s_quantity: i32,
-        ol_quantity: i32,
-        remote: i32,
-        ol_i_id: i32,
-        ol_supply_w_id: i32,
-        ol_number: i32,
-        ol_amount: f64,
-        ol_dist_info: String,
-    }
-
     #[expect(clippy::cast_sign_loss)]
     let mut writes: Vec<LineWrite> = Vec::with_capacity(ol_cnt as usize);
 
@@ -210,18 +211,18 @@ pub async fn run(
     //
     // Uses `batch_execute` (simple query)  which does not support prepared statements
     // but batching is still faster than using prepared statements with multiple round-trips.
-    use std::fmt::Write;
     let mut batch_sql = String::with_capacity(writes.len() * 200);
 
     for w in &writes {
-        write!(
+        if let Err(e) = write!(
             &mut batch_sql,
             "UPDATE stock SET s_quantity = {}, s_ytd = s_ytd + {}, \
              s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + {} \
              WHERE s_i_id = {} AND s_w_id = {};",
             w.s_quantity, w.ol_quantity, w.remote, w.ol_i_id, w.ol_supply_w_id
-        )
-        .unwrap_or(());
+        ) {
+            eprintln!("Failed to format stock UPDATE SQL: {e}");
+        }
     }
 
     batch_sql.push_str(
@@ -236,12 +237,13 @@ pub async fn run(
         // ol_dist_info is a fixed 24-char alphanumeric string from stock table;
         // escape single quotes defensively.
         let escaped_dist = w.ol_dist_info.replace('\'', "''");
-        write!(
+        if let Err(e) = write!(
             &mut batch_sql,
             "({}, {}, {}, {}, {}, {}, {}, {}, '{escaped_dist}')",
             o_id, d_id, w_id, w.ol_number, w.ol_i_id, w.ol_supply_w_id, w.ol_quantity, w.ol_amount
-        )
-        .unwrap_or(());
+        ) {
+            eprintln!("Failed to format order_line VALUES SQL: {e}");
+        }
     }
     batch_sql.push(';');
 
