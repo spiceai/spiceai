@@ -47,8 +47,8 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 /// ```
 pub const FOREIGN_KEYS_METADATA_KEY: &str = "foreign_keys";
 
-/// Canonical Arrow metadata key for user-facing table and column comments.
-pub const COMMENT_METADATA_KEY: &str = "comment";
+/// Canonical Arrow metadata key for user-facing table and column descriptions.
+pub const DESCRIPTION_METADATA_KEY: &str = "description";
 
 /// Canonical Arrow field metadata key for the source-native column type.
 pub const SOURCE_TYPE_METADATA_KEY: &str = "source_type";
@@ -458,7 +458,7 @@ mod tests {
         )]);
         let enriched = metadata_enriched_table_provider(
             provider,
-            HashMap::from([("comment".to_string(), "orders".to_string())]),
+            HashMap::from([("description".to_string(), "orders".to_string())]),
             field_metadata,
         );
 
@@ -468,7 +468,7 @@ mod tests {
             .expect("metadata enrichment should preserve the federated adaptor");
         let schema = adaptor.schema();
         assert_eq!(
-            schema.metadata().get("comment").map(String::as_str),
+            schema.metadata().get("description").map(String::as_str),
             Some("orders")
         );
         assert_eq!(

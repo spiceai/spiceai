@@ -4153,7 +4153,7 @@ mod tests {
             registered_schema_with_metadata("dataset_meta", &metadata, &dataset.columns).await;
 
         assert_eq!(
-            schema.metadata().get("comment").map(String::as_str),
+            schema.metadata().get("description").map(String::as_str),
             Some("dataset description")
         );
         assert_eq!(
@@ -4162,7 +4162,7 @@ mod tests {
         );
         let id_field = schema.field_with_name("id").expect("id field should exist");
         assert_eq!(
-            id_field.metadata().get("comment").map(String::as_str),
+            id_field.metadata().get("description").map(String::as_str),
             Some("stable row id")
         );
     }
@@ -4180,14 +4180,14 @@ mod tests {
         let schema = registered_schema_with_metadata("view_meta", &metadata, &view.columns).await;
 
         assert_eq!(
-            schema.metadata().get("comment").map(String::as_str),
+            schema.metadata().get("description").map(String::as_str),
             Some("view description")
         );
         let name_field = schema
             .field_with_name("name")
             .expect("name field should exist");
         assert_eq!(
-            name_field.metadata().get("comment").map(String::as_str),
+            name_field.metadata().get("description").map(String::as_str),
             Some("display name")
         );
     }

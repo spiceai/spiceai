@@ -29,7 +29,7 @@ use arrow::{
     datatypes::{DataType, SchemaRef},
 };
 use async_trait::async_trait;
-use data_components::COMMENT_METADATA_KEY;
+use data_components::DESCRIPTION_METADATA_KEY;
 use datafusion::{
     catalog::CatalogProviderList,
     common::{DataFusionError, ScalarValue, TableReference},
@@ -155,7 +155,7 @@ impl ObjDescription {
             return Ok(None);
         };
 
-        Ok(schema.metadata().get(COMMENT_METADATA_KEY).cloned())
+        Ok(schema.metadata().get(DESCRIPTION_METADATA_KEY).cloned())
     }
 }
 
@@ -268,12 +268,12 @@ impl ColDescription {
             ColumnSelector::Name(name) => schema
                 .field_with_name(&name)
                 .ok()
-                .and_then(|field| field.metadata().get(COMMENT_METADATA_KEY).cloned()),
+                .and_then(|field| field.metadata().get(DESCRIPTION_METADATA_KEY).cloned()),
             ColumnSelector::Position(position) => position
                 .checked_sub(1)
                 .and_then(|index| usize::try_from(index).ok())
                 .and_then(|index| schema.fields().get(index))
-                .and_then(|field| field.metadata().get(COMMENT_METADATA_KEY).cloned()),
+                .and_then(|field| field.metadata().get(DESCRIPTION_METADATA_KEY).cloned()),
         };
 
         Ok(comment)
@@ -509,7 +509,7 @@ mod tests {
         datatypes::{Field, Schema},
         record_batch::RecordBatch,
     };
-    use data_components::COMMENT_METADATA_KEY;
+    use data_components::DESCRIPTION_METADATA_KEY;
     use datafusion::{
         assert_batches_eq,
         datasource::MemTable,
@@ -520,17 +520,20 @@ mod tests {
 
     fn commented_schema() -> SchemaRef {
         let mut table_metadata = HashMap::new();
-        table_metadata.insert(COMMENT_METADATA_KEY.to_string(), "orders table".to_string());
+        table_metadata.insert(
+            DESCRIPTION_METADATA_KEY.to_string(),
+            "orders table".to_string(),
+        );
 
         let mut id_metadata = HashMap::new();
         id_metadata.insert(
-            COMMENT_METADATA_KEY.to_string(),
+            DESCRIPTION_METADATA_KEY.to_string(),
             "stable row id".to_string(),
         );
 
         let mut customer_metadata = HashMap::new();
         customer_metadata.insert(
-            COMMENT_METADATA_KEY.to_string(),
+            DESCRIPTION_METADATA_KEY.to_string(),
             "customer name".to_string(),
         );
 

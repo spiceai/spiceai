@@ -40,8 +40,8 @@ use tokio::sync::Mutex;
 
 use crate::schema_discovery::{NoPermissionsCheck, SchemaProbeResult, discover_schema};
 use crate::{
-    CLUSTERING_KEY_METADATA_KEY, CLUSTERING_METADATA_KEY, COMMENT_METADATA_KEY, Read, ReadWrite,
-    SOURCE_TYPE_METADATA_KEY,
+    CLUSTERING_KEY_METADATA_KEY, CLUSTERING_METADATA_KEY, DESCRIPTION_METADATA_KEY, Read,
+    ReadWrite, SOURCE_TYPE_METADATA_KEY,
 };
 
 pub type SnowflakeConnectionPool =
@@ -304,7 +304,7 @@ fn parse_information_schema_json(
 
         if let Some(table_comment) = optional_json_string(row.get(6)) {
             schema_metadata
-                .entry(COMMENT_METADATA_KEY.to_string())
+                .entry(DESCRIPTION_METADATA_KEY.to_string())
                 .or_insert_with(|| table_comment.to_string());
         }
         if let Some(clustering_key) = optional_json_string(row.get(7)) {
@@ -400,7 +400,7 @@ fn parse_information_schema_arrow(
             let source_type = snowflake_source_type(data_type_str, precision, scale);
             if let Some(table_comment) = optional_arrow_string(table_comments, i) {
                 schema_metadata
-                    .entry(COMMENT_METADATA_KEY.to_string())
+                    .entry(DESCRIPTION_METADATA_KEY.to_string())
                     .or_insert_with(|| table_comment.to_string());
             }
             if let Some(clustering_key) = optional_arrow_string(clustering_keys, i) {
@@ -454,7 +454,7 @@ fn field_with_optional_metadata(
 ) -> Field {
     let mut metadata = HashMap::new();
     if let Some(comment) = comment {
-        metadata.insert(COMMENT_METADATA_KEY.to_string(), comment.to_string());
+        metadata.insert(DESCRIPTION_METADATA_KEY.to_string(), comment.to_string());
     }
     if let Some(source_type) = source_type.map(str::trim).filter(|value| !value.is_empty()) {
         metadata.insert(
@@ -781,7 +781,7 @@ mod tests {
         assert_eq!(
             schema
                 .metadata()
-                .get(COMMENT_METADATA_KEY)
+                .get(DESCRIPTION_METADATA_KEY)
                 .map(String::as_str),
             Some("customer dimension")
         );
@@ -796,7 +796,7 @@ mod tests {
             schema
                 .field(0)
                 .metadata()
-                .get(COMMENT_METADATA_KEY)
+                .get(DESCRIPTION_METADATA_KEY)
                 .map(String::as_str),
             Some("stable identifier")
         );
@@ -820,7 +820,7 @@ mod tests {
             schema
                 .field(1)
                 .metadata()
-                .get(COMMENT_METADATA_KEY)
+                .get(DESCRIPTION_METADATA_KEY)
                 .map(String::as_str),
             Some("display name")
         );
@@ -844,7 +844,7 @@ mod tests {
             schema
                 .field(2)
                 .metadata()
-                .get(COMMENT_METADATA_KEY)
+                .get(DESCRIPTION_METADATA_KEY)
                 .is_none()
         );
         assert_eq!(
