@@ -23,7 +23,10 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
-use crate::{Runtime, model::LLMResponsesModelStore};
+use crate::{
+    Runtime,
+    model::{LLMResponsesModelStore, ResponsesApiSupport},
+};
 use llms::responses::Responses;
 
 fn extract_text(resp: &OpenAIResponse) -> String {
@@ -39,6 +42,29 @@ fn extract_text(resp: &OpenAIResponse) -> String {
             }
         })
         .join("\n")
+}
+
+fn responses_support_gate(model_id: &str, support: &ResponsesApiSupport) -> Option<Response> {
+    match support {
+        ResponsesApiSupport::UnsupportedProvider { provider } => {
+            Some(openai_error_to_response(OpenAIError::ApiError(ApiError {
+                message: format!(
+                    "Model '{model_id}' uses provider '{provider}' which does not support the OpenAI Responses API. Use /v1/chat/completions for this model or configure a model provider that supports Responses."
+                ),
+                r#type: Some("invalid_request_error".to_string()),
+                param: Some("model".to_string()),
+                code: Some("invalid_request_error".to_string()),
+            })))
+        }
+        ResponsesApiSupport::Unavailable => Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("model '{model_id}' is unavailable via /v1/responses"),
+            )
+                .into_response(),
+        ),
+        ResponsesApiSupport::Supported => None,
+    }
 }
 
 #[cfg_attr(feature = "openapi", utoipa::path(
@@ -154,16 +180,8 @@ pub(crate) async fn post(
         let stream = req.stream.unwrap_or(false);
 
         let responses_support = rt.responses_api_support_for_model(&model_id).await;
-        if let crate::model::ResponsesApiSupport::UnsupportedProvider { provider } = responses_support
-        {
-            return openai_error_to_response(OpenAIError::ApiError(ApiError {
-                message: format!(
-                    "Model '{model_id}' uses provider '{provider}' which does not support the OpenAI Responses API. Use /v1/chat/completions for this model or configure a model provider that supports Responses."
-                ),
-                r#type: Some("invalid_request_error".to_string()),
-                param: Some("model".to_string()),
-                code: Some("invalid_request_error".to_string()),
-            }));
+        if let Some(response) = responses_support_gate(&model_id, &responses_support) {
+            return response;
         }
 
         let Some(model) = llms.read().await.get(&model_id).cloned() else {
@@ -439,5 +457,53 @@ mod tests {
             names.contains(&"response.completed"),
             "stream must include a response.completed SSE event"
         );
+    }
+
+    #[tokio::test]
+    async fn unsupported_provider_returns_invalid_request_error() {
+        let response = responses_support_gate(
+            "anthropic_model",
+            &ResponsesApiSupport::UnsupportedProvider {
+                provider: "anthropic".to_string(),
+            },
+        )
+        .expect("unsupported provider should produce an early response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body should be readable")
+            .to_bytes();
+        let body_json: serde_json::Value =
+            serde_json::from_slice(&body).expect("body should be valid json");
+
+        assert_eq!(
+            body_json["error"]["type"].as_str(),
+            Some("invalid_request_error")
+        );
+        assert_eq!(body_json["error"]["param"].as_str(), Some("model"));
+        assert_eq!(
+            body_json["error"]["code"].as_str(),
+            Some("invalid_request_error")
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_support_returns_service_unavailable() {
+        let response = responses_support_gate("temporary_model", &ResponsesApiSupport::Unavailable)
+            .expect("unavailable support should produce an early response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body should be readable")
+            .to_bytes();
+        let body_text = String::from_utf8(body.to_vec()).expect("body should be valid utf-8");
+        assert!(body_text.contains("temporary_model"));
+        assert!(body_text.contains("unavailable via /v1/responses"));
     }
 }

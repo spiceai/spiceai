@@ -353,4 +353,17 @@ mod tests {
                     && value == &Value::String("24h".to_string()))
         );
     }
+
+    #[tokio::test]
+    async fn unsupported_provider_reports_responses_not_supported() {
+        let runtime = Runtime::builder().build().await;
+        let model = Model::new("anthropic:claude-3-5-sonnet", "anthropic_model");
+        let params: HashMap<String, SecretString> = HashMap::new();
+
+        let err = try_to_responses_model(&model, &params, Arc::new(runtime))
+            .await
+            .expect_err("unsupported providers should fail conversion to responses model");
+
+        assert!(matches!(err, LlmError::ResponsesNotSupported { .. }));
+    }
 }
