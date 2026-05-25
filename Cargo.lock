@@ -16184,10 +16184,12 @@ dependencies = [
  "snafu",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tracing",
  "tracing-futures",
  "url",
  "util",
+ "uuid 1.21.0",
 ]
 
 [[package]]

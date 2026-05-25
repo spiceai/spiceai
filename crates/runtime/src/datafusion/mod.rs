@@ -3584,6 +3584,102 @@ impl runtime_cluster::context::PartitionDiscoverer for DataFusion {
     }
 }
 
+#[async_trait::async_trait]
+impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
+    fn session_context(&self) -> &Arc<SessionContext> {
+        &self.ctx
+    }
+
+    async fn get_table(&self, table_ref: &TableReference) -> Option<Arc<dyn TableProvider>> {
+        DataFusion::get_table(self, table_ref).await
+    }
+
+    fn get_table_sync(&self, table_ref: &TableReference) -> Option<Arc<dyn TableProvider>> {
+        DataFusion::get_table_sync(self, table_ref)
+    }
+
+    fn table_exists(&self, table_ref: &TableReference) -> bool {
+        DataFusion::table_exists(self, table_ref)
+    }
+
+    async fn get_arrow_schema(
+        &self,
+        table_ref: TableReference,
+    ) -> std::result::Result<Schema, runtime_datafusion::query_engine::BoxError> {
+        DataFusion::get_arrow_schema(self, table_ref)
+            .await
+            .map_err(Into::into)
+    }
+
+    fn get_user_table_names(&self) -> Vec<TableReference> {
+        DataFusion::get_user_table_names(self)
+    }
+
+    fn get_public_table_names(
+        &self,
+    ) -> std::result::Result<Vec<String>, runtime_datafusion::query_engine::BoxError> {
+        DataFusion::get_public_table_names(self).map_err(Into::into)
+    }
+
+    fn is_writable(&self, table_ref: &TableReference) -> bool {
+        DataFusion::is_writable(self, table_ref)
+    }
+
+    fn is_path_catalog_writable(&self, table_ref: &TableReference) -> bool {
+        DataFusion::is_path_catalog_writable(self, table_ref)
+    }
+
+    async fn execute_query(
+        &self,
+        request: runtime_datafusion::query_engine::QueryRequest,
+    ) -> std::result::Result<
+        datafusion::execution::SendableRecordBatchStream,
+        runtime_datafusion::query_engine::BoxError,
+    > {
+        let arc_self = self
+            .datafusion_ref
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| -> runtime_datafusion::query_engine::BoxError {
+                "DataFusion self-reference not initialized (call set_self_ref first)".into()
+            })?;
+
+        let mut qb = arc_self
+            .query_builder(&request.sql)
+            .read_only(request.read_only);
+        if let Some(params) = request.parameters {
+            qb = qb.parameters(Some(params));
+        }
+        if let Some(allowlist) = request.table_allowlist {
+            qb = qb.allow_tables(allowlist);
+        }
+        let result = qb.build().run().await.map_err(|e| {
+            let boxed: runtime_datafusion::query_engine::BoxError = Box::new(e);
+            boxed
+        })?;
+        Ok(result.data)
+    }
+
+    async fn write_data(
+        &self,
+        table_ref: &TableReference,
+        data: Vec<RecordBatch>,
+    ) -> std::result::Result<(), runtime_datafusion::query_engine::BoxError> {
+        let schema = data
+            .first()
+            .map(RecordBatch::schema)
+            .unwrap_or_else(|| Arc::new(Schema::empty()));
+        let update = DataUpdate {
+            schema,
+            data,
+            update_type: UpdateType::Append,
+        };
+        DataFusion::write_data(self, table_ref, update)
+            .await
+            .map_err(Into::into)
+    }
+}
+
 /// Strips a single layer of outer parentheses from `s` if, and only if, it both starts
 /// with `(` and ends with `)`.  For example `(bucket(10, foo))` → `bucket(10, foo)`.
 ///
