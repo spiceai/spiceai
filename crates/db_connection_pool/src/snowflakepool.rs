@@ -22,9 +22,135 @@ use pkcs8::{LineEnding, SecretDocument};
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use snafu::prelude::*;
 use snowflake_api::{SnowflakeApi, SnowflakeApiError};
-use std::{collections::HashMap, fmt::Write, fs, sync::Arc, time::Instant};
+use std::{collections::HashMap, fmt::Write, fs, str::FromStr, sync::Arc, time::Instant};
 
 use crate::dbconnection::snowflakeconn::SnowflakeConnection;
+
+/// Snowflake account identifier formats.
+///
+/// The org-based format (`orgname.account_name`) uses a dot separator that must
+/// become a dash in the API URL: `orgname-account_name.snowflakecomputing.com`.
+///
+/// The legacy format (`account_locator` with optional `.region.cloud` suffix)
+/// uses dots as subdomain separators and must be preserved as-is:
+/// `account_locator.region.cloud.snowflakecomputing.com`.
+///
+/// See: <https://docs.snowflake.com/en/user-guide/admin-account-identifier>
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnowflakeAccountIdentifier {
+    /// `orgname.account_name` — dot is replaced with dash for the API URL.
+    OrgBased {
+        orgname: String,
+        account_name: String,
+    },
+    /// `account_locator[.region[.cloud]]` — used as-is in the API URL.
+    Legacy {
+        account_locator: String,
+        region: Option<String>,
+        cloud: Option<String>,
+    },
+}
+
+impl SnowflakeAccountIdentifier {
+    /// Returns the account identifier formatted for the Snowflake API URL.
+    pub fn api_account(&self) -> String {
+        match self {
+            Self::OrgBased {
+                orgname,
+                account_name,
+            } => format!("{orgname}-{account_name}"),
+            Self::Legacy {
+                account_locator,
+                region: Some(r),
+                cloud: Some(c),
+            } => format!("{account_locator}.{r}.{c}"),
+            Self::Legacy {
+                account_locator,
+                region: Some(r),
+                cloud: None,
+            } => format!("{account_locator}.{r}"),
+
+            Self::Legacy {
+                account_locator,
+                region: _,
+                cloud: _,
+            } => account_locator.clone(),
+        }
+    }
+}
+
+impl FromStr for SnowflakeAccountIdentifier {
+    type Err = String;
+
+    /// Parses a Snowflake account identifier string.
+    ///
+    /// Org-based identifiers (`orgname.account_name`) have exactly one dot and
+    /// no dashes — both org and account names are alphanumeric + underscores.
+    ///
+    /// Legacy identifiers contain dashes (from region names like `eu-central-1`)
+    /// or multiple dots (`locator.region.cloud`), or no dots at all (bare locator).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err("account identifier cannot be empty".to_string());
+        }
+
+        let dot_count = s.matches('.').count();
+
+        // Exactly one dot and no dashes → org-based format.
+        // Org names and account names are alphanumeric + underscores only.
+        if dot_count == 1 && !s.contains('-') {
+            let (orgname, account_name) = s.split_once('.').expect("checked dot_count == 1");
+            if orgname.is_empty() || account_name.is_empty() {
+                return Err(format!("invalid org-based account identifier: {s}"));
+            }
+            return Ok(Self::OrgBased {
+                orgname: orgname.to_string(),
+                account_name: account_name.to_string(),
+            });
+        }
+
+        // Legacy format: account_locator[.region[.cloud]]
+        let parts: Vec<&str> = s.splitn(3, '.').collect();
+        match parts.as_slice() {
+            [locator] => Ok(Self::Legacy {
+                account_locator: (*locator).to_string(),
+                region: None,
+                cloud: None,
+            }),
+            [locator, region] => Ok(Self::Legacy {
+                account_locator: (*locator).to_string(),
+                region: Some((*region).to_string()),
+                cloud: None,
+            }),
+            [locator, region, cloud] => Ok(Self::Legacy {
+                account_locator: (*locator).to_string(),
+                region: Some((*region).to_string()),
+                cloud: Some((*cloud).to_string()),
+            }),
+            _ => Err(format!("invalid account identifier: {s}")),
+        }
+    }
+}
+
+impl std::fmt::Display for SnowflakeAccountIdentifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OrgBased {
+                orgname,
+                account_name,
+            } => write!(f, "{orgname}.{account_name}"),
+            Self::Legacy {
+                account_locator,
+                region,
+                cloud,
+            } => match (region, cloud) {
+                (Some(r), Some(c)) => write!(f, "{account_locator}.{r}.{c}"),
+                (Some(r), None) => write!(f, "{account_locator}.{r}"),
+                _ => write!(f, "{account_locator}"),
+            },
+        }
+    }
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -108,12 +234,17 @@ impl SnowflakeConnectionPool {
             .map(SecretBox::expose_secret)
             .context(MissingRequiredSecretSnafu { name: "username" })?;
 
-        let account = params
+        let account_raw = params
             .get("account")
             .map(SecretBox::expose_secret)
             .context(MissingRequiredSecretSnafu { name: "account" })?;
-        // account identifier can be in <orgname.account_name> format but API requires it as <orgname-account_name>
-        let account = account.replace('.', "-");
+        let account_id = SnowflakeAccountIdentifier::from_str(account_raw).map_err(|e| {
+            Error::InvalidParameterValue {
+                param_key: "snowflake_account".to_string(),
+                param_value: e,
+            }
+        })?;
+        let account = account_id.api_account();
 
         let warehouse = params
             .get("warehouse")
@@ -313,4 +444,100 @@ fn decode_pkcs8_encrypted_data(data: &SecretDocument, password: &str) -> Result<
         .context(FailedToCreatePemSnafu)?;
 
     Ok(decrypted_pem.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_org_based_format() {
+        let id: SnowflakeAccountIdentifier = "myorg.myaccount".parse().unwrap();
+        assert_eq!(
+            id,
+            SnowflakeAccountIdentifier::OrgBased {
+                orgname: "myorg".to_string(),
+                account_name: "myaccount".to_string(),
+            }
+        );
+        assert_eq!(id.api_account(), "myorg-myaccount");
+        assert_eq!(id.to_string(), "myorg.myaccount");
+    }
+
+    #[test]
+    fn test_org_based_with_underscores() {
+        let id: SnowflakeAccountIdentifier = "my_org.my_account".parse().unwrap();
+        assert_eq!(id.api_account(), "my_org-my_account");
+    }
+
+    #[test]
+    fn test_legacy_locator_with_region() {
+        let id: SnowflakeAccountIdentifier = "sb70577.eu-central-1".parse().unwrap();
+        assert_eq!(
+            id,
+            SnowflakeAccountIdentifier::Legacy {
+                account_locator: "sb70577".to_string(),
+                region: Some("eu-central-1".to_string()),
+                cloud: None,
+            }
+        );
+        assert_eq!(id.api_account(), "sb70577.eu-central-1");
+    }
+
+    #[test]
+    fn test_legacy_locator_with_region_and_cloud() {
+        let id: SnowflakeAccountIdentifier = "xy12345.us-east-2.aws".parse().unwrap();
+        assert_eq!(
+            id,
+            SnowflakeAccountIdentifier::Legacy {
+                account_locator: "xy12345".to_string(),
+                region: Some("us-east-2".to_string()),
+                cloud: Some("aws".to_string()),
+            }
+        );
+        assert_eq!(id.api_account(), "xy12345.us-east-2.aws");
+    }
+
+    #[test]
+    fn test_legacy_bare_locator() {
+        let id: SnowflakeAccountIdentifier = "xy12345".parse().unwrap();
+        assert_eq!(
+            id,
+            SnowflakeAccountIdentifier::Legacy {
+                account_locator: "xy12345".to_string(),
+                region: None,
+                cloud: None,
+            }
+        );
+        assert_eq!(id.api_account(), "xy12345");
+    }
+
+    #[test]
+    fn test_already_dashed_org_format() {
+        let id: SnowflakeAccountIdentifier = "myorg-myaccount".parse().unwrap();
+        assert_eq!(
+            id,
+            SnowflakeAccountIdentifier::Legacy {
+                account_locator: "myorg-myaccount".to_string(),
+                region: None,
+                cloud: None,
+            }
+        );
+        assert_eq!(id.api_account(), "myorg-myaccount");
+    }
+
+    #[test]
+    fn test_empty_is_err() {
+        assert!("".parse::<SnowflakeAccountIdentifier>().is_err());
+    }
+
+    #[test]
+    fn test_leading_dot_is_err() {
+        assert!(".myaccount".parse::<SnowflakeAccountIdentifier>().is_err());
+    }
+
+    #[test]
+    fn test_trailing_dot_is_err() {
+        assert!("myorg.".parse::<SnowflakeAccountIdentifier>().is_err());
+    }
 }
