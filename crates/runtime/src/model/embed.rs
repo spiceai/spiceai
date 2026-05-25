@@ -239,7 +239,7 @@ fn google(
         .get("dimensions")
         .expose()
         .ok()
-        .map(|d| d.parse::<u32>())
+        .map(str::parse::<u32>)
         .transpose()
         // Only error if user provided dimensions.
         .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
@@ -280,7 +280,7 @@ async fn bedrock(
             .get("normalize")
             .expose()
             .ok()
-            .map(|s| s.parse::<bool>())
+            .map(str::parse::<bool>)
             .transpose()
             .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
                 source: format!("Failed to parse 'normalize' parameter: {e}").into(),
@@ -291,7 +291,7 @@ async fn bedrock(
             .get("dimensions")
             .expose()
             .ok()
-            .map(|s| s.parse::<u32>())
+            .map(str::parse::<u32>)
             .transpose()
             .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
                 source: format!("Failed to parse 'dimensions' parameter: {e}").into(),
@@ -356,7 +356,7 @@ async fn bedrock(
             .get("dimensions")
             .expose()
             .ok()
-            .map(|s| s.parse::<u32>())
+            .map(str::parse::<u32>)
             .transpose()
             .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
                 source: format!("Failed to parse 'dimensions' parameter: {e}").into(),
