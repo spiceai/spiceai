@@ -79,7 +79,9 @@ use crate::cluster::{
     ExecutorRegistry, TablePartitions,
     {SchedulerPeers, partition::partition_value_to_bytes},
 };
-use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
+use crate::datafusion::{
+    DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_RUNTIME_SCHEMA,
+};
 use crate::metrics_reader::MetricsReader;
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
 
@@ -944,7 +946,19 @@ async fn handle_partitions_loaded(
         return;
     };
 
-    let table = ::datafusion::sql::TableReference::parse_str(&loaded.table_name);
+    // Canonicalize the executor-sent table name. Executors can legitimately
+    // emit different textual forms across paths (bare `foo`, partial
+    // `public.foo`, full `spice.public.foo`); resolving against Spice defaults
+    // produces a single key so a `replace(...)` on one form doesn't shadow an
+    // ack on another, and metadata lookup hits the same entry the scheduler
+    // populated.
+    let resolved = TableReference::parse_str(&loaded.table_name)
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+    let table = TableReference::full(
+        Arc::<str>::clone(&resolved.catalog),
+        Arc::<str>::clone(&resolved.schema),
+        Arc::<str>::clone(&resolved.table),
+    );
 
     let partition_expr_bytes: std::collections::HashSet<bytes::Bytes> = loaded
         .partition_expr_bytes
@@ -988,13 +1002,29 @@ async fn handle_partitions_loaded(
     };
 
     if tracker.is_table_loaded(&table, &metadata, datafusion).await {
+        // Find the dataset key that was registered as `Refreshing` at init
+        // time. The original key may be bare/partial (`foo`) while the
+        // canonical form is full (`spice.public.foo`); calling
+        // `update_dataset(&canonical)` would create a *new* status entry and
+        // leave the original stuck in `Refreshing`, keeping `/v1/ready` at
+        // 503. Match by resolve-equality to update the existing entry.
+        let target = datafusion
+            .runtime_status
+            .get_dataset_statuses()
+            .into_keys()
+            .find(|key| {
+                key.clone()
+                    .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                    == resolved
+            })
+            .unwrap_or_else(|| table.clone());
         tracing::info!(
             table = %loaded.table_name,
             "All assigned partitions loaded; marking dataset Ready"
         );
         datafusion
             .runtime_status
-            .update_dataset(&table, crate::status::ComponentStatus::Ready);
+            .update_dataset(&target, crate::status::ComponentStatus::Ready);
     }
 }
 

@@ -141,6 +141,55 @@ impl PartitionLoadTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use datafusion::error::DataFusionError;
+    use datafusion_expr::{Expr, col};
+
+    use crate::metadata::{PartitionMetadata, TablePartitionMetadata};
+
+    /// Deterministic resolver for tests: returns the partition expression
+    /// as a plain column reference so `partition_value_to_bytes` produces a
+    /// stable byte sequence (`col(expr) = lit(value)`) without needing a
+    /// real `DataFusion` table provider.
+    struct ColumnResolver;
+
+    #[async_trait]
+    impl PartitionExprResolver for ColumnResolver {
+        async fn try_parse_expr(
+            &self,
+            _tbl: &TableReference,
+            expr: &str,
+        ) -> Result<Expr, DataFusionError> {
+            Ok(col(expr))
+        }
+    }
+
+    /// Returns the bytes the executor would ack for the given partition value,
+    /// matching the encoding scheduler-side `is_table_loaded` checks against.
+    async fn ack_bytes(value: &[(&str, &str)], table: &TableReference) -> Bytes {
+        let pv: crate::metadata::PartitionValue = value
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), Some((*v).to_string())))
+            .collect();
+        crate::metadata::partition_value_to_bytes(pv, table, &ColumnResolver)
+            .await
+            .expect("partition_value_to_bytes")
+    }
+
+    fn partition(value: &[(&str, &str)], assigned_executors: Vec<&str>) -> PartitionMetadata {
+        let pv: crate::metadata::PartitionValue = value
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), Some((*v).to_string())))
+            .collect();
+        PartitionMetadata {
+            partition_value: pv,
+            assigned_executors: assigned_executors
+                .into_iter()
+                .map(ToString::to_string)
+                .collect(),
+            last_assigned_at: None,
+        }
+    }
 
     #[tokio::test]
     async fn drop_executor_clears_acks_across_tables() {
@@ -175,5 +224,102 @@ mod tests {
             .get(&table_b)
             .expect("table_b entry should exist after replace()");
         assert!(acks_other.get("exec-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn is_table_loaded_when_every_partition_is_covered_across_executors() {
+        let tracker = PartitionLoadTracker::new();
+        let table = TableReference::parse_str("t");
+
+        let p1 = ack_bytes(&[("date", "2024-01-01")], &table).await;
+        let p2 = ack_bytes(&[("date", "2024-01-02")], &table).await;
+
+        // Each executor acks only its own assigned partition; coverage is
+        // satisfied when *some* assigned executor reports it.
+        tracker
+            .replace(table.clone(), "exec-1".into(), HashSet::from([p1.clone()]))
+            .await;
+        tracker
+            .replace(table.clone(), "exec-2".into(), HashSet::from([p2.clone()]))
+            .await;
+
+        let metadata = TablePartitionMetadata {
+            table_name: "t".into(),
+            partitions: vec![
+                partition(&[("date", "2024-01-01")], vec!["exec-1", "exec-2"]),
+                partition(&[("date", "2024-01-02")], vec!["exec-1", "exec-2"]),
+            ],
+            schema_version: 1,
+            updated_at: 1,
+            partition_expressions: vec!["date".into()],
+        };
+
+        assert!(
+            tracker
+                .is_table_loaded(&table, &metadata, &ColumnResolver)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn is_table_loaded_returns_false_when_a_partition_is_uncovered() {
+        let tracker = PartitionLoadTracker::new();
+        let table = TableReference::parse_str("t");
+
+        let p1 = ack_bytes(&[("date", "2024-01-01")], &table).await;
+
+        // Only the first partition has an ack; the second is uncovered.
+        tracker
+            .replace(table.clone(), "exec-1".into(), HashSet::from([p1]))
+            .await;
+
+        let metadata = TablePartitionMetadata {
+            table_name: "t".into(),
+            partitions: vec![
+                partition(&[("date", "2024-01-01")], vec!["exec-1"]),
+                partition(&[("date", "2024-01-02")], vec!["exec-1"]),
+            ],
+            schema_version: 1,
+            updated_at: 1,
+            partition_expressions: vec!["date".into()],
+        };
+
+        assert!(
+            !tracker
+                .is_table_loaded(&table, &metadata, &ColumnResolver)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn is_table_loaded_handles_empty_partitions_via_updated_at() {
+        let tracker = PartitionLoadTracker::new();
+        let table = TableReference::parse_str("t");
+
+        // updated_at == 0: metadata never reconciled, can't be loaded yet.
+        let unreconciled = TablePartitionMetadata {
+            table_name: "t".into(),
+            partitions: vec![],
+            schema_version: 1,
+            updated_at: 0,
+            partition_expressions: vec![],
+        };
+        assert!(
+            !tracker
+                .is_table_loaded(&table, &unreconciled, &ColumnResolver)
+                .await
+        );
+
+        // updated_at > 0 with zero partitions: legitimately empty source,
+        // there is nothing to load.
+        let reconciled = TablePartitionMetadata {
+            updated_at: 1,
+            ..unreconciled
+        };
+        assert!(
+            tracker
+                .is_table_loaded(&table, &reconciled, &ColumnResolver)
+                .await
+        );
     }
 }

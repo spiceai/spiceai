@@ -873,30 +873,19 @@ impl Runtime {
         // the same way the scheduler encodes them when sending UpdatePartitions
         // (`Expr::to_bytes()`). `partition_value_to_bytes` sorts entries by
         // key so the encoding is deterministic across re-serialization.
+        let table_str = table.to_string();
         let partition_expr_bytes: Vec<Vec<u8>> = assignments
             .get(&table)
-            .map(|exprs| {
-                exprs
-                    .iter()
-                    .filter_map(|e| {
-                        use datafusion_proto::bytes::Serializeable;
-                        match e.to_bytes() {
-                            Ok(b) => Some(b.to_vec()),
-                            Err(err) => {
-                                tracing::warn!(
-                                    "Failed to encode partition Expr for {table} ack: {err}"
-                                );
-                                None
-                            }
-                        }
-                    })
-                    .collect()
-            })
+            .map(|exprs| runtime_cluster::encode_partition_exprs(exprs, &table_str))
             .unwrap_or_default();
 
-        if let Some(broadcaster) = self.executor_outbound_broadcaster()
-            && !partition_expr_bytes.is_empty()
-        {
+        if let Some(broadcaster) = self.executor_outbound_broadcaster() {
+            // Send the ack even when `partition_expr_bytes` is empty — a
+            // legitimately empty assignment (e.g. zero-partition source, or
+            // partitions that all failed to serialize) still needs to flip
+            // the scheduler-side readiness gate via the
+            // `is_table_loaded`/`updated_at` shortcut. Suppressing the empty
+            // case here would leave the dataset stuck in `Refreshing`.
             let table_name = table.to_string();
             tokio::spawn(async move {
                 if let Some(n) = notifier {

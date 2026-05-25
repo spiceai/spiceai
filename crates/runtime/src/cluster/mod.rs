@@ -119,6 +119,12 @@ pub enum DistributedNode {
         /// Tracks which (table, partition) pairs each executor has reported
         /// as loaded; used to drive accelerated-dataset readiness on the
         /// scheduler.
+        ///
+        /// Starts empty when the scheduler boots. A scheduler that joins
+        /// after executors are already running won't have ack state until
+        /// the next refresh-driven broadcast, so `/v1/ready` stays at 503
+        /// on that scheduler until then. Acceptable simplification: this
+        /// path is multi-scheduler HA, not the steady-state.
         partition_load_tracker: Arc<runtime_cluster::PartitionLoadTracker>,
     },
     Executor {
@@ -441,10 +447,11 @@ mod service;
 use crate::cluster::partition::service::PartitionService;
 pub use accelerated_partition_provider::AcceleratedPartitionProvider;
 pub use cluster_state::{ClusterStateStore, SchedulerEntry};
-pub use control_stream_client::{ControlStreamManager, ExecutorOutboundBroadcaster};
+pub use control_stream_client::ControlStreamManager;
 pub use heartbeat::{CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeat, SchedulerHeartbeatStore};
 pub use partition::{PartitionMetadata, PartitionStore, TablePartitionMetadata};
 pub use reaper::{Reaper, ReaperOutcome};
+pub use runtime_cluster::ExecutorOutboundBroadcaster;
 use runtime_cluster::store::{AccelerationsPartitions, CatalogPartitions};
 pub use runtime_cluster::{ExecutorRegistry, FederatedPartitionProvider, TablePartitions};
 pub use scheduler_registry::SchedulerPeers;

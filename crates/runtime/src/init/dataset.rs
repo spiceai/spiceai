@@ -1200,8 +1200,6 @@ impl Runtime {
         // The accelerated refresh task will set the dataset status to `Ready` once it finishes loading.
         self.status
             .update_dataset(&ds.name, status::ComponentStatus::Refreshing);
-        // Capture this before `initial_partition_filters` is moved into `register_table`.
-        let has_initial_partitions = !initial_partition_filters.is_empty();
         let notifier = self
             .df
             .register_table(
@@ -1246,40 +1244,34 @@ impl Runtime {
                 // hold. This is the executor → scheduler readiness signal that
                 // lets the scheduler flip the dataset to `Ready` once every
                 // assigned partition has at least one executor ack.
-                if has_initial_partitions
-                    && let Some(b) = broadcaster
-                    && let Some(assignments_lock) = runtime.partition_assignments()
-                {
-                    let bytes: Vec<Vec<u8>> = {
-                        let assignments = assignments_lock.read().await;
-                        assignments
-                            .get(&resolved_name)
-                            .map(|exprs| {
-                                use datafusion_proto::bytes::Serializeable;
-                                exprs
-                                    .iter()
-                                    .filter_map(|e| match e.to_bytes() {
-                                        Ok(b) => Some(b.to_vec()),
-                                        Err(err) => {
-                                            tracing::warn!(
-                                                dataset = %dataset_name,
-                                                "Failed to encode partition Expr for initial PartitionsLoaded ack: {err}"
-                                            );
-                                            None
-                                        }
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    };
-                    if !bytes.is_empty() {
-                        let sent = b
-                            .broadcast_partitions_loaded(dataset_name.clone(), bytes)
-                            .await;
-                        tracing::info!(
-                            "Broadcast initial PartitionsLoaded for {dataset_name} to {sent} scheduler(s)"
-                        );
-                    }
+                //
+                // Send the ack even when the assignment is empty or absent —
+                // empty-source / zero-partition datasets still need an ack to
+                // trip the scheduler-side `updated_at > 0` shortcut in
+                // `PartitionLoadTracker::is_table_loaded`. Always send the
+                // canonical (resolved) table name so the scheduler can match
+                // the ack against the registered dataset regardless of how
+                // the user spelled the table in their spicepod.
+                if let Some(b) = broadcaster {
+                    let bytes: Vec<Vec<u8>> =
+                        if let Some(assignments_lock) = runtime.partition_assignments() {
+                            let assignments = assignments_lock.read().await;
+                            assignments
+                                .get(&resolved_name)
+                                .map(|exprs| {
+                                    runtime_cluster::encode_partition_exprs(exprs, &dataset_name)
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                    let table_name = resolved_name.to_string();
+                    let sent = b
+                        .broadcast_partitions_loaded(table_name.clone(), bytes)
+                        .await;
+                    tracing::info!(
+                        "Broadcast initial PartitionsLoaded for {table_name} to {sent} scheduler(s)"
+                    );
                 }
                 if let Err(e) = runtime.create_dataset_or_view_schedule(ds).await {
                     tracing::error!("Failed to create dataset schedule for '{dataset_name}': {e}");

@@ -30,11 +30,12 @@ use std::time::Duration;
 use ballista_core::utils::{GrpcClientConfig, create_grpc_client_endpoint};
 use ballista_executor::executor::Executor;
 use futures::StreamExt;
+use runtime_cluster::ExecutorOutboundBroadcaster;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
 use runtime_proto::scheduler_control_message::Message as SchedulerMessage;
 use runtime_proto::{
-    Ack, BytesArray, ExecutorControlMessage, ExecutorHeartbeat, ExecutorShutdown, MetricsResponse,
-    PartitionsLoaded, executor_control_message::Message as ExecutorMessage,
+    Ack, ExecutorControlMessage, ExecutorHeartbeat, ExecutorShutdown, MetricsResponse,
+    executor_control_message::Message as ExecutorMessage,
 };
 use tokio::sync::{Notify, RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -73,119 +74,28 @@ pub type PartitionUpdateHandler = Arc<
 pub type RefreshDatasetHandler =
     Arc<dyn Fn(String, Option<String>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
-/// Per-scheduler outbound senders, shared between the [`ControlStreamManager`]
-/// and the executor runtime. The manager populates this map on each
-/// (re)connect and clears entries on disconnect; the runtime uses it to
-/// broadcast unsolicited messages (e.g. `PartitionsLoaded`) to every
-/// scheduler the executor is currently connected to.
-///
-/// Cloning is cheap (just `Arc::clone`).
-#[derive(Clone, Debug, Default)]
-pub struct ExecutorOutboundBroadcaster {
-    inner: Arc<ExecutorOutboundBroadcasterInner>,
-}
-
-#[derive(Debug, Default)]
-struct ExecutorOutboundBroadcasterInner {
-    streams: RwLock<HashMap<String, mpsc::Sender<ExecutorControlMessage>>>,
-    executor_id: RwLock<String>,
-}
-
-impl ExecutorOutboundBroadcaster {
-    #[must_use]
-    pub fn new(executor_id: String) -> Self {
-        Self {
-            inner: Arc::new(ExecutorOutboundBroadcasterInner {
-                streams: RwLock::new(HashMap::new()),
-                executor_id: RwLock::new(executor_id),
-            }),
-        }
-    }
-
-    /// Updates the executor id stamped on outbound messages. Called once the
-    /// executor's advertise address is finalised.
-    pub async fn set_executor_id(&self, executor_id: String) {
-        *self.inner.executor_id.write().await = executor_id;
-    }
-
-    pub(crate) async fn register(
-        &self,
-        scheduler_address: String,
-        tx: mpsc::Sender<ExecutorControlMessage>,
-    ) {
-        self.inner
-            .streams
-            .write()
-            .await
-            .insert(scheduler_address, tx);
-    }
-
-    pub(crate) async fn unregister(&self, scheduler_address: &str) {
-        self.inner.streams.write().await.remove(scheduler_address);
-    }
-
-    /// Broadcasts a `PartitionsLoaded` message to every connected scheduler.
-    /// Returns the number of schedulers the message was queued for.
-    ///
-    /// Uses `send().await` with a short timeout rather than `try_send`. The
-    /// scheduler's readiness gate depends on this ack arriving, so silently
-    /// dropping it (e.g. on a transiently full channel) could leave a dataset
-    /// stuck in `Refreshing` until the next refresh. The timeout keeps a
-    /// stuck/slow scheduler from blocking the broadcast to its peers.
-    pub async fn broadcast_partitions_loaded(
-        &self,
-        table_name: String,
-        partition_expr_bytes: Vec<Vec<u8>>,
-    ) -> usize {
-        let executor_id = self.inner.executor_id.read().await.clone();
-        let payload = ExecutorControlMessage {
-            executor_id,
-            message: Some(ExecutorMessage::PartitionsLoaded(PartitionsLoaded {
-                table_name,
-                partition_expr_bytes: Some(BytesArray {
-                    items: partition_expr_bytes,
-                }),
-            })),
-        };
-
-        // Snapshot the (address, sender) pairs so we don't hold the read lock
-        // across awaits — a slow scheduler shouldn't block register/unregister.
-        let targets: Vec<(String, mpsc::Sender<ExecutorControlMessage>)> = {
-            let streams = self.inner.streams.read().await;
-            streams
-                .iter()
-                .map(|(addr, tx)| (addr.clone(), tx.clone()))
-                .collect()
-        };
-
-        let mut sent = 0usize;
-        for (scheduler_address, tx) in targets {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), tx.send(payload.clone()))
-                .await
-            {
-                Ok(Ok(())) => sent += 1,
-                Ok(Err(err)) => {
-                    tracing::debug!(
-                        "PartitionsLoaded send to {scheduler_address} failed (channel closed): {err}"
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        scheduler = %scheduler_address,
-                        "Timed out sending PartitionsLoaded; scheduler may miss this ack until next refresh"
-                    );
-                }
-            }
-        }
-        sent
-    }
-}
-
 /// Handle for a single control stream connection to a scheduler.
 struct ControlStreamHandle {
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<()>,
     outbound_tx: Arc<RwLock<Option<mpsc::Sender<ExecutorControlMessage>>>>,
+}
+
+/// Tear down per-connection state when a control stream exits (cancellation,
+/// stream error, or scheduler-side close). Bundled so the four exit paths
+/// share a single cleanup sequence — if a new piece of per-connection state
+/// is added, this is the only place to update.
+async fn teardown_scheduler_stream(
+    heartbeat_task: &tokio::task::JoinHandle<()>,
+    outbound_tx_state: &Arc<RwLock<Option<mpsc::Sender<ExecutorControlMessage>>>>,
+    broadcaster: Option<&ExecutorOutboundBroadcaster>,
+    scheduler_address: &str,
+) {
+    heartbeat_task.abort();
+    *outbound_tx_state.write().await = None;
+    if let Some(b) = broadcaster {
+        b.unregister(scheduler_address).await;
+    }
 }
 
 /// Spawns a control stream connection to a single scheduler.
@@ -339,12 +249,13 @@ fn spawn_control_stream(
                 })),
             };
             if outbound_tx.send(init_msg).await.is_err() {
-                heartbeat_task.abort();
-                let mut outbound_guard = outbound_tx_state_for_task.write().await;
-                *outbound_guard = None;
-                if let Some(b) = broadcaster.as_ref() {
-                    b.unregister(&scheduler_address).await;
-                }
+                teardown_scheduler_stream(
+                    &heartbeat_task,
+                    &outbound_tx_state_for_task,
+                    broadcaster.as_ref(),
+                    &scheduler_address,
+                )
+                .await;
                 continue;
             }
 
@@ -358,12 +269,13 @@ fn spawn_control_stream(
                     tracing::warn!(
                         "Failed to establish control stream to {scheduler_address}: {e}"
                     );
-                    heartbeat_task.abort();
-                    let mut outbound_guard = outbound_tx_state_for_task.write().await;
-                    *outbound_guard = None;
-                    if let Some(b) = broadcaster.as_ref() {
-                        b.unregister(&scheduler_address).await;
-                    }
+                    teardown_scheduler_stream(
+                        &heartbeat_task,
+                        &outbound_tx_state_for_task,
+                        broadcaster.as_ref(),
+                        &scheduler_address,
+                    )
+                    .await;
                     if let Some(delay) = backoff.next_duration() {
                         tokio::select! {
                             () = token.cancelled() => break,
@@ -381,14 +293,13 @@ fn spawn_control_stream(
             loop {
                 tokio::select! {
                     () = token.cancelled() => {
-                        heartbeat_task.abort();
-                        {
-                            let mut outbound_guard = outbound_tx_state_for_task.write().await;
-                            *outbound_guard = None;
-                        }
-                        if let Some(b) = broadcaster.as_ref() {
-                            b.unregister(&scheduler_address).await;
-                        }
+                        teardown_scheduler_stream(
+                            &heartbeat_task,
+                            &outbound_tx_state_for_task,
+                            broadcaster.as_ref(),
+                            &scheduler_address,
+                        )
+                        .await;
                         tracing::debug!(
                             "Control stream to {scheduler_address} cancelled"
                         );
@@ -429,14 +340,13 @@ fn spawn_control_stream(
                 }
             }
 
-            heartbeat_task.abort();
-            {
-                let mut outbound_guard = outbound_tx_state_for_task.write().await;
-                *outbound_guard = None;
-            }
-            if let Some(b) = broadcaster.as_ref() {
-                b.unregister(&scheduler_address).await;
-            }
+            teardown_scheduler_stream(
+                &heartbeat_task,
+                &outbound_tx_state_for_task,
+                broadcaster.as_ref(),
+                &scheduler_address,
+            )
+            .await;
             tracing::debug!("Control stream to {scheduler_address} disconnected, will reconnect");
 
             if let Some(delay) = backoff.next_duration() {
