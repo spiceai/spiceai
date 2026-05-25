@@ -48,10 +48,8 @@ use tonic::Status;
 use tonic::async_trait;
 use tonic::codec::CompressionEncoding;
 
-use crate::datafusion::DataFusion;
-use crate::dataupdate::DataUpdate;
-use crate::dataupdate::UpdateType;
 use crate::{tracers::OnceTracer, warn_once};
+use runtime_datafusion::query_engine::QueryEngine;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -89,7 +87,7 @@ const TIME_UNIX_NANO_COLUMN_NAME: &str = "time_unix_nano";
 const START_TIME_UNIX_NANO_COLUMN_NAME: &str = "start_time_unix_nano";
 
 pub struct Service {
-    datafusion: Arc<DataFusion>,
+    datafusion: Arc<dyn QueryEngine>,
     once_tracer: OnceTracer,
 }
 
@@ -105,8 +103,11 @@ impl MetricsService for Service {
             for scope_metric in resource_metric.scope_metrics {
                 for metric in scope_metric.metrics {
                     if let Some(data) = metric.data {
-                        let existing_schema =
-                            (self.datafusion.get_arrow_schema(metric.name.as_str()).await).ok();
+                        let existing_schema = (self
+                            .datafusion
+                            .get_arrow_schema(TableReference::bare(metric.name.clone()))
+                            .await)
+                            .ok();
                         let (record_batch_result, data_points_count) = metric_data_to_record_batch(
                             metric.name.as_str(),
                             &data,
@@ -129,19 +130,12 @@ impl MetricsService for Service {
                                     continue;
                                 }
 
-                                let schema = record_batch.schema();
-                                let data_update = DataUpdate {
-                                    data: vec![record_batch],
-                                    schema,
-                                    update_type: UpdateType::Append,
-                                };
-
                                 let mut write_failed = false;
                                 if let Err(e) = self
                                     .datafusion
                                     .write_data(
                                         &TableReference::bare(metric.name.as_str()),
-                                        data_update,
+                                        vec![record_batch],
                                     )
                                     .await
                                 {
@@ -561,7 +555,7 @@ fn append_null(
 ///
 /// This is used to add OpenTelemetry metrics ingestion to the Flight gRPC server.
 #[must_use]
-pub fn create_metrics_service(datafusion: Arc<DataFusion>) -> MetricsServiceServer<Service> {
+pub fn create_metrics_service(datafusion: Arc<dyn QueryEngine>) -> MetricsServiceServer<Service> {
     let service = Service {
         datafusion,
         once_tracer: OnceTracer::new(),

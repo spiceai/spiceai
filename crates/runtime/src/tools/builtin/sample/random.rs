@@ -20,10 +20,10 @@ use std::{
 };
 
 use super::SampleFrom;
-use crate::datafusion::DataFusion;
 use arrow::{array::RecordBatch, compute::concat_batches};
 use datafusion::sql::TableReference;
 use futures::TryStreamExt;
+use runtime_datafusion::query_engine::{QueryEngine, QueryRequest};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
@@ -53,23 +53,20 @@ impl Display for RandomSampleParams {
 impl SampleFrom for RandomSampleParams {
     async fn sample(
         &self,
-        df: Arc<DataFusion>,
+        df: Arc<dyn QueryEngine>,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
         let current_span = Span::current();
         let tbl = TableReference::parse_str(self.tbl.as_str());
         let tbl_quoted = quote_table_reference(&tbl);
 
         let batches = async {
-            df.query_builder(&format!(
+            df.execute_query(QueryRequest::new(format!(
                 "SELECT * FROM {tbl} LIMIT {limit}",
                 limit = self.limit,
                 tbl = tbl_quoted,
-            ))
-            .build()
-            .run()
+            )))
             .await
             .boxed()?
-            .data
             .try_collect::<Vec<RecordBatch>>()
             .await
             .boxed()

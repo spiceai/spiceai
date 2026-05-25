@@ -17,6 +17,7 @@ limitations under the License.
 use async_trait::async_trait;
 
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
+use runtime_datafusion::query_engine::QueryEngine;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::{ResultExt, Snafu};
 use spicepod::component::tool::Tool;
@@ -150,25 +151,34 @@ impl BuiltinToolCatalog {
                     .with_table_allowlist(table_allowlist),
             )),
             "sql" => Ok(Arc::new(SqlTool::new(
-                self.rt.datafusion(),
+                self.rt.datafusion() as Arc<dyn runtime_datafusion::query_engine::QueryEngine>,
                 Some(name),
                 description,
                 table_allowlist,
             ))),
             "sample_distinct_columns" => Ok(Arc::new(
-                SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::DistinctColumns)
-                    .with_overrides(Some(name), description)
-                    .with_table_allowlist(table_allowlist),
+                SampleDataTool::new(
+                    self.rt.datafusion() as Arc<dyn QueryEngine>,
+                    SampleTableMethod::DistinctColumns,
+                )
+                .with_overrides(Some(name), description)
+                .with_table_allowlist(table_allowlist),
             )),
             "random_sample" => Ok(Arc::new(
-                SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::RandomSample)
-                    .with_overrides(Some(name), description)
-                    .with_table_allowlist(table_allowlist),
+                SampleDataTool::new(
+                    self.rt.datafusion() as Arc<dyn QueryEngine>,
+                    SampleTableMethod::RandomSample,
+                )
+                .with_overrides(Some(name), description)
+                .with_table_allowlist(table_allowlist),
             )),
             "top_n_sample" => Ok(Arc::new(
-                SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::TopNSample)
-                    .with_overrides(Some(name), description)
-                    .with_table_allowlist(table_allowlist),
+                SampleDataTool::new(
+                    self.rt.datafusion() as Arc<dyn QueryEngine>,
+                    SampleTableMethod::TopNSample,
+                )
+                .with_overrides(Some(name), description)
+                .with_table_allowlist(table_allowlist),
             )),
             "list_datasets" => Ok(Arc::new(ListDatasetsTool::new(
                 Some(name),

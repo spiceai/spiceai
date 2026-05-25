@@ -658,7 +658,9 @@ pub async fn start(
         .into_inner();
 
     // Create the OpenTelemetry MetricsService
-    let otel_service = create_metrics_service(rt.datafusion());
+    let otel_service = create_metrics_service(
+        rt.datafusion() as Arc<dyn runtime_datafusion::query_engine::QueryEngine>
+    );
 
     // Get job executor if available (cluster mode)
     let job_executor = rt.job_executor();

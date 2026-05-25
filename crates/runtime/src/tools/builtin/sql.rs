@@ -18,11 +18,12 @@ use async_trait::async_trait;
 use std::{borrow::Cow, sync::Arc};
 
 use crate::{
-    datafusion::{DataFusion, query::write_to_json_string},
+    datafusion::query::write_to_json_string,
     tools::{SpiceModelTool, utils::parameters},
 };
 use futures::TryStreamExt;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
+use runtime_datafusion::query_engine::{QueryEngine, QueryRequest};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -47,7 +48,7 @@ const DEFAULT_WRITABLE_DESCRIPTION: &str = "Execute an SQL query in the Spice.ai
 pub struct SqlTool {
     name: String,
     description: String,
-    df: Arc<DataFusion>,
+    df: Arc<dyn QueryEngine>,
 
     allowed_tables: Option<ResolvedTableAwareAllowlist>,
     /// When true (the default), the tool rejects any DDL, DML, COPY, or
@@ -62,7 +63,7 @@ pub struct SqlTool {
 impl SqlTool {
     #[must_use]
     pub fn new(
-        df: Arc<DataFusion>,
+        df: Arc<dyn QueryEngine>,
         name: Option<&str>,
         description: Option<&str>,
         allowed_tables: Option<ResolvedTableAwareAllowlist>,
@@ -119,17 +120,16 @@ impl SpiceModelTool for SqlTool {
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let req: SqlToolParams = serde_json::from_str(arg)?;
 
-            let mut query_builder = self.df.query_builder(&req.query).read_only(self.read_only);
+            let mut query_request = QueryRequest::new(&req.query).read_only(self.read_only);
             if let Some(ref allowlist) = self.allowed_tables {
-                query_builder = query_builder.allow_tables(allowlist.clone());
+                query_request = query_request.allow_tables(allowlist.clone());
             }
 
-            let batches = query_builder
-                .build()
-                .run()
+            let batches = self
+                .df
+                .execute_query(query_request)
                 .await
                 .boxed()?
-                .data
                 .try_collect::<Vec<RecordBatch>>()
                 .await
                 .boxed()?;
