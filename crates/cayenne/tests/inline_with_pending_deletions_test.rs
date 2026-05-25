@@ -139,15 +139,20 @@ async fn test_insert_inlines_despite_pending_deletions_impl(
     fixture: TestFixture,
 ) -> TestResult<()> {
     let schema = simple_schema();
-    let (table, ctx) =
-        setup_table(&fixture, "pending_del", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) = setup_table(
+        &fixture,
+        "pending_del",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
 
     // Initial insert: enough rows to go to file (exceeds inline limit).
     let n = DEFAULT_INLINE_MAX_ROWS + 1;
     let ids: Vec<i64> = (0..i64::try_from(n)?).collect();
     let vals: Vec<i64> = ids.iter().map(|i| i * 10).collect();
     let batch = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(ids)),
             Arc::new(Int64Array::from(vals)),
@@ -165,7 +170,7 @@ async fn test_insert_inlines_despite_pending_deletions_impl(
     // Previously this fell through to a protected snapshot; now it should inline.
     let new_id = i64::try_from(n)? + 100;
     let new_batch = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(vec![new_id])),
             Arc::new(Int64Array::from(vec![9999])),
@@ -203,15 +208,20 @@ test_with_backends!(test_insert_inlines_despite_pending_deletions_impl);
 
 async fn test_upsert_file_conflict_inlines_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = simple_schema();
-    let (table, ctx) =
-        setup_table(&fixture, "file_upsert", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) = setup_table(
+        &fixture,
+        "file_upsert",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
 
     // Initial insert: exceeds inline limit so data goes to file.
     let n = DEFAULT_INLINE_MAX_ROWS + 1;
     let ids: Vec<i64> = (0..i64::try_from(n)?).collect();
     let vals: Vec<i64> = ids.iter().map(|i| i * 10).collect();
     let batch = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(ids)),
             Arc::new(Int64Array::from(vals)),
@@ -222,7 +232,7 @@ async fn test_upsert_file_conflict_inlines_impl(fixture: TestFixture) -> TestRes
 
     // Upsert PK 0 with a new value (1 row → fits inline).
     let upsert_batch = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(vec![0])),
             Arc::new(Int64Array::from(vec![7777])),
@@ -256,7 +266,7 @@ async fn test_inlined_upsert_survives_restart_impl(fixture: TestFixture) -> Test
     let (table, _ctx) = setup_table(
         &fixture,
         "restart_tbl",
-        schema.clone(),
+        Arc::clone(&schema),
         vec!["email".into()],
     )
     .await?;
@@ -268,7 +278,7 @@ async fn test_inlined_upsert_survives_restart_impl(fixture: TestFixture) -> Test
     let mut vals: Vec<i64> = (0..i64::try_from(n)?).collect();
     vals[0] = 100;
     let batch = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(StringArray::from(emails)),
             Arc::new(Int64Array::from(vals)),
@@ -278,7 +288,7 @@ async fn test_inlined_upsert_survives_restart_impl(fixture: TestFixture) -> Test
 
     // Upsert alice with new value → inlined.
     let upsert = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(StringArray::from(vec!["alice@test.com"])),
             Arc::new(Int64Array::from(vec![999])),
@@ -335,14 +345,15 @@ test_with_backends!(test_inlined_upsert_survives_restart_impl);
 
 async fn test_interleaved_delete_insert_upsert_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = simple_schema();
-    let (table, ctx) = setup_table(&fixture, "tpcc", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) =
+        setup_table(&fixture, "tpcc", Arc::clone(&schema), vec!["id".into()]).await?;
 
     // Initial insert to file: ids 1..=N.
     let n = DEFAULT_INLINE_MAX_ROWS + 1;
     let ids: Vec<i64> = (1..=i64::try_from(n)?).collect();
     let vals: Vec<i64> = ids.iter().map(|i| i * 10).collect();
     let batch = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(ids)),
             Arc::new(Int64Array::from(vals)),
@@ -356,7 +367,7 @@ async fn test_interleaved_delete_insert_upsert_impl(fixture: TestFixture) -> Tes
     delete_by_id(&table, 1).await?;
 
     let insert_batch_1 = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(vec![high])),
             Arc::new(Int64Array::from(vec![high * 10])),
@@ -365,7 +376,7 @@ async fn test_interleaved_delete_insert_upsert_impl(fixture: TestFixture) -> Tes
     insert_batch(&table, insert_batch_1).await?;
 
     let upsert_batch_1 = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(vec![2])),
             Arc::new(Int64Array::from(vec![2222])),
@@ -391,7 +402,7 @@ async fn test_interleaved_delete_insert_upsert_impl(fixture: TestFixture) -> Tes
     delete_by_id(&table, 3).await?;
 
     let insert_batch_2 = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(vec![high2])),
             Arc::new(Int64Array::from(vec![high2 * 10])),
@@ -425,7 +436,7 @@ async fn test_composite_pk_upsert_file_conflict_inlines_impl(
     let (table, ctx) = setup_table(
         &fixture,
         "composite_pk",
-        schema.clone(),
+        Arc::clone(&schema),
         vec!["region".into(), "id".into()],
     )
     .await?;
@@ -438,7 +449,7 @@ async fn test_composite_pk_upsert_file_conflict_inlines_impl(
     let ids: Vec<i64> = (0..i64::try_from(n)?).collect();
     let vals: Vec<i64> = ids.iter().map(|i| i * 10).collect();
     let batch = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(StringArray::from(regions)),
             Arc::new(Int64Array::from(ids)),
@@ -450,7 +461,7 @@ async fn test_composite_pk_upsert_file_conflict_inlines_impl(
 
     // Upsert (east, 0) → inlined.
     let upsert = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(StringArray::from(vec!["east"])),
             Arc::new(Int64Array::from(vec![0])),
@@ -482,14 +493,15 @@ test_with_backends!(test_composite_pk_upsert_file_conflict_inlines_impl);
 
 async fn test_checkpoint_after_inlined_upsert_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = simple_schema();
-    let (table, ctx) = setup_table(&fixture, "ckpt", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) =
+        setup_table(&fixture, "ckpt", Arc::clone(&schema), vec!["id".into()]).await?;
 
     // Initial insert to file.
     let n = DEFAULT_INLINE_MAX_ROWS + 1;
     let ids: Vec<i64> = (0..i64::try_from(n)?).collect();
     let vals: Vec<i64> = ids.iter().map(|i| i * 10).collect();
     let batch = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(ids)),
             Arc::new(Int64Array::from(vals)),
@@ -499,7 +511,7 @@ async fn test_checkpoint_after_inlined_upsert_impl(fixture: TestFixture) -> Test
 
     // Upsert PK 0 → inlined.
     let upsert = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(vec![0])),
             Arc::new(Int64Array::from(vec![4242])),
