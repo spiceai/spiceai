@@ -436,7 +436,11 @@ impl PartitionService {
         .await;
         if let Some(node_id) = self.executor_registry.node_id() {
             let duration_ms = discovery_start.elapsed().as_secs_f64() * 1000.0;
-            metrics::record_partition_discovery_duration(node_id, &table.to_string(), duration_ms);
+            metrics::record_partition_discovery_duration(
+                node_id,
+                &dataset_label(table),
+                duration_ms,
+            );
         }
         let source_partitions = match discovery_result {
             Ok(Ok(partitions)) => partitions,
@@ -573,7 +577,12 @@ impl PartitionService {
                         (a + 1, u)
                     }
                 });
-        metrics::set_scheduler_partitions_count(node_id, &table.to_string(), assigned, unassigned);
+        metrics::set_scheduler_partitions_count(
+            node_id,
+            &dataset_label(table),
+            assigned,
+            unassigned,
+        );
     }
 
     /// Step 2: find every unassigned partition across the given tables, assign
@@ -642,6 +651,20 @@ fn resolved_equality(a: &TableReference, b: &TableReference) -> bool {
         .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
         == b.clone()
             .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+}
+
+/// Build the `dataset` label for scheduler-side metrics as `schema.table`.
+///
+/// Resolves bare references against the Spice defaults so a Spicepod dataset
+/// declared as `name: hits` and one declared as `name: public.hits` share the
+/// same series. Matches the executor-side normalization in
+/// `record_executor_assigned_partitions` so scheduler and executor metrics
+/// can be joined by `dataset`.
+fn dataset_label(table: &TableReference) -> String {
+    let resolved = table
+        .clone()
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+    format!("{}.{}", resolved.schema, resolved.table)
 }
 
 /// Sort a `PartitionValue` into a deterministic `Vec<(k, v)>` for equality comparisons.

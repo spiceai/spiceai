@@ -45,7 +45,9 @@ static QUERY_EXECUTOR_COUNT: LazyLock<Histogram<u64>> = LazyLock::new(|| {
         .u64_histogram("query_executor_count")
         .with_description("Number of executors selected per query during partition-aware planning.")
         .with_unit("executors")
-        .with_boundaries(vec![1.0, 2.0, 3.0, 4.0, 5.0, 8.0, 10.0, 16.0, 32.0])
+        .with_boundaries(vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 8.0, 10.0, 16.0, 32.0, 64.0, 128.0, 256.0,
+        ])
         .build()
 });
 
