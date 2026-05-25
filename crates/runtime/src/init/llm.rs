@@ -54,26 +54,27 @@ impl Runtime {
             .context(UnableToInitializeLlmSnafu)?;
 
         let mut responses_support = ResponsesApiSupport::Unavailable;
-        let mut responses_model =
-            match try_to_responses_model(&m, &params, Arc::new(self.clone())).await {
-                Ok(model) => {
-                    responses_support = ResponsesApiSupport::Supported;
-                    Some(model)
-                }
-                Err(llms::chat::Error::ResponsesNotSupported { from }) => {
-                    responses_support = ResponsesApiSupport::UnsupportedProvider {
-                        provider: from.short_name().to_string(),
-                    };
-                    None
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to construct Responses API endpoint for model '{}': {e}. The model will not be available via /v1/responses.",
-                        m.name
-                    );
-                    None
-                }
-            };
+        let mut responses_model = match try_to_responses_model(&m, &params, Arc::new(self.clone()))
+            .await
+        {
+            Ok(model) => {
+                responses_support = ResponsesApiSupport::Supported;
+                Some(model)
+            }
+            Err(llms::chat::Error::ResponsesNotSupported { from }) => {
+                responses_support = ResponsesApiSupport::UnsupportedProvider {
+                    provider: from.short_name().to_string(),
+                };
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to construct Responses API endpoint for model '{}': {e}. The model will not be available via /v1/responses.",
+                    m.name
+                );
+                None
+            }
+        };
 
         if let Some(model) = &responses_model
             && let Err(e) = model.health().await

@@ -128,21 +128,26 @@ impl Runtime {
                 Ok((completions_model, responses_model, responses_api_support)) => {
                     let rate_controller =
                         crate::model::rate_limit::build_model_rate_controller(m, &params);
-                    let mut llm_map = self.completion_llms().write().await;
+
+                    let completion_llms = self.completion_llms();
+                    let mut llm_map = completion_llms.write().await;
                     llm_map.insert(m.name.clone(), completions_model);
                     drop(llm_map);
 
                     if let Some(responses_model) = responses_model {
-                        let mut responses_llm_map = self.responses_llms().write().await;
+                        let responses_llms = self.responses_llms();
+                        let mut responses_llm_map = responses_llms.write().await;
                         responses_llm_map.insert(m.name.clone(), responses_model);
                     }
 
-                    let mut responses_support_map =
-                        self.llm_runtime_stores.responses_api_support().write().await;
+                    let responses_api_support_store =
+                        self.llm_runtime_stores.responses_api_support();
+                    let mut responses_support_map = responses_api_support_store.write().await;
                     responses_support_map.insert(m.name.clone(), responses_api_support);
                     drop(responses_support_map);
 
-                    let mut rc_map = self.model_rate_controllers().write().await;
+                    let model_rate_controllers = self.model_rate_controllers();
+                    let mut rc_map = model_rate_controllers.write().await;
                     rc_map.insert(m.name.clone(), rate_controller);
                     Ok(())
                 }
@@ -212,17 +217,23 @@ impl Runtime {
                 ml_map.remove(&m.name);
             }
             Some(ModelType::Llm) => {
-                let mut llm_map = self.completion_llms().write().await;
+                let completion_llms = self.completion_llms();
+                let mut llm_map = completion_llms.write().await;
                 llm_map.remove(&m.name);
                 drop(llm_map);
-                let mut responses_map = self.responses_llms().write().await;
+
+                let responses_llms = self.responses_llms();
+                let mut responses_map = responses_llms.write().await;
                 responses_map.remove(&m.name);
                 drop(responses_map);
-                let mut responses_support_map =
-                    self.llm_runtime_stores.responses_api_support().write().await;
+
+                let responses_api_support = self.llm_runtime_stores.responses_api_support();
+                let mut responses_support_map = responses_api_support.write().await;
                 responses_support_map.remove(&m.name);
                 drop(responses_support_map);
-                let mut rc_map = self.model_rate_controllers().write().await;
+
+                let model_rate_controllers = self.model_rate_controllers();
+                let mut rc_map = model_rate_controllers.write().await;
                 rc_map.remove(&m.name);
             }
             None => return,

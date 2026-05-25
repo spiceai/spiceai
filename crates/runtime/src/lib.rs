@@ -65,7 +65,7 @@ use governor::RateLimiter;
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
 use llms::rerank::RerankerModelStore;
-use model::{EmbeddingModelStore, LLMChatCompletionsModelStore, LlmRuntimeStores};
+use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
 use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
 use model_components::model::Model;
@@ -635,9 +635,7 @@ impl Runtime {
             .await
             .iter()
             .filter_map(|(name, support)| {
-                support
-                    .supports_responses_api()
-                    .then_some(name.to_string())
+                support.supports_responses_api().then_some(name.to_string())
             })
             .collect()
     }

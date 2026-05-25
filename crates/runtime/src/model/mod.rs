@@ -18,9 +18,10 @@ use arrow::record_batch::RecordBatch;
 use datafusion::prelude::col;
 use datafusion::sql::TableReference;
 use model_components::model::{Error as ModelError, Model};
-use std::io;
 use std::result::Result;
 use std::sync::Arc;
+use std::{collections::HashMap, io};
+use tokio::sync::RwLock;
 
 mod chat;
 mod embed;
@@ -48,47 +49,43 @@ pub use tool_use_responses::ToolUsingResponses;
 
 #[derive(Clone)]
 pub struct LlmRuntimeStores {
-    completion_llms: Arc<tokio::sync::RwLock<LLMChatCompletionsModelStore>>,
-    responses_llms: Arc<tokio::sync::RwLock<LLMResponsesModelStore>>,
-    rate_controllers:
-        Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<runtime_rate_control::RateController>>>>,
-    responses_api_support:
-        Arc<tokio::sync::RwLock<std::collections::HashMap<String, ResponsesApiSupport>>>,
+    completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
+    responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
+    rate_controllers: Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>>,
+    responses_api_support: Arc<RwLock<HashMap<String, ResponsesApiSupport>>>,
 }
 
 impl Default for LlmRuntimeStores {
     fn default() -> Self {
         Self {
-            completion_llms: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            responses_llms: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            rate_controllers: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            responses_api_support: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            completion_llms: Arc::new(RwLock::new(HashMap::new())),
+            responses_llms: Arc::new(RwLock::new(HashMap::new())),
+            rate_controllers: Arc::new(RwLock::new(HashMap::new())),
+            responses_api_support: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
 
 impl LlmRuntimeStores {
     #[must_use]
-    pub fn completion_llms(&self) -> Arc<tokio::sync::RwLock<LLMChatCompletionsModelStore>> {
+    pub fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
         Arc::clone(&self.completion_llms)
     }
 
     #[must_use]
-    pub fn responses_llms(&self) -> Arc<tokio::sync::RwLock<LLMResponsesModelStore>> {
+    pub fn responses_llms(&self) -> Arc<RwLock<LLMResponsesModelStore>> {
         Arc::clone(&self.responses_llms)
     }
 
     #[must_use]
     pub fn rate_controllers(
         &self,
-    ) -> Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<runtime_rate_control::RateController>>>> {
+    ) -> Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>> {
         Arc::clone(&self.rate_controllers)
     }
 
     #[must_use]
-    pub fn responses_api_support(
-        &self,
-    ) -> Arc<tokio::sync::RwLock<std::collections::HashMap<String, ResponsesApiSupport>>> {
+    pub fn responses_api_support(&self) -> Arc<RwLock<HashMap<String, ResponsesApiSupport>>> {
         Arc::clone(&self.responses_api_support)
     }
 }

@@ -353,5 +353,4 @@ mod tests {
                     && value == &Value::String("24h".to_string()))
         );
     }
-
 }
