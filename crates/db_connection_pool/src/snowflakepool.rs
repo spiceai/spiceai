@@ -53,6 +53,7 @@ pub enum SnowflakeAccountIdentifier {
 
 impl SnowflakeAccountIdentifier {
     /// Returns the account identifier formatted for the Snowflake API URL.
+    #[must_use]
     pub fn api_account(&self) -> String {
         match self {
             Self::OrgBased {
@@ -99,7 +100,9 @@ impl FromStr for SnowflakeAccountIdentifier {
         // Exactly one dot and no dashes → org-based format.
         // Org names and account names are alphanumeric + underscores only.
         if dot_count == 1 && !s.contains('-') {
-            let (orgname, account_name) = s.split_once('.').expect("checked dot_count == 1");
+            let (orgname, account_name) = s
+                .split_once('.')
+                .ok_or_else(|| format!("invalid org-based account identifier: {s}"))?;
             if orgname.is_empty() || account_name.is_empty() {
                 return Err(format!("invalid org-based account identifier: {s}"));
             }
@@ -111,6 +114,11 @@ impl FromStr for SnowflakeAccountIdentifier {
 
         // Legacy format: account_locator[.region[.cloud]]
         let parts: Vec<&str> = s.splitn(3, '.').collect();
+        let has_empty_segment = parts.iter().any(|segment| segment.is_empty());
+        if has_empty_segment {
+            return Err(format!("invalid account identifier: {s}"));
+        }
+
         match parts.as_slice() {
             [locator] => Ok(Self::Legacy {
                 account_locator: (*locator).to_string(),
@@ -539,5 +547,23 @@ mod tests {
     #[test]
     fn test_trailing_dot_is_err() {
         assert!("myorg.".parse::<SnowflakeAccountIdentifier>().is_err());
+    }
+
+    #[test]
+    fn test_legacy_with_empty_region_segment_is_err() {
+        assert!(
+            "xy12345..aws"
+                .parse::<SnowflakeAccountIdentifier>()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_legacy_with_empty_cloud_segment_is_err() {
+        assert!(
+            "xy12345.us-east-1."
+                .parse::<SnowflakeAccountIdentifier>()
+                .is_err()
+        );
     }
 }
