@@ -32,7 +32,10 @@ use globset::GlobSet;
 use mysql_async::prelude::Queryable;
 use snafu::prelude::*;
 
-use crate::{Read, RefreshableCatalogProvider};
+use crate::{
+    COMMENT_METADATA_KEY, FieldMetadata, Read, RefreshableCatalogProvider,
+    SOURCE_TYPE_METADATA_KEY, metadata_enriched_table_provider,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -47,6 +50,30 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// System schemas to exclude from discovery.
 const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "mysql", "performance_schema", "sys"];
+
+#[derive(Debug, Clone, Default)]
+struct TableComments {
+    table_comment: Option<String>,
+    column_comments: HashMap<String, String>,
+    column_source_types: HashMap<String, String>,
+}
+
+pub type MySqlTableMetadataRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+type MySqlSchemaMetadataRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+type CommentMap = HashMap<String, TableComments>;
 
 /// A catalog provider for `MySQL` that discovers schemas and tables
 /// by querying `information_schema`.
@@ -190,6 +217,17 @@ impl MySQLSchemaProvider {
 
     async fn refresh_tables(&self) -> Result<()> {
         let table_names = self.list_tables().await?;
+        let comments = match self.list_comments().await {
+            Ok(comments) => comments,
+            Err(error) => {
+                tracing::warn!(
+                    schema = %self.schema_name,
+                    error = %error,
+                    "Failed to query MySQL comments for schema, continuing without comment metadata"
+                );
+                HashMap::new()
+            }
+        };
 
         let mut tables = HashMap::new();
         for table_name in table_names {
@@ -209,7 +247,10 @@ impl MySQLSchemaProvider {
 
             match self.table_creator.table_provider(table_ref).await {
                 Ok(provider) => {
-                    tables.insert(table_name, provider);
+                    tables.insert(
+                        table_name.clone(),
+                        provider_with_comments(provider, comments.get(&table_name)),
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -249,6 +290,126 @@ impl MySQLSchemaProvider {
 
         Ok(rows)
     }
+
+    async fn list_comments(&self) -> Result<CommentMap> {
+        let mut conn = self.pool.get_conn().await.context(ConnectionFailedSnafu)?;
+
+        let rows: Vec<MySqlSchemaMetadataRow> = conn
+            .exec(
+                "SELECT \
+                     t.TABLE_NAME, \
+                     NULLIF(t.TABLE_COMMENT, '') AS TABLE_COMMENT, \
+                     c.COLUMN_NAME, \
+                     NULLIF(c.COLUMN_COMMENT, '') AS COLUMN_COMMENT, \
+                     c.COLUMN_TYPE \
+                 FROM information_schema.TABLES t \
+                 LEFT JOIN information_schema.COLUMNS c \
+                     ON c.TABLE_SCHEMA = t.TABLE_SCHEMA \
+                     AND c.TABLE_NAME = t.TABLE_NAME \
+                 WHERE t.TABLE_SCHEMA = ? \
+                 AND t.TABLE_TYPE IN ('BASE TABLE', 'VIEW') \
+                 ORDER BY t.TABLE_NAME, c.ORDINAL_POSITION",
+                (&self.schema_name,),
+            )
+            .await
+            .context(QueryFailedSnafu)?;
+
+        let mut comments_by_table = HashMap::new();
+        for (table_name, table_comment, column_name, column_comment, column_source_type) in rows {
+            let comments: &mut TableComments = comments_by_table.entry(table_name).or_default();
+            if comments.table_comment.is_none()
+                && let Some(comment) = table_comment
+            {
+                comments.table_comment = Some(comment);
+            }
+            if let Some(column_name) = column_name {
+                if let Some(comment) = column_comment {
+                    comments
+                        .column_comments
+                        .insert(column_name.clone(), comment);
+                }
+                if let Some(source_type) =
+                    column_source_type.filter(|source_type| !source_type.is_empty())
+                {
+                    comments
+                        .column_source_types
+                        .insert(column_name, source_type);
+                }
+            }
+        }
+
+        Ok(comments_by_table)
+    }
+}
+
+fn provider_with_comments(
+    provider: Arc<dyn TableProvider>,
+    comments: Option<&TableComments>,
+) -> Arc<dyn TableProvider> {
+    let Some(comments) = comments else {
+        return provider;
+    };
+
+    let (table_metadata, field_metadata) = table_comments_metadata(comments);
+
+    if table_metadata.is_empty() && field_metadata.is_empty() {
+        provider
+    } else {
+        metadata_enriched_table_provider(provider, table_metadata, field_metadata)
+    }
+}
+
+fn table_comments_metadata(comments: &TableComments) -> (HashMap<String, String>, FieldMetadata) {
+    let mut table_metadata = HashMap::new();
+    if let Some(comment) = &comments.table_comment {
+        table_metadata.insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
+    }
+
+    let mut field_metadata = FieldMetadata::new();
+    for (column, source_type) in &comments.column_source_types {
+        field_metadata
+            .entry(column.clone())
+            .or_default()
+            .insert(SOURCE_TYPE_METADATA_KEY.to_string(), source_type.clone());
+    }
+    for (column, comment) in &comments.column_comments {
+        field_metadata
+            .entry(column.clone())
+            .or_default()
+            .insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
+    }
+
+    (table_metadata, field_metadata)
+}
+
+#[must_use]
+pub fn mysql_metadata_from_rows(
+    rows: impl IntoIterator<Item = MySqlTableMetadataRow>,
+) -> (HashMap<String, String>, FieldMetadata) {
+    let mut comments = TableComments::default();
+    for (table_comment, column_name, column_comment, column_source_type) in rows {
+        if comments.table_comment.is_none()
+            && let Some(comment) = table_comment.filter(|comment| !comment.is_empty())
+        {
+            comments.table_comment = Some(comment);
+        }
+        if let Some(column_name) = column_name {
+            if let Some(comment) = column_comment.filter(|comment| !comment.is_empty()) {
+                comments
+                    .column_comments
+                    .insert(column_name.clone(), comment);
+            }
+            if let Some(source_type) =
+                column_source_type.filter(|source_type| !source_type.is_empty())
+            {
+                comments
+                    .column_source_types
+                    .insert(column_name, source_type);
+            }
+        }
+    }
+
+    table_comments_metadata(&comments)
 }
 
 #[async_trait]

@@ -120,6 +120,7 @@ impl SpiceTest<NotStarted> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
+            validate_row_count: self.validate_row_count,
             state: Running {
                 vector_workers: workers,
             },
@@ -148,6 +149,7 @@ impl SpiceTest<Running> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
+            validate_row_count: self.validate_row_count,
             state: Completed {
                 end_time: SystemTime::now(),
                 search_results,
