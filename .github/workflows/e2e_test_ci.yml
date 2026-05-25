@@ -464,7 +464,7 @@ jobs:
       - name: Spice dataset configure
         working-directory: test_app
         run: |
-          echo -e "taxi_trips\nnew york taxi trips\nspice.ai/spiceai/quickstart/datasets/taxi_trips\ny" | spice dataset configure
+          spice dataset configure taxi_trips --description "new york taxi trips" --from spice.ai/spiceai/quickstart/datasets/taxi_trips --param spiceai_region=us-east-1
           cat spicepod.yaml
 
       - name: Start spice runtime

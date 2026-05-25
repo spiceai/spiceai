@@ -6,6 +6,10 @@ inputs:
     description: 'Version of protoc to install (e.g. "v29.3"). If empty, installs the latest release.'
     required: false
     default: ''
+  token:
+    description: 'GitHub token for release API requests (avoids unauthenticated api.github.com rate limits). Defaults to the workflow github.token.'
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
@@ -15,8 +19,22 @@ runs:
       shell: bash
       env:
         INPUT_VERSION: ${{ inputs.version }}
+        GITHUB_TOKEN: ${{ inputs.token || github.token }}
       run: |
         set -euo pipefail
+
+        github_api_curl() {
+          local url="$1"
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            curl -fsSL \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "${url}"
+          else
+            curl -fsSL "${url}"
+          fi
+        }
 
         # Ensure jq is available
         if ! command -v jq &>/dev/null; then
@@ -28,15 +46,15 @@ runs:
           fi
         fi
 
-        # Fetch release metadata
+        # Fetch release metadata (authenticated to avoid shared-runner IP rate limits)
         if [ -z "${INPUT_VERSION}" ]; then
-          RELEASE_JSON=$(curl -fsSL https://api.github.com/repos/protocolbuffers/protobuf/releases/latest)
+          RELEASE_JSON=$(github_api_curl "https://api.github.com/repos/protocolbuffers/protobuf/releases/latest")
         else
           QUERY_VERSION="${INPUT_VERSION}"
           if [[ ! "${QUERY_VERSION}" =~ ^v ]]; then
             QUERY_VERSION="v${QUERY_VERSION}"
           fi
-          RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/protocolbuffers/protobuf/releases/tags/${QUERY_VERSION}")
+          RELEASE_JSON=$(github_api_curl "https://api.github.com/repos/protocolbuffers/protobuf/releases/tags/${QUERY_VERSION}")
         fi
 
         VERSION=$(echo "${RELEASE_JSON}" | jq -r '.tag_name')
@@ -133,18 +151,27 @@ runs:
       shell: pwsh
       env:
         INPUT_VERSION: ${{ inputs.version }}
+        GITHUB_TOKEN: ${{ inputs.token || github.token }}
       run: |
         $ErrorActionPreference = "Stop"
 
-        # Fetch release metadata
+        $ApiHeaders = @{
+          Accept = "application/vnd.github+json"
+          "X-GitHub-Api-Version" = "2022-11-28"
+        }
+        if (-not [string]::IsNullOrEmpty($env:GITHUB_TOKEN)) {
+          $ApiHeaders.Authorization = "Bearer $($env:GITHUB_TOKEN)"
+        }
+
+        # Fetch release metadata (authenticated to avoid shared-runner IP rate limits)
         if ([string]::IsNullOrEmpty($env:INPUT_VERSION)) {
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/protocolbuffers/protobuf/releases/latest"
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/protocolbuffers/protobuf/releases/latest" -Headers $ApiHeaders
         } else {
           $QueryVersion = $env:INPUT_VERSION
           if (-not $QueryVersion.StartsWith("v")) {
             $QueryVersion = "v$QueryVersion"
           }
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/protocolbuffers/protobuf/releases/tags/$QueryVersion"
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/protocolbuffers/protobuf/releases/tags/$QueryVersion" -Headers $ApiHeaders
         }
 
         $Version = $release.tag_name
