@@ -867,10 +867,13 @@ Cayenne synthesizes several established database/storage techniques. The list be
 - **S3 Express One Zone** for low-latency object storage of the Vortex tier, with optional multi-zone replication and best-effort rollback on partial failure. The metastore stays on local disk (SQLite cannot run on object storage).
   - AWS S3 Express One Zone: <https://aws.amazon.com/s3/storage-classes/express-one-zone/>
 
-### Related work referenced in optimizer-rule design
+### Benchmarks and related work
 
+- **SpiceBench** — Spice.ai's end-to-end benchmark for hybrid lake + database platforms. SpiceBench streams pre-generated data continuously into the system under test while concurrently executing query workloads, capturing the tension between ingestion throughput, materialization freshness, and query latency under load. Cayenne's CDC apply pipelining, inline-memtable absorption, tiered compaction, and post-write maintenance debouncing are all design responses to the workload shape SpiceBench measures; the primary ranking metric (`test_duration_ms`, end-to-end wall-clock from test start through ETL completion) is the metric these mechanisms collectively optimize. Today SpiceBench covers a TPC-H scenario with ClickBench and custom datasets planned, and publishes results at <https://spicebench.com>.
+  - Repository: <https://github.com/spiceai/spicebench>
+  - Site: <https://spicebench.com>
 - The "no-spill build-side memory strategy" documented in `crates/cayenne/src/optimizer_rules.rs` (Inner-join → `SortMergeJoin` rewrite above a 10M-row build-side threshold) builds on classical join-spilling literature; the rewriter targets the chbench q21 shape specifically.
-- chbench (CH-benCHmark) — the HTAP benchmark whose q17/q21 multi-way joins drove the predicate-propagation and sort-merge rewrites.
+- **chbench (CH-benCHmark)** — the HTAP benchmark whose q17/q21 multi-way joins drove the predicate-propagation and sort-merge rewrites in `optimizer_rules.rs` and `logical_optimizer.rs`. Used as a chbench-shape micro-driver inside the Spice runtime tests; the broader end-to-end HTAP coverage is provided by SpiceBench.
   - Cole, Funke, Giakoumakis, Guy, Kemper, Krompass, Kuno, Nambiar, Neumann, Poess, Sattler, Seibold, Simon, Waas, *"The mixed workload CH-benCHmark"*, DBTest 2011. <https://dl.acm.org/doi/10.1145/1988842.1988850>
 
 ## References
@@ -886,3 +889,4 @@ Cayenne synthesizes several established database/storage techniques. The list be
 - [RoaringBitmap format specification](https://github.com/RoaringBitmap/RoaringFormatSpec)
 - [RFC 9562 — UUIDv7](https://www.rfc-editor.org/rfc/rfc9562)
 - [AWS S3 Express One Zone](https://aws.amazon.com/s3/storage-classes/express-one-zone/)
+- [SpiceBench](https://github.com/spiceai/spicebench) — Spice.ai's end-to-end HTAP benchmark; published results at [spicebench.com](https://spicebench.com)
