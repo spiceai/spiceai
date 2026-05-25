@@ -25,7 +25,6 @@ use crate::component::access::AccessMode;
 use app::App;
 use datafusion::sql::TableReference;
 use runtime_acceleration::snapshot::SnapshotBehavior;
-use serde_json::Value;
 use snafu::prelude::*;
 use spicepod::{
     acceleration as spicepod_acceleration,
@@ -98,6 +97,8 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
                 a.snapshots_compaction
             });
 
+        let metadata = dataset.metadata();
+
         let acceleration = dataset
             .acceleration
             .map(acceleration::Acceleration::try_from)
@@ -127,11 +128,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
                 .as_ref()
                 .map(Params::as_string_map)
                 .unwrap_or_default(),
-            metadata: dataset
-                .metadata
-                .iter()
-                .map(|(k, v)| (k.clone(), value_to_string(v)))
-                .collect(),
+            metadata,
             columns: dataset.columns,
             has_metadata_table: dataset
                 .has_metadata_table
@@ -390,11 +387,4 @@ fn fts_store_from_column_overrides(
         engine: Some(column_engine),
         params: column_params,
     }))
-}
-
-fn value_to_string(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        _ => value.to_string(),
-    }
 }

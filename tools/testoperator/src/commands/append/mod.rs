@@ -78,6 +78,8 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
             .with_retention_test_data(args.with_retention_data),
     )
     .with_progress_bars(!args.test_args.common.disable_progress_bars)
+    // Append tests start from a small data subset and load incrementally, so queries legitimately return 0 rows
+    .with_validate_row_count(false)
     .start_appending()
     .await
     {
