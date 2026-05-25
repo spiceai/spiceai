@@ -171,4 +171,8 @@ impl TableProvider for PolyTableProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.write.update(state, assignments, filters).await
     }
+
+    async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.write.truncate(state).await
+    }
 }
