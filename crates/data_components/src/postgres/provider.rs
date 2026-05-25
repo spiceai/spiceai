@@ -28,6 +28,7 @@ use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
+use datafusion_federation::FederatedTableProviderAdaptor;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use globset::GlobSet;
 use snafu::prelude::*;
@@ -487,9 +488,10 @@ async fn build_table_providers_for_schema(
                 let mut table_metadata = HashMap::new();
                 if let Some(fks) = foreign_keys.get(&table_name) {
                     match serde_json::to_string(fks) {
-                        Ok(fk_json) => {
-                            table_metadata.insert(FOREIGN_KEYS_METADATA_KEY.to_string(), fk_json);
-                        }
+                        Ok(fk_json) => add_metadata_to_table(
+                            provider,
+                            HashMap::from([(FOREIGN_KEYS_METADATA_KEY.to_string(), fk_json)]),
+                        ),
                         Err(e) => {
                             tracing::warn!(
                                 schema = %schema_name,
@@ -530,6 +532,32 @@ async fn build_table_providers_for_schema(
     }
 
     tables
+}
+
+fn add_metadata_to_table(
+    inner: Arc<dyn TableProvider>,
+    metadata: HashMap<String, String>,
+) -> Arc<dyn TableProvider> {
+    match inner
+        .as_any()
+        .downcast_ref::<FederatedTableProviderAdaptor>()
+    {
+        None => Arc::new(MetadataEnrichedTableProvider::new(inner, metadata)),
+        Some(FederatedTableProviderAdaptor {
+            source,
+            table_provider: Some(inner),
+        }) => Arc::new(FederatedTableProviderAdaptor::new_with_provider(
+            Arc::clone(&source),
+            Arc::new(MetadataEnrichedTableProvider::new(
+                Arc::clone(inner),
+                metadata,
+            )),
+        )),
+        Some(FederatedTableProviderAdaptor {
+            source,
+            table_provider: None,
+        }) => Arc::new(FederatedTableProviderAdaptor::new(Arc::clone(source))),
+    }
 }
 
 fn table_comments_metadata(comments: &TableComments) -> (HashMap<String, String>, FieldMetadata) {
