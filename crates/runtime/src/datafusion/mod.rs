@@ -3665,10 +3665,10 @@ impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
         table_ref: &TableReference,
         data: Vec<RecordBatch>,
     ) -> std::result::Result<(), runtime_datafusion::query_engine::BoxError> {
-        let schema = data
-            .first()
-            .map(RecordBatch::schema)
-            .unwrap_or_else(|| Arc::new(Schema::empty()));
+        let Some(schema) = data.first().map(RecordBatch::schema) else {
+            return Ok(());
+        };
+
         let update = DataUpdate {
             schema,
             data,

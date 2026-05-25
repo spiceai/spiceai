@@ -110,12 +110,12 @@ impl DistinctColumnsParams {
         df: Arc<dyn QueryEngine>,
         query: &str,
     ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
-        let stream = df.execute_query(QueryRequest::new(query)).await.boxed()?;
+        let stream = df.execute_query(QueryRequest::new(query)).await?;
 
         let column = stream
             .try_collect::<Vec<RecordBatch>>()
             .await
-            .boxed()?
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
             .iter()
             .map(|batch| Arc::clone(batch.column(0)))
             .collect_vec();
@@ -123,7 +123,8 @@ impl DistinctColumnsParams {
         let array_slices: Vec<&dyn arrow::array::Array> =
             column.iter().map(AsRef::as_ref).collect();
 
-        concat(array_slices.as_slice()).boxed()
+        concat(array_slices.as_slice())
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
     }
 }
 

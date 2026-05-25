@@ -27,7 +27,6 @@ use runtime_datafusion::query_engine::{QueryEngine, QueryRequest};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use snafu::ResultExt;
 use tracing::Span;
 use tracing_futures::Instrument;
 
@@ -125,14 +124,8 @@ impl SpiceModelTool for SqlTool {
                 query_request = query_request.allow_tables(allowlist.clone());
             }
 
-            let batches = self
-                .df
-                .execute_query(query_request)
-                .await
-                .boxed()?
-                .try_collect::<Vec<RecordBatch>>()
-                .await
-                .boxed()?;
+            let stream = self.df.execute_query(query_request).await?;
+            let batches = stream.try_collect::<Vec<RecordBatch>>().await?;
 
             Ok(Value::String(write_to_json_string(&batches)?))
         }
@@ -141,7 +134,7 @@ impl SpiceModelTool for SqlTool {
 
         match tool_use_result {
             Ok(value) => {
-                let captured_output_json = serde_json::to_string(&value).boxed()?;
+                let captured_output_json = serde_json::to_string(&value)?;
                 tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
                 Ok(value)
             }

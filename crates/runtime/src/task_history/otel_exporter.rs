@@ -31,6 +31,7 @@ use spicepod::component::runtime::{
     TaskHistoryCapturedContext, TaskHistoryCapturedOutput, TaskHistoryCapturedPlan,
 };
 
+use crate::datafusion::DataFusion;
 use runtime_datafusion::query_engine::{QueryEngine, QueryRequest};
 
 use super::TaskSpan;
@@ -86,7 +87,7 @@ pub trait SpanRetention: Send + Sync {
 
 #[derive(Clone)]
 pub struct TaskHistoryExporter {
-    df: Arc<dyn QueryEngine>,
+    df: Arc<DataFusion>,
     captured_output: TaskHistoryCapturedOutput,
     captured_context: TaskHistoryCapturedContext,
     min_sql_duration_ms: Option<f64>,
@@ -112,7 +113,7 @@ impl Debug for TaskHistoryExporter {
 
 impl TaskHistoryExporter {
     pub fn new(
-        df: Arc<dyn QueryEngine>,
+        df: Arc<DataFusion>,
         captured_output: TaskHistoryCapturedOutput,
         captured_context: TaskHistoryCapturedContext,
         min_sql_duration_ms: Option<f64>,
@@ -233,7 +234,7 @@ impl TaskHistoryExporter {
     /// with `task="sql_query"` and the original query's `span_id` as `parent_span_id`.
     /// The output is always captured in full regardless of the global `captured_output` setting.
     async fn capture_plans_async(
-        df: Arc<dyn QueryEngine>,
+        df: Arc<DataFusion>,
         spans: Vec<TaskSpan>,
         captured_plan: TaskHistoryCapturedPlan,
         _min_plan_duration_ms: Option<f64>,

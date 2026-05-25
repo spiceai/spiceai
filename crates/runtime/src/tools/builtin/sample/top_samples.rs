@@ -99,23 +99,26 @@ impl SampleFrom for TopSamplesParams {
         let tbl_quoted = quote_table_reference(&tbl);
 
         let batches = async {
-            df.execute_query(QueryRequest::new(format!(
-                "SELECT * FROM {tbl} ORDER BY {order_by} LIMIT {limit}",
-                limit = self.limit,
-                tbl = tbl_quoted,
-            )))
-            .await
-            .boxed()?
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .boxed()
+            let stream = df
+                .execute_query(QueryRequest::new(format!(
+                    "SELECT * FROM {tbl} ORDER BY {order_by} LIMIT {limit}",
+                    limit = self.limit,
+                    tbl = tbl_quoted,
+                )))
+                .await?;
+
+            stream
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
         }
         .instrument(current_span)
         .await?;
 
-        let schema = Arc::new(df.get_arrow_schema(tbl).await.boxed()?);
+        let schema = Arc::new(df.get_arrow_schema(tbl).await?);
 
-        concat_batches(&schema, batches.iter()).boxed()
+        concat_batches(&schema, batches.iter())
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
     }
 }
 
