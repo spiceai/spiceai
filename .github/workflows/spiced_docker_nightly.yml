@@ -136,6 +136,7 @@ jobs:
             new_version="${current_version}-$NIGHTLY_LABEL"
           fi
           sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          sed -i "s/version = \"${current_version}\"/version = \"${new_version}\"/g" Cargo.lock
           grep '^version =' Cargo.toml
 
       - name: Install docker
@@ -256,6 +257,7 @@ jobs:
             new_version="${current_version}-$NIGHTLY_LABEL"
           fi
           sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          sed -i "s/version = \"${current_version}\"/version = \"${new_version}\"/g" Cargo.lock
           grep '^version =' Cargo.toml
 
       - name: Set up Docker Buildx

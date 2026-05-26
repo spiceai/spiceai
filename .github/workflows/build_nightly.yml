@@ -111,6 +111,7 @@ jobs:
             new_version="${current_version}-$NIGHTLY_LABEL"
           fi
           sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          sed -i "s/version = \"${current_version}\"/version = \"${new_version}\"/g" Cargo.lock
           grep '^version =' Cargo.toml
 
       - name: Set up Rust
@@ -129,7 +130,7 @@ jobs:
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
-        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models -p spiced -p spice --target-dir ../../target
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --locked --features release,models -p spiced -p spice --target-dir ../../target
 
       - name: tar spiced binary
         run: |
@@ -183,6 +184,7 @@ jobs:
             new_version="${current_version}-$NIGHTLY_LABEL"
           fi
           sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          sed -i "s/version = \"${current_version}\"/version = \"${new_version}\"/g" Cargo.lock
           grep '^version =' Cargo.toml
 
       - name: Set up Rust
@@ -201,7 +203,7 @@ jobs:
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
-        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models -p spiced -p spice --target-dir ../../target
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --locked --features release,models -p spiced -p spice --target-dir ../../target
 
       - name: tar spiced binary
         run: |
@@ -255,6 +257,7 @@ jobs:
             new_version="${current_version}-$NIGHTLY_LABEL"
           fi
           sed -i '' "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          sed -i '' "s/version = \"${current_version}\"/version = \"${new_version}\"/g" Cargo.lock
           grep '^version =' Cargo.toml
 
       - name: Install missing tools
@@ -272,7 +275,7 @@ jobs:
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
-        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models -p spiced -p spice --target-dir ../../target
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --locked --features release,models -p spiced -p spice --target-dir ../../target
 
       - name: tar spiced binary
         run: |
