@@ -616,9 +616,9 @@ Spice.ai is designed to be extensible. See [EXTENSIBILITY.md](./docs/EXTENSIBILI
 
 🚀 See the [Roadmap](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md). Highlights:
 
-- **v2.0 (April 2026)** — Cayenne GA, multi-active HA GA, distributed query GA
-- **v2.1 (H2 2026)** — Distributed search, schema registry, Cedar policy engine
-- **v2.2 (H2 2026)** — Webhooks, reactive event-driven actions
+- **[v2.0](https://github.com/spiceai/spiceai/milestone/58) (June 2026)** — Cayenne GA, multi-active HA GA, distributed query GA, mTLS, Cedar policy engine (Beta)
+- **[v2.1](https://github.com/spiceai/spiceai/milestone/95) (July 2026)** — Distributed search, schema registry, schema evolution
+- **[v2.2](https://github.com/spiceai/spiceai/milestone/99) (September 2026)** — Webhooks, reactive event-driven actions (Drasi-based)
 
 ### 🤝 Connect with us
 
