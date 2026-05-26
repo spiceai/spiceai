@@ -342,12 +342,13 @@ impl SideAnalysis {
 }
 
 /// Logical optimizer rule that rewrites `column IN (k, k+1, …, k+N-1)` to
-/// `column BETWEEN k AND k+N-1` for Cayenne-backed filter inputs when the list
-/// contents are integer literals sorted unique and consecutive. BETWEEN is
-/// ~50 % faster than IN-list at per-row predicate evaluation. Running this as a
-/// logical-plan rule (rather than in `TableProvider::scan`) lets `DataFusion`'s
-/// downstream simplification passes treat the result identically to a
-/// SQL-parsed `BETWEEN`. See bench `pk_in_list_vs_range_rewrite`.
+/// `column BETWEEN k AND k+N-1` for single-table Cayenne-backed filter inputs
+/// when the list contents are integer literals sorted unique and consecutive.
+/// BETWEEN is ~50 % faster than IN-list at per-row predicate evaluation.
+/// Running this as a logical-plan rule (rather than in `TableProvider::scan`)
+/// lets `DataFusion`'s downstream simplification passes treat the result
+/// identically to a SQL-parsed `BETWEEN`. See bench
+/// `pk_in_list_vs_range_rewrite`.
 pub struct CayenneInListToRangeRewrite {
     is_cayenne_table_source: TableSourcePredicate,
 }
@@ -419,7 +420,7 @@ impl OptimizerRule for CayenneInListToRangeRewrite {
         let LogicalPlan::Filter(filter) = plan else {
             return Ok(Transformed::no(plan));
         };
-        if !contains_cayenne_table_scan(&filter.input, &self.is_cayenne_table_source) {
+        if !is_single_cayenne_table_scan_input(&filter.input, &self.is_cayenne_table_source) {
             return Ok(Transformed::no(LogicalPlan::Filter(filter)));
         }
 
@@ -444,22 +445,26 @@ impl OptimizerRule for CayenneInListToRangeRewrite {
     }
 }
 
-fn contains_cayenne_table_scan(
+fn is_single_cayenne_table_scan_input(
     plan: &LogicalPlan,
     is_cayenne_table_source: &TableSourcePredicate,
 ) -> bool {
-    let mut found = false;
+    let mut total_scans = 0_usize;
+    let mut cayenne_scans = 0_usize;
     let _ = plan.apply(|node| {
-        if let LogicalPlan::TableScan(scan) = node
-            && is_cayenne_table_source(scan.source.as_ref())
-        {
-            found = true;
-            return Ok(TreeNodeRecursion::Stop);
+        if let LogicalPlan::TableScan(scan) = node {
+            total_scans = total_scans.saturating_add(1);
+            if is_cayenne_table_source(scan.source.as_ref()) {
+                cayenne_scans = cayenne_scans.saturating_add(1);
+            }
+            if total_scans > 1 {
+                return Ok(TreeNodeRecursion::Stop);
+            }
         }
 
         Ok(TreeNodeRecursion::Continue)
     });
-    found
+    total_scans == 1 && cayenne_scans == 1
 }
 
 fn column_expr(column: &Column) -> Expr {
@@ -2489,6 +2494,36 @@ mod tests {
         assert!(
             !transformed.transformed,
             "rule should leave non-Cayenne filter inputs untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inlist_to_range_rule_leaves_join_filter_untouched() -> Result<()> {
+        use datafusion::optimizer::OptimizerContext;
+        use datafusion_expr::builder::table_scan;
+        use datafusion_expr::{JoinType, LogicalPlanBuilder, lit};
+
+        let left_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        let left = table_scan(Some("c"), &left_schema, None)?.build()?;
+        let right = table_scan(Some("p"), &right_schema, None)?.build()?;
+
+        let joined = LogicalPlanBuilder::from(left)
+            .join_using(right, JoinType::Inner, vec!["id".into()])?
+            .filter(
+                Expr::Column(Column::new(Some("p"), "id"))
+                    .in_list(vec![lit(5_i64), lit(6_i64), lit(7_i64), lit(8_i64)], false),
+            )?
+            .build()?;
+
+        let rule = CayenneInListToRangeRewrite::new_with_table_source_predicate(|_| true);
+        let cfg = OptimizerContext::new();
+        let transformed = rule.rewrite(joined, &cfg)?;
+        assert!(
+            !transformed.transformed,
+            "rule should not rewrite join-level filter inputs that span multiple table scans"
         );
         Ok(())
     }
