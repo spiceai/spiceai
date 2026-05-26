@@ -81,7 +81,7 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 - **Extensible Middleware**: Pluggable extensions for dynamic customization.
 - **Search at 100B+ Row Scale**: Vector and full-text search benchmarked and tuned for hundred-billion-row deployments, including S3 Vectors throughput improvements.
-- **Unified Connector Rate Control**: Runtime-wide rate control shared across all data connectors.
+- **Unified Connector Rate Control**: Extend the runtime-wide rate-control surface from HTTP connectors to database and file/object-store connectors for consistent per-origin concurrency and request-rate limits.
 
 ### [v2.5](https://github.com/spiceai/spiceai/milestone/102) (January 2027)
 
