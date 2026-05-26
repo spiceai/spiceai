@@ -73,7 +73,7 @@ pub enum Error {
 }
 
 static UTC_TIMEZONE: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("UTC"));
-const COMMENT_METADATA_KEY: &str = "comment";
+const DESCRIPTION_METADATA_KEY: &str = "description";
 const SOURCE_TYPE_METADATA_KEY: &str = "source_type";
 
 pub struct SnowflakeConnection {
@@ -688,7 +688,7 @@ pub fn parse_schema_from_json(resp: &serde_json::Value) -> Result<SchemaRef, Err
             .map(str::trim)
             .filter(|comment| !comment.is_empty())
         {
-            metadata.insert(COMMENT_METADATA_KEY.to_string(), comment.to_string());
+            metadata.insert(DESCRIPTION_METADATA_KEY.to_string(), comment.to_string());
         }
 
         let field = Field::new(column_name, data_type, is_nullable).with_metadata(metadata);
@@ -1344,7 +1344,7 @@ mod tests {
             schema
                 .field(0)
                 .metadata()
-                .get("comment")
+                .get("description")
                 .map(String::as_str),
             Some("customer dimension key")
         );

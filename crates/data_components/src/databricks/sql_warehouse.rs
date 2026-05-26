@@ -66,7 +66,7 @@ use crate::schema_discovery::{
     DatasetPermissions, NoPermissionsCheck, PermissionCheckResult, SchemaProbeResult,
     discover_schema,
 };
-use crate::{COMMENT_METADATA_KEY, PARTITION_METADATA_KEY, SOURCE_TYPE_METADATA_KEY};
+use crate::{DESCRIPTION_METADATA_KEY, PARTITION_METADATA_KEY, SOURCE_TYPE_METADATA_KEY};
 use tracing::Instrument;
 use util::retry_strategy::BackoffMethod;
 
@@ -1641,7 +1641,7 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
 
         if let Some(table_comment) = optional_string(row_array.get(4)) {
             schema_metadata
-                .entry(COMMENT_METADATA_KEY.to_string())
+                .entry(DESCRIPTION_METADATA_KEY.to_string())
                 .or_insert_with(|| table_comment.to_string());
         }
 
@@ -1766,7 +1766,7 @@ fn field_with_optional_metadata(
 ) -> Field {
     let mut metadata = HashMap::new();
     if let Some(comment) = comment {
-        metadata.insert(COMMENT_METADATA_KEY.to_string(), comment.to_string());
+        metadata.insert(DESCRIPTION_METADATA_KEY.to_string(), comment.to_string());
     }
     if let Some(source_type) = source_type.map(str::trim).filter(|value| !value.is_empty()) {
         metadata.insert(
@@ -2131,7 +2131,7 @@ mod tests {
         assert_eq!(
             schema
                 .metadata()
-                .get(COMMENT_METADATA_KEY)
+                .get(DESCRIPTION_METADATA_KEY)
                 .map(String::as_str),
             Some("customer dimension")
         );
@@ -2139,7 +2139,7 @@ mod tests {
             schema
                 .field(0)
                 .metadata()
-                .get(COMMENT_METADATA_KEY)
+                .get(DESCRIPTION_METADATA_KEY)
                 .map(String::as_str),
             Some("stable identifier")
         );
@@ -2155,7 +2155,7 @@ mod tests {
             schema
                 .field(1)
                 .metadata()
-                .get(COMMENT_METADATA_KEY)
+                .get(DESCRIPTION_METADATA_KEY)
                 .map(String::as_str),
             Some("display name")
         );
@@ -2171,7 +2171,7 @@ mod tests {
             schema
                 .field(2)
                 .metadata()
-                .get(COMMENT_METADATA_KEY)
+                .get(DESCRIPTION_METADATA_KEY)
                 .is_none()
         );
         assert_eq!(
@@ -4676,7 +4676,7 @@ mod tests {
             schema
                 .field(0)
                 .metadata()
-                .get(COMMENT_METADATA_KEY)
+                .get(DESCRIPTION_METADATA_KEY)
                 .map(String::as_str),
             Some("primary key")
         );
@@ -4691,7 +4691,7 @@ mod tests {
             schema
                 .field(1)
                 .metadata()
-                .get(COMMENT_METADATA_KEY)
+                .get(DESCRIPTION_METADATA_KEY)
                 .map(String::as_str),
             Some("user name")
         );
@@ -4703,7 +4703,7 @@ mod tests {
             schema
                 .field(2)
                 .metadata()
-                .get(COMMENT_METADATA_KEY)
+                .get(DESCRIPTION_METADATA_KEY)
                 .is_none()
         );
     }
