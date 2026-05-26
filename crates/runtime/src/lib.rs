@@ -707,6 +707,8 @@ impl Runtime {
             guard.clone_from(&assignments);
             drop(guard); // drop lock before updating tables
 
+            self.record_executor_assigned_partitions(&assignments);
+
             // Update all assigned tables
             for table in assignments.keys() {
                 if let Err(e) = self
@@ -719,6 +721,25 @@ impl Runtime {
         } else {
             tracing::warn!(
                 "Attempted to set partition assignments on a non-executor node. Ignoring."
+            );
+        }
+    }
+
+    /// Emit `executor_assigned_partitions_count` for each assigned table.
+    ///
+    /// Uses `schema.table` for the `dataset` label so executor-side series
+    /// line up with the scheduler-side partition metrics, which build their
+    /// label from the user-declared dataset name (typically 2-part). The
+    /// `node_id` label uses `metrics_node_id()` (host + bind port, scheme
+    /// stripped) to match the executor identity registered with the scheduler.
+    fn record_executor_assigned_partitions(&self, assignments: &PartitionAssignments) {
+        let node_id = self.df.cluster_config.metrics_node_id();
+        for (table, partitions) in assignments {
+            let dataset = format!("{}.{}", table.schema, table.table);
+            runtime_cluster::metrics::set_executor_assigned_partitions_count(
+                &node_id,
+                &dataset,
+                partitions.len() as u64,
             );
         }
     }
@@ -802,6 +823,8 @@ impl Runtime {
             self.update_partition_refresh_sql(resolved.clone(), &prospective)
                 .await?;
         }
+
+        self.record_executor_assigned_partitions(&prospective);
 
         // All filter updates succeeded — commit the new routing state. Last
         // step so the planner's view of executor partitions never gets ahead
