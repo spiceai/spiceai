@@ -44,9 +44,12 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 **DataFusion:** v53
 
-- **Distributed Search (Alpha)**: Federated vector and full-text search across multiple nodes.
+- **Distributed Search (Alpha)**: Federated vector and full-text search across multiple nodes, with FTS indexes available in distributed query mode.
 - **Schema Registry (Initial)**: Versioning and backward compatibility checks.
 - **Schema Evolution**: Safe, non-breaking schema changes for accelerated datasets (add/drop/rename columns, type widening) with automatic migration.
+- **Cayenne Improvements**: Non-distributed Cayenne catalog, multi-version metadata schema support, and orphaned deletion-vector cleanup during retention.
+- **Distributed Acceleration Hardening**: Correct handling of `bucket()` partitioning with NULL values, accurate readiness signaling, and TopK pushdown ordering with filter pushdown.
+- **Ballista / Distributed Query**: Shared job state across schedulers and faster partition reassignment on executor failure.
 
 ### v2.2 (September 2026)
 
@@ -56,6 +59,8 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 - **Webhooks & Event Notifications**: Push-based data change alerts for downstream consumers.
 - **Actions (Drasi-based)**: Reactive event-driven actions triggered by data changes.
+- **Streaming Cayenne Ingest**: `refresh_mode: changes` (Kafka) support for Cayenne-accelerated tables.
+- **Distributed Search Scale-Out**: Search query partitioning and relative score fusion across distributed nodes.
 
 ### v2.3 (October 2026)
 
@@ -65,6 +70,8 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 - **Audit Logging**: Persistent, immutable query and access logs for compliance.
 - **Resource Quotas**: Per-user/tenant query limits and throttling.
+- **Distributed Cayenne Catalog**: Cayenne catalog with full distributed query and acceleration support.
+- **Write-Back Acceleration**: Eventually-consistent write-back, with full DML (UPDATE/DELETE) and `spice refresh`/`refresh_check_interval` on write-through accelerated tables.
 
 ### v2.4 (December 2026)
 
@@ -73,6 +80,8 @@ To propose features or report issues, please [file an issue](https://github.com/
 **DataFusion:** v56
 
 - **Extensible Middleware**: Pluggable extensions for dynamic customization.
+- **Search at 100B+ Row Scale**: Vector and full-text search benchmarked and tuned for hundred-billion-row deployments, including S3 Vectors throughput improvements.
+- **Unified Connector Rate Control**: Runtime-wide rate control shared across all data connectors.
 
 ### v2.5 (January 2027)
 
