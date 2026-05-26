@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Integration tests verifying that PostgreSQL table and column comments are
+//! Integration tests verifying that `PostgreSQL` table and column comments are
 //! accessible via `obj_description` and `col_description` UDFs when the dataset
-//! is loaded with DuckDB acceleration.
+//! is loaded with `DuckDB` acceleration.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -125,8 +125,8 @@ async fn start_runtime(dataset: Dataset) -> Result<Arc<runtime::Runtime>, anyhow
     Ok(rt)
 }
 
-/// `obj_description('orders')` returns the PostgreSQL table comment when the
-/// dataset is accelerated with DuckDB.
+/// `obj_description('orders')` returns the `PostgreSQL` table comment when the
+/// dataset is accelerated with `DuckDB`.
 #[tokio::test]
 async fn test_postgres_obj_description_with_duckdb_acceleration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -158,8 +158,8 @@ async fn test_postgres_obj_description_with_duckdb_acceleration() -> Result<(), 
         .await
 }
 
-/// `col_description('orders', N)` returns PostgreSQL column comments by
-/// 1-based position when the dataset is accelerated with DuckDB.
+/// `col_description('orders', N)` returns `PostgreSQL` column comments by
+/// 1-based position when the dataset is accelerated with `DuckDB`.
 #[tokio::test]
 async fn test_postgres_col_description_with_duckdb_acceleration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));

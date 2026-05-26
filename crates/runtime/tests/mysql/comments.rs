@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Integration tests verifying that MySQL table and column comments are
+//! Integration tests verifying that `MySQL` table and column comments are
 //! accessible via `obj_description` and `col_description` UDFs when the dataset
-//! is loaded with DuckDB acceleration.
+//! is loaded with `DuckDB` acceleration.
 
 use std::{sync::Arc, time::Duration};
 
@@ -49,7 +49,7 @@ fn commented_dataset(port: u16) -> Dataset {
     ds
 }
 
-/// Waits until MySQL's InnoDB is ready to execute DDL by probing with a trivial
+/// Waits until `MySQL`'s `InnoDB` is ready to execute DDL by probing with a trivial
 /// CREATE/DROP. `mysqladmin ping` and even `SELECT 1` can succeed before the data
 /// dictionary is fully initialized, causing the first real CREATE TABLE to block
 /// indefinitely. Each probe attempt has a short timeout so abandoned connections
@@ -90,7 +90,9 @@ async fn wait_for_ddl_ready(port: u16) -> Result<(), anyhow::Error> {
                 tracing::debug!("wait_for_ddl_ready: attempt {attempt} error: {e}");
             }
             Err(_elapsed) => {
-                tracing::debug!("wait_for_ddl_ready: attempt {attempt} timed out, InnoDB not ready yet");
+                tracing::debug!(
+                    "wait_for_ddl_ready: attempt {attempt} timed out, InnoDB not ready yet"
+                );
             }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -139,9 +141,9 @@ async fn start_runtime(dataset: Dataset) -> Result<Arc<runtime::Runtime>, anyhow
     Ok(rt)
 }
 
-/// `obj_description('orders')` returns the MySQL table comment and
-/// `col_description('orders', N)` returns MySQL column comments by 1-based
-/// position when the dataset is accelerated with DuckDB.
+/// `obj_description('orders')` returns the `MySQL` table comment and
+/// `col_description('orders', N)` returns `MySQL` column comments by 1-based
+/// position when the dataset is accelerated with `DuckDB`.
 #[tokio::test]
 async fn test_mysql_comments_with_duckdb_acceleration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
