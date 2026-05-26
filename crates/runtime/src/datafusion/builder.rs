@@ -1541,6 +1541,88 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
+    fn test_auto_cayenne_filter_propagation_handles_mixed_cayenne_and_non_cayenne_joins() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .build();
+
+        rt.block_on(async {
+            register_stat_table(
+                &df.ctx,
+                "nation_plain",
+                vec![
+                    Field::new("n_nationkey", DataType::Int64, false),
+                    Field::new("n_name", DataType::Utf8, true),
+                ],
+                25,
+                false,
+            );
+            register_stat_table(
+                &df.ctx,
+                "supplier_cayenne",
+                vec![
+                    Field::new("s_suppkey", DataType::Int64, false),
+                    Field::new("s_nationkey", DataType::Int64, false),
+                ],
+                500_000,
+                true,
+            );
+            register_stat_table(
+                &df.ctx,
+                "nation_cayenne",
+                vec![
+                    Field::new("n_nationkey", DataType::Int64, false),
+                    Field::new("n_name", DataType::Utf8, true),
+                ],
+                25,
+                true,
+            );
+            register_stat_table(
+                &df.ctx,
+                "supplier_plain",
+                vec![
+                    Field::new("s_suppkey", DataType::Int64, false),
+                    Field::new("s_nationkey", DataType::Int64, false),
+                ],
+                500_000,
+                false,
+            );
+
+            let cayenne_probe_plan = optimized_sql_query_plan(
+                &df.ctx,
+                "SELECT s_suppkey FROM supplier_cayenne, nation_plain \
+                 WHERE s_nationkey = n_nationkey AND n_name = 'CHINA'",
+            )
+            .await;
+            assert!(
+                logical_plan_has_propagated_filter_marker(&cayenne_probe_plan),
+                "mixed-source join should still propagate onto the Cayenne-backed side when the q21 shape is present; plan was:\n{cayenne_probe_plan}"
+            );
+
+            let non_cayenne_probe_plan = optimized_sql_query_plan(
+                &df.ctx,
+                "SELECT s_suppkey FROM supplier_plain, nation_cayenne \
+                 WHERE s_nationkey = n_nationkey AND n_name = 'CHINA'",
+            )
+            .await;
+            assert!(
+                !logical_plan_has_propagated_filter_marker(&non_cayenne_probe_plan),
+                "mixed-source join should not propagate onto a non-Cayenne probe side; plan was:\n{non_cayenne_probe_plan}"
+            );
+        });
+    }
+
+    #[test]
+    #[cfg(not(windows))]
     fn test_built_datafusion_registers_cayenne_logical_rule_when_enabled() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1855,7 +1937,7 @@ mod tests {
 
     #[cfg(not(windows))]
     fn register_q21_shape_tables(ctx: &SessionContext) {
-        register_stat_cayenne_table(
+        register_stat_table(
             ctx,
             "nation",
             vec![
@@ -1863,8 +1945,9 @@ mod tests {
                 Field::new("n_name", DataType::Utf8, true),
             ],
             25,
+            true,
         );
-        register_stat_cayenne_table(
+        register_stat_table(
             ctx,
             "supplier",
             vec![
@@ -1872,8 +1955,9 @@ mod tests {
                 Field::new("s_nationkey", DataType::Int64, false),
             ],
             500_000,
+            true,
         );
-        register_stat_cayenne_table(
+        register_stat_table(
             ctx,
             "small_supplier",
             vec![
@@ -1881,20 +1965,25 @@ mod tests {
                 Field::new("s_nationkey", DataType::Int64, false),
             ],
             1_000,
+            true,
         );
     }
 
     #[cfg(not(windows))]
-    fn register_stat_cayenne_table(
+    fn register_stat_table(
         ctx: &SessionContext,
         table_name: &str,
         fields: Vec<Field>,
         num_rows: usize,
+        cayenne_backed: bool,
     ) {
-        let schema = Arc::new(Schema::new_with_metadata(
-            fields,
-            HashMap::from([("spice.accelerator".to_string(), "cayenne".to_string())]),
-        ));
+        let metadata = if cayenne_backed {
+            HashMap::from([("spice.accelerator".to_string(), "cayenne".to_string())])
+        } else {
+            HashMap::new()
+        };
+
+        let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
 
         ctx.register_table(
             table_name,
