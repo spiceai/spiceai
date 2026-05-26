@@ -116,6 +116,7 @@ default = [
     "models",
     "aws-secrets-manager",
     "azure-keyvault",
+    "hashicorp_vault",
     "keyring-secret-store",
 ]
 delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
