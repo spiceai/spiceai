@@ -529,7 +529,9 @@ fn validate_distributed_engine(
 fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
     match engine {
         #[cfg(feature = "duckdb")]
-        Engine::DuckDB | Engine::TableModePartitionedDuckDB => Some(AccelerationEngine::DuckDB),
+        Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
+            Some(AccelerationEngine::DuckDB)
+        }
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => Some(AccelerationEngine::Sqlite),
         #[cfg(feature = "turso")]
@@ -3895,9 +3897,9 @@ async fn build_snapshot_creation_config(
     ))]
     let acceleration_engine = match acceleration_settings.engine {
         #[cfg(feature = "duckdb")]
-        Engine::DuckDB => AccelerationEngine::DuckDB,
-        #[cfg(feature = "duckdb")]
-        Engine::TableModePartitionedDuckDB => AccelerationEngine::DuckDB,
+        Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
+            AccelerationEngine::DuckDB
+        }
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => AccelerationEngine::Sqlite,
         #[cfg(feature = "turso")]
