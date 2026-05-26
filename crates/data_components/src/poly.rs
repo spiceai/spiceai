@@ -111,7 +111,9 @@ impl TableProvider for PolyTableProvider {
     }
     fn schema(&self) -> SchemaRef {
         let schema = self.write.schema().as_ref().clone();
-        Arc::new(schema.with_metadata(self.schema_metadata.clone()))
+        let mut metadata = schema.metadata().clone();
+        metadata.extend(self.schema_metadata.clone());
+        Arc::new(schema.with_metadata(metadata))
     }
     fn constraints(&self) -> Option<&Constraints> {
         self.write.constraints()
