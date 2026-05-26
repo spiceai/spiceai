@@ -374,9 +374,18 @@ pub async fn forward_partitioned_batches(
     // tasks may hold the real error (e.g. DoPut rejection from the executor)
     // that caused the channel to close and triggered a SendBatch error.
     drop(senders);
+    let metrics_node_id = executor_registry.node_id().map(str::to_string);
     let mut executor_error: Option<Error> = None;
-    for handle in join_handles {
-        match handle.await {
+    for (executor_id, handle) in join_handles {
+        let outcome = handle.await;
+        if let Some(node_id) = metrics_node_id.as_deref() {
+            let status = match &outcome {
+                Ok(Ok(())) => crate::metrics::WriteForwardStatus::Completed,
+                _ => crate::metrics::WriteForwardStatus::Failed,
+            };
+            crate::metrics::record_partitioned_write_forward(node_id, &executor_id, status);
+        }
+        match outcome {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 if executor_error.is_none() {
@@ -798,6 +807,9 @@ fn build_executor_filters(
 }
 
 /// Opens a channel, per-executor, and spawns a `forward_batches_to_executor` task for each.
+///
+/// Returns one `(executor_id, JoinHandle)` per spawned task so callers can pair
+/// per-executor outcomes (used by partitioned-write metrics).
 async fn spawn_executor_forwarding_tasks(
     executor_registry: &ExecutorRegistry,
     executors: &[ExecutorId],
@@ -806,7 +818,7 @@ async fn spawn_executor_forwarding_tasks(
     io_runtime: &tokio::runtime::Handle,
 ) -> Result<(
     HashMap<String, Sender<RecordBatch>>,
-    Vec<tokio::task::JoinHandle<Result<()>>>,
+    Vec<(ExecutorId, tokio::task::JoinHandle<Result<()>>)>,
 )> {
     // Resolve auth header and clone clients before holding the lock across spawns.
     let auth_header = RequestContext::current(AsyncMarker::new().await)
@@ -833,15 +845,19 @@ async fn spawn_executor_forwarding_tasks(
         let (tx, rx) = mpsc::channel::<RecordBatch>(64);
         senders.insert(executor_id.clone(), tx);
 
-        join_handles.push(io_runtime.spawn(forward_batches_to_executor(
-            client,
-            rx,
-            Arc::clone(schema),
-            tbl.clone(),
-            auth_header.clone(),
-            io_runtime.clone(),
+        let executor_id_for_task = executor_id.clone();
+        join_handles.push((
             executor_id,
-        )));
+            io_runtime.spawn(forward_batches_to_executor(
+                client,
+                rx,
+                Arc::clone(schema),
+                tbl.clone(),
+                auth_header.clone(),
+                io_runtime.clone(),
+                executor_id_for_task,
+            )),
+        ));
     }
 
     Ok((senders, join_handles))

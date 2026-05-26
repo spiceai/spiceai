@@ -28,6 +28,7 @@ pub mod executor_registry;
 pub mod executor_selection;
 pub mod flight_config;
 pub mod metadata;
+pub mod metrics;
 pub mod outbound_broadcaster;
 pub mod partition_load_tracker;
 pub mod scheduler_task_config;

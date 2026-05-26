@@ -289,6 +289,12 @@ fn spawn_control_stream(
             tracing::debug!("Control stream established to scheduler {scheduler_address}");
             backoff.reset();
 
+            runtime_cluster::metrics::set_executor_scheduler_active_connection(
+                &executor_id,
+                &scheduler_address,
+                true,
+            );
+
             // Process inbound messages (metrics requests)
             loop {
                 tokio::select! {
@@ -302,6 +308,11 @@ fn spawn_control_stream(
                         .await;
                         tracing::debug!(
                             "Control stream to {scheduler_address} cancelled"
+                        );
+                        runtime_cluster::metrics::set_executor_scheduler_active_connection(
+                            &executor_id,
+                            &scheduler_address,
+                            false,
                         );
                         return;
                     }
@@ -348,6 +359,16 @@ fn spawn_control_stream(
             )
             .await;
             tracing::debug!("Control stream to {scheduler_address} disconnected, will reconnect");
+
+            runtime_cluster::metrics::set_executor_scheduler_active_connection(
+                &executor_id,
+                &scheduler_address,
+                false,
+            );
+            runtime_cluster::metrics::record_executor_scheduler_connection_retry(
+                &executor_id,
+                &scheduler_address,
+            );
 
             if let Some(delay) = backoff.next_duration() {
                 tokio::select! {

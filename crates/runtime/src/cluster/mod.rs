@@ -891,6 +891,24 @@ impl ResolvedClusterConfig {
             .or_else(|| self.node_advertise_address())
             .map_or_else(|| self.node_bind_address().to_string(), str::to_string)
     }
+
+    /// Returns the canonical `<host>:<port>` form used as the `node_id`
+    /// attribute on cluster metrics. Strips any URL scheme from the
+    /// configured advertise value and pairs the advertise host with the
+    /// configured bind port, so series line up with the executor identity
+    /// registered in the cluster control plane.
+    ///
+    /// Note: if an executor fell back to a dynamic port at flight-server
+    /// bind time, the configured port here may diverge from the actually
+    /// bound port. That edge case is not corrected by this helper.
+    #[must_use]
+    pub fn metrics_node_id(&self) -> String {
+        let port = self.node_bind_address().port();
+        if let Some(host) = self.node_advertise_address() {
+            return format!("{host}:{port}");
+        }
+        self.node_bind_address().to_string()
+    }
 }
 
 /// Creates & binds a Ballista scheduler to the Runtime handle, then updates status
