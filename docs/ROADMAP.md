@@ -15,53 +15,70 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### v2.0 (April 2026)
+### v2.0 (June 2026)
 
-**Focus:** Production-Grade HA.
+**Focus:** Production-Grade HA, Distributed Query, and Enterprise Security.
 
-- **Spice Cayenne (GA)**: Production-ready columnar storage format for accelerated datasets.
+**DataFusion:** v52
+
+- **Spice Cayenne (GA)**: Production-ready distributed columnar storage format for accelerated datasets.
 - **Multi-Active HA (GA)**: Production-ready multi-node deployment with zero-downtime failover.
 - **Distributed Query (GA)**: Stable multi-node query execution for large-scale workloads.
 - **Accelerated Dataset Distribution**: Replicate accelerated datasets across executor nodes.
+- **Mutual TLS (mTLS)**: End-to-end mTLS across HTTP and Arrow Flight, with certificate hot-reload.
+- **Real-time CDC**: Native MongoDB Change Streams and durable Kafka CDC offsets.
+- **DML Write-Back**: INSERT, UPDATE, and DELETE on PostgreSQL, Snowflake, and Arrow datasets.
+- **DuckLake (Beta)**: Catalog support with write-back.
+- **Elasticsearch**: First-class data connector for search and analytics workloads.
+- **Hybrid Search Ranking**: Reciprocal Rank Fusion (RRF) and learned re-ranking across vector and full-text search.
+- **Custom MCP Tool Providers**: User-defined MCP tools for agents and assistants.
+- **Policy Engine (Cedar-based) Beta**: Role-based access control, fine-grained data access policies, and dynamic PII redaction/masking at query time for compliance and governance.
+- **User-Defined Functions**: SQL UDFs in spicepods, plus optional spatial (`ST_*`) functions.
+- **On-Demand Dataset Loading**: Defer dataset initialization until first reference.
+- **Point-in-Time Snapshots**: `refresh_mode: snapshot` for consistent point-in-time acceleration.
+- **LLM Enhancements**: Provider-aware prompt caching, Responses API across all model providers, and a searchable tool registry for agents.
 
-### v2.1 (H2 2026)
+### v2.1 (July 2026)
 
-**Focus:** Schema Management, Search, and Policy.
+**Focus:** Schema Management and Distributed Search.
 
-- **Elasticsearch**: Integration for search and analytics workloads.
+**DataFusion:** v53
+
 - **Distributed Search (Alpha)**: Federated vector and full-text search across multiple nodes.
 - **Schema Registry (Initial)**: Versioning and backward compatibility checks.
 - **Schema Evolution**: Safe, non-breaking schema changes for accelerated datasets (add/drop/rename columns, type widening) with automatic migration.
-- **Hybrid Search Ranking**: Configurable fusion strategies (Reciprocal Rank Fusion (RRF) weights, learned ranking).
-- **Policy Engine (Cedar-based) Beta**:
-  - Role-based security for fine-grained access control.
-  - Data access policies to enforce compliance and governance.
 
-### v2.2 (H2 2026)
+### v2.2 (September 2026)
 
 **Focus:** Reactive Actions & Event Processing.
+
+**DataFusion:** v54
 
 - **Webhooks & Event Notifications**: Push-based data change alerts for downstream consumers.
 - **Actions (Drasi-based)**: Reactive event-driven actions triggered by data changes.
 
-### v2.3 (H2 2026)
+### v2.3 (October 2026)
 
 **Focus:** Enterprise Security, Compliance, & Governance.
 
-- **Data Masking & Anonymization**: Dynamic PII redaction at query time.
+**DataFusion:** v55
+
 - **Audit Logging**: Persistent, immutable query and access logs for compliance.
 - **Resource Quotas**: Per-user/tenant query limits and throttling.
 
-### v2.4 (2027)
+### v2.4 (December 2026)
 
 **Focus:** Extensibility & Plugin Architecture.
 
-- **Extensible Middleware**: Pluggable extensions for dynamic customization.
-- **Custom Tool Providers**: User-defined MCP tool implementations.
+**DataFusion:** v56
 
-### v2.5 (2027)
+- **Extensible Middleware**: Pluggable extensions for dynamic customization.
+
+### v2.5 (January 2027)
 
 **Focus:** Encryption.
+
+**DataFusion:** v57
 
 - **Customer-Managed Keys (BYOK)**: Encryption key management for sensitive workloads.
 - **Data-at-Rest Encryption**: Encrypted storage for accelerated datasets.
