@@ -275,12 +275,9 @@ fn classify_block_devices(devices: &[BlockDevice]) -> ResolvedAccelerationStorag
     let mut non_rotational_storage_found = false;
 
     for device in devices {
-        let description = format!(
-            "{} {} {}",
-            device.name,
-            device.model.as_deref().unwrap_or_default(),
-            device.vendor.as_deref().unwrap_or_default()
-        );
+        let model = device.model.as_deref().unwrap_or_default();
+        let vendor = device.vendor.as_deref().unwrap_or_default();
+        let description = format!("{} {} {}", device.name, model, vendor);
 
         if description.contains("amazon elastic block store")
             || description.contains("amazon ebs")
@@ -294,7 +291,8 @@ fn classify_block_devices(devices: &[BlockDevice]) -> ResolvedAccelerationStorag
         // vendor "Msft" and model "Virtual Disk". Treat them like EBS for
         // pool sizing because they share the same network-attached latency
         // characteristics.
-        if description.contains("msft virtual disk")
+        if (model.contains("virtual disk")
+            && (vendor.contains("msft") || vendor.contains("microsoft")))
             || description.contains("microsoft virtual disk")
             || description.contains("azure managed disk")
         {

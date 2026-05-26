@@ -385,17 +385,16 @@ impl TursoAccelerator {
 
     /// Per-storage SQLite/Turso pragma overrides applied after pool creation.
     ///
-    /// On EBS-class network-attached storage we bump the page cache and enable
-    /// mmap to absorb random I/O latency. Local SSD, tmpfs, and unknown
-    /// storage keep the engine defaults.
+    /// On EBS-class network-attached storage we bump the page cache to absorb
+    /// random I/O latency. Local SSD, tmpfs, and unknown storage keep the
+    /// engine defaults.
     fn storage_setup_pragmas(
         storage: ResolvedAccelerationStorage,
     ) -> &'static [(&'static str, &'static str)] {
         match storage {
-            // 200_000 KiB is about a 200 MiB page cache, plus a 256 MiB mmap window.
-            ResolvedAccelerationStorage::Ebs => {
-                &[("cache_size", "-200000"), ("mmap_size", "268435456")]
-            }
+            // 200_000 KiB is about a 200 MiB page cache. Turso/libSQL does not
+            // support SQLite's `mmap_size` pragma.
+            ResolvedAccelerationStorage::Ebs => &[("cache_size", "-200000")],
             ResolvedAccelerationStorage::LocalSsd
             | ResolvedAccelerationStorage::Tmpfs
             | ResolvedAccelerationStorage::Unknown => &[],
@@ -829,6 +828,25 @@ mod tests {
     };
     use datafusion_table_providers::util::test::MockExec;
     use std::collections::HashMap;
+
+    #[test]
+    fn storage_profile_drives_turso_setup_pragmas() {
+        assert_eq!(
+            TursoAccelerator::storage_setup_pragmas(ResolvedAccelerationStorage::Ebs),
+            &[("cache_size", "-200000")]
+        );
+        assert!(
+            TursoAccelerator::storage_setup_pragmas(ResolvedAccelerationStorage::LocalSsd)
+                .is_empty()
+        );
+        assert!(
+            TursoAccelerator::storage_setup_pragmas(ResolvedAccelerationStorage::Tmpfs).is_empty()
+        );
+        assert!(
+            TursoAccelerator::storage_setup_pragmas(ResolvedAccelerationStorage::Unknown)
+                .is_empty()
+        );
+    }
 
     fn cleanup_turso_test_files(path: &str) {
         let db_path = std::path::Path::new(path);

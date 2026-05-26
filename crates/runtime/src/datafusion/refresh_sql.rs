@@ -22,7 +22,7 @@ use arrow_tools::schema::schema_meta_get_computed_columns;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::error::DataFusionError;
 use datafusion::sql::parser::{DFParser, Statement};
-use datafusion::sql::sqlparser::ast::{Expr, GroupByExpr, SelectItem, SetExpr};
+use datafusion::sql::sqlparser::ast::{Expr, GroupByExpr, Ident, SelectItem, SetExpr};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{TableReference, sqlparser};
 use datafusion_expr::sqlparser::ast::LimitClause;
@@ -335,7 +335,7 @@ fn validate_and_extract_columns(
 
     // If the refresh SQL defines a subset of columns to fetch, computed columns (e.g., embeddings)
     // are not included automatically. We verify their presence in the source schema and add them manually if needed.
-    fields = include_computed_columns(&fields, &source_schema);
+    let (fields, column_idents) = include_computed_columns(&fields, &column_idents, &source_schema);
 
     Ok((
         RefreshSQLColumns::Named(column_idents),
@@ -363,9 +363,11 @@ fn split_conjunction(expr: Expr) -> Vec<Expr> {
 /// and adds any missing computed fields to the target schema if they are found.
 fn include_computed_columns(
     fields: &[arrow_schema::Field],
+    column_idents: &[Ident],
     source_schema: &SchemaRef,
-) -> Vec<arrow_schema::Field> {
+) -> (Vec<arrow_schema::Field>, Vec<Ident>) {
     let mut extended_fields = fields.to_owned();
+    let mut extended_idents = column_idents.to_owned();
     for field in fields {
         if let Some(computed_cols) = schema_meta_get_computed_columns(source_schema, field.name()) {
             for computed_col in computed_cols {
@@ -375,12 +377,13 @@ fn include_computed_columns(
                     .any(|f| f.name() == computed_col.name())
                 {
                     extended_fields.push((*computed_col).clone());
+                    extended_idents.push(Ident::new(computed_col.name().clone()));
                 }
             }
         }
     }
 
-    extended_fields
+    (extended_fields, extended_idents)
 }
 
 #[cfg(test)]
@@ -535,12 +538,16 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT id, name FROM test_table";
 
-        let (_, result_schema) = parse_refresh_sql(table, sql, Arc::clone(&schema))?;
+        let (refresh_sql, result_schema) = parse_refresh_sql(table, sql, Arc::clone(&schema))?;
         assert_eq!(result_schema.fields().len(), 4);
         assert_eq!(result_schema.field(0).name(), "id");
         assert_eq!(result_schema.field(1).name(), "name");
         assert_eq!(result_schema.field(2).name(), "name_embedding");
         assert_eq!(result_schema.field(3).name(), "name_offset");
+        assert_eq!(
+            refresh_sql.to_sql(),
+            "SELECT id, name, name_embedding, name_offset FROM test_table"
+        );
         Ok(())
     }
 

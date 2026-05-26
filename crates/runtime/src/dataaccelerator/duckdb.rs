@@ -40,8 +40,12 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
-use datafusion::error::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::{
+    arrow::datatypes::{DataType, Field, IntervalUnit, Schema},
+    common::DFSchema,
+    error::DataFusionError,
+};
 use datafusion::{
     catalog::TableProviderFactory,
     datasource::TableProvider,
@@ -506,6 +510,8 @@ impl DataAccelerator for DuckDBAccelerator {
         _partition_by: Vec<PartitionedBy>,
         _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        normalize_interval_schema_for_duckdb(&mut cmd).boxed()?;
+
         if let Some(duckdb_file) = cmd.options.remove("file") {
             cmd.options.insert("open".to_string(), duckdb_file);
         }
@@ -755,6 +761,102 @@ fn apply_changes_refresh_write_defaults(cmd: &mut CreateExternalTable, is_change
             "recompute_statistics_on_write".to_string(),
             "false".to_string(),
         );
+    }
+}
+
+fn normalize_interval_schema_for_duckdb(
+    cmd: &mut CreateExternalTable,
+) -> Result<(), DataFusionError> {
+    let arrow_schema = cmd.schema.as_arrow();
+    let mut changed = false;
+    let fields = arrow_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let (normalized_field, field_changed) = normalize_interval_field_for_duckdb(field);
+            changed |= field_changed;
+            normalized_field
+        })
+        .collect::<Vec<_>>();
+
+    if changed {
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            arrow_schema.metadata().clone(),
+        ));
+        cmd.schema = Arc::new(DFSchema::try_from(schema)?);
+    }
+
+    Ok(())
+}
+
+fn normalize_interval_field_for_duckdb(field: &Field) -> (Field, bool) {
+    let (data_type, changed) = normalize_interval_data_type_for_duckdb(field.data_type());
+    if changed {
+        (field.clone().with_data_type(data_type), true)
+    } else {
+        (field.clone(), false)
+    }
+}
+
+fn normalize_interval_data_type_for_duckdb(data_type: &DataType) -> (DataType, bool) {
+    match data_type {
+        DataType::Interval(IntervalUnit::YearMonth | IntervalUnit::DayTime) => {
+            (DataType::Interval(IntervalUnit::MonthDayNano), true)
+        }
+        DataType::List(field) => {
+            let (field, changed) = normalize_interval_field_for_duckdb(field);
+            (DataType::List(Arc::new(field)), changed)
+        }
+        DataType::ListView(field) => {
+            let (field, changed) = normalize_interval_field_for_duckdb(field);
+            (DataType::ListView(Arc::new(field)), changed)
+        }
+        DataType::FixedSizeList(field, size) => {
+            let (field, changed) = normalize_interval_field_for_duckdb(field);
+            (DataType::FixedSizeList(Arc::new(field), *size), changed)
+        }
+        DataType::LargeList(field) => {
+            let (field, changed) = normalize_interval_field_for_duckdb(field);
+            (DataType::LargeList(Arc::new(field)), changed)
+        }
+        DataType::LargeListView(field) => {
+            let (field, changed) = normalize_interval_field_for_duckdb(field);
+            (DataType::LargeListView(Arc::new(field)), changed)
+        }
+        DataType::Struct(fields) => {
+            let mut changed = false;
+            let fields = fields
+                .iter()
+                .map(|field| {
+                    let (normalized_field, field_changed) =
+                        normalize_interval_field_for_duckdb(field);
+                    changed |= field_changed;
+                    normalized_field
+                })
+                .collect::<Vec<_>>();
+            (DataType::Struct(fields.into()), changed)
+        }
+        DataType::Map(field, sorted) => {
+            let (field, changed) = normalize_interval_field_for_duckdb(field);
+            (DataType::Map(Arc::new(field), *sorted), changed)
+        }
+        DataType::Dictionary(key_type, value_type) => {
+            let (value_type, changed) = normalize_interval_data_type_for_duckdb(value_type);
+            (
+                DataType::Dictionary(key_type.clone(), Box::new(value_type)),
+                changed,
+            )
+        }
+        DataType::RunEndEncoded(run_ends, values) => {
+            let (run_ends, run_ends_changed) = normalize_interval_field_for_duckdb(run_ends);
+            let (values, values_changed) = normalize_interval_field_for_duckdb(values);
+            (
+                DataType::RunEndEncoded(Arc::new(run_ends), Arc::new(values)),
+                run_ends_changed || values_changed,
+            )
+        }
+        _ => (data_type.clone(), false),
     }
 }
 

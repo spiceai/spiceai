@@ -2334,6 +2334,13 @@ mod accelerator_compat_tests {
 
                 let original_type = original_field.data_type();
                 let table_type = table_field.data_type();
+                let expected_type = if matches!(engine, Engine::DuckDB)
+                    && matches!(original_type, DataType::Interval(_))
+                {
+                    DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
+                } else {
+                    original_type.clone()
+                };
 
                 // For Vortex, check if unsupported types are converted to Utf8
                 if matches!(engine, Engine::Cayenne) {
@@ -2362,26 +2369,26 @@ mod accelerator_compat_tests {
                     } else {
                         // Other types should match exactly (or be compatible conversions like timestamps)
                         assert_eq!(
-                            original_type,
+                            &expected_type,
                             table_type,
                             "{:?}: Field {} ({}) data type mismatch. Expected {:?}, got {:?}",
                             engine,
                             i,
                             original_field.name(),
-                            original_type,
+                            expected_type,
                             table_type
                         );
                     }
                 } else {
                     // For non-Vortex engines, types should match exactly
                     assert_eq!(
-                        original_type,
+                        &expected_type,
                         table_type,
                         "{:?}: Field {} ({}) data type mismatch. Expected {:?}, got {:?}",
                         engine,
                         i,
                         original_field.name(),
-                        original_type,
+                        expected_type,
                         table_type
                     );
                 }

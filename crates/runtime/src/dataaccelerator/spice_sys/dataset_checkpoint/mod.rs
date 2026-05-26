@@ -144,6 +144,9 @@ impl DatasetCheckpoint {
     }
 
     async fn init(connection: &AccelerationConnection) -> Result<()> {
+        #[cfg(not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")))]
+        preserve_async_checkpoint_api().await;
+
         // First create the initial table
         #[cfg(any(
             feature = "sqlite",
@@ -226,6 +229,9 @@ impl DatasetCheckpoint {
     }
 
     pub async fn exists(&self) -> bool {
+        #[cfg(not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")))]
+        preserve_async_checkpoint_api().await;
+
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.exists_duckdb(pool).ok().unwrap_or(false),
@@ -256,6 +262,9 @@ impl DatasetCheckpoint {
     }
 
     pub async fn last_checkpoint_time(&self) -> Result<Option<SystemTime>> {
+        #[cfg(not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")))]
+        preserve_async_checkpoint_api().await;
+
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.last_checkpoint_time_duckdb(pool),
@@ -289,6 +298,9 @@ impl DatasetCheckpoint {
         expect(unused_variables)
     )]
     pub async fn checkpoint(&self, schema: &SchemaRef, refresh_sql: Option<&str>) -> Result<()> {
+        #[cfg(not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")))]
+        preserve_async_checkpoint_api().await;
+
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => {
@@ -321,6 +333,9 @@ impl DatasetCheckpoint {
     }
 
     pub async fn get_schema(&self) -> Result<Option<SchemaRef>> {
+        #[cfg(not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")))]
+        preserve_async_checkpoint_api().await;
+
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_schema_duckdb(pool),
@@ -343,6 +358,9 @@ impl DatasetCheckpoint {
     }
 
     pub async fn get_refresh_sql(&self) -> Result<Option<String>> {
+        #[cfg(not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")))]
+        preserve_async_checkpoint_api().await;
+
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_refresh_sql_duckdb(pool),
@@ -366,6 +384,9 @@ impl DatasetCheckpoint {
 
     /// Deletes the checkpoint for this dataset so the next refresh treats it as a fresh table.
     pub async fn delete(&self) -> Result<()> {
+        #[cfg(not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")))]
+        preserve_async_checkpoint_api().await;
+
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.delete_duckdb(pool),
@@ -386,4 +407,9 @@ impl DatasetCheckpoint {
             _ => Err(Error::NoAccelerationConnection),
         }
     }
+}
+
+#[cfg(not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")))]
+async fn preserve_async_checkpoint_api() {
+    std::future::ready(()).await;
 }
