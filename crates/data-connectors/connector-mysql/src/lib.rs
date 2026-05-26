@@ -23,7 +23,7 @@ use datafusion_table_providers::sql::db_connection_pool::{
     Error as DbConnectionPoolError, dbconnection,
     mysqlpool::{self, MySQLConnectionPool},
 };
-use mysql_async::Metrics;
+use mysql_async::{Metrics, prelude::Queryable};
 use opentelemetry::KeyValue;
 use runtime::component::ComponentType;
 use runtime::component::dataset::Dataset;
@@ -36,6 +36,7 @@ use runtime::parameters::ParameterSpec;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -58,6 +59,7 @@ const DEFAULT_CONNECTION_POOL_MAX: usize = 5;
 
 pub struct MySQL {
     mysql_factory: MySQLTableFactory,
+    pool: Arc<MySQLConnectionPool>,
 }
 
 impl std::fmt::Debug for MySQL {
@@ -258,9 +260,12 @@ impl DataConnectorFactory for MySQLFactory {
                     }
                 },
             };
-            let mysql_factory = MySQLTableFactory::new(pool);
+            let mysql_factory = MySQLTableFactory::new(Arc::clone(&pool));
 
-            Ok(Arc::new(MySQL { mysql_factory }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(MySQL {
+                mysql_factory,
+                pool,
+            }) as Arc<dyn DataConnector>)
         })
     }
 
@@ -274,6 +279,74 @@ impl DataConnectorFactory for MySQLFactory {
 
     fn reserved_keywords(&self) -> &'static [&'static str] {
         RESERVED_KEYWORDS
+    }
+}
+
+async fn mysql_comment_metadata(
+    pool: &Arc<MySQLConnectionPool>,
+    table_reference: &datafusion::sql::TableReference,
+) -> std::result::Result<
+    (HashMap<String, String>, data_components::FieldMetadata),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let connection = pool.connect_direct().await?;
+    let mut conn = connection.conn.lock().await;
+    let table_schema = table_reference
+        .schema()
+        .or_else(|| table_reference.catalog())
+        .map(ToString::to_string);
+    let table_name = table_reference.table().to_string();
+
+    let rows: Vec<data_components::mysql::provider::MySqlTableMetadataRow> = conn
+        .exec(
+            "SELECT \
+                 NULLIF(t.TABLE_COMMENT, '') AS TABLE_COMMENT, \
+                 c.COLUMN_NAME, \
+                 NULLIF(c.COLUMN_COMMENT, '') AS COLUMN_COMMENT, \
+                 c.COLUMN_TYPE \
+             FROM information_schema.TABLES t \
+             LEFT JOIN information_schema.COLUMNS c \
+                 ON c.TABLE_SCHEMA = t.TABLE_SCHEMA \
+                 AND c.TABLE_NAME = t.TABLE_NAME \
+             WHERE t.TABLE_SCHEMA = COALESCE(?, DATABASE()) \
+             AND t.TABLE_NAME = ? \
+             ORDER BY c.ORDINAL_POSITION",
+            (table_schema, table_name),
+        )
+        .await?;
+
+    Ok(data_components::mysql::provider::mysql_metadata_from_rows(
+        rows,
+    ))
+}
+
+async fn enrich_with_mysql_comments(
+    pool: &Arc<MySQLConnectionPool>,
+    dataset: &Dataset,
+    table_reference: &datafusion::sql::TableReference,
+    provider: Arc<dyn TableProvider>,
+) -> Arc<dyn TableProvider> {
+    match mysql_comment_metadata(pool, table_reference).await {
+        Ok((table_metadata, field_metadata)) => {
+            if table_metadata.is_empty() && field_metadata.is_empty() {
+                provider
+            } else {
+                data_components::metadata_enriched_table_provider(
+                    provider,
+                    table_metadata,
+                    field_metadata,
+                )
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                dataset = %dataset.name,
+                source = %dataset.path(),
+                error = %error,
+                "Failed to query MySQL comments; registering without comment metadata"
+            );
+            provider
+        }
     }
 }
 
@@ -299,8 +372,14 @@ impl DataConnector for MySQL {
 
         // Call the inherent method directly instead of using Read trait
         // (orphan rule prevents trait impl in external crate)
+        let table_reference = tbl.clone();
         match self.mysql_factory.table_provider(tbl).await {
-            Ok(provider) => Ok(provider),
+            Ok(provider) => {
+                Ok(
+                    enrich_with_mysql_comments(&self.pool, dataset, &table_reference, provider)
+                        .await,
+                )
+            }
             Err(e) => {
                 if let Some(err_source) = e.source()
                     && let Some(dbconnection::Error::UndefinedTable {
