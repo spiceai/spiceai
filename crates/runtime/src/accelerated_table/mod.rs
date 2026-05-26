@@ -195,6 +195,11 @@ pub enum Error {
 
     #[snafu(display("No primary keys defined for dataset {dataset_name}"))]
     NoPrimaryKeysDefined { dataset_name: String },
+
+    #[snafu(transparent)]
+    PkFilterExpr {
+        source: data_components::pk_filter_expr::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

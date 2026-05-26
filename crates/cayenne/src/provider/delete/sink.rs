@@ -81,6 +81,9 @@ mod position_based;
 // File-based deletion for time-based retention (deletes entire expired files)
 pub(crate) mod file_based;
 
+mod pk_filter_extract;
+use pk_filter_extract::ExtractedPkDeletes;
+
 /// Deletion sink for Cayenne tables.
 ///
 /// This sink handles the process of marking rows as deleted by writing
@@ -279,6 +282,28 @@ impl CayenneDeletionSink {
             return self.delete_filtered_rows_position_based(ctx, tables).await;
         }
 
+        // If filters encode PK deletion values directly, extract them and write
+        // deletion vectors without performing full scan.
+        match self.try_extract_pks_from_filters() {
+            Some(ExtractedPkDeletes::Int64(pk_values)) => {
+                tracing::debug!(
+                    table = %table_name,
+                    count = pk_values.len(),
+                    "Fast-path delete: extracted Int64 PK values directly from filters, skipping table scan"
+                );
+                return self.persist_int64_pk_deletions(pk_values).await;
+            }
+            Some(ExtractedPkDeletes::RowKeys(row_keys)) => {
+                tracing::debug!(
+                    table = %table_name,
+                    count = row_keys.len(),
+                    "Fast-path delete: extracted row keys directly from filters, skipping table scan"
+                );
+                return self.persist_key_based_deletions(row_keys).await;
+            }
+            None => {}
+        }
+
         let coerced_filters = self.coerce_filters_for_schema()?;
         let physical_filters = self.build_physical_filters(&coerced_filters)?;
 
@@ -410,6 +435,62 @@ impl CayenneDeletionSink {
                     "PositionBased strategy should have returned early via delete_filtered_rows_position_based"
                 )
             }
+        }
+    }
+
+    /// Attempt to extract primary key values directly from the deletion filters,
+    /// without scanning any data files.
+    ///
+    /// Expects a single filter expr and recognizes the following filter shapes:
+    ///
+    /// - **Single PK**: `pk_col IN (v1, v2, ...)` — a flat `Expr::InList`.
+    /// - **Composite PK**: A balanced OR tree of AND-equality conjunctions, e.g.
+    ///   `(pk1 = a AND pk2 = b) OR (pk1 = c AND pk2 = d)`.
+    fn try_extract_pks_from_filters(&self) -> Option<ExtractedPkDeletes> {
+        if self.filters.len() != 1 {
+            return None;
+        }
+        let filter = &self.filters[0];
+        let pk_columns = &self.table_metadata.primary_key;
+
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { .. } => {
+                if pk_columns.len() != 1 {
+                    return None;
+                }
+                pk_filter_extract::try_extract_int64_in_list(filter, &pk_columns[0])
+                    .map(ExtractedPkDeletes::Int64)
+            }
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
+                let row_converter = self.pk_row_converter.as_ref()?;
+                // Single non-Int64 PK - try InList first.
+                if pk_columns.len() == 1 {
+                    let pk_idx = *self.pk_column_indices.first()?;
+                    let target_type = self.schema.field(pk_idx).data_type();
+                    if let Some(keys) = pk_filter_extract::try_extract_in_list_row_keys(
+                        filter,
+                        &pk_columns[0],
+                        target_type,
+                        row_converter,
+                    ) {
+                        return Some(ExtractedPkDeletes::RowKeys(keys));
+                    }
+                }
+                // Composite PK — balanced OR-of-AND equality tree.
+                let pk_target_types: Vec<&arrow_schema::DataType> = self
+                    .pk_column_indices
+                    .iter()
+                    .map(|&idx| self.schema.field(idx).data_type())
+                    .collect();
+                pk_filter_extract::try_extract_composite_pk_keys(
+                    filter,
+                    pk_columns,
+                    &pk_target_types,
+                    row_converter,
+                )
+                .map(ExtractedPkDeletes::RowKeys)
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => None,
         }
     }
 

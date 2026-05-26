@@ -2275,7 +2275,7 @@ fn filter_records(
                     .context(super::FailedToFilterUpdatesSnafu)?;
                 Ok((Arc::clone(field), update_data.column(column_idx).to_owned()))
             })
-            .collect::<Result<Vec<_>, _>>()?,
+            .collect::<Result<Vec<_>, super::Error>>()?,
     );
 
     for existing in existing_records {
@@ -2290,7 +2290,7 @@ fn filter_records(
                         .context(super::FailedToFilterUpdatesSnafu)?;
                     Ok((Arc::clone(field), existing.column(column_idx).to_owned()))
                 })
-                .collect::<Result<Vec<_>, _>>()?,
+                .collect::<Result<Vec<_>, super::Error>>()?,
         );
 
         comparators.push((
