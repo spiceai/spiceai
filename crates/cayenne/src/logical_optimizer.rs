@@ -342,20 +342,59 @@ impl SideAnalysis {
 }
 
 /// Logical optimizer rule that rewrites `column IN (k, k+1, …, k+N-1)` to
-/// `column BETWEEN k AND k+N-1` when the list contents are integer literals
-/// sorted unique and consecutive. BETWEEN is ~50 % faster than IN-list at
-/// per-row predicate evaluation. Running this as a logical-plan rule (rather
-/// than in `TableProvider::scan`) lets `DataFusion`'s downstream simplification
-/// passes treat the result identically to a SQL-parsed `BETWEEN`. See bench
-/// `pk_in_list_vs_range_rewrite`.
-#[derive(Debug, Default)]
-pub struct CayenneInListToRangeRewrite;
+/// `column BETWEEN k AND k+N-1` for Cayenne-backed filter inputs when the list
+/// contents are integer literals sorted unique and consecutive. BETWEEN is
+/// ~50 % faster than IN-list at per-row predicate evaluation. Running this as a
+/// logical-plan rule (rather than in `TableProvider::scan`) lets `DataFusion`'s
+/// downstream simplification passes treat the result identically to a
+/// SQL-parsed `BETWEEN`. See bench `pk_in_list_vs_range_rewrite`.
+pub struct CayenneInListToRangeRewrite {
+    is_cayenne_table_source: TableSourcePredicate,
+}
+
+impl Default for CayenneInListToRangeRewrite {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl CayenneInListToRangeRewrite {
     /// Create a new instance of the rule.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::new_with_table_provider_predicate(|provider| {
+            provider.as_any().is::<CayenneTableProvider>()
+        })
+    }
+
+    /// Create a new instance with a caller-provided table-provider predicate.
+    #[must_use]
+    pub fn new_with_table_provider_predicate(
+        is_cayenne_table_provider: impl Fn(&dyn TableProvider) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        let is_cayenne_table_provider: TableProviderPredicate = Arc::new(is_cayenne_table_provider);
+        Self::new_with_table_source_predicate(move |source| {
+            source
+                .as_any()
+                .downcast_ref::<DefaultTableSource>()
+                .is_some_and(|source| is_cayenne_table_provider(source.table_provider.as_ref()))
+        })
+    }
+
+    /// Create a new instance with a caller-provided table-source predicate.
+    #[must_use]
+    pub fn new_with_table_source_predicate(
+        is_cayenne_table_source: impl Fn(&dyn TableSource) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            is_cayenne_table_source: Arc::new(is_cayenne_table_source),
+        }
+    }
+}
+
+impl std::fmt::Debug for CayenneInListToRangeRewrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CayenneInListToRangeRewrite").finish()
     }
 }
 
@@ -380,6 +419,10 @@ impl OptimizerRule for CayenneInListToRangeRewrite {
         let LogicalPlan::Filter(filter) = plan else {
             return Ok(Transformed::no(plan));
         };
+        if !contains_cayenne_table_scan(&filter.input, &self.is_cayenne_table_source) {
+            return Ok(Transformed::no(LogicalPlan::Filter(filter)));
+        }
+
         let original = filter.predicate.clone();
         let rewritten = original
             .clone()
@@ -399,6 +442,24 @@ impl OptimizerRule for CayenneInListToRangeRewrite {
         let new_filter = Filter::try_new(rewritten, filter.input)?;
         Ok(Transformed::yes(LogicalPlan::Filter(new_filter)))
     }
+}
+
+fn contains_cayenne_table_scan(
+    plan: &LogicalPlan,
+    is_cayenne_table_source: &TableSourcePredicate,
+) -> bool {
+    let mut found = false;
+    let _ = plan.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node
+            && is_cayenne_table_source(scan.source.as_ref())
+        {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
 }
 
 fn column_expr(column: &Column) -> Expr {
@@ -2322,7 +2383,7 @@ mod tests {
             .in_list(vec![lit(5_i64), lit(6_i64), lit(7_i64), lit(8_i64)], false);
         let plan = LogicalPlanBuilder::from(scan).filter(in_list)?.build()?;
 
-        let rule = CayenneInListToRangeRewrite::new();
+        let rule = CayenneInListToRangeRewrite::new_with_table_source_predicate(|_| true);
         let cfg = OptimizerContext::new();
         let transformed = rule.rewrite(plan, &cfg)?;
         assert!(
@@ -2352,7 +2413,7 @@ mod tests {
             .in_list(vec![lit(1_i64), lit(100_i64), lit(1000_i64)], false);
         let plan = LogicalPlanBuilder::from(scan).filter(in_list)?.build()?;
 
-        let rule = CayenneInListToRangeRewrite::new();
+        let rule = CayenneInListToRangeRewrite::new_with_table_source_predicate(|_| true);
         let cfg = OptimizerContext::new();
         let transformed = rule.rewrite(plan, &cfg)?;
         assert!(
@@ -2378,7 +2439,7 @@ mod tests {
         let combined = in_list.and(Expr::Column(Column::new(Some("t"), "status")).eq(lit(1_i64)));
         let plan = LogicalPlanBuilder::from(scan).filter(combined)?.build()?;
 
-        let rule = CayenneInListToRangeRewrite::new();
+        let rule = CayenneInListToRangeRewrite::new_with_table_source_predicate(|_| true);
         let cfg = OptimizerContext::new();
         let transformed = rule.rewrite(plan, &cfg)?;
         assert!(
@@ -2400,12 +2461,34 @@ mod tests {
             .in_list(vec![lit(5_i64), lit(6_i64), lit(7_i64)], false);
         let plan = LogicalPlanBuilder::from(scan).filter(in_list)?.build()?;
 
-        let rule = CayenneInListToRangeRewrite::new();
+        let rule = CayenneInListToRangeRewrite::new_with_table_source_predicate(|_| true);
         let cfg = OptimizerContext::new();
         let transformed = rule.rewrite(plan, &cfg)?;
         assert!(
             !transformed.transformed,
             "rule should leave short consecutive IN-list untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inlist_to_range_rule_leaves_non_cayenne_filter_untouched() -> Result<()> {
+        use datafusion::optimizer::OptimizerContext;
+        use datafusion_expr::builder::table_scan;
+        use datafusion_expr::{LogicalPlanBuilder, lit};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let scan = table_scan(Some("t"), &schema, None)?.build()?;
+        let in_list = Expr::Column(Column::new(Some("t"), "id"))
+            .in_list(vec![lit(5_i64), lit(6_i64), lit(7_i64), lit(8_i64)], false);
+        let plan = LogicalPlanBuilder::from(scan).filter(in_list)?.build()?;
+
+        let rule = CayenneInListToRangeRewrite::new_with_table_source_predicate(|_| false);
+        let cfg = OptimizerContext::new();
+        let transformed = rule.rewrite(plan, &cfg)?;
+        assert!(
+            !transformed.transformed,
+            "rule should leave non-Cayenne filter inputs untouched"
         );
         Ok(())
     }
