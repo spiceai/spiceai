@@ -243,17 +243,18 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `s3`                               | [S3][s3]                              | Stable            | Parquet, CSV                 |
 | `mysql`                            | MySQL                                 | Stable            |                              |
 | `spice.ai`                         | [Spice.ai][spiceai]                   | Stable            | Arrow Flight                 |
+| `dynamodb`                         | Amazon DynamoDB (with Streams)        | Stable            |                              |
 | `graphql`                          | GraphQL                               | Release Candidate | JSON                         |
-| `dynamodb`                         | Amazon DynamoDB (with Streams)        | Release Candidate |                              |
 | `cosmosdb`                         | Azure Cosmos DB (NoSQL)               | Release Candidate |                              |
 | `git`                              | Git repositories                      | Release Candidate |                              |
+| `snowflake`                        | Snowflake                             | Release Candidate | Arrow                        |
+| `adbc`                             | ADBC                                  | Release Candidate | Arrow                        |
+| `iceberg`                          | [Apache Iceberg][iceberg] (read+write) | Release Candidate | Parquet                      |
 | `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
 | `ducklake`                         | [DuckLake][ducklake]                  | Beta              | Parquet                      |
 | `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
-| `iceberg`                          | [Apache Iceberg][iceberg] (read+write) | Beta              | Parquet                      |
 | `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
 | `odbc`                             | ODBC                                  | Beta              | ODBC                         |
-| `snowflake`                        | Snowflake                             | Beta              | Arrow                        |
 | `spark`                            | Spark                                 | Beta              | [Spark Connect][spark]       |
 | `sharepoint`                       | Microsoft SharePoint                  | Beta              | Object-store listing         |
 | `oracle`                           | Oracle                                | Alpha             | [Oracle ODPI-C][ODPIC]       |
@@ -271,6 +272,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `mongodb`                          | MongoDB                               | Alpha             |                              |
 | `scylladb`                         | ScyllaDB                              | Alpha             |                              |
 | `smb`                              | SMB 3.1.1                             | Alpha             | SMB                          |
+| `nfs`                              | NFS                                   | Alpha             | Parquet, CSV, JSON           |
 
 [databricks]: https://github.com/spiceai/cookbook/blob/trunk/databricks/README.md
 [ducklake]: https://ducklake.select/
@@ -449,7 +451,7 @@ The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runt
 spice sql
 ```
 
-The SQL REPL inferface will be shown:
+The SQL REPL interface will be shown:
 
 ```bash
 Welcome to the Spice.ai SQL REPL! Type 'help' for help.
@@ -616,9 +618,9 @@ Spice.ai is designed to be extensible. See [EXTENSIBILITY.md](./docs/EXTENSIBILI
 
 🚀 See the [Roadmap](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md). Highlights:
 
-- **v2.0 (April 2026)** — Cayenne GA, multi-active HA GA, distributed query GA
-- **v2.1 (H2 2026)** — Distributed search, schema registry, Cedar policy engine
-- **v2.2 (H2 2026)** — Webhooks, reactive event-driven actions
+- **[v2.0](https://github.com/spiceai/spiceai/milestone/58) (June 2026)** — Cayenne GA, multi-active HA GA, distributed query GA, mTLS, Cedar policy engine (Beta)
+- **[v2.1](https://github.com/spiceai/spiceai/milestone/95) (July 2026)** — Distributed search, schema registry, schema evolution
+- **[v2.2](https://github.com/spiceai/spiceai/milestone/99) (September 2026)** — Webhooks, reactive event-driven actions (Drasi-based)
 
 ### 🤝 Connect with us
 

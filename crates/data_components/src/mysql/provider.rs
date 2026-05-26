@@ -33,7 +33,7 @@ use mysql_async::prelude::Queryable;
 use snafu::prelude::*;
 
 use crate::{
-    COMMENT_METADATA_KEY, FieldMetadata, Read, RefreshableCatalogProvider,
+    DESCRIPTION_METADATA_KEY, FieldMetadata, Read, RefreshableCatalogProvider,
     SOURCE_TYPE_METADATA_KEY, metadata_enriched_table_provider,
 };
 
@@ -362,7 +362,7 @@ fn provider_with_comments(
 fn table_comments_metadata(comments: &TableComments) -> (HashMap<String, String>, FieldMetadata) {
     let mut table_metadata = HashMap::new();
     if let Some(comment) = &comments.table_comment {
-        table_metadata.insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
+        table_metadata.insert(DESCRIPTION_METADATA_KEY.to_string(), comment.clone());
     }
 
     let mut field_metadata = FieldMetadata::new();
@@ -376,7 +376,7 @@ fn table_comments_metadata(comments: &TableComments) -> (HashMap<String, String>
         field_metadata
             .entry(column.clone())
             .or_default()
-            .insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
+            .insert(DESCRIPTION_METADATA_KEY.to_string(), comment.clone());
     }
 
     (table_metadata, field_metadata)
