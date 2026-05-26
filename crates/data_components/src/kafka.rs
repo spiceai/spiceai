@@ -28,7 +28,7 @@ use futures::Stream;
 use rdkafka::{
     ClientConfig, Message, Offset,
     config::RDKafkaLogLevel,
-    consumer::{CommitMode, Consumer, StreamConsumer},
+    consumer::{BaseConsumer, CommitMode, Consumer, Rebalance, StreamConsumer},
     message::BorrowedMessage,
     topic_partition_list::TopicPartitionList,
     util::get_rdkafka_version,
@@ -217,11 +217,19 @@ pub struct KafkaMetrics {
 
 struct KafkaConsumerContext {
     metrics: Arc<KafkaMetrics>,
+    /// Offsets to seek to on the first partition assignment (restored from sidecar).
+    /// Populated at construction so the stash is in place before `subscribe()` can
+    /// trigger a rebalance. The first `Rebalance::Assign` takes the value; later
+    /// rebalances see `None` and fall back to the group-committed offset.
+    restore_offsets: std::sync::Mutex<Option<TopicPartitionList>>,
 }
 
 impl KafkaConsumerContext {
-    fn new(metrics: Arc<KafkaMetrics>) -> Self {
-        Self { metrics }
+    fn new(metrics: Arc<KafkaMetrics>, restore_offsets: Option<TopicPartitionList>) -> Self {
+        Self {
+            metrics,
+            restore_offsets: std::sync::Mutex::new(restore_offsets),
+        }
     }
 }
 
@@ -320,7 +328,35 @@ impl rdkafka::ClientContext for KafkaConsumerContext {
     }
 }
 
-impl rdkafka::consumer::ConsumerContext for KafkaConsumerContext {}
+impl rdkafka::consumer::ConsumerContext for KafkaConsumerContext {
+    fn post_rebalance(&self, base_consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
+        if let Rebalance::Assign(_) = rebalance {
+            // On first assignment after subscribe, seek to sidecar offsets if available.
+            // Take the offsets so this only fires once on success.
+            let offsets = self
+                .restore_offsets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+
+            if let Some(tpl) = offsets {
+                match base_consumer.seek_partitions(tpl.clone(), Duration::from_secs(5)) {
+                    Ok(_) => {
+                        tracing::info!("Restored Kafka consumer offsets from sidecar");
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to seek to restored offsets: {e}");
+                        // Re-insert offsets so the next rebalance retries the seek.
+                        *self
+                            .restore_offsets
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tpl);
+                    }
+                }
+            }
+        }
+    }
+}
 
 pub struct KafkaConsumer {
     group_id: String,
@@ -329,11 +365,16 @@ pub struct KafkaConsumer {
 }
 
 impl KafkaConsumer {
+    /// Construct a consumer for an existing consumer group, restoring partition
+    /// offsets from the sidecar before any rebalance can fire. Pass an empty
+    /// slice for `restore_offsets` when there is nothing to restore.
     pub fn create_with_existing_group_id(
         group_id: impl Into<String>,
         kafka_config: &KafkaConfig,
+        restore_offsets: &[KafkaOffset],
     ) -> Result<Self> {
-        Self::create(group_id.into(), kafka_config)
+        let restore = Self::build_restore_tpl(restore_offsets)?;
+        Self::create(group_id.into(), kafka_config, restore)
     }
 
     pub fn create_for_dataset(
@@ -344,6 +385,7 @@ impl KafkaConsumer {
         Self::create(
             group_id.unwrap_or_else(|| Self::generate_group_id(dataset)),
             kafka_config,
+            None,
         )
     }
 
@@ -408,9 +450,12 @@ impl KafkaConsumer {
             .context(UnableToCommitConsumerStateSnafu)
     }
 
-    pub fn restore_offsets(&self, offsets: &[KafkaOffset]) -> Result<()> {
+    /// Build a [`TopicPartitionList`] from sidecar offsets. Returns `None` when
+    /// the slice is empty so callers can pass the result straight into
+    /// [`KafkaConsumer::create`] for the no-restore case.
+    fn build_restore_tpl(offsets: &[KafkaOffset]) -> Result<Option<TopicPartitionList>> {
         if offsets.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         let mut topic_partition_list = TopicPartitionList::new();
@@ -426,11 +471,7 @@ impl KafkaConsumer {
                 })?;
         }
 
-        self.consumer
-            .commit(&topic_partition_list, CommitMode::Sync)
-            .context(UnableToRestoreOffsetsSnafu {
-                message: "Failed to commit sidecar offsets to Kafka".to_string(),
-            })
+        Ok(Some(topic_partition_list))
     }
 
     pub fn restart_topic(&self, topic: &str) -> Result<()> {
@@ -490,7 +531,11 @@ impl KafkaConsumer {
         &self.metrics
     }
 
-    fn create(group_id: String, kafka_config: &KafkaConfig) -> Result<Self> {
+    fn create(
+        group_id: String,
+        kafka_config: &KafkaConfig,
+        restore_offsets: Option<TopicPartitionList>,
+    ) -> Result<Self> {
         tracing::debug!("Using kafka group_id: {}", group_id);
 
         let (_, version) = get_rdkafka_version();
@@ -548,7 +593,10 @@ impl KafkaConsumer {
 
         let consumer: StreamConsumer<KafkaConsumerContext> = config
             .set_log_level(RDKafkaLogLevel::Debug)
-            .create_with_context(KafkaConsumerContext::new(Arc::clone(&metrics)))
+            .create_with_context(KafkaConsumerContext::new(
+                Arc::clone(&metrics),
+                restore_offsets,
+            ))
             .context(UnableToCreateConsumerSnafu)?;
 
         Ok(Self {
@@ -571,7 +619,7 @@ impl KafkaConsumer {
         let temp_group_id = format!("spice-schema-peek-{}", uuid::Uuid::new_v4());
         let mut peek_config = kafka_config.clone();
         peek_config.metrics_store = None; // Avoid skewing real consumer metrics
-        let temp_consumer = Self::create(temp_group_id, &peek_config)?;
+        let temp_consumer = Self::create(temp_group_id, &peek_config, None)?;
 
         // Fetch topic metadata to discover partitions
         let metadata = temp_consumer

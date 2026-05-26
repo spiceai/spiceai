@@ -47,7 +47,7 @@ limitations under the License.
 //! 2. Apply the mask in one shot via [`arrow::compute::filter_record_batch`].
 
 use crate::provider::deletion_index::{DeletionIndex, KeyDeletionIndex};
-use arrow::array::{ArrayRef, BooleanArray};
+use arrow::array::{ArrayRef, BooleanArray, BooleanBufferBuilder};
 use arrow_row::RowConverter;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_physical_plan::DisplayAs;
@@ -405,7 +405,10 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     };
 
                     // Build keep mask: bloom-prefiltered probe per row + visibility check.
-                    let mut keep_mask: Vec<bool> = Vec::with_capacity(batch_size);
+                    // Use `BooleanBufferBuilder` so the mask lives as a packed bitmap
+                    // (1 bit per row instead of 1 byte) and skips the `Vec<bool>` →
+                    // `BooleanArray` conversion pass.
+                    let mut keep_mask = BooleanBufferBuilder::new(batch_size);
                     let mut keep_count: usize = 0;
                     for row in &rows {
                         let key: &[u8] = row.as_ref();
@@ -415,7 +418,7 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                             &self.insert_records,
                             self.min_delete_seq_to_apply,
                         );
-                        keep_mask.push(visible);
+                        keep_mask.append(visible);
                         keep_count += usize::from(visible);
                     }
 
@@ -436,7 +439,7 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     }
 
                     // Apply mask in one shot via Arrow's filter kernel.
-                    let filter_array = BooleanArray::from(keep_mask);
+                    let filter_array = BooleanArray::new(keep_mask.finish(), None);
                     let filtered_batch =
                         match arrow::compute::filter_record_batch(&batch, &filter_array) {
                             Ok(filtered) => filtered,
@@ -661,9 +664,12 @@ impl futures::Stream for Int64PkDeletionFilterStream {
 
                     // Build keep mask: bloom-prefiltered probe per row + visibility check.
                     // Iterate over `pk_array.values()` (a contiguous &[i64] slice) so the
-                    // hot loop stays branchless on column access.
+                    // hot loop stays branchless on column access. The mask uses a packed
+                    // bitmap (`BooleanBufferBuilder`, 1 bit per row) instead of a
+                    // `Vec<bool>` to save 8× the per-batch heap footprint and skip the
+                    // `BooleanArray` re-pack pass.
                     let pk_slice = pk_array.values();
-                    let mut keep_mask: Vec<bool> = Vec::with_capacity(batch_size);
+                    let mut keep_mask = BooleanBufferBuilder::new(batch_size);
                     let mut keep_count: usize = 0;
                     for &pk_value in pk_slice {
                         let visible = is_pk_visible_i64(
@@ -672,7 +678,7 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                             &self.insert_records,
                             self.min_delete_seq_to_apply,
                         );
-                        keep_mask.push(visible);
+                        keep_mask.append(visible);
                         keep_count += usize::from(visible);
                     }
 
@@ -693,7 +699,7 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                     }
 
                     // Apply mask in one shot via Arrow's filter kernel.
-                    let filter_array = BooleanArray::from(keep_mask);
+                    let filter_array = BooleanArray::new(keep_mask.finish(), None);
                     let filtered_batch =
                         match arrow::compute::filter_record_batch(&batch, &filter_array) {
                             Ok(filtered) => filtered,
