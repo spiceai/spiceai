@@ -29,6 +29,7 @@ fundu.workspace = true
 futures.workspace = true
 object_store.workspace = true
 object_store_occ = { path = "../object_store_occ" }
+opentelemetry = { workspace = true }
 parking_lot.workspace = true
 serde_json.workspace = true
 runtime-datafusion = { path = "../runtime-datafusion" }
@@ -38,6 +39,7 @@ runtime-table-partition = { path = "../runtime-table-partition" }
 serde = { workspace = true, features = ["derive"] }
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
+telemetry = { path = "../telemetry" }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream.workspace = true
 tonic.workspace = true
