@@ -249,10 +249,10 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `git`                              | Git repositories                      | Release Candidate |                              |
 | `snowflake`                        | Snowflake                             | Release Candidate | Arrow                        |
 | `adbc`                             | ADBC                                  | Release Candidate | Arrow                        |
+| `iceberg`                          | [Apache Iceberg][iceberg] (read+write) | Release Candidate | Parquet                      |
 | `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
 | `ducklake`                         | [DuckLake][ducklake]                  | Beta              | Parquet                      |
 | `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
-| `iceberg`                          | [Apache Iceberg][iceberg] (read+write) | Beta              | Parquet                      |
 | `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
 | `odbc`                             | ODBC                                  | Beta              | ODBC                         |
 | `spark`                            | Spark                                 | Beta              | [Spark Connect][spark]       |
@@ -272,6 +272,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `mongodb`                          | MongoDB                               | Alpha             |                              |
 | `scylladb`                         | ScyllaDB                              | Alpha             |                              |
 | `smb`                              | SMB 3.1.1                             | Alpha             | SMB                          |
+| `nfs`                              | NFS                                   | Alpha             | Parquet, CSV, JSON           |
 
 [databricks]: https://github.com/spiceai/cookbook/blob/trunk/databricks/README.md
 [ducklake]: https://ducklake.select/
