@@ -449,7 +449,7 @@ The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runt
 spice sql
 ```
 
-The SQL REPL inferface will be shown:
+The SQL REPL interface will be shown:
 
 ```bash
 Welcome to the Spice.ai SQL REPL! Type 'help' for help.
