@@ -16,8 +16,6 @@ limitations under the License.
 
 use crate::accelerated_table::refresh::Refresh;
 use crate::component::dataset::acceleration::OnConflictBehavior;
-use crate::datafusion::DataFusion;
-use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::internal_table::create_internal_accelerated_table;
 use crate::{Runtime, status};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
@@ -30,6 +28,7 @@ use datafusion::sql::TableReference;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::constraints::UpsertOptions;
 use futures::TryStreamExt;
+use runtime_datafusion::query_engine::{DataUpdate, QueryEngine, UpdateType};
 use snafu::prelude::*;
 use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
@@ -183,7 +182,7 @@ impl TaskSpan {
         Schema::new(fields)
     }
 
-    pub async fn write(df: Arc<DataFusion>, spans: Vec<TaskSpan>) -> Result<(), Error> {
+    pub async fn write(df: Arc<dyn QueryEngine>, spans: Vec<TaskSpan>) -> Result<(), Error> {
         let overrides: Vec<_> = spans
             .iter()
             .filter_map(|s| {
@@ -203,13 +202,7 @@ impl TaskSpan {
             .boxed()
             .context(UnableToWriteToTableSnafu)?;
 
-        let data_update = DataUpdate {
-            schema,
-            data: vec![data],
-            update_type: crate::dataupdate::UpdateType::Append,
-        };
-
-        df.write_data(&table_ref, data_update)
+        df.write_data(&table_ref, vec![data])
             .await
             .boxed()
             .context(UnableToWriteToTableSnafu)?;
@@ -226,7 +219,7 @@ impl TaskSpan {
     }
 
     async fn override_trace_id(
-        df: Arc<DataFusion>,
+        df: Arc<dyn QueryEngine>,
         from: Arc<str>,
         to: Arc<str>,
     ) -> Result<(), Error> {

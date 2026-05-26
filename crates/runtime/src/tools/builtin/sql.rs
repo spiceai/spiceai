@@ -124,8 +124,13 @@ impl SpiceModelTool for SqlTool {
                 query_request = query_request.allow_tables(allowlist.clone());
             }
 
-            let stream = self.df.execute_query(query_request).await?;
-            let batches = stream.try_collect::<Vec<RecordBatch>>().await?;
+            let batches = self
+                .df
+                .execute_query(query_request)
+                .await?
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .boxed()?;
 
             Ok(Value::String(write_to_json_string(&batches)?))
         }

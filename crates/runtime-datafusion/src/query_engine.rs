@@ -87,6 +87,24 @@ impl QueryRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateType {
+    Append,
+    Overwrite,
+    Changes,
+}
+
+#[derive(Debug, Clone)]
+pub struct DataUpdate {
+    pub schema: Arc<Schema>,
+    pub data: Vec<RecordBatch>,
+    /// The type of update to perform.
+    /// If `UpdateType::Append`, the runtime will append the data to the existing dataset.
+    /// If `UpdateType::Overwrite`, the runtime will overwrite the existing data with the new data.
+    /// If `UpdateType::Changes`, the runtime will apply the changes to the existing data.
+    pub update_type: UpdateType,
+}
+
 /// Trait for components that provide query execution capabilities.
 ///
 /// This trait captures the read-path, query execution, and data write surface
@@ -141,10 +159,10 @@ pub trait QueryEngine: Send + Sync + Debug {
 
     // --- Data write ---
 
-    /// Write record batches to a table (append).
+    /// Write record batches to a table.
     async fn write_data(
         &self,
         table_ref: &TableReference,
-        data: Vec<RecordBatch>,
+        data: DataUpdate,
     ) -> Result<(), BoxError>;
 }

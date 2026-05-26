@@ -175,7 +175,7 @@ pub(crate) fn init_tracing_with_task_history_captured_context(
     let (ballista_transform, ballista_retention) =
         runtime::datafusion::query::stage_history::BallistaStageMiddleware::pair();
     let task_history_exporter = TaskHistoryExporter::new(
-        rt.datafusion() as std::sync::Arc<dyn runtime_datafusion::query_engine::QueryEngine>,
+        rt.datafusion(),
         TaskHistoryCapturedOutput::Truncated,
         captured_context,
         None, // min_sql_duration_ms

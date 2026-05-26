@@ -66,11 +66,7 @@ impl SampleFrom for RandomSampleParams {
                     tbl = tbl_quoted,
                 )))
                 .await?;
-
-            stream
-                .try_collect::<Vec<RecordBatch>>()
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+            stream.try_collect::<Vec<RecordBatch>>().await.boxed()
         }
         .instrument(current_span)
         .await?;

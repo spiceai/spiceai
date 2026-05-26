@@ -31,7 +31,6 @@ use spicepod::component::runtime::{
     TaskHistoryCapturedContext, TaskHistoryCapturedOutput, TaskHistoryCapturedPlan,
 };
 
-use crate::datafusion::DataFusion;
 use runtime_datafusion::query_engine::{QueryEngine, QueryRequest};
 
 use super::TaskSpan;
@@ -87,7 +86,7 @@ pub trait SpanRetention: Send + Sync {
 
 #[derive(Clone)]
 pub struct TaskHistoryExporter {
-    df: Arc<DataFusion>,
+    df: Arc<dyn QueryEngine>,
     captured_output: TaskHistoryCapturedOutput,
     captured_context: TaskHistoryCapturedContext,
     min_sql_duration_ms: Option<f64>,
@@ -113,7 +112,7 @@ impl Debug for TaskHistoryExporter {
 
 impl TaskHistoryExporter {
     pub fn new(
-        df: Arc<DataFusion>,
+        df: Arc<dyn QueryEngine>,
         captured_output: TaskHistoryCapturedOutput,
         captured_context: TaskHistoryCapturedContext,
         min_sql_duration_ms: Option<f64>,
@@ -234,7 +233,7 @@ impl TaskHistoryExporter {
     /// with `task="sql_query"` and the original query's `span_id` as `parent_span_id`.
     /// The output is always captured in full regardless of the global `captured_output` setting.
     async fn capture_plans_async(
-        df: Arc<DataFusion>,
+        df: Arc<dyn QueryEngine>,
         spans: Vec<TaskSpan>,
         captured_plan: TaskHistoryCapturedPlan,
         _min_plan_duration_ms: Option<f64>,
@@ -264,11 +263,11 @@ impl TaskHistoryExporter {
 
             // Run EXPLAIN query within the span context so it appears as a child task
             async {
-                match df.execute_query(QueryRequest::new(&explain_query)).await {
+                match df.query_builder(&explain_query).build().run().await {
                     Ok(mut result) => {
                         // Collect all record batches from the result stream
                         let mut batches = Vec::new();
-                        while let Some(batch) = result.next().await {
+                        while let Some(batch) = result.data.next().await {
                             match batch {
                                 Ok(b) => batches.push(b),
                                 Err(e) => {
