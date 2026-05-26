@@ -18,7 +18,7 @@ Cayenne provides a lakehouse format that enables efficient CRUD operations on co
 - **PK conflict detection opt-out** (`cayenne_pk_conflict_detection: none`) for append-only CDC workloads where the source enforces PK uniqueness and the ingestion path cannot replay existing rows.
 - **MERGE DML** and **DDL** (`CREATE TABLE`, `DROP TABLE`, `CREATE SCHEMA`) handlers behind the `partition-table-provider` feature, for direct SQL DDL/DML against a Cayenne catalog.
 - **Snapshot engine** (`CayenneSnapshotEngine` in the runtime) that exports a per-dataset metastore "slice" (versioned JSON) so snapshots are portable across nodes with different data directories and never archive raw `cayenne.db*` files.
-- **Logical and physical optimizer rules** that surface Cayenne-friendly join shapes for HTAP / chbench workloads (predicate transitive closure for non-key dim filters, dynamic-filter sharing across same-source scans, anti/semi-join sort-merge rewrite above a 10M-row build side, in-list-to-range rewrite).
+- **Logical and physical optimizer rules** that surface Cayenne-friendly join shapes for HTAP workloads (predicate transitive closure for non-key dim filters, dynamic-filter sharing across same-source scans, anti/semi-join sort-merge rewrite above a 10M-row build side, in-list-to-range rewrite).
 
 ## Architecture
 
@@ -92,8 +92,14 @@ pub trait MetastoreBackend: Send + Sync {
     async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()>;
     async fn execute_batch(&self, sql: &str) -> CatalogResult<()>;
     async fn execute_transaction_batch(&self, sql: &str) -> CatalogResult<()>;
-    async fn query_row<F, T>(&self, params: QueryRowParams<'_>, f: F) -> CatalogResult<T> where ...;
-    async fn query<F, T>(&self, params: QueryParams<'_>, f: F) -> CatalogResult<Vec<T>> where ...;
+    async fn query_row<F, T>(&self, params: QueryRowParams<'_>, f: F) -> CatalogResult<T>
+    where
+        F: FnOnce(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
+        T: Send + 'static;
+    async fn query<F, T>(&self, params: QueryParams<'_>, f: F) -> CatalogResult<Vec<T>>
+    where
+        F: Fn(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
+        T: Send + 'static;
     async fn begin_transaction(&self) -> CatalogResult<Box<dyn MetastoreTransaction>>;
     async fn shutdown(&self) -> CatalogResult<()>;
 }
@@ -112,7 +118,7 @@ pub trait MetastoreTransaction: Send + Sync {
 }
 ```
 
-Backends translate the `MetastoreValue` enum (`Integer | Text | Bool | Blob | Null`) to and from native column types. The starting BEGIN statement is sent by the backend itself (`BEGIN TRANSACTION` for SQLite, `BEGIN CONCURRENT` for Turso).
+Backends translate the `MetastoreValue` enum (`Integer | Text | Bool | Blob | Null`) to and from native column types. The starting BEGIN statement is sent by the backend itself: `BEGIN IMMEDIATE` for SQLite (takes the reserved write lock up front so a subsequent `UPDATE`/`INSERT` cannot upgrade-deadlock against a concurrent writer), and `BEGIN CONCURRENT` for Turso (MVCC writers serialize at commit time on actual conflicts).
 
 **Schema validation.** `metastore::EXPECTED_TABLES` is the canonical list of expected metadata tables and their ordered column names; `validate_existing_schema` is invoked after `init_schema` and returns `CatalogError::SchemaMismatch` (with an actionable "clear your acceleration data" message) when the on-disk schema does not match. Types and constraints are not compared — SQLite/libSQL type affinity makes exact type matching unreliable — but column names and ordering are.
 
@@ -217,7 +223,7 @@ pub struct VortexConfig {
 
     // Writer concurrency
     pub upload_concurrency: usize,            // default available_parallelism()
-    pub write_concurrency: Option<usize>,     // None = session target_partitions; forced to 1 if sort_columns set
+    pub write_concurrency: Option<usize>,     // None = session target_partitions; the sort-and-rewrite compaction path pins to 1 regardless of this setting
 
     // Compaction
     pub compaction_trigger_files: usize,                // small-write profile = 4, otherwise = 8
@@ -242,7 +248,7 @@ pub struct VortexConfig {
 }
 ```
 
-The runtime classifies a dataset as the "small-write profile" when its refresh mode is `caching`, `changes`, or `append` with `refresh_check_interval <= 5m`. All other refresh modes (`full`, `snapshot`, `disabled`, manual/cron append, unspecified) get the larger-write defaults. The `VortexConfig::default()` ships the "otherwise" values; the runtime layer overrides them when the small-write profile applies (`runtime/src/dataaccelerator/cayenne/mod.rs::apply_refresh_mode_defaults`).
+The runtime classifies a dataset as the "small-write profile" when its refresh mode is `caching`, `changes`, or `append` with `refresh_check_interval <= 5m`. All other refresh modes (`full`, `snapshot`, `disabled`, manual/cron append, unspecified) get the larger-write defaults. The two threshold groups have different baselines: `VortexConfig::default()` ships the small-write values for the `inline_max_*` admission gate (1024 / 1 MiB / 4 MiB), and the runtime layer zeroes those out for the large-write profile (disabling inlining for big batch loads). For everything else (compaction triggers and `inline_flush_max_*`), `VortexConfig::default()` ships the larger-write values, and the runtime layer overrides them when the small-write profile applies (`runtime/src/dataaccelerator/cayenne/mod.rs::apply_refresh_mode_defaults`).
 
 Two distinct threshold groups for inline data — `inline_max_*` is the *per-write admission* gate ("is this single write small enough to absorb into the memtable?"); `inline_flush_max_*` is the *cumulative flush* gate ("has the accumulated memtable grown enough that we should checkpoint it to Vortex?").
 
@@ -408,11 +414,11 @@ These are local single-node implementations. The runtime wraps them with distrib
 
 ### 11. Optimizer rules (`logical_optimizer.rs`, `optimizer_rules.rs`)
 
-Cayenne ships four optimizer rules that work together to keep multi-way HTAP joins (chbench q21 was the motivating case) inside memory budget and on the fast path:
+Cayenne ships five optimizer rules that work together to keep multi-way HTAP joins (chbench q21 was the motivating case) inside memory budget and on the fast path:
 
 - **`CayennePropagateFilterAcrossEquiJoinKeys`** (logical) — predicate transitive closure for non-key dim-table filters. DataFusion's stock `infer_join_predicates` only propagates filters that already reference the join key; this rule introduces `Filter(other_side.key IN (SELECT this_side.key FROM dim_subtree))` for `Inner`, `LeftSemi`, and `RightSemi` joins where the selective filter is on a non-key column (e.g. `n_name = 'CHINA'`). Subqueries are tagged with `__cayenne_xclos__` and the rule refuses to re-introduce a propagated filter for the same target key, so the rule terminates under fixed-point iteration.
 - **`CayenneInListToRangeRewrite`** (logical) — rewrites long consecutive integer `IN` lists into half-open ranges, so PK scans see a tight `[lo, hi)` predicate the file pruner can use.
-- **`CayenneJoinRewriter`** (physical) — when the probe side of a `HashJoinExec` is a `CayenneAccelerationExec`, swaps DataFusion's default in-list dynamic-filter accumulator for `ExactLeftAccumulator`. The exact accumulator produces a precise dynamic filter when the build side fits in a configurable byte budget (`cayenne.exact_join_filter_max_bytes`), falling back to `RangeBounds + BloomFilter` otherwise. DataFusion's filter-pushdown phase then plants the resulting `Arc<DynamicFilterPhysicalExpr>` into the right-side scan's `FileSource`.
+- **`CayenneJoinRewriter`** (physical) — for inner-join `HashJoinExec` nodes (the only shape DataFusion pushes join-derived dynamic filters through), swaps DataFusion's default in-list dynamic-filter accumulator for `ExactLeftAccumulator`. The exact accumulator produces a precise dynamic filter when the build side fits in a configurable byte budget (`cayenne.exact_join_filter_max_bytes`), falling back to `RangeBounds + BloomFilter` otherwise. DataFusion's filter-pushdown phase then plants the resulting `Arc<DynamicFilterPhysicalExpr>` into the right-side scan's `FileSource`.
 - **`CayenneDynamicFilterSharing`** (physical) — when a dynamic filter has been pushed into one `CayenneAccelerationExec`, installs the same `Arc<DynamicFilterPhysicalExpr>` on sibling `CayenneAccelerationExec`s backed by the same underlying table and equi-joined column set. Applies to `Inner`, `LeftSemi`, and `RightSemi` parent joins (anti joins excluded — sharing would drop rows they're meant to preserve).
 - **`CayenneAntiJoinSortMergeRewriter`** (physical) — DataFusion's `HashJoinExec` build side is non-spillable. For same-source Cayenne semi/anti joins above a 10M-row exact build-side threshold (`cayenne.sort_merge_min_rows`) and exceeding a fraction of the query memory pool (`cayenne.sort_merge_memory_pool_fraction`, default 0.125 of `runtime.query.memory_limit`), the rule rewrites the hash join into a `SortMergeJoinExec` with explicit spillable `SortExec` inputs. Inner/outer joins keep `HashJoinExec`.
 
@@ -470,21 +476,21 @@ Deletion vectors, protected snapshots, inlined data union, and time-retention fi
 
 ## Configuration parameters
 
-The runtime accelerator (`runtime/src/dataaccelerator/cayenne/mod.rs`) recognizes the following `cayenne_*` spicepod parameters. Defaults marked "small-write profile" apply when `refresh_mode` is `caching`, `changes`, or `append` with `refresh_check_interval <= 5m`; otherwise the larger defaults apply.
+The runtime accelerator (`runtime/src/dataaccelerator/cayenne/mod.rs`) recognizes the following core `cayenne_*` spicepod parameters that configure dataset-level behavior. S3 Express One Zone storage parameters are listed in a separate table below. Defaults marked "small-write profile" apply when `refresh_mode` is `caching`, `changes`, or `append` with `refresh_check_interval <= 5m`; otherwise the larger defaults apply.
 
 | Parameter                                        | Description                                                                                                                 | Default                                                                   |
 | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
 | `cayenne_file_path`                              | Data file path. Local path or S3 Express One Zone (`s3://{bucket}--{zone-id}--x-s3/...`). Standard S3 buckets are rejected. | `{spice_data}/{dataset}/`                                                 |
 | `cayenne_metadata_dir`                           | SQLite metadata directory.                                                                                                  | `{spice_data}/metadata` or `{cayenne_file_path}/metadata` for local paths |
 | `cayenne_metastore`                              | `sqlite` (default) or `turso` (requires `turso` build feature).                                                             | `sqlite`                                                                  |
-| `cayenne_unsupported_type_action`                | `string` (default), `error`, `warn`, `ignore`.                                                                              | `string`                                                                  |
+| `cayenne_unsupported_type_action`                | `error` (default), `string`, `warn`, `ignore`.                                                                              | `error`                                                                   |
 | `cayenne_segment_cache_mb`                       | Vortex segment cache in MB.                                                                                                 | `256`                                                                     |
 | `cayenne_target_file_size_mb`                    | Vortex file target size in MB.                                                                                              | `256`                                                                     |
 | `cayenne_sort_columns`                           | Comma-separated sort columns.                                                                                               | (none)                                                                    |
 | `cayenne_compression_strategy`                   | `btrblocks` or `zstd`.                                                                                                      | `btrblocks`                                                               |
 | `cayenne_pk_conflict_detection`                  | `auto` or `none`.                                                                                                           | `auto`                                                                    |
 | `cayenne_upload_concurrency`                     | Concurrent multipart upload fan-out.                                                                                        | `available_parallelism()`                                                 |
-| `cayenne_write_concurrency`                      | Writer partition override (forced to 1 with `sort_columns`).                                                                | `target_partitions`                                                       |
+| `cayenne_write_concurrency`                      | Writer partition override for unsorted ingests. The sort-and-rewrite compaction path always writes serially.                | `target_partitions`                                                       |
 | `cayenne_compaction_trigger_files`               | Small-tier file count trigger.                                                                                              | small = 4, otherwise = 8                                                  |
 | `cayenne_compaction_trigger_protected_snapshots` | Protected-snapshot count trigger.                                                                                           | small = 4, otherwise = 8                                                  |
 | `cayenne_compaction_trigger_snapshot_age_ms`     | Protected-snapshot age trigger, 0 disables.                                                                                 | small = 60_000, otherwise = 300_000                                       |
@@ -498,7 +504,22 @@ The runtime accelerator (`runtime/src/dataaccelerator/cayenne/mod.rs`) recognize
 | `cayenne_inline_flush_max_segments`              | Cumulative inline-flush segment trigger.                                                                                    | small = 16, otherwise = 64                                                |
 | `cayenne_inline_flush_max_bytes`                 | Cumulative inline-flush IPC-byte trigger.                                                                                   | small = 2_097_152, otherwise = 8_388_608                                  |
 
-For S3 Express One Zone the `cayenne_s3_zone_ids`, `cayenne_s3_region`, `cayenne_s3_endpoint`, `cayenne_s3_key`, `cayenne_s3_secret`, `cayenne_s3_session_token`, `cayenne_s3_auth`, `cayenne_s3_client_timeout`, `cayenne_s3_allow_http`, and `cayenne_s3_unsigned_payload` parameters configure the underlying object store. When `cayenne_s3_zone_ids` lists multiple zones, every write is applied to every zone atomically with best-effort rollback on partial failure (`MultiZoneS3ExpressStore`).
+### S3 Express One Zone parameters
+
+When the data tier targets S3 Express One Zone (either via an `s3://...--x-s3/...` path in `cayenne_file_path` or via `cayenne_s3_zone_ids`), the following additional parameters configure the underlying object store. When `cayenne_s3_zone_ids` lists multiple zones, every write is applied to every zone atomically with best-effort rollback on partial failure (`MultiZoneS3ExpressStore`).
+
+| Parameter                     | Description                                                                                                                                              | Default                              |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| `cayenne_s3_zone_ids`         | Comma-separated AZ IDs (e.g. `usw2-az1` or `usw2-az1,usw2-az2`). When set without `cayenne_file_path`, the bucket name is auto-generated and created.    | (none)                               |
+| `cayenne_s3_region`           | AWS region. Derived from `cayenne_s3_zone_ids` if not set.                                                                                               | (derived)                            |
+| `cayenne_s3_endpoint`         | Custom S3 endpoint URL.                                                                                                                                  | (default AWS)                        |
+| `cayenne_s3_key`              | AWS access key ID. Secret.                                                                                                                               | (none)                               |
+| `cayenne_s3_secret`           | AWS secret access key. Secret.                                                                                                                           | (none)                               |
+| `cayenne_s3_session_token`    | AWS session token for temporary credentials. Secret.                                                                                                     | (none)                               |
+| `cayenne_s3_auth`             | Authentication mode: `iam_role` (env credentials) or `key` (explicit `cayenne_s3_key`/`cayenne_s3_secret`).                                              | `iam_role`                           |
+| `cayenne_s3_client_timeout`   | Timeout for S3 client operations (e.g. `30s`, `5m`).                                                                                                     | `120s`                               |
+| `cayenne_s3_allow_http`       | Allow plaintext HTTP connections.                                                                                                                        | `false`                              |
+| `cayenne_s3_unsigned_payload` | Skip SHA-256 payload signing for S3 Express requests (session-based auth makes payload signing redundant).                                               | `true`                               |
 
 The runtime-global Vortex footer-metadata cache is sized via `runtime.params.cayenne_footer_cache_mb`; when set, the configured value is persisted in the metastore to detect cross-restart drift. Memory accounting for the PK keyset cache, sort/merge join build-side rewrites, and inline-memtable buffers is integrated with `runtime.query.memory_limit` (the canonical Spicepod v2 path; the legacy `runtime.memory_limit` is auto-migrated with a deprecation warning).
 
@@ -734,8 +755,8 @@ Some Arrow data types are not natively supported by the Vortex format:
 
 The `cayenne_unsupported_type_action` parameter controls handling:
 
-- `string` (default): convert unsupported types to UTF-8 strings
-- `error`: fail on unsupported types
+- `error` (default): fail on unsupported types
+- `string`: convert unsupported types to UTF-8 strings
 - `warn`: include in schema but may fail on insert
 - `ignore`: skip unsupported fields
 
