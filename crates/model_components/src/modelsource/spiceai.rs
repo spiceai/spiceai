@@ -132,7 +132,7 @@ impl ModelSource for SpiceAI {
             .await
             .context(super::UnableToFetchModelSnafu)?;
 
-        // Given we are still actively developing the model response, we'll only fetch the frist
+        // Given we are still actively developing the model response, we'll only fetch the first
         // export url for now.
         // In future, we can use a proper static model response format to parse the body
         let download_url = data
