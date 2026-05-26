@@ -531,3 +531,224 @@ async fn test_checkpoint_after_inlined_upsert_impl(fixture: TestFixture) -> Test
 }
 
 test_with_backends!(test_checkpoint_after_inlined_upsert_impl);
+
+// =============================================================================
+// Test 7: Two successive inline upserts on same PK
+// =============================================================================
+//
+// Insert to file → upsert PK (inlined) → upsert same PK again (inlined).
+// The second upsert must see the first inline row as a conflict source,
+// rewrite the inline entry, and only the latest value should be visible.
+// Also verifies correctness after restart.
+
+async fn test_double_inline_upsert_same_pk_impl(fixture: TestFixture) -> TestResult<()> {
+    let schema = simple_schema();
+    let (table, ctx) = setup_table(
+        &fixture,
+        "dbl_upsert",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
+
+    // Initial insert to file.
+    let n = DEFAULT_INLINE_MAX_ROWS + 1;
+    let ids: Vec<i64> = (0..i64::try_from(n)?).collect();
+    let vals: Vec<i64> = ids.iter().map(|i| i * 10).collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(Int64Array::from(vals)),
+        ],
+    )?;
+    insert_batch(&table, batch).await?;
+    assert_eq!(row_count(&ctx, "dbl_upsert").await?, n);
+
+    // First inline upsert: PK 0 → value 1111.
+    let upsert1 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![0])),
+            Arc::new(Int64Array::from(vec![1111])),
+        ],
+    )?;
+    insert_batch(&table, upsert1).await?;
+
+    // Second inline upsert: PK 0 → value 2222 (conflict is now the inline row).
+    let upsert2 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![0])),
+            Arc::new(Int64Array::from(vec![2222])),
+        ],
+    )?;
+    insert_batch(&table, upsert2).await?;
+
+    // Row count unchanged — no duplicates.
+    assert_eq!(row_count(&ctx, "dbl_upsert").await?, n);
+
+    // Only the latest value is visible.
+    let v = query_value(&ctx, "SELECT value FROM dbl_upsert WHERE id = 0").await?;
+    assert_eq!(v, vec![2222], "second upsert value should win");
+
+    // ---- Restart ----
+    let connection_string = format!("sqlite://{}", fixture.db_path().to_string_lossy());
+    drop(table);
+    drop(ctx);
+
+    let catalog2 = Arc::new(CayenneCatalog::new(&connection_string)?);
+    catalog2.init().await?;
+    let catalog_trait2: Arc<dyn MetadataCatalog> =
+        Arc::clone(&catalog2) as Arc<dyn MetadataCatalog>;
+
+    let ctx2 = SessionContext::new();
+    let provider2 = cayenne::CayenneTableProviderBuilder::new(catalog_trait2, ctx2.runtime_env())
+        .open("dbl_upsert")
+        .await?;
+    let provider2 = Arc::new(provider2);
+    ctx2.register_table(
+        "dbl_upsert",
+        Arc::clone(&provider2) as Arc<dyn TableProvider>,
+    )?;
+
+    assert_eq!(row_count(&ctx2, "dbl_upsert").await?, n);
+    let v = query_value(&ctx2, "SELECT value FROM dbl_upsert WHERE id = 0").await?;
+    assert_eq!(v, vec![2222], "latest value should survive restart");
+
+    Ok(())
+}
+
+test_with_backends!(test_double_inline_upsert_same_pk_impl);
+
+// =============================================================================
+// Test 8: Delete of an inlined PK
+// =============================================================================
+//
+// Insert to file → upsert PK (inlined) → delete that same PK.
+// The delete must remove both the file-backed deletion vector AND the inline
+// row, resulting in 0 rows for that PK.
+
+async fn test_delete_of_inlined_pk_impl(fixture: TestFixture) -> TestResult<()> {
+    let schema = simple_schema();
+    let (table, ctx) = setup_table(
+        &fixture,
+        "del_inline",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
+
+    // Initial insert to file.
+    let n = DEFAULT_INLINE_MAX_ROWS + 1;
+    let ids: Vec<i64> = (0..i64::try_from(n)?).collect();
+    let vals: Vec<i64> = ids.iter().map(|i| i * 10).collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(Int64Array::from(vals)),
+        ],
+    )?;
+    insert_batch(&table, batch).await?;
+    assert_eq!(row_count(&ctx, "del_inline").await?, n);
+
+    // Upsert PK 0 → inlined with new value.
+    let upsert = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![0])),
+            Arc::new(Int64Array::from(vec![9999])),
+        ],
+    )?;
+    insert_batch(&table, upsert).await?;
+
+    // Verify upsert worked.
+    let v = query_value(&ctx, "SELECT value FROM del_inline WHERE id = 0").await?;
+    assert_eq!(v, vec![9999]);
+
+    // Delete PK 0 — must remove the inlined row too.
+    delete_by_id(&table, 0).await?;
+
+    // PK 0 is gone entirely.
+    let v = query_value(&ctx, "SELECT value FROM del_inline WHERE id = 0").await?;
+    assert!(v.is_empty(), "deleted inlined PK should not be visible");
+
+    // Total rows decreased by 1.
+    assert_eq!(row_count(&ctx, "del_inline").await?, n - 1);
+
+    Ok(())
+}
+
+test_with_backends!(test_delete_of_inlined_pk_impl);
+
+// =============================================================================
+// Test 9: Mixed inline + file conflicts in one upsert batch
+// =============================================================================
+//
+// Insert to file → upsert PK A (inlined) → upsert batch containing both PK A
+// (conflict with inline) and PK B (conflict with file).  Both conflict sources
+// must be resolved in a single `try_inline_batches_with_inlined_deletions` call.
+
+async fn test_mixed_inline_and_file_conflicts_impl(fixture: TestFixture) -> TestResult<()> {
+    let schema = simple_schema();
+    let (table, ctx) = setup_table(
+        &fixture,
+        "mixed_conflict",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
+
+    // Initial insert to file: ids 0..n.
+    let n = DEFAULT_INLINE_MAX_ROWS + 1;
+    let ids: Vec<i64> = (0..i64::try_from(n)?).collect();
+    let vals: Vec<i64> = ids.iter().map(|i| i * 10).collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(Int64Array::from(vals)),
+        ],
+    )?;
+    insert_batch(&table, batch).await?;
+    assert_eq!(row_count(&ctx, "mixed_conflict").await?, n);
+
+    // Upsert PK 0 → inlined (conflict with file, now PK 0 lives inline).
+    let upsert1 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![0])),
+            Arc::new(Int64Array::from(vec![1000])),
+        ],
+    )?;
+    insert_batch(&table, upsert1).await?;
+
+    // Now upsert both PK 0 (inline conflict) and PK 1 (file conflict) together.
+    let upsert_mixed = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![0, 1])),
+            Arc::new(Int64Array::from(vec![5555, 6666])),
+        ],
+    )?;
+    insert_batch(&table, upsert_mixed).await?;
+
+    // Row count unchanged — two replacements, no new PKs.
+    assert_eq!(row_count(&ctx, "mixed_conflict").await?, n);
+
+    // Both PKs have latest values.
+    let v0 = query_value(&ctx, "SELECT value FROM mixed_conflict WHERE id = 0").await?;
+    assert_eq!(v0, vec![5555], "PK 0 should have mixed-upsert value");
+
+    let v1 = query_value(&ctx, "SELECT value FROM mixed_conflict WHERE id = 1").await?;
+    assert_eq!(v1, vec![6666], "PK 1 should have mixed-upsert value");
+
+    // Other PKs untouched.
+    let v2 = query_value(&ctx, "SELECT value FROM mixed_conflict WHERE id = 2").await?;
+    assert_eq!(v2, vec![20], "PK 2 should be unchanged");
+
+    Ok(())
+}
+
+test_with_backends!(test_mixed_inline_and_file_conflicts_impl);
