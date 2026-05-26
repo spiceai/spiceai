@@ -162,9 +162,14 @@ pub trait QueryEngine: Send + Sync + Debug {
     // --- Data write ---
 
     /// Write record batches to a table.
+    ///
+    /// `schema` is provided explicitly so callers can specify the
+    /// intended schema even when `data` is empty.
     async fn write_data(
         &self,
         table_ref: &TableReference,
-        data: DataUpdate,
+        schema: Arc<Schema>,
+        data: Vec<RecordBatch>,
+        update_type: UpdateType,
     ) -> Result<(), BoxError>;
 }

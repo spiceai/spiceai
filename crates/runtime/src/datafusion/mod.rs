@@ -3663,9 +3663,16 @@ impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
     async fn write_data(
         &self,
         table_ref: &TableReference,
-        data: runtime_datafusion::query_engine::DataUpdate,
+        schema: Arc<Schema>,
+        data: Vec<RecordBatch>,
+        update_type: runtime_datafusion::query_engine::UpdateType,
     ) -> std::result::Result<(), runtime_datafusion::query_engine::BoxError> {
-        DataFusion::write_data(self, table_ref, data)
+        let update = DataUpdate {
+            schema,
+            data,
+            update_type,
+        };
+        DataFusion::write_data(self, table_ref, update)
             .await
             .map_err(Into::into)
     }

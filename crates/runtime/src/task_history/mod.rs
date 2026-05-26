@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::accelerated_table::refresh::Refresh;
 use crate::component::dataset::acceleration::OnConflictBehavior;
-use crate::dataupdate::{DataUpdate, UpdateType};
+use crate::dataupdate::UpdateType;
 use crate::internal_table::create_internal_accelerated_table;
 use crate::{Runtime, status};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
@@ -203,12 +203,7 @@ impl TaskSpan {
             .boxed()
             .context(UnableToWriteToTableSnafu)?;
 
-        let data_update = DataUpdate {
-            schema,
-            data: vec![data],
-            update_type: UpdateType::Append,
-        };
-        df.write_data(&table_ref, data_update)
+        df.write_data(&table_ref, schema, vec![data], UpdateType::Append)
             .await
             .map_err(|source| Error::UnableToWriteToTable { source })?;
 
@@ -259,16 +254,9 @@ impl TaskSpan {
         let table_provider = df.get_table(&table_ref).await.context(TableNotFoundSnafu)?;
         let schema = table_provider.schema();
 
-        df.write_data(
-            &table_ref,
-            DataUpdate {
-                schema,
-                data: overriden,
-                update_type: UpdateType::Changes,
-            },
-        )
-        .await
-        .map_err(|source| Error::UnableToUpdateTraces { source })?;
+        df.write_data(&table_ref, schema, overriden, UpdateType::Changes)
+            .await
+            .map_err(|source| Error::UnableToUpdateTraces { source })?;
 
         Ok(())
     }
