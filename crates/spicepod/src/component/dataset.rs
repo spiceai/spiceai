@@ -320,7 +320,7 @@ impl Dataset {
     pub fn metadata(&self) -> HashMap<String, String> {
         let mut metadata = HashMap::new();
         if let Some(d) = self.description.as_ref() {
-            metadata.insert("comment".to_string(), d.clone());
+            metadata.insert("description".to_string(), d.clone());
         }
         for (k, v) in &self.metadata {
             metadata.insert(k.clone(), metadata_value_to_string(v));
