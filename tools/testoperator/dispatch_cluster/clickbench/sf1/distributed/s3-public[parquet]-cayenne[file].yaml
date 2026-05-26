@@ -1,7 +1,7 @@
 tests:
   bench:
-    # Disabled because queries start before acceleration is ready; this is a Spice bug
-    # that needs to be fixed for distributed accelerations.
+    # Disabled to isolate the TPC-H Ballista run. Distributed acceleration currently
+    # has a Spice bug where queries start before acceleration is ready.
     enabled: false
     spicepod_path: distributed/s3-public[parquet]-cayenne[file].yaml
     query_set: clickbench
