@@ -19,6 +19,8 @@ use logos::{Lexer, Logos};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::DESCRIPTION_METADATA_KEY;
+
 const MAX_RECURSION_DEPTH: usize = 100;
 
 #[derive(Logos, Debug, PartialEq, Clone)]
@@ -485,7 +487,7 @@ impl<'input> Parser<'input> {
             if let Some(Ok(Token::QuotedString(s))) = self.current.clone() {
                 self.advance();
                 let mut metadata = HashMap::new();
-                metadata.insert("comment".to_string(), s);
+                metadata.insert(DESCRIPTION_METADATA_KEY.to_string(), s);
                 metadata
             } else {
                 return Err("Expected quoted string for COMMENT".to_string());
@@ -583,7 +585,7 @@ mod tests {
         let expected = ArrowDataType::Struct(
             vec![
                 ArrowField::new("field1", ArrowDataType::Int32, false).with_metadata(
-                    HashMap::from([("comment".to_string(), "id field".to_string())]),
+                    HashMap::from([(DESCRIPTION_METADATA_KEY.to_string(), "id field".to_string())]),
                 ),
                 ArrowField::new("field2", ArrowDataType::Utf8, true),
             ]
