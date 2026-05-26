@@ -1,5 +1,7 @@
 tests:
   bench:
+    # Disabled to isolate the TPC-H Ballista run.
+    enabled: false
     spicepod_path: distributed/s3-public[parquet]-cayenne[file].yaml
     query_set: tpch
     query_transport: flightsql
