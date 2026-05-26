@@ -16,16 +16,11 @@ limitations under the License.
 
 use super::{EngineKind, run_bootstrap_then_refresh_cycle};
 
-// Turso (libsql) WAL flush via rusqlite currently fails with
-// "file is not a database" — the libsql on-disk file isn't byte-compatible
-// with the rusqlite reader. Tracked in spiceai/spiceai#10657.
-//
-// The WAL-flush hook (commit 1 of #10651) is therefore a no-op for Turso
-// today; data loss can occur on snapshot creation if writes are still in
-// the WAL. The integration test stays \#\[ignore\]d until #10657 swaps in
-// a turso-native checkpoint path.
+// Turso WAL flush is now routed through the turso crate's native connection
+// (see `runtime-acceleration::snapshot::engine::TursoSnapshotEngine`), so the
+// snapshot creation path captures all uncheckpointed WAL frames as expected.
+// Closes spiceai/spiceai#10657.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "snapshot_refresh for turso requires a turso-native WAL checkpoint; see spiceai/spiceai#10657"]
 async fn snapshot_refresh_turso_bootstrap_then_refresh() -> Result<(), anyhow::Error> {
     run_bootstrap_then_refresh_cycle("snapshot_refresh_turso", EngineKind::Turso).await
 }

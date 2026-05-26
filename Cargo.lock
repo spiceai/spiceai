@@ -16066,6 +16066,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "turso",
  "url",
  "util",
  "uuid 1.21.0",
