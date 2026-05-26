@@ -202,9 +202,13 @@ impl ObjDescription {
         else {
             return Ok(None);
         };
-        let Some(schema) = self.lookup.table_schema(&table_key, cache).await? else {
-            return Ok(None);
-        };
+        let schema = self
+            .lookup
+            .table_schema(&table_key, cache)
+            .await?
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!("Table '{}' not found", table_key.table))
+            })?;
 
         Ok(schema.metadata().get(DESCRIPTION_METADATA_KEY).cloned())
     }
@@ -312,20 +316,42 @@ impl ColDescription {
         else {
             return Ok(None);
         };
-        let Some(schema) = self.lookup.table_schema(&table_key, cache).await? else {
-            return Ok(None);
-        };
+        let schema = self
+            .lookup
+            .table_schema(&table_key, cache)
+            .await?
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!("Table '{}' not found", table_key.table))
+            })?;
 
         let comment = match selector {
-            ColumnSelector::Name(name) => schema
-                .field_with_name(&name)
-                .ok()
-                .and_then(|field| field.metadata().get(DESCRIPTION_METADATA_KEY).cloned()),
-            ColumnSelector::Position(position) => position
-                .checked_sub(1)
-                .and_then(|index| usize::try_from(index).ok())
-                .and_then(|index| schema.fields().get(index))
-                .and_then(|field| field.metadata().get(DESCRIPTION_METADATA_KEY).cloned()),
+            ColumnSelector::Name(name) => {
+                let field = schema.field_with_name(&name).map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "Column '{}' not found in table '{}'",
+                        name, table_key.table
+                    ))
+                })?;
+                field.metadata().get(DESCRIPTION_METADATA_KEY).cloned()
+            }
+            ColumnSelector::Position(position) => {
+                let index = position
+                    .checked_sub(1)
+                    .and_then(|i| usize::try_from(i).ok())
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "Column position must be >= 1, got {position}"
+                        ))
+                    })?;
+                let field = schema.fields().get(index).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Column at position {position} does not exist in table '{}' ({} columns total)",
+                        table_key.table,
+                        schema.fields().len()
+                    ))
+                })?;
+                field.metadata().get(DESCRIPTION_METADATA_KEY).cloned()
+            }
         };
 
         Ok(comment)
@@ -808,6 +834,84 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn obj_description_errors_on_unknown_table() {
+        let ctx = SessionContext::new();
+        register_postgres_comment_udfs(&ctx);
+
+        let error = ctx
+            .sql("SELECT obj_description('nonexistent_table')")
+            .await
+            .expect("planning should succeed")
+            .collect()
+            .await
+            .expect_err("executing with unknown table should fail");
+
+        assert!(
+            error.to_string().contains("not found"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn col_description_errors_on_unknown_table() {
+        let ctx = SessionContext::new();
+        register_postgres_comment_udfs(&ctx);
+
+        let error = ctx
+            .sql("SELECT col_description('nonexistent_table', 1)")
+            .await
+            .expect("planning should succeed")
+            .collect()
+            .await
+            .expect_err("executing with unknown table should fail");
+
+        assert!(
+            error.to_string().contains("not found"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn col_description_errors_on_out_of_bounds_position() {
+        let ctx = SessionContext::new();
+        register_postgres_comment_udfs(&ctx);
+        register_test_table(&ctx);
+
+        let error = ctx
+            .sql("SELECT col_description('orders', 999)")
+            .await
+            .expect("planning should succeed")
+            .collect()
+            .await
+            .expect_err("executing with out-of-bounds column position should fail");
+
+        assert!(
+            error.to_string().contains("does not exist"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn col_description_errors_on_unknown_column_name() {
+        let ctx = SessionContext::new();
+        register_postgres_comment_udfs(&ctx);
+        register_test_table(&ctx);
+
+        let error = ctx
+            .sql("SELECT col_description('orders', 'nonexistent_column')")
+            .await
+            .expect("planning should succeed")
+            .collect()
+            .await
+            .expect_err("executing with unknown column name should fail");
+
+        assert!(
+            error.to_string().contains("not found"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

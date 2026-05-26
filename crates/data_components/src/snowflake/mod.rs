@@ -136,11 +136,11 @@ async fn probe_snowflake_information_schema(
     let table = table_reference.table().replace('\'', "''");
     let schema_filter = table_reference
         .schema()
-        .map(|s| format!(" AND table_schema = '{}'", s.replace('\'', "''")))
+        .map(|s| format!(" AND c.table_schema = '{}'", s.replace('\'', "''")))
         .unwrap_or_default();
     let catalog_filter = table_reference
         .catalog()
-        .map(|c| format!(" AND table_catalog = '{}'", c.replace('\'', "''")))
+        .map(|c| format!(" AND c.table_catalog = '{}'", c.replace('\'', "''")))
         .unwrap_or_default();
 
     // When a catalog (database) is specified, qualify `information_schema` with it so
