@@ -608,7 +608,10 @@ async fn bigquery_schema_metadata(
 
     let mut table_metadata = HashMap::new();
     if let Some(comment) = first_string_result(pool, table_sql).await? {
-        table_metadata.insert(data_components::COMMENT_METADATA_KEY.to_string(), comment);
+        table_metadata.insert(
+            data_components::DESCRIPTION_METADATA_KEY.to_string(),
+            comment,
+        );
     }
 
     let mut field_metadata = FieldMetadata::new();
@@ -654,7 +657,7 @@ async fn bigquery_schema_metadata(
             .entry(field_path.clone())
             .or_default()
             .insert(
-                data_components::COMMENT_METADATA_KEY.to_string(),
+                data_components::DESCRIPTION_METADATA_KEY.to_string(),
                 comment.clone(),
             );
     }
