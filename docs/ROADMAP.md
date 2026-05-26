@@ -15,7 +15,7 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### v2.0 (June 2026)
+### [v2.0](https://github.com/spiceai/spiceai/milestone/58) (June 2026)
 
 **Focus:** Production-Grade HA, Distributed Query, and Enterprise Security.
 
@@ -38,7 +38,7 @@ To propose features or report issues, please [file an issue](https://github.com/
 - **Point-in-Time Snapshots**: `refresh_mode: snapshot` for consistent point-in-time acceleration.
 - **LLM Enhancements**: Provider-aware prompt caching, Responses API across all model providers, and a searchable tool registry for agents.
 
-### v2.1 (July 2026)
+### [v2.1](https://github.com/spiceai/spiceai/milestone/95) (July 2026)
 
 **Focus:** Schema Management and Distributed Search.
 
@@ -51,7 +51,7 @@ To propose features or report issues, please [file an issue](https://github.com/
 - **Distributed Acceleration Hardening**: Correct handling of `bucket()` partitioning with NULL values, accurate readiness signaling, and TopK pushdown ordering with filter pushdown.
 - **Ballista / Distributed Query**: Shared job state across schedulers and faster partition reassignment on executor failure.
 
-### v2.2 (September 2026)
+### [v2.2](https://github.com/spiceai/spiceai/milestone/99) (September 2026)
 
 **Focus:** Reactive Actions & Event Processing.
 
@@ -62,7 +62,7 @@ To propose features or report issues, please [file an issue](https://github.com/
 - **Streaming Cayenne Ingest**: `refresh_mode: changes` (Kafka) support for Cayenne-accelerated tables.
 - **Distributed Search Scale-Out**: Search query partitioning and relative score fusion across distributed nodes.
 
-### v2.3 (October 2026)
+### [v2.3](https://github.com/spiceai/spiceai/milestone/100) (October 2026)
 
 **Focus:** Enterprise Security, Compliance, & Governance.
 
@@ -73,7 +73,7 @@ To propose features or report issues, please [file an issue](https://github.com/
 - **Distributed Cayenne Catalog**: Cayenne catalog with full distributed query and acceleration support.
 - **Write-Back Acceleration**: Eventually-consistent write-back, with full DML (UPDATE/DELETE) and `spice refresh`/`refresh_check_interval` on write-through accelerated tables.
 
-### v2.4 (December 2026)
+### [v2.4](https://github.com/spiceai/spiceai/milestone/101) (December 2026)
 
 **Focus:** Extensibility & Plugin Architecture.
 
@@ -83,7 +83,7 @@ To propose features or report issues, please [file an issue](https://github.com/
 - **Search at 100B+ Row Scale**: Vector and full-text search benchmarked and tuned for hundred-billion-row deployments, including S3 Vectors throughput improvements.
 - **Unified Connector Rate Control**: Runtime-wide rate control shared across all data connectors.
 
-### v2.5 (January 2027)
+### [v2.5](https://github.com/spiceai/spiceai/milestone/102) (January 2027)
 
 **Focus:** Encryption.
 
