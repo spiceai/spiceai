@@ -48,7 +48,7 @@ To propose features or report issues, please [file an issue](https://github.com/
 - **Schema Registry (Initial)**: Versioning and backward compatibility checks.
 - **Schema Evolution**: Safe, non-breaking schema changes for accelerated datasets (add/drop/rename columns, type widening) with automatic migration.
 - **Cayenne Improvements**: Non-distributed Cayenne catalog, multi-version metadata schema support, and orphaned deletion-vector cleanup during retention.
-- **Distributed Acceleration Hardening**: Correct handling of `bucket()` partitioning with NULL values, accurate readiness signaling, and TopK pushdown ordering with filter pushdown.
+- **Distributed Acceleration Hardening**: Continued planner and runtime improvements for distributed acceleration, including partitioning, readiness signaling, and filter/TopK pushdown.
 - **Ballista / Distributed Query**: Shared job state across schedulers and faster partition reassignment on executor failure.
 
 ### [v2.2](https://github.com/spiceai/spiceai/milestone/99) (September 2026)
