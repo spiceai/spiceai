@@ -26,7 +26,7 @@ mod duckdb;
 #[cfg(feature = "duckdb")]
 pub use duckdb::DuckDBSnapshotEngine;
 
-#[cfg(any(feature = "sqlite", feature = "turso"))]
+#[cfg(feature = "sqlite")]
 mod sqlite;
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteSnapshotEngine;
@@ -43,8 +43,12 @@ pub enum SnapshotEngineError {
     DuckDB { source: duckdb::DuckDBSnapshotError },
 
     #[snafu(display("SQLite snapshot error: {source}"))]
-    #[cfg(any(feature = "sqlite", feature = "turso"))]
+    #[cfg(feature = "sqlite")]
     Sqlite { source: sqlite::SqliteSnapshotError },
+
+    #[snafu(display("Turso snapshot error: {source}"))]
+    #[cfg(feature = "turso")]
+    Turso { source: turso::TursoSnapshotError },
 
     /// Placeholder variant for when no snapshot-capable feature is enabled.
     #[snafu(display(
