@@ -42,6 +42,7 @@ use datafusion::sql::{
 use snafu::Snafu;
 use spicepod::component::function::{Function, FunctionKind};
 
+mod args_inliner;
 mod arrow_type;
 #[cfg(feature = "http-functions")]
 pub mod remote;

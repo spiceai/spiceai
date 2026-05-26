@@ -268,19 +268,27 @@ async fn apply_sqlite_pragmas(
     pool: &SqliteConnectionPool,
     pragmas: &[&'static str],
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
-    let conn = pool.connect().await?;
-    let Some(async_conn) = conn.as_async() else {
-        unreachable!("SqliteConnectionPool only returns async-capable SQLite connections");
+    let conn_sync = pool.connect_sync();
+    let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+        return Err("Failed to downcast to SqliteConnection".into());
     };
+
     for pragma in pragmas {
-        if let Err(err) = async_conn.execute(pragma, &[]).await {
+        let query = (*pragma).to_string();
+        if let Err(err) = conn
+            .conn
+            .call(move |conn| {
+                conn.execute_batch(&query)?;
+                Ok::<(), rusqlite::Error>(())
+            })
+            .await
+        {
             tracing::warn!(
                 pragma,
                 error = %err,
                 "Failed to apply SQLite storage-profile pragma"
             );
-            return Err(err);
+            return Err(Box::new(err));
         }
     }
     Ok(())
@@ -581,6 +589,26 @@ mod tests {
     use crate::component::dataset::acceleration::{Engine, Mode};
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataaccelerator::sqlite::SqliteAccelerator;
+    use crate::dataaccelerator::storage::ResolvedAccelerationStorage;
+
+    #[test]
+    fn storage_profile_drives_sqlite_setup_pragmas() {
+        assert_eq!(
+            SqliteAccelerator::storage_setup_pragmas(ResolvedAccelerationStorage::Ebs),
+            &["PRAGMA cache_size=-200000", "PRAGMA mmap_size=268435456"]
+        );
+        assert!(
+            SqliteAccelerator::storage_setup_pragmas(ResolvedAccelerationStorage::LocalSsd)
+                .is_empty()
+        );
+        assert!(
+            SqliteAccelerator::storage_setup_pragmas(ResolvedAccelerationStorage::Tmpfs).is_empty()
+        );
+        assert!(
+            SqliteAccelerator::storage_setup_pragmas(ResolvedAccelerationStorage::Unknown)
+                .is_empty()
+        );
+    }
 
     #[tokio::test]
     #[expect(clippy::unreadable_literal)]

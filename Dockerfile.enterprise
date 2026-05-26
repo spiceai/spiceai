@@ -3,7 +3,7 @@
 # Build the ADBC BigQuery driver from source
 ARG ADBC_BIGQUERY_COMMIT=feb542e756362a7203a7aa41b50af533427be5a6
 ARG GO_VERSION=1.26.1
-ARG RUST_VERSION=1.93.1
+ARG RUST_VERSION=1.94.1
 
 FROM golang:${GO_VERSION}-bookworm AS adbc-bigquery
 ARG ADBC_BIGQUERY_COMMIT
@@ -20,7 +20,7 @@ RUN set -eu; \
     rm -f /libadbc_driver_bigquery.h; \
     strip /libadbc_driver_bigquery.so
 
-FROM rust:${RUST_VERSION}-slim-bookworm as build
+FROM rust:${RUST_VERSION}-slim-trixie as build
 
 # cache mounts below may already exist and owned by root
 USER root
@@ -65,10 +65,11 @@ RUN \
     fi && \
     cp /build/target/${RUST_PROFILE}/spiced /root/spiced
 
-FROM debian:bookworm-slim as sandbox-setup
+FROM debian:trixie-slim as sandbox-setup
 
 ARG CARGO_FEATURES
 
+# Oracle ODPI-C configuration for the sandbox-setup stage, which runs on debian:trixie-slim.
 ARG INSTALL_ORACLE_ODPIC=false
 ARG ORACLE_INSTANTCLIENT_SHA256_AMD64=208bc7a9372efae098ab743d6e76aeb66e6f42579dcdbb7a6a8438412481b02e
 ARG ORACLE_INSTANTCLIENT_SHA256_ARM64=390999bc623c39c065f1236b8b1331b342431564a7a5e36e4c645fe8d159fc5e

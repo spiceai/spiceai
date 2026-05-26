@@ -16,7 +16,6 @@ limitations under the License.
 
 use app::App;
 use datafusion::sql::TableReference;
-use serde_json::Value;
 use snafu::prelude::*;
 use spicepod::{component::view as spicepod_view, vector::VectorStore};
 use std::{collections::HashMap, fs, sync::Arc, time::Duration};
@@ -37,7 +36,7 @@ use spicepod::semantic::Column;
 pub struct View {
     pub name: TableReference,
     pub sql: Arc<str>,
-    pub metadata: HashMap<String, Value>,
+    pub metadata: HashMap<String, String>,
     pub columns: Vec<Column>,
     pub acceleration: Option<acceleration::Acceleration>,
     pub ready_state: ReadyState,
@@ -161,7 +160,7 @@ impl View {
 pub struct ViewBuilder {
     pub name: TableReference,
     pub sql: String,
-    pub metadata: HashMap<String, Value>,
+    pub metadata: HashMap<String, String>,
     pub columns: Vec<Column>,
     pub acceleration: Option<acceleration::Acceleration>,
     pub ready_state: ReadyState,
@@ -185,6 +184,8 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
                 name: table_reference.to_string(),
             });
         };
+
+        let metadata = view.metadata();
 
         let acceleration = view
             .acceleration
@@ -213,7 +214,7 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
         Ok(ViewBuilder {
             name: table_reference,
             sql,
-            metadata: view.metadata,
+            metadata,
             columns: view.columns,
             acceleration,
             ready_state: ReadyState::from(view.ready_state),

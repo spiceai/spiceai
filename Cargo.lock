@@ -4235,6 +4235,7 @@ version = "2.0.0-rc.5-enterprise"
 dependencies = [
  "async-trait",
  "chrono",
+ "data_components",
  "datafusion",
  "datafusion-table-providers",
  "linkme",
@@ -4307,6 +4308,7 @@ dependencies = [
  "snafu",
  "tokio",
  "tokio-postgres",
+ "tracing",
 ]
 
 [[package]]
@@ -14134,9 +14136,9 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pingora-lru"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aa964c4e12e6328388b7059c93aac37b052be7962bbb70dd239b515532be4bf"
+checksum = "91bb5030596a3d442c0866ac68afe29c14ba558e77c726dcdf7016b0dbb359d9"
 dependencies = [
  "arrayvec 0.5.2",
  "hashbrown 0.5.0",

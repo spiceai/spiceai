@@ -76,6 +76,22 @@ jobs:
             echo "MYSQL_DB=tpch_sf1" >> $GITHUB_ENV
           fi
 
+      - name: Install ADBC BigQuery Driver
+        if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
+        uses: ./.github/actions/setup-adbc-bigquery
+
+      - name: Set up Python
+        if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Setup ScyllaDB
+        if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') }}
+        uses: ./.github/actions/setup-scylladb
+        with:
+          keyspace: tpch_sf1
+
       - name: Run the throughput test - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
@@ -133,6 +149,10 @@ jobs:
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           MONGODB_HOST: ${{ vars.TEST_MONGODB_HOST }}
           MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
+          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
+          SCYLLADB_HOST: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '127.0.0.1' || '' }}
+          SCYLLADB_PORT: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '9042' || '' }}
+          SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}
 
       - name: Run the throughput test (with overrides) - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides != '' }}
@@ -192,3 +212,7 @@ jobs:
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           MONGODB_HOST: ${{ vars.TEST_MONGODB_HOST }}
           MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
+          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
+          SCYLLADB_HOST: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '127.0.0.1' || '' }}
+          SCYLLADB_PORT: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '9042' || '' }}
+          SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}

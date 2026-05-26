@@ -278,7 +278,7 @@ pgwire-replication = { version = "0.3", default-features = false, features = ["t
 postgres-native-tls = "0.5"
 native-tls = "0.2"
 pin-project = "1.1"
-pingora-lru = "0.7"
+pingora-lru = "0.8"
 postcard = { version = "1.1.3", features = ["use-std"] }
 prometheus = "0.14"
 prost = { version = "0.14.1", default-features = false, features = [

@@ -118,6 +118,14 @@ default = [
     "vortex",
     "http-functions",
     "wasm-functions",
+    "aws-secrets-manager",
+    "azure-keyvault",
+    "hashicorp_vault",
+    "geo",                    # Enterprise feature
+    "rate-control",           # Enterprise feature
+    "wasm-functions-compile", # Enterprise feature
+    "keyring-secret-store",
+    "client_tls",             # Enterprise feature
 ]
 delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
 dev = ["runtime/dev"]
