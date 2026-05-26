@@ -34,7 +34,7 @@ use snafu::prelude::*;
 use tokio::sync::{RwLock, mpsc};
 
 use crate::correlated::{CorrelatedResponses, CorrelationError, send_correlated};
-use crate::{PartitionStore, PartitionValue, executor_selection};
+use crate::{PartitionStore, PartitionValue, executor_selection, metrics};
 
 /// Error type for executor registry operations.
 #[derive(Debug, Snafu)]
@@ -216,14 +216,37 @@ pub struct ExecutorRegistry {
 
     /// Append-only log of DDL SQL statements applied to the cluster.
     ddl_log: Arc<RwLock<DdlLog>>,
+
+    /// Scheduler's `<host>:<port>` identity, used as the `node_id` attribute on
+    /// cluster metrics recorded from this registry. `None` when metrics
+    /// shouldn't be emitted (e.g. tests, runtime hasn't propagated identity).
+    node_id: Option<Arc<str>>,
 }
 
 impl ExecutorRegistry {
-    /// Creates a new executor registry.
+    /// Creates a new executor registry without a `node_id`. Metrics recorded
+    /// via this registry will be skipped. Use [`Self::with_node_id`] in
+    /// production to attach the scheduler's `<host>:<port>` identity.
     #[must_use]
     pub fn new(
         accelerations_partition_store: Arc<PartitionStore>,
         federated_partition_store: Arc<PartitionStore>,
+    ) -> Self {
+        Self::with_node_id(
+            accelerations_partition_store,
+            federated_partition_store,
+            None,
+        )
+    }
+
+    /// Creates a new executor registry with an explicit `node_id`. The
+    /// `<host>:<port>` string is attached to every cluster metric recorded
+    /// through this registry.
+    #[must_use]
+    pub fn with_node_id(
+        accelerations_partition_store: Arc<PartitionStore>,
+        federated_partition_store: Arc<PartitionStore>,
+        node_id: Option<Arc<str>>,
     ) -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
@@ -232,7 +255,14 @@ impl ExecutorRegistry {
             accelerations_partition_store,
             federated_partition_store,
             ddl_log: Arc::new(RwLock::new(DdlLog::default())),
+            node_id,
         }
+    }
+
+    /// Returns the scheduler's `node_id` if one was provided at construction.
+    #[must_use]
+    pub fn node_id(&self) -> Option<&str> {
+        self.node_id.as_deref()
     }
 
     #[must_use]
@@ -286,12 +316,21 @@ impl ExecutorRegistry {
         };
 
         let mut connections = self.connections.write().await;
-        if connections.contains_key(&executor_id) {
+        let is_reconnect = connections.contains_key(&executor_id);
+        if is_reconnect {
             tracing::debug!("Executor {executor_id} reconnected, replacing existing connection");
         } else {
             tracing::debug!("Executor {executor_id} connected");
         }
-        connections.insert(executor_id, connection);
+        connections.insert(executor_id.clone(), connection);
+        drop(connections);
+
+        if let Some(node_id) = self.node_id.as_deref() {
+            metrics::set_scheduler_executor_active_connection(node_id, &executor_id, true);
+            if is_reconnect {
+                metrics::record_scheduler_executor_connection_retry(node_id, &executor_id);
+            }
+        }
 
         handles
     }
@@ -303,6 +342,10 @@ impl ExecutorRegistry {
         }
         self.flight_sql_clients.write().await.remove(executor_id);
         self.partitions.write().await.remove(executor_id);
+
+        if let Some(node_id) = self.node_id.as_deref() {
+            metrics::set_scheduler_executor_active_connection(node_id, executor_id, false);
+        }
     }
 
     /// Returns `true` if at least one executor has an active `FlightSqlClient`.
@@ -541,6 +584,7 @@ impl ExecutorRegistry {
             &executors,
             table,
             schema,
+            self.node_id.as_deref(),
         )
     }
 }
@@ -585,6 +629,7 @@ pub(crate) fn get_partitions_from_store(
     executors: &HashMap<String, (&ExecutorConnection, &FlightSqlClient)>,
     table: &TableReference,
     schema: &SchemaRef,
+    node_id: Option<&str>,
 ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
     let Some(table_metadata) = partition_store.get_cached_table_metadata(table) else {
         // No partition metadata — route to a single live executor to avoid duplicate results.
@@ -593,9 +638,18 @@ pub(crate) fn get_partitions_from_store(
             tracing::warn!(
                 "No partition assignments for table {table:?} and no connected executors with FlightSQL clients"
             );
+            if let Some(node_id) = node_id {
+                metrics::record_query_planning_failure(
+                    node_id,
+                    metrics::PlanningFailure::NoExecutors,
+                );
+            }
             return Vec::new();
         };
 
+        if let Some(node_id) = node_id {
+            metrics::record_query_executor_count(node_id, 1);
+        }
         return vec![(
             flight_sql_table_provider(executor_id, (*client).clone(), table, Arc::clone(schema)),
             Vec::new(),
@@ -645,9 +699,19 @@ pub(crate) fn get_partitions_from_store(
                 missing.len(),
                 missing.iter().take(5).collect::<Vec<_>>()
             );
+            if let Some(node_id) = node_id {
+                metrics::record_query_planning_failure(
+                    node_id,
+                    metrics::PlanningFailure::MissingPartitions,
+                );
+            }
             return Vec::new();
         }
     };
+
+    if let Some(node_id) = node_id {
+        metrics::record_query_executor_count(node_id, selected_executors.len() as u64);
+    }
 
     tracing::debug!(
         "Selected {} executor(s) from {} available for table {} (covering {} partition(s))",
@@ -682,6 +746,7 @@ pub struct FederatedPartitionProvider {
     connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
     flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
     partition_store: Arc<PartitionStore>,
+    node_id: Option<Arc<str>>,
 }
 
 impl FederatedPartitionProvider {
@@ -692,6 +757,7 @@ impl FederatedPartitionProvider {
             connections: Arc::clone(&registry.connections),
             flight_sql_clients: Arc::clone(&registry.flight_sql_clients),
             partition_store: Arc::clone(&registry.federated_partition_store),
+            node_id: registry.node_id.clone(),
         }
     }
 }
@@ -719,10 +785,16 @@ impl TablePartitionProvider for FederatedPartitionProvider {
 
         let executors = ready_executors(&connections, &flight_sql_clients);
 
-        get_partitions_from_store(&self.partition_store, &executors, table, schema)
-            .into_iter()
-            .map(|(provider, _)| (provider, vec![]))
-            .collect()
+        get_partitions_from_store(
+            &self.partition_store,
+            &executors,
+            table,
+            schema,
+            self.node_id.as_deref(),
+        )
+        .into_iter()
+        .map(|(provider, _)| (provider, vec![]))
+        .collect()
     }
 }
 

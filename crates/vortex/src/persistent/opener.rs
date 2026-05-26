@@ -274,7 +274,7 @@ impl FileOpener for VortexOpener {
                     .into_iter()
                     .map(|idx| this_file_schema.field(idx).clone())
                     .collect();
-                Schema::new(fields)
+                Schema::new_with_metadata(fields, this_file_schema.metadata().clone())
             };
             let stream_schema = calculate_physical_schema(&scan_dtype, &scan_reference_schema)?;
 
