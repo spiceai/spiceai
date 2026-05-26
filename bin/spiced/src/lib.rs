@@ -57,6 +57,7 @@ use yaml::Value;
 #[cfg(feature = "anonymous_telemetry")]
 const TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE: &str = "Usage telemetry is anonymous and aggregated. In Spice.ai Open Source, setting runtime.telemetry.enabled: false in a Spicepod or passing --telemetry-enabled=false does not disable anonymous usage telemetry. To remove anonymous telemetry from an Open Source build, build from source without the anonymous_telemetry feature, or consider using Spice.ai Enterprise. Learn more at https://docs.spice.ai/docs/enterprise";
 
+mod cloud_connect;
 #[path = "tracing.rs"]
 mod spiced_tracing;
 mod tls;
@@ -801,6 +802,12 @@ pub async fn run(args: Args) -> Result<()> {
         Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await
     });
 
+    // Spice Cloud Connect (UniFi-style adoption). Default off — only
+    // activates when an identity is on disk or an adoption code is
+    // available. Failures here are non-fatal: spiced keeps running.
+    let cloud_connect_handle =
+        cloud_connect::maybe_start(env!("CARGO_PKG_VERSION"), Arc::clone(&rt)).await;
+
     tokio::select! {
         () = Arc::clone(&rt).load_components() => {},
         () = runtime::shutdown_signal() => {
@@ -819,6 +826,9 @@ pub async fn run(args: Args) -> Result<()> {
         }),
     };
 
+    if let Some(cc) = cloud_connect_handle {
+        cc.shutdown().await;
+    }
     rt.shutdown().await;
 
     result

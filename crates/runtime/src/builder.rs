@@ -543,6 +543,10 @@ impl Default for RuntimeBuilder {
     }
 }
 
+// The `return` in the `not(feature = "rate-control")` arm is required because
+// the function body continues into another cfg branch below; clippy can't see
+// the alternative is hidden behind the opposite cfg, so we silence the lint.
+#[allow(clippy::needless_return)]
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
     secrets: Arc<RwLock<Secrets>>,

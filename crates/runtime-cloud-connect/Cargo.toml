@@ -1,0 +1,41 @@
+[package]
+name = "runtime-cloud-connect"
+description = "Outbound control-plane client for Spice Cloud Connect (UniFi-style adoption for standalone spiced)"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+dirs = "6"
+ed25519-dalek = { version = "2", features = ["pem", "rand_core"] }
+futures = { workspace = true }
+gethostname = { workspace = true }
+prost = { workspace = true }
+rand = { workspace = true }
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+snafu = { workspace = true }
+sysinfo = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = "0.14"
+tracing = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "test-util"] }

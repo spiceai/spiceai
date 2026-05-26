@@ -136,6 +136,10 @@ pub enum Error {
     /// No models configured
     #[snafu(display("No models found. Please configure a model in your Spicepod."))]
     NoModelsConfigured,
+
+    /// Local I/O failure for the Cloud Connect / adoption flow.
+    #[snafu(display("Cloud Connect I/O error: {message}"))]
+    CloudConnectIo { message: String },
 }
 
 /// Check an HTTP response status and return an appropriate error for non-success responses.

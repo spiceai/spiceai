@@ -50,6 +50,9 @@ reqwest.workspace = true
 runtime = { path = "../../crates/runtime" }
 runtime-auth = { path = "../../crates/runtime-auth" }
 runtime-async = { path = "../../crates/runtime-async" }
+runtime-cloud-connect = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
 rustls.workspace = true
 yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
