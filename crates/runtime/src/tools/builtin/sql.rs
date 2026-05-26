@@ -130,7 +130,7 @@ impl SpiceModelTool for SqlTool {
                 .await?
                 .try_collect::<Vec<RecordBatch>>()
                 .await
-                .boxed()?;
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
             Ok(Value::String(write_to_json_string(&batches)?))
         }

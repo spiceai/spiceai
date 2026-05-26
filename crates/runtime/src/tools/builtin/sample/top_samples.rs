@@ -106,7 +106,10 @@ impl SampleFrom for TopSamplesParams {
                     tbl = tbl_quoted,
                 )))
                 .await?;
-            stream.try_collect::<Vec<RecordBatch>>().await.boxed()
+            stream
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
         }
         .instrument(current_span)
         .await?;

@@ -49,7 +49,7 @@ use tonic::async_trait;
 use tonic::codec::CompressionEncoding;
 
 use crate::{tracers::OnceTracer, warn_once};
-use runtime_datafusion::query_engine::QueryEngine;
+use runtime_datafusion::query_engine::{DataUpdate, QueryEngine, UpdateType};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -130,12 +130,18 @@ impl MetricsService for Service {
                                     continue;
                                 }
 
+                                let schema = record_batch.schema();
+                                let data_update = DataUpdate {
+                                    data: vec![record_batch],
+                                    schema,
+                                    update_type: UpdateType::Append,
+                                };
                                 let mut write_failed = false;
                                 if let Err(e) = self
                                     .datafusion
                                     .write_data(
                                         &TableReference::bare(metric.name.as_str()),
-                                        vec![record_batch],
+                                        data_update,
                                     )
                                     .await
                                 {

@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 
-use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
+use arrow::datatypes::SchemaRef;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -26,7 +26,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 use futures::TryStreamExt;
-use runtime_datafusion::query_engine::{DataUpdate, UpdateType};
+pub use runtime_datafusion::query_engine::{DataUpdate, UpdateType};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
 use datafusion::sql::TableReference;

@@ -1648,7 +1648,7 @@ impl DataFusion {
                 .context(SchemaMismatchSnafu)?;
         }
 
-        let update_data = Arc::new(update_data);
+        let update_data: Arc<Vec<RecordBatch>> = Arc::new(update_data);
 
         let overwrite = match &update_type {
             UpdateType::Overwrite => InsertOp::Overwrite,
@@ -3663,18 +3663,9 @@ impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
     async fn write_data(
         &self,
         table_ref: &TableReference,
-        data: Vec<RecordBatch>,
+        data: runtime_datafusion::query_engine::DataUpdate,
     ) -> std::result::Result<(), runtime_datafusion::query_engine::BoxError> {
-        let Some(schema) = data.first().map(RecordBatch::schema) else {
-            return Ok(());
-        };
-
-        let update = DataUpdate {
-            schema,
-            data,
-            update_type: UpdateType::Append,
-        };
-        DataFusion::write_data(self, table_ref, update)
+        DataFusion::write_data(self, table_ref, data)
             .await
             .map_err(Into::into)
     }

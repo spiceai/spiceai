@@ -263,11 +263,11 @@ impl TaskHistoryExporter {
 
             // Run EXPLAIN query within the span context so it appears as a child task
             async {
-                match df.query_builder(&explain_query).build().run().await {
+                match df.execute_query(QueryRequest::new(&explain_query)).await {
                     Ok(mut result) => {
                         // Collect all record batches from the result stream
                         let mut batches = Vec::new();
-                        while let Some(batch) = result.data.next().await {
+                        while let Some(batch) = result.next().await {
                             match batch {
                                 Ok(b) => batches.push(b),
                                 Err(e) => {

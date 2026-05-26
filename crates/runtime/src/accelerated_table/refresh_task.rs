@@ -1369,7 +1369,9 @@ impl RefreshTask {
             let disable_federation = self.disable_federation;
             let io_runtime = self.io_runtime.clone();
 
-            let managed_stream = managed_runtime::run_record_batch_stream_on_runtime(
+            let managed_stream: runtime_datafusion::managed_runtime::ManagedRecordBatchStream<
+                UpdateType,
+            > = managed_runtime::run_record_batch_stream_on_runtime(
                 cpu_runtime_handle,
                 request_context,
                 span,

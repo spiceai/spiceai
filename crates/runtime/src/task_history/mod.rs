@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::accelerated_table::refresh::Refresh;
 use crate::component::dataset::acceleration::OnConflictBehavior;
+use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::internal_table::create_internal_accelerated_table;
 use crate::{Runtime, status};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
@@ -28,7 +29,7 @@ use datafusion::sql::TableReference;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::constraints::UpsertOptions;
 use futures::TryStreamExt;
-use runtime_datafusion::query_engine::{DataUpdate, QueryEngine, UpdateType};
+use runtime_datafusion::query_engine::{QueryEngine, QueryRequest};
 use snafu::prelude::*;
 use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
@@ -202,10 +203,14 @@ impl TaskSpan {
             .boxed()
             .context(UnableToWriteToTableSnafu)?;
 
-        df.write_data(&table_ref, vec![data])
+        let data_update = DataUpdate {
+            schema,
+            data: vec![data],
+            update_type: UpdateType::Append,
+        };
+        df.write_data(&table_ref, data_update)
             .await
-            .boxed()
-            .context(UnableToWriteToTableSnafu)?;
+            .map_err(|source| Error::UnableToWriteToTable { source })?;
 
         // Override trace_ids if necessary. Must be after above write so that it also handles override this batch of spans.
         for (from, to) in overrides {
@@ -225,20 +230,14 @@ impl TaskSpan {
     ) -> Result<(), Error> {
         let table_ref = TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE);
 
+        let sql = format!(
+            "SELECT * FROM {} where trace_id = '{from}'",
+            table_ref.to_quoted_string()
+        );
         let overriden: Vec<_> = df
-            .query_builder(
-                format!(
-                    "SELECT * FROM {} where trace_id = '{from}'",
-                    table_ref.to_quoted_string()
-                )
-                .as_str(),
-            )
-            .build()
-            .run()
+            .execute_query(QueryRequest::new(sql))
             .await
-            .boxed()
-            .context(UnableToUpdateTracesSnafu)?
-            .data
+            .map_err(|source| Error::UnableToUpdateTraces { source })?
             .try_collect::<Vec<RecordBatch>>()
             .await
             .boxed()
@@ -269,8 +268,7 @@ impl TaskSpan {
             },
         )
         .await
-        .boxed()
-        .context(UnableToUpdateTracesSnafu)?;
+        .map_err(|source| Error::UnableToUpdateTraces { source })?;
 
         Ok(())
     }
