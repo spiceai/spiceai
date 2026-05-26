@@ -1804,7 +1804,28 @@ impl TableProvider for AcceleratedTable {
     }
 
     async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.accelerator.truncate(state).await
+        if self.refresh_mode == RefreshMode::Snapshot {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "truncate on accelerated table {} is not permitted when refresh_mode is 'snapshot'; the accelerator is driven exclusively from the snapshot store",
+                self.dataset_name
+            )));
+        }
+
+        self.update_last_updated_at();
+
+        match &self.write_mode {
+            WriteMode::AcceleratorOnly => self.accelerator.truncate(state).await,
+            WriteMode::WriteThrough => {
+                let federated_table = self.federated.table_provider().await;
+                federated_table.truncate(state).await
+            }
+            WriteMode::WriteBack | WriteMode::DualWrite { .. } => {
+                Err(datafusion::error::DataFusionError::Plan(
+                    "TRUNCATE is not supported for write_back or dual_write accelerated tables"
+                        .to_string(),
+                ))
+            }
+        }
     }
 }
 
