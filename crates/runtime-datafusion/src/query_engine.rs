@@ -21,6 +21,8 @@ limitations under the License.
 //! records can depend on `Arc<dyn QueryEngine>` instead of the concrete
 //! `DataFusion` struct, breaking the coupling to the `runtime` crate.
 
+#![allow(clippy::missing_errors_doc)]
+
 use std::fmt::Debug;
 use std::sync::Arc;
 
