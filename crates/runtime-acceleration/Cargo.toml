@@ -40,6 +40,7 @@ tar = "0.4"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 tracing.workspace = true
+turso = { workspace = true, optional = true }
 url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 uuid = { version = "1", features = ["v7"] }
@@ -49,7 +50,7 @@ default = []
 duckdb = ["dep:duckdb"]
 snapshots = []
 sqlite = ["dep:rusqlite"]
-turso = ["dep:rusqlite"]
+turso = ["dep:turso"]
 
 [dev-dependencies]
 anyhow = { workspace = true }
