@@ -427,7 +427,7 @@ async fn test_cayenne_with_partitioned_tpch() -> Result<(), String> {
             runtime_ready_check_with_timeout(&rt, Duration::from_secs(600)).await;
 
             let queries = QuerySet::Tpch
-                .get_queries(None, None, None)
+                .get_queries(None, None, None, None)
                 .await
                 .expect("to get queries");
 

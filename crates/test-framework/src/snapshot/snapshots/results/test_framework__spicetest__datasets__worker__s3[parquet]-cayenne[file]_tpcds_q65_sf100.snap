@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q65"
+---
++--------------+-------------+---------+-----------------+------------------+--------------------+
+| s_store_name | i_item_desc | revenue | i_current_price | i_wholesale_cost | i_brand            |
++--------------+-------------+---------+-----------------+------------------+--------------------+
+| able         | A           | 7.74    | 2.47            | 1.13             | amalgedu pack #2   |
+| able         | A           | 4.90    | 2.86            | 2.48             | amalgexporti #1    |
+| able         | A           | 3.21    | 3.29            | 2.79             | amalgamalg #2      |
+| able         | A           | 0.00    | 1.81            | 0.66             | edu packexporti #1 |
+| able         | A           | 6.96    | 6.64            | 2.19             | maxinameless #7    |
+| able         | A           | 9.71    | 3.35            | 2.34             | edu packexporti #2 |
+| able         | A           | 0.57    | 1.75            | 0.57             | importoedu pack #1 |
+| able         | A           | 8.85    | 3.97            | 1.66             | amalgexporti #2    |
+| able         | A           | 9.19    | 1.07            | 0.87             | amalgmaxi #3       |
+| able         | A           | 4.64    | 9.15            | 7.22             | importoscholar #2  |
++--------------+-------------+---------+-----------------+------------------+--------------------+

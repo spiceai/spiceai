@@ -737,7 +737,7 @@ mod test {
         // Use the correct answer, but a different datatype
         // Q22 from CSV, cntrycode is Utf8. Query returns it as Int64
         let query = QuerySet::Tpch
-            .get_queries(None, None, None)
+            .get_queries(None, None, None, None)
             .await
             .expect("to get queries")
             .get(20)
@@ -823,7 +823,7 @@ mod test {
     async fn test_wrong_answers() {
         // Use the wrong answer and validate it fails
         let query = QuerySet::Tpch
-            .get_queries(None, None, None)
+            .get_queries(None, None, None, None)
             .await
             .expect("to get queries")
             .get(20)

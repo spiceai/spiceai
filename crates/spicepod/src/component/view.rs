@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{Nameable, WithDependsOn, dataset::ReadyState, is_default};
-use crate::{acceleration::Acceleration, semantic::Column, vector::VectorStore};
+use crate::{
+    acceleration::Acceleration, metadata::metadata_value_to_string, semantic::Column,
+    vector::VectorStore,
+};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -102,7 +105,7 @@ impl View {
             metadata.insert("description".to_string(), d.clone());
         }
         for (k, v) in &self.metadata {
-            metadata.insert(k.clone(), v.to_string());
+            metadata.insert(k.clone(), metadata_value_to_string(v));
         }
         metadata
     }

@@ -260,7 +260,8 @@ fn is_cayenne_table(session: &SessionState, table_name: &TableReference) -> bool
 async fn is_distributed_insert_table(session: &SessionState, table_name: &TableReference) -> bool {
     // Distributed scheduler-mode INSERT rewriting applies to both:
     // 1. Cayenne catalog tables, which must be forwarded to executors, and
-    // 2. write-through accelerated tables, which also forward writes remotely.
+    // 2. dual-write accelerated tables (Iceberg federated catalog cache), which
+    //    also forward writes remotely.
     if is_cayenne_table(session, table_name) {
         return true;
     }
@@ -280,12 +281,12 @@ async fn is_distributed_insert_table(session: &SessionState, table_name: &TableR
         return false;
     };
 
-    is_write_through_table_provider(&table_provider)
+    is_dual_write_table_provider(&table_provider)
 }
 
-fn is_write_through_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
+fn is_dual_write_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
     if let Some(accelerated) = table_provider.as_any().downcast_ref::<AcceleratedTable>() {
-        return accelerated.is_write_through();
+        return accelerated.is_dual_write();
     }
 
     if let Some(adaptor) = table_provider
@@ -294,7 +295,7 @@ fn is_write_through_table_provider(table_provider: &Arc<dyn TableProvider>) -> b
         && let Some(inner_provider) = adaptor.table_provider.as_ref()
         && let Some(accelerated) = inner_provider.as_any().downcast_ref::<AcceleratedTable>()
     {
-        return accelerated.is_write_through();
+        return accelerated.is_dual_write();
     }
 
     false
