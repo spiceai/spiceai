@@ -242,6 +242,12 @@ impl SpiceTestQueryWorker {
             );
         }
 
+        if validation::has_static_tpch_answer(query)
+            && !validation::should_validate_with_static_tpch_answer(query, self.scale_factor)
+        {
+            return Ok(QueryValidationResult::Pass);
+        }
+
         // Fall back to TPCH validation (which handles TPCH, parameterized TPCH, etc.)
         validation::validate_tpch_query(query, actual_batches)
     }

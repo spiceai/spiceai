@@ -127,6 +127,16 @@ static TPCH_ANSWERS: LazyLock<BTreeMap<Arc<str>, Vec<RecordBatch>>> = LazyLock::
     }
 });
 
+#[must_use]
+pub fn has_static_tpch_answer(query: &Query) -> bool {
+    TPCH_ANSWERS.contains_key(&query.name)
+}
+
+#[must_use]
+pub fn should_validate_with_static_tpch_answer(query: &Query, scale_factor: f64) -> bool {
+    (scale_factor - 1.0).abs() < f64::EPSILON && has_static_tpch_answer(query)
+}
+
 fn datatype_equivalent(expected_type: &DataType, actual_type: &DataType) -> bool {
     if expected_type == actual_type {
         return true;
@@ -667,6 +677,16 @@ mod test {
             .clone();
         let schema = batches[0].schema();
         assert_eq!(schema.fields().len(), 10);
+    }
+
+    #[test]
+    fn test_static_tpch_answers_are_sf1_only() {
+        let query = Query::new("tpch_q22".into(), "SELECT 1".into(), false);
+
+        assert!(has_static_tpch_answer(&query));
+        assert!(should_validate_with_static_tpch_answer(&query, 1.0));
+        assert!(!should_validate_with_static_tpch_answer(&query, 10.0));
+        assert!(!should_validate_with_static_tpch_answer(&query, 100.0));
     }
 
     #[test]
