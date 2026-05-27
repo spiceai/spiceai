@@ -131,8 +131,6 @@ pub struct BenchArgs {
     pub update_snapshots: Option<UpdateSnapshots>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validate_results: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reference_schema: Option<String>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         serialize_with = "serialize_scale_factor"

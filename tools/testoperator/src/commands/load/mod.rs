@@ -138,6 +138,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let (baseline_query_set, test_builder) = super::build_test_with_validation(
         &args.test_args,
+        &app,
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::QuerySetCompleted(1))
@@ -164,6 +165,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let (_, test_builder) = super::build_test_with_validation(
         &args.test_args,
+        &app,
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::Duration(baseline_duration))
@@ -221,7 +223,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     }
 
     let (query_set, test_builder) =
-        super::build_test_with_validation(&args.test_args, test_builder).await?;
+        super::build_test_with_validation(&args.test_args, &app, test_builder).await?;
 
     // Use the same query overrides that were applied in build_test_with_validation
     let query_overrides = args

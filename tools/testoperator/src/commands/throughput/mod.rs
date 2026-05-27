@@ -77,6 +77,7 @@ async fn run_inner(
 
     let (_query_set, test_builder) = super::build_test_with_validation(
         args,
+        &app,
         NotStarted::new()
             .with_parallel_count(1)
             .with_end_condition(EndCondition::QuerySetCompleted(6))
@@ -104,6 +105,7 @@ async fn run_inner(
 
     let (_query_set, test_builder) = super::build_test_with_validation(
         args,
+        &app,
         NotStarted::new()
             .with_parallel_count(args.common.concurrency)
             .with_end_condition(EndCondition::QuerySetCompleted(2))

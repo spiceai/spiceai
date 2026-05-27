@@ -34,6 +34,9 @@ use test_framework::{
 };
 
 const AUTOMATIC_REFERENCE_SCHEMA: &str = "__test_reference";
+const TPCH_TABLE_NAMES: [&str; 8] = [
+    "customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier",
+];
 
 #[cfg(feature = "append")]
 pub(crate) mod append;
@@ -82,6 +85,7 @@ pub(crate) fn create_telemetry_with_resource(common: &CommonArgs, resource: Reso
 /// Tuple of (`QuerySet`, `NotStarted` builder)
 pub(crate) async fn build_test_with_validation(
     args: &DatasetTestArgs,
+    app: &App,
     test_builder: NotStarted,
 ) -> anyhow::Result<(QuerySet, NotStarted)> {
     let query_set = args.load_query_set()?;
@@ -107,7 +111,7 @@ pub(crate) async fn build_test_with_validation(
     }
 
     // Add reference schema for validation against known good tables
-    if let Some(ref_schema) = validation_reference_schema(args)? {
+    if let Some(ref_schema) = validation_reference_schema(args, app)? {
         test_builder = test_builder.with_reference_schema(Some(ref_schema));
     }
 
@@ -118,25 +122,55 @@ fn supports_automatic_reference_validation(query_set: &QuerySet) -> bool {
     matches!(query_set, QuerySet::Tpch | QuerySet::ParameterizedTpch)
 }
 
-fn validation_reference_schema(args: &DatasetTestArgs) -> anyhow::Result<Option<String>> {
+fn validation_reference_schema(
+    args: &DatasetTestArgs,
+    app: &App,
+) -> anyhow::Result<Option<String>> {
     if let Some(reference_schema) = &args.reference_schema {
         return Ok(Some(reference_schema.clone()));
     }
 
-    if !args.validate || args.common.is_external_instance() || args.common.is_system_adapter() {
+    if !args.validate {
         return Ok(None);
     }
 
     let query_set = args.load_query_set()?;
-    if supports_automatic_reference_validation(&query_set) {
-        Ok(Some(AUTOMATIC_REFERENCE_SCHEMA.to_string()))
-    } else {
-        Ok(None)
+    if !supports_automatic_reference_validation(&query_set) {
+        return Ok(None);
     }
+
+    if let Some(reference_schema) = detect_tpch_reference_schema(app) {
+        return Ok(Some(reference_schema));
+    }
+
+    if args.common.is_external_instance() || args.common.is_system_adapter() {
+        return Ok(None);
+    }
+
+    Ok(Some(AUTOMATIC_REFERENCE_SCHEMA.to_string()))
+}
+
+fn detect_tpch_reference_schema(app: &App) -> Option<String> {
+    let mut schemas = BTreeMap::<&str, BTreeSet<&str>>::new();
+
+    for dataset in &app.datasets {
+        let Some((schema_name, table_name)) = dataset.name.split_once('.') else {
+            continue;
+        };
+
+        if TPCH_TABLE_NAMES.contains(&table_name) {
+            schemas.entry(schema_name).or_default().insert(table_name);
+        }
+    }
+
+    schemas
+        .into_iter()
+        .find(|(_, tables)| TPCH_TABLE_NAMES.iter().all(|table| tables.contains(*table)))
+        .map(|(schema_name, _)| schema_name.to_string())
 }
 
 fn add_automatic_reference_datasets(args: &DatasetTestArgs, app: &mut App) -> anyhow::Result<()> {
-    if args.reference_schema.is_some() || validation_reference_schema(args)?.is_none() {
+    if validation_reference_schema(args, app)?.as_deref() != Some(AUTOMATIC_REFERENCE_SCHEMA) {
         return Ok(());
     }
 
@@ -458,16 +492,20 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn automatic_reference_datasets_clone_base_datasets() {
-        let args = DatasetTestArgs::parse_from([
+    fn tpch_validation_args() -> DatasetTestArgs {
+        DatasetTestArgs::parse_from([
             "testoperator",
             "--query-set",
             "tpch",
             "--validate",
             "--scale-factor",
             "100",
-        ]);
+        ])
+    }
+
+    #[test]
+    fn automatic_reference_datasets_clone_base_datasets() {
+        let args = tpch_validation_args();
 
         let mut app = App::default();
         app.datasets
@@ -488,6 +526,35 @@ mod tests {
             app.datasets
                 .iter()
                 .all(|dataset| dataset.name != "__test_reference.existing.lineitem")
+        );
+    }
+
+    #[test]
+    fn existing_tpch_reference_schema_is_detected() {
+        let args = tpch_validation_args();
+        let mut app = App::default();
+        app.datasets
+            .push(Dataset::new("s3://bucket/customer.parquet", "customer"));
+
+        for table_name in TPCH_TABLE_NAMES {
+            app.datasets.push(Dataset::new(
+                format!("s3://bucket/{table_name}.parquet"),
+                format!("arrow.{table_name}"),
+            ));
+        }
+
+        assert_eq!(
+            validation_reference_schema(&args, &app).expect("should get reference schema"),
+            Some("arrow".to_string())
+        );
+
+        add_automatic_reference_datasets(&args, &mut app)
+            .expect("should not add generated references");
+
+        assert!(
+            app.datasets
+                .iter()
+                .all(|dataset| !dataset.name.starts_with("__test_reference."))
         );
     }
 }

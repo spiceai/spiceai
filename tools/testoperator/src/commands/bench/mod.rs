@@ -175,6 +175,7 @@ async fn run_inner(
 
     let (_, test_builder) = super::build_test_with_validation(
         args,
+        &app,
         NotStarted::new()
             .with_parallel_count(1)
             .with_end_condition(EndCondition::QuerySetCompleted(5))
