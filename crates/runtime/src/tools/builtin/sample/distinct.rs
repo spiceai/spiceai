@@ -244,6 +244,7 @@ mod tests {
             cols: None,
         };
 
+        let df = Arc::clone(&df) as Arc<dyn QueryEngine>;
         let sample = params
             .sample(Arc::clone(&df))
             .await
