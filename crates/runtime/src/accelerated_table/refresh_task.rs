@@ -47,7 +47,9 @@ use arrow::{
 use arrow_schema::SchemaRef;
 use async_stream::stream;
 use data_components::poly::PolyTableProvider;
-use data_components::{FieldMetadata, MetadataEnrichedTableProvider, metadata_enriched_table_provider};
+use data_components::{
+    FieldMetadata, MetadataEnrichedTableProvider, metadata_enriched_table_provider,
+};
 use datafusion::catalog::MemoryCatalogProvider;
 use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::execution::SessionStateBuilder;
@@ -2471,9 +2473,10 @@ mod tests {
     #[test]
     fn table_provider_with_existing_metadata_preserves_indexed_provider() {
         let schema = Arc::new(Schema::new_with_metadata(
-            vec![Field::new("id", DataType::Int64, false).with_metadata(
-                [("field_meta".to_string(), "field_value".to_string())].into(),
-            )],
+            vec![
+                Field::new("id", DataType::Int64, false)
+                    .with_metadata([("field_meta".to_string(), "field_value".to_string())].into()),
+            ],
             [("table_meta".to_string(), "table_value".to_string())].into(),
         ));
         let batch = RecordBatch::try_new(
@@ -2487,10 +2490,9 @@ mod tests {
         );
         let index: Arc<dyn runtime_datafusion_index::Index + Send + Sync> =
             Arc::new(TestRefreshIndex);
-        let indexed_provider: Arc<dyn TableProvider> = Arc::new(IndexedTableProvider::with_indexes(
-            mem_table,
-            vec![Arc::clone(&index)],
-        ));
+        let indexed_provider: Arc<dyn TableProvider> = Arc::new(
+            IndexedTableProvider::with_indexes(mem_table, vec![Arc::clone(&index)]),
+        );
 
         let wrapped = table_provider_with_existing_metadata(indexed_provider);
         let indexed = wrapped
@@ -2508,7 +2510,10 @@ mod tests {
 
         let wrapped_schema = wrapped.schema();
         assert_eq!(
-            wrapped_schema.metadata().get("table_meta").map(String::as_str),
+            wrapped_schema
+                .metadata()
+                .get("table_meta")
+                .map(String::as_str),
             Some("table_value")
         );
         let id_field = wrapped_schema
