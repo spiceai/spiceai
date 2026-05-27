@@ -306,6 +306,11 @@ impl RuntimeBuilder {
             }
         };
 
+        let scheduler_node_id: Option<Arc<str>> = self
+            .resolved_cluster_config
+            .as_ref()
+            .map(|cfg| Arc::<str>::from(cfg.metrics_node_id()));
+
         let distributed: Option<DistributedNode> = match self
             .resolved_cluster_config
             .as_ref()
@@ -338,9 +343,10 @@ impl RuntimeBuilder {
                                 Arc::new(PartitionStore::accelerations(Arc::clone(&cluster_state)));
                             let catalog_partitions_store =
                                 Arc::new(PartitionStore::catalog(Arc::clone(&cluster_state)));
-                            let executor_registry = Arc::new(ExecutorRegistry::new(
+                            let executor_registry = Arc::new(ExecutorRegistry::with_node_id(
                                 Arc::clone(&accelerations_partitions_store),
                                 Arc::clone(&catalog_partitions_store),
+                                scheduler_node_id.clone(),
                             ));
                             let partition_service = Arc::new(PartitionService::new(
                                 Arc::clone(&accelerations_partitions_store),
@@ -382,9 +388,10 @@ impl RuntimeBuilder {
                         Arc::new(PartitionStore::accelerations(Arc::clone(&cluster_state)));
                     let catalog_partitions_store =
                         Arc::new(PartitionStore::catalog(Arc::clone(&cluster_state)));
-                    let executor_registry = Arc::new(ExecutorRegistry::new(
+                    let executor_registry = Arc::new(ExecutorRegistry::with_node_id(
                         Arc::clone(&accelerations_partitions_store),
                         Arc::clone(&catalog_partitions_store),
+                        scheduler_node_id.clone(),
                     ));
                     let partition_service = Arc::new(PartitionService::new(
                         Arc::clone(&accelerations_partitions_store),
