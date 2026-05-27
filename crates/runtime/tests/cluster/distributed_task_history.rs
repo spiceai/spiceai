@@ -132,8 +132,10 @@ impl opentelemetry_sdk::trace::SpanExporter for SwappableExporter {
             // `node_id` — synthesize one for the test.
             let (ballista_transform, ballista_retention) =
                 runtime::datafusion::query::stage_history::BallistaStageMiddleware::pair();
+            let query_engine: std::sync::Arc<dyn runtime_datafusion::query_engine::QueryEngine> =
+                df;
             let exporter = TaskHistoryExporter::new(
-                df as std::sync::Arc<dyn runtime_datafusion::query_engine::QueryEngine>,
+                query_engine,
                 TaskHistoryCapturedOutput::Truncated,
                 TaskHistoryCapturedContext::Truncated,
                 None,

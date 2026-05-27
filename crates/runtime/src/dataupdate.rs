@@ -347,6 +347,7 @@ mod tests {
     use super::*;
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use datafusion::physical_plan::collect;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::sql::TableReference;

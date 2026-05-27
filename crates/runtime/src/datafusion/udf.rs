@@ -290,8 +290,7 @@ async fn maybe_register_function_as_tool(runtime: &crate::Runtime, decl: &Functi
     if !decl.as_tool {
         return;
     }
-    let df_dyn: Arc<dyn runtime_datafusion::query_engine::QueryEngine> =
-        Arc::clone(&runtime.df) as Arc<dyn runtime_datafusion::query_engine::QueryEngine>;
+    let df_dyn: Arc<dyn runtime_datafusion::query_engine::QueryEngine> = Arc::clone(&runtime.df);
     let df_weak = Arc::downgrade(&df_dyn);
     match crate::tools::builtin::function_tool::build(decl, df_weak) {
         Ok(adapter) => {

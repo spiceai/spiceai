@@ -138,6 +138,10 @@ pub trait QueryEngine: Send + Sync + Debug {
     fn get_user_table_names(&self) -> Vec<TableReference>;
 
     /// Get all public table names as fully-qualified strings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying table metadata cannot be read.
     fn get_public_table_names(&self) -> Result<Vec<String>, BoxError>;
 
     // --- Access control ---

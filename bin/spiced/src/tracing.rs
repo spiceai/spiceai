@@ -245,8 +245,10 @@ where
 
     let (ballista_transform, ballista_retention) =
         runtime::datafusion::query::stage_history::BallistaStageMiddleware::pair();
+    let query_engine: std::sync::Arc<dyn runtime_datafusion::query_engine::QueryEngine> =
+        std::sync::Arc::clone(&df);
     let task_history_exporter = task_history::otel_exporter::TaskHistoryExporter::new(
-        df as std::sync::Arc<dyn runtime_datafusion::query_engine::QueryEngine>,
+        query_engine,
         captured_output,
         captured_context,
         min_sql_duration_ms,
