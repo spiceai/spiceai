@@ -1403,7 +1403,6 @@ mod tests {
             Arc::new(AcceleratorEngineRegistry::default()),
             handle,
         )
-        .cayenne_optimizer_rules(CayenneOptimizerRules::all_enabled())
         .build();
 
         let state = df.ctx.state();
@@ -1436,7 +1435,6 @@ mod tests {
             Arc::new(AcceleratorEngineRegistry::default()),
             handle,
         )
-        .cayenne_optimizer_rules(CayenneOptimizerRules::all_enabled())
         .build();
 
         let state = df.ctx.state();
@@ -1649,7 +1647,7 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
-    fn test_enabled_cayenne_filter_propagation_rewrites_only_q21_shaped_queries() {
+    fn test_enabled_cayenne_filter_propagation_rewrites_only_selective_large_fact_queries() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1665,17 +1663,17 @@ mod tests {
         .build();
 
         rt.block_on(async {
-            register_q21_shape_tables(&df.ctx);
+            register_large_fact_dimension_tables(&df.ctx);
 
-            let q21_plan = optimized_sql_query_plan(
+            let large_fact_plan = optimized_sql_query_plan(
                 &df.ctx,
                 "SELECT s_suppkey FROM supplier, nation \
                  WHERE s_nationkey = n_nationkey AND n_name = 'CHINA'",
             )
             .await;
             assert!(
-                logical_plan_has_propagated_filter_marker(&q21_plan),
-                "enabled Cayenne filter propagation should fire for the q21-shaped large-fact join; plan was:\n{q21_plan}"
+                logical_plan_has_propagated_filter_marker(&large_fact_plan),
+                "enabled Cayenne filter propagation should fire for the selective large-fact join; plan was:\n{large_fact_plan}"
             );
 
             let no_dim_filter_plan = optimized_sql_query_plan(
@@ -1769,7 +1767,7 @@ mod tests {
             .await;
             assert!(
                 logical_plan_has_propagated_filter_marker(&cayenne_probe_plan),
-                "mixed-source join should still propagate onto the Cayenne-backed side when the q21 shape is present; plan was:\n{cayenne_probe_plan}"
+                "mixed-source join should still propagate onto the Cayenne-backed side when the selective large-fact shape is present; plan was:\n{cayenne_probe_plan}"
             );
 
             let non_cayenne_probe_plan = optimized_sql_query_plan(
@@ -1912,11 +1910,11 @@ mod tests {
                      WHERE s_nationkey = n_nationkey AND n_name = 'CHINA'",
                 )
                 .await
-                .expect("q21-shaped query should create a dataframe");
+                .expect("selective large-fact query should create a dataframe");
             let optimized_plan = dataframe
                 .clone()
                 .into_optimized_plan()
-                .expect("q21-shaped query should optimize");
+                .expect("selective large-fact query should optimize");
             let optimized_plan = optimized_plan.to_string();
 
             assert!(
@@ -1927,7 +1925,7 @@ mod tests {
             dataframe
                 .create_physical_plan()
                 .await
-                .expect("q21-shaped query should create a physical plan");
+                .expect("selective large-fact query should create a physical plan");
         });
     }
 
@@ -1938,8 +1936,8 @@ mod tests {
     /// cycle-detection fix in `analyze_logical_side`, the rule would re-fire
     /// each pass and stack one redundant `LeftSemi` per iteration up to
     /// `max_passes`. This integration test runs the full optimizer pipeline
-    /// and asserts the final plan has at most one `LeftSemi` for the q21
-    /// shape — proving the cycle guard holds across decorrelation.
+    /// and asserts the final plan has at most one `LeftSemi` for the selective
+    /// large-fact shape — proving the cycle guard holds across decorrelation.
     #[test]
     #[cfg(not(windows))]
     fn test_built_datafusion_does_not_stack_redundant_left_semi_after_decorrelation() {
@@ -1993,10 +1991,10 @@ mod tests {
                      WHERE s_nationkey = n_nationkey AND n_name = 'CHINA'",
                 )
                 .await
-                .expect("q21-shaped query should create a dataframe");
+                .expect("selective large-fact query should create a dataframe");
             let optimized_plan = dataframe
                 .into_optimized_plan()
-                .expect("q21-shaped query should optimize");
+                .expect("selective large-fact query should optimize");
             let plan_text = optimized_plan.to_string();
 
             // The optimizer iterates rules to fixed point. Before the cycle
@@ -2028,6 +2026,7 @@ mod tests {
             Arc::new(AcceleratorEngineRegistry::default()),
             handle,
         )
+        .cayenne_optimizer_rules(CayenneOptimizerRules::all_enabled())
         .build();
 
         let state = df.ctx.state();
@@ -2124,7 +2123,7 @@ mod tests {
     }
 
     #[cfg(not(windows))]
-    fn register_q21_shape_tables(ctx: &SessionContext) {
+    fn register_large_fact_dimension_tables(ctx: &SessionContext) {
         register_stat_table(
             ctx,
             "nation",
@@ -2177,10 +2176,10 @@ mod tests {
             table_name,
             Arc::new(
                 StatMemTable::try_new(Arc::clone(&schema), vec![vec![]], num_rows)
-                    .expect("q21-shape stat table should be valid"),
+                    .expect("selective large-fact stat table should be valid"),
             ),
         )
-        .expect("q21-shape stat table should register");
+        .expect("selective large-fact stat table should register");
     }
 
     #[cfg(not(windows))]

@@ -17,16 +17,15 @@ limitations under the License.
 //! Logical optimizer rules for Cayenne.
 //!
 //! The flagship rules here are [`CayennePropagateFilterAcrossEquiJoinKeys`]
-//! and [`CayenneReassociateCrossJoin`], the plan-time rewrites used to unblock
-//! chbench q21 (see `crates/cayenne/src/optimizer_rules.rs` module docs for
-//! the broader no-spill strategy this fits into).
+//! and [`CayenneReassociateCrossJoin`], the plan-time rewrites that expose
+//! selective key domains and avoid preserving expensive join-order shapes.
 //!
 //! `DataFusion`'s stock `infer_join_predicates` (in `push_down_filter`) already
 //! propagates predicates that *directly* reference a join-key column:
 //! `WHERE nation.n_nationkey = 5 AND nation.n_nationkey = supplier.s_nationkey`
 //! is transformed into `WHERE supplier.s_nationkey = 5 AND ...`. That covers
-//! the `n_nationkey = $const` shape but misses the q21 shape, where the
-//! selective filter is on a *non-key* column (`n_name = 'CHINA'`). The
+//! the `n_nationkey = $const` shape but misses the common star/snowflake
+//! shape, where the selective filter is on a *non-key* column (`n_name = 'CHINA'`). The
 //! cardinality bound the dim-table filter implies for the equi-joined key
 //! column never reaches the fact-table scans, so by the time the planner
 //! orders joins from the SQL `FROM` clause, `(supplier, order_line, …)`
@@ -50,7 +49,7 @@ limitations under the License.
 //! already exist on the original side, so `DataFusion`'s
 //! `decorrelate_predicate_subquery` and `push_down_filter` can then plant a
 //! `LeftSemi` join (or, after pushdown, a partition-pruning predicate) on
-//! the fact-table scan. For q21 this turns
+//! the fact-table scan. For example, this turns
 //! `nation ⋈ supplier ⋈ order_line` into a shape where `supplier.s_nationkey
 //! IN (SELECT n_nationkey FROM nation WHERE n_name = 'CHINA')` is visible
 //! while the join graph is being costed.
@@ -66,8 +65,7 @@ limitations under the License.
 //!
 //! Outer joins and expression join keys are excluded. They can be legal to
 //! rewrite in narrow cases, but HTAP workloads showed the extra semi-join shape
-//! can cost more than it saves outside the q17/q21-style column-domain pruning
-//! path.
+//! can cost more than it saves outside selective dimension-to-fact pruning.
 //!
 //! ## Termination
 //!
@@ -98,8 +96,8 @@ limitations under the License.
 //!   there isn't enough probe-side cardinality for the filter to save
 //!   meaningful work, and the plain hash join wins.
 //! * [`MIN_FACT_TO_DIM_KEY_DOMAIN_RATIO`] — skip unless the receiving side is
-//!   much larger than the filtered side's join-key domain. This keeps q17/q21
-//!   style small-domain pruning, while avoiding broad propagation across
+//!   much larger than the filtered side's join-key domain. This keeps
+//!   small-domain pruning, while avoiding broad propagation across
 //!   similarly sized HTAP joins.
 //!
 //! Statistics are required before propagation fires: the receiving subtree must
@@ -141,7 +139,7 @@ type TableSourcePredicate = Arc<dyn Fn(&dyn TableSource) -> bool + Send + Sync>;
 /// `Filter(other_side.key IN (SELECT this_side.key FROM this_side_subtree))`
 /// on the Cayenne-backed side opposite a non-key filter.
 ///
-/// See the module-level docs for the full design and the q21 motivation.
+/// See the module-level docs for the full design and selective join-domain motivation.
 pub struct CayennePropagateFilterAcrossEquiJoinKeys {
     is_cayenne_table_source: TableSourcePredicate,
 }
@@ -346,12 +344,11 @@ impl SideAnalysis {
 /// SQL `FROM` order leaves an early cross join in front of a later selective
 /// join.
 ///
-/// The canonical q21 shape is `(supplier CROSS order_line) JOIN oorder`, where
-/// the parent join predicates only reference `order_line` and `oorder`. This
-/// rule rewrites that to `supplier CROSS (order_line JOIN oorder)` while
-/// preserving the final output schema order. If the parent join also contains
-/// predicates involving `supplier`, only the `order_line`/right-side predicates
-/// move inward and the `supplier` predicates remain on the outer join.
+/// A typical shape is `(A CROSS B) JOIN C`, where the parent join predicates
+/// only reference `B` and `C`. This rule rewrites that to `A CROSS (B JOIN C)`
+/// while preserving the final output schema order. If the parent join also
+/// contains predicates involving `A`, only the `B`/`C` predicates move inward
+/// and the `A` predicates remain on the outer join.
 pub struct CayenneReassociateCrossJoin {
     is_cayenne_table_source: TableSourcePredicate,
 }
@@ -874,7 +871,7 @@ fn join_key_types_match(
 
 /// Maximum number of `TableScan` leaves allowed inside a dim-like subtree.
 ///
-/// Chosen to cover the canonical chbench / TPC-H dimension snowflake
+/// Chosen to cover common dimension snowflakes
 /// (`region ⋈ nation ⋈ supplier`, three leaves) without admitting arbitrarily
 /// large dim joins whose re-execution under an `InSubquery` would be expensive.
 const MAX_DIM_LIKE_TABLE_SCANS: usize = 3;
@@ -1504,13 +1501,13 @@ mod tests {
             Field::new("s_nationkey", DataType::Int64, false),
         ]));
         // fact-like customer table for expression-equi-key no-op tests
-        // (chbench `ascii(substr(c_state, 1, 1)) - 65` nation mapping).
+        // (expression-derived nation mapping).
         let customer_schema = Arc::new(Schema::new(vec![
             Field::new("c_id", DataType::Int64, false),
             Field::new("c_state", DataType::Utf8, true),
         ]));
         // Dim tables use realistic small domains; fact tables are large enough
-        // for the fact-to-dim key-domain ratio gate to allow q21-style pruning.
+        // for the fact-to-dim key-domain ratio gate to allow pruning.
         ctx.register_table(
             "nation",
             Arc::new(StatMemTable::try_new(
@@ -1739,7 +1736,7 @@ mod tests {
         )?;
         assert!(
             transformed.transformed,
-            "q21-shaped cross join should be reassociated; plan was:\n{plan}"
+            "cross join with later selective predicates should be reassociated; plan was:\n{plan}"
         );
         assert_eq!(
             transformed.data.schema(),
@@ -2000,7 +1997,7 @@ mod tests {
 
     #[tokio::test]
     async fn inner_join_with_dim_filter_propagates_via_subquery() -> Result<()> {
-        // The canonical q21 shape (reduced):
+        // Representative large fact/dimension join shape:
         //   FROM supplier, nation
         //   WHERE s_nationkey = n_nationkey AND n_name = 'CHINA'
         //
@@ -2494,12 +2491,12 @@ mod tests {
 
     #[tokio::test]
     async fn inner_join_with_expression_fact_key_is_unchanged() -> Result<()> {
-        // The canonical chbench Q5/Q7/Q10 shape: a non-trivial expression on
+        // Common expression-key join shape: a non-trivial expression on
         // the fact side and a pure column on the dim side, with the dim side
         // carrying the selective non-key filter.
         //
         // These expression-key joins were valid to rewrite but too easy to
-        // over-apply, so the q17/q21-focused rule now leaves them alone.
+        // over-apply, so the selective key-domain rule leaves them alone.
         let ctx = make_ctx()?;
         let plan = ctx
             .sql(
@@ -2609,11 +2606,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn q17_shaped_aggregate_propagates_using_group_key_domain() -> Result<()> {
-        // CH-benCH q17 joins a large outer `order_line` scan to an aggregate
-        // over `item ⋈ order_line`. The aggregate subtree contains a large
-        // fact scan, but the propagated `i_id` domain is bounded by `item`, so
-        // the ratio gate should still allow the q17 pruning path.
+    async fn aggregate_propagates_using_group_key_domain() -> Result<()> {
+        // A large outer fact scan can join to an aggregate over a filtered
+        // dimension/fact subtree. The aggregate subtree contains a large fact
+        // scan, but the propagated `i_id` domain is bounded by `item`, so the
+        // ratio gate should still allow the aggregate-domain pruning path.
         let ctx = SessionContext::new();
         let item_schema = Arc::new(Schema::new(vec![
             Field::new("i_id", DataType::Int64, false),

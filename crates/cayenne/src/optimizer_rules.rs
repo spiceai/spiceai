@@ -16,15 +16,15 @@ limitations under the License.
 
 //! Physical optimizer rules for Cayenne execution plans.
 //!
-//! # No-spill build-side memory strategy (q21 / chbench multi-way joins)
+//! # No-spill build-side memory strategy for wide multi-way joins
 //!
 //! `DataFusion`'s `HashJoinExec` build side is non-spillable. Under the runtime
-//! memory pool (`GreedyMemoryPool` wrapped in `TrackConsumersPool`), wide chbench
-//! shapes such as q21 (a 5-way join feeding a correlated `NOT EXISTS` self-join
-//! over `order_line`) exhaust the `HashJoinInput[N]` reservations because each
-//! build-side hash table independently materializes its full keyspace.
+//! memory pool (`GreedyMemoryPool` wrapped in `TrackConsumersPool`), wide
+//! multi-way joins with correlated semi/anti subplans can exhaust the
+//! `HashJoinInput[N]` reservations because each build-side hash table
+//! independently materializes its full keyspace.
 //!
-//! The q21 fix is layered so each optimizer rule handles the part `DataFusion`
+//! The optimizer strategy is layered so each rule handles the part `DataFusion`
 //! cannot currently spill or infer on its own:
 //!
 //! 1. **Logical predicate propagation.**
@@ -32,10 +32,10 @@ limitations under the License.
 //!    introduces explicit `InSubquery` filters for equi-join keys when the
 //!    selective predicate is on a non-key column. `DataFusion`'s stock
 //!    `infer_join_predicates` only fires when the predicate already references
-//!    a join key (`WHERE n_nationkey = 5` → `WHERE s_nationkey = 5`). For q21
-//!    the filter is `n_name = 'CHINA'`, so the Cayenne rule exposes the
-//!    `nation → supplier → stock/order_line` cardinality bound before
-//!    `push_down_filter` plants it into scans.
+//!    a join key (`WHERE n_nationkey = 5` → `WHERE s_nationkey = 5`). When the
+//!    selective filter is on a non-key dimension column, the Cayenne rule
+//!    exposes the dimension-to-fact cardinality bound before `push_down_filter`
+//!    plants it into scans.
 //!
 //! 2. **Cross-scan dynamic filter sharing.** When a join's
 //!    `Arc<DynamicFilterPhysicalExpr>` is pushed into one
@@ -66,8 +66,7 @@ limitations under the License.
 //! filter-pushdown phase plants into the right-side `CayenneAccelerationExec`'s
 //! `FileSource`.
 //!
-//! ## Audit notes (verified 2026-05-14 against the q21 explain snapshot at
-//! `crates/test-framework/src/snapshot/snapshots/explain/test_framework__snapshot__file[parquet]-cayenne[file]-indexes_tpch_q21_explain.snap`)
+//! ## Audit notes
 //!
 //! * **Cayenne table statistics are `Exact` at the physical-plan boundary.**
 //!   The chain `CayenneTableProvider::statistics`
@@ -78,13 +77,12 @@ limitations under the License.
 //!   `SessionConfig::default().collect_statistics()` is `true`, so
 //!   `ListingTable::do_collect_statistics` is exercised for every scan.
 //!   `CayenneAccelerationExec::partition_statistics` simply delegates to the
-//!   inner `DataSourceExec`, so the value reaches `JoinSelection`. The q21
-//!   explain plan confirms `should_swap_join_order` picks the smaller side as
-//!   build at every level (nation/supplier on the LEFT, lineitem on the
-//!   RIGHT), so poor q21 behavior is *not* attributable to fuzzy stats — the
-//!   logical optimizer must also avoid preserving SQL `FROM`-order cross joins
-//!   such as `(supplier CROSS order_line) JOIN oorder` when the parent join
-//!   predicates can be evaluated as `order_line JOIN oorder` first.
+//!   inner `DataSourceExec`, so the value reaches `JoinSelection`. Representative
+//!   explain plans confirm `should_swap_join_order` picks the smaller side as
+//!   build at every level, so poor behavior on wide joins is *not* attributable
+//!   to fuzzy stats — the logical optimizer must also avoid preserving SQL
+//!   `FROM`-order cross joins when the parent join predicates can be evaluated
+//!   inside a selective branch first.
 //!
 //! * **Build-side projections are minimal.** Every `CayenneAccelerationExec`
 //!   in the snapshot terminates in a `DataSourceExec` whose `projection=[...]`
@@ -94,8 +92,8 @@ limitations under the License.
 //!   `[l_orderkey, l_suppkey]`, etc. No additional `ProjectionExec` insertion
 //!   above the build side is required.
 //!
-//! With these layers active, q21 is included in
-//! `test_framework::queries::get_chbench_test_queries`.
+//! With these layers active, wide join and semi/anti-join workloads can stay on
+//! spillable or pruned execution paths more often.
 
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, IntervalUnit, SchemaRef};
@@ -161,11 +159,11 @@ impl std::fmt::Debug for CayenneDynamicFilterSharing {
 /// sort-merge join when the build side is large enough to risk OOM.
 ///
 /// `DataFusion`'s `HashJoinExec` always materializes its left input as the
-/// non-spillable build side regardless of join type. For q21, that build side
-/// can be a large multi-way `order_line` result for `NOT EXISTS` / `EXISTS`
-/// decorrelations. Sort-merge preserves those semi/anti semantics while
-/// keeping the build side spillable; ordinary inner/outer joins are left alone
-/// because their hash join can still be the faster plan.
+/// non-spillable build side regardless of join type. For wide semi/anti-join
+/// decorrelations, that build side can be a large multi-way result. Sort-merge
+/// preserves those semi/anti semantics while keeping the build side spillable;
+/// ordinary inner/outer joins are left alone because their hash join can still
+/// be the faster plan.
 #[derive(Default)]
 pub struct CayenneAntiJoinSortMergeRewriter;
 
@@ -399,8 +397,8 @@ fn try_rewrite_large_same_source_join(
     config: &ConfigOptions,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
     // Semi/anti joins are the clear-win target: `HashJoinExec` builds the LEFT
-    // input into a non-spillable hash table, while these q21-shaped joins do
-    // not have the same dynamic-filter fallback as ordinary inner joins.
+    // input into a non-spillable hash table, while these joins do not have the
+    // same dynamic-filter fallback as ordinary inner joins.
     if !matches!(
         hash_join.join_type(),
         JoinType::LeftAnti | JoinType::RightAnti | JoinType::LeftSemi | JoinType::RightSemi,
@@ -430,8 +428,8 @@ fn try_rewrite_large_same_source_join(
 
     // When a memory gate is configured, it's the *primary* signal — the row gate
     // becomes irrelevant unless the byte estimate is unavailable. This lets the
-    // rule catch wide-row builds (e.g. q21 self-joins over `stock` at SF1) whose
-    // row count is well below the row threshold but whose materialised hash
+    // rule catch wide-row builds whose row count is well below the row
+    // threshold but whose materialised hash
     // table would still exhaust the memory pool. When the gate is *inactive*
     // (no memory pool wired through config — direct DataFusion users), fall back
     // to the row-count threshold alone.
@@ -2320,8 +2318,8 @@ mod tests {
         );
     }
 
-    /// q21-shape regression: low row count but wide projection produces a build
-    /// big enough to OOM `HashJoinExec`'s non-spillable hash table. The byte gate
+    /// Wide-build regression: low row count but wide projection produces a
+    /// build big enough to OOM `HashJoinExec`'s non-spillable hash table. The byte gate
     /// must catch this case even though the row count is below
     /// `sort_merge_min_rows`.
     #[test]
