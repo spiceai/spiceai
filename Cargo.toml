@@ -299,7 +299,7 @@ sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
 sysinfo = "0.38.4"
-system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "d00700353822309a047a220c855493ac96ddc5a2", features = ["client", "server"] }
+system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "fc2e5c350b05f7d4d894642cf47cd31b9283c068", features = ["client", "server"] }
 tantivy = "0.26.0"
 tempfile = "3"
 tiberius = { version = "0.12.3", default-features = false, features = [
@@ -481,6 +481,3 @@ vortex-datafusion = { path = "crates/vortex" }
 vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6" } # spiceai-52.5
 vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6" } # spiceai-52.5
 vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6" } # spiceai-52.5
-
-[patch."https://github.com/spiceai/spicebench.git"]
-system-adapter-protocol = { path = "/Users/viktor/workspace/spicebench/crates/system-adapter-protocol" }
