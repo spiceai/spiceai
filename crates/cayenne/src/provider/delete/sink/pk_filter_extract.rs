@@ -237,16 +237,16 @@ fn collect_and_eq_pairs<'a>(expr: &'a Expr, pairs: &mut Vec<(&'a Expr, &'a Expr)
         }
 
         let Expr::BinaryExpr(bin) = current else {
-            continue;
+            return false;
         };
 
-        if bin.op == Operator::And {
-            stack.push(&bin.right);
-            stack.push(&bin.left);
-            continue;
-        }
-        if bin.op == Operator::Eq {
-            pairs.push((&bin.left, &bin.right));
+        match bin.op {
+            Operator::And => {
+                stack.push(&bin.right);
+                stack.push(&bin.left);
+            }
+            Operator::Eq => pairs.push((&bin.left, &bin.right)),
+            _ => return false,
         }
     }
 
@@ -507,6 +507,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_composite_pk_extra_predicate_returns_none() {
+        let converter = make_composite_converter();
+        let pk_columns = vec!["pk".to_string(), "sk".to_string()];
+        let target_types = vec![
+            &arrow_schema::DataType::Int64 as &DataType,
+            &arrow_schema::DataType::Utf8 as &DataType,
+        ];
+
+        let expr = make_and_conjunction(1, "x")
+            .and(col("other").gt(Expr::Literal(ScalarValue::Int64(Some(0)), None)));
+        assert!(
+            try_extract_composite_pk_keys(&expr, &pk_columns, &target_types, &converter).is_none()
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Tree-walking helper tests
     // -----------------------------------------------------------------------
@@ -541,6 +557,14 @@ mod tests {
         let mut pairs = Vec::new();
         assert!(collect_and_eq_pairs(&expr, &mut pairs));
         assert_eq!(pairs.len(), 2);
+    }
+
+    #[test]
+    fn test_collect_and_eq_pairs_rejects_non_equality_predicate() {
+        let expr = make_and_conjunction(1, "x")
+            .and(col("other").gt(Expr::Literal(ScalarValue::Int64(Some(0)), None)));
+        let mut pairs = Vec::new();
+        assert!(!collect_and_eq_pairs(&expr, &mut pairs));
     }
 
     #[test]

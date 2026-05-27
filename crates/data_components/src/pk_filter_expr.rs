@@ -116,7 +116,7 @@ pub enum Error {
     ))]
     ArrayDowncastFailed {
         field_name: String,
-        expected_type: String,
+        expected_type: &'static str,
         schema: SchemaRef,
     },
 }
