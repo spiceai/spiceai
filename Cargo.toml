@@ -121,18 +121,18 @@ async-openai = { git = "https://github.com/spiceai/async-openai", rev = "98e0c53
 ] }
 async-stream = "0.3.5"
 async-trait = "0.1.89"
-aws-config = "1.8.16"
+aws-config = "1.8.17"
 aws-credential-types = "1.2.13"
 aws-runtime = "1.7.1"
-aws-sdk-bedrockruntime = "1.130.0"
-aws-sdk-cognitoidentity = "1.99.0"
-aws-sdk-cognitoidentityprovider = "1.116.0"
-aws-sdk-dynamodb = "1.111.0"
-aws-sdk-dynamodbstreams = "1.99.0"
-aws-sdk-glue = "1.145.1"
-aws-sdk-s3 = "1.132.0"
-aws-sdk-s3vectors = "1.24.0"
-aws-sdk-secretsmanager = "1.104.0"
+aws-sdk-bedrockruntime = "1.131.0"
+aws-sdk-cognitoidentity = "1.100.0"
+aws-sdk-cognitoidentityprovider = "1.117.0"
+aws-sdk-dynamodb = "1.112.0"
+aws-sdk-dynamodbstreams = "1.100.0"
+aws-sdk-glue = "1.146.0"
+aws-sdk-s3 = "1.133.0"
+aws-sdk-s3vectors = "1.25.0"
+aws-sdk-secretsmanager = "1.105.0"
 aws-sdk-sts = "1.102.0"
 aws-smithy-async = "1.2.14"
 aws-smithy-runtime = "1.11.1"
@@ -169,7 +169,7 @@ datafusion-common-runtime = "52.0.0"
 datafusion-datasource = "52.0.0"
 datafusion-execution = "52.0.0"
 datafusion-expr = "52.0.0"
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a4fce79433e5c2fe779427c0bfce6a599193e300", features = ["sql"] } # branch: trunk; SHA format (short vs full) must match to what datafusion-table-providers use for datafusion-federation
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "6b6bfb0d30da8e5c2eb851094e366d98fa839575", features = ["sql"] } # branch: trunk; SHA format (short vs full) must match to what datafusion-table-providers use for datafusion-federation
 datafusion-functions = "52.0.0"
 datafusion-functions-json = "0.52"
 datafusion-physical-expr = "52.0.0"
@@ -427,7 +427,7 @@ datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.g
 datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "06e4b624c6073c40c7b2127ce620e281ec1979ae" }                    # spiceai-52.5
 datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "06e4b624c6073c40c7b2127ce620e281ec1979ae" }                # spiceai-52.5
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "29f66085875f1d4d7b80fc1947e68c6835302241" } # spiceai-52
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "466acff6af701872ba41de99c1783df2a288ddf8" } # spiceai-52
 
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "07be66a8efff7e20c2abadaaba6ef62b02fc1ffc" }      # spiceai-52.5
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "07be66a8efff7e20c2abadaaba6ef62b02fc1ffc" } # spiceai-52.5

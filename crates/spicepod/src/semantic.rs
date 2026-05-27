@@ -24,6 +24,7 @@ use serde_json::Value;
 
 use crate::{
     component::embeddings::{EmbeddingAggregation, EmbeddingChunkConfig},
+    metadata::metadata_value_to_string,
     param::Params,
 };
 
@@ -118,7 +119,7 @@ impl Column {
             metadata.insert("description".to_string(), d.clone());
         }
         for (k, v) in &self.metadata {
-            metadata.insert(k.clone(), v.to_string());
+            metadata.insert(k.clone(), metadata_value_to_string(v));
         }
         metadata
     }

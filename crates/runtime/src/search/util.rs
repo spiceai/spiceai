@@ -19,6 +19,7 @@ use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc};
 
 use app::App;
+use data_components::MetadataEnrichedTableProvider;
 use datafusion::common::Column;
 use datafusion::error::DataFusionError;
 use datafusion::{datasource::TableProvider, sql::TableReference};
@@ -69,6 +70,14 @@ pub(crate) fn find_concrete_table_provider<T: TableProvider + 'static>(
             && let Some(adapted_tbl) = adaptor.table_provider.as_ref()
         {
             current_tbl = adapted_tbl;
+            continue;
+        }
+
+        if let Some(metadata_table) = current_tbl
+            .as_any()
+            .downcast_ref::<MetadataEnrichedTableProvider>()
+        {
+            current_tbl = metadata_table.get_inner_ref();
             continue;
         }
 

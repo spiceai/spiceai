@@ -65,7 +65,9 @@ use spicepod::component::function::{
 };
 use util::session_state::builder_from_existing;
 
-const SQL_TABLE_ARGS_TABLE_NAME: &str = "args";
+use crate::user_functions::args_inliner::inline_args_into_plan;
+
+pub(crate) const SQL_TABLE_ARGS_TABLE_NAME: &str = "args";
 
 /// Monotonic identifier for built SQL UDFs — used as the basis for
 /// [`Hash`] / [`Eq`] since physical expressions cannot derive them.
@@ -522,7 +524,10 @@ impl TableProvider for SqlTableProvider {
             &self.name,
         )
         .await?;
-        let mut df = ctx.sql(&self.body).await?;
+
+        let (session_state, plan) = ctx.sql(&self.body).await?.into_parts();
+        let inlined_plan = inline_args_into_plan(plan, self.arg_schema.as_ref(), &self.args)?;
+        let mut df = DataFrame::new(session_state, inlined_plan);
         validate_output_schema(&self.name, df.schema().as_arrow(), self.schema.as_ref())
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
         if let Some(limit) = limit {

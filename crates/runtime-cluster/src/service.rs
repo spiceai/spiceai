@@ -48,6 +48,7 @@ use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 use crate::context::PartitionOperations;
 use crate::executor_registry::{self, ExecutorRegistry};
+use crate::metrics;
 use crate::scheduler_task_config::PartitionAssignmentConfig;
 use crate::{PartitionMetadata, PartitionStore, PartitionValue, partition_value_to_bytes, store};
 
@@ -297,17 +298,21 @@ impl PartitionService {
         let executors = self.executor_registry.connected_executors().await;
         if executors.is_empty() {
             tracing::warn!(table = %table, "No executors connected, cannot assign new partitions");
+            self.record_partitions_count_for_table(table);
             return Ok(());
         }
 
-        self.assign_pending(
-            std::slice::from_ref(table),
-            &executors,
-            ops,
-            AssignmentLimit::Unlimited,
-            &config,
-        )
-        .await
+        let result = self
+            .assign_pending(
+                std::slice::from_ref(table),
+                &executors,
+                ops,
+                AssignmentLimit::Unlimited,
+                &config,
+            )
+            .await;
+        self.record_partitions_count_for_table(table);
+        result
     }
 
     /// Discover, add/remove, and assign partitions for every accelerated table
@@ -384,17 +389,25 @@ impl PartitionService {
 
         let executors = self.executor_registry.connected_executors().await;
         if executors.is_empty() {
+            for table in &reconciled_tables {
+                self.record_partitions_count_for_table(table);
+            }
             return Ok(());
         }
 
-        self.assign_pending(
-            &reconciled_tables,
-            &executors,
-            ops,
-            AssignmentLimit::PerCycleCap,
-            &config,
-        )
-        .await
+        let result = self
+            .assign_pending(
+                &reconciled_tables,
+                &executors,
+                ops,
+                AssignmentLimit::PerCycleCap,
+                &config,
+            )
+            .await;
+        for table in &reconciled_tables {
+            self.record_partitions_count_for_table(table);
+        }
+        result
     }
 
     /// Step 1: query the source via `ops`, diff against the store, and apply the diff.
@@ -415,12 +428,21 @@ impl PartitionService {
         config: &AssignmentConfig,
     ) -> Result<PartitionDiff> {
         // Query source partitions via the trait (with timeout).
-        let source_partitions = match timeout(
+        let discovery_start = std::time::Instant::now();
+        let discovery_result = timeout(
             config.discovery_timeout,
             ops.table_partition_values(table, partition_by),
         )
-        .await
-        {
+        .await;
+        if let Some(node_id) = self.executor_registry.node_id() {
+            let duration_ms = discovery_start.elapsed().as_secs_f64() * 1000.0;
+            metrics::record_partition_discovery_duration(
+                node_id,
+                &dataset_label(table),
+                duration_ms,
+            );
+        }
+        let source_partitions = match discovery_result {
             Ok(Ok(partitions)) => partitions,
             Ok(Err(e)) => {
                 return Err(Error::DiscoveryFailed {
@@ -499,6 +521,13 @@ impl PartitionService {
                 tracing::warn!(table = %table, error = %e, "Failed to initialize partition metadata");
             }
             add_partitions_with_retry(&self.partition_store, table, diff.new.clone()).await?;
+            if let Some(node_id) = self.executor_registry.node_id() {
+                metrics::record_partition_state_operation(
+                    node_id,
+                    metrics::PartitionStateOperation::Added,
+                    diff.new.len() as u64,
+                );
+            }
         }
 
         if !diff.removed.is_empty() {
@@ -515,9 +544,45 @@ impl PartitionService {
                 diff.removed.clone(),
             )
             .await?;
+            if let Some(node_id) = self.executor_registry.node_id() {
+                metrics::record_partition_state_operation(
+                    node_id,
+                    metrics::PartitionStateOperation::Removed,
+                    diff.removed.len() as u64,
+                );
+            }
         }
 
         Ok(diff)
+    }
+
+    /// Refresh and emit the `scheduler_partitions_count` gauge for `table`
+    /// based on the current state of the partition store. No-op when the
+    /// scheduler has no `node_id` configured for metrics.
+    fn record_partitions_count_for_table(&self, table: &TableReference) {
+        let Some(node_id) = self.executor_registry.node_id() else {
+            return;
+        };
+        let Some(metadata) = self.partition_store.get_cached_table_metadata(table) else {
+            return;
+        };
+        let (assigned, unassigned) =
+            metadata
+                .partitions
+                .iter()
+                .fold((0u64, 0u64), |(a, u), part| {
+                    if part.assigned_executors.is_empty() {
+                        (a, u + 1)
+                    } else {
+                        (a + 1, u)
+                    }
+                });
+        metrics::set_scheduler_partitions_count(
+            node_id,
+            &dataset_label(table),
+            assigned,
+            unassigned,
+        );
     }
 
     /// Step 2: find every unassigned partition across the given tables, assign
@@ -543,8 +608,12 @@ impl PartitionService {
 
         let assignments =
             assign_unassigned_partitions(unassigned, &state, &self.partition_store, config, limit);
-        let CommitResult { committed, failed } =
-            commit_assignments(&self.partition_store, assignments).await?;
+        let CommitResult { committed, failed } = commit_assignments(
+            &self.partition_store,
+            assignments,
+            self.executor_registry.node_id(),
+        )
+        .await?;
         if !failed.is_empty() {
             tracing::warn!("Failed to commit {} partition assignments", failed.len());
         }
@@ -582,6 +651,20 @@ fn resolved_equality(a: &TableReference, b: &TableReference) -> bool {
         .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
         == b.clone()
             .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+}
+
+/// Build the `dataset` label for scheduler-side metrics as `schema.table`.
+///
+/// Resolves bare references against the Spice defaults so a Spicepod dataset
+/// declared as `name: hits` and one declared as `name: public.hits` share the
+/// same series. Matches the executor-side normalization in
+/// `record_executor_assigned_partitions` so scheduler and executor metrics
+/// can be joined by `dataset`.
+fn dataset_label(table: &TableReference) -> String {
+    let resolved = table
+        .clone()
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+    format!("{}.{}", resolved.schema, resolved.table)
 }
 
 /// Sort a `PartitionValue` into a deterministic `Vec<(k, v)>` for equality comparisons.
@@ -971,6 +1054,7 @@ fn score_executor_for_partition(
 async fn commit_assignments(
     partition_store: &PartitionStore,
     assignments: Vec<Assignment>,
+    node_id: Option<&str>,
 ) -> Result<CommitResult> {
     let mut committed = Vec::new();
     let mut failed = Vec::new();
@@ -991,6 +1075,13 @@ async fn commit_assignments(
                     executor = %assignment.executor_id,
                     "Partition assigned"
                 );
+                if let Some(node_id) = node_id {
+                    metrics::record_partition_assignment(
+                        node_id,
+                        &assignment.executor_id,
+                        metrics::AssignmentStatus::Committed,
+                    );
+                }
                 committed.push(assignment);
             }
             Err(e) => {
@@ -1001,6 +1092,13 @@ async fn commit_assignments(
                     error = %e,
                     "Failed to assign partition"
                 );
+                if let Some(node_id) = node_id {
+                    metrics::record_partition_assignment(
+                        node_id,
+                        &assignment.executor_id,
+                        metrics::AssignmentStatus::Failed,
+                    );
+                }
                 failed.push((assignment, e));
             }
         }
@@ -1539,7 +1637,7 @@ mod tests {
             executor_id: "exec1".to_string(),
         }];
 
-        let result = commit_assignments(&store, assignments)
+        let result = commit_assignments(&store, assignments, None)
             .await
             .expect("commit");
         assert_eq!(result.committed.len(), 1);
@@ -1619,7 +1717,7 @@ mod tests {
         );
 
         // Step 3: Commit assignments to the store.
-        let result = commit_assignments(&store, assignments)
+        let result = commit_assignments(&store, assignments, None)
             .await
             .expect("commit");
         assert_eq!(result.committed.len(), 2);
