@@ -33,7 +33,8 @@ pub enum AccelerationEngine {
 pub enum FederatedStorage {
     Cayenne,
     Postgres,
-    Mongo,
+    #[value(name = "postgres-debezium")]
+    PostgresDebezium,
     #[value(name = "dynamodb")]
     DynamoDB,
 }
@@ -173,7 +174,7 @@ pub struct StdioArgs {
     #[arg(long, env = "SPIDAPTER_QUERY_MEMORY_LIMIT")]
     pub query_memory_limit: Option<String>,
 
-    /// Federated storage: `cayenne` (default), `postgres`, `mongo`, or `dynamodb`.
+    /// Federated storage: `cayenne` (default), `postgres`, `debezium`, or `dynamodb`.
     #[arg(long, env = "SPIDAPTER_STORAGE", default_value = "cayenne")]
     pub storage: FederatedStorage,
 

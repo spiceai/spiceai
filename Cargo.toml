@@ -428,7 +428,8 @@ datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.g
 datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "06e4b624c6073c40c7b2127ce620e281ec1979ae" }                    # spiceai-52.5
 datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "06e4b624c6073c40c7b2127ce620e281ec1979ae" }                # spiceai-52.5
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "466acff6af701872ba41de99c1783df2a288ddf8" } # spiceai-52
+#datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "466acff6af701872ba41de99c1783df2a288ddf8" } # spiceai-52
+datafusion-table-providers = { path="../dtp/core" } # spiceai-52
 
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "07be66a8efff7e20c2abadaaba6ef62b02fc1ffc" }      # spiceai-52.5
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "07be66a8efff7e20c2abadaaba6ef62b02fc1ffc" } # spiceai-52.5
@@ -480,3 +481,6 @@ vortex-datafusion = { path = "crates/vortex" }
 vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6" } # spiceai-52.5
 vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6" } # spiceai-52.5
 vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6" } # spiceai-52.5
+
+[patch."https://github.com/spiceai/spicebench.git"]
+system-adapter-protocol = { path = "/Users/viktor/workspace/spicebench/crates/system-adapter-protocol" }

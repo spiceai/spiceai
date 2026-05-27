@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use super::{
     FederatedStorageConfig, RunState, ScpRunState, SetupConfig, generate_initial_spicepod,
-    post_setup_sink_action, serialize_spicepod,
+    serialize_spicepod,
 };
 use crate::args::{DeploymentMode, StdioArgs};
 use crate::commands;
@@ -103,21 +103,6 @@ pub(super) async fn provision_scp_app(
         Err(e) => eprintln!("[stdio] warning: failed to set RUNNER secret (non-fatal): {e}"),
     }
 
-    // Set storage-specific secrets
-    if let FederatedStorageConfig::Mongo {
-            connection_string, ..
-        } = &setup_config.storage {
-        eprintln!("[stdio] Setting MONGODB_CONNECTION_STRING secret...");
-        commands::secrets::set_secret(
-            &cloud,
-            app_id,
-            "MONGODB_CONNECTION_STRING",
-            connection_string,
-        )
-        .await?;
-        eprintln!("[stdio] MONGODB_CONNECTION_STRING secret set");
-    }
-
     // Apply custom image configuration if any image-related overrides are provided.
     // This updates the app's image_tag/update_channel before creating the deployment,
     // so the deployment picks up the requested image version instead of the default.
@@ -175,7 +160,6 @@ pub(super) async fn provision_scp_app(
     eprintln!("[stdio] Spice Cloud deployment ready for app '{app_name}' at {flight_url}");
 
     let sql_url = format!("https://{cname}.spiceai.io/v1/sql");
-    post_setup_sink_action(setup_config, datasets, &sql_url, Some(&api_key)).await?;
 
     Ok(RunState::Scp(Box::new(ScpRunState {
         app_id,

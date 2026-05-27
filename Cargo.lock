@@ -6281,7 +6281,6 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=466acff6af701872ba41de99c1783df2a288ddf8#466acff6af701872ba41de99c1783df2a288ddf8"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -18709,7 +18708,6 @@ dependencies = [
 [[package]]
 name = "system-adapter-protocol"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/spicebench.git?rev=d00700353822309a047a220c855493ac96ddc5a2#d00700353822309a047a220c855493ac96ddc5a2"
 dependencies = [
  "arrow-schema",
  "async-trait",

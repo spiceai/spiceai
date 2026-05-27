@@ -279,9 +279,8 @@ async fn wait_for_instance_running(ec2: &Ec2Client, instance_id: &str) -> anyhow
             Err(e) => {
                 // EC2 has eventual consistency — the instance may not be visible
                 // immediately after RunInstances returns. Retry on NotFound.
-                let is_not_found = e
-                    .as_service_error()
-                    .and_then(|se| se.meta().code()) == Some("InvalidInstanceID.NotFound");
+                let is_not_found = e.as_service_error().and_then(|se| se.meta().code())
+                    == Some("InvalidInstanceID.NotFound");
 
                 if !is_not_found {
                     return Err(anyhow::anyhow!(

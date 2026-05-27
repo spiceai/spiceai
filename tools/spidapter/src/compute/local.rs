@@ -18,13 +18,13 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use system_adapter_protocol::{DatasetConfig, EtlSinkType};
+use system_adapter_protocol::DatasetConfig;
 use tokio::process::{Child, Command as TokioCommand};
 use uuid::Uuid;
 
 use super::{
-    LocalProcesses, LocalRunState, RunState, SetupConfig, generate_initial_spicepod,
-    post_setup_sink_action, write_local_spicepod,
+    FederatedStorageConfig, LocalProcesses, LocalRunState, RunState, SetupConfig,
+    generate_initial_spicepod, write_local_spicepod,
 };
 use crate::args::StdioArgs;
 
@@ -58,7 +58,12 @@ struct LocalPkiPaths {
 }
 
 pub(super) fn build_local_extra_envs(_setup_config: &SetupConfig) -> HashMap<String, String> {
-    HashMap::new()
+    let mut map = HashMap::new();
+    map.insert(
+        "SPICED_LOG".to_string(),
+        "info,runtime::accelerated_table::refresh_task::changes=trace".to_string(),
+    );
+    map
 }
 
 pub(super) async fn provision_local_single_node(
@@ -73,7 +78,7 @@ pub(super) async fn provision_local_single_node(
     let ports = allocate_local_ports(LOCAL_BIND_HOST, num_exec)?;
 
     let working_dir = create_local_working_dir(run_id).await?;
-    let local_flight_api_key = (setup_config.sink_type == Some(EtlSinkType::Adbc))
+    let local_flight_api_key = matches!(setup_config.storage, FederatedStorageConfig::Cayenne)
         .then(|| format!("spidapter-local-{run_id}"));
 
     let spicepod_path = match async {
@@ -135,30 +140,22 @@ pub(super) async fn provision_local_single_node(
         return Err(error);
     }
 
-    if let Err(error) = post_setup_sink_action(
-        setup_config,
-        datasets,
-        &sql_url,
-        local_flight_api_key.as_deref(),
-    )
-    .await
-    {
-        let _ = stop_child_process(&mut child, "spiced").await;
-        let _ = cleanup_local_artifacts(&working_dir).await;
-        return Err(error);
-    }
-
-    if let Err(error) = wait_for_runtime_ready(
-        &http_url,
-        &mut child,
-        ready_wait,
-        local_flight_api_key.as_deref(),
-    )
-    .await
-    {
-        let _ = stop_child_process(&mut child, "spiced").await;
-        let _ = cleanup_local_artifacts(&working_dir).await;
-        return Err(error);
+    if !matches!(
+        setup_config.storage,
+        FederatedStorageConfig::DynamoDB { .. } | FederatedStorageConfig::PostgresDebezium { .. }
+    ) {
+        if let Err(error) = wait_for_runtime_ready(
+            &http_url,
+            &mut child,
+            ready_wait,
+            local_flight_api_key.as_deref(),
+        )
+        .await
+        {
+            let _ = stop_child_process(&mut child, "spiced").await;
+            let _ = cleanup_local_artifacts(&working_dir).await;
+            return Err(error);
+        }
     }
 
     Ok(RunState::Local(Box::new(LocalRunState {
@@ -183,7 +180,7 @@ pub(super) async fn provision_local_spiced_cluster(
     let cluster_ports = allocate_cluster_ports(LOCAL_BIND_HOST, num_exec)?;
 
     let working_dir = create_local_working_dir(run_id).await?;
-    let local_flight_api_key = (setup_config.sink_type == Some(EtlSinkType::Adbc))
+    let local_flight_api_key = matches!(setup_config.storage, FederatedStorageConfig::Cayenne)
         .then(|| format!("spidapter-local-{run_id}"));
 
     let setup_result = async {
@@ -355,36 +352,25 @@ pub(super) async fn provision_local_spiced_cluster(
         }
     }
 
-    if let Err(error) = post_setup_sink_action(
-        setup_config,
-        datasets,
-        &scheduler_sql_url,
-        local_flight_api_key.as_deref(),
-    )
-    .await
-    {
-        for c in &mut executor_children {
-            let _ = stop_child_process(c, "executor").await;
+    if !matches!(
+        setup_config.storage,
+        FederatedStorageConfig::DynamoDB { .. } | FederatedStorageConfig::PostgresDebezium { .. }
+    ) {
+        if let Err(error) = wait_for_runtime_ready(
+            &scheduler_http_url,
+            &mut scheduler_child,
+            ready_wait,
+            local_flight_api_key.as_deref(),
+        )
+        .await
+        {
+            for c in &mut executor_children {
+                let _ = stop_child_process(c, "executor").await;
+            }
+            let _ = stop_child_process(&mut scheduler_child, "scheduler").await;
+            let _ = cleanup_local_artifacts(&working_dir).await;
+            return Err(error);
         }
-        let _ = stop_child_process(&mut scheduler_child, "scheduler").await;
-        let _ = cleanup_local_artifacts(&working_dir).await;
-        return Err(error);
-    }
-
-    if let Err(error) = wait_for_runtime_ready(
-        &scheduler_http_url,
-        &mut scheduler_child,
-        ready_wait,
-        local_flight_api_key.as_deref(),
-    )
-    .await
-    {
-        for c in &mut executor_children {
-            let _ = stop_child_process(c, "executor").await;
-        }
-        let _ = stop_child_process(&mut scheduler_child, "scheduler").await;
-        let _ = cleanup_local_artifacts(&working_dir).await;
-        return Err(error);
     }
 
     Ok(RunState::Local(Box::new(LocalRunState {

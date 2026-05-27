@@ -15,85 +15,25 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use arrow::array::{Array, AsArray};
-use arrow::datatypes::{DataType, Float64Type, Int64Type};
+use arrow::datatypes::DataType;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::ComponentOrReference;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{Runtime, TelemetryConfig};
 use spicepod::param::Params;
+use spicepod::semantic::Column;
 use spicepod::spec::SpicepodDefinition;
-use system_adapter_protocol::{AdbcDriver, DatasetConfig, SetupResponse};
+use system_adapter_protocol::DatasetConfig;
 use uuid::Uuid;
 
-use super::super::{RunState, SetupConfig, resolve_aws_region};
-
-pub(crate) const DYNAMODB_ADBC_DEFAULT_PARALLELISM: usize = 10;
+use super::super::{SetupConfig, resolve_aws_region};
+use super::dynamodb_arrow_type_to_spicepod_str;
 
 /// Tracks `DynamoDB` tables created during setup so they can be cleaned up on teardown.
 #[derive(Debug, Clone)]
 pub(crate) struct DynamoDbTeardownInfo {
     pub(crate) table_names: Vec<String>,
     pub(crate) region: String,
-}
-
-pub(crate) fn build_dynamodb_setup_response(
-    setup_config: &SetupConfig,
-    state: &RunState,
-    datasets: &HashMap<String, DatasetConfig>,
-    table_name_map: &HashMap<String, String>,
-) -> SetupResponse {
-    let region = resolve_aws_region(setup_config);
-
-    let mut dynamodb_kwargs: HashMap<String, serde_json::Value> = HashMap::from([(
-        "adbc.driver.dynamodb.region".into(),
-        serde_json::Value::String(region),
-    )]);
-
-    // Forward AWS credentials from environment to the DynamoDB ADBC driver.
-    for (env_var, adbc_key) in [
-        ("AWS_ACCESS_KEY_ID", "adbc.driver.dynamodb.access_key_id"),
-        (
-            "AWS_SECRET_ACCESS_KEY",
-            "adbc.driver.dynamodb.secret_access_key",
-        ),
-        ("AWS_SESSION_TOKEN", "adbc.driver.dynamodb.session_token"),
-    ] {
-        if let Ok(val) = std::env::var(env_var) {
-            dynamodb_kwargs.insert(adbc_key.into(), serde_json::Value::String(val));
-        }
-    }
-
-    for dataset_name in datasets.keys() {
-        let parallelism = dynamodb_table_throughput(dataset_name)
-            .map_or(DYNAMODB_ADBC_DEFAULT_PARALLELISM, |(_, p)| p);
-        dynamodb_kwargs.insert(
-            format!("adbc.driver.dynamodb.parallelism.{dataset_name}"),
-            serde_json::Value::String(parallelism.to_string()),
-        );
-    }
-
-    // Flight SQL read driver pointing to the provisioned Spice Cloud app.
-    let read_db_kwargs = HashMap::from([
-        (
-            "uri".into(),
-            serde_json::Value::String(state.flight_url().to_string()),
-        ),
-        ("username".into(), serde_json::Value::String(String::new())),
-        (
-            "password".into(),
-            serde_json::Value::String(state.password().to_string()),
-        ),
-    ]);
-
-    SetupResponse {
-        driver: AdbcDriver::Dynamodb,
-        db_kwargs: dynamodb_kwargs,
-        catalog_namespace: None,
-        read_driver: Some((AdbcDriver::Flightsql, read_db_kwargs)),
-        endpoints: HashMap::new(),
-        table_name_map: table_name_map.clone(),
-    }
 }
 
 /// Pre-create `DynamoDB` tables so that spicebench can ingest via `CreateAppend` mode
@@ -112,10 +52,10 @@ struct TableSpec {
 pub(crate) async fn create_dynamodb_tables(
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
-) -> anyhow::Result<HashMap<String, String>> {
+) -> anyhow::Result<String> {
     use aws_sdk_dynamodb::types::{
-        AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ProvisionedThroughput,
-        StreamSpecification, StreamViewType, Tag,
+        AttributeDefinition, BillingMode, KeySchemaElement, KeyType, StreamSpecification,
+        StreamViewType, Tag,
     };
 
     let region = resolve_aws_region(setup_config);
@@ -131,7 +71,7 @@ pub(crate) async fn create_dynamodb_tables(
     let specs: Vec<TableSpec> = datasets
         .iter()
         .map(|(dataset_name, config)| {
-            let physical_name = format!("{prefix}{dataset_name}");
+            let physical_name = format!("{prefix}.{dataset_name}");
             let partition_key = config.primary_key_columns.first().ok_or_else(|| {
                 anyhow::anyhow!(
                     "Dataset '{dataset_name}' has no primary key columns; cannot create DynamoDB table"
@@ -193,18 +133,7 @@ pub(crate) async fn create_dynamodb_tables(
                         .build()?,
                 );
 
-            if let Some((wcu, _)) = dynamodb_table_throughput(&dataset_name) {
-                create_req = create_req
-                    .billing_mode(BillingMode::Provisioned)
-                    .provisioned_throughput(
-                        ProvisionedThroughput::builder()
-                            .write_capacity_units(wcu)
-                            .read_capacity_units(10000)
-                            .build()?,
-                    );
-            } else {
-                create_req = create_req.billing_mode(BillingMode::PayPerRequest);
-            }
+            create_req = create_req.billing_mode(BillingMode::PayPerRequest);
 
             create_req = create_req.stream_specification(
                 StreamSpecification::builder()
@@ -258,13 +187,11 @@ pub(crate) async fn create_dynamodb_tables(
         });
     }
 
-    let mut table_name_map: HashMap<String, String> = HashMap::new();
     let mut wait_tables: Vec<String> = Vec::new();
 
     while let Some(result) = create_tasks.join_next().await {
-        let (dataset_name, physical_name, needs_wait) =
+        let (_dataset_name, physical_name, needs_wait) =
             result.map_err(|e| anyhow::anyhow!("DynamoDB create task panicked: {e}"))??;
-        table_name_map.insert(dataset_name, physical_name.clone());
         if needs_wait {
             wait_tables.push(physical_name);
         }
@@ -281,7 +208,7 @@ pub(crate) async fn create_dynamodb_tables(
     }
 
     eprintln!("[stdio] DynamoDB: table pre-creation complete");
-    Ok(table_name_map)
+    Ok(prefix)
 }
 
 pub(crate) async fn delete_dynamodb_tables(info: &DynamoDbTeardownInfo) -> anyhow::Result<()> {
@@ -352,16 +279,6 @@ pub(crate) fn infer_dynamodb_key_type(
     }
 }
 
-/// Returns provisioned WCU and write parallelism for well-known TPC-H tables.
-/// Other tables use on-demand billing (no provisioned capacity).
-pub(crate) fn dynamodb_table_throughput(table_name: &str) -> Option<(i64, usize)> {
-    match table_name {
-        "lineitem" => Some((15_000, 30)),
-        "orders" => Some((8_000, 20)),
-        _ => None,
-    }
-}
-
 /// Returns the number of scan segments for well-known TPC-H tables.
 pub(crate) fn dynamodb_scan_segments(table_name: &str) -> usize {
     match table_name {
@@ -422,7 +339,7 @@ pub(crate) fn generate_dynamodb_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
-    dynamodb_table_names: &HashMap<String, String>,
+    prefix: &str,
     acceleration_engine: &str,
 ) -> SpicepodDefinition {
     let run_id_str = run_id.to_string();
@@ -438,7 +355,7 @@ pub(crate) fn generate_dynamodb_spicepod(
         ..Runtime::default()
     };
 
-    for dataset_name in datasets.keys() {
+    for (dataset_name, config) in datasets {
         let mut param_map = HashMap::from([
             ("ready_lag".to_string(), "1h".to_string()),
             ("dynamodb_aws_region".to_string(), region.clone()),
@@ -466,12 +383,23 @@ pub(crate) fn generate_dynamodb_spicepod(
         );
         param_map.insert("schema_infer_max_records".to_string(), "200".to_string());
 
-        let physical_name = dynamodb_table_names
-            .get(dataset_name)
-            .cloned()
-            .unwrap_or_else(|| dataset_name.clone());
-        let mut dataset = Dataset::new(format!("dynamodb:{physical_name}"), dataset_name.as_str());
+        let physical_name = if prefix.is_empty() {
+            dataset_name.clone()
+        } else {
+            format!("{prefix}.{dataset_name}")
+        };
+        let mut dataset = Dataset::new(format!("dynamodb:{physical_name}"), physical_name.as_str());
         dataset.params = Some(Params::from_string_map(param_map));
+        dataset.columns = config
+            .schema
+            .fields()
+            .iter()
+            .map(|field| {
+                Column::new(field.name())
+                    .with_type(dynamodb_arrow_type_to_spicepod_str(field.data_type()))
+                    .with_nullable(field.is_nullable())
+            })
+            .collect();
         dataset.acceleration = Some(Acceleration {
             enabled: true,
             engine: Some(acceleration_engine.to_string()),
@@ -486,160 +414,4 @@ pub(crate) fn generate_dynamodb_spicepod(
     }
 
     spicepod
-}
-
-/// Write seed rows (base64-encoded Arrow IPC streams) into `DynamoDB` tables before
-/// the spicepod starts. This allows schema inference to succeed and primes the
-/// change-stream position so Spice receives subsequent ingested rows as CDC events.
-pub(crate) async fn seed_dynamodb_rows(
-    setup_config: &SetupConfig,
-    table_name_map: &HashMap<String, String>,
-    seed_data: &HashMap<String, String>,
-) -> anyhow::Result<()> {
-    use arrow::ipc::reader::StreamReader;
-    use aws_sdk_dynamodb::types::AttributeValue;
-    use base64::Engine as _;
-
-    if seed_data.is_empty() {
-        return Ok(());
-    }
-
-    let region = resolve_aws_region(setup_config);
-    let client = build_dynamodb_client(&region).await;
-
-    for (dataset_name, encoded) in seed_data {
-        let physical_name = table_name_map
-            .get(dataset_name)
-            .cloned()
-            .unwrap_or_else(|| dataset_name.clone());
-
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|e| anyhow::anyhow!("seed_data decode error for '{dataset_name}': {e}"))?;
-
-        let cursor = std::io::Cursor::new(bytes);
-        let reader = StreamReader::try_new(cursor, None)
-            .map_err(|e| anyhow::anyhow!("Arrow IPC read error for '{dataset_name}': {e}"))?;
-
-        let mut row_count = 0usize;
-        for batch_result in reader {
-            let batch = batch_result
-                .map_err(|e| anyhow::anyhow!("Arrow batch error '{dataset_name}': {e}"))?;
-            let schema = batch.schema();
-
-            for row in 0..batch.num_rows() {
-                let mut item: HashMap<String, AttributeValue> = HashMap::new();
-
-                for (col_idx, field) in schema.fields().iter().enumerate() {
-                    let col = batch.column(col_idx);
-                    if col.is_null(row) {
-                        continue;
-                    }
-                    let av = arrow_scalar_to_attribute_value(col.as_ref(), row);
-                    item.insert(field.name().clone(), av);
-                }
-
-                client
-                    .put_item()
-                    .table_name(&physical_name)
-                    .set_item(Some(item))
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("DynamoDB PutItem failed for table '{physical_name}': {e}")
-                    })?;
-
-                row_count += 1;
-            }
-        }
-
-        eprintln!("[stdio] DynamoDB: seeded {row_count} row(s) into '{physical_name}'");
-    }
-
-    Ok(())
-}
-
-fn arrow_scalar_to_attribute_value(
-    col: &dyn Array,
-    row: usize,
-) -> aws_sdk_dynamodb::types::AttributeValue {
-    use aws_sdk_dynamodb::types::AttributeValue;
-
-    match col.data_type() {
-        DataType::Boolean => {
-            let v = col.as_boolean().value(row);
-            AttributeValue::Bool(v)
-        }
-        DataType::Int8 => AttributeValue::N(
-            col.as_primitive::<arrow::datatypes::Int8Type>()
-                .value(row)
-                .to_string(),
-        ),
-        DataType::Int16 => AttributeValue::N(
-            col.as_primitive::<arrow::datatypes::Int16Type>()
-                .value(row)
-                .to_string(),
-        ),
-        DataType::Int32 => AttributeValue::N(
-            col.as_primitive::<arrow::datatypes::Int32Type>()
-                .value(row)
-                .to_string(),
-        ),
-        DataType::Int64 => {
-            AttributeValue::N(col.as_primitive::<Int64Type>().value(row).to_string())
-        }
-        DataType::UInt8 => AttributeValue::N(
-            col.as_primitive::<arrow::datatypes::UInt8Type>()
-                .value(row)
-                .to_string(),
-        ),
-        DataType::UInt16 => AttributeValue::N(
-            col.as_primitive::<arrow::datatypes::UInt16Type>()
-                .value(row)
-                .to_string(),
-        ),
-        DataType::UInt32 => AttributeValue::N(
-            col.as_primitive::<arrow::datatypes::UInt32Type>()
-                .value(row)
-                .to_string(),
-        ),
-        DataType::UInt64 => AttributeValue::N(
-            col.as_primitive::<arrow::datatypes::UInt64Type>()
-                .value(row)
-                .to_string(),
-        ),
-        DataType::Float32 => AttributeValue::N(
-            col.as_primitive::<arrow::datatypes::Float32Type>()
-                .value(row)
-                .to_string(),
-        ),
-        DataType::Float64 => {
-            AttributeValue::N(col.as_primitive::<Float64Type>().value(row).to_string())
-        }
-        DataType::Decimal128(_, scale) => {
-            let raw = col
-                .as_primitive::<arrow::datatypes::Decimal128Type>()
-                .value(row);
-            #[expect(clippy::cast_sign_loss)]
-            let scale = *scale as u32;
-            let divisor = 10i128.pow(scale);
-            AttributeValue::N(format!(
-                "{}.{:0>width$}",
-                raw / divisor,
-                (raw % divisor).abs(),
-                width = scale as usize
-            ))
-        }
-        DataType::Utf8 => AttributeValue::S(col.as_string::<i32>().value(row).to_string()),
-        DataType::LargeUtf8 => AttributeValue::S(col.as_string::<i64>().value(row).to_string()),
-        DataType::Binary => AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(
-            col.as_binary::<i32>().value(row).to_vec(),
-        )),
-        DataType::LargeBinary => AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(
-            col.as_binary::<i64>().value(row).to_vec(),
-        )),
-        _ => AttributeValue::S(
-            arrow::util::display::array_value_to_string(col, row).unwrap_or_default(),
-        ),
-    }
 }

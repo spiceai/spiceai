@@ -26,8 +26,8 @@ use spicepod::component::runtime::{
 use spicepod::param::{ParamValue, Params};
 use spicepod::spec::SpicepodDefinition;
 use system_adapter_protocol::{
-    AdbcDriver, DatasetConfig, EtlSinkType, Handler, IngestionMetrics, MetricsResponse,
-    ResourceMetrics, Server, SetupResponse, TeardownResponse,
+    AdbcDriver, DatasetConfig, Handler, IngestionMetrics, MetricsResponse, ResourceMetrics, Server,
+    SetupResponse, SinkConfig, TeardownResponse,
 };
 use tokio::process::Child;
 use tokio::time::sleep;
@@ -49,22 +49,21 @@ use compute_local::{
     provision_local_single_node, provision_local_spiced_cluster, teardown_local_run,
 };
 use compute_scp::provision_scp_app;
-use sources::cayenne::{
-    build_cayenne_setup_response, generate_cayenne_sink_spicepod, generate_hive_spicepod,
-};
+use sources::cayenne::generate_cayenne_sink_spicepod;
 use sources::dynamodb::{
-    DynamoDbTeardownInfo, build_dynamodb_setup_response, create_dynamodb_tables,
-    delete_dynamodb_tables, generate_dynamodb_spicepod, seed_dynamodb_rows,
+    DynamoDbTeardownInfo, create_dynamodb_tables, delete_dynamodb_tables,
+    generate_dynamodb_spicepod,
 };
 use sources::ec2_postgres::{
     Ec2PostgresInstance, is_ec2_mode, launch_postgres_ec2, terminate_ec2_instance,
 };
-use sources::mongo::{
-    build_mongodb_setup_response, generate_mongodb_spicepod, seed_mongodb_rows,
-};
 use sources::postgres_cdc::{
     PgConfig, generate_postgres_wal_spicepod, pg_create_table_ddl, pg_error_message,
     setup_postgres_for_wal, teardown_postgres, tpch_schema_name,
+};
+use sources::postgres_debezium::{
+    generate_postgres_debezium_spicepod, register_debezium_postgres_connector,
+    setup_postgres_for_debezium,
 };
 
 const POST_SETUP_SQL_MAX_RETRIES: u64 = 5;
@@ -168,14 +167,15 @@ enum FederatedStorageConfig {
         acceleration: AccelerationEngine,
         ec2: Option<Ec2InstanceInfo>,
     },
-    Mongo {
-        connection_string: String,
-        database: String,
+    PostgresDebezium {
+        pg: PgConfig,
+        kafka_brokers: String,
+        debezium_connect_url: String,
         acceleration: AccelerationEngine,
         ec2: Option<Ec2InstanceInfo>,
     },
     DynamoDB {
-        table_names: HashMap<String, String>,
+        prefix: String,
         region: String,
         acceleration: AccelerationEngine,
     },
@@ -200,8 +200,6 @@ fn acceleration_engine_str(engine: AccelerationEngine) -> &'static str {
 #[derive(Debug, Clone)]
 struct SetupConfig {
     region: Option<String>,
-    endpoint: Option<String>,
-    sink_type: Option<EtlSinkType>,
     /// Absolute path to a spicepod the client wants deployed verbatim
     /// (testoperator's cluster-bench path passes this; spicebench leaves it
     /// empty and relies on the `datasets` JSON-RPC parameter instead).
@@ -216,17 +214,10 @@ impl SetupConfig {
     fn from_metadata(metadata: &HashMap<String, serde_json::Value>) -> Self {
         Self {
             region: metadata_string(metadata, "etl_region"),
-            endpoint: metadata_string(metadata, "etl_endpoint"),
-            sink_type: None,
             spicepod_path: metadata_string(metadata, "spicepod_path"),
             storage: FederatedStorageConfig::Cayenne,
             aws_region_override: None,
         }
-    }
-
-    fn set_etl_sink_type(mut self, sink_type: Option<EtlSinkType>) -> Self {
-        self.sink_type = sink_type;
-        self
     }
 
     fn set_storage(mut self, storage: FederatedStorageConfig) -> Self {
@@ -332,19 +323,16 @@ impl Handler for SpidapterHandler {
         run_id: Uuid,
         metadata: HashMap<String, serde_json::Value>,
         datasets: HashMap<String, DatasetConfig>,
-        etl_sink_type: Option<EtlSinkType>,
-        seed_data: HashMap<String, String>,
     ) -> Result<SetupResponse, String> {
         eprintln!(
             "[stdio] setup: run_id={run_id}, metadata_keys={:?}",
             metadata.keys().collect::<Vec<_>>()
         );
 
-        // Build the FederatedStorageConfig from the --storage CLI arg + metadata + pg config.
+        // Build the FederatedStorageConfig (same logic as setup()).
         let storage = match self.args.storage {
             FederatedStorage::Cayenne => FederatedStorageConfig::Cayenne,
             FederatedStorage::Postgres => {
-                // EC2 mode: provision a fresh PostgreSQL instance on EC2 for this run.
                 let ec2_instance: Option<Ec2PostgresInstance> = if is_ec2_mode(&self.args) {
                     let run_id_str = run_id.to_string();
                     let short_id = run_id_str.split('-').next().unwrap_or_default();
@@ -373,16 +361,14 @@ impl Handler for SpidapterHandler {
                     "FederatedStorage::Postgres requires PG_HOST or EC2 provisioning".to_string()
                 })?;
 
-                // WAL CDC setup before provisioning Spice
                 if let Err(e) = setup_postgres_for_wal(&pg, &datasets).await {
-                    // Terminate EC2 if we provisioned one and WAL setup fails.
                     if let Some(ref ec2) = ec2_instance
                         && let Err(te) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
-                        {
-                            eprintln!(
-                                "[stdio] warning: failed to terminate EC2 instance after WAL setup failure: {te}"
-                            );
-                        }
+                    {
+                        eprintln!(
+                            "[stdio] warning: failed to terminate EC2 instance after WAL setup failure: {te}"
+                        );
+                    }
                     return Err(format!("Failed to set up PostgreSQL for WAL CDC: {e}"));
                 }
 
@@ -397,45 +383,69 @@ impl Handler for SpidapterHandler {
                     ec2,
                 }
             }
-            FederatedStorage::Mongo => {
-                let ec2_mongo_instance = if is_ec2_mode(&self.args) {
+            FederatedStorage::PostgresDebezium => {
+                let ec2_instance: Option<Ec2PostgresInstance> = if is_ec2_mode(&self.args) {
                     let run_id_str = run_id.to_string();
                     let short_id = run_id_str.split('-').next().unwrap_or_default();
-                    let instance =
-                        sources::ec2_mongo::launch_mongo_ec2(&self.args, short_id)
-                            .await
-                            .map_err(|e| {
-                                format!("Failed to provision EC2 MongoDB instance: {e}")
-                            })?;
+                    let instance = launch_postgres_ec2(&self.args, short_id)
+                        .await
+                        .map_err(|e| format!("Failed to provision EC2 PostgreSQL instance: {e}"))?;
                     Some(instance)
                 } else {
                     None
                 };
 
-                let (connection_string, database) = if let Some(ref ec2) = ec2_mongo_instance {
-                    (ec2.connection_string.clone(), ec2.database.clone())
+                let pg = if let Some(ref ec2) = ec2_instance {
+                    Some(PgConfig {
+                        host: ec2.host.clone(),
+                        port: ec2.pg_port,
+                        user: ec2.pg_user.clone(),
+                        password: ec2.pg_password.clone(),
+                        database: ec2.pg_database.clone(),
+                        schema: tpch_schema_name(&run_id),
+                    })
                 } else {
-                    let cs = metadata_string(&metadata, "mongodb_connection_string")
-                        .or_else(|| std::env::var("MONGODB_CONNECTION_STRING").ok().filter(|s| !s.is_empty()))
-                        .ok_or_else(|| "Mongo storage requires mongodb_connection_string in metadata or MONGODB_CONNECTION_STRING env".to_string())?;
-                    let db = metadata_string(&metadata, "mongodb_database")
-                        .or_else(|| {
-                            std::env::var("MONGODB_DATABASE")
-                                .ok()
-                                .filter(|s| !s.is_empty())
-                        })
-                        .unwrap_or_else(|| "spicebench".to_string());
-                    (cs, db)
+                    PgConfig::from_args(&self.args, &run_id)
                 };
 
-                let ec2 = ec2_mongo_instance.map(|e| Ec2InstanceInfo {
+                let pg = pg.ok_or_else(|| {
+                    "FederatedStorage::PostgresDebezium requires PG_HOST or EC2 provisioning"
+                        .to_string()
+                })?;
+
+                let kafka_brokers = std::env::var("KAFKA_BROKERS")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        "PostgresDebezium storage requires KAFKA_BROKERS env".to_string()
+                    })?;
+                let debezium_connect_url = std::env::var("DEBEZIUM_CONNECT_URL")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        "PostgresDebezium storage requires DEBEZIUM_CONNECT_URL env".to_string()
+                    })?;
+
+                if let Err(e) = setup_postgres_for_debezium(&pg, &datasets).await {
+                    if let Some(ref ec2) = ec2_instance
+                        && let Err(te) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
+                    {
+                        eprintln!(
+                            "[stdio] warning: failed to terminate EC2 instance after Debezium setup failure: {te}"
+                        );
+                    }
+                    return Err(format!("Failed to set up PostgreSQL for Debezium CDC: {e}"));
+                }
+
+                let ec2 = ec2_instance.map(|e| Ec2InstanceInfo {
                     instance_id: e.instance_id,
                     region: e.region,
                 });
 
-                FederatedStorageConfig::Mongo {
-                    connection_string,
-                    database,
+                FederatedStorageConfig::PostgresDebezium {
+                    pg,
+                    kafka_brokers,
+                    debezium_connect_url,
                     acceleration: self.args.acceleration,
                     ec2,
                 }
@@ -450,116 +460,95 @@ impl Handler for SpidapterHandler {
                     .or_else(|| metadata_string(&metadata, "etl_region"))
                     .unwrap_or_else(|| "us-east-1".to_string());
                 FederatedStorageConfig::DynamoDB {
-                    table_names: HashMap::new(),
+                    prefix: String::new(),
                     region,
                     acceleration: self.args.acceleration,
                 }
             }
         };
 
-        let mut setup_config = SetupConfig::from_metadata(&metadata)
-            .set_etl_sink_type(etl_sink_type)
-            .set_storage(storage);
+        let mut setup_config = SetupConfig::from_metadata(&metadata).set_storage(storage);
         setup_config.aws_region_override = self.args.aws_region.clone();
 
-        // DynamoDB: create tables then seed rows before starting Spice so that
-        // schema inference succeeds and the change-stream position is primed.
+        // DynamoDB: create tables now so spicebench can write via the native sink.
         if let FederatedStorageConfig::DynamoDB { .. } = &setup_config.storage {
-            let table_names = create_dynamodb_tables(&setup_config, &datasets)
+            let prefix = create_dynamodb_tables(&setup_config, &datasets)
                 .await
                 .map_err(|e| format!("Failed to create DynamoDB tables: {e}"))?;
-            if !seed_data.is_empty() {
-                seed_dynamodb_rows(&setup_config, &table_names, &seed_data)
-                    .await
-                    .map_err(|e| format!("Failed to seed DynamoDB rows: {e}"))?;
-            }
-            // Update the storage with the resolved table names
             if let FederatedStorageConfig::DynamoDB {
-                table_names: ref mut tn,
-                ..
+                prefix: ref mut p, ..
             } = setup_config.storage
             {
-                *tn = table_names;
+                *p = prefix;
             }
         }
 
-        // MongoDB: seed rows before starting Spice so the change-stream position is primed.
-        if let FederatedStorageConfig::Mongo {
-            ref connection_string,
-            ref database,
+        // Debezium/PostgreSQL: register the connector so Kafka topics are created
+        // before spicebench starts writing data.
+        if let FederatedStorageConfig::PostgresDebezium {
+            ref pg,
+            ref debezium_connect_url,
             ..
         } = setup_config.storage
-            && !seed_data.is_empty() {
-                seed_mongodb_rows(connection_string, database, &seed_data)
-                    .await
-                    .map_err(|e| format!("Failed to seed MongoDB rows: {e}"))?;
-            }
-
-        let deployment_mode = setup_config.storage.deployment_mode();
-
-        let provision_result = match self.args.compute {
-            SpiceCompute::Cloud => {
-                provision_scp_app(
-                    run_id,
-                    &self.args,
-                    &setup_config,
-                    &datasets,
-                    &deployment_mode,
-                )
-                .await
-            }
-            SpiceCompute::Local => match deployment_mode {
-                DeploymentMode::SingleNode => {
-                    provision_local_single_node(
-                        run_id,
-                        Duration::from_secs(self.args.ready_wait),
-                        &setup_config,
-                        &datasets,
-                        &self.args,
-                    )
-                    .await
-                }
-                DeploymentMode::Cluster => {
-                    provision_local_spiced_cluster(
-                        run_id,
-                        Duration::from_secs(self.args.ready_wait),
-                        &setup_config,
-                        &datasets,
-                        &self.args,
-                    )
-                    .await
-                }
-            },
-        };
-
-        let mut state = match provision_result {
-            Ok(s) => s,
-            Err(e) => {
-                // Terminate any EC2 instance provisioned before the failure.
-                let ec2 = match &setup_config.storage {
-                    FederatedStorageConfig::Postgres { ec2, .. } => ec2.as_ref(),
-                    FederatedStorageConfig::Mongo { ec2, .. } => ec2.as_ref(),
-                    _ => None,
-                };
-                if let Some(ec2) = ec2
-                    && let Err(te) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await {
-                        eprintln!(
-                            "[stdio] warning: failed to terminate EC2 instance on setup failure: {te}"
-                        );
-                    }
-                return Err(format!("Setup failed: {e}"));
-            }
-        };
-
-        // Attach storage config to the run state.
-        match &mut state {
-            RunState::Scp(scp) => scp.storage = setup_config.storage.clone(),
-            RunState::Local(local) => local.storage = setup_config.storage.clone(),
+        {
+            let debezium_host = std::env::var("PG_DEBEZIUM_HOST")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| pg.host.clone());
+            let table_names: Vec<&str> = datasets.keys().map(String::as_str).collect();
+            register_debezium_postgres_connector(
+                debezium_connect_url,
+                pg,
+                &debezium_host,
+                &table_names,
+            )
+            .await
+            .map_err(|e| format!("Failed to register Debezium PostgreSQL connector: {e}"))?;
         }
 
-        let response = match &setup_config.storage {
-            FederatedStorageConfig::Postgres { pg, .. } => {
-                let flight_kwargs = HashMap::from([
+        // For Cayenne: provision spiced first (Flight URL needed to build SinkConfig).
+        // For all other backends: build SinkConfig first, then provision spiced.
+        let (sink, state) = match &setup_config.storage {
+            FederatedStorageConfig::Cayenne => {
+                let deployment_mode = setup_config.storage.deployment_mode();
+                let provision_result = match self.args.compute {
+                    SpiceCompute::Cloud => {
+                        provision_scp_app(
+                            run_id,
+                            &self.args,
+                            &setup_config,
+                            &datasets,
+                            &deployment_mode,
+                        )
+                        .await
+                    }
+                    SpiceCompute::Local => {
+                        provision_local_spiced_cluster(
+                            run_id,
+                            Duration::from_secs(self.args.ready_wait),
+                            &setup_config,
+                            &datasets,
+                            &self.args,
+                        )
+                        .await
+                    }
+                };
+                let mut state = match provision_result {
+                    Ok(s) => s,
+                    Err(e) => return Err(format!("Cayenne setup: provisioning failed: {e}")),
+                };
+                match &mut state {
+                    RunState::Scp(scp) => scp.storage = setup_config.storage.clone(),
+                    RunState::Local(local) => local.storage = setup_config.storage.clone(),
+                }
+
+                let sql_url = state.sql_url().to_string();
+                let api_key = state.api_key().map(str::to_string);
+                post_setup_sink_action(&datasets, &sql_url, api_key.as_deref())
+                    .await
+                    .map_err(|e| format!("Cayenne post-setup SQL failed: {e}"))?;
+
+                let mut db_kwargs = HashMap::from([
                     (
                         "uri".to_string(),
                         serde_json::Value::String(state.flight_url().to_string()),
@@ -572,36 +561,175 @@ impl Handler for SpidapterHandler {
                         "password".to_string(),
                         serde_json::Value::String(state.password().to_string()),
                     ),
+                    (
+                        "spicebench.write_schema".to_string(),
+                        serde_json::Value::String("spicebench.bench".to_string()),
+                    ),
                 ]);
-                let db_kwargs = pg.adbc_kwargs();
-                eprintln!("[stdio] ADBC db_kwargs: {db_kwargs:?}");
-                let mut write_db_kwargs = db_kwargs;
-                write_db_kwargs.insert(
-                    "spicebench.write_schema".to_string(),
-                    serde_json::Value::String(pg.schema.clone()),
-                );
-                SetupResponse {
-                    driver: AdbcDriver::Postgresql,
-                    db_kwargs: write_db_kwargs,
-                    catalog_namespace: None,
-                    read_driver: Some((AdbcDriver::Flightsql, flight_kwargs)),
-                    endpoints: HashMap::new(),
-                    table_name_map: HashMap::new(),
+                if let RunState::Local(local_state) = &state
+                    && let Some(ak) = &local_state.flight_api_key
+                {
+                    db_kwargs.insert(
+                        "adbc.flight.sql.rpc.call_header.authorization".to_string(),
+                        serde_json::Value::String(format!("Bearer {ak}")),
+                    );
                 }
+                (
+                    SinkConfig::Adbc {
+                        driver: AdbcDriver::Flightsql,
+                        db_kwargs,
+                    },
+                    state,
+                )
             }
-            FederatedStorageConfig::Cayenne => build_cayenne_setup_response(etl_sink_type, &state),
-            FederatedStorageConfig::DynamoDB { table_names, .. } => {
-                build_dynamodb_setup_response(&setup_config, &state, &datasets, table_names)
+            _ => {
+                let sink = match &setup_config.storage {
+                    FederatedStorageConfig::Postgres { pg, .. } => {
+                        let mut write_db_kwargs = pg.adbc_kwargs();
+                        write_db_kwargs.insert(
+                            "spicebench.write_schema".to_string(),
+                            serde_json::Value::String(pg.schema.clone()),
+                        );
+                        SinkConfig::Adbc {
+                            driver: AdbcDriver::Postgresql,
+                            db_kwargs: write_db_kwargs,
+                        }
+                    }
+                    FederatedStorageConfig::DynamoDB { .. } => {
+                        let region = resolve_aws_region(&setup_config);
+                        let access_key_id = std::env::var("AWS_ACCESS_KEY_ID").ok();
+                        let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+                        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+                        SinkConfig::DynamoDb {
+                            region,
+                            access_key_id,
+                            secret_access_key,
+                            session_token,
+                        }
+                    }
+                    FederatedStorageConfig::PostgresDebezium { pg, .. } => {
+                        let mut write_db_kwargs = pg.adbc_kwargs();
+                        write_db_kwargs.insert(
+                            "spicebench.write_schema".to_string(),
+                            serde_json::Value::String(pg.schema.clone()),
+                        );
+                        SinkConfig::Adbc {
+                            driver: AdbcDriver::Postgresql,
+                            db_kwargs: write_db_kwargs,
+                        }
+                    }
+                    FederatedStorageConfig::Cayenne => unreachable!(),
+                };
+
+                let deployment_mode = setup_config.storage.deployment_mode();
+                let provision_result = match self.args.compute {
+                    SpiceCompute::Cloud => {
+                        provision_scp_app(
+                            run_id,
+                            &self.args,
+                            &setup_config,
+                            &datasets,
+                            &deployment_mode,
+                        )
+                        .await
+                    }
+                    SpiceCompute::Local => match deployment_mode {
+                        DeploymentMode::SingleNode => {
+                            provision_local_single_node(
+                                run_id,
+                                Duration::from_secs(self.args.ready_wait),
+                                &setup_config,
+                                &datasets,
+                                &self.args,
+                            )
+                            .await
+                        }
+                        DeploymentMode::Cluster => {
+                            provision_local_spiced_cluster(
+                                run_id,
+                                Duration::from_secs(self.args.ready_wait),
+                                &setup_config,
+                                &datasets,
+                                &self.args,
+                            )
+                            .await
+                        }
+                    },
+                };
+
+                let state = match provision_result {
+                    Ok(mut s) => {
+                        match &mut s {
+                            RunState::Scp(scp) => scp.storage = setup_config.storage.clone(),
+                            RunState::Local(local) => {
+                                local.storage = setup_config.storage.clone();
+                            }
+                        }
+                        s
+                    }
+                    Err(e) => {
+                        let ec2 = match &setup_config.storage {
+                            FederatedStorageConfig::Postgres { ec2, .. } => ec2.as_ref(),
+                            FederatedStorageConfig::PostgresDebezium { ec2, .. } => ec2.as_ref(),
+                            _ => None,
+                        };
+                        if let Some(ec2) = ec2
+                            && let Err(te) =
+                                terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
+                        {
+                            eprintln!(
+                                "[stdio] warning: failed to terminate EC2 instance on setup failure: {te}"
+                            );
+                        }
+                        return Err(format!("Setup failed: provisioning failed: {e}"));
+                    }
+                };
+
+                (sink, state)
             }
-            FederatedStorageConfig::Mongo {
-                connection_string, ..
-            } => build_mongodb_setup_response(connection_string, &state),
+        };
+
+        let mut read_db_kwargs = HashMap::from([
+            (
+                "uri".to_string(),
+                serde_json::Value::String(state.flight_url().to_string()),
+            ),
+            (
+                "username".to_string(),
+                serde_json::Value::String(String::new()),
+            ),
+            (
+                "password".to_string(),
+                serde_json::Value::String(state.password().to_string()),
+            ),
+        ]);
+        if let RunState::Local(local_state) = &state
+            && let Some(ak) = &local_state.flight_api_key
+        {
+            read_db_kwargs.insert(
+                "adbc.flight.sql.rpc.call_header.authorization".to_string(),
+                serde_json::Value::String(format!("Bearer {ak}")),
+            );
+        }
+
+        let catalog_namespace = match &setup_config.storage {
+            FederatedStorageConfig::Cayenne => Some("spicebench.bench".to_string()),
+            FederatedStorageConfig::DynamoDB { prefix, .. } if !prefix.is_empty() => {
+                Some(prefix.clone())
+            }
+            _ => None,
         };
 
         self.runs.insert(run_id, state);
         self.run_datasets.insert(run_id, datasets);
 
-        Ok(response)
+        Ok(SetupResponse {
+            sink,
+            read_driver: AdbcDriver::Flightsql,
+            read_db_kwargs,
+            catalog_namespace,
+            endpoints: HashMap::new(),
+        })
     }
 
     async fn metrics(
@@ -698,29 +826,34 @@ impl Handler for SpidapterHandler {
                     .await
                     .map_err(|e| format!("Failed to teardown PostgreSQL: {e}"))?;
                 if let Some(ec2) = ec2
-                    && let Err(e) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await {
-                        eprintln!(
-                            "[stdio] warning: failed to terminate EC2 Postgres instance {}: {e}",
-                            ec2.instance_id
-                        );
-                    }
+                    && let Err(e) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
+                {
+                    eprintln!(
+                        "[stdio] warning: failed to terminate EC2 Postgres instance {}: {e}",
+                        ec2.instance_id
+                    );
+                }
             }
-            FederatedStorageConfig::Mongo { ec2, .. } => {
+            FederatedStorageConfig::PostgresDebezium { pg, ec2, .. } => {
+                teardown_postgres(&pg, &run_datasets)
+                    .await
+                    .map_err(|e| format!("Failed to teardown PostgreSQL (Debezium): {e}"))?;
                 if let Some(ec2) = ec2
-                    && let Err(e) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await {
-                        eprintln!(
-                            "[stdio] warning: failed to terminate EC2 Mongo instance {}: {e}",
-                            ec2.instance_id
-                        );
-                    }
+                    && let Err(e) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
+                {
+                    eprintln!(
+                        "[stdio] warning: failed to terminate EC2 PostgresDebezium instance {}: {e}",
+                        ec2.instance_id
+                    );
+                }
             }
-            FederatedStorageConfig::DynamoDB {
-                table_names,
-                region,
-                ..
-            } => {
+            FederatedStorageConfig::DynamoDB { prefix, region, .. } => {
+                let table_names = run_datasets
+                    .keys()
+                    .map(|name| format!("{prefix}.{name}"))
+                    .collect();
                 let info = DynamoDbTeardownInfo {
-                    table_names: table_names.values().cloned().collect(),
+                    table_names,
                     region,
                 };
                 delete_dynamodb_tables(&info)
@@ -766,8 +899,10 @@ impl Handler for SpidapterHandler {
             ));
         }
 
-        if let FederatedStorageConfig::Postgres { pg, .. } = &storage {
-            // PostgresCdc: create staging table directly in PostgreSQL.
+        if let FederatedStorageConfig::Postgres { pg, .. }
+        | FederatedStorageConfig::PostgresDebezium { pg, .. } = &storage
+        {
+            // PostgresCdc/Debezium: create staging table directly in PostgreSQL.
             let source_config = self
                 .run_datasets
                 .get(&run_id)
@@ -828,36 +963,24 @@ pub async fn run_stdio_server(args: &StdioArgs) -> anyhow::Result<()> {
 }
 
 async fn post_setup_sink_action(
-    setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
     sql_url: &str,
     api_key: Option<&str>,
 ) -> anyhow::Result<()> {
-    if !matches!(setup_config.storage, FederatedStorageConfig::Cayenne) {
-        eprintln!("[stdio] Non-cayenne ingestion target: skipping post-setup SQL actions");
+    eprintln!("[stdio] Executing post-setup actions for Cayenne ADBC sink...");
+
+    let create_table_statements = generate_adbc_create_table_statements(datasets)?;
+    if create_table_statements.is_empty() {
+        eprintln!("[stdio] No datasets configured, skipping table creation");
         return Ok(());
     }
 
-    if setup_config.sink_type == Some(EtlSinkType::Adbc) {
-        eprintln!("[stdio] Executing post-setup actions for ADBC sink...");
-
-        let create_table_statements = generate_adbc_create_table_statements(datasets)?;
-        if create_table_statements.is_empty() {
-            eprintln!("[stdio] No datasets configured for ADBC sink, skipping table creation");
-            return Ok(());
-        }
-
-        for statement in create_table_statements {
-            eprintln!("[stdio] Running post-setup SQL: {statement}");
-            execute_sql_statement(sql_url, api_key, &statement).await?;
-        }
-
-        eprintln!("[stdio] ADBC post-setup table creation complete");
-    } else {
-        eprintln!(
-            "[stdio] No ETL sink type specified or ETL sink requires no additional steps, skipping post-setup actions"
-        );
+    for statement in create_table_statements {
+        eprintln!("[stdio] Running post-setup SQL: {statement}");
+        execute_sql_statement(sql_url, api_key, &statement).await?;
     }
+
+    eprintln!("[stdio] Cayenne post-setup table creation complete");
     Ok(())
 }
 
@@ -1090,34 +1213,30 @@ async fn generate_initial_spicepod(
                 datasets,
                 acceleration_engine_str(*acceleration),
             ),
-            FederatedStorageConfig::Cayenne => match setup_config.sink_type {
-                Some(EtlSinkType::Adbc) => {
-                    generate_cayenne_sink_spicepod(run_id, flight_api_key, args)
-                }
-                _ => generate_hive_spicepod(run_id, setup_config, datasets)?,
-            },
+            FederatedStorageConfig::Cayenne => {
+                generate_cayenne_sink_spicepod(run_id, flight_api_key, args)
+            }
             FederatedStorageConfig::DynamoDB {
-                table_names,
+                prefix,
                 acceleration,
                 ..
             } => generate_dynamodb_spicepod(
                 run_id,
                 setup_config,
                 datasets,
-                table_names,
+                prefix,
                 acceleration_engine_str(*acceleration),
             ),
-            FederatedStorageConfig::Mongo {
-                connection_string,
-                database,
+            FederatedStorageConfig::PostgresDebezium {
+                pg,
+                kafka_brokers,
                 acceleration,
                 ..
-            } => generate_mongodb_spicepod(
+            } => generate_postgres_debezium_spicepod(
                 run_id,
-                connection_string,
-                database,
+                kafka_brokers,
+                pg,
                 acceleration_engine_str(*acceleration),
-                setup_config,
                 datasets,
             ),
         }
@@ -1257,11 +1376,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generate_spicepod_includes_dataset_entries() {
+    async fn generate_spicepod_includes_cayenne_catalog() {
         let setup_config = SetupConfig {
-            region: Some("us-west-2".to_string()),
-            endpoint: Some("http://localhost:9000".to_string()),
-            sink_type: None,
+            region: None,
             spicepod_path: None,
             storage: FederatedStorageConfig::Cayenne,
             aws_region_override: None,
@@ -1287,53 +1404,21 @@ mod tests {
         let spicepod_yaml =
             serialize_spicepod(&spicepod).expect("spicepod should serialize to YAML");
 
-        assert!(spicepod_yaml.contains("from: \"s3://bucket/path/my_table/\""));
-        assert!(spicepod_yaml.contains("name: my_table"));
-        assert!(spicepod_yaml.contains("file_format: parquet"));
-        assert!(spicepod_yaml.contains("s3_region: us-west-2"));
-        assert!(spicepod_yaml.contains("s3_endpoint: \"http://localhost:9000\""));
-        assert!(spicepod_yaml.contains("allow_http: \"true\""));
-        assert!(spicepod_yaml.contains("engine: cayenne"));
-        assert!(spicepod_yaml.contains("mode: file"));
-        assert!(spicepod_yaml.contains("refresh_mode: full"));
-        assert!(spicepod_yaml.contains("telemetry:"));
-        assert!(spicepod_yaml.contains("enabled: false"));
-        assert!(spicepod_yaml.contains(
-            "state_location: \"s3://bucket/state/00000000-0000-0000-0000-000000000000\""
-        ));
-        assert!(spicepod_yaml.contains("s3_auth: key"));
-    }
-
-    #[tokio::test]
-    async fn generate_spicepod_errors_on_missing_dataset_source() {
-        let setup_config = SetupConfig {
-            region: None,
-            endpoint: None,
-            sink_type: None,
-            spicepod_path: None,
-            storage: FederatedStorageConfig::Cayenne,
-            aws_region_override: None,
-        };
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let datasets = HashMap::from([(
-            "missing_table".to_string(),
-            DatasetConfig {
-                schema,
-                location: None,
-                primary_key_columns: Vec::new(),
-                time_column: None,
-                partition_columns: Vec::new(),
-            },
-        )]);
-
-        let args = test_stdio_args();
-        let err = generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None, &args)
-            .await
-            .expect_err("missing source should fail");
         assert!(
-            err.to_string().contains("missing_table"),
-            "unexpected error: {err}"
+            spicepod_yaml.contains("from: cayenne"),
+            "expected cayenne provider: {spicepod_yaml}"
+        );
+        assert!(
+            spicepod_yaml.contains("name: spicebench"),
+            "expected spicebench catalog name: {spicepod_yaml}"
+        );
+        assert!(
+            spicepod_yaml.contains("telemetry:"),
+            "expected telemetry config: {spicepod_yaml}"
+        );
+        assert!(
+            spicepod_yaml.contains("enabled: false"),
+            "expected telemetry disabled: {spicepod_yaml}"
         );
     }
 
@@ -1352,8 +1437,6 @@ mod tests {
 
         let setup_config = SetupConfig {
             region: None,
-            endpoint: None,
-            sink_type: None,
             spicepod_path: Some(path.to_string_lossy().into_owned()),
             storage: FederatedStorageConfig::Cayenne,
             aws_region_override: None,
