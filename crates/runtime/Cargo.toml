@@ -396,6 +396,10 @@ turso = [
     "runtime-acceleration/turso",
 ]
 vortex = ["ballista-core/vortex", "ballista-executor/vortex"]
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+rdkafka = { workspace = true, features = ["cmake-build"] }
+
 [target.'cfg(not(windows))'.dependencies]
 cayenne = { path = "../cayenne", features = [
     "turso",
