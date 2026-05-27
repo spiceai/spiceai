@@ -25,7 +25,7 @@ use test_framework::{
     anyhow,
     app::{App, AppBuilder},
     opentelemetry_sdk::Resource,
-    queries::QuerySet,
+    queries::{Query, QuerySet},
     spiced::{SpicedInstance, StartRequest},
     spicepod::Spicepod,
     spicepod_utils::from_app,
@@ -34,9 +34,6 @@ use test_framework::{
 };
 
 const AUTOMATIC_REFERENCE_SCHEMA: &str = "__test_reference";
-const TPCH_TABLE_NAMES: [&str; 8] = [
-    "customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier",
-];
 
 #[cfg(feature = "append")]
 pub(crate) mod append;
@@ -96,6 +93,7 @@ pub(crate) async fn build_test_with_validation(
     let queries = query_set
         .get_queries(query_overrides, None, None, args.scale_factor)
         .await?;
+    let reference_schema = validation_reference_schema(args, app, &query_set, &queries)?;
 
     let mut test_builder = test_builder
         .with_query_set(queries)
@@ -111,7 +109,7 @@ pub(crate) async fn build_test_with_validation(
     }
 
     // Add reference schema for validation against known good tables
-    if let Some(ref_schema) = validation_reference_schema(args, app)? {
+    if let Some(ref_schema) = reference_schema {
         test_builder = test_builder.with_reference_schema(Some(ref_schema));
     }
 
@@ -119,12 +117,17 @@ pub(crate) async fn build_test_with_validation(
 }
 
 fn supports_automatic_reference_validation(query_set: &QuerySet) -> bool {
-    matches!(query_set, QuerySet::Tpch | QuerySet::ParameterizedTpch)
+    matches!(
+        query_set,
+        QuerySet::Tpch | QuerySet::ParameterizedTpch | QuerySet::Tpcds | QuerySet::Clickbench
+    )
 }
 
 fn validation_reference_schema(
     args: &DatasetTestArgs,
     app: &App,
+    query_set: &QuerySet,
+    queries: &[Query],
 ) -> anyhow::Result<Option<String>> {
     if let Some(reference_schema) = &args.reference_schema {
         return Ok(Some(reference_schema.clone()));
@@ -134,12 +137,16 @@ fn validation_reference_schema(
         return Ok(None);
     }
 
-    let query_set = args.load_query_set()?;
-    if !supports_automatic_reference_validation(&query_set) {
+    if !supports_automatic_reference_validation(query_set) {
         return Ok(None);
     }
 
-    if let Some(reference_schema) = detect_tpch_reference_schema(app) {
+    let table_names = reference_table_names(queries)?;
+    if table_names.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(reference_schema) = detect_reference_schema(app, &table_names) {
         return Ok(Some(reference_schema));
     }
 
@@ -147,10 +154,24 @@ fn validation_reference_schema(
         return Ok(None);
     }
 
-    Ok(Some(AUTOMATIC_REFERENCE_SCHEMA.to_string()))
+    if has_unqualified_datasets(app, &table_names) {
+        Ok(Some(AUTOMATIC_REFERENCE_SCHEMA.to_string()))
+    } else {
+        Ok(None)
+    }
 }
 
-fn detect_tpch_reference_schema(app: &App) -> Option<String> {
+fn reference_table_names(queries: &[Query]) -> anyhow::Result<BTreeSet<String>> {
+    let mut table_names = BTreeSet::new();
+
+    for query in queries {
+        table_names.extend(query.unqualified_table_names()?);
+    }
+
+    Ok(table_names)
+}
+
+fn detect_reference_schema(app: &App, table_names: &BTreeSet<String>) -> Option<String> {
     let mut schemas = BTreeMap::<&str, BTreeSet<&str>>::new();
 
     for dataset in &app.datasets {
@@ -158,21 +179,60 @@ fn detect_tpch_reference_schema(app: &App) -> Option<String> {
             continue;
         };
 
-        if TPCH_TABLE_NAMES.contains(&table_name) {
+        if table_names.contains(table_name) {
             schemas.entry(schema_name).or_default().insert(table_name);
         }
     }
 
     schemas
         .into_iter()
-        .find(|(_, tables)| TPCH_TABLE_NAMES.iter().all(|table| tables.contains(*table)))
+        .find(|(_, tables)| {
+            table_names
+                .iter()
+                .all(|table| tables.contains(table.as_str()))
+        })
         .map(|(schema_name, _)| schema_name.to_string())
 }
 
-fn add_automatic_reference_datasets(args: &DatasetTestArgs, app: &mut App) -> anyhow::Result<()> {
-    if validation_reference_schema(args, app)?.as_deref() != Some(AUTOMATIC_REFERENCE_SCHEMA) {
+fn has_unqualified_datasets(app: &App, table_names: &BTreeSet<String>) -> bool {
+    let unqualified_datasets = app
+        .datasets
+        .iter()
+        .filter(|dataset| !dataset.name.contains('.'))
+        .map(|dataset| dataset.name.as_str())
+        .collect::<BTreeSet<_>>();
+
+    table_names
+        .iter()
+        .all(|table_name| unqualified_datasets.contains(table_name.as_str()))
+}
+
+async fn benchmark_queries(
+    args: &DatasetTestArgs,
+    query_set: &QuerySet,
+) -> anyhow::Result<Vec<Query>> {
+    let query_overrides = args
+        .query_overrides
+        .clone()
+        .map(test_framework::queries::QueryOverrides::from);
+    query_set
+        .get_queries(query_overrides, None, None, args.scale_factor)
+        .await
+}
+
+async fn add_automatic_reference_datasets(
+    args: &DatasetTestArgs,
+    app: &mut App,
+) -> anyhow::Result<()> {
+    let query_set = args.load_query_set()?;
+    let queries = benchmark_queries(args, &query_set).await?;
+    if validation_reference_schema(args, app, &query_set, &queries)?.as_deref()
+        != Some(AUTOMATIC_REFERENCE_SCHEMA)
+    {
         return Ok(());
     }
+
+    let table_names = reference_table_names(&queries)?;
 
     let existing_dataset_names = app
         .datasets
@@ -184,6 +244,7 @@ fn add_automatic_reference_datasets(args: &DatasetTestArgs, app: &mut App) -> an
         .datasets
         .iter()
         .filter(|dataset| !dataset.name.contains('.'))
+        .filter(|dataset| table_names.contains(dataset.name.as_str()))
         .filter_map(|dataset| {
             let reference_name = format!("{AUTOMATIC_REFERENCE_SCHEMA}.{}", dataset.name);
             if existing_dataset_names.contains(reference_name.as_str()) {
@@ -200,7 +261,7 @@ fn add_automatic_reference_datasets(args: &DatasetTestArgs, app: &mut App) -> an
 
     if !reference_datasets.is_empty() {
         println!(
-            "Adding {} unaccelerated reference datasets under {AUTOMATIC_REFERENCE_SCHEMA}.* for TPCH validation",
+            "Adding {} unaccelerated reference datasets under {AUTOMATIC_REFERENCE_SCHEMA}.* for benchmark validation",
             reference_datasets.len()
         );
         app.datasets.extend(reference_datasets);
@@ -328,7 +389,7 @@ pub(crate) async fn get_dataset_app_and_start_request(
     args: &DatasetTestArgs,
 ) -> anyhow::Result<(App, StartRequest)> {
     let mut app = load_app(&args.common).await?;
-    add_automatic_reference_datasets(args, &mut app)?;
+    add_automatic_reference_datasets(args, &mut app).await?;
     let start_request = start_request_from_app(&args.common, app.clone())?;
 
     Ok((app, start_request))
@@ -492,30 +553,51 @@ mod tests {
 
     use super::*;
 
-    fn tpch_validation_args() -> DatasetTestArgs {
+    fn validation_args(query_set: &str) -> DatasetTestArgs {
         DatasetTestArgs::parse_from([
             "testoperator",
             "--query-set",
-            "tpch",
+            query_set,
             "--validate",
             "--scale-factor",
             "100",
         ])
     }
 
-    #[test]
-    fn automatic_reference_datasets_clone_base_datasets() {
-        let args = tpch_validation_args();
+    async fn validation_context(query_set_name: &str) -> (DatasetTestArgs, QuerySet, Vec<Query>) {
+        let args = validation_args(query_set_name);
+        let query_set = args.load_query_set().expect("should load query set");
+        let queries = benchmark_queries(&args, &query_set)
+            .await
+            .expect("should load benchmark queries");
+
+        (args, query_set, queries)
+    }
+
+    fn add_unqualified_datasets(app: &mut App, table_names: &BTreeSet<String>) {
+        for table_name in table_names {
+            app.datasets.push(Dataset::new(
+                format!("s3://bucket/{table_name}.parquet"),
+                table_name.as_str(),
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_reference_datasets_clone_base_datasets() {
+        let (args, _, queries) = validation_context("tpch").await;
+        let table_names = reference_table_names(&queries).expect("should get table names");
 
         let mut app = App::default();
-        app.datasets
-            .push(Dataset::new("s3://bucket/customer.parquet", "customer"));
+        add_unqualified_datasets(&mut app, &table_names);
         app.datasets.push(Dataset::new(
             "s3://bucket/lineitem.parquet",
             "existing.lineitem",
         ));
 
-        add_automatic_reference_datasets(&args, &mut app).expect("should add reference datasets");
+        add_automatic_reference_datasets(&args, &mut app)
+            .await
+            .expect("should add reference datasets");
 
         assert!(
             app.datasets
@@ -529,14 +611,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn existing_tpch_reference_schema_is_detected() {
-        let args = tpch_validation_args();
-        let mut app = App::default();
-        app.datasets
-            .push(Dataset::new("s3://bucket/customer.parquet", "customer"));
+    #[tokio::test]
+    async fn existing_tpcds_reference_schema_is_detected() {
+        let (args, query_set, queries) = validation_context("tpcds").await;
+        let table_names = reference_table_names(&queries).expect("should get table names");
+        assert!(table_names.contains("store_sales"));
+        assert!(!table_names.contains("customer_total_return"));
 
-        for table_name in TPCH_TABLE_NAMES {
+        let mut app = App::default();
+
+        for table_name in &table_names {
             app.datasets.push(Dataset::new(
                 format!("s3://bucket/{table_name}.parquet"),
                 format!("arrow.{table_name}"),
@@ -544,17 +628,41 @@ mod tests {
         }
 
         assert_eq!(
-            validation_reference_schema(&args, &app).expect("should get reference schema"),
+            validation_reference_schema(&args, &app, &query_set, &queries)
+                .expect("should get reference schema"),
             Some("arrow".to_string())
         );
 
         add_automatic_reference_datasets(&args, &mut app)
+            .await
             .expect("should not add generated references");
 
         assert!(
             app.datasets
                 .iter()
                 .all(|dataset| !dataset.name.starts_with("__test_reference."))
+        );
+    }
+
+    #[tokio::test]
+    async fn clickbench_reference_datasets_use_query_table_names() {
+        let (args, _, queries) = validation_context("clickbench").await;
+        let table_names = reference_table_names(&queries).expect("should get table names");
+        assert!(table_names.contains("hits"));
+        assert!(!table_names.contains("hits_delayed"));
+
+        let mut app = App::default();
+        app.datasets
+            .push(Dataset::new("s3://bucket/hits.parquet", "hits"));
+
+        add_automatic_reference_datasets(&args, &mut app)
+            .await
+            .expect("should add reference datasets");
+
+        assert!(
+            app.datasets
+                .iter()
+                .any(|dataset| dataset.name == "__test_reference.hits")
         );
     }
 }
