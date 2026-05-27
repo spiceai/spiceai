@@ -376,7 +376,14 @@ impl ClusterHarnessBuilder {
             () = Arc::clone(&scheduler_rt).load_components() => {}
         }
 
-        runtime_ready_check(&scheduler_rt).await;
+        // Don't gate on `runtime_ready_check(&scheduler_rt)` here: the
+        // scheduler now only flips accelerated datasets to `Ready` after
+        // executors confirm their partition loads via `PartitionsLoaded`,
+        // so `is_ready()` will legitimately stay false until at least one
+        // executor has connected and acked. Tests that need full
+        // cluster-level readiness should wait via `wait_for_executors` +
+        // `wait_for_row_count` (or `is_ready` after the executor harness
+        // has loaded its data).
 
         // Wait for the scheduler's cluster port to be reachable.
         wait_for_tcp(
