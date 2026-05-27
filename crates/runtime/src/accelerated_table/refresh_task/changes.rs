@@ -40,6 +40,7 @@ use data_components::kafka::{
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
+#[cfg(test)]
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
@@ -52,7 +53,9 @@ use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion_index::IndexedTableProvider;
 use runtime_table_partition::provider::PartitionTableProvider;
-use snafu::{OptionExt, ResultExt};
+#[cfg(test)]
+use snafu::OptionExt;
+use snafu::ResultExt;
 use std::collections::HashSet;
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -140,6 +143,7 @@ impl WriteChangeOutcome {
 ///    println!("Primary key value as DataFusion expression: {}", expr_value);
 /// }
 /// ```
+#[cfg(test)]
 macro_rules! extract_primary_key {
     ($key_col:expr, $key:expr, $data_schema:expr, $array_type:ty, $data_type_str:expr, $row:expr) => {{
         let key_col = $key_col.as_any().downcast_ref::<$array_type>().context(
@@ -1474,6 +1478,7 @@ pub(crate) fn get_primary_key_value(
     get_primary_key_value_at_row(data, 0, key)
 }
 
+#[cfg(test)]
 pub(crate) fn get_primary_key_value_at_row(
     data: &RecordBatch,
     row: usize,
@@ -1506,8 +1511,44 @@ pub(crate) fn get_primary_key_value_at_row(
     }
 }
 
-/// Groups rows into sub-batches based on operation type and primary key uniqueness
-/// Returns a vector of (`operation_type`, `row_indices`) tuples
+/// An active batch accumulating row indices for a single operation type.
+/// Tracks the set of primary keys it contains so that PK conflicts can be
+/// detected in O(1) per row.
+struct OpBatchAccumulator {
+    rows: Vec<usize>,
+    pks: HashSet<Vec<u8>, BuildHasherDefault<twox_hash::XxHash3_64>>,
+}
+
+impl OpBatchAccumulator {
+    fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            pks: HashSet::default(),
+        }
+    }
+
+    /// Drain accumulated rows into `out` under the given operation type and
+    /// reset PK tracking.
+    fn flush_into(
+        &mut self,
+        op: ChangeOperationType,
+        out: &mut Vec<(ChangeOperationType, Vec<usize>)>,
+    ) {
+        if !self.rows.is_empty() {
+            out.push((op, std::mem::take(&mut self.rows)));
+            self.pks.clear();
+        }
+    }
+}
+
+/// Groups rows into sub-batches based on operation type and primary key
+/// conflicts across active operation buckets.
+///
+/// Uses a streaming conflict-window algorithm: two active buckets (upsert,
+/// delete) accumulate rows concurrently. When an incoming row's PK already
+/// exists in *either* bucket, only the conflicting bucket is flushed — the
+/// other keeps accumulating. Truncate and Unknown act as barriers that flush
+/// everything.
 #[must_use]
 fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationType, Vec<usize>)> {
     let num_rows = change_batch.record.num_rows();
@@ -1522,56 +1563,72 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
         .iter()
         .filter_map(|name| data_batch.schema().index_of(name).ok())
         .collect();
-
-    let mut sub_batches = Vec::new();
-    let mut current_batch_indices = Vec::new();
-    let mut current_op_type: Option<ChangeOperationType> = None;
-    let mut seen_primary_keys: HashSet<Vec<u8>, BuildHasherDefault<twox_hash::XxHash3_64>> =
-        HashSet::default();
     let has_pks = !pk_col_indices.is_empty();
+
+    let mut upserts = OpBatchAccumulator::new();
+    let mut deletes = OpBatchAccumulator::new();
+    let mut out: Vec<(ChangeOperationType, Vec<usize>)> = Vec::new();
 
     for row_id in 0..num_rows {
         let op = change_batch.op(row_id);
         let op_type = ChangeOperationType::from_operation(&op);
 
-        let primary_key = if has_pks {
-            encode_primary_key(&data_batch, &pk_col_indices, row_id)
-        } else {
-            Vec::new()
-        };
+        // Truncate and Unknown are barriers — flush everything, emit the
+        // barrier row, and continue.
+        if op_type == ChangeOperationType::Truncate || op_type == ChangeOperationType::Unknown {
+            upserts.flush_into(ChangeOperationType::Upsert, &mut out);
+            deletes.flush_into(ChangeOperationType::Delete, &mut out);
+            out.push((op_type, vec![row_id]));
+            continue;
+        }
 
-        let should_split = if let Some(current_type) = current_op_type {
-            current_type != op_type || (has_pks && seen_primary_keys.contains(&primary_key))
-        } else {
-            false
-        };
+        // When PKs are available, flush only the bucket(s) that already
+        // contain this PK so that per-PK ordering is preserved without
+        // unnecessarily breaking up non-conflicting batches.
+        if has_pks {
+            let primary_key = encode_primary_key(&data_batch, &pk_col_indices, row_id);
 
-        if should_split {
-            if !current_batch_indices.is_empty()
-                && let Some(op_type) = current_op_type
-            {
-                sub_batches.push((op_type, std::mem::take(&mut current_batch_indices)));
+            if upserts.pks.contains(&primary_key) {
+                upserts.flush_into(ChangeOperationType::Upsert, &mut out);
+            }
+            if deletes.pks.contains(&primary_key) {
+                deletes.flush_into(ChangeOperationType::Delete, &mut out);
             }
 
-            seen_primary_keys.clear();
-            current_op_type = Some(op_type);
-        } else if current_op_type.is_none() {
-            current_op_type = Some(op_type);
-        }
-
-        current_batch_indices.push(row_id);
-        if has_pks {
-            seen_primary_keys.insert(primary_key);
+            let batch = match op_type {
+                ChangeOperationType::Upsert => &mut upserts,
+                ChangeOperationType::Delete => &mut deletes,
+                ChangeOperationType::Truncate | ChangeOperationType::Unknown => {
+                    // Handled as barriers above; this is unreachable.
+                    unreachable!("unexpected op type {op_type:?} after barrier check")
+                }
+            };
+            batch.rows.push(row_id);
+            batch.pks.insert(primary_key);
+        } else {
+            // No PKs — fall back to grouping consecutive same-op rows
+            // (can't detect conflicts without keys).
+            match op_type {
+                ChangeOperationType::Upsert => {
+                    deletes.flush_into(ChangeOperationType::Delete, &mut out);
+                    upserts.rows.push(row_id);
+                }
+                ChangeOperationType::Delete => {
+                    upserts.flush_into(ChangeOperationType::Upsert, &mut out);
+                    deletes.rows.push(row_id);
+                }
+                ChangeOperationType::Truncate | ChangeOperationType::Unknown => {
+                    unreachable!("unexpected op type {op_type:?} after barrier check")
+                }
+            }
         }
     }
 
-    if !current_batch_indices.is_empty()
-        && let Some(op_type) = current_op_type
-    {
-        sub_batches.push((op_type, current_batch_indices));
-    }
+    // Flush remaining active batches.
+    upserts.flush_into(ChangeOperationType::Upsert, &mut out);
+    deletes.flush_into(ChangeOperationType::Delete, &mut out);
 
-    sub_batches
+    out
 }
 
 fn encode_primary_key(
@@ -1971,7 +2028,9 @@ mod tests {
     }
 
     #[test]
-    fn test_different_operation_types_split() {
+    fn test_different_operation_types_no_pk_conflict_merges() {
+        // U(pk1), D(pk2), U(pk3) — no PK conflicts across buckets,
+        // so upserts merge and deletes merge.
         let change_batch = create_test_change_batch(
             vec!["c", "d", "c"],
             &[vec!["id"], vec!["id"], vec!["id"]],
@@ -1983,18 +2042,15 @@ mod tests {
 
         assert_eq!(
             result.len(),
-            3,
-            "Should split into three sub-batches for different operations"
+            2,
+            "Non-conflicting ops should merge into 2 batches"
         );
 
         assert_eq!(result[0].0, ChangeOperationType::Upsert);
-        assert_eq!(result[0].1, vec![0]);
+        assert_eq!(result[0].1, vec![0, 2]);
 
         assert_eq!(result[1].0, ChangeOperationType::Delete);
         assert_eq!(result[1].1, vec![1]);
-
-        assert_eq!(result[2].0, ChangeOperationType::Upsert);
-        assert_eq!(result[2].1, vec![2]);
     }
 
     #[test]
@@ -2144,7 +2200,9 @@ mod tests {
     }
 
     #[test]
-    fn test_alternating_operations() {
+    fn test_alternating_operations_no_pk_conflict_merges() {
+        // U(pk1), D(pk2), U(pk3), D(pk4) — all distinct PKs,
+        // so upserts merge and deletes merge.
         let change_batch = create_test_change_batch(
             vec!["c", "d", "c", "d"],
             &[vec!["id"], vec!["id"], vec!["id"], vec!["id"]],
@@ -2156,21 +2214,79 @@ mod tests {
 
         assert_eq!(
             result.len(),
-            4,
-            "Alternating operations should create 4 sub-batches"
+            2,
+            "Alternating operations with distinct PKs should merge into 2 batches"
         );
 
         assert_eq!(result[0].0, ChangeOperationType::Upsert);
-        assert_eq!(result[0].1, vec![0]);
+        assert_eq!(result[0].1, vec![0, 2]);
 
         assert_eq!(result[1].0, ChangeOperationType::Delete);
+        assert_eq!(result[1].1, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_cross_op_pk_conflict_flushes_only_conflicting_bucket() {
+        // U(pk1), D(pk2), D(pk1) — pk1 conflicts with upserts bucket,
+        // so upserts is flushed but deletes keeps accumulating.
+        let change_batch = create_test_change_batch(
+            vec!["c", "d", "d"],
+            &[vec!["id"], vec!["id"], vec!["id"]],
+            vec![1, 2, 1],
+            vec![Some("A"), Some("B"), Some("A_del")],
+        );
+
+        let result = group_into_sub_batches(&change_batch);
+
+        assert_eq!(result.len(), 2, "Should flush upserts, then merge deletes");
+        assert_eq!(result[0].0, ChangeOperationType::Upsert);
+        assert_eq!(result[0].1, vec![0]);
+        assert_eq!(result[1].0, ChangeOperationType::Delete);
+        assert_eq!(result[1].1, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_truncate_barrier_flushes_all_buckets() {
+        // U(pk1), D(pk2), T, U(pk3) — truncate flushes both active
+        // buckets, emits the truncate row, then a new upsert batch starts.
+        let change_batch = create_test_change_batch(
+            vec!["c", "d", "t", "c"],
+            &[vec!["id"], vec!["id"], vec!["id"], vec!["id"]],
+            vec![1, 2, 99, 3],
+            vec![Some("A"), Some("B"), Some("T"), Some("C")],
+        );
+
+        let result = group_into_sub_batches(&change_batch);
+
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].0, ChangeOperationType::Upsert);
+        assert_eq!(result[0].1, vec![0]);
+        assert_eq!(result[1].0, ChangeOperationType::Delete);
         assert_eq!(result[1].1, vec![1]);
-
-        assert_eq!(result[2].0, ChangeOperationType::Upsert);
+        assert_eq!(result[2].0, ChangeOperationType::Truncate);
         assert_eq!(result[2].1, vec![2]);
-
-        assert_eq!(result[3].0, ChangeOperationType::Delete);
+        assert_eq!(result[3].0, ChangeOperationType::Upsert);
         assert_eq!(result[3].1, vec![3]);
+    }
+
+    #[test]
+    fn test_same_pk_upsert_then_delete_conflict_forces_flush() {
+        // U(pk1), D(pk1) — pk1 is in upserts when delete arrives,
+        // so upserts is flushed first, then delete goes to its bucket.
+        let change_batch = create_test_change_batch(
+            vec!["c", "d"],
+            &[vec!["id"], vec!["id"]],
+            vec![1, 1],
+            vec![Some("A"), Some("A_del")],
+        );
+
+        let result = group_into_sub_batches(&change_batch);
+
+        assert_eq!(result.len(), 2, "PK conflict across ops forces flush");
+        assert_eq!(result[0].0, ChangeOperationType::Upsert);
+        assert_eq!(result[0].1, vec![0]);
+        assert_eq!(result[1].0, ChangeOperationType::Delete);
+        assert_eq!(result[1].1, vec![1]);
     }
 
     fn make_mem_table() -> Arc<MemTable> {
