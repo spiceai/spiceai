@@ -16116,8 +16116,11 @@ dependencies = [
 name = "runtime-cloud-connect"
 version = "2.0.0-unstable"
 dependencies = [
+ "arrow",
  "async-stream",
  "async-trait",
+ "base64 0.22.1",
+ "chrono",
  "dirs",
  "ed25519-dalek",
  "futures",
@@ -18116,6 +18119,7 @@ name = "spiced"
 version = "2.0.0-unstable"
 dependencies = [
  "app",
+ "arrow",
  "async-trait",
  "clap",
  "connector-clickhouse",

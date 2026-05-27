@@ -39,6 +39,7 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
+pub mod arrow_json;
 pub mod client;
 pub mod config;
 pub mod fingerprint;

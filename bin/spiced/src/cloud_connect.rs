@@ -152,51 +152,111 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         })
     }
 
+    /// Execute a SQL statement and return the rows plus column metadata
+    /// in the wire shape consumed by the Spice Cloud portal's Query tab:
+    ///
+    /// ```json
+    /// {
+    ///   "columns": [{ "name": "...", "data_type": "..." }],
+    ///   "rows": [[v1, v2, ...], ...],
+    ///   "row_count": N,
+    ///   "truncated": bool
+    /// }
+    /// ```
+    ///
+    /// Caps:
+    /// - `max_rows == 0` → default cap of [`DEFAULT_RUN_QUERY_ROW_CAP`].
+    /// - Hard ceiling of [`RUN_QUERY_HARD_ROW_CAP`] rows regardless.
+    /// - Payload byte budget of
+    ///   [`runtime_cloud_connect::arrow_json::PAYLOAD_SIZE_BUDGET_BYTES`]
+    ///   — exceeding either cap sets `truncated: true`.
     async fn execute_sql(
         &self,
         sql: &str,
         max_rows: u32,
     ) -> Result<serde_json::Value, String> {
-        // Cap defensively. The control plane is trusted to set a
-        // sensible limit, but we still box it.
-        let cap = max_rows.clamp(1, 10_000) as usize;
+        let cap = resolve_run_query_cap(max_rows);
+
         let df = self.runtime.datafusion();
         let query = df.query_builder(sql).build();
         let result = query.run().await.map_err(|e| e.to_string())?;
         let mut stream = result.data;
         use futures::StreamExt as _;
-        let mut total_rows: usize = 0;
-        let mut total_batches: usize = 0;
-        let mut schema_json: Option<serde_json::Value> = None;
+
+        // Collect up to `cap` rows worth of batches. We stop streaming
+        // once we have enough rows so we don't pull the rest of a huge
+        // result set into memory just to throw it away.
+        let mut batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
+        let mut collected_rows: usize = 0;
+        let mut source_truncated = false;
         while let Some(batch) = stream.next().await {
             let batch = batch.map_err(|e| e.to_string())?;
-            if schema_json.is_none() {
-                let schema = batch.schema();
-                schema_json = Some(serde_json::json!(
-                    schema
-                        .fields()
-                        .iter()
-                        .map(|f| {
-                            serde_json::json!({
-                                "name": f.name(),
-                                "type": f.data_type().to_string(),
-                                "nullable": f.is_nullable(),
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                ));
-            }
-            total_batches += 1;
-            total_rows = total_rows.saturating_add(batch.num_rows());
-            if total_rows >= cap {
+            let take_rows = cap.saturating_sub(collected_rows);
+            if take_rows == 0 {
+                source_truncated = true;
                 break;
             }
+            if batch.num_rows() > take_rows {
+                source_truncated = true;
+                batches.push(batch.slice(0, take_rows));
+                break;
+            }
+            collected_rows += batch.num_rows();
+            batches.push(batch);
         }
-        Ok(serde_json::json!({
-            "rows": total_rows,
-            "batches": total_batches,
-            "schema": schema_json.unwrap_or(serde_json::Value::Null),
-            "note": "RunQuery returns row counts and schema only in v0; row payloads are not streamed to the cloud."
-        }))
+
+        let mut envelope =
+            runtime_cloud_connect::arrow_json::encode_record_batches(&batches, cap);
+        // Propagate the source-side truncation flag if we cut off the
+        // upstream stream before exhausting it.
+        if source_truncated
+            && let Some(obj) = envelope.as_object_mut()
+        {
+            obj.insert("truncated".to_string(), serde_json::Value::Bool(true));
+        }
+        Ok(envelope)
+    }
+}
+
+/// Default row cap when the cloud control plane sets `max_rows = 0`.
+pub const DEFAULT_RUN_QUERY_ROW_CAP: usize = 1_000;
+/// Hard row ceiling that the runtime always enforces, even when the
+/// control plane requests more.
+pub const RUN_QUERY_HARD_ROW_CAP: usize = 10_000;
+
+/// Resolve the effective row cap for a `RunQuery`:
+/// - `max_rows == 0` → [`DEFAULT_RUN_QUERY_ROW_CAP`]
+/// - else → `min(max_rows, RUN_QUERY_HARD_ROW_CAP)`
+#[must_use]
+pub fn resolve_run_query_cap(max_rows: u32) -> usize {
+    if max_rows == 0 {
+        DEFAULT_RUN_QUERY_ROW_CAP
+    } else {
+        (max_rows as usize).min(RUN_QUERY_HARD_ROW_CAP)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_query_cap_defaults_when_unset() {
+        assert_eq!(resolve_run_query_cap(0), DEFAULT_RUN_QUERY_ROW_CAP);
+    }
+
+    #[test]
+    fn run_query_cap_honors_caller_below_hard_cap() {
+        assert_eq!(resolve_run_query_cap(50), 50);
+        assert_eq!(resolve_run_query_cap(9_999), 9_999);
+        assert_eq!(resolve_run_query_cap(10_000), 10_000);
+    }
+
+    #[test]
+    fn run_query_cap_clamps_to_hard_cap() {
+        // The hard cap is 10_000 — even when the caller asks for 99_999
+        // we never serialize more than 10_000 rows.
+        assert_eq!(resolve_run_query_cap(99_999), RUN_QUERY_HARD_ROW_CAP);
+        assert_eq!(resolve_run_query_cap(u32::MAX), RUN_QUERY_HARD_ROW_CAP);
     }
 }

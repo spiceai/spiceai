@@ -10,6 +10,7 @@ version.workspace = true
 
 [dependencies]
 app = { path = "../../crates/app" }
+arrow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 connector-clickhouse = { path = "../../crates/data-connectors/connector-clickhouse", optional = true }
 connector-databricks = { path = "../../crates/data-connectors/connector-databricks", optional = true }

@@ -354,21 +354,64 @@ impl ClientDriver {
                 send_result(tx, &cmd.command_id, true, "", info).await;
             }
             proto::control_message::Body::RunQuery(cmd) => {
+                let sql_hash = sql_hash(&cmd.sql);
                 tracing::info!(
                     target: "cloud_connect_audit",
                     command_id = %cmd.command_id,
                     max_rows = cmd.max_rows,
                     sql_len = cmd.sql.len(),
+                    sql_hash = %sql_hash,
                     "RunQuery command received from cloud control plane"
                 );
+                let identifier = self
+                    .identity
+                    .as_ref()
+                    .map(|i| i.identifier.clone())
+                    .unwrap_or_default();
+                let started = std::time::Instant::now();
                 match self.runtime.execute_sql(&cmd.sql, cmd.max_rows).await {
-                    Ok(payload) => send_result(tx, &cmd.command_id, true, "", payload).await,
+                    Ok(payload) => {
+                        let duration_ms = started.elapsed().as_millis() as u64;
+                        let row_count = payload
+                            .get("row_count")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        let truncated = payload
+                            .get("truncated")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        emit_run_query_audit(
+                            tx,
+                            &identifier,
+                            &cmd.command_id,
+                            &sql_hash,
+                            row_count,
+                            truncated,
+                            duration_ms,
+                            true,
+                        )
+                        .await;
+                        send_result(tx, &cmd.command_id, true, "", payload).await;
+                    }
                     Err(err) => {
+                        let duration_ms = started.elapsed().as_millis() as u64;
+                        emit_run_query_audit(
+                            tx,
+                            &identifier,
+                            &cmd.command_id,
+                            &sql_hash,
+                            0,
+                            false,
+                            duration_ms,
+                            false,
+                        )
+                        .await;
+                        // Safe error: never includes the SQL text.
                         send_result(
                             tx,
                             &cmd.command_id,
                             false,
-                            &err,
+                            &sanitize_error(&err),
                             serde_json::Value::Null,
                         )
                         .await;
@@ -670,6 +713,117 @@ async fn send_unsupported(tx: &mpsc::Sender<proto::ClientMessage>, command_id: &
         serde_json::Value::Null,
     )
     .await;
+}
+
+/// Hash a SQL string with SHA-256 so the audit log carries a stable
+/// identifier for the statement without leaking the statement itself.
+fn sql_hash(sql: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(sql.as_bytes());
+    // Hex is compact, log-friendly, and avoids any worry about base64
+    // padding showing up in structured logs.
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Trim a runtime error string to a short, safe summary. We deliberately
+/// avoid surfacing the full DataFusion error message because it can
+/// echo back the SQL fragment, table contents, or row values that
+/// triggered the failure.
+///
+/// Strategy:
+/// 1. Take the first line only.
+/// 2. Replace any backtick-, single-quote-, or double-quote-delimited
+///    spans with a `<redacted>` placeholder — these almost always carry
+///    user data (table names, identifiers, column values).
+/// 3. Cap at 256 chars.
+fn sanitize_error(err: &str) -> String {
+    const MAX_LEN: usize = 256;
+    let first_line = err.lines().next().unwrap_or("query failed");
+    let redacted = redact_quoted_spans(first_line);
+    if redacted.len() <= MAX_LEN {
+        redacted
+    } else {
+        let mut s: String = redacted.chars().take(MAX_LEN).collect();
+        s.push('…');
+        s
+    }
+}
+
+/// Walk the input and replace any text between matching backticks /
+/// single quotes / double quotes with `<redacted>`. Unterminated
+/// delimiters discard the rest of the input.
+fn redact_quoted_spans(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(c) = chars.next() {
+        if c == '`' || c == '\'' || c == '"' {
+            // Skip until the matching delimiter or end of string.
+            let mut found_close = false;
+            for next in chars.by_ref() {
+                if next == c {
+                    found_close = true;
+                    break;
+                }
+            }
+            out.push_str("<redacted>");
+            if !found_close {
+                break;
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Emit a `kind: "audit"` EventLog describing a RunQuery invocation.
+#[allow(clippy::too_many_arguments)]
+async fn emit_run_query_audit(
+    tx: &mpsc::Sender<proto::ClientMessage>,
+    identifier: &str,
+    command_id: &str,
+    sql_hash: &str,
+    row_count: u64,
+    truncated: bool,
+    duration_ms: u64,
+    success: bool,
+) {
+    let event = serde_json::json!({
+        "action": "run_query",
+        "sql_hash": sql_hash,
+        "row_count": row_count,
+        "truncated": truncated,
+        "duration_ms": duration_ms,
+        "command_id": command_id,
+        "success": success,
+    });
+    let event_json = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+    tracing::info!(
+        target: "cloud_connect_audit",
+        command_id = %command_id,
+        sql_hash = %sql_hash,
+        row_count = row_count,
+        truncated = truncated,
+        duration_ms = duration_ms,
+        success = success,
+        "RunQuery audit event"
+    );
+    let msg = proto::ClientMessage {
+        body: Some(proto::client_message::Body::Event(proto::EventLog {
+            identifier: identifier.to_string(),
+            kind: "audit".to_string(),
+            event_json,
+            timestamp_unix: crate::heartbeat::now_unix(),
+        })),
+    };
+    if let Err(err) = tx.send(msg).await {
+        tracing::warn!("Cloud Connect: failed to send audit EventLog: {err}");
+    }
 }
 
 fn humanize(d: Duration) -> String {
