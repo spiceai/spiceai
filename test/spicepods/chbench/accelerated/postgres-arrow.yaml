@@ -2,20 +2,23 @@ version: v1
 kind: Spicepod
 name: postgres-arrow
 
+postgres_connection_params: &postgres_params
+  pg_host: 127.0.0.1
+  pg_port: 5432
+  pg_db: chbench
+  pg_user: bench
+  pg_pass: bench
+  pg_sslmode: disable
+
 datasets:
   # ---- TPC-C core tables (mutated by OLTP workload) ----
 
   - from: postgres:warehouse
     name: warehouse
-    params: &postgres_params
-      pg_host: 127.0.0.1
-      pg_port: 5432
-      pg_db: chbench
-      pg_user: bench
-      pg_pass: bench
-      pg_sslmode: disable
+    params:
+      <<: *postgres_params
       pg_replication_slot: spice_warehouse
-      pg_replication_initial_snapshot: "true"
+      pg_replication_initial_snapshot: 'true'
     acceleration: &arrow_accel
       enabled: true
       engine: arrow
@@ -29,6 +32,7 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_district
+      pg_replication_initial_snapshot: 'true'
     acceleration:
       <<: *arrow_accel
       primary_key: (d_w_id, d_id)
@@ -40,6 +44,7 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_customer
+      pg_replication_initial_snapshot: 'true'
     acceleration:
       <<: *arrow_accel
       primary_key: (c_w_id, c_d_id, c_id)
@@ -51,6 +56,7 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_new_order
+      pg_replication_initial_snapshot: 'true'
     acceleration:
       <<: *arrow_accel
       primary_key: (no_w_id, no_d_id, no_o_id)
@@ -62,6 +68,7 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_oorder
+      pg_replication_initial_snapshot: 'true'
     acceleration:
       <<: *arrow_accel
       primary_key: (o_w_id, o_d_id, o_id)
@@ -73,41 +80,47 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_order_line
+      pg_replication_initial_snapshot: 'true'
     acceleration:
       <<: *arrow_accel
       primary_key: (ol_w_id, ol_d_id, ol_o_id, ol_number)
       on_conflict:
         (ol_w_id, ol_d_id, ol_o_id, ol_number): upsert
 
-  - from: postgres:item
-    name: item
-    params:
-      <<: *postgres_params
-      pg_replication_slot: spice_item
-    acceleration:
-      <<: *arrow_accel
-      primary_key: i_id
-      on_conflict:
-        i_id: upsert
-
   - from: postgres:stock
     name: stock
     params:
       <<: *postgres_params
       pg_replication_slot: spice_stock
+      pg_replication_initial_snapshot: 'true'
     acceleration:
       <<: *arrow_accel
       primary_key: (s_w_id, s_i_id)
       on_conflict:
         (s_w_id, s_i_id): upsert
 
+  # ---- Static reference tables (no OLTP mutations, full refresh) ----
+
+  - from: postgres:item
+    name: item
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: arrow
+      refresh_mode: full
+      primary_key: i_id
+      on_conflict:
+        i_id: upsert
+
   - from: postgres:region
     name: region
     params:
       <<: *postgres_params
-      pg_replication_slot: spice_region
     acceleration:
-      <<: *arrow_accel
+      enabled: true
+      engine: arrow
+      refresh_mode: full
       primary_key: r_regionkey
       on_conflict:
         r_regionkey: upsert
@@ -116,9 +129,10 @@ datasets:
     name: nation
     params:
       <<: *postgres_params
-      pg_replication_slot: spice_nation
     acceleration:
-      <<: *arrow_accel
+      enabled: true
+      engine: arrow
+      refresh_mode: full
       primary_key: n_nationkey
       on_conflict:
         n_nationkey: upsert
@@ -127,9 +141,10 @@ datasets:
     name: supplier
     params:
       <<: *postgres_params
-      pg_replication_slot: spice_supplier
     acceleration:
-      <<: *arrow_accel
+      enabled: true
+      engine: arrow
+      refresh_mode: full
       primary_key: su_suppkey
       on_conflict:
         su_suppkey: upsert
