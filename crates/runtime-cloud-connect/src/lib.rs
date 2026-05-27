@@ -47,6 +47,7 @@ pub mod identity;
 mod client;
 mod fingerprint;
 mod heartbeat;
+mod shutdown;
 
 /// Generated gRPC types for `spice.cloud.v1.CloudConnect`.
 pub mod proto {
@@ -73,6 +74,8 @@ use tokio::task::JoinHandle;
 pub use config::CloudConnectConfig;
 pub use handlers::RuntimeHandle;
 pub use identity::{Identity, IdentityStore};
+
+use shutdown::Shutdown;
 
 /// Errors that can occur while starting or running the Cloud Connect client.
 #[derive(Debug, Snafu)]
@@ -107,7 +110,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// [`CloudConnect::shutdown`] to stop it cleanly.
 pub struct CloudConnect {
     task: Mutex<Option<JoinHandle<()>>>,
-    shutdown_tx: Arc<tokio::sync::Notify>,
+    shutdown: Arc<Shutdown>,
 }
 
 impl CloudConnect {
@@ -142,13 +145,13 @@ impl CloudConnect {
             return Ok(None);
         }
 
-        let shutdown_tx = Arc::new(tokio::sync::Notify::new());
-        let shutdown_rx = Arc::clone(&shutdown_tx);
+        let shutdown = Shutdown::new();
+        let shutdown_for_task = Arc::clone(&shutdown);
 
         let runtime_for_task = Arc::clone(&runtime);
         let task = tokio::spawn(async move {
             let driver =
-                client::ClientDriver::new(config, runtime_for_task, shutdown_rx, identity);
+                client::ClientDriver::new(config, runtime_for_task, shutdown_for_task, identity);
             if let Err(err) = driver.run().await {
                 tracing::error!("Cloud Connect driver exited with error: {err}");
             }
@@ -156,7 +159,7 @@ impl CloudConnect {
 
         Ok(Some(Self {
             task: Mutex::new(Some(task)),
-            shutdown_tx,
+            shutdown,
         }))
     }
 
@@ -164,7 +167,7 @@ impl CloudConnect {
     ///
     /// Waits for the background task to exit (≤ 10s drain budget).
     pub async fn shutdown(&self) {
-        self.shutdown_tx.notify_waiters();
+        self.shutdown.trigger();
         let Some(handle) = self.task.lock().await.take() else {
             return;
         };

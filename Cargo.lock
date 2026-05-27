@@ -16019,13 +16019,11 @@ name = "runtime-cloud-connect"
 version = "2.0.0-unstable"
 dependencies = [
  "arrow",
- "async-stream",
  "async-trait",
  "base64 0.22.1",
  "chrono",
  "dirs",
  "ed25519-dalek",
- "futures",
  "gethostname",
  "prost 0.14.3",
  "rand 0.10.1",
@@ -16034,7 +16032,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "snafu",
- "sysinfo 0.38.4",
  "tempfile",
  "tokio",
  "tokio-stream",

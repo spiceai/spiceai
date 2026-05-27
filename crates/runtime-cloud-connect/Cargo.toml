@@ -14,13 +14,11 @@ path = "src/lib.rs"
 
 [dependencies]
 arrow = { workspace = true }
-async-stream = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 dirs = "6"
 ed25519-dalek = { version = "2", features = ["pem", "rand_core"] }
-futures = { workspace = true }
 gethostname = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
@@ -29,8 +27,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 snafu = { workspace = true }
-sysinfo = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = "0.14"

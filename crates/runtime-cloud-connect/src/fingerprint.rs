@@ -24,9 +24,11 @@ limitations under the License.
 //! machine-id || ":" || hostname || ":" || os || ":" || arch
 //! ```
 //!
-//! Where `machine-id` is taken from `/etc/machine-id` (or its
-//! `/var/lib/dbus/machine-id` fallback) on Linux, the `IOPlatformUUID`
-//! on macOS via `sysinfo`, or a synthetic value on other platforms.
+//! `machine-id` is taken from `/etc/machine-id` (or its
+//! `/var/lib/dbus/machine-id` fallback) on Linux. On macOS and Windows
+//! we currently substitute the literal `"unknown"` so the fingerprint
+//! degrades to a hostname/os/arch hash — a proper platform UUID there
+//! would require `ioreg` / registry access which we have not wired up.
 //!
 //! This is a fingerprint, not a secret — leaking it is not a security
 //! issue, and it intentionally does not include MAC addresses (because
@@ -65,7 +67,15 @@ pub(crate) fn compute() -> String {
     out
 }
 
-/// Best-effort host machine id. Returns `None` if we cannot find one.
+/// Best-effort host machine id. Returns `None` if we cannot find a
+/// stable identifier — the caller substitutes `"unknown"` in that case.
+///
+/// We deliberately do NOT fall back to `boot_time`: it changes on every
+/// reboot, which would defeat the whole point of a "stable" fingerprint.
+/// On macOS / Windows the fingerprint is hostname-derived for now; a
+/// proper platform UUID would require spawning `ioreg` (macOS) or
+/// reading `MachineGuid` from the registry (Windows). Not worth the
+/// extra deps yet.
 fn read_machine_id() -> Option<String> {
     // /etc/machine-id is canonical on systemd-based Linux distributions.
     // /var/lib/dbus/machine-id is the older D-Bus fallback.
@@ -77,17 +87,6 @@ fn read_machine_id() -> Option<String> {
             }
         }
     }
-
-    // On macOS, `ioreg -d2 -c IOPlatformExpertDevice` yields a stable
-    // `IOPlatformUUID`. We avoid spawning a subprocess and rely on
-    // the boot-id surfaced by `sysinfo` instead, which is also stable
-    // across reboots on most platforms.
-    if let Some(boot_id) = sysinfo::System::boot_time().to_string().into() {
-        // boot_time is u64-as-string and is identical for the lifetime
-        // of the boot; combined with hostname this is enough.
-        return Some(boot_id);
-    }
-
     None
 }
 

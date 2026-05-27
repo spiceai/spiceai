@@ -67,9 +67,10 @@ pub trait RuntimeHandle: Send + Sync + 'static {
     /// Apply a cloud-managed spicepod to disk and trigger a reload.
     ///
     /// The default implementation writes the YAML to
-    /// `config_dir/spicepod-cloud-managed.yml`. Implementations that
-    /// want to actually merge it into the running runtime should
-    /// override this.
+    /// `config_dir/spicepod-cloud-managed.yml` via `tokio::fs` so the
+    /// filesystem write does not block the runtime worker thread.
+    /// Implementations that want to actually merge the spicepod into
+    /// the running runtime should override this.
     async fn apply_spicepod(
         &self,
         config_dir: &Path,
@@ -77,10 +78,13 @@ pub trait RuntimeHandle: Send + Sync + 'static {
     ) -> Result<serde_json::Value, String> {
         let path = config_dir.join(crate::config::CLOUD_MANAGED_SPICEPOD_FILE);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            tokio::fs::create_dir_all(parent)
+                .await
                 .map_err(|e| format!("create config dir: {e}"))?;
         }
-        std::fs::write(&path, spicepod_yaml).map_err(|e| format!("write spicepod: {e}"))?;
+        tokio::fs::write(&path, spicepod_yaml)
+            .await
+            .map_err(|e| format!("write spicepod: {e}"))?;
         Ok(serde_json::json!({
             "path": path.display().to_string(),
             "reload": "deferred",

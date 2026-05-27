@@ -29,17 +29,18 @@ limitations under the License.
 //! - Otherwise, send the (pending) adoption code as `Hello.credential`
 //!   and identifier empty.
 //!
-//! If a Forget arrives, we clear the local identity and *continue
-//! running unmanaged* — spiced stays up and serving local spicepod
-//! traffic as before. This matches the UniFi semantics where "Forget"
-//! releases management but doesn't destroy the device.
+//! If a Forget arrives, we clear the local identity and exit the
+//! cloud-connect task — spiced itself stays up and keeps serving local
+//! spicepod traffic as before. This matches the UniFi semantics where
+//! "Forget" releases management but doesn't destroy the device. To
+//! re-adopt, the user runs `spice connect <code>` and restarts spiced.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use snafu::ResultExt;
 use crate::TransportSnafu;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{RwLock, mpsc};
 use tokio::time;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Streaming;
@@ -50,6 +51,7 @@ use crate::handlers::RuntimeHandle;
 use crate::heartbeat::{HEARTBEAT_INTERVAL, TELEMETRY_INTERVAL, build_heartbeat, build_telemetry, now_unix};
 use crate::identity::{Identity, IdentityStore};
 use crate::proto;
+use crate::shutdown::Shutdown;
 use crate::{Error, Result, fingerprint};
 
 /// Minimum reconnect backoff.
@@ -64,7 +66,7 @@ const CLIENT_CHANNEL_SIZE: usize = 64;
 pub(crate) struct ClientDriver {
     config: CloudConnectConfig,
     runtime: Arc<dyn RuntimeHandle>,
-    shutdown: Arc<Notify>,
+    shutdown: Arc<Shutdown>,
     /// Currently-effective identity, if any. Replaced on adoption; set
     /// to `None` on Forget or when the identity cert expires.
     identity: Option<Identity>,
@@ -74,7 +76,7 @@ impl ClientDriver {
     pub(crate) fn new(
         config: CloudConnectConfig,
         runtime: Arc<dyn RuntimeHandle>,
-        shutdown: Arc<Notify>,
+        shutdown: Arc<Shutdown>,
         identity: Option<Identity>,
     ) -> Self {
         Self {
@@ -95,7 +97,7 @@ impl ClientDriver {
 
         loop {
             // Honor shutdown before each reconnect.
-            if shutdown_triggered(&self.shutdown).await {
+            if self.shutdown.is_triggered() {
                 tracing::info!("Cloud Connect: shutdown requested; exiting driver");
                 return Ok(());
             }
@@ -135,10 +137,8 @@ impl ClientDriver {
                 Ok(ExitReason::Shutdown) => return Ok(()),
                 Ok(ExitReason::Forget) => {
                     tracing::info!(
-                        "Cloud Connect: Forget acknowledged; remaining online, unmanaged"
+                        "Cloud Connect: Forget acknowledged; cloud-connect task exiting. spiced remains running and serving local spicepod traffic. To re-adopt, run `spice connect <code>` and restart spiced."
                     );
-                    // Stay running, just disconnected. The user can
-                    // re-adopt via `spice connect <code>` and restart.
                     return Ok(());
                 }
                 Ok(ExitReason::Disconnected) => {
@@ -157,7 +157,7 @@ impl ClientDriver {
             tracing::debug!("Cloud Connect: sleeping {} before reconnect", humanize(sleep_for));
             tokio::select! {
                 () = time::sleep(sleep_for) => {},
-                () = self.shutdown.notified() => {
+                () = self.shutdown.wait() => {
                     tracing::info!("Cloud Connect: shutdown requested during backoff; exiting");
                     return Ok(());
                 }
@@ -218,17 +218,20 @@ impl ClientDriver {
         tracing::info!("Cloud Connect: stream established to {}", self.config.endpoint);
 
         // Spawn periodic heartbeat + telemetry tasks. They emit through
-        // the same outbound channel.
+        // the same outbound channel. The identifier is shared by RwLock
+        // so that frames sent *after* a first-contact adoption pick up
+        // the assigned identifier without waiting for a reconnect.
         let runtime = Arc::clone(&self.runtime);
-        let identifier_for_tasks = self
-            .identity
-            .as_ref()
-            .map(|i| i.identifier.clone())
-            .unwrap_or_default();
+        let identifier = Arc::new(RwLock::new(
+            self.identity
+                .as_ref()
+                .map(|i| i.identifier.clone())
+                .unwrap_or_default(),
+        ));
 
         let hb_tx = tx.clone();
         let hb_runtime = Arc::clone(&runtime);
-        let hb_identifier = identifier_for_tasks.clone();
+        let hb_identifier = Arc::clone(&identifier);
         let hb_handle = tokio::spawn(async move {
             let mut seq: u64 = 0;
             let mut ticker = time::interval(HEARTBEAT_INTERVAL);
@@ -236,7 +239,8 @@ impl ClientDriver {
             loop {
                 ticker.tick().await;
                 seq = seq.wrapping_add(1);
-                let hb = build_heartbeat(&hb_identifier, seq, &hb_runtime).await;
+                let id = hb_identifier.read().await.clone();
+                let hb = build_heartbeat(&id, seq, &hb_runtime).await;
                 let msg = proto::ClientMessage {
                     body: Some(proto::client_message::Body::Heartbeat(hb)),
                 };
@@ -248,7 +252,7 @@ impl ClientDriver {
 
         let tel_tx = tx.clone();
         let tel_runtime = Arc::clone(&runtime);
-        let tel_identifier = identifier_for_tasks.clone();
+        let tel_identifier = Arc::clone(&identifier);
         let tel_handle = tokio::spawn(async move {
             let mut ticker = time::interval(TELEMETRY_INTERVAL);
             ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -256,7 +260,8 @@ impl ClientDriver {
             loop {
                 ticker.tick().await;
                 let now = now_unix();
-                let t = build_telemetry(&tel_identifier, last_window, now, &tel_runtime).await;
+                let id = tel_identifier.read().await.clone();
+                let t = build_telemetry(&id, last_window, now, &tel_runtime).await;
                 last_window = now;
                 let msg = proto::ClientMessage {
                     body: Some(proto::client_message::Body::Telemetry(t)),
@@ -271,7 +276,7 @@ impl ClientDriver {
         let mut pending_code_consumed = false;
         let exit_reason = loop {
             tokio::select! {
-                () = self.shutdown.notified() => {
+                () = self.shutdown.wait() => {
                     tracing::info!("Cloud Connect: shutdown requested; closing stream");
                     break ExitReason::Shutdown;
                 }
@@ -299,7 +304,7 @@ impl ClientDriver {
                             }
 
                             if let Some(reason) = self
-                                .dispatch(&tx, msg)
+                                .dispatch(&tx, msg, &identifier)
                                 .await
                             {
                                 break reason;
@@ -331,6 +336,7 @@ impl ClientDriver {
         &mut self,
         tx: &mpsc::Sender<proto::ClientMessage>,
         msg: proto::ControlMessage,
+        live_identifier: &Arc<RwLock<String>>,
     ) -> Option<ExitReason> {
         let Some(body) = msg.body else {
             tracing::debug!("Cloud Connect: received empty ControlMessage");
@@ -358,11 +364,7 @@ impl ClientDriver {
                     sql_hash = %sql_hash,
                     "RunQuery command received from cloud control plane"
                 );
-                let identifier = self
-                    .identity
-                    .as_ref()
-                    .map(|i| i.identifier.clone())
-                    .unwrap_or_default();
+                let identifier = live_identifier.read().await.clone();
                 let started = std::time::Instant::now();
                 match self.runtime.execute_sql(&cmd.sql, cmd.max_rows).await {
                     Ok(payload) => {
@@ -449,10 +451,10 @@ impl ClientDriver {
                 }
             }
             proto::control_message::Body::Adopt(cmd) => {
-                self.handle_adopt(tx, cmd).await;
+                self.handle_adopt(tx, cmd, live_identifier).await;
             }
             proto::control_message::Body::Forget(cmd) => {
-                self.handle_forget(tx, cmd).await;
+                self.handle_forget(tx, cmd, live_identifier).await;
                 return Some(ExitReason::Forget);
             }
             // Operator-only commands: acknowledge with an error.
@@ -480,6 +482,7 @@ impl ClientDriver {
         &mut self,
         tx: &mpsc::Sender<proto::ClientMessage>,
         cmd: proto::Adopt,
+        live_identifier: &Arc<RwLock<String>>,
     ) {
         // Generate keypair + persist identity.
         let pair = match IdentityStore::generate_keypair() {
@@ -528,6 +531,11 @@ impl ClientDriver {
             self.config.identity_path.display()
         );
         self.identity = Some(identity.clone());
+        // Push the assigned identifier into the shared cell so the
+        // in-flight heartbeat / telemetry tasks pick it up on their
+        // next tick (otherwise frames on the same stream would carry
+        // an empty identifier until the next reconnect).
+        *live_identifier.write().await = identity.identifier.clone();
 
         // Clear the pending code file — adoption succeeded.
         if let Some(ref path) = self.config.pending_adopt_code_path {
@@ -569,6 +577,7 @@ impl ClientDriver {
         &mut self,
         tx: &mpsc::Sender<proto::ClientMessage>,
         cmd: proto::Forget,
+        live_identifier: &Arc<RwLock<String>>,
     ) {
         // Clear identity from disk and memory.
         if let Err(err) = IdentityStore::clear(&self.config.identity_path) {
@@ -578,6 +587,7 @@ impl ClientDriver {
             );
         }
         self.identity = None;
+        live_identifier.write().await.clear();
 
         send_result(
             tx,
@@ -595,12 +605,6 @@ enum ExitReason {
     Shutdown,
     Disconnected,
     Forget,
-}
-
-async fn shutdown_triggered(notify: &Notify) -> bool {
-    // Non-blocking check: wait for a notify with a zero deadline.
-    use tokio::time::timeout;
-    timeout(Duration::from_millis(0), notify.notified()).await.is_ok()
 }
 
 fn build_channel(config: &CloudConnectConfig) -> Result<Channel> {

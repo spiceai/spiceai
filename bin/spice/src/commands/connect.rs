@@ -200,8 +200,7 @@ fn print_status() -> Result<()> {
         println!("  code (masked):   {mask}");
         println!(
             "  start `spiced` to send the code to {} and finish adoption.",
-            std::env::var("SPICE_CLOUD_ENDPOINT")
-                .unwrap_or_else(|_| runtime_cloud_connect::config::DEFAULT_ENDPOINT.to_string())
+            resolved_endpoint(&pending_path)
         );
         return Ok(());
     }
@@ -244,6 +243,28 @@ fn forget_identity() -> Result<()> {
         println!("Spice Cloud Connect: nothing to forget.");
     }
     Ok(())
+}
+
+/// Resolve the endpoint `spiced` will actually contact, mirroring the
+/// precedence used at runtime: `SPICE_CLOUD_ENDPOINT` env var first, then
+/// the on-disk `cloud-endpoint` override (sibling of the pending code
+/// file), then the built-in default.
+fn resolved_endpoint(pending_path: &std::path::Path) -> String {
+    if let Ok(env) = std::env::var("SPICE_CLOUD_ENDPOINT")
+        && !env.is_empty()
+    {
+        return env;
+    }
+    if let Some(parent) = pending_path.parent() {
+        let override_path = parent.join("cloud-endpoint");
+        if let Ok(s) = std::fs::read_to_string(&override_path) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    runtime_cloud_connect::config::DEFAULT_ENDPOINT.to_string()
 }
 
 fn mask_code(code: &str) -> String {
