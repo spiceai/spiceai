@@ -38,8 +38,10 @@ use crate::{
     parameters::ParameterSpec,
     register_data_accelerator, spice_data_base_path,
 };
+use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
+use datafusion::common::ToDFSchema;
 use datafusion::error::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
@@ -392,6 +394,35 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("optimizer_duckdb_aggregate_pushdown"),
 ];
 
+/// DuckDB has no Null type and silently coerces it to INT32. Normalize any
+/// `DataType::Null` fields to `DataType::Int32` so the schema Spice stores
+/// matches what DuckDB actually creates, preventing a mismatch on reads.
+fn normalize_null_schema(
+    schema: &datafusion::common::DFSchemaRef,
+) -> datafusion::common::Result<datafusion::common::DFSchemaRef> {
+    let arrow_schema = schema.as_arrow();
+    if !arrow_schema
+        .fields()
+        .iter()
+        .any(|f| f.data_type() == &DataType::Null)
+    {
+        return Ok(Arc::clone(schema));
+    }
+    let normalized_fields: Vec<Field> = arrow_schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if f.data_type() == &DataType::Null {
+                f.as_ref().clone().with_data_type(DataType::Int32)
+            } else {
+                f.as_ref().clone()
+            }
+        })
+        .collect();
+    let normalized = Schema::new_with_metadata(normalized_fields, arrow_schema.metadata().clone());
+    ToDFSchema::to_dfschema_ref(Arc::new(normalized))
+}
+
 #[async_trait]
 impl DataAccelerator for DuckDBAccelerator {
     fn as_any(&self) -> &dyn Any {
@@ -506,6 +537,9 @@ impl DataAccelerator for DuckDBAccelerator {
         _partition_by: Vec<PartitionedBy>,
         _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        cmd.schema = normalize_null_schema(&cmd.schema)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
         if let Some(duckdb_file) = cmd.options.remove("file") {
             cmd.options.insert("open".to_string(), duckdb_file);
         }
@@ -2204,6 +2238,48 @@ mod tests {
         assert!(
             DuckDBAccelerator::storage_setup_queries(ResolvedAccelerationStorage::Unknown)
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn normalize_null_schema_converts_null_fields_to_int32() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("untyped", DataType::Null, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let df_schema = ToDFSchema::to_dfschema_ref(schema).expect("valid schema");
+
+        let result = super::normalize_null_schema(&df_schema).expect("normalize succeeds");
+
+        let arrow = result.as_arrow();
+        assert_eq!(
+            arrow.field_with_name("id").unwrap().data_type(),
+            &DataType::Int64
+        );
+        assert_eq!(
+            arrow.field_with_name("untyped").unwrap().data_type(),
+            &DataType::Int32
+        );
+        assert_eq!(
+            arrow.field_with_name("name").unwrap().data_type(),
+            &DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn normalize_null_schema_is_noop_when_no_null_fields() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let df_schema = ToDFSchema::to_dfschema_ref(schema).expect("valid schema");
+
+        let result = super::normalize_null_schema(&df_schema).expect("normalize succeeds");
+
+        assert!(
+            Arc::ptr_eq(&df_schema, &result),
+            "should return the same Arc"
         );
     }
 }
