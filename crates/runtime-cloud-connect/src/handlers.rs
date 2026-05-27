@@ -23,7 +23,6 @@ limitations under the License.
 //! and keeping spice-cloud-connect easy to unit-test.
 
 use std::path::Path;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -43,12 +42,6 @@ pub trait RuntimeHandle: Send + Sync + 'static {
     /// Number of active models currently loaded.
     async fn active_models(&self) -> u32 {
         0
-    }
-
-    /// Hostname suitable for `Hello.hostname`. The default implementation
-    /// returns the system hostname.
-    fn hostname(&self) -> String {
-        gethostname::gethostname().to_string_lossy().into_owned()
     }
 
     /// Construct the `runtime_info` payload returned for the
@@ -113,17 +106,6 @@ pub trait RuntimeHandle: Send + Sync + 'static {
             "requested_version": target_version,
             "note": "UpgradeRuntime is not implemented in v0",
         }))
-    }
-}
-
-/// Convenience newtype that lets a caller wrap a plain `Arc<T>` where
-/// `T: RuntimeHandle`.
-#[derive(Clone)]
-pub struct DynRuntimeHandle(pub Arc<dyn RuntimeHandle>);
-
-impl std::fmt::Debug for DynRuntimeHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DynRuntimeHandle").finish_non_exhaustive()
     }
 }
 

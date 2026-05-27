@@ -29,7 +29,7 @@ limitations under the License.
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::SigningKey;
-use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
+use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
@@ -54,9 +54,6 @@ pub enum Error {
 
     #[snafu(display("Failed to encode private key in PKCS#8: {source}"))]
     EncodePrivateKey { source: ed25519_dalek::pkcs8::Error },
-
-    #[snafu(display("Failed to decode private key from PKCS#8: {source}"))]
-    DecodePrivateKey { source: ed25519_dalek::pkcs8::Error },
 
     #[snafu(display("Failed to encode public key in SPKI: {source}"))]
     EncodePublicKey {
@@ -162,13 +159,6 @@ impl IdentityStore {
             private_key_pem,
             public_key_pem,
         })
-    }
-
-    /// Parse a PEM-encoded PKCS#8 ed25519 private key back into a
-    /// `SigningKey`. Useful for future challenge-response work; not
-    /// used today.
-    pub fn signing_key_from_pem(pem: &str) -> Result<SigningKey> {
-        SigningKey::from_pkcs8_pem(pem).context(DecodePrivateKeySnafu)
     }
 }
 
@@ -308,8 +298,6 @@ mod tests {
         let pair = IdentityStore::generate_keypair().expect("generate");
         assert!(pair.private_key_pem.contains("PRIVATE KEY"));
         assert!(pair.public_key_pem.contains("PUBLIC KEY"));
-        // Round-trip parse the private key.
-        let _signing = IdentityStore::signing_key_from_pem(&pair.private_key_pem).unwrap();
     }
 
     #[test]

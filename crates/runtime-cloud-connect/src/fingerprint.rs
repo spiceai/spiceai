@@ -42,7 +42,7 @@ use sha2::{Digest, Sha256};
 /// This function is deterministic on the same host across runs as long
 /// as the OS-supplied machine id and hostname are stable.
 #[must_use]
-pub fn compute() -> String {
+pub(crate) fn compute() -> String {
     let machine_id = read_machine_id().unwrap_or_else(|| "unknown".to_string());
     let hostname = gethostname::gethostname().to_string_lossy().into_owned();
     let os = std::env::consts::OS.to_string();

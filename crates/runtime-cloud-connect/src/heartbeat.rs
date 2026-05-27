@@ -23,13 +23,13 @@ use crate::handlers::RuntimeHandle;
 use crate::proto;
 
 /// Default heartbeat cadence.
-pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Default telemetry cadence.
-pub const TELEMETRY_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const TELEMETRY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Build a heartbeat for the current runtime state.
-pub async fn build_heartbeat(
+pub(crate) async fn build_heartbeat(
     identifier: &str,
     sequence: u64,
     runtime: &Arc<dyn RuntimeHandle>,
@@ -52,7 +52,7 @@ pub async fn build_heartbeat(
 /// Build a stub telemetry frame. The shape is intentionally minimal in
 /// v0 — we send the runtime liveness counters and let the server add
 /// richer metrics over time.
-pub async fn build_telemetry(
+pub(crate) async fn build_telemetry(
     identifier: &str,
     window_start_unix: u64,
     window_end_unix: u64,
@@ -78,7 +78,7 @@ pub async fn build_telemetry(
 /// Current Unix timestamp (seconds), clamped to 0 if the system clock
 /// is before the epoch.
 #[must_use]
-pub fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

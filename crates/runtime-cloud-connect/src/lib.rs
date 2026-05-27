@@ -40,12 +40,13 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
 pub mod arrow_json;
-pub mod client;
 pub mod config;
-pub mod fingerprint;
 pub mod handlers;
-pub mod heartbeat;
 pub mod identity;
+
+mod client;
+mod fingerprint;
+mod heartbeat;
 
 /// Generated gRPC types for `spice.cloud.v1.CloudConnect`.
 pub mod proto {
@@ -82,12 +83,6 @@ pub enum Error {
         source: identity::Error,
     },
 
-    #[snafu(display("Failed to store identity at {}: {source}", path.display()))]
-    IdentityStore {
-        path: std::path::PathBuf,
-        source: identity::Error,
-    },
-
     #[snafu(display("Invalid Cloud Connect endpoint: {endpoint}: {source}"))]
     InvalidEndpoint {
         endpoint: String,
@@ -102,12 +97,6 @@ pub enum Error {
 
     #[snafu(display("Cloud Connect is configured but no credentials are available"))]
     NoCredentials,
-
-    #[snafu(display("Failed to read adoption code file at {}: {source}", path.display()))]
-    AdoptCodeRead {
-        path: std::path::PathBuf,
-        source: std::io::Error,
-    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -137,7 +126,6 @@ impl CloudConnect {
         config: CloudConnectConfig,
         runtime: Arc<dyn RuntimeHandle>,
     ) -> Result<Option<Self>> {
-        // Lazy import; keep ergonomics local.
         use snafu::ResultExt as _;
 
         let identity_path = config.identity_path.clone();

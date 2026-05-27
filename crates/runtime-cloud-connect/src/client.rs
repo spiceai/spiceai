@@ -50,7 +50,7 @@ use crate::handlers::RuntimeHandle;
 use crate::heartbeat::{HEARTBEAT_INTERVAL, TELEMETRY_INTERVAL, build_heartbeat, build_telemetry, now_unix};
 use crate::identity::{Identity, IdentityStore};
 use crate::proto;
-use crate::{Error, Result, fingerprint, is_valid_adoption_code};
+use crate::{Error, Result, fingerprint};
 
 /// Minimum reconnect backoff.
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
@@ -61,7 +61,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const CLIENT_CHANNEL_SIZE: usize = 64;
 
 /// State held by the driver across reconnects.
-pub struct ClientDriver {
+pub(crate) struct ClientDriver {
     config: CloudConnectConfig,
     runtime: Arc<dyn RuntimeHandle>,
     shutdown: Arc<Notify>,
@@ -71,8 +71,7 @@ pub struct ClientDriver {
 }
 
 impl ClientDriver {
-    #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         config: CloudConnectConfig,
         runtime: Arc<dyn RuntimeHandle>,
         shutdown: Arc<Notify>,
@@ -91,9 +90,8 @@ impl ClientDriver {
     /// The driver is fully fault-tolerant: a transport, decode, or
     /// stream error triggers a reconnect with backoff; only an explicit
     /// shutdown notify exits the loop.
-    pub async fn run(mut self) -> Result<()> {
+    pub(crate) async fn run(mut self) -> Result<()> {
         let mut backoff = MIN_BACKOFF;
-        let mut heartbeat_seq: u64 = 0;
 
         loop {
             // Honor shutdown before each reconnect.
@@ -133,7 +131,7 @@ impl ClientDriver {
                 );
             }
 
-            match self.connect_and_run(client_type, identifier, credential, &mut heartbeat_seq).await {
+            match self.connect_and_run(client_type, identifier, credential).await {
                 Ok(ExitReason::Shutdown) => return Ok(()),
                 Ok(ExitReason::Forget) => {
                     tracing::info!(
@@ -165,8 +163,7 @@ impl ClientDriver {
                 }
             }
 
-            // Exponential backoff with hard cap.
-            backoff = (backoff * 2).min(MAX_BACKOFF);
+            backoff = next_backoff(backoff);
         }
     }
 
@@ -190,7 +187,6 @@ impl ClientDriver {
         client_type: proto::ClientType,
         identifier: String,
         credential: String,
-        heartbeat_seq: &mut u64,
     ) -> Result<ExitReason> {
         if credential.is_empty() {
             return Err(Error::NoCredentials);
@@ -233,9 +229,8 @@ impl ClientDriver {
         let hb_tx = tx.clone();
         let hb_runtime = Arc::clone(&runtime);
         let hb_identifier = identifier_for_tasks.clone();
-        let hb_seq_start = *heartbeat_seq;
         let hb_handle = tokio::spawn(async move {
-            let mut seq = hb_seq_start;
+            let mut seq: u64 = 0;
             let mut ticker = time::interval(HEARTBEAT_INTERVAL);
             ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
             loop {
@@ -419,38 +414,15 @@ impl ClientDriver {
                 }
             }
             proto::control_message::Body::Restart(cmd) => {
-                match self.runtime.restart(cmd.graceful).await {
-                    Ok(payload) => send_result(tx, &cmd.command_id, true, "", payload).await,
-                    Err(err) => {
-                        send_result(
-                            tx,
-                            &cmd.command_id,
-                            false,
-                            &err,
-                            serde_json::Value::Null,
-                        )
-                        .await;
-                    }
-                }
+                let r = self.runtime.restart(cmd.graceful).await;
+                reply_with(tx, &cmd.command_id, r).await;
             }
             proto::control_message::Body::ApplySpicepod(cmd) => {
-                match self
+                let r = self
                     .runtime
                     .apply_spicepod(&self.config.config_dir, &cmd.spicepod_yaml)
-                    .await
-                {
-                    Ok(payload) => send_result(tx, &cmd.command_id, true, "", payload).await,
-                    Err(err) => {
-                        send_result(
-                            tx,
-                            &cmd.command_id,
-                            false,
-                            &err,
-                            serde_json::Value::Null,
-                        )
-                        .await;
-                    }
-                }
+                    .await;
+                reply_with(tx, &cmd.command_id, r).await;
             }
             proto::control_message::Body::UpgradeRuntime(cmd) => {
                 match self.runtime.upgrade_runtime(&cmd.target_version).await {
@@ -703,6 +675,18 @@ async fn send_result(
     }
 }
 
+/// Forward a `Result<Value, String>` from a runtime call as a `CommandResult`.
+async fn reply_with(
+    tx: &mpsc::Sender<proto::ClientMessage>,
+    command_id: &str,
+    result: Result<serde_json::Value, String>,
+) {
+    match result {
+        Ok(payload) => send_result(tx, command_id, true, "", payload).await,
+        Err(err) => send_result(tx, command_id, false, &err, serde_json::Value::Null).await,
+    }
+}
+
 async fn send_unsupported(tx: &mpsc::Sender<proto::ClientMessage>, command_id: &str, kind: &str) {
     tracing::debug!("Cloud Connect: ignoring operator-only command {kind} ({command_id})");
     send_result(
@@ -834,21 +818,9 @@ fn humanize(d: Duration) -> String {
     }
 }
 
-/// Compute the canonical reconnect backoff sequence given a starting
-/// duration. Exposed for tests so we can verify the math without
-/// running real timers.
-#[doc(hidden)]
-#[must_use]
-pub fn reconnect_backoff(prev: Duration) -> Duration {
+/// Next reconnect backoff after a failure: doubles, capped at `MAX_BACKOFF`.
+fn next_backoff(prev: Duration) -> Duration {
     (prev * 2).min(MAX_BACKOFF)
-}
-
-/// Validate an adoption code (proxy to the public function — re-exported
-/// here for use in client tests).
-#[doc(hidden)]
-#[must_use]
-pub fn validate_adoption_code(code: &str) -> bool {
-    is_valid_adoption_code(code)
 }
 
 #[cfg(test)]
@@ -861,11 +833,9 @@ mod tests {
         let mut seen = Vec::new();
         for _ in 0..10 {
             seen.push(d);
-            d = reconnect_backoff(d);
+            d = next_backoff(d);
         }
-        // First step is at least the minimum.
         assert_eq!(seen[0], MIN_BACKOFF);
-        // Should grow strictly monotonically until the cap.
         let mut last = Duration::ZERO;
         let mut hit_cap = false;
         for d in seen {
@@ -880,13 +850,7 @@ mod tests {
 
     #[test]
     fn backoff_caps_at_max() {
-        let d = reconnect_backoff(Duration::from_secs(120));
+        let d = next_backoff(Duration::from_secs(120));
         assert_eq!(d, MAX_BACKOFF);
-    }
-
-    #[test]
-    fn validate_adoption_code_matches_public_helper() {
-        assert!(validate_adoption_code("SPICE-ADOPT-AAAA-BBBB"));
-        assert!(!validate_adoption_code("nope"));
     }
 }
