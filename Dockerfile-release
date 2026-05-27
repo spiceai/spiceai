@@ -98,7 +98,8 @@ RUN find /lib /usr/lib -name 'libdl.so.2' -exec sh -c 'mkdir -p /spice_sandbox/$
 # Preinstall Oracle ODPI-C (if enabled)
 RUN if [ "$INSTALL_ORACLE_ODPIC" = "true" ]; then \
     set -euo pipefail; \
-    apt-get update && apt-get install -y --no-install-recommends libaio1 unzip curl; \
+    # Debian Trixie renamed libaio1 to libaio1t64 for 64-bit time_t transition
+    apt-get update && (apt-get install -y --no-install-recommends libaio1t64 || apt-get install -y --no-install-recommends libaio1) && apt-get install -y --no-install-recommends unzip curl; \
     ARCH=$(dpkg --print-architecture); \
     if [ "$ARCH" = "amd64" ]; then \
       : "${ORACLE_INSTANTCLIENT_SHA256_AMD64:?ORACLE_INSTANTCLIENT_SHA256_AMD64 must be set to the expected SHA256 checksum}"; \
