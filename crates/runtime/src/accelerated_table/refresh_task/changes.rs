@@ -2097,7 +2097,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_primary_key_causes_split() {
+    fn test_duplicate_primary_key_replaces_in_place() {
         let change_batch = create_test_change_batch(
             vec!["c", "c", "c"],
             &[vec!["id"], vec!["id"], vec!["id"]],
