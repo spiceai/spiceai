@@ -25,6 +25,7 @@ use super::{Nameable, WithDependsOn, embeddings::ColumnEmbeddingConfig, is_defau
 use crate::acceleration::Acceleration;
 use crate::component::access::AccessMode;
 use crate::fts::FtsStore;
+use crate::metadata::metadata_value_to_string;
 use crate::metric::Metrics;
 use crate::param::Params;
 use crate::semantic::Column;
@@ -322,7 +323,7 @@ impl Dataset {
             metadata.insert("description".to_string(), d.clone());
         }
         for (k, v) in &self.metadata {
-            metadata.insert(k.clone(), v.to_string());
+            metadata.insert(k.clone(), metadata_value_to_string(v));
         }
         metadata
     }

@@ -47,6 +47,7 @@ use arrow::{
 use arrow_schema::SchemaRef;
 use async_stream::stream;
 use data_components::poly::PolyTableProvider;
+use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use datafusion::catalog::MemoryCatalogProvider;
 use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::execution::SessionStateBuilder;
@@ -103,6 +104,27 @@ const NANOS_TO_MILLIS: u128 = 1_000_000;
 // Callback which is called after each batch of streaming data is processed by the `RefreshTask`.
 type StreamBatchProcessCallback =
     Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>;
+
+fn table_provider_with_existing_metadata(
+    provider: Arc<dyn TableProvider>,
+) -> Arc<dyn TableProvider> {
+    let schema = provider.schema();
+    let table_metadata = schema.metadata().clone();
+    let field_metadata = schema
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            let metadata = field.metadata().clone();
+            (!metadata.is_empty()).then(|| (field.name().clone(), metadata))
+        })
+        .collect::<FieldMetadata>();
+
+    if table_metadata.is_empty() && field_metadata.is_empty() {
+        return provider;
+    }
+
+    metadata_enriched_table_provider(provider, table_metadata, field_metadata)
+}
 
 #[derive(Debug, Clone, Default)]
 struct RefreshStat {
@@ -1062,6 +1084,29 @@ impl RefreshTask {
 
         let info = match download_result {
             Ok(Some(info)) => info,
+            Ok(None) if current_local_id.is_none() => {
+                // No snapshot has ever been loaded and none is available at the configured location.
+                tracing::warn!(
+                    dataset = %self.dataset_name,
+                    snapshot_location = %state.manager.snapshot_location(),
+                    "refresh_mode: snapshot - no snapshot found at the configured location. Ensure the snapshot location is correct and that a snapshot has been created."
+                );
+                self.set_refresh_status(
+                    None,
+                    status::ComponentStatus::error_with_message(
+                        "no snapshot available".to_string(),
+                    ),
+                )
+                .await;
+                return Err(RetryError::transient(
+                    super::Error::FailedToRefreshDataset {
+                        source: datafusion::error::DataFusionError::Internal(
+                            "refresh_mode: snapshot - no snapshot found at the configured location"
+                                .to_string(),
+                        ),
+                    },
+                ));
+            }
             Ok(None) => {
                 tracing::debug!(
                     dataset = %self.dataset_name,
@@ -1503,6 +1548,7 @@ impl RefreshTask {
             );
         }
 
+        let federated_provider = table_provider_with_existing_metadata(federated_provider);
         if let Err(e) = ctx.register_table(dataset_name.clone(), federated_provider) {
             tracing::error!("Unable to register federated table: {e}");
         }

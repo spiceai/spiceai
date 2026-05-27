@@ -362,16 +362,6 @@ impl DataConnector for Debezium {
                     );
                 }
 
-                let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
-                    &metadata.consumer_group_id,
-                    &self.kafka_config,
-                )
-                .boxed()
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "debezium",
-                    connector_component: ConnectorComponent::from(dataset),
-                })?;
-
                 ensure!(
                     topic == metadata.topic,
                     super::InvalidConfigurationNoSourceSnafu {
@@ -406,20 +396,26 @@ impl DataConnector for Debezium {
                     (metadata, Arc::new(schema))
                 };
 
+                // Build the consumer with the sidecar offsets already stashed so
+                // the first rebalance callback after `subscribe` seeks before any
+                // messages are delivered.
+                let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
+                    &metadata.consumer_group_id,
+                    &self.kafka_config,
+                    &metadata.offsets,
+                )
+                .boxed()
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "debezium",
+                    connector_component: ConnectorComponent::from(dataset),
+                })?;
+
                 kafka_consumer.subscribe(topic).boxed().context(
                     super::UnableToGetReadProviderSnafu {
                         dataconnector: "debezium",
                         connector_component: ConnectorComponent::from(dataset),
                     },
                 )?;
-
-                kafka_consumer
-                    .restore_offsets(&metadata.offsets)
-                    .boxed()
-                    .context(super::UnableToGetReadProviderSnafu {
-                        dataconnector: "debezium",
-                        connector_component: ConnectorComponent::from(dataset),
-                    })?;
 
                 (kafka_consumer, metadata, schema)
             }
