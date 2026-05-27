@@ -341,7 +341,7 @@ impl<'a> AppendMutationWriter<'a> {
         );
 
         let inline_policy = InlineMutationPolicy::from_blocking_conditions([
-            pending_pk_deletions,
+            false,
             false,
             self.table.metadata().partition_column.is_some(),
             self.table.has_retention_delete_filters(),
@@ -506,15 +506,16 @@ impl<'a> AppendMutationWriter<'a> {
                 });
             }
 
-            if !state.on_conflict_deletions.has_file_deletions()
-                && self
-                    .table
-                    .try_inline_batches_with_inlined_deletions(
-                        buffer.batches(),
-                        &state.on_conflict_deletions.deleted_inlined_pk_i64,
-                        &state.on_conflict_deletions.deleted_inlined_row_keys,
-                    )
-                    .await?
+            if self
+                .table
+                .try_inline_batches_with_inlined_deletions(
+                    buffer.batches(),
+                    &state.on_conflict_deletions.deleted_inlined_pk_i64,
+                    &state.on_conflict_deletions.deleted_inlined_row_keys,
+                    &state.on_conflict_deletions.deleted_pk_i64,
+                    &state.on_conflict_deletions.deleted_row_keys,
+                )
+                .await?
             {
                 let stats_acc = ColumnStatsAccumulator::new(&schema);
                 for batch in buffer.batches() {

@@ -21,8 +21,9 @@ use super::constants::{
     DEFAULT_DATA_FILE_ID, STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
 };
 use super::delete::{
-    CayenneDeletionSink, DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter,
-    FileBasedDeletionSink, Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
+    CayenneDeletionSink, DeletionIdentifier, DeletionVectorWriteResult, DeletionVectorWriteSpec,
+    DeletionVectorWriter, FileBasedDeletionSink, Int64PkDeletionFilterExec,
+    KeyBasedDeletionFilterExec,
 };
 use super::mutation_writer::AppendMutationWriter;
 use super::streaming::StreamingExec;
@@ -1591,15 +1592,6 @@ pub(crate) struct OnConflictDeletions {
     pub(crate) deleted_inlined_pk_i64: Vec<i64>,
     /// Deleted inlined row keys.
     pub(crate) deleted_inlined_row_keys: Vec<Box<[u8]>>,
-}
-
-impl OnConflictDeletions {
-    #[must_use]
-    pub(crate) fn has_file_deletions(&self) -> bool {
-        !self.delete_specs.is_empty()
-            || !self.deleted_pk_i64.is_empty()
-            || !self.deleted_row_keys.is_empty()
-    }
 }
 
 #[derive(Clone)]
@@ -4578,6 +4570,49 @@ impl CayenneTableProvider {
         Ok(rewrite)
     }
 
+    /// Update the in-memory PK deletion cache to immediately hide file-backed
+    /// rows that have been superseded by inlined data.
+    fn update_file_deletion_cache(
+        &self,
+        deleted_pk_i64: &[i64],
+        deleted_row_keys: &[Box<[u8]>],
+        delete_sequence: i64,
+    ) {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { deletion_snapshot } => {
+                if deleted_pk_i64.is_empty() {
+                    return;
+                }
+                let current = deletion_snapshot.load_full();
+                let updated_deleted = current
+                    .deleted_pk
+                    .extend_max(deleted_pk_i64.iter().map(|&pk| (pk, delete_sequence)));
+                deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_arcs(
+                    Arc::new(updated_deleted),
+                    Arc::clone(&current.insert_records),
+                )));
+            }
+            PkDeletionStrategyWithCache::RowConverterBased { deletion_snapshot } => {
+                if deleted_row_keys.is_empty() {
+                    return;
+                }
+                let current = deletion_snapshot.load_full();
+                let updated_deleted = current.deleted_row_keys.extend_max(
+                    deleted_row_keys
+                        .iter()
+                        .map(|key| (key.clone(), delete_sequence)),
+                );
+                deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_arcs(
+                    Arc::new(updated_deleted),
+                    Arc::clone(&current.insert_records),
+                )));
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => {
+                // Position-based tables don't support upserts.
+            }
+        }
+    }
+
     async fn commit_inlined_data_mutation(
         &self,
         rewrite: InlinedDataRewrite,
@@ -4608,6 +4643,74 @@ impl CayenneTableProvider {
         self.inlined_generation.fetch_add(1, Ordering::Release);
 
         Ok(())
+    }
+
+    /// Convert typed PK values into raw key bytes for deletion vector writing.
+    ///
+    /// For `Int64Pk` tables, encodes each i64 as big-endian bytes.
+    /// For `RowConverterBased` tables, passes through the already-encoded row keys.
+    /// Position-based tables don't support upserts and return an empty vec.
+    fn build_pk_deletion_row_keys(
+        &self,
+        deleted_pk_i64: &[i64],
+        deleted_row_keys: Vec<Box<[u8]>>,
+    ) -> Vec<Box<[u8]>> {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { .. } => deleted_pk_i64
+                .iter()
+                .map(|&pk| pk.to_be_bytes().to_vec().into_boxed_slice())
+                .collect(),
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => deleted_row_keys,
+            PkDeletionStrategyWithCache::PositionBased { .. } => vec![],
+        }
+    }
+
+    /// Write key-based deletion vectors to disk and commit them to the catalog.
+    ///
+    /// This is the shared mechanical step used by both the snapshot upsert path
+    /// ([`Self::apply_on_conflict_deletions`]) and the inline upsert path
+    /// ([`Self::persist_file_deletions_after_inlined_insert`]). It handles:
+    ///
+    /// 1. Building deletion vector specs from raw row keys
+    /// 2. Writing deletion vector files via [`DeletionVectorWriter`]
+    /// 3. Committing delete files + optional insert records to the catalog
+    async fn write_and_commit_deletion_vectors(
+        &self,
+        delete_sequence: i64,
+        row_keys: Vec<Box<[u8]>>,
+        insert_pk_bytes: Vec<Vec<u8>>,
+        insert_sequence: i64,
+    ) -> CatalogResult<Option<Vec<DeletionVectorWriteResult>>> {
+        if row_keys.is_empty() {
+            return Ok(None);
+        }
+
+        let mut temp_metadata = self.table_metadata.clone();
+        temp_metadata.current_sequence_number = delete_sequence;
+        let writer = DeletionVectorWriter::new(&temp_metadata);
+
+        let specs = vec![DeletionVectorWriteSpec::new_key_based(row_keys)];
+        let results = writer.write(specs).await?;
+
+        if results.is_empty() {
+            return Ok(None);
+        }
+
+        let delete_files: Vec<crate::metadata::DeleteFile> =
+            results.iter().map(|r| r.delete_file.clone()).collect();
+        self.catalog
+            .commit_on_conflict_deletions(
+                delete_files,
+                &self.table_metadata.table_id,
+                insert_pk_bytes,
+                insert_sequence,
+            )
+            .await
+            .map_err(|err| CatalogError::InvalidOperationNoSource {
+                message: format!("Failed to commit deletion vectors: {err}"),
+            })?;
+
+        Ok(Some(results))
     }
 
     /// Apply deletion vectors generated by on-conflict (upsert) handling.
@@ -4695,88 +4798,21 @@ impl CayenneTableProvider {
         let delete_sequence = base;
         let insert_sequence = base + 1;
 
-        // Create a temporary metadata with the fresh delete sequence number.
-        // The table_metadata's current_sequence_number is stale (set at table open time),
-        // so we must use the actual delete_sequence we just reserved.
-        let mut temp_metadata = self.table_metadata.clone();
-        temp_metadata.current_sequence_number = delete_sequence;
-        let writer = DeletionVectorWriter::new(&temp_metadata);
+        let row_keys = self.build_pk_deletion_row_keys(&deleted_pk_i64, deleted_row_keys);
+        let insert_pk_bytes: Vec<Vec<u8>> =
+            row_keys.iter().map(|key| key.as_ref().to_vec()).collect();
 
-        // For on-conflict (upsert) handling, use key-based deletion vectors.
-        // Position-based tables don't support upserts, so we always use row keys here.
-        // Move `deleted_row_keys` into the spec; the cache-extend block below
-        // takes owned keys from the write result so we avoid a Vec<Box<[u8]>>
-        // clone plus the per-element clones for both extend_max calls. See
-        // `benches/apply_on_conflict_keys_double_clone.rs`.
-        let row_keys_for_deletion: Vec<Box<[u8]>> = match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk { .. } => deleted_pk_i64
-                .iter()
-                .map(|&pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-                .collect(),
-            PkDeletionStrategyWithCache::RowConverterBased { .. } => deleted_row_keys,
-            PkDeletionStrategyWithCache::PositionBased { .. } => {
-                // Position-based tables don't support upserts
-                vec![]
-            }
-        };
-
-        let pk_bytes_list_for_insert_records: Vec<Vec<u8>> = row_keys_for_deletion
-            .iter()
-            .map(|key| key.as_ref().to_vec())
-            .collect();
-
-        let specs = if row_keys_for_deletion.is_empty() {
-            vec![]
-        } else {
-            vec![DeletionVectorWriteSpec::new_key_based(
-                row_keys_for_deletion,
-            )]
-        };
-
-        let results = writer.write(specs).await?;
-
-        if results.is_empty() {
-            return Ok(());
-        }
-
-        // Track new position-based deletions for the in-memory cache update
-        // below. This walks the same `results` list we'd otherwise enumerate
-        // during per-file `add_delete_file` calls.
-        let mut new_deleted_rows = RoaringBitmap::new();
-        for result in &results {
-            if let DeletionIdentifier::PositionBased { row_ids, .. } = &result.identifiers {
-                for &row_id in row_ids {
-                    if let Ok(row_id_u32) = u32::try_from(row_id) {
-                        new_deleted_rows.insert(row_id_u32);
-                    }
-                }
-            }
-        }
-
-        // Atomically commit every delete-file row AND every insert-record row
-        // in one catalog transaction. Replaces the legacy
-        // `add_delete_file × N` + `add_insert_records_batch` sequence which
-        // left a crash window where deletion records could persist without
-        // their corresponding insert sequences — see
-        // `crates/cayenne/benches/apply_on_conflict_rpc_ceiling.rs` for the
-        // metastore call-count shape and atomicity tradeoff.
-        let delete_files: Vec<crate::metadata::DeleteFile> =
-            results.iter().map(|r| r.delete_file.clone()).collect();
-        self.catalog
-            .commit_on_conflict_deletions(
-                delete_files,
-                &self.table_metadata.table_id,
-                pk_bytes_list_for_insert_records,
+        let Some(results) = self
+            .write_and_commit_deletion_vectors(
+                delete_sequence,
+                row_keys,
+                insert_pk_bytes,
                 insert_sequence,
             )
-            .await
-            .map_err(|err| CatalogError::InvalidOperationNoSource {
-                message: format!("Failed to commit on-conflict deletions: {err}"),
-            })?;
-
-        // For PK-based strategies, keep old delete files to preserve deletion history.
-        // Each upsert round may affect a different subset of PKs, so removing old files
-        // would lose deletion records for PKs not in the current round.
+            .await?
+        else {
+            return Ok(());
+        };
 
         // Update the appropriate cache based on deletion strategy.
         // This follows Iceberg's pattern where deletes are tracked by PK + sequence number.
@@ -4858,6 +4894,36 @@ impl CayenneTableProvider {
                 );
             }
         }
+
+        Ok(())
+    }
+
+    /// Persist file-backed PK deletion vectors to disk for durability.
+    ///
+    /// Called after replacement data has been inlined and the in-memory deletion
+    /// cache has already been updated (by [`Self::update_file_deletion_cache`]
+    /// inside [`Self::try_inline_batches_with_inlined_deletions`]). This method
+    /// writes the durable deletion vectors and commits them to the catalog so
+    /// that the deletions survive a restart.
+    pub(crate) async fn persist_file_deletions_after_inlined_insert(
+        &self,
+        deleted_pk_i64: &[i64],
+        deleted_row_keys: &[Box<[u8]>],
+        delete_sequence: i64,
+    ) -> CatalogResult<()> {
+        let has_file_deletions = !deleted_pk_i64.is_empty() || !deleted_row_keys.is_empty();
+
+        if !has_file_deletions {
+            return Ok(());
+        }
+
+        let row_keys = self.build_pk_deletion_row_keys(deleted_pk_i64, deleted_row_keys.to_vec());
+
+        // Commit delete files only — no insert records (inline data bypasses
+        // the deletion filter, so no protected insert sequence is needed).
+        // The in-memory deletion cache was already updated by the caller.
+        self.write_and_commit_deletion_vectors(delete_sequence, row_keys, vec![], 0)
+            .await?;
 
         Ok(())
     }
@@ -6452,6 +6518,8 @@ impl CayenneTableProvider {
         batches: &[RecordBatch],
         deleted_inlined_pk_i64: &[i64],
         deleted_inlined_row_keys: &[Box<[u8]>],
+        file_deleted_pk_i64: &[i64],
+        file_deleted_row_keys: &[Box<[u8]>],
     ) -> Result<bool> {
         let total_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         if total_rows == 0 {
@@ -6467,6 +6535,30 @@ impl CayenneTableProvider {
         if ipc_bytes.len() > inline_max_bytes {
             return Ok(false);
         }
+
+        // --- Past this point, inlining WILL proceed (all size checks passed). ---
+
+        let has_file_deletions =
+            !file_deleted_pk_i64.is_empty() || !file_deleted_row_keys.is_empty();
+
+        // Reserve the deletion sequence BEFORE `commit_inlined_data_mutation` so
+        // the inline entry gets a strictly higher sequence number.
+        let delete_seq = if has_file_deletions {
+            Some(
+                self.catalog
+                    .increment_sequence_number(&self.table_metadata.table_id)
+                    .await
+                    .map_err(|err| Error::Catalog {
+                        source: CatalogError::InvalidOperationNoSource {
+                            message: format!(
+                                "Failed to pre-reserve deletion sequence for inline insert: {err}"
+                            ),
+                        },
+                    })?,
+            )
+        } else {
+            None
+        };
 
         let rewrite = self
             .build_inlined_data_rewrite_for_pk_keys(
@@ -6488,11 +6580,26 @@ impl CayenneTableProvider {
         )
         .await?;
 
+        // Update in-memory deletion cache and persist deletion vectors for
+        // file-backed PKs replaced by the inlined data.
+        if let Some(delete_seq) = delete_seq {
+            self.update_file_deletion_cache(file_deleted_pk_i64, file_deleted_row_keys, delete_seq);
+
+            self.persist_file_deletions_after_inlined_insert(
+                file_deleted_pk_i64,
+                file_deleted_row_keys,
+                delete_seq,
+            )
+            .await
+            .map_err(|err| Error::Catalog { source: err })?;
+        }
+
         tracing::debug!(
-            "Inlined {} rows for table {} after removing {} replaced inline row(s)",
+            "Inlined {} rows for table {} after removing {} replaced inline row(s), file_pk_deletions={}",
             total_rows,
             self.table_metadata.table_name,
             removed_rows,
+            file_deleted_pk_i64.len() + file_deleted_row_keys.len(),
         );
 
         Ok(true)
