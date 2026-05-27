@@ -208,7 +208,7 @@ async fn first_contact_adoption_persists_identity_and_acks() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let s = mock_state.lock().await;
     let hello = s.last_hello.clone().expect("server saw Hello");
-    assert_eq!(hello.client_type, proto::ClientType::Instance as i32);
+    assert_eq!(hello.kind, proto::InstanceKind::KindStandalone as i32);
     assert!(hello.identifier.is_empty(), "first hello has empty identifier");
     assert_eq!(hello.credential, "SPICE-ADOPT-AAAA-BBBB");
 

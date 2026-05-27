@@ -114,7 +114,7 @@ impl ClientDriver {
             }
 
             // Determine the credential for this attempt.
-            let (client_type, identifier, credential) = self.next_credential();
+            let (kind, identifier, credential) = self.next_credential();
 
             if credential.is_empty() {
                 tracing::warn!(
@@ -133,7 +133,7 @@ impl ClientDriver {
                 );
             }
 
-            match self.connect_and_run(client_type, identifier, credential).await {
+            match self.connect_and_run(kind, identifier, credential).await {
                 Ok(ExitReason::Shutdown) => return Ok(()),
                 Ok(ExitReason::Forget) => {
                     tracing::info!(
@@ -168,23 +168,23 @@ impl ClientDriver {
     }
 
     /// Determine the next-attempt credential triple.
-    fn next_credential(&self) -> (proto::ClientType, String, String) {
+    fn next_credential(&self) -> (proto::InstanceKind, String, String) {
         if let Some(ref id) = self.identity {
             return (
-                proto::ClientType::Instance,
+                proto::InstanceKind::KindStandalone,
                 id.identifier.clone(),
                 id.identity_cert_pem.clone(),
             );
         }
         if let Some(ref code) = self.config.adoption_code {
-            return (proto::ClientType::Instance, String::new(), code.clone());
+            return (proto::InstanceKind::KindStandalone, String::new(), code.clone());
         }
-        (proto::ClientType::Instance, String::new(), String::new())
+        (proto::InstanceKind::KindStandalone, String::new(), String::new())
     }
 
     async fn connect_and_run(
         &mut self,
-        client_type: proto::ClientType,
+        kind: proto::InstanceKind,
         identifier: String,
         credential: String,
     ) -> Result<ExitReason> {
@@ -201,7 +201,7 @@ impl ClientDriver {
         let (tx, rx) = mpsc::channel::<proto::ClientMessage>(CLIENT_CHANNEL_SIZE);
 
         // Send Hello as the first frame.
-        let hello = build_hello(&self.config, client_type, identifier, credential);
+        let hello = build_hello(&self.config, kind, identifier, credential);
         tx.send(proto::ClientMessage {
             body: Some(proto::client_message::Body::Hello(hello)),
         })
@@ -633,12 +633,12 @@ fn build_channel(config: &CloudConnectConfig) -> Result<Channel> {
 
 fn build_hello(
     config: &CloudConnectConfig,
-    client_type: proto::ClientType,
+    kind: proto::InstanceKind,
     identifier: String,
     credential: String,
 ) -> proto::Hello {
     proto::Hello {
-        client_type: client_type as i32,
+        kind: kind as i32,
         identifier,
         credential,
         runtime_version: config.runtime_version.clone(),

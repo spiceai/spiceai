@@ -13,9 +13,9 @@
 // limitations under the License.
 
 // Spice Cloud Connect — bidirectional control plane between a spiced
-// runtime (standalone or operator-managed) and the Spice Cloud control
-// plane. One service, two client types disambiguated by
-// `Hello.client_type`.
+// runtime (standalone or cluster-managed) and the Spice Cloud control
+// plane. One service, two instance kinds disambiguated by
+// `Hello.kind`.
 syntax = "proto3";
 package spice.cloud.v1;
 
@@ -27,10 +27,10 @@ service CloudConnect {
   rpc Stream(stream ClientMessage) returns (stream ControlMessage);
 }
 
-enum ClientType {
-  CLIENT_TYPE_UNSPECIFIED = 0;
-  CLIENT_TYPE_OPERATOR = 1;     // K8s operator (BYOC); reserved.
-  CLIENT_TYPE_INSTANCE = 2;     // Standalone spiced runtime.
+enum InstanceKind {
+  KIND_UNSPECIFIED = 0;
+  KIND_CLUSTER = 1;     // K8s operator (BYOC); reserved.
+  KIND_STANDALONE = 2;  // Standalone spiced runtime.
 }
 
 message ClientMessage {
@@ -63,7 +63,7 @@ message ControlMessage {
 }
 
 message Hello {
-  ClientType client_type = 1;
+  InstanceKind kind = 1;
   string identifier = 2;
   string credential = 3;
   string runtime_version = 4;
