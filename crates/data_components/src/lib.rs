@@ -113,6 +113,7 @@ pub mod resilient_http;
 pub mod s3_single_file_cached;
 #[cfg(feature = "s3_vectors")]
 pub mod s3_vectors;
+pub mod schema;
 pub mod schema_discovery;
 #[cfg(feature = "scylladb")]
 pub mod scylladb;

@@ -34,6 +34,7 @@ use bollard::secret::HealthConfig;
 use runtime::Runtime;
 use spicepod::acceleration::{Mode, RefreshMode};
 use spicepod::component::caching::SQLResultsCacheConfig;
+use spicepod::semantic::Column;
 use spicepod::{
     acceleration::Acceleration, component::dataset::Dataset, param::Params as DatasetParams,
 };
@@ -52,6 +53,7 @@ const PORT4: u16 = 8004;
 const PORT5: u16 = 8005;
 const PORT6: u16 = 8006;
 const PORT7: u16 = 8007;
+const PORT8: u16 = 8008;
 const DYNAMODB_HOST_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[instrument]
@@ -1342,6 +1344,89 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
                 &rt,
                 &format!("SELECT * FROM {table_name}"),
                 "dynamodb_streams_cayenne_file_acceleration",
+            )
+            .await?;
+
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                anyhow::Error::msg(e.to_string())
+            })?;
+
+            Ok(())
+        })
+        .await
+}
+
+/// Verifies that a DynamoDB-accelerated dataset with a declared schema initializes
+/// successfully when the source table is empty, then becomes queryable once rows
+/// are inserted.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamodb_streams_declared_schema_empty_table() -> anyhow::Result<()> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,data_components=debug,info",
+    ));
+
+    let table_name = "declared_schema_test";
+    let access_key = "foo";
+    let secret_key = "bar";
+
+    test_request_context()
+        .scope(async {
+            let running_container = start_dynamodb_docker_container(PORT8).await?;
+            let client = get_client(PORT8, access_key, secret_key);
+
+            // Create table with streams but do NOT insert any rows yet.
+            create_table(&client, table_name).await;
+
+            // Build dataset with explicit column type declarations so the runtime
+            // can initialize schema without scanning any rows.
+            let mut ds = make_dynamodb_dataset(table_name, PORT8, access_key, secret_key, true);
+            ds.columns = vec![
+                Column::new("id").with_type("text"),
+                Column::new("name").with_type("text"),
+                Column::new("version").with_type("bigint"),
+            ];
+
+            let app = AppBuilder::new("dynamodb_declared_schema_test")
+                .with_dataset(ds)
+                .with_sql_cache(SQLResultsCacheConfig {
+                    enabled: false,
+                    ..Default::default()
+                })
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            // Expect successful load even though the table is empty.
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // Schema should reflect declared columns.
+            run_and_snapshot_query(
+                &rt,
+                &format!("DESCRIBE {table_name}"),
+                "declared_schema_empty_table_schema",
+            )
+            .await?;
+
+            // Insert rows into the source table.
+            insert_rows(&client, table_name, 0..3).await;
+            wait_for_dynamodb_source_rows(&client, table_name, 3, 30).await?;
+
+            // Rows should become visible via the accelerated dataset.
+            ensure_dataset_rows(&rt, table_name, 3, 30).await?;
+            run_and_snapshot_query(
+                &rt,
+                &format!("SELECT * FROM {table_name} ORDER BY id"),
+                "declared_schema_empty_table_data",
             )
             .await?;
 

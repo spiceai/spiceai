@@ -32,6 +32,7 @@ use crate::dynamodb::schema::infer_arrow_schema_from_rows;
 use crate::dynamodb::stream::{StreamError, process_batch, record_batch_to_change_batch};
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use crate::dynamodb::unnest::unnest_dynamodb_rows;
+use crate::schema::merge_inferred_with_declared;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
@@ -113,6 +114,7 @@ impl DynamoDBTableProvider {
         metrics_collector: Arc<MetricsCollector>,
         json_nesting: Option<&JsonNesting>,
         write_parallelism: usize,
+        declared_schema: Option<SchemaRef>,
     ) -> Result<Self, Error> {
         let db_client = Arc::new(DbClient::new(&sdk_config));
         let buffer_size = NonZeroUsize::new(1).unwrap_or_else(|| unreachable!("1 is safe"));
@@ -132,6 +134,7 @@ impl DynamoDBTableProvider {
                 schema_infer_max_records,
                 &time_format,
                 json_nesting,
+                declared_schema,
             )
             .await?;
 
@@ -315,6 +318,7 @@ impl DynamoDBTableProvider {
         schema_infer_max_records: i32,
         time_format: &str,
         json_nesting: Option<&JsonNesting>,
+        declared_schema: Option<SchemaRef>,
     ) -> Result<(
         SchemaRef,
         String,
@@ -375,9 +379,23 @@ impl DynamoDBTableProvider {
             .to_vec();
 
         if rows.is_empty() {
-            return Err(Error::EmptyTable {
-                table_name: table_name.to_string(),
-            });
+            return match declared_schema {
+                Some(schema) => {
+                    tracing::debug!(
+                        "DynamoDB table {table_name:?} is empty; using declared schema"
+                    );
+                    Ok((
+                        schema,
+                        partition_key,
+                        sort_key,
+                        HashSet::new(),
+                        table.item_count,
+                    ))
+                }
+                None => Err(Error::EmptyTable {
+                    table_name: table_name.to_string(),
+                }),
+            };
         }
 
         let (unnested_rows, flattened_fields) = match unnest_depth {
@@ -396,7 +414,8 @@ impl DynamoDBTableProvider {
             &final_rows[..final_rows.len().min(2)]
         );
 
-        let schema = infer_arrow_schema_from_rows(&final_rows, time_format)?;
+        let inferred_schema = infer_arrow_schema_from_rows(&final_rows, time_format)?;
+        let schema = merge_inferred_with_declared(inferred_schema, declared_schema.as_ref());
 
         tracing::debug!(
             "DynamoDB inferred schema: table_name={:?}, schema={:?}",

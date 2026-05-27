@@ -486,10 +486,61 @@ fn rescale_i128(unscaled: i128, src_scale: i8, dst_scale: i8) -> Result<i128> {
     }
 }
 
+/// Convert a plain JSON number (from `decimal.handling.mode=double`) to an `i128`
+/// scaled to `target_scale`.
+///
+/// Parses the number's string representation directly to avoid f64 precision loss.
+/// Scientific notation falls back to f64 rounding.
+fn parse_number_to_decimal(n: &serde_json::Number, target_scale: i8) -> Result<i128> {
+    let s = n.to_string();
+
+    // Scientific notation: fall back to f64
+    if s.bytes().any(|b| b == b'e' || b == b'E') {
+        let f: f64 = s.parse().map_err(|_| Error::InvalidDecimalJson {
+            reason: format!("cannot parse '{s}' as decimal"),
+        })?;
+        let scale_factor =
+            pow10_i128(target_scale).context(VariableScaleDecimalParsingOverflowSnafu)?;
+        #[expect(clippy::cast_possible_truncation)]
+        return Ok((f * scale_factor as f64).round() as i128);
+    }
+
+    let negative = s.starts_with('-');
+    let digits = if negative { &s[1..] } else { &s };
+
+    let (int_str, frac_str) = match digits.find('.') {
+        Some(pos) => (&digits[..pos], &digits[pos + 1..]),
+        None => (digits, ""),
+    };
+
+    let int_val: i128 = int_str.parse().map_err(|_| Error::InvalidDecimalJson {
+        reason: format!("cannot parse integer part '{int_str}'"),
+    })?;
+
+    let frac_scale = i8::try_from(frac_str.len()).map_err(|_| Error::InvalidDecimalJson {
+        reason: "fractional part too long".to_string(),
+    })?;
+
+    let frac_val: i128 = if frac_str.is_empty() {
+        0
+    } else {
+        frac_str.parse().map_err(|_| Error::InvalidDecimalJson {
+            reason: format!("cannot parse fractional part '{frac_str}'"),
+        })?
+    };
+
+    let scaled_int = rescale_i128(int_val, 0, target_scale)?;
+    let scaled_frac = rescale_i128(frac_val, frac_scale, target_scale)?;
+    let result = scaled_int + scaled_frac;
+
+    Ok(if negative { -result } else { result })
+}
+
 /// Parse a decimal from JSON.
 /// Supported inputs:
 /// - JSON string: base64-encoded
 /// - JSON object: {"scale": <int>, "value": <base64>}
+/// - JSON number: plain float (decimal.handling.mode=double)
 pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<Option<i128>> {
     if !(0..=38).contains(&target_scale) {
         return InvalidDecimalJsonSnafu {
@@ -518,11 +569,12 @@ pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<Option<i128
             let normalized = rescale_i128(unscaled, src_scale, target_scale)?;
             Ok(Some(normalized))
         }
+        // decimal.handling.mode=double sends decimals as plain JSON numbers.
+        Json::Number(n) => Ok(Some(parse_number_to_decimal(n, target_scale)?)),
         _ => {
             let actual_type = match v {
                 Json::Null => "null",
                 Json::Bool(_) => "boolean",
-                Json::Number(_) => "number",
                 Json::Array(_) => "array",
                 _ => "unknown",
             };
@@ -681,6 +733,54 @@ mod tests {
         let input = json!({"value": i128_to_base64(n)});
         let result = convert_json_to_decimal(&input, 2);
         result.expect_err("Should fail for missing scale");
+    }
+
+    // decimal.handling.mode=double — plain JSON numbers
+    #[test]
+    fn test_number_integer_value() {
+        // 123 with scale 2 → 12300
+        let input = json!(123);
+        let result = convert_json_to_decimal(&input, 2);
+        assert_eq!(result.ok().flatten(), Some(12_300));
+    }
+
+    #[test]
+    fn test_number_with_fractional_exact_scale() {
+        // 123.45 with scale 2 → 12345
+        let input = json!(123.45_f64);
+        let result = convert_json_to_decimal(&input, 2);
+        assert_eq!(result.ok().flatten(), Some(12_345));
+    }
+
+    #[test]
+    fn test_number_with_fractional_fewer_digits_than_scale() {
+        // 123.4 with scale 2 → 12340
+        let input = json!(123.4_f64);
+        let result = convert_json_to_decimal(&input, 2);
+        assert_eq!(result.ok().flatten(), Some(12_340));
+    }
+
+    #[test]
+    fn test_number_with_fractional_more_digits_than_scale() {
+        // 123.456 with scale 2 → 12345 (truncated)
+        let input = json!(123.456_f64);
+        let result = convert_json_to_decimal(&input, 2);
+        assert_eq!(result.ok().flatten(), Some(12_345));
+    }
+
+    #[test]
+    fn test_number_negative() {
+        // -123.45 with scale 2 → -12345
+        let input = json!(-123.45_f64);
+        let result = convert_json_to_decimal(&input, 2);
+        assert_eq!(result.ok().flatten(), Some(-12_345));
+    }
+
+    #[test]
+    fn test_number_zero() {
+        let input = json!(0);
+        let result = convert_json_to_decimal(&input, 2);
+        assert_eq!(result.ok().flatten(), Some(0));
     }
 
     #[test]

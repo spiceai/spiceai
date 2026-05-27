@@ -101,6 +101,19 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Returns `true` when `e` indicates the topic does not exist on the broker yet.
+#[must_use]
+pub fn is_unknown_topic_or_partition(e: &Error) -> bool {
+    use rdkafka::error::KafkaError as RdKafkaError;
+    use rdkafka::types::RDKafkaErrorCode;
+    matches!(
+        e,
+        Error::UnableToReceiveMessage {
+            source: RdKafkaError::MessageConsumption(RDKafkaErrorCode::UnknownTopicOrPartition)
+        }
+    )
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct KafkaOffset {
     pub topic: String,
