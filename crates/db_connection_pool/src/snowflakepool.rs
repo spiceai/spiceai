@@ -80,6 +80,13 @@ impl SnowflakeAccountIdentifier {
     }
 }
 
+fn is_valid_org_identifier_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
 impl FromStr for SnowflakeAccountIdentifier {
     type Err = String;
 
@@ -103,7 +110,9 @@ impl FromStr for SnowflakeAccountIdentifier {
             let (orgname, account_name) = s
                 .split_once('.')
                 .ok_or_else(|| format!("invalid org-based account identifier: {s}"))?;
-            if orgname.is_empty() || account_name.is_empty() {
+            if !is_valid_org_identifier_segment(orgname)
+                || !is_valid_org_identifier_segment(account_name)
+            {
                 return Err(format!("invalid org-based account identifier: {s}"));
             }
             return Ok(Self::OrgBased {
@@ -248,7 +257,7 @@ impl SnowflakeConnectionPool {
             .context(MissingRequiredSecretSnafu { name: "account" })?;
         let account_id = SnowflakeAccountIdentifier::from_str(account_raw).map_err(|e| {
             Error::InvalidParameterValue {
-                param_key: "snowflake_account".to_string(),
+                param_key: "account".to_string(),
                 param_value: e,
             }
         })?;
@@ -460,7 +469,9 @@ mod tests {
 
     #[test]
     fn test_org_based_format() {
-        let id: SnowflakeAccountIdentifier = "myorg.myaccount".parse().unwrap();
+        let id: SnowflakeAccountIdentifier = "myorg.myaccount"
+            .parse()
+            .expect("parse org-based Snowflake account identifier");
         assert_eq!(
             id,
             SnowflakeAccountIdentifier::OrgBased {
@@ -474,13 +485,17 @@ mod tests {
 
     #[test]
     fn test_org_based_with_underscores() {
-        let id: SnowflakeAccountIdentifier = "my_org.my_account".parse().unwrap();
+        let id: SnowflakeAccountIdentifier = "my_org.my_account"
+            .parse()
+            .expect("parse org-based Snowflake account identifier with underscores");
         assert_eq!(id.api_account(), "my_org-my_account");
     }
 
     #[test]
     fn test_legacy_locator_with_region() {
-        let id: SnowflakeAccountIdentifier = "sb70577.eu-central-1".parse().unwrap();
+        let id: SnowflakeAccountIdentifier = "sb70577.eu-central-1"
+            .parse()
+            .expect("parse legacy Snowflake account identifier with region");
         assert_eq!(
             id,
             SnowflakeAccountIdentifier::Legacy {
@@ -494,7 +509,9 @@ mod tests {
 
     #[test]
     fn test_legacy_locator_with_region_and_cloud() {
-        let id: SnowflakeAccountIdentifier = "xy12345.us-east-2.aws".parse().unwrap();
+        let id: SnowflakeAccountIdentifier = "xy12345.us-east-2.aws"
+            .parse()
+            .expect("parse legacy Snowflake account identifier with region and cloud");
         assert_eq!(
             id,
             SnowflakeAccountIdentifier::Legacy {
@@ -508,7 +525,9 @@ mod tests {
 
     #[test]
     fn test_legacy_bare_locator() {
-        let id: SnowflakeAccountIdentifier = "xy12345".parse().unwrap();
+        let id: SnowflakeAccountIdentifier = "xy12345"
+            .parse()
+            .expect("parse legacy Snowflake account locator");
         assert_eq!(
             id,
             SnowflakeAccountIdentifier::Legacy {
@@ -522,7 +541,9 @@ mod tests {
 
     #[test]
     fn test_already_dashed_org_format() {
-        let id: SnowflakeAccountIdentifier = "myorg-myaccount".parse().unwrap();
+        let id: SnowflakeAccountIdentifier = "myorg-myaccount"
+            .parse()
+            .expect("parse dashed Snowflake account identifier as legacy locator");
         assert_eq!(
             id,
             SnowflakeAccountIdentifier::Legacy {
@@ -551,6 +572,14 @@ mod tests {
     fn test_trailing_dot_is_err() {
         assert!(matches!(
             "myorg.".parse::<SnowflakeAccountIdentifier>(),
+            Err(_)
+        ));
+    }
+
+    #[test]
+    fn test_org_based_with_invalid_character_is_err() {
+        assert!(matches!(
+            "myorg.my$account".parse::<SnowflakeAccountIdentifier>(),
             Err(_)
         ));
     }
