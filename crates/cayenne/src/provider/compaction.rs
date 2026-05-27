@@ -154,8 +154,12 @@ pub(crate) fn pick_candidates<P: Clone>(
     files: impl IntoIterator<Item = FileEntry<P>>,
     cfg: &CompactionPickerConfig,
 ) -> Option<CompactionCandidate<P>> {
-    let mut small = Vec::new();
-    let mut mid = Vec::new();
+    let files = files.into_iter();
+    // Reserve based on the iterator's size_hint so the buckets do not
+    // re-allocate as they grow when the caller knows the total file count.
+    let hint = files.size_hint().0;
+    let mut small = Vec::with_capacity(hint);
+    let mut mid = Vec::with_capacity(hint);
 
     for entry in files {
         match Tier::classify(entry.size_bytes, &cfg.tiers) {
@@ -199,8 +203,14 @@ fn pick_from_bucket<P: Clone>(
         return None;
     }
 
-    bucket.sort_by_key(|entry| entry.size_bytes);
+    // We only need the K smallest entries — `select_nth_unstable_by_key` runs
+    // in O(N) expected time vs O(N log N) for a full sort, and the candidate
+    // downstream consumers (path collection + byte sum) don't depend on
+    // ordering within the picked set. See `compaction_picker` bench.
     let max_pick = cfg.max_files_per_pick.min(bucket.len());
+    if max_pick < bucket.len() {
+        let _ = bucket.select_nth_unstable_by_key(max_pick, |entry| entry.size_bytes);
+    }
     let picked = &bucket[..max_pick];
     let picked_bytes: u64 = picked.iter().map(|entry| entry.size_bytes).sum();
     let paths = picked.iter().map(|entry| entry.path.clone()).collect();
@@ -330,9 +340,9 @@ mod tests {
             .collect()
     }
 
-    /// Helper: target file size of 128 MiB, matching the default.
+    /// Helper: target file size of 256 MiB, matching the default.
     fn default_cfg() -> CompactionPickerConfig {
-        CompactionPickerConfig::new(8, 32, 128 * 1024 * 1024)
+        CompactionPickerConfig::new(8, 32, 256 * 1024 * 1024)
     }
 
     #[test]
@@ -377,7 +387,7 @@ mod tests {
     fn picker_returns_none_when_total_bytes_below_target() {
         let cfg = default_cfg();
         // 8 small files of 1 MiB each — meets trigger_files but total = 8 MiB,
-        // well below the 32 MiB Small-tier byte threshold (target_size / 4).
+        // well below the 64 MiB Small-tier byte threshold (target_size / 4).
         let files = entries(&[1024 * 1024; 8]);
         assert!(pick_candidates(files.iter().cloned(), &cfg).is_none());
     }
@@ -417,7 +427,7 @@ mod tests {
     #[test]
     fn picker_returns_none_when_only_one_file_above_target() {
         let cfg = default_cfg();
-        let files = entries(&[256 * 1024 * 1024]);
+        let files = entries(&[512 * 1024 * 1024]);
         assert!(pick_candidates(files.iter().cloned(), &cfg).is_none());
     }
 
@@ -445,7 +455,7 @@ mod tests {
     fn picker_promotes_to_mid_tier_when_small_tier_drained() {
         let cfg = default_cfg();
         // Simulate post-merge state: small tier is empty, mid tier has 8 files
-        // totaling > 128 MiB.
+        // totaling > 256 MiB.
         let files = entries(&[64 * 1024 * 1024; 8]);
         let candidate = pick_candidates(files.iter().cloned(), &cfg).expect("expected a candidate");
         assert_eq!(candidate.tier, Tier::Mid);
@@ -455,7 +465,7 @@ mod tests {
     fn picker_skips_settled_files() {
         let cfg = default_cfg();
         // All files at exactly target size — none are candidates.
-        let files = entries(&[128 * 1024 * 1024; 16]);
+        let files = entries(&[256 * 1024 * 1024; 16]);
         assert!(pick_candidates(files.iter().cloned(), &cfg).is_none());
     }
 

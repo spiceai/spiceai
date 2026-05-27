@@ -342,7 +342,7 @@ pub struct Builder {
     append_stream: Option<ChangesStream>,
     disable_federation: bool,
     write_to_accelerator_only: bool,
-    write_through: bool,
+    dual_write: bool,
     write_back: bool,
     refresh_semaphore: Option<Arc<Semaphore>>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
@@ -396,7 +396,7 @@ impl Builder {
             synchronize_with: None,
             disable_federation: false,
             write_to_accelerator_only: false,
-            write_through: false,
+            dual_write: false,
             write_back: false,
             initial_load_complete: false,
             refresh_semaphore: None,
@@ -490,10 +490,12 @@ impl Builder {
         self
     }
 
-    /// Enable write-through mode: writes go simultaneously to both the federated source
+    /// Enable dual-write mode: writes go simultaneously to both the federated source
     /// and the local Cayenne accelerator using staged append/commit/rollback semantics.
-    pub fn write_through(&mut self) -> &mut Self {
-        self.write_through = true;
+    /// Reserved for the Iceberg federated catalog cache path — not driven by the
+    /// user-facing `write_mode: write_through` setting.
+    pub fn dual_write(&mut self) -> &mut Self {
+        self.dual_write = true;
         self
     }
 
@@ -1047,14 +1049,14 @@ impl Builder {
             }
         }
 
-        let write_mode = if self.write_through {
-            WriteMode::resolve_write_through(&self.accelerator, &self.federated)?
+        let write_mode = if self.dual_write {
+            WriteMode::resolve_dual_write(&self.accelerator, &self.federated)?
         } else if self.write_back {
             WriteMode::WriteBack
         } else if self.write_to_accelerator_only {
             WriteMode::AcceleratorOnly
         } else {
-            WriteMode::FederatedOnly
+            WriteMode::WriteThrough
         };
 
         Ok(AcceleratedTable {
@@ -1170,8 +1172,8 @@ impl AcceleratedTable {
     }
 
     #[must_use]
-    pub fn is_write_through(&self) -> bool {
-        self.write_mode.is_write_through()
+    pub fn is_dual_write(&self) -> bool {
+        self.write_mode.is_dual_write()
     }
 
     #[must_use]
@@ -1645,9 +1647,10 @@ impl TableProvider for AcceleratedTable {
                 self.refresher().set_initial_load_completed(true);
                 Ok(accelerated_insert_plan)
             }
-            WriteMode::FederatedOnly => {
-                // Writes go to the federated source. The acceleration refresh
-                // mechanism will pick up the new data on its next cycle.
+            WriteMode::WriteThrough => {
+                // Writes go to the federated source synchronously. The acceleration
+                // refresh mechanism (CDC for refresh_mode: changes, otherwise the
+                // periodic refresh cycle) propagates the change to the accelerator.
                 let federated_table = self.federated.table_provider().await;
                 federated_table.insert_into(state, input, overwrite).await
             }
@@ -1663,10 +1666,10 @@ impl TableProvider for AcceleratedTable {
                     self.schema(),
                 )
             }
-            WriteMode::WriteThrough {
+            WriteMode::DualWrite {
                 cayenne_target,
                 federated_provider,
-            } => write::write_through::insert_write_through(
+            } => write::dual_write::insert_dual_write(
                 input,
                 overwrite,
                 cayenne_target.as_ref(),
@@ -1693,7 +1696,7 @@ impl TableProvider for AcceleratedTable {
 
         match &self.write_mode {
             WriteMode::AcceleratorOnly => self.accelerator.delete_from(state, filters).await,
-            WriteMode::FederatedOnly => {
+            WriteMode::WriteThrough => {
                 let federated_table = self.federated.table_provider().await;
                 federated_table.delete_from(state, filters).await
             }
@@ -1706,11 +1709,11 @@ impl TableProvider for AcceleratedTable {
                 )
                 .await
             }
-            WriteMode::WriteThrough {
+            WriteMode::DualWrite {
                 cayenne_target,
                 federated_provider,
             } => {
-                write::write_through::delete_write_through(
+                write::dual_write::delete_dual_write(
                     state,
                     filters,
                     cayenne_target.as_ref(),
@@ -1740,7 +1743,7 @@ impl TableProvider for AcceleratedTable {
             WriteMode::AcceleratorOnly => {
                 self.accelerator.update(state, assignments, filters).await
             }
-            WriteMode::FederatedOnly => {
+            WriteMode::WriteThrough => {
                 let federated_table = self.federated.table_provider().await;
                 federated_table.update(state, assignments, filters).await
             }
@@ -1754,11 +1757,11 @@ impl TableProvider for AcceleratedTable {
                 )
                 .await
             }
-            WriteMode::WriteThrough {
+            WriteMode::DualWrite {
                 cayenne_target,
                 federated_provider,
             } => {
-                write::write_through::update_write_through(
+                write::dual_write::update_dual_write(
                     state,
                     assignments,
                     filters,
@@ -1801,7 +1804,28 @@ impl TableProvider for AcceleratedTable {
     }
 
     async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.accelerator.truncate(state).await
+        if self.refresh_mode == RefreshMode::Snapshot {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "truncate on accelerated table {} is not permitted when refresh_mode is 'snapshot'; the accelerator is driven exclusively from the snapshot store",
+                self.dataset_name
+            )));
+        }
+
+        self.update_last_updated_at();
+
+        match &self.write_mode {
+            WriteMode::AcceleratorOnly => self.accelerator.truncate(state).await,
+            WriteMode::WriteThrough => {
+                let federated_table = self.federated.table_provider().await;
+                federated_table.truncate(state).await
+            }
+            WriteMode::WriteBack | WriteMode::DualWrite { .. } => {
+                Err(datafusion::error::DataFusionError::Plan(
+                    "TRUNCATE is not supported for write_back or dual_write accelerated tables"
+                        .to_string(),
+                ))
+            }
+        }
     }
 }
 

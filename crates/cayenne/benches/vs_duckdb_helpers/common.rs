@@ -451,6 +451,48 @@ pub async fn cayenne_insert(table: &Arc<CayenneTableProvider>, batch: RecordBatc
         .map_or(0, |rows| rows.value(0))
 }
 
+/// Drive Cayenne's pipelined CDC append path end-to-end for a single batch.
+///
+/// Calls [`CayenneTableProvider::write_cdc_append_stream`] (the entry point
+/// used by `refresh_mode: changes` in spiced's accelerated_table refresh
+/// loop) and then awaits `finish()` so the rows are fully visible — this is
+/// the apples-to-apples comparison against DuckDB's INSERT path, which has
+/// no staged/visibility split.
+///
+/// Takes a `task_ctx` reference rather than constructing a fresh
+/// `SessionContext` per call. In tight benches that spawn one writer per
+/// concurrent task and pump many batches, `SessionContext::new()` would
+/// dominate the per-batch cost (~tens to hundreds of µs of setup + allocator
+/// churn). The caller should build one `SessionContext` per writer at spawn
+/// time and pass the same `task_ctx` for every batch — that matches how a
+/// long-running Spice runtime drives the CDC refresh loop in production.
+///
+/// Returns the number of rows acknowledged by the CDC write.
+pub async fn cayenne_cdc_write(
+    table: &Arc<CayenneTableProvider>,
+    task_ctx: &Arc<datafusion_execution::TaskContext>,
+    batch: RecordBatch,
+) -> u64 {
+    use datafusion::error::DataFusionError;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+    let schema = batch.schema();
+    let stream = Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        futures::stream::iter(vec![Ok::<_, DataFusionError>(batch)]),
+    ));
+    let cdc_write = table
+        .write_cdc_append_stream(stream, task_ctx)
+        .await
+        .expect("cayenne cdc write stage A");
+    let rows = cdc_write.rows();
+    cdc_write
+        .finish()
+        .await
+        .expect("cayenne cdc write stage B finish");
+    rows
+}
+
 /// Insert from a parquet file through Cayenne via DataFusion's parquet
 /// reader. Mirrors spiced's `file:` connector → accelerator ingestion path
 /// and gives parity with `duckdb_insert_parquet` (both engines now consume
@@ -499,6 +541,39 @@ pub async fn cayenne_query(table: &Arc<CayenneTableProvider>, sql: &str) -> Vec<
     let ctx = SessionContext::new();
     ctx.register_table("t", Arc::clone(table) as Arc<dyn TableProvider>)
         .expect("register table");
+    let df = ctx.sql(sql).await.expect("cayenne sql");
+    df.collect().await.expect("cayenne collect")
+}
+
+/// Build a long-lived [`SessionContext`] with the given Cayenne table registered
+/// as `t`. Use this once at fixture-load time and pass the resulting context
+/// into [`cayenne_query_warm`] inside `b.iter` to measure the steady-state
+/// query cost without paying per-iteration `SessionContext::new()` overhead.
+///
+/// The default [`cayenne_query`] path creates a fresh session per call, which
+/// matches one valid usage (e.g. CLI invocation) but over-estimates the
+/// per-query cost a long-running Spice runtime actually pays — Spice keeps a
+/// `SessionContext` alive across the daemon's lifetime, paying setup once at
+/// startup. Reporting both lanes makes the asymmetry quantifiable instead of
+/// hand-wavey.
+pub fn warm_session_for(table: &Arc<CayenneTableProvider>) -> datafusion::prelude::SessionContext {
+    use datafusion::datasource::TableProvider;
+    use datafusion::prelude::SessionContext;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::clone(table) as Arc<dyn TableProvider>)
+        .expect("register table");
+    ctx
+}
+
+/// Run a SQL query through Cayenne reusing the given [`SessionContext`].
+///
+/// Pair with [`warm_session_for`] to measure Cayenne under steady-state session
+/// reuse — see that function's docs for when this is the right lane to read.
+pub async fn cayenne_query_warm(
+    ctx: &datafusion::prelude::SessionContext,
+    sql: &str,
+) -> Vec<RecordBatch> {
     let df = ctx.sql(sql).await.expect("cayenne sql");
     df.collect().await.expect("cayenne collect")
 }

@@ -19,6 +19,7 @@ arrow_tools = { path = "../arrow_tools" }
 async-stream.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+dashmap = "6.1.0"
 data_components = { path = "../data_components" }
 datafusion.workspace = true
 datafusion-expr = { workspace = true }
@@ -28,6 +29,7 @@ fundu.workspace = true
 futures.workspace = true
 object_store.workspace = true
 object_store_occ = { path = "../object_store_occ" }
+opentelemetry = { workspace = true }
 parking_lot.workspace = true
 serde_json.workspace = true
 runtime-datafusion = { path = "../runtime-datafusion" }
@@ -37,6 +39,7 @@ runtime-table-partition = { path = "../runtime-table-partition" }
 serde = { workspace = true, features = ["derive"] }
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
+telemetry = { path = "../telemetry" }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream.workspace = true
 tonic.workspace = true

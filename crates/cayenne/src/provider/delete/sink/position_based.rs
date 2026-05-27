@@ -519,6 +519,10 @@ impl CayenneDeletionSink {
 
         let mut matching_positions: Vec<u64> = Vec::new();
         let mut row_position: u64 = 0;
+        // Resolved on the first chunk and reused across the stream — schema is
+        // stable per file, so the per-chunk `index_of` lookups become wasted
+        // work as files grow past one chunk.
+        let mut key_indices: Option<Vec<usize>> = None;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result.map_err(|e| Error::Vortex {
@@ -548,21 +552,27 @@ impl CayenneDeletionSink {
                 })?;
             let batch = arrow::record_batch::RecordBatch::from(struct_array);
 
-            // Resolve key column indices (once per chunk — schema is stable across chunks).
-            let key_indices: Vec<usize> = key_columns
-                .iter()
-                .map(|col_name| {
-                    batch
-                        .schema()
-                        .index_of(col_name)
-                        .map_err(|_| Error::Internal {
-                            table: table_name.clone(),
-                            message: format!(
-                                "Key column '{col_name}' not found in Vortex file schema"
-                            ),
-                        })
-                })
-                .collect::<crate::provider::Result<Vec<_>>>()?;
+            let key_indices: &[usize] = if let Some(indices) = &key_indices {
+                indices.as_slice()
+            } else {
+                let resolved: Vec<usize> = key_columns
+                    .iter()
+                    .map(|col_name| {
+                        batch
+                            .schema()
+                            .index_of(col_name)
+                            .map_err(|_| Error::Internal {
+                                table: table_name.clone(),
+                                message: format!(
+                                    "Key column '{col_name}' not found in Vortex file schema"
+                                ),
+                            })
+                    })
+                    .collect::<crate::provider::Result<Vec<_>>>()?;
+                key_indices = Some(resolved);
+                // SAFETY: we just assigned `Some` above
+                key_indices.as_deref().unwrap_or(&[])
+            };
 
             for row_idx in 0..batch.num_rows() {
                 let key: Vec<datafusion_common::ScalarValue> = key_indices
@@ -643,6 +653,8 @@ impl CayenneDeletionSink {
         // Build write specs and precompute cache updates while counting TRUE new deletions
         // (set difference between incoming row_ids and existing cache per file).
         let mut new_deletion_count: usize = 0;
+        let mut overflow_count: u64 = 0;
+        let mut first_overflow_id: Option<u64> = None;
         let mut specs: Vec<DeletionVectorWriteSpec> = Vec::new();
         let mut cache_updates: HashMap<String, Arc<PositionDeletionVector>> = HashMap::new();
 
@@ -653,47 +665,65 @@ impl CayenneDeletionSink {
             let existing_deletion = existing_deletions.get(file_path);
 
             // Deduplicate incoming row IDs first to avoid over-counting and redundant writes.
-            let mut unique_new_row_ids = incoming_row_ids.clone();
+            let mut unique_new_row_ids: Vec<u32> = Vec::with_capacity(incoming_row_ids.len());
+            for &id in incoming_row_ids {
+                if let Ok(id32) = u32::try_from(id) {
+                    unique_new_row_ids.push(id32);
+                } else {
+                    if first_overflow_id.is_none() {
+                        first_overflow_id = Some(id);
+                    }
+                    overflow_count += 1;
+                }
+            }
             unique_new_row_ids.sort_unstable();
             unique_new_row_ids.dedup();
 
+            if unique_new_row_ids.is_empty() {
+                continue;
+            }
+
             let newly_added_for_file = unique_new_row_ids
                 .iter()
-                .filter(|&&id| {
-                    u32::try_from(id).ok().is_none_or(|id32| {
-                        existing_deletion.is_none_or(|deletion| !deletion.contains(id32))
-                    })
-                })
+                .filter(|&&id| existing_deletion.is_none_or(|deletion| !deletion.contains(id)))
                 .count();
+
+            if newly_added_for_file == 0 {
+                continue;
+            }
+
             new_deletion_count += newly_added_for_file;
 
-            // Deletion vector must contain ALL deleted positions (existing + new).
-            let mut combined_ids: Vec<u64> = existing_deletion.map_or_else(Vec::new, |deletion| {
-                deletion.iter().map(u64::from).collect()
-            });
-            combined_ids.extend(unique_new_row_ids.iter().copied());
-            combined_ids.sort_unstable();
-            combined_ids.dedup();
-            specs.push(DeletionVectorWriteSpec::new_position_based(
-                file_path.clone(),
-                combined_ids,
-            ));
-
-            // Pre-build updated cache bitmap (u32 representable positions only).
-            // Clone only THIS file's bitmap; unchanged file bitmaps remain
-            // shared through their existing `Arc`s in the outer map snapshot.
+            // Union existing + new into one bitmap, then derive the writer-bound
+            // `Vec<u64>` from its monotone iterator — saves a separate
+            // `Vec<u64> + sort/dedup` pass. See `position_delete_redundant_walks`
+            // bench. Only THIS file's bitmap is cloned; unchanged file bitmaps
+            // stay shared through `Arc`s in the outer snapshot.
             let mut updated_bitmap = existing_deletion
                 .map_or_else(RoaringBitmap::new, |deletion_vector| {
                     deletion_vector.to_bitmap()
                 });
-            updated_bitmap.extend(
-                unique_new_row_ids
-                    .iter()
-                    .filter_map(|&id| u32::try_from(id).ok()),
-            );
+            updated_bitmap.extend(unique_new_row_ids.iter().copied());
+
+            // RoaringBitmap::iter yields strictly-increasing values, so the writer
+            // can skip its sort/dedup pass — see `position_delete_redundant_walks` bench.
+            let combined_ids: Vec<u64> = updated_bitmap.iter().map(u64::from).collect();
+            specs.push(DeletionVectorWriteSpec::new_position_based_sorted(
+                file_path.clone(),
+                combined_ids,
+            ));
+
             cache_updates.insert(
                 file_path.clone(),
                 Arc::new(PositionDeletionVector::new(updated_bitmap)),
+            );
+        }
+
+        if overflow_count > 0 {
+            tracing::warn!(
+                "Skipped {} row ID(s) that exceed u32::MAX (first: {}) - table should be compacted",
+                overflow_count,
+                first_overflow_id.unwrap_or(0)
             );
         }
 

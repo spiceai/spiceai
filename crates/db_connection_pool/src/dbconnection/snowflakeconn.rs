@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
@@ -72,6 +73,8 @@ pub enum Error {
 }
 
 static UTC_TIMEZONE: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("UTC"));
+const DESCRIPTION_METADATA_KEY: &str = "description";
+const SOURCE_TYPE_METADATA_KEY: &str = "source_type";
 
 pub struct SnowflakeConnection {
     pub api: Arc<SnowflakeApi>,
@@ -675,7 +678,22 @@ pub fn parse_schema_from_json(resp: &serde_json::Value) -> Result<SchemaRef, Err
             .as_str()
             .is_none_or(|s| s.to_uppercase() == "TRUE");
 
-        fields.push(Field::new(column_name, data_type, is_nullable));
+        let mut metadata = HashMap::from([(
+            SOURCE_TYPE_METADATA_KEY.to_string(),
+            data_type_str.to_string(),
+        )]);
+        if let Some(comment) = column
+            .get(5)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|comment| !comment.is_empty())
+        {
+            metadata.insert(DESCRIPTION_METADATA_KEY.to_string(), comment.to_string());
+        }
+
+        let field = Field::new(column_name, data_type, is_nullable).with_metadata(metadata);
+
+        fields.push(field);
     }
 
     Ok(Arc::new(Schema::new(fields)))
@@ -1306,6 +1324,38 @@ mod tests {
                 "Nullability mismatch for {name}"
             );
         }
+    }
+
+    #[test]
+    fn test_parse_schema_from_json_preserves_column_comment() {
+        let rows = serde_json::json!([[
+            "db",
+            "schema",
+            "customer_id",
+            r#"{"type":"FIXED","precision":38,"scale":0,"nullable":true}"#,
+            "TRUE",
+            "customer dimension key"
+        ]]);
+
+        let schema =
+            parse_schema_from_json(&rows).expect("Should parse SHOW COLUMNS JSON into a Schema");
+
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get("description")
+                .map(String::as_str),
+            Some("customer dimension key")
+        );
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get("source_type")
+                .map(String::as_str),
+            Some(r#"{"type":"FIXED","precision":38,"scale":0,"nullable":true}"#)
+        );
     }
 
     #[test]

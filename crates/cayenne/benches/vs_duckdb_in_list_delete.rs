@@ -87,14 +87,15 @@ use std::sync::Arc;
 
 use arrow::array::UInt64Array;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use datafusion::catalog::TableProvider;
 use datafusion::prelude::SessionContext;
 use datafusion_expr::{col, lit};
 use tokio::runtime::Runtime;
 
 use common::{
-    CayenneFixture, DuckDbFixture, capture_comparison_plans, cayenne_insert, cayenne_query,
-    duckdb_insert_parquet, duckdb_query_scalar, make_batch, schema, setup_cayenne_pk,
-    setup_duckdb_pk, write_parquet,
+    CAYENNE_LANES, CayenneFixture, DuckDbFixture, Metastore, capture_comparison_plans,
+    cayenne_insert, cayenne_query, duckdb_insert_parquet, duckdb_query_scalar, make_batch, schema,
+    setup_cayenne_pk_for, setup_duckdb_pk, write_parquet,
 };
 
 const TABLE_SIZES: &[usize] = &[16_384, 131_072, 1_048_576];
@@ -142,8 +143,8 @@ fn duckdb_delete_in_list(fixture: &DuckDbFixture, table: &str, ids: &[i64]) {
         .expect("duckdb delete in list");
 }
 
-async fn load_cayenne(rows: usize) -> CayenneFixture {
-    let fixture = setup_cayenne_pk("in_list_del_bench").await;
+async fn load_cayenne(lane: Metastore, rows: usize) -> CayenneFixture {
+    let fixture = setup_cayenne_pk_for("in_list_del_bench", lane).await;
     let batch = make_batch(schema(), 0, rows);
     let _ = cayenne_insert(&fixture.table, batch).await;
     fixture
@@ -172,22 +173,25 @@ fn bench_in_list_delete(c: &mut Criterion) {
         let ids = build_in_list_ids(rows);
 
         // --- delete (rebuild fixture on each iteration so deletes don't compound) ---
-        group.bench_with_input(
-            BenchmarkId::new("cayenne/delete_in_list", rows),
-            &rows,
-            |b, &_| {
-                b.iter_batched(
-                    || rt.block_on(load_cayenne(rows)),
-                    |fixture| {
-                        rt.block_on(async {
-                            let n = cayenne_delete_in_list(&fixture, &ids).await;
-                            black_box(n);
-                        });
-                    },
-                    BatchSize::SmallInput,
-                );
-            },
-        );
+        for &lane in CAYENNE_LANES {
+            let lane_label = lane.lane();
+            group.bench_with_input(
+                BenchmarkId::new(format!("{lane_label}/delete_in_list"), rows),
+                &rows,
+                |b, &_| {
+                    b.iter_batched(
+                        || rt.block_on(load_cayenne(lane, rows)),
+                        |fixture| {
+                            rt.block_on(async {
+                                let deleted = cayenne_delete_in_list(&fixture, &ids).await;
+                                black_box(deleted);
+                            });
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+        }
 
         group.bench_with_input(
             BenchmarkId::new("duckdb/delete_in_list", rows),
@@ -206,12 +210,20 @@ fn bench_in_list_delete(c: &mut Criterion) {
 
         // --- scan_after_in_list_delete (load + delete once outside the timed region,
         //     then time only the scan path that probes the deletion vector). ---
-        let cayenne_fixture = Arc::new(rt.block_on(async {
-            let fx = load_cayenne(rows).await;
-            let n = cayenne_delete_in_list(&fx, &ids).await;
-            assert!(n > 0, "expected the IN-list delete to remove some rows");
-            fx
-        }));
+        let mut cayenne_fixtures = Vec::new();
+        for &lane in CAYENNE_LANES {
+            let fixture = Arc::new(rt.block_on(async {
+                let fixture = load_cayenne(lane, rows).await;
+                let deleted = cayenne_delete_in_list(&fixture, &ids).await;
+                assert!(
+                    deleted > 0,
+                    "expected the IN-list delete to remove some rows"
+                );
+                fixture
+            }));
+            cayenne_fixtures.push((lane, lane.lane(), fixture));
+        }
+
         let duckdb_fixture = Arc::new({
             let fx = load_duckdb(&parquet_path);
             duckdb_delete_in_list(&fx, "in_list_del_bench", &ids);
@@ -220,25 +232,33 @@ fn bench_in_list_delete(c: &mut Criterion) {
 
         rt.block_on(capture_comparison_plans(
             &format!("in_list_delete/{rows}/scan_after_in_list_delete"),
-            &cayenne_fixture.table,
+            &cayenne_fixtures
+                .iter()
+                .find(|(lane, _, _)| *lane == Metastore::Sqlite)
+                .expect("sqlite cayenne lane should exist")
+                .2
+                .table,
             &duckdb_fixture.conn,
             "SELECT SUM(value) FROM t",
             "SELECT SUM(value) FROM in_list_del_bench",
         ));
 
-        let cf = Arc::clone(&cayenne_fixture);
-        group.bench_with_input(
-            BenchmarkId::new("cayenne/scan_after_in_list_delete", rows),
-            &rows,
-            |b, &_| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        let batches = cayenne_query(&cf.table, "SELECT SUM(value) FROM t").await;
-                        black_box(batches);
+        for (_, lane_label, cayenne_fixture) in &cayenne_fixtures {
+            let fixture = Arc::clone(cayenne_fixture);
+            group.bench_with_input(
+                BenchmarkId::new(format!("{lane_label}/scan_after_in_list_delete"), rows),
+                &rows,
+                |b, &_| {
+                    b.iter(|| {
+                        rt.block_on(async {
+                            let batches =
+                                cayenne_query(&fixture.table, "SELECT SUM(value) FROM t").await;
+                            black_box(batches);
+                        });
                     });
-                });
-            },
-        );
+                },
+            );
+        }
 
         let df = Arc::clone(&duckdb_fixture);
         group.bench_with_input(

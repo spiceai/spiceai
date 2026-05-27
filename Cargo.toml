@@ -59,6 +59,7 @@ members = [
     "crates/test-framework",
     "crates/token_provider",
     "crates/turso-shared",
+    "crates/vortex",
     "crates/tools",
     "crates/util",
     "crates/workers",
@@ -89,6 +90,7 @@ edition = "2024"
 exclude = [".github/"]
 homepage = "https://spice.ai"
 license-file = "LICENSE"
+publish = false
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.94.1"
 version = "2.0.0-unstable"
@@ -119,18 +121,18 @@ async-openai = { git = "https://github.com/spiceai/async-openai", rev = "98e0c53
 ] }
 async-stream = "0.3.5"
 async-trait = "0.1.89"
-aws-config = "1.8.16"
+aws-config = "1.8.17"
 aws-credential-types = "1.2.13"
 aws-runtime = "1.7.1"
-aws-sdk-bedrockruntime = "1.130.0"
-aws-sdk-cognitoidentity = "1.99.0"
-aws-sdk-cognitoidentityprovider = "1.116.0"
-aws-sdk-dynamodb = "1.111.0"
-aws-sdk-dynamodbstreams = "1.99.0"
-aws-sdk-glue = "1.145.1"
-aws-sdk-s3 = "1.132.0"
-aws-sdk-s3vectors = "1.24.0"
-aws-sdk-secretsmanager = "1.104.0"
+aws-sdk-bedrockruntime = "1.131.0"
+aws-sdk-cognitoidentity = "1.100.0"
+aws-sdk-cognitoidentityprovider = "1.117.0"
+aws-sdk-dynamodb = "1.112.0"
+aws-sdk-dynamodbstreams = "1.100.0"
+aws-sdk-glue = "1.146.0"
+aws-sdk-s3 = "1.133.0"
+aws-sdk-s3vectors = "1.25.0"
+aws-sdk-secretsmanager = "1.105.0"
 aws-sdk-sts = "1.102.0"
 aws-smithy-async = "1.2.14"
 aws-smithy-runtime = "1.11.1"
@@ -167,10 +169,11 @@ datafusion-common-runtime = "52.0.0"
 datafusion-datasource = "52.0.0"
 datafusion-execution = "52.0.0"
 datafusion-expr = "52.0.0"
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a4fce79433e5c2fe779427c0bfce6a599193e300", features = ["sql"] } # branch: trunk; SHA format (short vs full) must match to what datafusion-table-providers use for datafusion-federation
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "6b6bfb0d30da8e5c2eb851094e366d98fa839575", features = ["sql"] } # branch: trunk; SHA format (short vs full) must match to what datafusion-table-providers use for datafusion-federation
 datafusion-functions = "52.0.0"
 datafusion-functions-json = "0.52"
 datafusion-physical-expr = "52.0.0"
+datafusion-physical-expr-adapter = "52.0.0"
 datafusion-physical-expr-common = "52.0.0"
 datafusion-physical-plan = "52.0.0"
 datafusion-proto = { version = "52.0.0", features = ["json"] }
@@ -349,7 +352,7 @@ flatbuffers = "25.2.10"
 # transitive vortex dependencies pulled in by other patched crates.
 vortex = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6" } # spiceai-52.5
 vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6" } # spiceai-52.5
-vortex-datafusion = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6" } # spiceai-52.5
+vortex-datafusion = { path = "crates/vortex" }
 vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6" } # spiceai-52.5
 vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6" } # spiceai-52.5
 vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6" } # spiceai-52.5
@@ -424,11 +427,11 @@ datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.g
 datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "06e4b624c6073c40c7b2127ce620e281ec1979ae" }                    # spiceai-52.5
 datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "06e4b624c6073c40c7b2127ce620e281ec1979ae" }                # spiceai-52.5
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "b798c391b6566c172d44361f8acc8472c958ca75" } # spiceai-52
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "466acff6af701872ba41de99c1783df2a288ddf8" } # spiceai-52
 
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "47e2b4946762c834d4a11532a25cc99c9e8a0b9d" }      # spiceai-52.5
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "47e2b4946762c834d4a11532a25cc99c9e8a0b9d" } # spiceai-52.5
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "47e2b4946762c834d4a11532a25cc99c9e8a0b9d" } # spiceai-52.5
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "07be66a8efff7e20c2abadaaba6ef62b02fc1ffc" }      # spiceai-52.5
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "07be66a8efff7e20c2abadaaba6ef62b02fc1ffc" } # spiceai-52.5
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "07be66a8efff7e20c2abadaaba6ef62b02fc1ffc" } # spiceai-52.5
 
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "47034733a0477f72e4f6abbbf6a27d0da069860a" } # spiceai-0.18.2
 
@@ -472,7 +475,7 @@ object_store = { git = "https://github.com/apache/arrow-rs-object-store", rev = 
 
 vortex = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6" } # spiceai-52.5
 vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6" } # spiceai-52.5
-vortex-datafusion = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6" } # spiceai-52.5
+vortex-datafusion = { path = "crates/vortex" }
 vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6" } # spiceai-52.5
 vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6" } # spiceai-52.5
 vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "86cc337cb133fc54ec45bd665e348453a84785a6" } # spiceai-52.5

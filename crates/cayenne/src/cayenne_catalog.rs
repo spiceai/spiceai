@@ -472,6 +472,8 @@ impl CayenneCatalog {
     ) -> CatalogResult<TableMetadata> {
         match self.get_table(table_name).await {
             Ok(stored_metadata) => {
+                log_runtime_footer_cache_drift(table_name, &stored_metadata, options);
+
                 if configuration_matches(&stored_metadata, options) {
                     return Ok(stored_metadata);
                 }
@@ -516,30 +518,34 @@ impl CayenneCatalog {
         pk_bytes_list: &[Vec<u8>],
         sequence_number: i64,
     ) -> (String, Vec<MetastoreValue>) {
-        let mut values_parts = Vec::with_capacity(pk_bytes_list.len());
+        use std::fmt::Write as _;
+
+        const PREFIX: &str = "INSERT OR REPLACE INTO cayenne_insert_record \
+             (insert_record_id, table_id, pk_bytes, sequence_number) VALUES ";
+        // Each "(?N, ?N, ?N, ?N)" row is ≤ 32 bytes for the placeholder counts we hit.
+        let mut sql = String::with_capacity(PREFIX.len() + pk_bytes_list.len() * 32);
+        sql.push_str(PREFIX);
         let mut params = Vec::with_capacity(pk_bytes_list.len() * 4);
-        let table_id = table_id.to_string();
 
         for (i, pk_bytes) in pk_bytes_list.iter().enumerate() {
             let base = i * 4 + 1; // SQLite params are 1-indexed
-            values_parts.push(format!(
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            // `write!` into a `String` is infallible.
+            let _ = write!(
+                sql,
                 "(?{}, ?{}, ?{}, ?{})",
                 base,
                 base + 1,
                 base + 2,
                 base + 3
-            ));
+            );
             params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
-            params.push(MetastoreValue::Text(table_id.clone()));
+            params.push(MetastoreValue::Text(table_id.to_string()));
             params.push(MetastoreValue::Blob(pk_bytes.clone()));
             params.push(MetastoreValue::Integer(sequence_number));
         }
-
-        let sql = format!(
-            "INSERT OR REPLACE INTO cayenne_insert_record \
-             (insert_record_id, table_id, pk_bytes, sequence_number) VALUES {}",
-            values_parts.join(", ")
-        );
 
         (sql, params)
     }
@@ -552,13 +558,37 @@ impl CayenneCatalog {
     fn build_insert_delete_files_chunk_sql(
         delete_files: &[DeleteFile],
     ) -> (String, Vec<MetastoreValue>) {
+        use std::fmt::Write as _;
+
         const PARAMS_PER_ROW: usize = 9;
-        let mut values_parts = Vec::with_capacity(delete_files.len());
+        const PREFIX: &str = "INSERT INTO cayenne_delete_file (\
+                 delete_file_id, table_id, path, path_is_relative, \
+                 format, delete_count, file_size_bytes, source_data_file_path, sequence_number\
+             ) VALUES ";
+        const SUFFIX: &str = " \
+             ON CONFLICT(table_id, path) DO UPDATE SET \
+                 path = CASE \
+                     WHEN cayenne_delete_file.path_is_relative = excluded.path_is_relative \
+                         AND cayenne_delete_file.format = excluded.format \
+                         AND cayenne_delete_file.delete_count = excluded.delete_count \
+                         AND cayenne_delete_file.file_size_bytes = excluded.file_size_bytes \
+                         AND cayenne_delete_file.source_data_file_path IS excluded.source_data_file_path \
+                         AND cayenne_delete_file.sequence_number = excluded.sequence_number \
+                     THEN cayenne_delete_file.path \
+                     ELSE NULL \
+                 END";
+        // Each "(?N, ?N, ?N, ?N, ?N, ?N, ?N, ?N, ?N)" row averages ~64 bytes.
+        let mut sql = String::with_capacity(PREFIX.len() + SUFFIX.len() + delete_files.len() * 64);
+        sql.push_str(PREFIX);
         let mut params = Vec::with_capacity(delete_files.len() * PARAMS_PER_ROW);
 
         for (i, delete_file) in delete_files.iter().enumerate() {
             let base = i * PARAMS_PER_ROW + 1; // 1-indexed
-            values_parts.push(format!(
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            let _ = write!(
+                sql,
                 "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
                 base,
                 base + 1,
@@ -569,7 +599,7 @@ impl CayenneCatalog {
                 base + 6,
                 base + 7,
                 base + 8,
-            ));
+            );
             params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
             params.push(MetastoreValue::Text(delete_file.table_id.clone()));
             params.push(MetastoreValue::Text(delete_file.path.clone()));
@@ -586,25 +616,7 @@ impl CayenneCatalog {
             params.push(MetastoreValue::Integer(delete_file.sequence_number));
         }
 
-        let sql = format!(
-            "INSERT INTO cayenne_delete_file (\
-                 delete_file_id, table_id, path, path_is_relative, \
-                 format, delete_count, file_size_bytes, source_data_file_path, sequence_number\
-             ) VALUES {} \
-             ON CONFLICT(table_id, path) DO UPDATE SET \
-                 path = CASE \
-                     WHEN cayenne_delete_file.path_is_relative = excluded.path_is_relative \
-                         AND cayenne_delete_file.format = excluded.format \
-                         AND cayenne_delete_file.delete_count = excluded.delete_count \
-                         AND cayenne_delete_file.file_size_bytes = excluded.file_size_bytes \
-                         AND cayenne_delete_file.source_data_file_path IS excluded.source_data_file_path \
-                         AND cayenne_delete_file.sequence_number = excluded.sequence_number \
-                     THEN cayenne_delete_file.path \
-                     ELSE NULL \
-                 END",
-            values_parts.join(", ")
-        );
-
+        sql.push_str(SUFFIX);
         (sql, params)
     }
 }
@@ -1088,20 +1100,23 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         delete_file_ids: &[String],
     ) -> CatalogResult<()> {
+        use std::fmt::Write as _;
+
+        const PREFIX: &str =
+            "DELETE FROM cayenne_delete_file WHERE table_id = ?1 AND delete_file_id IN (";
+
         if delete_file_ids.is_empty() {
             return Ok(());
         }
-
-        let placeholders = delete_file_ids
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| format!("?{}", idx + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let sql = format!(
-            "DELETE FROM cayenne_delete_file WHERE table_id = ?1 AND delete_file_id IN ({placeholders})"
-        );
+        let mut sql = String::with_capacity(PREFIX.len() + delete_file_ids.len() * 6 + 1);
+        sql.push_str(PREFIX);
+        for idx in 0..delete_file_ids.len() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+            let _ = write!(sql, "?{}", idx + 2);
+        }
+        sql.push(')');
 
         let mut params = Vec::with_capacity(delete_file_ids.len() + 1);
         params.push(MetastoreValue::Text(table_id.to_string()));
@@ -1369,10 +1384,14 @@ impl MetadataCatalog for CayenneCatalog {
                 source: Box::new(e),
             })?;
 
-        Ok(results
-            .into_iter()
-            .map(|(pk, seq)| (pk.into_boxed_slice(), seq))
-            .collect())
+        // Pre-size the map so the load path skips bucket reallocations as the
+        // insert-record set grows; `collect()` starts from capacity 0 and grows
+        // by doubling.
+        let mut map = std::collections::HashMap::<Box<[u8]>, i64>::with_capacity(results.len());
+        for (pk, seq) in results {
+            map.insert(pk.into_boxed_slice(), seq);
+        }
+        Ok(map)
     }
 
     async fn clear_insert_records(&self, table_id: &str) -> CatalogResult<()> {
@@ -2784,6 +2803,25 @@ fn validate_create_table_options(options: &CreateTableOptions) -> CatalogResult<
     }
 
     Ok(())
+}
+
+fn log_runtime_footer_cache_drift(
+    table_name: &str,
+    stored: &TableMetadata,
+    options: &CreateTableOptions,
+) {
+    if let (Some(stored_footer_cache_mb), Some(configured_footer_cache_mb)) = (
+        stored.vortex_config.footer_cache_mb,
+        options.vortex_config.footer_cache_mb,
+    ) && stored_footer_cache_mb != configured_footer_cache_mb
+    {
+        tracing::warn!(
+            table = table_name,
+            stored_footer_cache_mb,
+            configured_footer_cache_mb,
+            "Cayenne table was registered with a different runtime.params.cayenne_footer_cache_mb than the value stored in the metastore; using the current runtime value"
+        );
+    }
 }
 
 /// Logs a warning describing exactly which configuration fields differ between the
@@ -4353,7 +4391,7 @@ mod tests {
 
         // Change only cache sizes (non-data-affecting) — should NOT trigger recreation
         let vortex_config = crate::metadata::VortexConfig {
-            footer_cache_mb: 512,
+            footer_cache_mb: Some(512),
             segment_cache_mb: 1024,
             upload_concurrency: 8,
             write_concurrency: Some(16),
@@ -5297,6 +5335,64 @@ mod tests {
         );
 
         // Cleanup
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_existing_table_configuration_allows_configured_footer_cache_drift() {
+        let test_db = format!(
+            "sqlite://./.test_footer_cache_validate_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+
+        let options = CreateTableOptions {
+            table_name: "footer_cache_validate_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_footer_cache_validate_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig {
+                footer_cache_mb: Some(128),
+                ..Default::default()
+            },
+        };
+        catalog
+            .create_table(options)
+            .await
+            .expect("Failed to create table");
+
+        let changed_options = CreateTableOptions {
+            table_name: "footer_cache_validate_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_footer_cache_validate_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig {
+                footer_cache_mb: Some(256),
+                ..Default::default()
+            },
+        };
+        let result = catalog
+            .validate_existing_table_configuration("footer_cache_validate_table", &changed_options)
+            .await;
+        assert!(
+            result.is_ok(),
+            "Expected Ok for footer cache runtime tuning drift, got: {result:?}"
+        );
+
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));

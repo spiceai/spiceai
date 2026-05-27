@@ -35,11 +35,14 @@ use datafusion_table_providers::sql::{
     db_connection_pool::DbConnectionPool, sql_provider_datafusion::SqlTable,
 };
 use snowflake_api::SnowflakeApi;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
 use crate::schema_discovery::{NoPermissionsCheck, SchemaProbeResult, discover_schema};
-use crate::{Read, ReadWrite};
+use crate::{
+    CLUSTERING_KEY_METADATA_KEY, CLUSTERING_METADATA_KEY, DESCRIPTION_METADATA_KEY, Read,
+    ReadWrite, SOURCE_TYPE_METADATA_KEY,
+};
 
 pub type SnowflakeConnectionPool =
     dyn DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> + Send + Sync;
@@ -133,11 +136,11 @@ async fn probe_snowflake_information_schema(
     let table = table_reference.table().replace('\'', "''");
     let schema_filter = table_reference
         .schema()
-        .map(|s| format!(" AND table_schema = '{}'", s.replace('\'', "''")))
+        .map(|s| format!(" AND c.table_schema = '{}'", s.replace('\'', "''")))
         .unwrap_or_default();
     let catalog_filter = table_reference
         .catalog()
-        .map(|c| format!(" AND table_catalog = '{}'", c.replace('\'', "''")))
+        .map(|c| format!(" AND c.table_catalog = '{}'", c.replace('\'', "''")))
         .unwrap_or_default();
 
     // When a catalog (database) is specified, qualify `information_schema` with it so
@@ -151,11 +154,22 @@ async fn probe_snowflake_information_schema(
         "information_schema.columns".to_string()
     };
 
+    let tables_from_clause = if let Some(c) = table_reference.catalog() {
+        let escaped = c.replace('"', "\"\"");
+        format!("\"{escaped}\".information_schema.tables")
+    } else {
+        "information_schema.tables".to_string()
+    };
+
     let sql = format!(
-        "SELECT column_name, data_type, is_nullable, numeric_precision, numeric_scale \
-         FROM {from_clause} \
-         WHERE table_name = '{table}'{schema_filter}{catalog_filter} \
-         ORDER BY ordinal_position"
+        "SELECT c.column_name, c.data_type, c.is_nullable, c.numeric_precision, c.numeric_scale, c.comment, t.comment, t.clustering_key \
+         FROM {from_clause} c \
+         LEFT JOIN {tables_from_clause} t \
+             ON c.table_catalog = t.table_catalog \
+             AND c.table_schema = t.table_schema \
+             AND c.table_name = t.table_name \
+         WHERE c.table_name = '{table}'{schema_filter}{catalog_filter} \
+         ORDER BY c.ordinal_position"
     );
 
     match api.exec(&sql).await {
@@ -239,7 +253,7 @@ fn is_snowflake_access_denied(msg: &str) -> bool {
 /// Parses the JSON response from `information_schema.columns`.
 ///
 /// Expected columns: `column_name`, `data_type`, `is_nullable`,
-/// `numeric_precision`, `numeric_scale`.
+/// `numeric_precision`, `numeric_scale`, `comment`, `table_comment`, `clustering_key`.
 fn parse_information_schema_json(
     resp: &serde_json::Value,
     table_name: &str,
@@ -255,6 +269,7 @@ fn parse_information_schema_json(
     }
 
     let mut fields = Vec::new();
+    let mut schema_metadata = HashMap::new();
     for (i, row) in rows.iter().enumerate() {
         let row = row
             .as_array()
@@ -285,11 +300,34 @@ fn parse_information_schema_json(
         });
 
         let data_type = map_snowflake_sql_type(data_type_str, precision, scale);
+        let source_type = snowflake_source_type(data_type_str, precision, scale);
 
-        fields.push(Field::new(col_name, data_type, is_nullable));
+        if let Some(table_comment) = optional_json_string(row.get(6)) {
+            schema_metadata
+                .entry(DESCRIPTION_METADATA_KEY.to_string())
+                .or_insert_with(|| table_comment.to_string());
+        }
+        if let Some(clustering_key) = optional_json_string(row.get(7)) {
+            schema_metadata
+                .entry(CLUSTERING_KEY_METADATA_KEY.to_string())
+                .or_insert_with(|| clustering_key.to_string());
+        }
+
+        fields.push(field_with_optional_metadata(
+            Field::new(col_name, data_type, is_nullable),
+            optional_json_string(row.get(5)),
+            Some(&source_type),
+        ));
     }
 
-    Ok(Arc::new(Schema::new(fields)))
+    let fields = fields_with_clustering_metadata(
+        fields,
+        schema_metadata
+            .get(CLUSTERING_KEY_METADATA_KEY)
+            .map(String::as_str),
+    );
+
+    Ok(Arc::new(Schema::new_with_metadata(fields, schema_metadata)))
 }
 
 /// Parses an Arrow response from `information_schema.columns`.
@@ -300,6 +338,7 @@ fn parse_information_schema_arrow(
     use arrow::array::AsArray;
 
     let mut fields = Vec::new();
+    let mut schema_metadata = HashMap::new();
     for batch in batches {
         if batch.num_columns() < 3 {
             return Err("information_schema Arrow response has fewer than 3 columns".to_string());
@@ -330,6 +369,21 @@ fn parse_information_schema_arrow(
         } else {
             None
         };
+        let comments: Option<&arrow::array::StringArray> = if batch.num_columns() > 5 {
+            batch.column(5).as_string_opt()
+        } else {
+            None
+        };
+        let table_comments: Option<&arrow::array::StringArray> = if batch.num_columns() > 6 {
+            batch.column(6).as_string_opt()
+        } else {
+            None
+        };
+        let clustering_keys: Option<&arrow::array::StringArray> = if batch.num_columns() > 7 {
+            batch.column(7).as_string_opt()
+        } else {
+            None
+        };
 
         for i in 0..batch.num_rows() {
             let col_name = col_names.value(i);
@@ -343,7 +397,23 @@ fn parse_information_schema_arrow(
                 .and_then(|s| s.parse::<i8>().ok());
 
             let data_type = map_snowflake_sql_type(data_type_str, precision, scale);
-            fields.push(Field::new(col_name, data_type, is_nullable));
+            let source_type = snowflake_source_type(data_type_str, precision, scale);
+            if let Some(table_comment) = optional_arrow_string(table_comments, i) {
+                schema_metadata
+                    .entry(DESCRIPTION_METADATA_KEY.to_string())
+                    .or_insert_with(|| table_comment.to_string());
+            }
+            if let Some(clustering_key) = optional_arrow_string(clustering_keys, i) {
+                schema_metadata
+                    .entry(CLUSTERING_KEY_METADATA_KEY.to_string())
+                    .or_insert_with(|| clustering_key.to_string());
+            }
+
+            fields.push(field_with_optional_metadata(
+                Field::new(col_name, data_type, is_nullable),
+                optional_arrow_string(comments, i),
+                Some(&source_type),
+            ));
         }
     }
 
@@ -353,7 +423,165 @@ fn parse_information_schema_arrow(
         ));
     }
 
-    Ok(Arc::new(Schema::new(fields)))
+    let fields = fields_with_clustering_metadata(
+        fields,
+        schema_metadata
+            .get(CLUSTERING_KEY_METADATA_KEY)
+            .map(String::as_str),
+    );
+
+    Ok(Arc::new(Schema::new_with_metadata(fields, schema_metadata)))
+}
+
+fn optional_json_string(value: Option<&serde_json::Value>) -> Option<&str> {
+    value
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn optional_arrow_string(array: Option<&arrow::array::StringArray>, index: usize) -> Option<&str> {
+    array
+        .filter(|array| !array.is_null(index))
+        .map(|array| array.value(index).trim())
+        .filter(|value| !value.is_empty())
+}
+
+fn field_with_optional_metadata(
+    field: Field,
+    comment: Option<&str>,
+    source_type: Option<&str>,
+) -> Field {
+    let mut metadata = HashMap::new();
+    if let Some(comment) = comment {
+        metadata.insert(DESCRIPTION_METADATA_KEY.to_string(), comment.to_string());
+    }
+    if let Some(source_type) = source_type.map(str::trim).filter(|value| !value.is_empty()) {
+        metadata.insert(
+            SOURCE_TYPE_METADATA_KEY.to_string(),
+            source_type.to_string(),
+        );
+    }
+
+    if metadata.is_empty() {
+        return field;
+    }
+
+    field.with_metadata(metadata)
+}
+
+fn fields_with_clustering_metadata(fields: Vec<Field>, clustering_key: Option<&str>) -> Vec<Field> {
+    let Some(clustering_key) = clustering_key else {
+        return fields;
+    };
+    let clustering_columns = snowflake_clustering_columns(clustering_key);
+    if clustering_columns.is_empty() {
+        return fields;
+    }
+
+    fields
+        .into_iter()
+        .map(|field| {
+            let position = clustering_columns
+                .iter()
+                .position(|column| column == field.name())
+                .or_else(|| {
+                    clustering_columns
+                        .iter()
+                        .position(|column| column.eq_ignore_ascii_case(field.name()))
+                });
+
+            if let Some(position) = position {
+                let mut metadata = field.metadata().clone();
+                metadata.insert(
+                    CLUSTERING_METADATA_KEY.to_string(),
+                    (position + 1).to_string(),
+                );
+                field.with_metadata(metadata)
+            } else {
+                field
+            }
+        })
+        .collect()
+}
+
+fn snowflake_source_type(sql_type: &str, precision: Option<u8>, scale: Option<i8>) -> String {
+    let upper = sql_type.to_uppercase();
+    if matches!(upper.as_str(), "NUMBER" | "DECIMAL" | "NUMERIC") {
+        match (precision, scale) {
+            (Some(precision), Some(scale)) => format!("{upper}({precision},{scale})"),
+            (Some(precision), None) => format!("{upper}({precision})"),
+            _ => upper,
+        }
+    } else {
+        sql_type.to_string()
+    }
+}
+
+fn snowflake_clustering_columns(clustering_key: &str) -> Vec<String> {
+    let mut expression = clustering_key.trim();
+    if let Some(inner) = expression
+        .strip_prefix("LINEAR(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        expression = inner;
+    } else if let Some(inner) = expression
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        expression = inner;
+    }
+
+    split_snowflake_clustering_expression(expression)
+        .into_iter()
+        .filter_map(simple_snowflake_identifier)
+        .collect()
+}
+
+fn split_snowflake_clustering_expression(expression: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0;
+    let mut in_quotes = false;
+    let mut chars = expression.char_indices().peekable();
+
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '"' => {
+                if in_quotes && chars.peek().is_some_and(|(_, next)| *next == '"') {
+                    let _ = chars.next();
+                } else {
+                    in_quotes = !in_quotes;
+                }
+            }
+            '(' if !in_quotes => depth += 1,
+            ')' if !in_quotes && depth > 0 => depth -= 1,
+            ',' if !in_quotes && depth == 0 => {
+                parts.push(expression[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+
+    parts.push(expression[start..].trim());
+    parts
+}
+
+fn simple_snowflake_identifier(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.contains('(') || value.contains(')') {
+        return None;
+    }
+
+    let value = value
+        .rsplit_once('.')
+        .map_or(value, |(_, column)| column.trim());
+    if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+        Some(value[1..value.len() - 1].replace("\"\"", "\""))
+    } else {
+        Some(value.to_string())
+    }
 }
 
 /// Maps a Snowflake SQL `DATA_TYPE` name to an Arrow `DataType`.
@@ -511,6 +739,123 @@ impl SnowflakeTableFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_information_schema_json_preserves_comment_metadata() {
+        let rows = serde_json::json!([
+            [
+                "ID",
+                "NUMBER",
+                "NO",
+                38,
+                0,
+                "stable identifier",
+                "customer dimension",
+                "LINEAR(ID, NAME)"
+            ],
+            [
+                "NAME",
+                "VARCHAR",
+                "YES",
+                null,
+                null,
+                "display name",
+                "customer dimension",
+                "LINEAR(ID, NAME)"
+            ],
+            [
+                "AMOUNT",
+                "NUMBER",
+                "YES",
+                12,
+                2,
+                "",
+                "customer dimension",
+                "LINEAR(ID, NAME)"
+            ]
+        ]);
+
+        let schema = parse_information_schema_json(&rows, "CUSTOMERS")
+            .expect("information_schema rows should parse");
+
+        assert_eq!(
+            schema
+                .metadata()
+                .get(DESCRIPTION_METADATA_KEY)
+                .map(String::as_str),
+            Some("customer dimension")
+        );
+        assert_eq!(
+            schema
+                .metadata()
+                .get(CLUSTERING_KEY_METADATA_KEY)
+                .map(String::as_str),
+            Some("LINEAR(ID, NAME)")
+        );
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get(DESCRIPTION_METADATA_KEY)
+                .map(String::as_str),
+            Some("stable identifier")
+        );
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get(SOURCE_TYPE_METADATA_KEY)
+                .map(String::as_str),
+            Some("NUMBER(38,0)")
+        );
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get(CLUSTERING_METADATA_KEY)
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            schema
+                .field(1)
+                .metadata()
+                .get(DESCRIPTION_METADATA_KEY)
+                .map(String::as_str),
+            Some("display name")
+        );
+        assert_eq!(
+            schema
+                .field(1)
+                .metadata()
+                .get(SOURCE_TYPE_METADATA_KEY)
+                .map(String::as_str),
+            Some("VARCHAR")
+        );
+        assert_eq!(
+            schema
+                .field(1)
+                .metadata()
+                .get(CLUSTERING_METADATA_KEY)
+                .map(String::as_str),
+            Some("2")
+        );
+        assert!(
+            schema
+                .field(2)
+                .metadata()
+                .get(DESCRIPTION_METADATA_KEY)
+                .is_none()
+        );
+        assert_eq!(
+            schema
+                .field(2)
+                .metadata()
+                .get(SOURCE_TYPE_METADATA_KEY)
+                .map(String::as_str),
+            Some("NUMBER(12,2)")
+        );
+    }
 
     /// Every Snowflake `information_schema.columns` `DATA_TYPE` we support, paired
     /// with its expected Arrow mapping. Covers integer/decimal/float variants,

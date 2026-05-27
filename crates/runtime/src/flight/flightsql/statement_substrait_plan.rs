@@ -35,7 +35,6 @@ use datafusion_substrait::substrait::proto::Plan;
 use prost::Message;
 use tonic::{Request, Response, Status};
 
-use crate::datafusion::DataFusion;
 use crate::datafusion::query::QueryBuilder;
 use crate::datafusion::request_context_extension::get_current_datafusion;
 use crate::datafusion::sql_validator::validate_sql_query_read_only;
@@ -45,6 +44,7 @@ use crate::flight::{
     to_tonic_err,
     util::{attach_cache_metadata, set_flightsql_protocol},
 };
+use crate::{datafusion::DataFusion, flight::handle_query_error};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use telemetry::timing::TimedStream;
 
@@ -132,9 +132,7 @@ pub(crate) async fn get_flight_info(
             .map_err(|e| Status::permission_denied(format!("Write access denied. {e}")))?;
     }
 
-    let query = QueryBuilder::from_plan(plan, cache_key, Arc::clone(&datafusion))
-        .read_only(read_only)
-        .build();
+    let query = QueryBuilder::from_plan(plan, cache_key, Arc::clone(&datafusion)).build();
     let (dataset_schema, _) = query.get_schema().await.map_err(handle_datafusion_error)?;
     let dataset_schema = arrow_tools::schema::expand_views_schema(&dataset_schema);
 
@@ -170,8 +168,13 @@ pub(crate) async fn do_get(
             .map_err(|e| Status::permission_denied(format!("Write access denied. {e}")))?;
     }
 
-    let (output, from_cache) =
-        Box::pin(Service::plan_to_flight_stream(datafusion, plan, cache_key)).await?;
+    let query_result = QueryBuilder::from_plan(plan, cache_key, Arc::clone(&datafusion))
+        .build()
+        .run()
+        .await
+        .map_err(handle_query_error)?;
+
+    let (output, from_cache) = Service::query_result_to_flight_stream(query_result);
     let timed_output = TimedStream::new(output, move || start);
 
     let mut response =

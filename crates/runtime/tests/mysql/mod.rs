@@ -26,8 +26,9 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 use crate::init_tracing;
 use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
 
+#[cfg(feature = "duckdb")]
+mod comments;
 pub mod common;
-
 mod federation;
 
 use super::*;
