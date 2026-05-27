@@ -360,10 +360,9 @@ mod tests {
         let model = Model::new("anthropic:claude-3-5-sonnet", "anthropic_model");
         let params: HashMap<String, SecretString> = HashMap::new();
 
-        let err = try_to_responses_model(&model, &params, Arc::new(runtime))
-            .await
-            .expect_err("unsupported providers should fail conversion to responses model");
-
-        assert!(matches!(err, LlmError::ResponsesNotSupported { .. }));
+        assert!(matches!(
+            try_to_responses_model(&model, &params, Arc::new(runtime)).await,
+            Err(LlmError::ResponsesNotSupported { .. })
+        ));
     }
 }
