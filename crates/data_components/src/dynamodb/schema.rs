@@ -21,8 +21,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use util::time_format::{ParsedDateTime, parse_datetime};
 
-pub use crate::schema::merge_with_declared;
-
 /// Maximum recursion depth for nested `DynamoDB` structures.
 /// This limit prevents stack overflow from maliciously crafted deeply nested data.
 const MAX_RECURSION_DEPTH: usize = 100;

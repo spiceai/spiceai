@@ -501,7 +501,7 @@ fn parse_number_to_decimal(n: &serde_json::Number, target_scale: i8) -> Result<i
         })?;
         let scale_factor =
             pow10_i128(target_scale).context(VariableScaleDecimalParsingOverflowSnafu)?;
-        #[expect(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
         return Ok((f * scale_factor as f64).round() as i128);
     }
 

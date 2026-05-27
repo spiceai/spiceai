@@ -20,12 +20,13 @@ use std::sync::Arc;
 
 /// Merges `inferred` with `declared` when `declared` is present.
 /// Returns `inferred` unchanged when `declared` is `None`.
+#[must_use]
 pub fn merge_inferred_with_declared(
     inferred: SchemaRef,
     declared: Option<&SchemaRef>,
 ) -> SchemaRef {
     match declared {
-        Some(d) => merge_with_declared(inferred, d),
+        Some(d) => merge_with_declared(&inferred, d),
         None => inferred,
     }
 }
@@ -36,7 +37,8 @@ pub fn merge_inferred_with_declared(
 /// name, the declared type and nullability are used. Fields present only in the
 /// inferred schema are kept unchanged. Fields present only in the declared schema
 /// are appended after the inferred fields.
-pub fn merge_with_declared(inferred: SchemaRef, declared: &SchemaRef) -> SchemaRef {
+#[must_use]
+pub fn merge_with_declared(inferred: &SchemaRef, declared: &SchemaRef) -> SchemaRef {
     let declared_by_name: HashMap<&str, &Field> = declared
         .fields()
         .iter()
@@ -89,7 +91,7 @@ mod tests {
         let inferred = schema(&[("id", DataType::Int64, true)]);
         let declared = schema(&[("id", DataType::Utf8, false)]);
 
-        let result = merge_with_declared(inferred, &declared);
+        let result = merge_with_declared(&inferred, &declared);
 
         assert_eq!(result.fields().len(), 1);
         let f = result.field(0);
@@ -106,7 +108,7 @@ mod tests {
         ]);
         let declared = schema(&[("id", DataType::Utf8, false)]);
 
-        let result = merge_with_declared(inferred, &declared);
+        let result = merge_with_declared(&inferred, &declared);
 
         assert_eq!(result.fields().len(), 2);
         // "extra" is only in inferred — kept as-is
@@ -119,7 +121,7 @@ mod tests {
         let inferred = schema(&[("a", DataType::Int64, true)]);
         let declared = schema(&[("b", DataType::Utf8, false)]);
 
-        let result = merge_with_declared(inferred, &declared);
+        let result = merge_with_declared(&inferred, &declared);
 
         assert_eq!(result.fields().len(), 2);
         assert_eq!(result.field(0).name(), "a"); // inferred first
@@ -135,7 +137,7 @@ mod tests {
         ]);
         let declared = schema(&[("a", DataType::Utf8, false)]);
 
-        let result = merge_with_declared(inferred, &declared);
+        let result = merge_with_declared(&inferred, &declared);
 
         let names: Vec<&str> = result.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["c", "a", "b"]);
@@ -149,7 +151,7 @@ mod tests {
             ("y", DataType::Boolean, false),
         ]);
 
-        let result = merge_with_declared(inferred, &declared);
+        let result = merge_with_declared(&inferred, &declared);
 
         let names: Vec<&str> = result.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["x", "z", "y"]);
@@ -163,7 +165,7 @@ mod tests {
             ("name", DataType::Utf8, true),
         ]);
 
-        let result = merge_with_declared(inferred, &declared);
+        let result = merge_with_declared(&inferred, &declared);
 
         assert_eq!(result.fields().len(), 2);
         assert_eq!(result.field(0).name(), "id");
@@ -175,7 +177,7 @@ mod tests {
         let inferred = schema(&[("id", DataType::Int64, true)]);
         let declared = schema(&[]);
 
-        let result = merge_with_declared(inferred.clone(), &declared);
+        let result = merge_with_declared(&inferred, &declared);
 
         assert_eq!(result.fields().len(), 1);
         assert_eq!(result.field(0).data_type(), &DataType::Int64);
@@ -183,7 +185,7 @@ mod tests {
 
     #[test]
     fn both_empty_returns_empty_schema() {
-        let result = merge_with_declared(schema(&[]), &schema(&[]));
+        let result = merge_with_declared(&schema(&[]), &schema(&[]));
         assert_eq!(result.fields().len(), 0);
     }
 
