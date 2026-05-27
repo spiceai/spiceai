@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #[cfg(test)]
-use crate::accelerated_table::refresh_task::changes::get_primary_key_value;
-use crate::accelerated_table::refresh_task::changes::get_primary_key_value_at_row;
 use arrow::array::RecordBatch;
 use data_components::cdc::ChangeBatch;
-use datafusion::logical_expr::{Expr, col};
+use data_components::pk_filter_expr::{self, balanced_binary};
+use datafusion::logical_expr::Expr;
+#[cfg(test)]
+use datafusion::logical_expr::col;
 
 #[cfg(test)]
 pub fn build_batch_delete_expr<F, G>(
@@ -90,7 +91,7 @@ pub fn build_batch_delete_expr_from_change_batch(
 
     let data_batch = change_batch.data_batch();
     if first_row_pks.len() == 1 {
-        return Ok(Some(build_in_list_expr_from_batch(
+        return Ok(Some(pk_filter_expr::build_pk_in_list_from_batch(
             row_indices,
             &first_row_pks[0],
             &data_batch,
@@ -101,7 +102,8 @@ pub fn build_batch_delete_expr_from_change_batch(
         .iter()
         .map(|&row| {
             let primary_keys = change_batch.primary_keys(row);
-            let exprs = get_delete_where_expr_from_batch(&data_batch, row, primary_keys)?;
+            let exprs =
+                pk_filter_expr::get_delete_where_expr_from_batch(&data_batch, row, primary_keys)?;
             balanced_binary(exprs, Expr::and).ok_or_else(|| {
                 crate::accelerated_table::Error::NoPrimaryKeysDefined {
                     dataset_name: dataset_name.to_string(),
@@ -111,42 +113,6 @@ pub fn build_batch_delete_expr_from_change_batch(
         .collect::<crate::accelerated_table::Result<Vec<_>>>()?;
 
     Ok(balanced_binary(row_conditions, Expr::or))
-}
-
-/// Builds a balanced binary tree of expressions to avoid deep nesting.
-///
-/// Instead of creating a right-associative chain like `OP(a, OP(b, OP(c, d)))` which
-/// has O(n) depth and causes stack overflow when cloned, this creates a balanced tree
-/// with O(log n) depth.
-///
-/// For 975 rows, depth goes from 975 to ~10.
-fn balanced_binary(conditions: Vec<Expr>, op: fn(Expr, Expr) -> Expr) -> Option<Expr> {
-    balanced_binary_impl(conditions, op)
-}
-
-fn balanced_binary_impl(mut conditions: Vec<Expr>, op: fn(Expr, Expr) -> Expr) -> Option<Expr> {
-    match conditions.len() {
-        0 => None,
-        1 => Some(
-            conditions
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| unreachable!("len checked")),
-        ),
-        _ => {
-            let mid = conditions.len() / 2;
-            let right_exprs = conditions.split_off(mid);
-
-            match (
-                balanced_binary_impl(conditions, op),
-                balanced_binary_impl(right_exprs, op),
-            ) {
-                (Some(l), Some(r)) => Some(op(l, r)),
-                (Some(s), None) | (None, Some(s)) => Some(s),
-                (None, None) => None,
-            }
-        }
-    }
 }
 
 /// Builds an IN list expression for single-column primary key deletes.
@@ -162,28 +128,12 @@ fn build_in_list_expr<G>(
 where
     G: Fn(usize) -> RecordBatch,
 {
+    // Each closure call returns a single-row batch; extract the value at row 0.
     let values: Vec<Expr> = row_indices
         .iter()
         .map(|&row| {
             let row_data = get_row_data(row);
-            let (_, expr_val) = get_primary_key_value(&row_data, primary_key)?;
-            Ok(expr_val)
-        })
-        .collect::<crate::accelerated_table::Result<Vec<_>>>()?;
-
-    Ok(col(primary_key).in_list(values, false))
-}
-
-fn build_in_list_expr_from_batch(
-    row_indices: &[usize],
-    primary_key: &str,
-    data: &RecordBatch,
-) -> crate::accelerated_table::Result<Expr> {
-    let values: Vec<Expr> = row_indices
-        .iter()
-        .map(|&row| {
-            let (_, expr_val) = get_primary_key_value_at_row(data, row, primary_key)?;
-            Ok(expr_val)
+            Ok(pk_filter_expr::pk_value_at_row(&row_data, 0, primary_key)?)
         })
         .collect::<crate::accelerated_table::Result<Vec<_>>>()?;
 
@@ -195,29 +145,12 @@ fn get_delete_where_expr(
     data: &RecordBatch,
     primary_keys: Vec<String>,
 ) -> crate::accelerated_table::Result<Vec<Expr>> {
-    let mut delete_where_exprs: Vec<Expr> = vec![];
-
-    for primary_key in primary_keys {
-        let (_, expr_val) = get_primary_key_value(data, &primary_key)?;
-        delete_where_exprs.push(col(primary_key).eq(expr_val));
-    }
-
-    Ok(delete_where_exprs)
-}
-
-fn get_delete_where_expr_from_batch(
-    data: &RecordBatch,
-    row: usize,
-    primary_keys: Vec<String>,
-) -> crate::accelerated_table::Result<Vec<Expr>> {
-    let mut delete_where_exprs: Vec<Expr> = Vec::with_capacity(primary_keys.len());
-
-    for primary_key in primary_keys {
-        let (_, expr_val) = get_primary_key_value_at_row(data, row, &primary_key)?;
-        delete_where_exprs.push(col(primary_key).eq(expr_val));
-    }
-
-    Ok(delete_where_exprs)
+    // Single-row batch; build equalities via the shared helper at row 0.
+    Ok(pk_filter_expr::get_delete_where_expr_from_batch(
+        data,
+        0,
+        primary_keys,
+    )?)
 }
 
 #[cfg(test)]

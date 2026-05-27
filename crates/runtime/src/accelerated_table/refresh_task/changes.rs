@@ -40,6 +40,7 @@ use data_components::kafka::{
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
+#[cfg(test)]
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
@@ -52,7 +53,9 @@ use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion_index::IndexedTableProvider;
 use runtime_table_partition::provider::PartitionTableProvider;
-use snafu::{OptionExt, ResultExt};
+#[cfg(test)]
+use snafu::OptionExt;
+use snafu::ResultExt;
 use std::collections::HashSet;
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -140,6 +143,7 @@ impl WriteChangeOutcome {
 ///    println!("Primary key value as DataFusion expression: {}", expr_value);
 /// }
 /// ```
+#[cfg(test)]
 macro_rules! extract_primary_key {
     ($key_col:expr, $key:expr, $data_schema:expr, $array_type:ty, $data_type_str:expr, $row:expr) => {{
         let key_col = $key_col.as_any().downcast_ref::<$array_type>().context(
@@ -1474,6 +1478,7 @@ pub(crate) fn get_primary_key_value(
     get_primary_key_value_at_row(data, 0, key)
 }
 
+#[cfg(test)]
 pub(crate) fn get_primary_key_value_at_row(
     data: &RecordBatch,
     row: usize,
