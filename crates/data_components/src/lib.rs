@@ -134,6 +134,7 @@ pub mod unity_catalog;
 pub mod git;
 pub mod github;
 pub mod key_filter;
+pub mod pk_filter_expr;
 pub mod rate_limit;
 
 pub mod cdc;
