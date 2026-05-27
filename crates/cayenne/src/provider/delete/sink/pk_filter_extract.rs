@@ -34,6 +34,8 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::Expr;
 use datafusion_expr::Operator;
 
+const MAX_PK_FILTER_TREE_NODES: usize = 65_536;
+
 /// PK values extracted directly from structured deletion filters
 pub(crate) enum ExtractedPkDeletes {
     /// Single-column Int64 primary key values from an `IN` list.
@@ -103,24 +105,26 @@ pub(crate) fn try_extract_in_list_row_keys(
         return None;
     }
 
-    let mut row_keys = Vec::with_capacity(in_list.list.len());
+    let mut scalars = Vec::with_capacity(in_list.list.len());
     for item in &in_list.list {
         let Expr::Literal(scalar, _) = item else {
             return None;
         };
-        let array = scalar.to_array_of_size(1).ok()?;
-        let array = if array.data_type() == target_type {
-            array
-        } else {
-            arrow::compute::cast(&array, target_type).ok()?
-        };
-        if array.is_null(0) {
-            return None;
-        }
-        let rows = row_converter.convert_columns(&[array]).ok()?;
-        row_keys.push(rows.row(0).as_ref().into());
+        scalars.push(scalar.clone());
     }
-    Some(row_keys)
+
+    let array = ScalarValue::iter_to_array(scalars.into_iter()).ok()?;
+    let array = if array.data_type() == target_type {
+        array
+    } else {
+        arrow::compute::cast(&array, target_type).ok()?
+    };
+    if array.null_count() > 0 {
+        return None;
+    }
+
+    let rows = row_converter.convert_columns(&[array]).ok()?;
+    Some(rows.iter().map(|row| row.as_ref().into()).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -146,72 +150,107 @@ pub(crate) fn try_extract_composite_pk_keys(
         return None;
     }
     let mut and_conjunctions: Vec<&Expr> = Vec::new();
-    collect_or_leaves(expr, &mut and_conjunctions);
+    if !collect_or_leaves(expr, &mut and_conjunctions) {
+        return None;
+    }
     if and_conjunctions.is_empty() {
         return None;
     }
 
-    let mut row_keys = Vec::with_capacity(and_conjunctions.len());
+    let mut pk_column_values: Vec<Vec<ScalarValue>> = pk_columns
+        .iter()
+        .map(|_| Vec::with_capacity(and_conjunctions.len()))
+        .collect();
+
     for conjunction in &and_conjunctions {
         let mut eq_pairs: Vec<(&Expr, &Expr)> = Vec::new();
-        collect_and_eq_pairs(conjunction, &mut eq_pairs);
+        if !collect_and_eq_pairs(conjunction, &mut eq_pairs) {
+            return None;
+        }
         if eq_pairs.len() != pk_columns.len() {
             return None;
         }
 
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(pk_columns.len());
         for (pk_idx, pk_col_name) in pk_columns.iter().enumerate() {
             let scalar = find_scalar_for_column(&eq_pairs, pk_col_name)?;
-            let array = scalar.to_array_of_size(1).ok()?;
-            let target_type = pk_target_types[pk_idx];
-            let array = if array.data_type() == target_type {
-                array
-            } else {
-                arrow::compute::cast(&array, target_type).ok()?
-            };
-            if array.is_null(0) {
-                return None;
-            }
-            arrays.push(array);
+            pk_column_values[pk_idx].push(scalar.clone());
         }
-
-        let rows = row_converter.convert_columns(&arrays).ok()?;
-        let row = rows.row(0);
-        row_keys.push(row.as_ref().into());
     }
 
-    Some(row_keys)
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(pk_columns.len());
+    for (pk_idx, values) in pk_column_values.into_iter().enumerate() {
+        let array = ScalarValue::iter_to_array(values.into_iter()).ok()?;
+        let target_type = pk_target_types[pk_idx];
+        let array = if array.data_type() == target_type {
+            array
+        } else {
+            arrow::compute::cast(&array, target_type).ok()?
+        };
+        if array.null_count() > 0 {
+            return None;
+        }
+        arrays.push(array);
+    }
+
+    let rows = row_converter.convert_columns(&arrays).ok()?;
+    Some(rows.iter().map(|row| row.as_ref().into()).collect())
 }
 
 // ---------------------------------------------------------------------------
 // Tree-walking helpers
 // ---------------------------------------------------------------------------
 
-/// Recursively collect leaf expressions from a balanced OR tree.
+/// Iteratively collect leaf expressions from a balanced OR tree.
 /// Non-OR nodes are treated as leaves.
-fn collect_or_leaves<'a>(expr: &'a Expr, leaves: &mut Vec<&'a Expr>) {
-    if let Expr::BinaryExpr(bin) = expr
-        && bin.op == Operator::Or
-    {
-        collect_or_leaves(&bin.left, leaves);
-        collect_or_leaves(&bin.right, leaves);
-        return;
+fn collect_or_leaves<'a>(expr: &'a Expr, leaves: &mut Vec<&'a Expr>) -> bool {
+    let mut stack = vec![expr];
+    let mut visited = 0usize;
+
+    while let Some(current) = stack.pop() {
+        visited += 1;
+        if visited > MAX_PK_FILTER_TREE_NODES {
+            return false;
+        }
+
+        if let Expr::BinaryExpr(bin) = current
+            && bin.op == Operator::Or
+        {
+            stack.push(&bin.right);
+            stack.push(&bin.left);
+            continue;
+        }
+        leaves.push(current);
     }
-    leaves.push(expr);
+
+    true
 }
 
-/// Recursively collect `(left, right)` pairs from an AND tree of equalities.
-fn collect_and_eq_pairs<'a>(expr: &'a Expr, pairs: &mut Vec<(&'a Expr, &'a Expr)>) {
-    if let Expr::BinaryExpr(bin) = expr {
+/// Iteratively collect `(left, right)` pairs from an AND tree of equalities.
+fn collect_and_eq_pairs<'a>(expr: &'a Expr, pairs: &mut Vec<(&'a Expr, &'a Expr)>) -> bool {
+    let mut stack = vec![expr];
+    let mut visited = 0usize;
+
+    while let Some(current) = stack.pop() {
+        visited += 1;
+        if visited > MAX_PK_FILTER_TREE_NODES {
+            return false;
+        }
+
+        let Expr::BinaryExpr(bin) = current else {
+            continue;
+        };
+
         if bin.op == Operator::And {
-            collect_and_eq_pairs(&bin.left, pairs);
-            collect_and_eq_pairs(&bin.right, pairs);
-            return;
+            stack.push(&bin.right);
+            stack.push(&bin.left);
+            continue;
         }
         if bin.op == Operator::Eq {
             pairs.push((&bin.left, &bin.right));
         }
     }
+
+    true
 }
 
 /// Find the `ScalarValue` paired with a specific column name in equality pairs.
@@ -479,7 +518,7 @@ mod tests {
         let c = col("c").eq(Expr::Literal(ScalarValue::Int64(Some(3)), None));
         let expr = a.or(b).or(c);
         let mut leaves = Vec::new();
-        collect_or_leaves(&expr, &mut leaves);
+        assert!(collect_or_leaves(&expr, &mut leaves));
         assert_eq!(leaves.len(), 3);
     }
 
@@ -487,7 +526,7 @@ mod tests {
     fn test_collect_or_leaves_single_non_or() {
         let expr = col("a").eq(Expr::Literal(ScalarValue::Int64(Some(1)), None));
         let mut leaves = Vec::new();
-        collect_or_leaves(&expr, &mut leaves);
+        assert!(collect_or_leaves(&expr, &mut leaves));
         assert_eq!(leaves.len(), 1);
     }
 
@@ -500,7 +539,7 @@ mod tests {
                 None,
             )));
         let mut pairs = Vec::new();
-        collect_and_eq_pairs(&expr, &mut pairs);
+        assert!(collect_and_eq_pairs(&expr, &mut pairs));
         assert_eq!(pairs.len(), 2);
     }
 

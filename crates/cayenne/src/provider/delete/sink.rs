@@ -84,6 +84,8 @@ pub(crate) mod file_based;
 mod pk_filter_extract;
 use pk_filter_extract::ExtractedPkDeletes;
 
+const PK_DELETE_FLUSH_BATCH_SIZE: usize = 50_000;
+
 /// Deletion sink for Cayenne tables.
 ///
 /// This sink handles the process of marking rows as deleted by writing
@@ -272,8 +274,6 @@ impl CayenneDeletionSink {
         ctx: &SessionContext,
         tables: &[Arc<ListingTable>],
     ) -> super::super::Result<u64> {
-        const PK_DELETE_FLUSH_BATCH_SIZE: usize = 50_000;
-
         let table_name = &self.table_metadata.table_name;
 
         // For position-based deletion, use the streaming per-file approach directly.
@@ -282,9 +282,11 @@ impl CayenneDeletionSink {
             return self.delete_filtered_rows_position_based(ctx, tables).await;
         }
 
+        let coerced_filters = self.coerce_filters_for_schema()?;
+
         // If filters encode PK deletion values directly, extract them and write
         // deletion vectors without performing full scan.
-        match self.try_extract_pks_from_filters() {
+        match self.try_extract_pks_from_filters(&coerced_filters) {
             Some(ExtractedPkDeletes::Int64(pk_values)) => {
                 tracing::debug!(
                     table = %table_name,
@@ -304,7 +306,6 @@ impl CayenneDeletionSink {
             None => {}
         }
 
-        let coerced_filters = self.coerce_filters_for_schema()?;
         let physical_filters = self.build_physical_filters(&coerced_filters)?;
 
         match &self.pk_deletion_strategy {
@@ -446,11 +447,11 @@ impl CayenneDeletionSink {
     /// - **Single PK**: `pk_col IN (v1, v2, ...)` — a flat `Expr::InList`.
     /// - **Composite PK**: A balanced OR tree of AND-equality conjunctions, e.g.
     ///   `(pk1 = a AND pk2 = b) OR (pk1 = c AND pk2 = d)`.
-    fn try_extract_pks_from_filters(&self) -> Option<ExtractedPkDeletes> {
-        if self.filters.len() != 1 {
+    fn try_extract_pks_from_filters(&self, filters: &[Expr]) -> Option<ExtractedPkDeletes> {
+        if filters.len() != 1 {
             return None;
         }
-        let filter = &self.filters[0];
+        let filter = &filters[0];
         let pk_columns = &self.table_metadata.primary_key;
 
         match &self.pk_deletion_strategy {
@@ -610,13 +611,31 @@ impl CayenneDeletionSink {
             return Ok(0);
         }
 
-        let delete_sequence = self
-            .catalog
-            .increment_sequence_number(&self.table_metadata.table_id)
-            .await?;
+        let table_name = &self.table_metadata.table_name;
+        let mut delete_sequence: Option<i64> = None;
+        let mut deleted_rows: u64 = 0;
+        let mut row_keys_iter = filtered_row_keys.into_iter();
 
-        self.persist_key_based_deletions_with_sequence(filtered_row_keys, delete_sequence)
-            .await
+        loop {
+            let chunk_keys: Vec<Box<[u8]>> = row_keys_iter
+                .by_ref()
+                .take(PK_DELETE_FLUSH_BATCH_SIZE)
+                .collect();
+            if chunk_keys.is_empty() {
+                return Ok(deleted_rows);
+            }
+
+            let chunk_deleted = self
+                .persist_key_based_chunk_with_shared_sequence(chunk_keys, &mut delete_sequence)
+                .await?;
+            deleted_rows =
+                deleted_rows
+                    .checked_add(chunk_deleted)
+                    .ok_or_else(|| Error::Internal {
+                        table: table_name.clone(),
+                        message: "Deleted row count overflowed u64".to_string(),
+                    })?;
+        }
     }
 
     async fn persist_key_based_deletions_with_sequence(
@@ -713,13 +732,31 @@ impl CayenneDeletionSink {
             return Ok(0);
         }
 
-        let delete_sequence = self
-            .catalog
-            .increment_sequence_number(&self.table_metadata.table_id)
-            .await?;
+        let table_name = &self.table_metadata.table_name;
+        let mut delete_sequence: Option<i64> = None;
+        let mut deleted_rows: u64 = 0;
+        let mut pk_values_iter = filtered_pk_values.into_iter();
 
-        self.persist_int64_pk_deletions_with_sequence(filtered_pk_values, delete_sequence)
-            .await
+        loop {
+            let chunk_values: Vec<i64> = pk_values_iter
+                .by_ref()
+                .take(PK_DELETE_FLUSH_BATCH_SIZE)
+                .collect();
+            if chunk_values.is_empty() {
+                return Ok(deleted_rows);
+            }
+
+            let chunk_deleted = self
+                .persist_int64_pk_chunk_with_shared_sequence(chunk_values, &mut delete_sequence)
+                .await?;
+            deleted_rows =
+                deleted_rows
+                    .checked_add(chunk_deleted)
+                    .ok_or_else(|| Error::Internal {
+                        table: table_name.clone(),
+                        message: "Deleted row count overflowed u64".to_string(),
+                    })?;
+        }
     }
 
     async fn persist_int64_pk_deletions_with_sequence(
