@@ -30,6 +30,7 @@ use opentelemetry_sdk::{
 use opentelemetry_zipkin::ZipkinExporter;
 use reqwest::Client;
 use runtime::{datafusion::DataFusion, task_history};
+use runtime_datafusion::query_engine::QueryEngine;
 use std::time::Duration;
 use tracing::Subscriber;
 use tracing_log::LogTracer;
@@ -245,8 +246,7 @@ where
 
     let (ballista_transform, ballista_retention) =
         runtime::datafusion::query::stage_history::BallistaStageMiddleware::pair();
-    let query_engine: std::sync::Arc<dyn runtime_datafusion::query_engine::QueryEngine> =
-        std::sync::Arc::clone(&df);
+    let query_engine = std::sync::Arc::clone(&df) as std::sync::Arc<dyn QueryEngine>;
     let task_history_exporter = task_history::otel_exporter::TaskHistoryExporter::new(
         query_engine,
         captured_output,

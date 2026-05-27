@@ -36,6 +36,7 @@ use datafusion::logical_expr::ScalarUDF;
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::supported_functions::{FunctionRestriction, FunctionSupport};
 use parking_lot::RwLock;
+use runtime_datafusion::query_engine::QueryEngine;
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::{
     ai::{AI_UDF_NAME, Ai},
@@ -290,7 +291,7 @@ async fn maybe_register_function_as_tool(runtime: &crate::Runtime, decl: &Functi
     if !decl.as_tool {
         return;
     }
-    let df_dyn: Arc<dyn runtime_datafusion::query_engine::QueryEngine> = Arc::clone(&runtime.df);
+    let df_dyn = Arc::clone(&runtime.df) as Arc<dyn QueryEngine>;
     let df_weak = Arc::downgrade(&df_dyn);
     match crate::tools::builtin::function_tool::build(decl, df_weak) {
         Ok(adapter) => {
