@@ -1516,6 +1516,7 @@ pub(crate) fn get_primary_key_value_at_row(
 /// last-write-wins deduplication (the newer row replaces the older one)
 struct OpBatchAccumulator {
     rows: Vec<usize>,
+    needs_sort: bool,
     /// Maps encoded PK to index into `rows`, enabling replacement on same-bucket PK collision.
     pk_to_pos: HashMap<Vec<u8>, usize, BuildHasherDefault<twox_hash::XxHash3_64>>,
 }
@@ -1524,6 +1525,7 @@ impl OpBatchAccumulator {
     fn new() -> Self {
         Self {
             rows: Vec::new(),
+            needs_sort: false,
             pk_to_pos: HashMap::default(),
         }
     }
@@ -1541,6 +1543,9 @@ impl OpBatchAccumulator {
             // Same-bucket collision: replace the earlier row with the newer
             // one. The old row is superseded because CDC rows carry the
             // full row state.
+            if pos + 1 < self.rows.len() {
+                self.needs_sort = true;
+            }
             self.rows[pos] = row_id;
         } else {
             let pos = self.rows.len();
@@ -1557,6 +1562,10 @@ impl OpBatchAccumulator {
         out: &mut Vec<(ChangeOperationType, Vec<usize>)>,
     ) {
         if !self.rows.is_empty() {
+            if self.needs_sort {
+                self.rows.sort_unstable();
+                self.needs_sort = false;
+            }
             out.push((op, std::mem::take(&mut self.rows)));
             self.pk_to_pos.clear();
         }
@@ -2180,11 +2189,12 @@ mod tests {
 
         // Last-write-wins: pk1 appears at rows 0, 1, 3 — each successive
         // occurrence replaces the previous in-place. pk2 at row 2 is kept.
-        // Final bucket: position 0 holds row 3 (latest pk1), position 1 holds row 2 (pk2).
+        // The final bucket is ordered by row index to preserve contiguous-slice fast paths.
         assert_eq!(result.len(), 1);
 
         assert_eq!(result[0].0, ChangeOperationType::Upsert);
-        assert_eq!(result[0].1, vec![3, 2]);
+        assert_eq!(result[0].1, vec![2, 3]);
+        assert_eq!(contiguous_row_span(&result[0].1), Some((2, 2)));
     }
 
     #[test]
@@ -2206,7 +2216,8 @@ mod tests {
             "Same composite key should replace, not split"
         );
         assert_eq!(result[0].0, ChangeOperationType::Upsert);
-        assert_eq!(result[0].1, vec![2, 1]);
+        assert_eq!(result[0].1, vec![1, 2]);
+        assert_eq!(contiguous_row_span(&result[0].1), Some((1, 2)));
     }
 
     #[test]
