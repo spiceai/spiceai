@@ -59,9 +59,9 @@ RUN \
       *) export CFLAGS="-O3 -ffunction-sections -fdata-sections -fPIC" ;; \
     esac && \
     if [ "${CARGO_NO_DEFAULT_FEATURES}" = "true" ]; then \
-      cargo build --profile "${RUST_PROFILE}" --no-default-features ${CARGO_FEATURES:+--features ${CARGO_FEATURES}}; \
+      cargo build --profile "${RUST_PROFILE}" --locked --no-default-features ${CARGO_FEATURES:+--features ${CARGO_FEATURES}}; \
     else \
-      cargo build --profile ${RUST_PROFILE} --features ${CARGO_FEATURES:-default}; \
+      cargo build --profile ${RUST_PROFILE} --locked --features ${CARGO_FEATURES:-default}; \
     fi && \
     cp /build/target/${RUST_PROFILE}/spiced /root/spiced
 
@@ -118,9 +118,15 @@ RUN find /lib /usr/lib -name 'libdl.so.2' -exec sh -c 'mkdir -p /spice_sandbox/$
 # Preinstall Oracle ODPI-C (if enabled)
 RUN if [ "$INSTALL_ORACLE_ODPIC" = "true" ]; then \
     # Use `set -eu` instead of `set -euo pipefail` because this stage runs on
-    # debian:bookworm-slim where /bin/sh is dash, which does not support pipefail.
+    # debian:trixie-slim where /bin/sh is dash, which does not support pipefail.
     set -eu; \
-    apt-get update && apt-get install -y --no-install-recommends libaio1 unzip curl; \
+    apt-get update; \
+    if apt-cache show libaio1t64 2>/dev/null | grep -q '^Package: libaio1t64$'; then \
+      LIBAIO_PACKAGE=libaio1t64; \
+    else \
+      LIBAIO_PACKAGE=libaio1; \
+    fi; \
+    apt-get install -y --no-install-recommends "$LIBAIO_PACKAGE" unzip curl; \
     ARCH=$(dpkg --print-architecture); \
     if [ "$ARCH" = "amd64" ]; then \
     : "${ORACLE_INSTANTCLIENT_SHA256_AMD64:?ORACLE_INSTANTCLIENT_SHA256_AMD64 must be set to the expected SHA256 checksum}"; \
@@ -144,7 +150,11 @@ RUN if [ "$INSTALL_ORACLE_ODPIC" = "true" ]; then \
     /spice_sandbox/usr/lib && \
     ln -s libclntsh.so.23.1 /spice_sandbox/usr/lib/libclntsh.so && \
     ln -s libclntshcore.so.23.1 /spice_sandbox/usr/lib/libclntshcore.so && \
-    cp "$(find /usr/lib /lib -name 'libaio.so.1' | head -n 1)" /spice_sandbox/usr/lib && \
+    LIBAIO_PATH="$(find /usr/lib /lib \( -name 'libaio.so.1' -o -name 'libaio.so.1t64' \) | head -n 1)" && \
+    test -n "$LIBAIO_PATH" && \
+    LIBAIO_BASENAME="$(basename "$LIBAIO_PATH")" && \
+    cp "$LIBAIO_PATH" "/spice_sandbox/usr/lib/$LIBAIO_BASENAME" && \
+    if [ "$LIBAIO_BASENAME" != "libaio.so.1" ]; then ln -sf "$LIBAIO_BASENAME" /spice_sandbox/usr/lib/libaio.so.1; fi && \
     cp "$(find /usr/lib /lib -name 'libresolv.so.2' | head -n 1)" /spice_sandbox/usr/lib && \
     rm -f basic.zip; \
     fi

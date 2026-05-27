@@ -123,7 +123,7 @@ util = { path = "../util", features = ["datafusion"] }
 uuid.workspace = true
 zip = "8.3.0"
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 
 [features]

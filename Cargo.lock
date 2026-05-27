@@ -114,9 +114,9 @@ dependencies = [
 
 [[package]]
 name = "aes"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66bd29a732b644c0431c6140f370d097879203d79b80c94a6747ba0872adaef8"
+checksum = "f1fc76eaeac4c9164506c466d4ffdd8ec9d0c5bf57ee97177c4d8eceb3a0e138"
 dependencies = [
  "cipher 0.5.1",
  "cpubits",
@@ -14140,9 +14140,9 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91bb5030596a3d442c0866ac68afe29c14ba558e77c726dcdf7016b0dbb359d9"
 dependencies = [
- "arrayvec 0.5.2",
- "hashbrown 0.5.0",
- "parking_lot 0.11.2",
+ "arrayvec 0.7.6",
+ "hashbrown 0.17.0",
+ "parking_lot 0.12.5",
  "rand 0.8.6",
 ]
 
@@ -16411,6 +16411,7 @@ dependencies = [
  "futures",
  "object_store",
  "object_store_occ",
+ "opentelemetry",
  "parking_lot 0.12.5",
  "runtime-datafusion",
  "runtime-proto",
@@ -16420,6 +16421,7 @@ dependencies = [
  "serde_json",
  "snafu",
  "spicepod",
+ "telemetry",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -23969,7 +23971,7 @@ version = "8.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
 dependencies = [
- "aes 0.9.0",
+ "aes 0.9.1",
  "bzip2",
  "constant_time_eq 0.4.2",
  "crc32fast",
