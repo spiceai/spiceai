@@ -28,9 +28,9 @@ service CloudConnect {
 }
 
 enum InstanceKind {
-  KIND_UNSPECIFIED = 0;
-  KIND_CLUSTER = 1;     // K8s operator (BYOC); reserved.
-  KIND_STANDALONE = 2;  // Standalone spiced runtime.
+  INSTANCE_KIND_UNSPECIFIED = 0;
+  INSTANCE_KIND_CLUSTER = 1;     // K8s operator (BYOC); reserved.
+  INSTANCE_KIND_STANDALONE = 2;  // Standalone spiced runtime.
 }
 
 message ClientMessage {

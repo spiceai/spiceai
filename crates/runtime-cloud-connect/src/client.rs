@@ -630,7 +630,7 @@ fn build_hello(
     credential: String,
 ) -> proto::Hello {
     proto::Hello {
-        kind: proto::InstanceKind::KindStandalone as i32,
+        kind: proto::InstanceKind::Standalone as i32,
         identifier,
         credential,
         runtime_version: config.runtime_version.clone(),
