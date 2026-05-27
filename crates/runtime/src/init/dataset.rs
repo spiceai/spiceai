@@ -1219,13 +1219,60 @@ impl Runtime {
                 connector_component: ConnectorComponent::from(&ds),
             })?;
 
-        if let Some(notifier) = notifier {
+        if notifier.is_some() {
             // spawn a background task to wait for the accelerated table to be ready before creating schedules
             let runtime = ds.runtime();
+            let runtime_status = Arc::clone(&self.status);
             let ds = Arc::clone(&ds);
             let dataset_name = ds.name.to_string();
+            let dataset_table_ref = ds.name.clone();
+            let broadcaster = runtime.executor_outbound_broadcaster();
+            let resolved_name = ds.name.clone().resolve(
+                crate::datafusion::SPICE_DEFAULT_CATALOG,
+                crate::datafusion::SPICE_DEFAULT_SCHEMA,
+            );
             tokio::task::spawn(async move {
-                notifier.notified().await;
+                // Wait for the dataset's status to reach `Ready` rather than
+                // relying on the `Notify`-based completion handle (which is
+                // edge-triggered and can race with this spawn for fast
+                // initial refreshes).
+                runtime_status
+                    .wait_for_dataset_ready(&dataset_table_ref)
+                    .await;
+                // After the executor's initial load for this dataset finishes,
+                // ack the scheduler with the partition expressions we currently
+                // hold. This is the executor → scheduler readiness signal that
+                // lets the scheduler flip the dataset to `Ready` once every
+                // assigned partition has at least one executor ack.
+                //
+                // Send the ack even when the assignment is empty or absent —
+                // empty-source / zero-partition datasets still need an ack to
+                // trip the scheduler-side `updated_at > 0` shortcut in
+                // `PartitionLoadTracker::is_table_loaded`. Always send the
+                // canonical (resolved) table name so the scheduler can match
+                // the ack against the registered dataset regardless of how
+                // the user spelled the table in their spicepod.
+                if let Some(b) = broadcaster {
+                    let bytes: Vec<Vec<u8>> =
+                        if let Some(assignments_lock) = runtime.partition_assignments() {
+                            let assignments = assignments_lock.read().await;
+                            assignments
+                                .get(&resolved_name)
+                                .map(|exprs| {
+                                    runtime_cluster::encode_partition_exprs(exprs, &dataset_name)
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                    let table_name = resolved_name.to_string();
+                    let sent = b
+                        .broadcast_partitions_loaded(table_name.clone(), bytes)
+                        .await;
+                    tracing::info!(
+                        "Broadcast initial PartitionsLoaded for {table_name} to {sent} scheduler(s)"
+                    );
+                }
                 if let Err(e) = runtime.create_dataset_or_view_schedule(ds).await {
                     tracing::error!("Failed to create dataset schedule for '{dataset_name}': {e}");
                 }
