@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Spice-owned SQLExecutor wrapper that applies a function deny-list to
+//! Spice-owned `SQLExecutor` wrapper that applies a function deny-list to
 //! Snowflake federation decisions.
 //!
 //! Upstream `impl SQLExecutor for SqlTable<T, P>` inherits the trait default for
@@ -22,7 +22,7 @@ limitations under the License.
 //! including ones with Spice-only UDFs like `json_get_str` — is pushed to the
 //! remote engine, where it fails. This wrapper consults a `FunctionSupport`
 //! deny-list and refuses federation when an unsupported function appears, so
-//! DataFusion evaluates the affected expression locally instead.
+//! `DataFusion` evaluates the affected expression locally instead.
 
 use std::sync::Arc;
 
@@ -117,7 +117,7 @@ impl<T: 'static, P: 'static> SQLExecutor for DenyFunctionsSqlExecutor<T, P> {
 /// This mirrors [`SqlTable::create_federated_table_provider`] but installs the
 /// wrapper executor so that any plan referencing a function on the supplied
 /// `function_support` deny-list (e.g. `json_get_str`) falls back to local
-/// DataFusion evaluation instead of being unparsed into the remote engine's
+/// `DataFusion` evaluation instead of being unparsed into the remote engine's
 /// SQL.
 #[must_use]
 pub fn create_spice_federated_table_provider<T: 'static, P: 'static>(

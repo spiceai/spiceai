@@ -75,7 +75,7 @@ impl SnowflakeTableFactory {
     /// Install a function deny-list so federation pushdown skips remote
     /// execution for any plan touching one of the denied functions. Plans that
     /// would otherwise be unparsed into Snowflake SQL with Spice-only UDFs
-    /// (e.g. `json_get_str`) fall back to local DataFusion evaluation instead.
+    /// (e.g. `json_get_str`) fall back to local `DataFusion` evaluation instead.
     #[must_use]
     pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
         self.function_support = Some(function_support);
