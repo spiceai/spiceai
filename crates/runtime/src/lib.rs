@@ -634,9 +634,7 @@ impl Runtime {
             .read()
             .await
             .iter()
-            .filter_map(|(name, support)| {
-                support.supports_responses_api().then_some(name.to_string())
-            })
+            .filter_map(|(name, support)| support.supports_responses_api().then_some(name.clone()))
             .collect()
     }
 
