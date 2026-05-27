@@ -141,27 +141,54 @@ fn stage_adoption_code(code: &str, endpoint: Option<&str>) -> Result<()> {
             message: format!("create config dir {}: {e}", parent.display()),
         })?;
     }
+
+    let endpoint_path = pending_path
+        .parent()
+        .map(|p| p.join("cloud-endpoint"))
+        .unwrap_or_else(|| PathBuf::from("cloud-endpoint"));
+
+    // If the user did NOT pass `--endpoint`, remove any previous override
+    // so the next `spiced` start doesn't silently re-use a stale endpoint
+    // from an earlier connect. A `forget` also clears this file, but
+    // re-staging without `--endpoint` is the more common case.
+    if endpoint.is_none()
+        && let Err(e) = std::fs::remove_file(&endpoint_path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(crate::error::Error::CloudConnectIo {
+            message: format!("remove stale endpoint override {}: {e}", endpoint_path.display()),
+        });
+    }
+
     atomic_write_0600(&pending_path, code.as_bytes()).map_err(|e| crate::error::Error::CloudConnectIo {
         message: format!("write adoption code: {e}"),
     })?;
 
-    println!(
-        "Adoption code stored at {}.\nStart `spiced` (or restart if already running) to begin adoption.",
-        pending_path.display()
-    );
+    // Write the endpoint override BEFORE printing success. If the override
+    // can't be persisted, roll the staged code back so adoption can't
+    // proceed against the wrong control plane on the next `spiced` start.
     if let Some(ep) = endpoint {
-        let endpoint_path = pending_path
-            .parent()
-            .map(|p| p.join("cloud-endpoint"))
-            .unwrap_or_else(|| PathBuf::from("cloud-endpoint"));
         if let Err(e) = atomic_write_0600(&endpoint_path, ep.as_bytes()) {
-            eprintln!(
-                "Warning: failed to write endpoint override to {}: {e}",
-                endpoint_path.display()
-            );
-        } else {
-            println!("Endpoint override stored at {}.", endpoint_path.display());
+            // Best-effort rollback of the staged code; surface the
+            // original endpoint-write failure to the caller.
+            let _ = std::fs::remove_file(&pending_path);
+            return Err(crate::error::Error::CloudConnectIo {
+                message: format!(
+                    "write endpoint override {}: {e} (adoption code not staged)",
+                    endpoint_path.display()
+                ),
+            });
         }
+        println!(
+            "Adoption code stored at {}.\nStart `spiced` (or restart if already running) to begin adoption.",
+            pending_path.display()
+        );
+        println!("Endpoint override stored at {}.", endpoint_path.display());
+    } else {
+        println!(
+            "Adoption code stored at {}.\nStart `spiced` (or restart if already running) to begin adoption.",
+            pending_path.display()
+        );
     }
     Ok(())
 }
@@ -216,9 +243,14 @@ fn forget_identity() -> Result<()> {
     let identity_path = runtime_cloud_connect::config::CloudConnectConfig::default_identity_path();
     let pending_path =
         runtime_cloud_connect::config::CloudConnectConfig::default_pending_adopt_code_path();
+    let endpoint_path = pending_path
+        .parent()
+        .map(|p| p.join("cloud-endpoint"))
+        .unwrap_or_else(|| PathBuf::from("cloud-endpoint"));
 
     let had_identity = identity_path.exists();
     let had_pending = pending_path.exists();
+    let had_endpoint = endpoint_path.exists();
 
     if had_identity {
         runtime_cloud_connect::identity::IdentityStore::clear(&identity_path).map_err(|e| {
@@ -234,8 +266,19 @@ fn forget_identity() -> Result<()> {
             message: format!("remove pending code: {e}"),
         });
     }
+    // Also clear any `cloud-endpoint` override so a later
+    // `spice connect <code>` without `--endpoint` doesn't silently keep
+    // using the stale endpoint.
+    if had_endpoint
+        && let Err(e) = std::fs::remove_file(&endpoint_path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(crate::error::Error::CloudConnectIo {
+            message: format!("remove endpoint override: {e}"),
+        });
+    }
 
-    if had_identity || had_pending {
+    if had_identity || had_pending || had_endpoint {
         println!(
             "Spice Cloud Connect identity cleared. Run `spice connect <SPICE-ADOPT-...>` to re-adopt."
         );
@@ -283,6 +326,7 @@ fn mask_code(code: &str) -> String {
 fn atomic_write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
 
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let file_name = path
@@ -290,13 +334,26 @@ fn atomic_write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()
         .and_then(|s| s.to_str())
         .unwrap_or("pending-adopt-code");
     let tmp = dir.join(format!(".{file_name}.tmp"));
+
+    // `OpenOptions::mode` only applies when the file is *created*. A stale
+    // `.<file>.tmp` from a previous crashed run with broader permissions
+    // would otherwise be reused, then renamed into place exposing the
+    // adoption code or endpoint override under those wider permissions.
+    // Remove any stale temp first, refuse to reuse an existing inode via
+    // `create_new`, and explicitly re-assert `0o600` before writing.
+    if let Err(err) = std::fs::remove_file(&tmp)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(err);
+    }
+
     {
         let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .write(true)
             .mode(0o600)
             .open(&tmp)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }

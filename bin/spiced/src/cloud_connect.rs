@@ -178,9 +178,17 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         let cap = resolve_run_query_cap(max_rows);
 
         let df = self.runtime.datafusion();
-        let query = df.query_builder(sql).build();
+        // Cloud-originated RunQuery is a remote management surface; we
+        // never want an adopted control plane to be able to mutate the
+        // local runtime via DDL/DML. Force read-only at the query layer
+        // regardless of principal — there is no signed-in user here.
+        let query = df.query_builder(sql).read_only(true).build();
         let result = query.run().await.map_err(|e| e.to_string())?;
         let mut stream = result.data;
+        // Capture the stream schema BEFORE consuming. A query that returns
+        // zero batches (empty result set) still has a real schema, so
+        // without this snapshot the envelope would advertise empty columns.
+        let stream_schema = stream.schema();
         use futures::StreamExt as _;
 
         // Collect up to `cap` rows worth of batches. We stop streaming
@@ -205,8 +213,11 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             batches.push(batch);
         }
 
-        let mut envelope =
-            runtime_cloud_connect::arrow_json::encode_record_batches(&batches, cap);
+        let mut envelope = runtime_cloud_connect::arrow_json::encode_record_batches_with_schema(
+            &batches,
+            Some(stream_schema.as_ref()),
+            cap,
+        );
         // Propagate the source-side truncation flag if we cut off the
         // upstream stream before exhausting it.
         if source_truncated

@@ -62,7 +62,9 @@ pub(crate) fn compute() -> String {
 
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        write!(&mut out, "{b:02x}").expect("write to String");
+        // Writing into a `String` is infallible; mirror the
+        // non-panicking pattern used in `client::sql_hash`.
+        let _ = write!(&mut out, "{b:02x}");
     }
     out
 }

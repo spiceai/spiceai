@@ -68,9 +68,16 @@ pub trait RuntimeHandle: Send + Sync + 'static {
     ///
     /// The default implementation writes the YAML to
     /// `config_dir/spicepod-cloud-managed.yml` via `tokio::fs` so the
-    /// filesystem write does not block the runtime worker thread.
-    /// Implementations that want to actually merge the spicepod into
-    /// the running runtime should override this.
+    /// filesystem write does not block the runtime worker thread. It
+    /// does NOT reload the spicepod into the running runtime — the
+    /// caller must restart spiced (or override this method) for the new
+    /// configuration to take effect.
+    ///
+    /// The returned envelope therefore advertises `reload: "deferred"`
+    /// and `applied: false` so the control plane can surface that the
+    /// runtime is still serving the previous configuration. Adapters
+    /// that can hot-reload (or that synchronously trigger a restart)
+    /// should override this and return `applied: true`.
     async fn apply_spicepod(
         &self,
         config_dir: &Path,
@@ -87,16 +94,23 @@ pub trait RuntimeHandle: Send + Sync + 'static {
             .map_err(|e| format!("write spicepod: {e}"))?;
         Ok(serde_json::json!({
             "path": path.display().to_string(),
+            "applied": false,
             "reload": "deferred",
+            "note": "spicepod written to disk; restart spiced (or implement RuntimeHandle::apply_spicepod) to take effect",
         }))
     }
 
     /// Restart the runtime. `graceful` indicates whether the runtime
-    /// should drain in-flight requests before exiting. The default
-    /// implementation is a no-op so that test mocks don't accidentally
-    /// kill themselves.
+    /// should drain in-flight requests before exiting.
+    ///
+    /// The default implementation does NOT actually restart — it returns
+    /// an error so the cloud control plane sees an explicit failure
+    /// rather than a false success. Real runtime adapters (e.g. spiced)
+    /// must override this to perform the actual restart. Tests/mocks
+    /// inherit the failing default so they don't accidentally kill
+    /// themselves.
     async fn restart(&self, _graceful: bool) -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({ "status": "restart_not_implemented" }))
+        Err("restart not implemented for this runtime handle".to_string())
     }
 
     /// Attempt an in-place runtime upgrade. v0: always returns an

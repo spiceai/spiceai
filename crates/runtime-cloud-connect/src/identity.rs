@@ -173,6 +173,7 @@ pub struct KeyPairPem {
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
 
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
@@ -181,13 +182,32 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .unwrap_or("identity.json");
     let tmp_path = dir.join(format!(".{file_name}.tmp"));
 
+    // `OpenOptions::mode` only applies to *newly created* files. If a stale
+    // `.<file>.tmp` from a previous crashed run still exists with broader
+    // permissions, `create(true).truncate(true)` would reuse it and then
+    // `rename` would publish the private key under those wider permissions.
+    // Defend against that by removing any stale temp first, refusing to
+    // reuse an existing inode (`create_new`), and explicitly enforcing
+    // `0o600` on the opened file before writing the sensitive bytes.
+    if let Err(err) = std::fs::remove_file(&tmp_path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(err).context(IoSnafu {
+            path: tmp_path.clone(),
+        });
+    }
+
     {
         let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .write(true)
             .mode(0o600)
             .open(&tmp_path)
+            .context(IoSnafu {
+                path: tmp_path.clone(),
+            })?;
+        // Re-assert mode in case umask/file-creation flags interfered.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .context(IoSnafu {
                 path: tmp_path.clone(),
             })?;

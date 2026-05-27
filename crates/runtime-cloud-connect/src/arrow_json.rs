@@ -86,16 +86,45 @@ pub const PAYLOAD_SIZE_BUDGET_BYTES: usize = 5 * 1024 * 1024;
 ///   of `usize::MAX` means "row cap disabled".
 /// - Honors [`PAYLOAD_SIZE_BUDGET_BYTES`] independently — if the encoded
 ///   JSON would exceed the budget we stop and mark `truncated: true`.
+///
+/// The schema is taken from the first batch in `batches`. If the query
+/// produced zero batches (zero-row result), callers should use
+/// [`encode_record_batches_with_schema`] so the envelope still reports
+/// the correct column metadata.
 #[must_use]
 pub fn encode_record_batches(batches: &[RecordBatch], row_cap: usize) -> Value {
-    let columns_json = columns_metadata(batches);
+    encode_record_batches_with_schema(batches, None, row_cap)
+}
+
+/// Like [`encode_record_batches`] but accepts an explicit schema so the
+/// envelope still reports the correct columns when `batches` is empty.
+/// Pass `None` to fall back to the schema of the first batch (matching
+/// the [`encode_record_batches`] behaviour).
+#[must_use]
+pub fn encode_record_batches_with_schema(
+    batches: &[RecordBatch],
+    schema: Option<&arrow::datatypes::Schema>,
+    row_cap: usize,
+) -> Value {
+    let columns_json = schema
+        .map(columns_metadata_from_schema)
+        .unwrap_or_else(|| columns_metadata(batches));
+
+    // Account for the bytes the envelope already costs before we add any
+    // rows: the serialized `columns` array (load-bearing for queries with
+    // many columns or long aliases) plus a small fixed allowance for the
+    // surrounding `{}` / keys / `row_count` / `truncated`. We compare
+    // *cumulative* size to the budget so a wide schema cannot push the
+    // final payload past the advertised cap even when `running_bytes`
+    // for just the rows stays under budget.
+    let columns_bytes = serde_json::to_string(&Value::Array(columns_json.clone()))
+        .map(|s| s.len())
+        .unwrap_or(0);
+    const ENVELOPE_OVERHEAD_BYTES: usize = 128;
+    let mut running_bytes: usize = columns_bytes + ENVELOPE_OVERHEAD_BYTES;
 
     let mut rows: Vec<Value> = Vec::new();
     let mut truncated = false;
-    // Running estimate of the JSON byte cost of `rows` alone. The
-    // envelope (`columns`, `row_count`, `truncated`) is small and bounded
-    // so we don't track it byte-for-byte.
-    let mut running_bytes: usize = 0;
 
     'outer: for batch in batches {
         if batch.num_rows() == 0 {
@@ -138,8 +167,11 @@ fn columns_metadata(batches: &[RecordBatch]) -> Vec<Value> {
     let Some(batch) = batches.first() else {
         return Vec::new();
     };
-    batch
-        .schema()
+    columns_metadata_from_schema(batch.schema().as_ref())
+}
+
+fn columns_metadata_from_schema(schema: &arrow::datatypes::Schema) -> Vec<Value> {
+    schema
         .fields()
         .iter()
         .map(|f| {

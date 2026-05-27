@@ -39,3 +39,7 @@ tonic-prost-build = "0.14"
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "test-util"] }
+# `tokio_stream::wrappers::TcpListenerStream` requires the `net` feature.
+# The workspace dependency only enables `sync`, so opt-in explicitly here
+# for the integration tests.
+tokio-stream = { workspace = true, features = ["net"] }

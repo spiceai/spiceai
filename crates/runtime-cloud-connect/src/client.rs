@@ -271,7 +271,6 @@ impl ClientDriver {
         });
 
         // Main read loop.
-        let mut pending_code_consumed = false;
         let exit_reason = loop {
             tokio::select! {
                 () = self.shutdown.wait() => {
@@ -281,26 +280,15 @@ impl ClientDriver {
                 next = server_stream.message() => {
                     match next {
                         Ok(Some(msg)) => {
-                            // The first inbound after Hello is taken as
-                            // implicit acceptance of the adoption code
-                            // (server may also send a no-op Ack). Delete
-                            // the pending file so we don't replay a
-                            // consumed code on restart.
-                            if !pending_code_consumed
-                                && self.identity.is_none()
-                                && let Some(ref path) = self.config.pending_adopt_code_path
-                            {
-                                if let Err(err) = std::fs::remove_file(path)
-                                    && err.kind() != std::io::ErrorKind::NotFound
-                                {
-                                    tracing::warn!(
-                                        "Cloud Connect: could not remove pending code at {}: {err}",
-                                        path.display()
-                                    );
-                                }
-                                pending_code_consumed = true;
-                            }
-
+                            // We intentionally do NOT delete the pending
+                            // adoption code here. Deletion happens only
+                            // after `handle_adopt` successfully generates
+                            // the keypair and persists the identity (see
+                            // `handle_adopt`). That way, if the very first
+                            // inbound is `Adopt` and persistence fails,
+                            // a restart can retry adoption with the same
+                            // pending code rather than being left with
+                            // neither an identity nor a stored code.
                             if let Some(reason) = self
                                 .dispatch(&tx, msg, &identifier)
                                 .await
@@ -406,7 +394,7 @@ impl ClientDriver {
                             tx,
                             &cmd.command_id,
                             false,
-                            &sanitize_error(&err),
+                            &sanitize_error(&err, &cmd.sql),
                             serde_json::Value::Null,
                         )
                         .await;
@@ -619,6 +607,13 @@ fn build_channel(config: &CloudConnectConfig) -> Result<Channel> {
         .keep_alive_while_idle(true);
 
     if !config.insecure {
+        // Server-authenticated TLS only. Client authentication is done
+        // at the application layer via `Hello.credential` (adoption code
+        // on first contact, persisted identity cert PEM thereafter).
+        // This is intentional for v0 — see the crate-level docs. The
+        // persisted private key currently signs nothing on the wire; it
+        // exists so a future revision can bind the identity cert to the
+        // transport (true mTLS) without re-running adoption.
         let mut tls = ClientTlsConfig::new().with_native_roots();
         if let Some(ref ca_pem) = config.ca_cert_pem {
             tls = tls.ca_certificate(Certificate::from_pem(ca_pem.as_bytes()));
@@ -722,14 +717,18 @@ fn sql_hash(sql: &str) -> String {
 ///
 /// Strategy:
 /// 1. Take the first line only.
-/// 2. Replace any backtick-, single-quote-, or double-quote-delimited
+/// 2. Strip any literal occurrences of the original `sql` (and substrings
+///    long enough to leak meaningful query content) — DataFusion errors
+///    sometimes include the SQL without quoting.
+/// 3. Replace any backtick-, single-quote-, or double-quote-delimited
 ///    spans with a `<redacted>` placeholder — these almost always carry
 ///    user data (table names, identifiers, column values).
-/// 3. Cap at 256 chars.
-fn sanitize_error(err: &str) -> String {
+/// 4. Cap at 256 chars.
+fn sanitize_error(err: &str, sql: &str) -> String {
     const MAX_LEN: usize = 256;
     let first_line = err.lines().next().unwrap_or("query failed");
-    let redacted = redact_quoted_spans(first_line);
+    let no_sql = redact_sql_occurrences(first_line, sql);
+    let redacted = redact_quoted_spans(&no_sql);
     if redacted.len() <= MAX_LEN {
         redacted
     } else {
@@ -737,6 +736,61 @@ fn sanitize_error(err: &str) -> String {
         s.push('…');
         s
     }
+}
+
+/// Replace occurrences of the original SQL — both the full text and any
+/// substring of length >= [`MIN_SQL_FRAGMENT_LEN`] — with `<sql>` so an
+/// error that quotes the query without backticks/quotes does not leak
+/// back to the control plane.
+fn redact_sql_occurrences(input: &str, sql: &str) -> String {
+    /// Below this length a fragment is unlikely to carry meaningful user
+    /// SQL (e.g. `SELECT`, `FROM`, `WHERE`) and replacing it would mangle
+    /// every error message. Tuned empirically.
+    const MIN_SQL_FRAGMENT_LEN: usize = 16;
+
+    let sql_trim = sql.trim();
+    if sql_trim.is_empty() {
+        return input.to_string();
+    }
+
+    // First pass: remove the full SQL verbatim if it appears.
+    let mut out = input.replace(sql_trim, "<sql>");
+
+    // Second pass: scan for the longest substrings of `sql_trim` that
+    // appear in the (already partially redacted) error. We only check
+    // substrings >= MIN_SQL_FRAGMENT_LEN to avoid eating common keywords.
+    if sql_trim.len() >= MIN_SQL_FRAGMENT_LEN {
+        // Slide a window over the SQL; if a window appears in `out`,
+        // replace it. Use byte indices and char boundaries to stay
+        // UTF-8-safe.
+        let bytes = sql_trim.as_bytes();
+        let mut start = 0;
+        while start + MIN_SQL_FRAGMENT_LEN <= bytes.len() {
+            // Skip indices that are not on a char boundary.
+            if !sql_trim.is_char_boundary(start) {
+                start += 1;
+                continue;
+            }
+            // Find the longest suffix starting at `start` that still
+            // appears in `out`. Greedy: try the longest first, shorten.
+            let mut end = bytes.len();
+            while end > start + MIN_SQL_FRAGMENT_LEN {
+                if !sql_trim.is_char_boundary(end) {
+                    end -= 1;
+                    continue;
+                }
+                let fragment = &sql_trim[start..end];
+                if out.contains(fragment) {
+                    out = out.replace(fragment, "<sql>");
+                    break;
+                }
+                end -= 1;
+            }
+            start += 1;
+        }
+    }
+
+    out
 }
 
 /// Walk the input and replace any text between matching backticks /
