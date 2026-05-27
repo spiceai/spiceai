@@ -310,9 +310,7 @@ fn convert_google_response_to_openai(
                 google_genai::types::FinishReason::Safety
                 | google_genai::types::FinishReason::Recitation => FinishReason::ContentFilter,
                 google_genai::types::FinishReason::Other
-                | google_genai::types::FinishReason::FinishReasonUnspecified => {
-                    FinishReason::Stop
-                }
+                | google_genai::types::FinishReason::FinishReasonUnspecified => FinishReason::Stop,
             });
 
             ChatChoice {
@@ -410,9 +408,7 @@ fn convert_google_stream_response_to_openai(
                 google_genai::types::FinishReason::Safety
                 | google_genai::types::FinishReason::Recitation => FinishReason::ContentFilter,
                 google_genai::types::FinishReason::Other
-                | google_genai::types::FinishReason::FinishReasonUnspecified => {
-                    FinishReason::Stop
-                }
+                | google_genai::types::FinishReason::FinishReasonUnspecified => FinishReason::Stop,
             });
 
             ChatChoiceStream {
