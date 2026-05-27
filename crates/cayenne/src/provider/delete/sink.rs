@@ -286,6 +286,13 @@ impl CayenneDeletionSink {
 
         // If filters encode PK deletion values directly, extract them and write
         // deletion vectors without performing full scan.
+        //
+        // The fast path always returns 0: the extracted key set is the filter's
+        // upper bound on deletions, not a verified per-row count, so we can't
+        // produce a meaningful "rows deleted" number without a scan. Callers
+        // (CDC, `InlineAwareDeletionSink`) must not depend on this count — the
+        // authoritative count for user-visible DELETEs comes from the inline
+        // path in `InlineAwareDeletionSink`.
         match self.try_extract_pks_from_filters(&coerced_filters) {
             Some(ExtractedPkDeletes::Int64(pk_values)) => {
                 tracing::debug!(
@@ -293,7 +300,8 @@ impl CayenneDeletionSink {
                     count = pk_values.len(),
                     "Fast-path delete: extracted Int64 PK values directly from filters, skipping table scan"
                 );
-                return self.persist_int64_pk_deletions(pk_values).await;
+                self.persist_int64_pk_deletions(pk_values).await?;
+                return Ok(0);
             }
             Some(ExtractedPkDeletes::RowKeys(row_keys)) => {
                 tracing::debug!(
@@ -301,7 +309,8 @@ impl CayenneDeletionSink {
                     count = row_keys.len(),
                     "Fast-path delete: extracted row keys directly from filters, skipping table scan"
                 );
-                return self.persist_key_based_deletions(row_keys).await;
+                self.persist_key_based_deletions(row_keys).await?;
+                return Ok(0);
             }
             None => {}
         }
