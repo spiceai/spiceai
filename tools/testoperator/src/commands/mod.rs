@@ -93,7 +93,7 @@ pub(crate) async fn build_test_with_validation(
     let queries = query_set
         .get_queries(query_overrides, None, None, args.scale_factor)
         .await?;
-    let reference_schema = validation_reference_schema(args, app, &query_set, &queries)?;
+    let reference_schema = validation_reference_schema(args, app, &query_set, &queries, false)?;
 
     let mut test_builder = test_builder
         .with_query_set(queries)
@@ -119,7 +119,11 @@ pub(crate) async fn build_test_with_validation(
 fn supports_automatic_reference_validation(query_set: &QuerySet) -> bool {
     matches!(
         query_set,
-        QuerySet::Tpch | QuerySet::ParameterizedTpch | QuerySet::Tpcds | QuerySet::Clickbench
+        QuerySet::Tpch
+            | QuerySet::ParameterizedTpch
+            | QuerySet::Tpcds
+            | QuerySet::Clickbench
+            | QuerySet::ChBench
     )
 }
 
@@ -128,6 +132,7 @@ fn validation_reference_schema(
     app: &App,
     query_set: &QuerySet,
     queries: &[Query],
+    allow_generated_reference_schema: bool,
 ) -> anyhow::Result<Option<String>> {
     if let Some(reference_schema) = &args.reference_schema {
         return Ok(Some(reference_schema.clone()));
@@ -154,7 +159,7 @@ fn validation_reference_schema(
         return Ok(None);
     }
 
-    if has_unqualified_datasets(app, &table_names) {
+    if allow_generated_reference_schema && has_unqualified_datasets(app, &table_names) {
         Ok(Some(AUTOMATIC_REFERENCE_SCHEMA.to_string()))
     } else {
         Ok(None)
@@ -226,7 +231,7 @@ async fn add_automatic_reference_datasets(
 ) -> anyhow::Result<()> {
     let query_set = args.load_query_set()?;
     let queries = benchmark_queries(args, &query_set).await?;
-    if validation_reference_schema(args, app, &query_set, &queries)?.as_deref()
+    if validation_reference_schema(args, app, &query_set, &queries, true)?.as_deref()
         != Some(AUTOMATIC_REFERENCE_SCHEMA)
     {
         return Ok(());
@@ -628,7 +633,7 @@ mod tests {
         }
 
         assert_eq!(
-            validation_reference_schema(&args, &app, &query_set, &queries)
+            validation_reference_schema(&args, &app, &query_set, &queries, false)
                 .expect("should get reference schema"),
             Some("arrow".to_string())
         );
@@ -663,6 +668,38 @@ mod tests {
             app.datasets
                 .iter()
                 .any(|dataset| dataset.name == "__test_reference.hits")
+        );
+    }
+
+    #[tokio::test]
+    async fn chbench_reference_datasets_can_be_generated() {
+        let (args, query_set, queries) = validation_context("chbench").await;
+        let table_names = reference_table_names(&queries).expect("should get table names");
+        assert!(table_names.contains("order_line"));
+        assert!(!table_names.contains("revenue0"));
+
+        let mut app = App::default();
+        add_unqualified_datasets(&mut app, &table_names);
+
+        assert_eq!(
+            validation_reference_schema(&args, &app, &query_set, &queries, false)
+                .expect("should not assume generated schema exists"),
+            None
+        );
+
+        add_automatic_reference_datasets(&args, &mut app)
+            .await
+            .expect("should add CH-benCH reference datasets");
+
+        assert!(
+            app.datasets
+                .iter()
+                .any(|dataset| dataset.name == "__test_reference.order_line")
+        );
+        assert_eq!(
+            validation_reference_schema(&args, &app, &query_set, &queries, false)
+                .expect("should detect generated schema"),
+            Some("__test_reference".to_string())
         );
     }
 }
