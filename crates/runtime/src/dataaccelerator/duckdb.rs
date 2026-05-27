@@ -394,9 +394,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("optimizer_duckdb_aggregate_pushdown"),
 ];
 
-/// DuckDB has no Null type and silently coerces it to INT32. Normalize any
+/// `DuckDB` has no Null type and silently coerces it to INT32. Normalize any
 /// `DataType::Null` fields to `DataType::Int32` so the schema Spice stores
-/// matches what DuckDB actually creates, preventing a mismatch on reads.
+/// matches what `DuckDB` actually creates, preventing a mismatch on reads.
 fn normalize_null_schema(
     schema: &datafusion::common::DFSchemaRef,
 ) -> datafusion::common::Result<datafusion::common::DFSchemaRef> {
