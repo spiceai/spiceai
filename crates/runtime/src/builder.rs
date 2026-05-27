@@ -293,6 +293,11 @@ impl RuntimeBuilder {
         )
         .await;
 
+        let scheduler_node_id: Option<Arc<str>> = self
+            .resolved_cluster_config
+            .as_ref()
+            .map(|cfg| Arc::<str>::from(cfg.metrics_node_id()));
+
         let distributed: Option<DistributedNode> = match self
             .resolved_cluster_config
             .as_ref()
@@ -325,9 +330,10 @@ impl RuntimeBuilder {
                                 Arc::new(PartitionStore::accelerations(Arc::clone(&cluster_state)));
                             let catalog_partitions_store =
                                 Arc::new(PartitionStore::catalog(Arc::clone(&cluster_state)));
-                            let executor_registry = Arc::new(ExecutorRegistry::new(
+                            let executor_registry = Arc::new(ExecutorRegistry::with_node_id(
                                 Arc::clone(&accelerations_partitions_store),
                                 Arc::clone(&catalog_partitions_store),
+                                scheduler_node_id.clone(),
                             ));
                             let partition_service = Arc::new(PartitionService::new(
                                 Arc::clone(&accelerations_partitions_store),
@@ -343,6 +349,9 @@ impl RuntimeBuilder {
                                 accelerations_partitions_store,
                                 catalog_partitions_store,
                                 partition_service,
+                                partition_load_tracker: Arc::new(
+                                    runtime_cluster::PartitionLoadTracker::new(),
+                                ),
                             })
                         }
                         Err(e) => {
@@ -369,9 +378,10 @@ impl RuntimeBuilder {
                         Arc::new(PartitionStore::accelerations(Arc::clone(&cluster_state)));
                     let catalog_partitions_store =
                         Arc::new(PartitionStore::catalog(Arc::clone(&cluster_state)));
-                    let executor_registry = Arc::new(ExecutorRegistry::new(
+                    let executor_registry = Arc::new(ExecutorRegistry::with_node_id(
                         Arc::clone(&accelerations_partitions_store),
                         Arc::clone(&catalog_partitions_store),
+                        scheduler_node_id.clone(),
                     ));
                     let partition_service = Arc::new(PartitionService::new(
                         Arc::clone(&accelerations_partitions_store),
@@ -387,11 +397,15 @@ impl RuntimeBuilder {
                         accelerations_partitions_store,
                         catalog_partitions_store,
                         partition_service,
+                        partition_load_tracker: Arc::new(
+                            runtime_cluster::PartitionLoadTracker::new(),
+                        ),
                     })
                 }
             }
             Some(ClusterRole::Executor) => Some(DistributedNode::Executor {
                 partition_assignments: Arc::new(RwLock::new(HashMap::new())),
+                outbound_broadcaster: crate::cluster::ExecutorOutboundBroadcaster::default(),
             }),
             None => None, // No cluster config means we're running in standalone mode
         };
@@ -418,12 +432,14 @@ impl RuntimeBuilder {
         if let Some(DistributedNode::Scheduler {
             executor_registry,
             partition_service,
+            partition_load_tracker,
             ..
         }) = distributed.as_ref()
         {
             df_builder = df_builder
                 .with_executor_registry(Arc::clone(executor_registry))
-                .with_partition_service(Arc::clone(partition_service));
+                .with_partition_service(Arc::clone(partition_service))
+                .with_partition_load_tracker(Arc::clone(partition_load_tracker));
         }
 
         if let Some(resolved_cluster_config) = self.resolved_cluster_config {

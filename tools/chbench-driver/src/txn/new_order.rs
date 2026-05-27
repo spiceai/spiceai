@@ -28,6 +28,7 @@ use super::TerminalAssignment;
 use super::prepared::NewOrderStmts;
 use crate::Result;
 use crate::rand as tpcc_rand;
+use std::fmt::Write;
 
 /// # Errors
 ///
@@ -38,6 +39,18 @@ pub async fn run(
     assignment: &TerminalAssignment,
     stmts: &NewOrderStmts,
 ) -> Result<()> {
+    // Collected write data from Phase 1.
+    struct LineWrite {
+        s_quantity: i32,
+        ol_quantity: i32,
+        remote: i32,
+        ol_i_id: i32,
+        ol_supply_w_id: i32,
+        ol_number: i32,
+        ol_amount: f64,
+        ol_dist_info: String,
+    }
+
     let w_id = assignment.home_w_id;
     let d_id = rng.random_range(assignment.district_lo..=assignment.district_hi);
     let c_id = tpcc_rand::rand_customer_id(rng);
@@ -135,7 +148,14 @@ pub async fn run(
             source,
         })?;
 
-    // 6-9. Process each order line: select item, select/update stock, insert order_line
+    // 6-9. Process order lines in two phases (similar to BenchBase-style batching):
+    //   Phase 1: Sequential reads (SELECT item + SELECT stock FOR UPDATE)
+    //   Phase 2: Single batch_execute for all writes (UPDATE stock + INSERT order_line)
+
+    #[expect(clippy::cast_sign_loss)]
+    let mut writes: Vec<LineWrite> = Vec::with_capacity(ol_cnt as usize);
+
+    // Phase 1: reads — pipeline SELECT item + SELECT stock per item.
     for (ol_number_0, &(ol_i_id, ol_supply_w_id, ol_quantity, remote)) in items.iter().enumerate() {
         let ol_number = i32::try_from(ol_number_0).unwrap_or(0) + 1;
 
@@ -148,26 +168,21 @@ pub async fn run(
             return Ok(());
         }
 
-        // Select item
-        let item_row = tx
-            .query_one(&stmts.select_item, &[&ol_i_id])
-            .await
-            .map_err(|source| crate::Error::Sql {
-                action: "new_order: select item".into(),
-                source,
-            })?;
+        // Pipeline: SELECT item + SELECT stock FOR UPDATE in one round-trip
+        let stock_stmt = &stmts.select_stock[usize::try_from(d_id - 1).unwrap_or(0)];
+        let item_params: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&ol_i_id];
+        let stock_params_sel: [&(dyn tokio_postgres::types::ToSql + Sync); 2] =
+            [&ol_i_id, &ol_supply_w_id];
+        let (item_row, stock_row) = tokio::try_join!(
+            tx.query_one(&stmts.select_item, &item_params),
+            tx.query_one(stock_stmt, &stock_params_sel),
+        )
+        .map_err(|source| crate::Error::Sql {
+            action: "new_order: select item+stock".into(),
+            source,
+        })?;
 
         let i_price: f64 = item_row.get(0);
-
-        // Select stock FOR UPDATE (pre-prepared per district)
-        let stock_stmt = &stmts.select_stock[usize::try_from(d_id - 1).unwrap_or(0)];
-        let stock_row = tx
-            .query_one(stock_stmt, &[&ol_i_id, &ol_supply_w_id])
-            .await
-            .map_err(|source| crate::Error::Sql {
-                action: "new_order: select stock".into(),
-                source,
-            })?;
 
         let mut s_quantity: i32 = stock_row.get(0);
         let ol_dist_info: String = stock_row.get(2);
@@ -177,48 +192,67 @@ pub async fn run(
             s_quantity += 91;
         }
 
-        // Update stock
-        tx.execute(
-            &stmts.update_stock,
-            &[
-                &s_quantity,
-                &ol_quantity,
-                &remote,
-                &ol_i_id,
-                &ol_supply_w_id,
-            ],
-        )
-        .await
-        .map_err(|source| crate::Error::Sql {
-            action: "new_order: update stock".into(),
-            source,
-        })?;
-
-        // Calculate amount
         let ol_amount =
             f64::from(ol_quantity) * i_price * (1.0 + w_tax + d_tax) * (1.0 - c_discount);
 
-        // Insert order_line
-        tx.execute(
-            &stmts.insert_order_line,
-            &[
-                &o_id,
-                &d_id,
-                &w_id,
-                &ol_number,
-                &ol_i_id,
-                &ol_supply_w_id,
-                &ol_quantity,
-                &ol_amount,
-                &ol_dist_info,
-            ],
-        )
+        writes.push(LineWrite {
+            s_quantity,
+            ol_quantity,
+            remote,
+            ol_i_id,
+            ol_supply_w_id,
+            ol_number,
+            ol_amount,
+            ol_dist_info,
+        });
+    }
+
+    // Phase 2: batch all writes in a single round-trip via simple query protocol.
+    //
+    // Uses `batch_execute` (simple query)  which does not support prepared statements
+    // but batching is still faster than using prepared statements with multiple round-trips.
+    let mut batch_sql = String::with_capacity(writes.len() * 200);
+
+    for w in &writes {
+        if let Err(e) = write!(
+            &mut batch_sql,
+            "UPDATE stock SET s_quantity = {}, s_ytd = s_ytd + {}, \
+             s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + {} \
+             WHERE s_i_id = {} AND s_w_id = {};",
+            w.s_quantity, w.ol_quantity, w.remote, w.ol_i_id, w.ol_supply_w_id
+        ) {
+            eprintln!("Failed to format stock UPDATE SQL: {e}");
+        }
+    }
+
+    batch_sql.push_str(
+        "INSERT INTO order_line \
+         (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, \
+          ol_quantity, ol_amount, ol_dist_info) VALUES ",
+    );
+    for (i, w) in writes.iter().enumerate() {
+        if i > 0 {
+            batch_sql.push(',');
+        }
+        // ol_dist_info is a fixed 24-char alphanumeric string from stock table;
+        // escape single quotes defensively.
+        let escaped_dist = w.ol_dist_info.replace('\'', "''");
+        if let Err(e) = write!(
+            &mut batch_sql,
+            "({}, {}, {}, {}, {}, {}, {}, {}, '{escaped_dist}')",
+            o_id, d_id, w_id, w.ol_number, w.ol_i_id, w.ol_supply_w_id, w.ol_quantity, w.ol_amount
+        ) {
+            eprintln!("Failed to format order_line VALUES SQL: {e}");
+        }
+    }
+    batch_sql.push(';');
+
+    tx.batch_execute(&batch_sql)
         .await
         .map_err(|source| crate::Error::Sql {
-            action: "new_order: insert order_line".into(),
+            action: "new_order: batch write stock+order_line".into(),
             source,
         })?;
-    }
 
     tx.commit().await.map_err(|source| crate::Error::Sql {
         action: "new_order: commit".into(),

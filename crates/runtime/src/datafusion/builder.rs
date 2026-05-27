@@ -168,6 +168,7 @@ pub struct DataFusionBuilder {
     additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
     executor_registry: Option<Arc<ExecutorRegistry>>,
     partition_service: Option<Arc<PartitionService>>,
+    partition_load_tracker: Option<Arc<runtime_cluster::PartitionLoadTracker>>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -219,6 +220,7 @@ impl DataFusionBuilder {
             additional_analyzer_rules: vec![],
             executor_registry: None,
             partition_service: None,
+            partition_load_tracker: None,
         }
     }
 
@@ -353,6 +355,17 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn with_partition_service(mut self, service: Arc<PartitionService>) -> Self {
         self.partition_service = Some(service);
+        self
+    }
+
+    /// Sets the partition load tracker used to aggregate executor
+    /// `PartitionsLoaded` acks (scheduler mode only).
+    #[must_use]
+    pub fn with_partition_load_tracker(
+        mut self,
+        tracker: Arc<runtime_cluster::PartitionLoadTracker>,
+    ) -> Self {
+        self.partition_load_tracker = Some(tracker);
         self
     }
 
@@ -655,6 +668,7 @@ impl DataFusionBuilder {
             executor: RwLock::new(None),
             executor_stream_registry: RwLock::new(None),
             partition_service: self.partition_service,
+            partition_load_tracker: self.partition_load_tracker,
             #[cfg(not(windows))]
             cayenne_ddl_handler,
         }

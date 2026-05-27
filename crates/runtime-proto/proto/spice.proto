@@ -132,7 +132,19 @@ message ExecutorControlMessage {
         ExecutorShutdown shutdown = 4;
         // Acknowledgement for a scheduler command (correlated by request_id).
         Ack ack = 5;
+        PartitionsLoaded partitions_loaded = 6;
     }
+}
+
+// Sent by an executor after it has finished accelerating one or more
+// partitions of a table. The bytes match the partition Expr encoding used
+// in `UpdatePartitions.new_partitions` so the scheduler can compare them
+// directly against the partition metadata it sent out.
+message PartitionsLoaded {
+    // Table name (as a TableReference string, e.g. "taxi_trips").
+    string table_name = 1;
+    // Partition expression bytes for partitions that are now loaded.
+    BytesArray partition_expr_bytes = 2;
 }
 
 // Message sent from scheduler to executor on the control stream.
