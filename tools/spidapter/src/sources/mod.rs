@@ -14,6 +14,7 @@
 
 pub(super) mod cayenne;
 pub(super) mod dynamodb;
+pub(super) mod ec2_debezium;
 pub(super) mod ec2_postgres;
 pub(super) mod postgres_cdc;
 pub(super) mod postgres_debezium;

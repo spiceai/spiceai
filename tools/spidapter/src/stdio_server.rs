@@ -54,6 +54,7 @@ use sources::dynamodb::{
     DynamoDbTeardownInfo, create_dynamodb_tables, delete_dynamodb_tables,
     generate_dynamodb_spicepod,
 };
+use sources::ec2_debezium::launch_ec2_debezium;
 use sources::ec2_postgres::{
     Ec2PostgresInstance, is_ec2_mode, launch_postgres_ec2, terminate_ec2_instance,
 };
@@ -173,6 +174,7 @@ enum FederatedStorageConfig {
         debezium_connect_url: String,
         acceleration: AccelerationEngine,
         ec2: Option<Ec2InstanceInfo>,
+        ec2_debezium: Option<Ec2InstanceInfo>,
     },
     DynamoDB {
         prefix: String,
@@ -384,18 +386,56 @@ impl Handler for SpidapterHandler {
                 }
             }
             FederatedStorage::PostgresDebezium => {
-                let ec2_instance: Option<Ec2PostgresInstance> = if is_ec2_mode(&self.args) {
-                    let run_id_str = run_id.to_string();
-                    let short_id = run_id_str.split('-').next().unwrap_or_default();
-                    let instance = launch_postgres_ec2(&self.args, short_id)
-                        .await
-                        .map_err(|e| format!("Failed to provision EC2 PostgreSQL instance: {e}"))?;
-                    Some(instance)
+                let run_id_str = run_id.to_string();
+                let short_id = run_id_str.split('-').next().unwrap_or_default();
+
+                // Launch Postgres EC2 (if EC2 mode) and Debezium EC2 concurrently.
+                let (ec2_pg_result, ec2_deb_result) = if is_ec2_mode(&self.args) {
+                    let (pg_res, deb_res) = tokio::join!(
+                        launch_postgres_ec2(&self.args, short_id),
+                        launch_ec2_debezium(&self.args, short_id)
+                    );
+                    (Some(pg_res), deb_res)
                 } else {
-                    None
+                    (None, launch_ec2_debezium(&self.args, short_id).await)
                 };
 
-                let pg = if let Some(ref ec2) = ec2_instance {
+                // Unwrap the Debezium EC2 result, cleaning up Postgres EC2 on failure.
+                let ec2_deb = match ec2_deb_result {
+                    Ok(inst) => inst,
+                    Err(e) => {
+                        if let Some(Ok(ref pg_ec2)) = ec2_pg_result {
+                            if let Err(te) =
+                                terminate_ec2_instance(&pg_ec2.region, &pg_ec2.instance_id).await
+                            {
+                                eprintln!(
+                                    "[stdio] warning: failed to terminate Postgres EC2 after Debezium launch failure: {te}"
+                                );
+                            }
+                        }
+                        return Err(format!("Failed to provision EC2 Debezium instance: {e}"));
+                    }
+                };
+
+                // Unwrap the Postgres EC2 result (if launched), cleaning up Debezium EC2 on failure.
+                let ec2_pg_instance: Option<Ec2PostgresInstance> = match ec2_pg_result {
+                    Some(Ok(inst)) => Some(inst),
+                    Some(Err(e)) => {
+                        if let Err(te) =
+                            terminate_ec2_instance(&ec2_deb.region, &ec2_deb.instance_id).await
+                        {
+                            eprintln!(
+                                "[stdio] warning: failed to terminate Debezium EC2 after Postgres launch failure: {te}"
+                            );
+                        }
+                        return Err(format!(
+                            "Failed to provision EC2 PostgreSQL instance: {e}"
+                        ));
+                    }
+                    None => None,
+                };
+
+                let pg = if let Some(ref ec2) = ec2_pg_instance {
                     Some(PgConfig {
                         host: ec2.host.clone(),
                         port: ec2.pg_port,
@@ -413,31 +453,33 @@ impl Handler for SpidapterHandler {
                         .to_string()
                 })?;
 
-                let kafka_brokers = std::env::var("KAFKA_BROKERS")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
-                        "PostgresDebezium storage requires KAFKA_BROKERS env".to_string()
-                    })?;
-                let debezium_connect_url = std::env::var("DEBEZIUM_CONNECT_URL")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
-                        "PostgresDebezium storage requires DEBEZIUM_CONNECT_URL env".to_string()
-                    })?;
-
                 if let Err(e) = setup_postgres_for_debezium(&pg, &datasets).await {
-                    if let Some(ref ec2) = ec2_instance
-                        && let Err(te) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
+                    if let Some(ref ec2) = ec2_pg_instance {
+                        if let Err(te) =
+                            terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
+                        {
+                            eprintln!(
+                                "[stdio] warning: failed to terminate Postgres EC2 after Debezium setup failure: {te}"
+                            );
+                        }
+                    }
+                    if let Err(te) =
+                        terminate_ec2_instance(&ec2_deb.region, &ec2_deb.instance_id).await
                     {
                         eprintln!(
-                            "[stdio] warning: failed to terminate EC2 instance after Debezium setup failure: {te}"
+                            "[stdio] warning: failed to terminate Debezium EC2 after setup failure: {te}"
                         );
                     }
                     return Err(format!("Failed to set up PostgreSQL for Debezium CDC: {e}"));
                 }
 
-                let ec2 = ec2_instance.map(|e| Ec2InstanceInfo {
+                let kafka_brokers = ec2_deb.kafka_brokers.clone();
+                let debezium_connect_url = ec2_deb.connect_url.clone();
+                let ec2_debezium = Some(Ec2InstanceInfo {
+                    instance_id: ec2_deb.instance_id,
+                    region: ec2_deb.region,
+                });
+                let ec2 = ec2_pg_instance.map(|e| Ec2InstanceInfo {
                     instance_id: e.instance_id,
                     region: e.region,
                 });
@@ -448,6 +490,7 @@ impl Handler for SpidapterHandler {
                     debezium_connect_url,
                     acceleration: self.args.acceleration,
                     ec2,
+                    ec2_debezium,
                 }
             }
             FederatedStorage::DynamoDB => {
@@ -491,15 +534,11 @@ impl Handler for SpidapterHandler {
             ..
         } = setup_config.storage
         {
-            let debezium_host = std::env::var("PG_DEBEZIUM_HOST")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| pg.host.clone());
             let table_names: Vec<&str> = datasets.keys().map(String::as_str).collect();
             register_debezium_postgres_connector(
                 debezium_connect_url,
                 pg,
-                &debezium_host,
+                &pg.host,
                 &table_names,
             )
             .await
@@ -668,17 +707,27 @@ impl Handler for SpidapterHandler {
                         s
                     }
                     Err(e) => {
-                        let ec2 = match &setup_config.storage {
-                            FederatedStorageConfig::Postgres { ec2, .. } => ec2.as_ref(),
-                            FederatedStorageConfig::PostgresDebezium { ec2, .. } => ec2.as_ref(),
-                            _ => None,
+                        let (ec2, ec2_debezium) = match &setup_config.storage {
+                            FederatedStorageConfig::Postgres { ec2, .. } => (ec2.as_ref(), None),
+                            FederatedStorageConfig::PostgresDebezium {
+                                ec2, ec2_debezium, ..
+                            } => (ec2.as_ref(), ec2_debezium.as_ref()),
+                            _ => (None, None),
                         };
                         if let Some(ec2) = ec2
                             && let Err(te) =
                                 terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
                         {
                             eprintln!(
-                                "[stdio] warning: failed to terminate EC2 instance on setup failure: {te}"
+                                "[stdio] warning: failed to terminate EC2 Postgres instance on setup failure: {te}"
+                            );
+                        }
+                        if let Some(ec2) = ec2_debezium
+                            && let Err(te) =
+                                terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
+                        {
+                            eprintln!(
+                                "[stdio] warning: failed to terminate EC2 Debezium instance on setup failure: {te}"
                             );
                         }
                         return Err(format!("Setup failed: provisioning failed: {e}"));
@@ -834,7 +883,12 @@ impl Handler for SpidapterHandler {
                     );
                 }
             }
-            FederatedStorageConfig::PostgresDebezium { pg, ec2, .. } => {
+            FederatedStorageConfig::PostgresDebezium {
+                pg,
+                ec2,
+                ec2_debezium,
+                ..
+            } => {
                 teardown_postgres(&pg, &run_datasets)
                     .await
                     .map_err(|e| format!("Failed to teardown PostgreSQL (Debezium): {e}"))?;
@@ -842,7 +896,15 @@ impl Handler for SpidapterHandler {
                     && let Err(e) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
                 {
                     eprintln!(
-                        "[stdio] warning: failed to terminate EC2 PostgresDebezium instance {}: {e}",
+                        "[stdio] warning: failed to terminate EC2 Postgres instance {}: {e}",
+                        ec2.instance_id
+                    );
+                }
+                if let Some(ec2) = ec2_debezium
+                    && let Err(e) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
+                {
+                    eprintln!(
+                        "[stdio] warning: failed to terminate EC2 Debezium instance {}: {e}",
                         ec2.instance_id
                     );
                 }
