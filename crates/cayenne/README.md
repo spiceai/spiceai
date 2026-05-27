@@ -287,6 +287,13 @@ For the PK strategies the deletion index plus its companion insert-records index
 
 A process-wide `DeletionIndex::shared_empty()` is reused across all tables that have no deletions, so the bloom allocation is amortized.
 
+On the **write side**, when a `DELETE`'s filters already encode a concrete set of primary key values, Cayenne extracts them directly from the filter tree and writes a deletion vector without scanning data files. The extractor (`provider/delete/sink/pk_filter_extract.rs`) recognises two shapes:
+
+- **Single PK** as `pk_col IN (v1, v2, ...)`. Integer literals are widened to `i64` and routed through the Int64 deletion-vector writer; non-integer literals are converted via Arrow's `RowConverter` and routed through the key-based writer.
+- **Composite PK** as an OR-tree of AND-equality conjunctions (`(pk1 = a AND pk2 = b) OR (pk1 = c AND pk2 = d) OR ...`), with the iterative tree walk capped at `MAX_PK_FILTER_TREE_NODES = 65_536` visited nodes. Every conjunction's column set must cover the PK exactly; otherwise the extractor declines and the slow path runs.
+
+CDC delete envelopes (whose filters are built directly from the source PK list) and DML `DELETE` statements both take this fast path when their filter shape qualifies. The fast path intentionally returns `0` from `delete_from` because the extracted key set is an upper bound on deletions, not a verified per-row count — the user-visible row count for DML comes from the inline path inside `InlineAwareDeletionSink`; CDC ignores the count entirely.
+
 ### 5. Table provider (`provider/table.rs`)
 
 DataFusion `TableProvider` implementation. Constructed via `CayenneTableProviderBuilder`. Selected fields (full list in source):
@@ -351,7 +358,7 @@ Provides:
 
 - Query execution with key- and position-based deletion-vector filtering, protected-snapshot routing, and inlined-data union.
 - Insert operations via DataFusion's `insert_into` API (regular path) and the dedicated `write_cdc_append_stream` (CDC-pipelined path).
-- Deletes via DataFusion's SQL `DELETE FROM` path (`CayenneDeletionSink` for non-PK / position-based deletes, `Int64PkDeletionFilterExec` / `KeyBasedDeletionFilterExec` for PK-bearing tables).
+- Deletes via DataFusion's SQL `DELETE FROM` path go through `CayenneDeletionSink`, which writes Arrow-IPC deletion vectors. Position-based deletes are wrapped in `PkKeysetInvalidatingDeletionSink` so the cached scan file statistics are dropped after the visible row count changes; PK-based deletes are wrapped in `InlineAwareDeletionSink` so any inline-memtable rows that match the filter are tombstoned in the same call as the file-side deletion vector. (Scan-time filter strategies are read-side — see *Deletion vectors* above.)
 - Sequence-based ordering for correct delete/insert visibility.
 - Protected snapshot tracking for concurrent access.
 - Per-scan `ListingTable` cache and per-`RuntimeEnv` object-store registration short-circuit.
@@ -365,10 +372,11 @@ The provider also maintains an **in-memory PK keyset cache** with a 256 MiB byte
 1. Acquire `write_lock`.
 2. `ensure_no_incomplete_write` — error if a previous burst's WAL is on disk and unreconciled (with an in-process bypass for prepared appends still being finalized, so back-to-back CDC bursts don't block on each other).
 3. `prepare_stream_for_insert` — if `pk_conflict_detection: auto` (default), build an existing-PK keyset via `load_existing_keyset` and resolve on-conflict deletions; if `pk_conflict_detection: none`, skip.
-4. Decide `can_stage_for_pipeline`: simple appends (no sort columns, no partition column, no retention filters, no pending PK deletions, no file/on-conflict deletions) take the pipelined path; others fall back to a fully synchronous write.
-5. **Stage A** — `write_to_snapshot` into the staging dir; `write_staging_wal` makes the file list durable via tmp+fsync+rename.
-6. Return a `CayenneCdcWrite` holding the staged-write handle and the still-held write lock; the runtime spawns Stage B on a background task.
-7. **Stage B** (3-phase `PreparedStagedAppend`: `prepare` → `apply_under_barrier` → `finish`) — under the listing fence: `move_files_to_current_snapshot`, `remove_staging_wal`, `publish_current_snapshot_files_changed` (invalidates DataFusion's list-files cache). The write lock drops when Stage B completes.
+4. Decide `can_stage_for_pipeline`: an append qualifies for the pipelined Stage A / Stage B split when there are no pending PK deletions, no on-conflict deletions to apply, and the table is not partitioned. Other tables fall back to the synchronous `write_prepared_stream` path that produces a new snapshot under the same visibility flip as the PK / on-conflict deletion vectors. Retention-configured tables can take the pipelined path now that retention runs through `PostWriteMaintenance` after publish rather than inline under the write lock.
+5. Whether the burst takes the pipelined or synchronous path, small writes are still funneled through `try_inline_or_restream` first. The inline path is **not** blocked by pending PK deletions: when batches fit the per-write admission gate, `try_inline_batches_with_inlined_deletions` rewrites inline rows that match the pending PK tombstones and writes file-side deletion vectors for PKs whose data lives in Vortex, all under one `commit_inlined_mutation` metastore transaction. (On the synchronous fallback path, `InlineMutationPolicy` blocks the inline path for partitioned tables and retention-configured tables; the pipelined path already excludes partitioned tables via `can_stage_for_pipeline` but not retention.)
+6. **Stage A** — `write_to_snapshot` into the staging dir; `write_staging_wal` makes the file list durable via tmp+fsync+rename.
+7. Return a `CayenneCdcWrite` holding the staged-write handle and the still-held write lock; the runtime spawns Stage B on a background task.
+8. **Stage B** (3-phase `PreparedStagedAppend`: `prepare` → `apply_under_barrier` → `finish`) — under the listing fence: `move_files_to_current_snapshot`, `remove_staging_wal`, `publish_current_snapshot_files_changed` (invalidates DataFusion's list-files cache). The write lock drops when Stage B completes.
 
 Stage A and Stage B preserve burst order via the runtime's `PendingApplyFinalize` FIFO. The runtime acks the source-side LSN after Stage A returns (data durable) without waiting for Stage B (data visible), so PG can recycle WAL ahead of visibility.
 
@@ -725,7 +733,9 @@ df.show().await?;
 - Staging WAL with crash-safe recovery; partitioned WAL for cross-partition commits on local FS
 - Tiered small-files compaction (inline + background)
 - Inline-data memtable (per-write admission + cumulative flush thresholds, both configurable)
+- Inline-memtable absorption of writes with concurrent pending PK deletions (inline rewrite + file-side deletion vector applied atomically in one metastore commit)
 - CDC apply pipelining with debounced post-write maintenance
+- Fast-path delete that extracts PK values directly from `IN`-list and OR-of-AND-equality filter trees, skipping the data scan
 - Per-dataset `cayenne_pk_conflict_detection` opt-out for append-only CDC
 - CDC apply observability metrics (`dataset_acceleration_cdc_apply_*`)
 - Same-source large-join `HashJoin → SortMergeJoin` rewriter for spillable hash-join build sides
