@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -32,6 +32,8 @@ use test_framework::{
     spicetest::datasets::NotStarted,
     telemetry::{OtlpExporterConfig, Telemetry},
 };
+
+const AUTOMATIC_REFERENCE_SCHEMA: &str = "__test_reference";
 
 #[cfg(feature = "append")]
 pub(crate) mod append;
@@ -104,12 +106,73 @@ pub(crate) async fn build_test_with_validation(
         test_builder = test_builder.with_validation_data(validation_data);
     }
 
-    // Add reference schema if provided for validation against known good tables
-    if let Some(ref_schema) = &args.reference_schema {
-        test_builder = test_builder.with_reference_schema(Some(ref_schema.clone()));
+    // Add reference schema for validation against known good tables
+    if let Some(ref_schema) = validation_reference_schema(args)? {
+        test_builder = test_builder.with_reference_schema(Some(ref_schema));
     }
 
     Ok((query_set, test_builder))
+}
+
+fn supports_automatic_reference_validation(query_set: &QuerySet) -> bool {
+    matches!(query_set, QuerySet::Tpch | QuerySet::ParameterizedTpch)
+}
+
+fn validation_reference_schema(args: &DatasetTestArgs) -> anyhow::Result<Option<String>> {
+    if let Some(reference_schema) = &args.reference_schema {
+        return Ok(Some(reference_schema.clone()));
+    }
+
+    if !args.validate || args.common.is_external_instance() || args.common.is_system_adapter() {
+        return Ok(None);
+    }
+
+    let query_set = args.load_query_set()?;
+    if supports_automatic_reference_validation(&query_set) {
+        Ok(Some(AUTOMATIC_REFERENCE_SCHEMA.to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn add_automatic_reference_datasets(args: &DatasetTestArgs, app: &mut App) -> anyhow::Result<()> {
+    if args.reference_schema.is_some() || validation_reference_schema(args)?.is_none() {
+        return Ok(());
+    }
+
+    let existing_dataset_names = app
+        .datasets
+        .iter()
+        .map(|dataset| dataset.name.clone())
+        .collect::<BTreeSet<_>>();
+
+    let reference_datasets = app
+        .datasets
+        .iter()
+        .filter(|dataset| !dataset.name.contains('.'))
+        .filter_map(|dataset| {
+            let reference_name = format!("{AUTOMATIC_REFERENCE_SCHEMA}.{}", dataset.name);
+            if existing_dataset_names.contains(reference_name.as_str()) {
+                return None;
+            }
+
+            let mut reference_dataset = dataset.clone();
+            reference_dataset.name = reference_name;
+            reference_dataset.acceleration = None;
+            reference_dataset.depends_on.clear();
+            Some(reference_dataset)
+        })
+        .collect::<Vec<_>>();
+
+    if !reference_datasets.is_empty() {
+        println!(
+            "Adding {} unaccelerated reference datasets under {AUTOMATIC_REFERENCE_SCHEMA}.* for TPCH validation",
+            reference_datasets.len()
+        );
+        app.datasets.extend(reference_datasets);
+    }
+
+    Ok(())
 }
 
 pub(crate) async fn run_or_connect_spiced(
@@ -222,8 +285,23 @@ pub(crate) async fn get_app_and_start_request(
     // remains unset and all metric operations are no-ops.
 
     let app = load_app(args).await?;
+    let start_request = start_request_from_app(args, app.clone())?;
 
-    let mut start_request = StartRequest::new(args.spiced_path_buf(), from_app(app.clone()))?;
+    Ok((app, start_request))
+}
+
+pub(crate) async fn get_dataset_app_and_start_request(
+    args: &DatasetTestArgs,
+) -> anyhow::Result<(App, StartRequest)> {
+    let mut app = load_app(&args.common).await?;
+    add_automatic_reference_datasets(args, &mut app)?;
+    let start_request = start_request_from_app(&args.common, app.clone())?;
+
+    Ok((app, start_request))
+}
+
+fn start_request_from_app(args: &CommonArgs, app: App) -> anyhow::Result<StartRequest> {
+    let mut start_request = StartRequest::new(args.spiced_path_buf(), from_app(app))?;
 
     if let Some(ref data_dir) = args.data_dir {
         start_request = start_request.with_data_dir(data_dir.clone());
@@ -235,7 +313,7 @@ pub(crate) async fn get_app_and_start_request(
             .with_additional_args(vec!["--metrics".to_string(), "0.0.0.0:9090".to_string()]);
     }
 
-    Ok((app, start_request))
+    Ok(start_request)
 }
 
 pub(crate) async fn env_export(args: &CommonArgs) -> anyhow::Result<()> {
@@ -370,5 +448,46 @@ pub(crate) async fn process_spiced_metrics(
             println!("Warning: Failed to collect spiced metrics: {e}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use test_framework::spicepod::component::dataset::Dataset;
+
+    use super::*;
+
+    #[test]
+    fn automatic_reference_datasets_clone_base_datasets() {
+        let args = DatasetTestArgs::parse_from([
+            "testoperator",
+            "--query-set",
+            "tpch",
+            "--validate",
+            "--scale-factor",
+            "100",
+        ]);
+
+        let mut app = App::default();
+        app.datasets
+            .push(Dataset::new("s3://bucket/customer.parquet", "customer"));
+        app.datasets.push(Dataset::new(
+            "s3://bucket/lineitem.parquet",
+            "existing.lineitem",
+        ));
+
+        add_automatic_reference_datasets(&args, &mut app).expect("should add reference datasets");
+
+        assert!(
+            app.datasets
+                .iter()
+                .any(|dataset| dataset.name == "__test_reference.customer")
+        );
+        assert!(
+            app.datasets
+                .iter()
+                .all(|dataset| dataset.name != "__test_reference.existing.lineitem")
+        );
     }
 }

@@ -98,6 +98,11 @@ on:
         required: false
         type: boolean
         default: false
+      reference_schema:
+        description: 'Reference schema containing known good tables for validation'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   run-bench:
@@ -339,6 +344,7 @@ jobs:
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
             --validate=${{ github.event.inputs.validate_results }} \
+            ${{ github.event.inputs.reference_schema != '' && format('--reference-schema {0}', github.event.inputs.reference_schema) || '' }} \
             --metrics \
             --scale-factor ${{ github.event.inputs.scale_factor }}
         env:
@@ -417,6 +423,7 @@ jobs:
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
             --validate=${{ github.event.inputs.validate_results }} \
+            ${{ github.event.inputs.reference_schema != '' && format('--reference-schema {0}', github.event.inputs.reference_schema) || '' }} \
             --metrics \
             --scale-factor ${{ github.event.inputs.scale_factor }}
         env:

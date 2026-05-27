@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::get_app_and_start_request;
+use super::get_dataset_app_and_start_request;
 use crate::{args::LoadTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper};
 use std::time::Duration;
 use test_framework::{
@@ -64,7 +64,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             .with_api_key(args.api_key.clone());
         (app, instance)
     } else {
-        let (app, start_request) = get_app_and_start_request(&args.test_args.common).await?;
+        let (app, start_request) = get_dataset_app_and_start_request(&args.test_args).await?;
         let instance = SpicedInstance::start(start_request).await?;
         (app, instance)
     };

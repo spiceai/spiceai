@@ -544,6 +544,22 @@ pub fn validate_tpch_query(
     validate_batches_as_strings(&expected_batches, &actual_batches)
 }
 
+pub fn validate_tpch_query_at_scale(
+    query: &Query,
+    batches: &[RecordBatch],
+    scale_factor: f64,
+) -> Result<QueryValidationResult> {
+    if has_static_tpch_answer(query)
+        && !should_validate_with_static_tpch_answer(query, scale_factor)
+    {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoExpectedAnswer,
+        ));
+    }
+
+    validate_tpch_query(query, batches)
+}
+
 /// Validate a query against expected results from a custom query set
 /// This is a generic validation function that can be used for custom queries
 pub fn validate_with_expected_batches(
@@ -687,6 +703,16 @@ mod test {
         assert!(should_validate_with_static_tpch_answer(&query, 1.0));
         assert!(!should_validate_with_static_tpch_answer(&query, 10.0));
         assert!(!should_validate_with_static_tpch_answer(&query, 100.0));
+
+        let batches = TPCH_ANSWERS
+            .get("tpch_q22")
+            .expect("should have q22 answer")
+            .clone();
+
+        assert_eq!(
+            validate_tpch_query_at_scale(&query, &batches, 100.0).expect("should validate"),
+            QueryValidationResult::Fail(QueryValidationFailReason::NoExpectedAnswer)
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{get_app_and_start_request, load_app};
+use super::{get_dataset_app_and_start_request, load_app};
 use crate::{args::DatasetTestArgs, health::HealthMonitor};
 use std::time::Duration;
 use test_framework::{
@@ -43,7 +43,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         let (instance, session) = crate::system_adapter::acquire(&args.common).await?;
         (app, instance, Some(session))
     } else {
-        let (app, start_request) = get_app_and_start_request(&args.common).await?;
+        let (app, start_request) = get_dataset_app_and_start_request(args).await?;
         let instance = SpicedInstance::start(start_request).await?;
         (app, instance, None)
     };
