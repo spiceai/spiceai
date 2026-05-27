@@ -33,7 +33,7 @@ use globset::GlobSet;
 use snafu::prelude::*;
 
 use crate::{
-    COMMENT_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, FieldMetadata, Read,
+    DESCRIPTION_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, FieldMetadata, Read,
     RefreshableCatalogProvider, SOURCE_TYPE_METADATA_KEY, metadata_enriched_table_provider,
 };
 
@@ -535,7 +535,7 @@ async fn build_table_providers_for_schema(
 fn table_comments_metadata(comments: &TableComments) -> (HashMap<String, String>, FieldMetadata) {
     let mut table_metadata = HashMap::new();
     if let Some(comment) = &comments.table_comment {
-        table_metadata.insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
+        table_metadata.insert(DESCRIPTION_METADATA_KEY.to_string(), comment.clone());
     }
 
     let mut field_metadata = FieldMetadata::new();
@@ -549,7 +549,7 @@ fn table_comments_metadata(comments: &TableComments) -> (HashMap<String, String>
         field_metadata
             .entry(column.clone())
             .or_default()
-            .insert(COMMENT_METADATA_KEY.to_string(), comment.clone());
+            .insert(DESCRIPTION_METADATA_KEY.to_string(), comment.clone());
     }
 
     (table_metadata, field_metadata)
@@ -618,7 +618,9 @@ mod tests {
         CommentMap, ForeignKeyConstraint, ForeignKeyMap, TableComments,
         build_table_providers_for_schema, is_table_included,
     };
-    use crate::{COMMENT_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, Read, SOURCE_TYPE_METADATA_KEY};
+    use crate::{
+        DESCRIPTION_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, Read, SOURCE_TYPE_METADATA_KEY,
+    };
     use async_trait::async_trait;
     use datafusion::catalog::Session;
     use datafusion::datasource::{TableProvider, TableType};
@@ -940,7 +942,7 @@ mod tests {
         assert_eq!(
             schema
                 .metadata()
-                .get(COMMENT_METADATA_KEY)
+                .get(DESCRIPTION_METADATA_KEY)
                 .map(String::as_str),
             Some("order facts")
         );
@@ -950,7 +952,7 @@ mod tests {
         assert_eq!(
             field
                 .metadata()
-                .get(COMMENT_METADATA_KEY)
+                .get(DESCRIPTION_METADATA_KEY)
                 .map(String::as_str),
             Some("customer dimension key")
         );

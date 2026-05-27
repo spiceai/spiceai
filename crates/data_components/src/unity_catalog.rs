@@ -578,10 +578,14 @@ pub struct UCColumn {
     pub name: String,
     pub type_text: String,
     pub type_name: String,
-    pub position: i64,
-    pub type_precision: i64,
-    pub type_scale: i64,
-    pub type_json: String,
+    #[serde(default)]
+    pub position: Option<i64>,
+    #[serde(default)]
+    pub type_precision: Option<i64>,
+    #[serde(default)]
+    pub type_scale: Option<i64>,
+    #[serde(default)]
+    pub type_json: Option<String>,
     pub nullable: bool,
 }
 

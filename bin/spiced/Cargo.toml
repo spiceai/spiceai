@@ -115,6 +115,9 @@ default = [
     "pingora",
     "scylladb",
     "models",
+    "aws-secrets-manager",
+    "azure-keyvault",
+    "keyring-secret-store",
 ]
 delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
 dev = ["runtime/dev"]

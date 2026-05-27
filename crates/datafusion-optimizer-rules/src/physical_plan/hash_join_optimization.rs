@@ -67,9 +67,19 @@ impl PhysicalOptimizerRule for EmptyHashJoinExecPhysicalOptimization {
                 return Ok(Transformed::no(plan));
             }
 
-            Ok(Transformed::yes(Arc::new(EmptyExec::new(
-                join_exec.schema(),
-            ))))
+            // Preserve the join's output partition count on the replacement
+            // EmptyExec. Without this, downstream operators that expected
+            // a `Partitioned` input (e.g. another `HashJoinExec` with
+            // `mode=Partitioned`) would see a partition-count mismatch at
+            // execution time and fail DataFusion's runtime sanity check.
+            let partitions = join_exec
+                .properties()
+                .output_partitioning()
+                .partition_count();
+
+            Ok(Transformed::yes(Arc::new(
+                EmptyExec::new(join_exec.schema()).with_partitions(partitions),
+            )))
         })
         .data()
     }
@@ -90,5 +100,135 @@ fn guaranteed_empty(plan: &Arc<dyn ExecutionPlan>) -> bool {
     match stats.num_rows {
         Precision::Exact(n) => n == 0,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::common::NullEquality;
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion::physical_plan::joins::PartitionMode;
+    use datafusion::physical_plan::repartition::RepartitionExec;
+    use datafusion::physical_plan::{Partitioning, PhysicalExpr};
+    use datafusion_datasource::memory::MemorySourceConfig;
+
+    fn schema(col: &str) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(col, DataType::Int32, true)]))
+    }
+
+    fn empty_memory_exec(col: &str) -> Arc<dyn ExecutionPlan> {
+        let schema = schema(col);
+        MemorySourceConfig::try_new_exec(&[vec![]], schema, None).expect("valid memory exec")
+    }
+
+    fn hash_repartition(
+        input: Arc<dyn ExecutionPlan>,
+        col: &str,
+        partitions: usize,
+    ) -> Arc<dyn ExecutionPlan> {
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new(col, 0));
+        Arc::new(
+            RepartitionExec::try_new(input, Partitioning::Hash(vec![expr], partitions))
+                .expect("valid repartition"),
+        )
+    }
+
+    #[test]
+    fn empty_partitioned_hash_join_replacement_preserves_partition_count() {
+        // Build a `HashJoinExec` with `mode=Partitioned` where both inputs
+        // are hash-partitioned into 8 partitions and the left input is
+        // statically empty. The rule must replace the join with an
+        // `EmptyExec` that still advertises 8 output partitions so that
+        // any downstream operator with a `Partitioned` distribution
+        // requirement continues to see matching partition counts.
+        let target_partitions = 8usize;
+
+        let left = hash_repartition(empty_memory_exec("l"), "l", target_partitions);
+        let right = hash_repartition(empty_memory_exec("r"), "r", target_partitions);
+
+        let on: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> =
+            vec![(Arc::new(Column::new("l", 0)), Arc::new(Column::new("r", 0)))];
+
+        let join: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+            )
+            .expect("valid HashJoinExec"),
+        );
+
+        let original_partitions = join.properties().output_partitioning().partition_count();
+        assert_eq!(
+            original_partitions, target_partitions,
+            "test precondition: partitioned hash join should output {target_partitions} partitions"
+        );
+
+        let rule = EmptyHashJoinExecPhysicalOptimization {};
+        let optimized = rule
+            .optimize(join, &ConfigOptions::default())
+            .expect("optimize succeeds");
+
+        let empty = optimized
+            .as_any()
+            .downcast_ref::<EmptyExec>()
+            .expect("join replaced with EmptyExec");
+        assert_eq!(
+            empty.properties().output_partitioning().partition_count(),
+            target_partitions,
+            "replacement EmptyExec must preserve the join's output partition count"
+        );
+    }
+
+    #[test]
+    fn non_empty_inputs_leave_hash_join_untouched() {
+        // Sanity check: when neither side is statically empty the rule
+        // must not rewrite the plan.
+        let schema = schema("l");
+        let mk_one_row = || -> Arc<dyn ExecutionPlan> {
+            use arrow::array::{Int32Array, RecordBatch};
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![1]))],
+            )
+            .expect("valid batch");
+            MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
+                .expect("valid memory exec")
+        };
+
+        let on: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> =
+            vec![(Arc::new(Column::new("l", 0)), Arc::new(Column::new("l", 0)))];
+
+        let join: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                mk_one_row(),
+                mk_one_row(),
+                on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+            )
+            .expect("valid HashJoinExec"),
+        );
+
+        let rule = EmptyHashJoinExecPhysicalOptimization {};
+        let optimized = rule
+            .optimize(Arc::clone(&join), &ConfigOptions::default())
+            .expect("optimize succeeds");
+
+        assert!(
+            optimized.as_any().is::<HashJoinExec>(),
+            "rule must leave non-empty joins as `HashJoinExec`"
+        );
     }
 }

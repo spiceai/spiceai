@@ -17,6 +17,9 @@ limitations under the License.
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
+use crate::datafusion::pg_catalog::{
+    COL_DESCRIPTION_UDF_NAME, OBJ_DESCRIPTION_UDF_NAME, register_postgres_comment_udfs,
+};
 use crate::datafusion::udtf::flatten_json::{
     FLATTEN_JSON_UDTF_NAME, FlattenJsonScalar, FlattenJsonTableFunc,
 };
@@ -75,6 +78,7 @@ pub fn register_core_scalar_udfs(ctx: &SessionContext) {
     ctx.register_udf(L2Norm::new().into());
     ctx.register_udf(Truncate::new().into());
     ctx.register_udf(INSTANCE.clone());
+    register_postgres_comment_udfs(ctx);
 }
 
 pub async fn register_udfs(runtime: &crate::Runtime) {
@@ -566,6 +570,8 @@ fn denied_spice_function_names() -> Vec<String> {
         L2_SQUARED_DISTANCE_UDF_NAME,
         L2_NORM_UDF_NAME,
         TRUNCATE_SCALAR_UDF_NAME,
+        OBJ_DESCRIPTION_UDF_NAME,
+        COL_DESCRIPTION_UDF_NAME,
         EMBED_UDF_NAME,
         #[cfg(feature = "models")]
         AI_UDF_NAME,
