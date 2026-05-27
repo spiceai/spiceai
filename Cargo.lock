@@ -14140,9 +14140,9 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91bb5030596a3d442c0866ac68afe29c14ba558e77c726dcdf7016b0dbb359d9"
 dependencies = [
- "arrayvec 0.5.2",
- "hashbrown 0.5.0",
- "parking_lot 0.11.2",
+ "arrayvec 0.7.6",
+ "hashbrown 0.17.0",
+ "parking_lot 0.12.5",
  "rand 0.8.6",
 ]
 
