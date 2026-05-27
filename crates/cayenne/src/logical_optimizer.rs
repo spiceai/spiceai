@@ -16,10 +16,10 @@ limitations under the License.
 
 //! Logical optimizer rules for Cayenne.
 //!
-//! The flagship rule here is [`CayennePropagateFilterAcrossEquiJoinKeys`], the
-//! plan-time predicate transitive closure used to unblock chbench q21 (see
-//! `crates/cayenne/src/optimizer_rules.rs` module docs for the broader
-//! no-spill strategy this fits into).
+//! The flagship rules here are [`CayennePropagateFilterAcrossEquiJoinKeys`]
+//! and [`CayenneReassociateCrossJoin`], the plan-time rewrites used to unblock
+//! chbench q21 (see `crates/cayenne/src/optimizer_rules.rs` module docs for
+//! the broader no-spill strategy this fits into).
 //!
 //! `DataFusion`'s stock `infer_join_predicates` (in `push_down_filter`) already
 //! propagates predicates that *directly* reference a join-key column:
@@ -113,11 +113,12 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DataFusionError, NullEquality, Result, Spans, TableReference};
 use datafusion::datasource::DefaultTableSource;
 use datafusion::logical_expr::{
-    Filter, Join, JoinType, LogicalPlan, Projection, Subquery, SubqueryAlias,
+    Filter, Join, JoinConstraint, JoinType, LogicalPlan, Projection, Subquery, SubqueryAlias,
 };
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use datafusion_expr::ExprSchemable;
 use datafusion_expr::expr::InSubquery;
+use datafusion_expr::utils::{conjunction, split_conjunction_owned};
 use datafusion_expr::{Expr, Operator, TableSource};
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -341,6 +342,94 @@ impl SideAnalysis {
     }
 }
 
+/// Logical optimizer rule that reassociates a left-deep inner join when the
+/// SQL `FROM` order leaves an early cross join in front of a later selective
+/// join.
+///
+/// The canonical q21 shape is `(supplier CROSS order_line) JOIN oorder`, where
+/// the parent join predicates only reference `order_line` and `oorder`. This
+/// rule rewrites that to `supplier CROSS (order_line JOIN oorder)` while
+/// preserving the final output schema order. If the parent join also contains
+/// predicates involving `supplier`, only the `order_line`/right-side predicates
+/// move inward and the `supplier` predicates remain on the outer join.
+pub struct CayenneReassociateCrossJoin {
+    is_cayenne_table_source: TableSourcePredicate,
+}
+
+impl Default for CayenneReassociateCrossJoin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CayenneReassociateCrossJoin {
+    /// Create a new instance of the rule.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::new_with_table_provider_predicate(|provider| {
+            provider.as_any().is::<CayenneTableProvider>()
+        })
+    }
+
+    /// Create a new instance with a caller-provided table-provider predicate.
+    ///
+    /// Runtime registration uses this to recognize `AcceleratedTable`s whose
+    /// inner accelerator is Cayenne, while this crate's default stays scoped to
+    /// direct [`CayenneTableProvider`] scans.
+    #[must_use]
+    pub fn new_with_table_provider_predicate(
+        is_cayenne_table_provider: impl Fn(&dyn TableProvider) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        let is_cayenne_table_provider: TableProviderPredicate = Arc::new(is_cayenne_table_provider);
+        Self::new_with_table_source_predicate(move |source| {
+            source
+                .as_any()
+                .downcast_ref::<DefaultTableSource>()
+                .is_some_and(|source| is_cayenne_table_provider(source.table_provider.as_ref()))
+        })
+    }
+
+    /// Create a new instance with a caller-provided table-source predicate.
+    #[must_use]
+    pub fn new_with_table_source_predicate(
+        is_cayenne_table_source: impl Fn(&dyn TableSource) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            is_cayenne_table_source: Arc::new(is_cayenne_table_source),
+        }
+    }
+}
+
+impl std::fmt::Debug for CayenneReassociateCrossJoin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CayenneReassociateCrossJoin").finish()
+    }
+}
+
+impl OptimizerRule for CayenneReassociateCrossJoin {
+    fn name(&self) -> &'static str {
+        "cayenne_reassociate_cross_join"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        // BottomUp lets a single optimizer pass grow `A CROSS (B JOIN C)` into
+        // `A JOIN (B JOIN C JOIN D)` as later joins expose more B/D predicates.
+        Some(ApplyOrder::BottomUp)
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>, DataFusionError> {
+        let LogicalPlan::Join(join) = plan else {
+            return Ok(Transformed::no(plan));
+        };
+
+        reassociate_cross_join(join, &self.is_cayenne_table_source)
+    }
+}
+
 /// Logical optimizer rule that rewrites `column IN (k, k+1, …, k+N-1)` to
 /// `column BETWEEN k AND k+N-1` for single-table Cayenne-backed filter inputs
 /// when the list contents are integer literals sorted unique and consecutive.
@@ -465,6 +554,186 @@ fn is_single_cayenne_table_scan_input(
         Ok(TreeNodeRecursion::Continue)
     });
     total_scans == 1 && cayenne_scans == 1
+}
+
+fn reassociate_cross_join(
+    join: Join,
+    is_cayenne_table_source: &TableSourcePredicate,
+) -> Result<Transformed<LogicalPlan>, DataFusionError> {
+    if !is_reassociable_inner_join(&join) {
+        return Ok(Transformed::no(LogicalPlan::Join(join)));
+    }
+    let LogicalPlan::Join(cross_join) = join.left.as_ref() else {
+        return Ok(Transformed::no(LogicalPlan::Join(join)));
+    };
+    if !is_pure_inner_cross_join(cross_join) {
+        return Ok(Transformed::no(LogicalPlan::Join(join)));
+    }
+    if !contains_cayenne_table_scan(&cross_join.right, is_cayenne_table_source)
+        && !contains_cayenne_table_scan(&join.right, is_cayenne_table_source)
+    {
+        return Ok(Transformed::no(LogicalPlan::Join(join)));
+    }
+
+    let cross_left = cross_join.left.as_ref();
+    let cross_right = cross_join.right.as_ref();
+    let join_right = join.right.as_ref();
+
+    let mut inner_on = Vec::new();
+    let mut outer_on = Vec::new();
+    for (left, right) in &join.on {
+        let Some(left_refs) = expr_input_refs(left, cross_left, cross_right, join_right) else {
+            return Ok(Transformed::no(LogicalPlan::Join(join)));
+        };
+        let Some(right_refs) = expr_input_refs(right, cross_left, cross_right, join_right) else {
+            return Ok(Transformed::no(LogicalPlan::Join(join)));
+        };
+
+        if left_refs.only_cross_right() && right_refs.only_join_right() {
+            inner_on.push((left.clone(), right.clone()));
+        } else if left_refs.only_cross_left() && right_refs.only_join_right() {
+            outer_on.push((left.clone(), right.clone()));
+        } else {
+            return Ok(Transformed::no(LogicalPlan::Join(join)));
+        }
+    }
+
+    if inner_on.is_empty() {
+        return Ok(Transformed::no(LogicalPlan::Join(join)));
+    }
+
+    let mut inner_filters = Vec::new();
+    let mut outer_filters = Vec::new();
+    if let Some(filter) = join.filter.clone() {
+        for conjunct in split_conjunction_owned(filter) {
+            let Some(refs) = expr_input_refs(&conjunct, cross_left, cross_right, join_right) else {
+                return Ok(Transformed::no(LogicalPlan::Join(join)));
+            };
+
+            if refs.only_cross_right_and_join_right() {
+                inner_filters.push(conjunct);
+            } else {
+                outer_filters.push(conjunct);
+            }
+        }
+    }
+
+    let inner_join = LogicalPlan::Join(Join::try_new(
+        Arc::clone(&cross_join.right),
+        Arc::clone(&join.right),
+        inner_on,
+        conjunction(inner_filters),
+        JoinType::Inner,
+        JoinConstraint::On,
+        NullEquality::NullEqualsNothing,
+    )?);
+
+    let outer_join = Join::try_new(
+        Arc::clone(&cross_join.left),
+        Arc::new(inner_join),
+        outer_on,
+        conjunction(outer_filters),
+        JoinType::Inner,
+        JoinConstraint::On,
+        NullEquality::NullEqualsNothing,
+    )?;
+
+    Ok(Transformed::yes(LogicalPlan::Join(outer_join)))
+}
+
+fn is_reassociable_inner_join(join: &Join) -> bool {
+    join.join_type == JoinType::Inner
+        && join.join_constraint == JoinConstraint::On
+        && join.null_equality == NullEquality::NullEqualsNothing
+}
+
+fn is_pure_inner_cross_join(join: &Join) -> bool {
+    is_reassociable_inner_join(join) && join.on.is_empty() && join.filter.is_none()
+}
+
+#[derive(Default)]
+struct JoinInputRefs {
+    cross_left: bool,
+    cross_right: bool,
+    join_right: bool,
+}
+
+impl JoinInputRefs {
+    fn only_cross_left(&self) -> bool {
+        self.cross_left && !self.cross_right && !self.join_right
+    }
+
+    fn only_cross_right(&self) -> bool {
+        !self.cross_left && self.cross_right && !self.join_right
+    }
+
+    fn only_join_right(&self) -> bool {
+        !self.cross_left && !self.cross_right && self.join_right
+    }
+
+    fn only_cross_right_and_join_right(&self) -> bool {
+        !self.cross_left && self.cross_right && self.join_right
+    }
+}
+
+fn expr_input_refs(
+    expr: &Expr,
+    cross_left: &LogicalPlan,
+    cross_right: &LogicalPlan,
+    join_right: &LogicalPlan,
+) -> Option<JoinInputRefs> {
+    if expr.is_volatile() {
+        return None;
+    }
+
+    let mut refs = JoinInputRefs::default();
+    let mut unknown = false;
+    let _ = expr.apply(|node| {
+        match node {
+            Expr::Column(column) => {
+                match (
+                    cross_left.schema().has_column(column),
+                    cross_right.schema().has_column(column),
+                    join_right.schema().has_column(column),
+                ) {
+                    (true, false, false) => refs.cross_left = true,
+                    (false, true, false) => refs.cross_right = true,
+                    (false, false, true) => refs.join_right = true,
+                    _ => {
+                        unknown = true;
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                }
+            }
+            Expr::OuterReferenceColumn(_, _) => {
+                unknown = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            _ => {}
+        }
+
+        Ok(TreeNodeRecursion::Continue)
+    });
+
+    if unknown { None } else { Some(refs) }
+}
+
+fn contains_cayenne_table_scan(
+    plan: &LogicalPlan,
+    is_cayenne_table_source: &TableSourcePredicate,
+) -> bool {
+    let mut found = false;
+    let _ = plan.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node
+            && is_cayenne_table_source(scan.source.as_ref())
+        {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
 }
 
 fn column_expr(column: &Column) -> Expr {
@@ -1197,6 +1466,10 @@ mod tests {
         CayennePropagateFilterAcrossEquiJoinKeys::new_with_table_source_predicate(|_| true)
     }
 
+    fn cross_join_rule() -> CayenneReassociateCrossJoin {
+        CayenneReassociateCrossJoin::new_with_table_source_predicate(|_| true)
+    }
+
     /// Build a [`LogicalPlan::TableScan`] backed by a [`StatMemTable`] that
     /// reports `num_rows` via `TableProvider::statistics()`. Use this instead
     /// of `datafusion_expr::builder::table_scan` in tests that need the
@@ -1323,6 +1596,8 @@ mod tests {
             "cayenne_propagate_filter_across_equi_join_keys"
         );
         assert_eq!(rule().apply_order(), Some(ApplyOrder::TopDown));
+        assert_eq!(cross_join_rule().name(), "cayenne_reassociate_cross_join");
+        assert_eq!(cross_join_rule().apply_order(), Some(ApplyOrder::BottomUp));
     }
 
     #[tokio::test]
@@ -1396,6 +1671,331 @@ mod tests {
             }
         })?;
         Ok((transformed.data, any_changed))
+    }
+
+    #[test]
+    fn cross_join_reassociation_moves_b_c_join_under_cross() -> Result<()> {
+        let supplier_schema = Arc::new(Schema::new(vec![Field::new(
+            "su_suppkey",
+            DataType::Int64,
+            false,
+        )]));
+        let order_line_schema = Arc::new(Schema::new(vec![
+            Field::new("ol_o_id", DataType::Int64, false),
+            Field::new("ol_w_id", DataType::Int64, false),
+            Field::new("ol_d_id", DataType::Int64, false),
+            Field::new("ol_delivery_d", DataType::Int64, false),
+        ]));
+        let order_schema = Arc::new(Schema::new(vec![
+            Field::new("o_id", DataType::Int64, false),
+            Field::new("o_w_id", DataType::Int64, false),
+            Field::new("o_d_id", DataType::Int64, false),
+            Field::new("o_entry_d", DataType::Int64, false),
+        ]));
+
+        let supplier = stat_table_scan("supplier", &supplier_schema, 10_000)?;
+        let order_line = stat_table_scan("l1", &order_line_schema, 300_000)?;
+        let order = stat_table_scan("oorder", &order_schema, 30_000)?;
+
+        let cross = LogicalPlan::Join(Join::try_new(
+            Arc::new(supplier),
+            Arc::new(order_line),
+            vec![],
+            None,
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+        let plan = LogicalPlan::Join(Join::try_new(
+            Arc::new(cross),
+            Arc::new(order),
+            vec![
+                (
+                    Expr::Column(Column::new(Some("l1"), "ol_o_id")),
+                    Expr::Column(Column::new(Some("oorder"), "o_id")),
+                ),
+                (
+                    Expr::Column(Column::new(Some("l1"), "ol_w_id")),
+                    Expr::Column(Column::new(Some("oorder"), "o_w_id")),
+                ),
+                (
+                    Expr::Column(Column::new(Some("l1"), "ol_d_id")),
+                    Expr::Column(Column::new(Some("oorder"), "o_d_id")),
+                ),
+            ],
+            Some(
+                Expr::Column(Column::new(Some("oorder"), "o_entry_d"))
+                    .lt(Expr::Column(Column::new(Some("l1"), "ol_delivery_d"))),
+            ),
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+        let original_schema = Arc::clone(plan.schema());
+
+        let transformed = cross_join_rule().rewrite(
+            plan.clone(),
+            &datafusion::optimizer::OptimizerContext::new(),
+        )?;
+        assert!(
+            transformed.transformed,
+            "q21-shaped cross join should be reassociated; plan was:\n{plan}"
+        );
+        assert_eq!(
+            transformed.data.schema(),
+            &original_schema,
+            "reassociation must preserve output schema order"
+        );
+
+        let LogicalPlan::Join(outer) = &transformed.data else {
+            panic!("expected outer join after reassociation")
+        };
+        assert!(
+            outer.on.is_empty(),
+            "supplier should remain cross-joined after the selective B/C join"
+        );
+        assert!(
+            outer.filter.is_none(),
+            "all parent predicates in this shape should move to the B/C join"
+        );
+        assert!(plan_is_table_scan(&outer.left, "supplier"));
+
+        let LogicalPlan::Join(inner) = outer.right.as_ref() else {
+            panic!("expected order_line/oorder inner join under the outer cross join")
+        };
+        assert_eq!(inner.on.len(), 3);
+        assert!(inner.filter.is_some());
+        assert!(plan_is_table_scan(&inner.left, "l1"));
+        assert!(plan_is_table_scan(&inner.right, "oorder"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn cross_join_reassociation_keeps_a_c_predicates_on_outer_join() -> Result<()> {
+        let supplier_schema = Arc::new(Schema::new(vec![Field::new(
+            "su_suppkey",
+            DataType::Int64,
+            false,
+        )]));
+        let order_line_schema = Arc::new(Schema::new(vec![Field::new(
+            "ol_i_id",
+            DataType::Int64,
+            false,
+        )]));
+        let stock_schema = Arc::new(Schema::new(vec![
+            Field::new("s_i_id", DataType::Int64, false),
+            Field::new("s_suppkey", DataType::Int64, false),
+        ]));
+
+        let supplier = stat_table_scan("supplier", &supplier_schema, 10_000)?;
+        let order_line = stat_table_scan("l1", &order_line_schema, 300_000)?;
+        let stock = stat_table_scan("stock", &stock_schema, 100_000)?;
+
+        let cross = LogicalPlan::Join(Join::try_new(
+            Arc::new(supplier),
+            Arc::new(order_line),
+            vec![],
+            None,
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+        let plan = LogicalPlan::Join(Join::try_new(
+            Arc::new(cross),
+            Arc::new(stock),
+            vec![
+                (
+                    Expr::Column(Column::new(Some("l1"), "ol_i_id")),
+                    Expr::Column(Column::new(Some("stock"), "s_i_id")),
+                ),
+                (
+                    Expr::Column(Column::new(Some("supplier"), "su_suppkey")),
+                    Expr::Column(Column::new(Some("stock"), "s_suppkey")),
+                ),
+            ],
+            None,
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+
+        let transformed = cross_join_rule().rewrite(
+            plan.clone(),
+            &datafusion::optimizer::OptimizerContext::new(),
+        )?;
+        assert!(
+            transformed.transformed,
+            "B/C predicates should move inward while A/C predicates stay outside; plan was:\n{plan}"
+        );
+
+        let LogicalPlan::Join(outer) = &transformed.data else {
+            panic!("expected outer join after reassociation")
+        };
+        assert_eq!(outer.on.len(), 1);
+        assert!(expr_is_column_named(&outer.on[0].0, "su_suppkey"));
+
+        let LogicalPlan::Join(inner) = outer.right.as_ref() else {
+            panic!("expected l1/stock inner join under the outer supplier join")
+        };
+        assert_eq!(inner.on.len(), 1);
+        assert!(expr_is_column_named(&inner.on[0].0, "ol_i_id"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn cross_join_reassociation_requires_b_c_equi_key() -> Result<()> {
+        let supplier_schema = Arc::new(Schema::new(vec![Field::new(
+            "su_suppkey",
+            DataType::Int64,
+            false,
+        )]));
+        let order_line_schema = Arc::new(Schema::new(vec![Field::new(
+            "ol_i_id",
+            DataType::Int64,
+            false,
+        )]));
+        let stock_schema = Arc::new(Schema::new(vec![Field::new(
+            "s_suppkey",
+            DataType::Int64,
+            false,
+        )]));
+
+        let supplier = stat_table_scan("supplier", &supplier_schema, 10_000)?;
+        let order_line = stat_table_scan("l1", &order_line_schema, 300_000)?;
+        let stock = stat_table_scan("stock", &stock_schema, 100_000)?;
+
+        let cross = LogicalPlan::Join(Join::try_new(
+            Arc::new(supplier),
+            Arc::new(order_line),
+            vec![],
+            None,
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+        let plan = LogicalPlan::Join(Join::try_new(
+            Arc::new(cross),
+            Arc::new(stock),
+            vec![(
+                Expr::Column(Column::new(Some("supplier"), "su_suppkey")),
+                Expr::Column(Column::new(Some("stock"), "s_suppkey")),
+            )],
+            None,
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+
+        let transformed = cross_join_rule().rewrite(
+            plan.clone(),
+            &datafusion::optimizer::OptimizerContext::new(),
+        )?;
+        assert!(
+            !transformed.transformed,
+            "rule must not reassociate without a B/C equi-key to move inward; plan was:\n{plan}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn cross_join_reassociation_skips_non_cayenne_subtrees() -> Result<()> {
+        let left_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let middle_schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, false)]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Int64, false)]));
+
+        let left = stat_table_scan("a", &left_schema, 10_000)?;
+        let middle = stat_table_scan("b", &middle_schema, 300_000)?;
+        let right = stat_table_scan("c", &right_schema, 30_000)?;
+        let cross = LogicalPlan::Join(Join::try_new(
+            Arc::new(left),
+            Arc::new(middle),
+            vec![],
+            None,
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+        let plan = LogicalPlan::Join(Join::try_new(
+            Arc::new(cross),
+            Arc::new(right),
+            vec![(
+                Expr::Column(Column::new(Some("b"), "b")),
+                Expr::Column(Column::new(Some("c"), "c")),
+            )],
+            None,
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+
+        let rule = CayenneReassociateCrossJoin::new_with_table_source_predicate(|_| false);
+        let transformed = rule.rewrite(
+            plan.clone(),
+            &datafusion::optimizer::OptimizerContext::new(),
+        )?;
+        assert!(
+            !transformed.transformed,
+            "rule must stay scoped to Cayenne-backed matched subtrees; plan was:\n{plan}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn cross_join_reassociation_skips_when_only_untouched_side_is_cayenne() -> Result<()> {
+        let left_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let middle_schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, false)]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Int64, false)]));
+
+        let left = stat_table_scan("a", &left_schema, 10_000)?;
+        let middle = stat_table_scan("b", &middle_schema, 300_000)?;
+        let right = stat_table_scan("c", &right_schema, 30_000)?;
+        let cross = LogicalPlan::Join(Join::try_new(
+            Arc::new(left),
+            Arc::new(middle),
+            vec![],
+            None,
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+        let plan = LogicalPlan::Join(Join::try_new(
+            Arc::new(cross),
+            Arc::new(right),
+            vec![(
+                Expr::Column(Column::new(Some("b"), "b")),
+                Expr::Column(Column::new(Some("c"), "c")),
+            )],
+            None,
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+
+        let rule = CayenneReassociateCrossJoin::new_with_table_provider_predicate(|provider| {
+            provider.schema().field_with_name("a").is_ok()
+        });
+        let transformed = rule.rewrite(
+            plan.clone(),
+            &datafusion::optimizer::OptimizerContext::new(),
+        )?;
+        assert!(
+            !transformed.transformed,
+            "rule must not reassociate a non-Cayenne B/C branch just because the untouched A side is Cayenne; plan was:\n{plan}"
+        );
+
+        Ok(())
+    }
+
+    fn plan_is_table_scan(plan: &LogicalPlan, table_name: &str) -> bool {
+        matches!(plan, LogicalPlan::TableScan(scan) if scan.table_name.table() == table_name)
+    }
+
+    fn expr_is_column_named(expr: &Expr, column_name: &str) -> bool {
+        matches!(expr, Expr::Column(column) if column.name == column_name)
     }
 
     #[tokio::test]

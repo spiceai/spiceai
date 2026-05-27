@@ -81,9 +81,10 @@ limitations under the License.
 //!   inner `DataSourceExec`, so the value reaches `JoinSelection`. The q21
 //!   explain plan confirms `should_swap_join_order` picks the smaller side as
 //!   build at every level (nation/supplier on the LEFT, lineitem on the
-//!   RIGHT), so the residual OOM is *not* attributable to fuzzy stats — it is
-//!   the **logical** join order locking in the SQL `FROM` order and applying
-//!   the nation filter last.
+//!   RIGHT), so poor q21 behavior is *not* attributable to fuzzy stats — the
+//!   logical optimizer must also avoid preserving SQL `FROM`-order cross joins
+//!   such as `(supplier CROSS order_line) JOIN oorder` when the parent join
+//!   predicates can be evaluated as `order_line JOIN oorder` first.
 //!
 //! * **Build-side projections are minimal.** Every `CayenneAccelerationExec`
 //!   in the snapshot terminates in a `DataSourceExec` whose `projection=[...]`

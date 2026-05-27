@@ -711,38 +711,37 @@ const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CayenneFilterPropagation {
-    Auto,
     Disabled,
     Enabled,
 }
 
 impl CayenneFilterPropagation {
     fn is_enabled(self) -> bool {
-        matches!(self, Self::Auto | Self::Enabled)
+        matches!(self, Self::Enabled)
     }
 }
 
 fn parse_cayenne_filter_propagation(params: &HashMap<String, String>) -> CayenneFilterPropagation {
     let Some(raw) = params.get(CAYENNE_FILTER_PROPAGATION_PARAM) else {
-        return CayenneFilterPropagation::Auto;
+        return CayenneFilterPropagation::Disabled;
     };
 
     match raw.trim().to_ascii_lowercase().as_str() {
-        "auto" => CayenneFilterPropagation::Auto,
         "enabled" => CayenneFilterPropagation::Enabled,
         "disabled" => CayenneFilterPropagation::Disabled,
         _ => {
             tracing::warn!(
-                "runtime.params.{CAYENNE_FILTER_PROPAGATION_PARAM}={raw:?} must be 'auto', 'enabled', or 'disabled'; using auto"
+                "runtime.params.{CAYENNE_FILTER_PROPAGATION_PARAM}={raw:?} must be 'enabled' or 'disabled'; using disabled"
             );
-            CayenneFilterPropagation::Auto
+            CayenneFilterPropagation::Disabled
         }
     }
 }
 
 fn default_cayenne_optimizer_rules(filter_propagation_enabled: bool) -> CayenneOptimizerRules {
-    let mut rules = CayenneOptimizerRules::all_enabled();
-    rules.filter_propagation = filter_propagation_enabled;
+    let mut rules = CayenneOptimizerRules::auto_enabled();
+    rules.set_filter_propagation(filter_propagation_enabled);
+    rules.set_inlist_to_range(filter_propagation_enabled);
     rules
 }
 
@@ -772,19 +771,22 @@ fn parse_cayenne_optimizer_rules(
         let rule_name = token.replace('-', "_");
         match rule_name.as_str() {
             "filter_propagation" | "logical_filter_propagation" | "propagate_filter" => {
-                rules.filter_propagation = true;
+                rules.set_filter_propagation(true);
+            }
+            "cross_join_reassociation" | "reassociate_cross_join" | "join_reassociation" => {
+                rules.set_cross_join_reassociation(true);
             }
             "inlist_to_range" | "in_list_to_range" => {
-                rules.inlist_to_range = true;
+                rules.set_inlist_to_range(true);
             }
             "dynamic_filter_sharing" | "dynamic_filters" => {
-                rules.dynamic_filter_sharing = true;
+                rules.set_dynamic_filter_sharing(true);
             }
             "anti_join_sort_merge" | "anti_sort_merge" => {
-                rules.anti_join_sort_merge = true;
+                rules.set_anti_join_sort_merge(true);
             }
             "exact_join_filter" | "join_rewriter" | "exact_accumulator" => {
-                rules.exact_join_filter = true;
+                rules.set_exact_join_filter(true);
             }
             _ => {
                 tracing::warn!(
@@ -916,32 +918,27 @@ mod test {
         assert_eq!(
             parse_cayenne_filter_propagation(&HashMap::from([(
                 CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
-                "auto".to_string(),
-            )])),
-            CayenneFilterPropagation::Auto
-        );
-        assert_eq!(
-            parse_cayenne_filter_propagation(&HashMap::from([(
-                CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
                 "true".to_string(),
             )])),
-            CayenneFilterPropagation::Auto
+            CayenneFilterPropagation::Disabled
         );
         assert_eq!(
             parse_cayenne_filter_propagation(&HashMap::new()),
-            CayenneFilterPropagation::Auto
+            CayenneFilterPropagation::Disabled
         );
     }
 
     #[test]
     fn test_parse_cayenne_optimizer_rules() {
+        let mut legacy_enabled = CayenneOptimizerRules::auto_enabled();
+        legacy_enabled.set_filter_propagation(true);
+        legacy_enabled.set_inlist_to_range(true);
         assert_eq!(
             parse_cayenne_optimizer_rules(&HashMap::new(), true),
-            CayenneOptimizerRules::all_enabled()
+            legacy_enabled
         );
 
-        let mut legacy_disabled = CayenneOptimizerRules::all_enabled();
-        legacy_disabled.filter_propagation = false;
+        let legacy_disabled = CayenneOptimizerRules::auto_enabled();
         assert_eq!(
             parse_cayenne_optimizer_rules(&HashMap::new(), false),
             legacy_disabled
@@ -966,13 +963,14 @@ mod test {
         );
 
         let mut selected_rules = CayenneOptimizerRules::none();
-        selected_rules.filter_propagation = true;
-        selected_rules.exact_join_filter = true;
+        selected_rules.set_filter_propagation(true);
+        selected_rules.set_cross_join_reassociation(true);
+        selected_rules.set_exact_join_filter(true);
         assert_eq!(
             parse_cayenne_optimizer_rules(
                 &HashMap::from([(
                     CAYENNE_OPTIMIZER_RULES_PARAM.to_string(),
-                    "filter-propagation,join_rewriter".to_string(),
+                    "filter-propagation,cross_join_reassociation,join_rewriter".to_string(),
                 )]),
                 true,
             ),
