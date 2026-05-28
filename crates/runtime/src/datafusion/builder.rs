@@ -465,6 +465,13 @@ impl DataFusionBuilder {
         self
     }
 
+    /// Enables (or disables) Cayenne filter propagation together with its
+    /// companion IN-list→range rewrite. The IN-list→range rewrite turns
+    /// `col IN (a, b, c)` predicates into range/bound predicates that filter
+    /// propagation can then push into Cayenne scans, so the two are toggled
+    /// together as a single "filter propagation" capability. For finer-grained
+    /// control over individual logical rules, use the
+    /// `runtime.params.cayenne_optimizer_rules` config path instead.
     #[must_use]
     pub fn cayenne_filter_propagation_enabled(mut self, enabled: bool) -> Self {
         self.cayenne_optimizer_rules.set_filter_propagation(enabled);

@@ -773,6 +773,7 @@ fn parse_cayenne_optimizer_rules(
 
     let mut rules = CayenneOptimizerRules::none();
     let mut saw_rule = false;
+    let mut unknown_rules: Vec<String> = Vec::new();
     for token in normalized
         .split(|character: char| character == ',' || character.is_ascii_whitespace())
         .filter(|token| !token.is_empty())
@@ -798,20 +799,26 @@ fn parse_cayenne_optimizer_rules(
                 rules.set_exact_join_filter(true);
             }
             _ => {
-                tracing::warn!(
-                    "runtime.params.{CAYENNE_OPTIMIZER_RULES_PARAM}={raw:?} contains unknown Cayenne optimizer rule {token:?}; using auto"
-                );
-                return default_rules;
+                // Don't discard the rest of an explicit list because of one bad
+                // token; collect the unknown ones, keep the recognized rules,
+                // and warn below.
+                unknown_rules.push(token.to_string());
+                continue;
             }
         }
         saw_rule = true;
     }
 
     if saw_rule {
+        if !unknown_rules.is_empty() {
+            tracing::warn!(
+                "runtime.params.{CAYENNE_OPTIMIZER_RULES_PARAM}={raw:?} contains unknown Cayenne optimizer rule(s) {unknown_rules:?}; ignoring them and using the recognized rules"
+            );
+        }
         rules
     } else {
         tracing::warn!(
-            "runtime.params.{CAYENNE_OPTIMIZER_RULES_PARAM}={raw:?} did not include any Cayenne optimizer rules; using auto"
+            "runtime.params.{CAYENNE_OPTIMIZER_RULES_PARAM}={raw:?} did not include any recognized Cayenne optimizer rules; using auto"
         );
         default_rules
     }
@@ -995,6 +1002,21 @@ mod test {
                 false,
             ),
             legacy_disabled
+        );
+
+        // A partially-valid explicit list keeps the recognized rules instead of
+        // silently reverting to auto when it hits an unknown token.
+        let mut partial_rules = CayenneOptimizerRules::none();
+        partial_rules.set_filter_propagation(true);
+        assert_eq!(
+            parse_cayenne_optimizer_rules(
+                &HashMap::from([(
+                    CAYENNE_OPTIMIZER_RULES_PARAM.to_string(),
+                    "filter_propagation,not_a_rule".to_string(),
+                )]),
+                false,
+            ),
+            partial_rules
         );
     }
 }

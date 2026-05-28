@@ -146,7 +146,7 @@ fn validation_reference_schema(
         return Ok(None);
     }
 
-    let table_names = reference_table_names(queries)?;
+    let table_names = reference_table_names(queries);
     if table_names.is_empty() {
         return Ok(None);
     }
@@ -166,14 +166,26 @@ fn validation_reference_schema(
     }
 }
 
-fn reference_table_names(queries: &[Query]) -> anyhow::Result<BTreeSet<String>> {
+fn reference_table_names(queries: &[Query]) -> BTreeSet<String> {
     let mut table_names = BTreeSet::new();
 
     for query in queries {
-        table_names.extend(query.unqualified_table_names()?);
+        // Best-effort: a query that DataFusion's PostgreSQL dialect can't parse
+        // (e.g. vendor-specific SQL) shouldn't abort automatic reference-schema
+        // detection for the whole benchmark — it just doesn't contribute tables.
+        // Strict parsing still applies where the query is actually executed.
+        match query.unqualified_table_names() {
+            Ok(names) => table_names.extend(names),
+            Err(error) => {
+                eprintln!(
+                    "Skipping unparseable query {:?} when computing the automatic reference schema: {error}",
+                    query.name
+                );
+            }
+        }
     }
 
-    Ok(table_names)
+    table_names
 }
 
 fn detect_reference_schema(app: &App, table_names: &BTreeSet<String>) -> Option<String> {
@@ -237,7 +249,7 @@ async fn add_automatic_reference_datasets(
         return Ok(());
     }
 
-    let table_names = reference_table_names(&queries)?;
+    let table_names = reference_table_names(&queries);
 
     let existing_dataset_names = app
         .datasets
@@ -591,7 +603,7 @@ mod tests {
     #[tokio::test]
     async fn automatic_reference_datasets_clone_base_datasets() {
         let (args, _, queries) = validation_context("tpch").await;
-        let table_names = reference_table_names(&queries).expect("should get table names");
+        let table_names = reference_table_names(&queries);
 
         let mut app = App::default();
         add_unqualified_datasets(&mut app, &table_names);
@@ -619,7 +631,7 @@ mod tests {
     #[tokio::test]
     async fn existing_tpcds_reference_schema_is_detected() {
         let (args, query_set, queries) = validation_context("tpcds").await;
-        let table_names = reference_table_names(&queries).expect("should get table names");
+        let table_names = reference_table_names(&queries);
         assert!(table_names.contains("store_sales"));
         assert!(!table_names.contains("customer_total_return"));
 
@@ -652,7 +664,7 @@ mod tests {
     #[tokio::test]
     async fn clickbench_reference_datasets_use_query_table_names() {
         let (args, _, queries) = validation_context("clickbench").await;
-        let table_names = reference_table_names(&queries).expect("should get table names");
+        let table_names = reference_table_names(&queries);
         assert!(table_names.contains("hits"));
         assert!(!table_names.contains("hits_delayed"));
 
@@ -674,7 +686,7 @@ mod tests {
     #[tokio::test]
     async fn chbench_reference_datasets_can_be_generated() {
         let (args, query_set, queries) = validation_context("chbench").await;
-        let table_names = reference_table_names(&queries).expect("should get table names");
+        let table_names = reference_table_names(&queries);
         assert!(table_names.contains("order_line"));
         assert!(!table_names.contains("revenue0"));
 

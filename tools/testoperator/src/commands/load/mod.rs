@@ -142,7 +142,8 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::QuerySetCompleted(1))
-            .with_query_executor(executor.clone()),
+            .with_query_executor(executor.clone())
+            .with_validate(args.test_args.validate),
     )
     .await?;
 
@@ -169,7 +170,8 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::Duration(baseline_duration))
-            .with_query_executor(executor.clone()),
+            .with_query_executor(executor.clone())
+            .with_validate(args.test_args.validate),
     )
     .await?;
 
@@ -215,7 +217,8 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .with_parallel_count(args.test_args.common.concurrency)
         .with_end_condition(load_end_condition)
         .with_query_executor(executor)
-        .with_query_duration_threshold(args.test_args.mark_query_failed_if_exceeds);
+        .with_query_duration_threshold(args.test_args.mark_query_failed_if_exceeds)
+        .with_validate(args.test_args.validate);
 
     // Add streaming metrics sender if exporter is configured
     if let Some(exporter) = &streaming_exporter {
