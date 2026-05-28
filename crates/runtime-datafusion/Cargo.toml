@@ -33,10 +33,12 @@ serde_json.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
 url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
+uuid.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
