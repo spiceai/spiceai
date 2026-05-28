@@ -382,7 +382,9 @@ impl DynamoDBTableProvider {
             return match declared_schema {
                 Some(schema) => {
                     tracing::debug!(
-                        "DynamoDB table {table_name:?} is empty; using declared schema"
+                        "DynamoDB table {table_name:?} is empty; using declared schema. \
+                         Only columns declared in `columns:` will be tracked until the \
+                         table contains data that can be used for schema inference."
                     );
                     Ok((
                         schema,
