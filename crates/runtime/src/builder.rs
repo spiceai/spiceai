@@ -591,8 +591,7 @@ async fn build_http_rate_control_registry(
         return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
     };
 
-    let Some(refresh_interval) =
-        parse_rate_control_refresh_interval(refresh_interval, config_path)
+    let Some(refresh_interval) = parse_rate_control_refresh_interval(refresh_interval, config_path)
     else {
         return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
     };

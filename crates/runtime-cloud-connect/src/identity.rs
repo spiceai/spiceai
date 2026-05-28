@@ -107,8 +107,9 @@ impl IdentityStore {
     pub fn load_optional(path: &Path) -> Result<Option<Identity>> {
         match std::fs::read_to_string(path) {
             Ok(s) => {
-                let identity: Identity =
-                    serde_json::from_str(&s).context(ParseSnafu { path: path.to_path_buf() })?;
+                let identity: Identity = serde_json::from_str(&s).context(ParseSnafu {
+                    path: path.to_path_buf(),
+                })?;
                 Ok(Some(identity))
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -275,7 +276,9 @@ mod tests {
         let identity = sample_identity();
 
         IdentityStore::store(&path, &identity).expect("store");
-        let loaded = IdentityStore::load_optional(&path).expect("load").expect("present");
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
 
         assert_eq!(loaded.identifier, identity.identifier);
         assert_eq!(loaded.identity_cert_pem, identity.identity_cert_pem);

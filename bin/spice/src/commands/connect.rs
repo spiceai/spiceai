@@ -156,12 +156,17 @@ fn stage_adoption_code(code: &str, endpoint: Option<&str>) -> Result<()> {
         && e.kind() != std::io::ErrorKind::NotFound
     {
         return Err(crate::error::Error::CloudConnectIo {
-            message: format!("remove stale endpoint override {}: {e}", endpoint_path.display()),
+            message: format!(
+                "remove stale endpoint override {}: {e}",
+                endpoint_path.display()
+            ),
         });
     }
 
-    atomic_write_0600(&pending_path, code.as_bytes()).map_err(|e| crate::error::Error::CloudConnectIo {
-        message: format!("write adoption code: {e}"),
+    atomic_write_0600(&pending_path, code.as_bytes()).map_err(|e| {
+        crate::error::Error::CloudConnectIo {
+            message: format!("write adoption code: {e}"),
+        }
     })?;
 
     // Write the endpoint override BEFORE printing success. If the override
@@ -217,8 +222,10 @@ fn print_status() -> Result<()> {
     }
 
     if pending_path.exists() {
-        let preview = std::fs::read_to_string(&pending_path).map_err(|e| crate::error::Error::CloudConnectIo {
-            message: format!("read pending code: {e}"),
+        let preview = std::fs::read_to_string(&pending_path).map_err(|e| {
+            crate::error::Error::CloudConnectIo {
+                message: format!("read pending code: {e}"),
+            }
         })?;
         let preview = preview.trim();
         println!("Spice Cloud Connect: pending adoption");
@@ -233,9 +240,7 @@ fn print_status() -> Result<()> {
     }
 
     println!("Spice Cloud Connect: not connected");
-    println!(
-        "Run `spice connect <SPICE-ADOPT-...>` with a code from your Spice Cloud portal."
-    );
+    println!("Run `spice connect <SPICE-ADOPT-...>` with a code from your Spice Cloud portal.");
     Ok(())
 }
 
@@ -259,9 +264,7 @@ fn forget_identity() -> Result<()> {
             }
         })?;
     }
-    if had_pending
-        && let Err(e) = std::fs::remove_file(&pending_path)
-    {
+    if had_pending && let Err(e) = std::fs::remove_file(&pending_path) {
         return Err(crate::error::Error::CloudConnectIo {
             message: format!("remove pending code: {e}"),
         });

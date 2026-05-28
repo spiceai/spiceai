@@ -59,11 +59,7 @@ struct ScriptedRuntime {
 
 #[async_trait]
 impl RuntimeHandle for ScriptedRuntime {
-    async fn execute_sql(
-        &self,
-        sql: &str,
-        max_rows: u32,
-    ) -> Result<serde_json::Value, String> {
+    async fn execute_sql(&self, sql: &str, max_rows: u32) -> Result<serde_json::Value, String> {
         *self.captured_sql.lock().await = Some(sql.to_string());
         *self.captured_max_rows.lock().await = Some(max_rows);
         Ok(self.payload.clone())
@@ -172,7 +168,11 @@ fn envelope(columns: Vec<(&str, &str)>, rows: Vec<Vec<Value>>, truncated: bool) 
     })
 }
 
-fn config_with(endpoint: String, identity_path: std::path::PathBuf, config_dir: std::path::PathBuf) -> CloudConnectConfig {
+fn config_with(
+    endpoint: String,
+    identity_path: std::path::PathBuf,
+    config_dir: std::path::PathBuf,
+) -> CloudConnectConfig {
     CloudConnectConfig {
         endpoint,
         ca_cert_pem: None,
@@ -229,7 +229,11 @@ async fn run_query_returns_documented_envelope_and_audit() {
     let mock_state = Arc::clone(&mock.state);
     let addr = spawn_server(mock).await;
 
-    let cfg = config_with(format!("http://{addr}"), identity_path.clone(), dir.path().to_path_buf());
+    let cfg = config_with(
+        format!("http://{addr}"),
+        identity_path.clone(),
+        dir.path().to_path_buf(),
+    );
     let handle = runtime_cloud_connect::CloudConnect::start(cfg, runtime)
         .await
         .expect("start")
@@ -250,7 +254,11 @@ async fn run_query_returns_documented_envelope_and_audit() {
     let state = mock_state.lock().await;
     let result = state.last_result.clone().expect("result");
     assert_eq!(result.command_id, "cmd-q-1");
-    assert!(result.success, "result.success=true, error={}", result.error);
+    assert!(
+        result.success,
+        "result.success=true, error={}",
+        result.error
+    );
     let payload: Value = serde_json::from_str(&result.payload_json).expect("parse payload");
     assert!(payload.is_object());
     let cols = payload["columns"].as_array().expect("columns");
@@ -272,17 +280,14 @@ async fn run_query_returns_documented_envelope_and_audit() {
     let audit = state.last_audit.clone().expect("audit event");
     assert_eq!(audit.kind, "audit");
     assert_eq!(audit.identifier, "inst_unit_test");
-    let audit_payload: Value =
-        serde_json::from_str(&audit.event_json).expect("parse audit event");
+    let audit_payload: Value = serde_json::from_str(&audit.event_json).expect("parse audit event");
     assert_eq!(audit_payload["action"], "run_query");
     assert_eq!(audit_payload["command_id"], "cmd-q-1");
     assert_eq!(audit_payload["row_count"], 2);
     assert_eq!(audit_payload["truncated"], false);
     assert_eq!(audit_payload["success"], true);
     // SQL hash must be present but must NOT contain the SQL text.
-    let sql_hash = audit_payload["sql_hash"]
-        .as_str()
-        .expect("sql_hash string");
+    let sql_hash = audit_payload["sql_hash"].as_str().expect("sql_hash string");
     assert_eq!(sql_hash.len(), 64, "sha256 hex digest is 64 chars");
     assert!(!sql_hash.contains("SELECT"));
     // duration_ms must be present and a number.
@@ -320,7 +325,11 @@ async fn run_query_propagates_truncation_flag() {
     let mock_state = Arc::clone(&mock.state);
     let addr = spawn_server(mock).await;
 
-    let cfg = config_with(format!("http://{addr}"), identity_path.clone(), dir.path().to_path_buf());
+    let cfg = config_with(
+        format!("http://{addr}"),
+        identity_path.clone(),
+        dir.path().to_path_buf(),
+    );
     let handle = runtime_cloud_connect::CloudConnect::start(cfg, runtime)
         .await
         .expect("start")
@@ -387,7 +396,11 @@ async fn run_query_failure_is_safe_and_audited() {
     let mock_state = Arc::clone(&mock.state);
     let addr = spawn_server(mock).await;
 
-    let cfg = config_with(format!("http://{addr}"), identity_path.clone(), dir.path().to_path_buf());
+    let cfg = config_with(
+        format!("http://{addr}"),
+        identity_path.clone(),
+        dir.path().to_path_buf(),
+    );
     let handle = runtime_cloud_connect::CloudConnect::start(cfg, runtime)
         .await
         .expect("start")

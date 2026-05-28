@@ -157,8 +157,8 @@ async fn first_contact_adoption_persists_identity_and_acks() {
         body: Some(proto::control_message::Body::Adopt(proto::Adopt {
             command_id: "cmd-adopt-1".to_string(),
             assigned_identifier: "inst_unit_test".to_string(),
-            identity_cert_pem: "-----BEGIN CERTIFICATE-----\nUNIT-TEST\n-----END CERTIFICATE-----\n"
-                .to_string(),
+            identity_cert_pem:
+                "-----BEGIN CERTIFICATE-----\nUNIT-TEST\n-----END CERTIFICATE-----\n".to_string(),
             not_after_unix: 0,
         })),
     };
@@ -179,7 +179,8 @@ async fn first_contact_adoption_persists_identity_and_acks() {
         runtime_version: "v0.0.0-test".to_string(),
     };
 
-    let runtime: Arc<dyn RuntimeHandle> = Arc::new(runtime_cloud_connect::handlers::NoopRuntimeHandle);
+    let runtime: Arc<dyn RuntimeHandle> =
+        Arc::new(runtime_cloud_connect::handlers::NoopRuntimeHandle);
     let handle = runtime_cloud_connect::CloudConnect::start(config, runtime)
         .await
         .expect("start")
@@ -209,7 +210,10 @@ async fn first_contact_adoption_persists_identity_and_acks() {
     let s = mock_state.lock().await;
     let hello = s.last_hello.clone().expect("server saw Hello");
     assert_eq!(hello.kind, proto::InstanceKind::Standalone as i32);
-    assert!(hello.identifier.is_empty(), "first hello has empty identifier");
+    assert!(
+        hello.identifier.is_empty(),
+        "first hello has empty identifier"
+    );
     assert_eq!(hello.credential, "SPICE-ADOPT-AAAA-BBBB");
 
     let ack = s.last_adopt_ack.clone().expect("server saw AdoptAck");
@@ -283,7 +287,10 @@ async fn apply_spicepod_writes_file_and_acks() {
             break;
         }
     }
-    assert!(applied_seen, "runtime should have received ApplySpicepod within 5s");
+    assert!(
+        applied_seen,
+        "runtime should have received ApplySpicepod within 5s"
+    );
 
     let (written_path, written_yaml) = captured.lock().await.clone().unwrap();
     assert_eq!(written_yaml, yaml);

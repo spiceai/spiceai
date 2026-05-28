@@ -115,10 +115,7 @@ pub trait RuntimeHandle: Send + Sync + 'static {
 
     /// Attempt an in-place runtime upgrade. v0: always returns an
     /// "unsupported" payload.
-    async fn upgrade_runtime(
-        &self,
-        target_version: &str,
-    ) -> Result<serde_json::Value, String> {
+    async fn upgrade_runtime(&self, target_version: &str) -> Result<serde_json::Value, String> {
         Ok(serde_json::json!({
             "status": "unsupported",
             "requested_version": target_version,

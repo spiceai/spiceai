@@ -64,10 +64,7 @@ fn build_config(runtime_version: &str) -> CloudConnectConfig {
 /// Start the Cloud Connect client if any of the opt-in conditions are
 /// met. The returned `Option<CloudConnect>` is `None` when CloudConnect
 /// is disabled — which is the default for vanilla OSS installs.
-pub async fn maybe_start(
-    runtime_version: &str,
-    runtime: Arc<Runtime>,
-) -> Option<CloudConnect> {
+pub async fn maybe_start(runtime_version: &str, runtime: Arc<Runtime>) -> Option<CloudConnect> {
     let config = build_config(runtime_version);
 
     // Quick sanity probe — if no identity AND no adoption code, skip.
@@ -170,11 +167,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
     /// - Payload byte budget of
     ///   [`runtime_cloud_connect::arrow_json::PAYLOAD_SIZE_BUDGET_BYTES`]
     ///   — exceeding either cap sets `truncated: true`.
-    async fn execute_sql(
-        &self,
-        sql: &str,
-        max_rows: u32,
-    ) -> Result<serde_json::Value, String> {
+    async fn execute_sql(&self, sql: &str, max_rows: u32) -> Result<serde_json::Value, String> {
         let cap = resolve_run_query_cap(max_rows);
 
         let df = self.runtime.datafusion();
@@ -220,9 +213,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         );
         // Propagate the source-side truncation flag if we cut off the
         // upstream stream before exhausting it.
-        if source_truncated
-            && let Some(obj) = envelope.as_object_mut()
-        {
+        if source_truncated && let Some(obj) = envelope.as_object_mut() {
             obj.insert("truncated".to_string(), serde_json::Value::Bool(true));
         }
         Ok(envelope)

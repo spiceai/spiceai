@@ -38,8 +38,8 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::Duration;
 
-use snafu::ResultExt;
 use crate::TransportSnafu;
+use snafu::ResultExt;
 use tokio::sync::{RwLock, mpsc};
 use tokio::time;
 use tokio_stream::wrappers::ReceiverStream;
@@ -48,7 +48,9 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 use crate::config::CloudConnectConfig;
 use crate::handlers::RuntimeHandle;
-use crate::heartbeat::{HEARTBEAT_INTERVAL, TELEMETRY_INTERVAL, build_heartbeat, build_telemetry, now_unix};
+use crate::heartbeat::{
+    HEARTBEAT_INTERVAL, TELEMETRY_INTERVAL, build_heartbeat, build_telemetry, now_unix,
+};
 use crate::identity::{Identity, IdentityStore};
 use crate::proto;
 use crate::shutdown::Shutdown;
@@ -154,7 +156,10 @@ impl ClientDriver {
             // Sleep with jitter, then retry.
             let jitter_ms: u64 = rand::random::<u64>() % 500;
             let sleep_for = backoff + Duration::from_millis(jitter_ms);
-            tracing::debug!("Cloud Connect: sleeping {} before reconnect", humanize(sleep_for));
+            tracing::debug!(
+                "Cloud Connect: sleeping {} before reconnect",
+                humanize(sleep_for)
+            );
             tokio::select! {
                 () = time::sleep(sleep_for) => {},
                 () = self.shutdown.wait() => {
@@ -191,8 +196,8 @@ impl ClientDriver {
         }
 
         let channel = build_channel(&self.config)?;
-        let mut grpc =
-            proto::cloud_connect_client::CloudConnectClient::new(channel).max_decoding_message_size(16 * 1024 * 1024);
+        let mut grpc = proto::cloud_connect_client::CloudConnectClient::new(channel)
+            .max_decoding_message_size(16 * 1024 * 1024);
 
         // Outbound channel: we hand the receiver to tonic and keep the
         // sender to push ClientMessages from this task.
@@ -213,7 +218,10 @@ impl ClientDriver {
             .map_err(|status| Error::Stream { source: status })?;
 
         let mut server_stream: Streaming<proto::ControlMessage> = response.into_inner();
-        tracing::info!("Cloud Connect: stream established to {}", self.config.endpoint);
+        tracing::info!(
+            "Cloud Connect: stream established to {}",
+            self.config.endpoint
+        );
 
         // Spawn periodic heartbeat + telemetry tasks. They emit through
         // the same outbound channel. The identifier is shared by RwLock
@@ -331,10 +339,7 @@ impl ClientDriver {
 
         match body {
             proto::control_message::Body::Ack(ack) => {
-                tracing::debug!(
-                    "Cloud Connect: ack for command_id={}",
-                    ack.for_command_id
-                );
+                tracing::debug!("Cloud Connect: ack for command_id={}", ack.for_command_id);
             }
             proto::control_message::Body::GetRuntimeInfo(cmd) => {
                 let info = self.runtime.runtime_info_json().await;
@@ -418,21 +423,13 @@ impl ClientDriver {
                         // The default impl returns "unsupported"; treat
                         // that as a soft failure so cloud sees the
                         // intent clearly.
-                        let success = payload
-                            .get("status")
-                            .and_then(serde_json::Value::as_str)
+                        let success = payload.get("status").and_then(serde_json::Value::as_str)
                             != Some("unsupported");
                         send_result(tx, &cmd.command_id, success, "", payload).await;
                     }
                     Err(err) => {
-                        send_result(
-                            tx,
-                            &cmd.command_id,
-                            false,
-                            &err,
-                            serde_json::Value::Null,
-                        )
-                        .await;
+                        send_result(tx, &cmd.command_id, false, &err, serde_json::Value::Null)
+                            .await;
                     }
                 }
             }

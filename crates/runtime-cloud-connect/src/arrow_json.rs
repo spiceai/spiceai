@@ -63,12 +63,11 @@ use std::sync::Arc;
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
     Decimal128Array, Decimal256Array, FixedSizeBinaryArray, FixedSizeListArray, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
-    LargeListArray, LargeStringArray, ListArray, MapArray, RecordBatch, StringArray,
-    StringViewArray, StructArray, Time32MillisecondArray, Time32SecondArray,
-    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeListArray,
+    LargeStringArray, ListArray, MapArray, RecordBatch, StringArray, StringViewArray, StructArray,
+    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use base64::Engine as _;
@@ -362,7 +361,9 @@ impl_array_value_at!(UInt64Array, u64);
 
 fn f32_to_json(v: f32) -> Value {
     if v.is_finite() {
-        Number::from_f64(f64::from(v)).map(Value::Number).unwrap_or(Value::Null)
+        Number::from_f64(f64::from(v))
+            .map(Value::Number)
+            .unwrap_or(Value::Null)
     } else {
         // JSON cannot represent NaN / +Inf / -Inf.
         Value::Null
@@ -371,7 +372,9 @@ fn f32_to_json(v: f32) -> Value {
 
 fn f64_to_json(v: f64) -> Value {
     if v.is_finite() {
-        Number::from_f64(v).map(Value::Number).unwrap_or(Value::Null)
+        Number::from_f64(v)
+            .map(Value::Number)
+            .unwrap_or(Value::Null)
     } else {
         Value::Null
     }
@@ -480,8 +483,7 @@ fn timestamp_to_json(array: &ArrayRef, idx: usize, unit: TimeUnit, tz: Option<&s
     if let Some(tz) = tz {
         // Parse named offsets like "+07:00" / "-05:00" / "UTC" / "Z".
         if let Some(offset) = parse_fixed_offset(tz) {
-            let dt = offset
-                .from_utc_datetime(&naive_dt);
+            let dt = offset.from_utc_datetime(&naive_dt);
             return Value::String(dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true));
         }
         // Otherwise stamp it UTC and append a note in the timezone slot.
@@ -626,7 +628,10 @@ fn arrow_data_type_label(dt: &DataType) -> String {
             format!("LargeList<{}>", arrow_data_type_label(field.data_type()))
         }
         DataType::FixedSizeList(field, n) => {
-            format!("FixedSizeList<{}, {n}>", arrow_data_type_label(field.data_type()))
+            format!(
+                "FixedSizeList<{}, {n}>",
+                arrow_data_type_label(field.data_type())
+            )
         }
         DataType::Struct(fields) => {
             let inner: Vec<String> = fields
@@ -663,11 +668,7 @@ mod tests {
             Field::new("s", DataType::Utf8, true),
             Field::new("b", DataType::Boolean, true),
             Field::new("n", DataType::Null, true),
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                true,
-            ),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
         ]);
         let batch = RecordBatch::try_new(
             Arc::clone(&s),
@@ -748,18 +749,10 @@ mod tests {
         ];
         let a_arr: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), Some(2)]));
         let b_arr: ArrayRef = Arc::new(StringArray::from(vec![Some("x"), Some("y")]));
-        let struct_array = StructArray::new(
-            struct_fields.clone().into(),
-            vec![a_arr, b_arr],
-            None,
-        );
+        let struct_array = StructArray::new(struct_fields.clone().into(), vec![a_arr, b_arr], None);
 
         let s = schema(vec![
-            Field::new(
-                "lst",
-                DataType::List(Arc::clone(&list_field)),
-                true,
-            ),
+            Field::new("lst", DataType::List(Arc::clone(&list_field)), true),
             Field::new("st", DataType::Struct(struct_fields.into()), true),
         ]);
 
@@ -810,11 +803,8 @@ mod tests {
         let big = "x".repeat(64 * 1024);
         let values: Vec<Option<String>> = (0..1024).map(|_| Some(big.clone())).collect();
         let s = schema(vec![Field::new("s", DataType::Utf8, false)]);
-        let batch = RecordBatch::try_new(
-            Arc::clone(&s),
-            vec![Arc::new(StringArray::from(values))],
-        )
-        .unwrap();
+        let batch = RecordBatch::try_new(Arc::clone(&s), vec![Arc::new(StringArray::from(values))])
+            .unwrap();
 
         let envelope = encode_record_batches(&[batch], 10_000);
         assert_eq!(envelope["truncated"], Value::Bool(true));

@@ -137,10 +137,9 @@ impl CloudConnect {
         use snafu::ResultExt as _;
 
         let identity_path = config.identity_path.clone();
-        let identity = IdentityStore::load_optional(&identity_path)
-            .context(IdentityLoadSnafu {
-                path: identity_path.clone(),
-            })?;
+        let identity = IdentityStore::load_optional(&identity_path).context(IdentityLoadSnafu {
+            path: identity_path.clone(),
+        })?;
 
         if identity.is_none() && config.adoption_code.is_none() {
             tracing::debug!(
@@ -197,7 +196,11 @@ pub fn is_valid_adoption_code(code: &str) -> bool {
     }
     let mut segments = 0_usize;
     for part in parts {
-        if part.len() != 4 || !part.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
+        if part.len() != 4
+            || !part
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        {
             return false;
         }
         segments += 1;
@@ -222,7 +225,9 @@ mod tests {
     fn accepts_canonical_adoption_code() {
         assert!(is_valid_adoption_code("SPICE-ADOPT-7K2P-9XYZ-A1B2"));
         assert!(is_valid_adoption_code("SPICE-ADOPT-AAAA-BBBB"));
-        assert!(is_valid_adoption_code("SPICE-ADOPT-1111-2222-3333-4444-5555"));
+        assert!(is_valid_adoption_code(
+            "SPICE-ADOPT-1111-2222-3333-4444-5555"
+        ));
     }
 
     #[test]
