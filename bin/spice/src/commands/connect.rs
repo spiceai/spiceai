@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! Two distinct use cases share this command:
 //!
-//! 1. **Cloud Connect adoption** (UniFi-style management of `spiced` from
+//! 1. **Cloud Connect adoption** (remote management of `spiced` from
 //!    Spice Cloud). The user passes an adoption code obtained in the
 //!    Spice Cloud portal:
 //!
@@ -46,14 +46,19 @@ use clap::{Args, Subcommand};
     about = "Connect this instance to Spice Cloud (or add a cloud-hosted Spicepod)",
     long_about = r#"`spice connect` has two modes:
 
-CLOUD CONNECT ADOPTION (UniFi-style):
+CLOUD CONNECT ADOPTION:
   spice connect SPICE-ADOPT-XXXX-XXXX     Stage an adoption code so the next
                                           `spiced` start connects to Spice Cloud
                                           and is shown as "Pending Adoption" in
                                           the portal.
   spice connect status                    Show the current adoption state.
-  spice connect forget                    Clear the local identity. spiced
-                                          continues to run unmanaged.
+  spice connect forget                    Clear the local identity on disk.
+                                          A running `spiced` keeps its
+                                          in-memory identity and active stream
+                                          until it is restarted (or the cloud
+                                          sends Forget / the stream drops), so
+                                          restart spiced to stop remote
+                                          management immediately.
 
 LEGACY POD-ADD BEHAVIOR:
   spice connect <org>/<pod>               Equivalent to `spice add <org>/<pod>`

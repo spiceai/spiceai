@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! Outbound control-plane client that lets a standalone `spiced` runtime be
 //! discovered and managed by Spice Cloud (or any compatible control plane)
-//! using a UniFi-style adoption flow:
+//! using a adoption flow:
 //!
 //! 1. Admin in Spice Cloud generates a single-use adoption code.
 //! 2. User runs `spice connect <code>` (or sets `SPICE_ADOPT_CODE`).
@@ -41,8 +41,6 @@ limitations under the License.
 //! Call [`CloudConnect::start`] from the runtime bootstrap. It returns a
 //! handle whose tokio task crashes/disconnects are isolated from the rest
 //! of the process; the runtime stays up.
-
-#![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
 pub mod arrow_json;
 pub mod config;

@@ -68,10 +68,21 @@ pub async fn maybe_start(runtime_version: &str, runtime: Arc<Runtime>) -> Option
     let config = build_config(runtime_version);
 
     // Quick sanity probe — if no identity AND no adoption code, skip.
-    let has_identity = IdentityStore::load_optional(&config.identity_path)
-        .ok()
-        .flatten()
-        .is_some();
+    // Surface a load/parse error (corrupt or unreadable identity.json)
+    // rather than silently treating it as "not adopted", so a broken
+    // identity file is visible to the operator instead of quietly
+    // disabling Cloud Connect.
+    let has_identity = match IdentityStore::load_optional(&config.identity_path) {
+        Ok(opt) => opt.is_some(),
+        Err(err) => {
+            tracing::warn!(
+                "Spice Cloud Connect: could not read identity at {}: {err}; \
+                 treating as not-adopted — fix or remove the file to re-adopt",
+                config.identity_path.display()
+            );
+            false
+        }
+    };
     if !has_identity && config.adoption_code.is_none() {
         tracing::debug!(
             "Spice Cloud Connect: disabled (no identity at {} and no adoption code)",

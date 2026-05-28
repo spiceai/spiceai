@@ -802,7 +802,7 @@ pub async fn run(args: Args) -> Result<()> {
         Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await
     });
 
-    // Spice Cloud Connect (UniFi-style adoption). Default off — only
+    // Spice Cloud Connect. Default off — only
     // activates when an identity is on disk or an adoption code is
     // available. Failures here are non-fatal: spiced keeps running.
     let cloud_connect_handle =

@@ -31,7 +31,7 @@ limitations under the License.
 //!
 //! If a Forget arrives, we clear the local identity and exit the
 //! cloud-connect task — spiced itself stays up and keeps serving local
-//! spicepod traffic as before. This matches the UniFi semantics where
+//! spicepod traffic as before. This matches the adoption semantics where
 //! "Forget" releases management but doesn't destroy the device. To
 //! re-adopt, the user runs `spice connect <code>` and restarts spiced.
 
@@ -212,10 +212,17 @@ impl ClientDriver {
         .map_err(|_| Error::NoCredentials)?;
 
         let request = tonic::Request::new(ReceiverStream::new(rx));
-        let response = grpc
-            .stream(request)
-            .await
-            .map_err(|status| Error::Stream { source: status })?;
+        // Keep shutdown bounded across a slow connect/handshake: if the
+        // process is shutting down while `stream()` is still negotiating,
+        // abort the connect instead of letting it run detached past the
+        // shutdown timeout.
+        let response = tokio::select! {
+            res = grpc.stream(request) => res.map_err(|status| Error::Stream { source: status })?,
+            () = self.shutdown.wait() => {
+                tracing::info!("Cloud Connect: shutdown requested during handshake; aborting connect");
+                return Ok(ExitReason::Shutdown);
+            }
+        };
 
         let mut server_stream: Streaming<proto::ControlMessage> = response.into_inner();
         tracing::info!(
@@ -371,12 +378,14 @@ impl ClientDriver {
                         emit_run_query_audit(
                             tx,
                             &identifier,
-                            &cmd.command_id,
-                            &sql_hash,
-                            row_count,
-                            truncated,
-                            duration_ms,
-                            true,
+                            &RunQueryAudit {
+                                command_id: &cmd.command_id,
+                                sql_hash: &sql_hash,
+                                row_count,
+                                truncated,
+                                duration_ms,
+                                success: true,
+                            },
                         )
                         .await;
                         send_result(tx, &cmd.command_id, true, "", payload).await;
@@ -386,12 +395,14 @@ impl ClientDriver {
                         emit_run_query_audit(
                             tx,
                             &identifier,
-                            &cmd.command_id,
-                            &sql_hash,
-                            0,
-                            false,
-                            duration_ms,
-                            false,
+                            &RunQueryAudit {
+                                command_id: &cmd.command_id,
+                                sql_hash: &sql_hash,
+                                row_count: 0,
+                                truncated: false,
+                                duration_ms,
+                                success: false,
+                            },
                         )
                         .await;
                         // Safe error: never includes the SQL text.
@@ -492,7 +503,21 @@ impl ClientDriver {
             not_after_unix: cmd.not_after_unix,
         };
 
-        if let Err(err) = IdentityStore::store(&self.config.identity_path, &identity) {
+        // Identity persistence is synchronous filesystem work (write +
+        // fsync), so run it on the blocking pool rather than blocking a
+        // Tokio worker thread on the async dispatch path.
+        let store_path = self.config.identity_path.clone();
+        let store_identity = identity.clone();
+        let persist = tokio::task::spawn_blocking(move || {
+            IdentityStore::store(&store_path, &store_identity)
+        })
+        .await;
+        let persist_err: Option<String> = match persist {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(join) => Some(format!("identity persistence task panicked: {join}")),
+        };
+        if let Some(err) = persist_err {
             tracing::error!(
                 "Cloud Connect: failed to persist identity at {}: {err}",
                 self.config.identity_path.display()
@@ -707,6 +732,19 @@ fn sql_hash(sql: &str) -> String {
     out
 }
 
+/// Return the longest prefix of `s` no longer than `max` bytes that ends on
+/// a UTF-8 char boundary. Used to bound work on the error-redaction path.
+fn bounded_prefix(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Trim a runtime error string to a short, safe summary. We deliberately
 /// avoid surfacing the full DataFusion error message because it can
 /// echo back the SQL fragment, table contents, or row values that
@@ -723,7 +761,13 @@ fn sql_hash(sql: &str) -> String {
 /// 4. Cap at 256 chars.
 fn sanitize_error(err: &str, sql: &str) -> String {
     const MAX_LEN: usize = 256;
+    // Bound the work on the error path: inbound gRPC errors can be up to
+    // 16 MiB and a pathological one may have no newlines, so cap the slice
+    // we scan/redact. The result is truncated to MAX_LEN anyway, so a few
+    // KiB of context is far more than enough.
+    const MAX_SCAN: usize = 8 * 1024;
     let first_line = err.lines().next().unwrap_or("query failed");
+    let first_line = bounded_prefix(first_line, MAX_SCAN);
     let no_sql = redact_sql_occurrences(first_line, sql);
     let redacted = redact_quoted_spans(&no_sql);
     if redacted.len() <= MAX_LEN {
@@ -745,7 +789,13 @@ fn redact_sql_occurrences(input: &str, sql: &str) -> String {
     /// every error message. Tuned empirically.
     const MIN_SQL_FRAGMENT_LEN: usize = 16;
 
-    let sql_trim = sql.trim();
+    // Cap the SQL length the O(n²) fragment scan walks over. The input is
+    // already bounded by the caller; bounding the SQL keeps the sliding
+    // window cheap for very large queries. A prefix is enough — any leaked
+    // fragment of the query is still redacted up to this length.
+    const MAX_SQL_SCAN: usize = 4 * 1024;
+
+    let sql_trim = bounded_prefix(sql.trim(), MAX_SQL_SCAN);
     if sql_trim.is_empty() {
         return input.to_string();
     }
@@ -817,18 +867,30 @@ fn redact_quoted_spans(input: &str) -> String {
     out
 }
 
-/// Emit a `kind: "audit"` EventLog describing a RunQuery invocation.
-#[allow(clippy::too_many_arguments)]
-async fn emit_run_query_audit(
-    tx: &mpsc::Sender<proto::ClientMessage>,
-    identifier: &str,
-    command_id: &str,
-    sql_hash: &str,
+/// Fields describing a single RunQuery invocation for the audit log.
+struct RunQueryAudit<'a> {
+    command_id: &'a str,
+    sql_hash: &'a str,
     row_count: u64,
     truncated: bool,
     duration_ms: u64,
     success: bool,
+}
+
+/// Emit a `kind: "audit"` EventLog describing a RunQuery invocation.
+async fn emit_run_query_audit(
+    tx: &mpsc::Sender<proto::ClientMessage>,
+    identifier: &str,
+    audit: &RunQueryAudit<'_>,
 ) {
+    let RunQueryAudit {
+        command_id,
+        sql_hash,
+        row_count,
+        truncated,
+        duration_ms,
+        success,
+    } = *audit;
     let event = serde_json::json!({
         "action": "run_query",
         "sql_hash": sql_hash,

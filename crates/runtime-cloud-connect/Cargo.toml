@@ -1,6 +1,6 @@
 [package]
 name = "runtime-cloud-connect"
-description = "Outbound control-plane client for Spice Cloud Connect (UniFi-style adoption for standalone spiced)"
+description = "Outbound control-plane client for Spice Cloud Connect (adoption flow for standalone spiced)"
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
