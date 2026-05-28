@@ -572,22 +572,28 @@ mod tests {
 
     #[test]
     fn test_org_based_with_invalid_character_is_err() {
-        assert!("myorg.my$account"
-            .parse::<SnowflakeAccountIdentifier>()
-            .is_err());
+        assert!(
+            "myorg.my$account"
+                .parse::<SnowflakeAccountIdentifier>()
+                .is_err()
+        );
     }
 
     #[test]
     fn test_legacy_with_empty_region_segment_is_err() {
-        assert!("xy12345..aws"
-            .parse::<SnowflakeAccountIdentifier>()
-            .is_err());
+        assert!(
+            "xy12345..aws"
+                .parse::<SnowflakeAccountIdentifier>()
+                .is_err()
+        );
     }
 
     #[test]
     fn test_legacy_with_empty_cloud_segment_is_err() {
-        assert!("xy12345.us-east-1."
-            .parse::<SnowflakeAccountIdentifier>()
-            .is_err());
+        assert!(
+            "xy12345.us-east-1."
+                .parse::<SnowflakeAccountIdentifier>()
+                .is_err()
+        );
     }
 }
