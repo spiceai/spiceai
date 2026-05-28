@@ -31,14 +31,37 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use datafusion::common::ParamValues;
 use datafusion::datasource::TableProvider;
+use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
+use snafu::Snafu;
 
 use crate::allowlist::ResolvedTableAwareAllowlist;
 
 /// Errors returned by [`QueryEngine`] methods.
-pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+#[derive(Snafu, Debug)]
+pub enum Error {
+    #[snafu(display("Failed to retrieve schema for table '{table_ref}'"))]
+    GetSchema {
+        table_ref: String,
+        source: DataFusionError,
+    },
+
+    #[snafu(display("Failed to retrieve public table names"))]
+    GetTableNames { source: DataFusionError },
+
+    #[snafu(display("Query execution failed"))]
+    QueryExecution { source: DataFusionError },
+
+    #[snafu(display("Failed to write data to table '{table_ref}'"))]
+    WriteData {
+        table_ref: String,
+        source: DataFusionError,
+    },
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// Options for a SQL query executed via [`QueryEngine::execute_query`].
 pub struct QueryRequest {
@@ -132,7 +155,7 @@ pub trait QueryEngine: Send + Sync + Debug {
     fn table_exists(&self, table_ref: &TableReference) -> bool;
 
     /// Get the Arrow schema for a dataset.
-    async fn get_arrow_schema(&self, table_ref: TableReference) -> Result<Schema, BoxError>;
+    async fn get_arrow_schema(&self, table_ref: TableReference) -> Result<Schema>;
 
     /// Get user-visible table names (excludes internal schemas like `runtime`).
     fn get_user_table_names(&self) -> Vec<TableReference>;
@@ -142,7 +165,7 @@ pub trait QueryEngine: Send + Sync + Debug {
     /// # Errors
     ///
     /// Returns an error if the underlying table metadata cannot be read.
-    fn get_public_table_names(&self) -> Result<Vec<String>, BoxError>;
+    fn get_public_table_names(&self) -> Result<Vec<String>>;
 
     // --- Access control ---
 
@@ -158,10 +181,7 @@ pub trait QueryEngine: Send + Sync + Debug {
     ///
     /// This is the primary query execution entry point. The implementation
     /// handles planning, validation, caching, and telemetry internally.
-    async fn execute_query(
-        &self,
-        request: QueryRequest,
-    ) -> Result<SendableRecordBatchStream, BoxError>;
+    async fn execute_query(&self, request: QueryRequest) -> Result<SendableRecordBatchStream>;
 
     // --- Data write ---
 
@@ -175,5 +195,5 @@ pub trait QueryEngine: Send + Sync + Debug {
         schema: Arc<Schema>,
         data: Vec<RecordBatch>,
         update_type: UpdateType,
-    ) -> Result<(), BoxError>;
+    ) -> Result<()>;
 }

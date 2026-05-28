@@ -51,6 +51,7 @@ use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
 
+use snafu::ResultExt;
 use {
     crate::cluster::{ExecutorControlStreamRegistry, ExecutorRegistry, ResolvedClusterConfig},
     ballista_executor::executor::Executor,
@@ -99,7 +100,9 @@ use runtime_acceleration::snapshot::AccelerationLayout;
 ))]
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
-use runtime_datafusion::schema_provider::SpiceSchemaProvider;
+use runtime_datafusion::{
+    query_engine::Error as QueryEngineError, schema_provider::SpiceSchemaProvider,
+};
 use runtime_table_partition::provider::PartitionTableProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
@@ -3612,20 +3615,23 @@ impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
     async fn get_arrow_schema(
         &self,
         table_ref: TableReference,
-    ) -> std::result::Result<Schema, runtime_datafusion::query_engine::BoxError> {
-        DataFusion::get_arrow_schema(self, table_ref)
+    ) -> runtime_datafusion::query_engine::Result<Schema> {
+        DataFusion::get_arrow_schema(self, table_ref.clone())
             .await
-            .map_err(Into::into)
+            .map_err(|e| QueryEngineError::GetSchema {
+                table_ref: table_ref.to_string(),
+                source: DataFusionError::External(Box::new(e)),
+            })
     }
 
     fn get_user_table_names(&self) -> Vec<TableReference> {
         DataFusion::get_user_table_names(self)
     }
 
-    fn get_public_table_names(
-        &self,
-    ) -> std::result::Result<Vec<String>, runtime_datafusion::query_engine::BoxError> {
-        DataFusion::get_public_table_names(self).map_err(Into::into)
+    fn get_public_table_names(&self) -> runtime_datafusion::query_engine::Result<Vec<String>> {
+        DataFusion::get_public_table_names(self).map_err(|e| QueryEngineError::GetTableNames {
+            source: DataFusionError::External(Box::new(e)),
+        })
     }
 
     fn is_writable(&self, table_ref: &TableReference) -> bool {
@@ -3639,16 +3645,17 @@ impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
     async fn execute_query(
         &self,
         request: runtime_datafusion::query_engine::QueryRequest,
-    ) -> std::result::Result<
-        datafusion::execution::SendableRecordBatchStream,
-        runtime_datafusion::query_engine::BoxError,
-    > {
+    ) -> runtime_datafusion::query_engine::Result<datafusion::execution::SendableRecordBatchStream>
+    {
         let arc_self = self
             .datafusion_ref
             .get()
             .and_then(std::sync::Weak::upgrade)
-            .ok_or_else(|| -> runtime_datafusion::query_engine::BoxError {
-                "DataFusion self-reference not initialized (call set_self_ref first)".into()
+            .ok_or_else(|| QueryEngineError::QueryExecution {
+                source: DataFusionError::Internal(
+                    "DataFusion self-reference not initialized (call set_self_ref first)"
+                        .to_string(),
+                ),
             })?;
 
         let mut qb = arc_self
@@ -3660,10 +3667,13 @@ impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
         if let Some(allowlist) = request.table_allowlist {
             qb = qb.allow_tables(allowlist);
         }
-        let result = qb.build().run().await.map_err(|e| {
-            let boxed: runtime_datafusion::query_engine::BoxError = Box::new(e);
-            boxed
-        })?;
+        let result = qb
+            .build()
+            .run()
+            .await
+            .map_err(|e| QueryEngineError::QueryExecution {
+                source: DataFusionError::External(Box::new(e)),
+            })?;
         Ok(result.data)
     }
 
@@ -3673,7 +3683,7 @@ impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
         schema: Arc<Schema>,
         data: Vec<RecordBatch>,
         update_type: runtime_datafusion::query_engine::UpdateType,
-    ) -> std::result::Result<(), runtime_datafusion::query_engine::BoxError> {
+    ) -> runtime_datafusion::query_engine::Result<()> {
         let update = DataUpdate {
             schema,
             data,
@@ -3681,7 +3691,10 @@ impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
         };
         DataFusion::write_data(self, table_ref, update)
             .await
-            .map_err(Into::into)
+            .map_err(|e| QueryEngineError::WriteData {
+                table_ref: table_ref.to_string(),
+                source: DataFusionError::External(Box::new(e)),
+            })
     }
 }
 

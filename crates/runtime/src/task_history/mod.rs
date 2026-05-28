@@ -205,6 +205,7 @@ impl TaskSpan {
 
         df.write_data(&table_ref, schema, vec![data], UpdateType::Append)
             .await
+            .boxed()
             .map_err(|source| Error::UnableToWriteToTable { source })?;
 
         // Override trace_ids if necessary. Must be after above write so that it also handles override this batch of spans.
@@ -232,6 +233,7 @@ impl TaskSpan {
         let overriden: Vec<_> = df
             .execute_query(QueryRequest::new(sql))
             .await
+            .boxed()
             .map_err(|source| Error::UnableToUpdateTraces { source })?
             .try_collect::<Vec<RecordBatch>>()
             .await
@@ -256,6 +258,7 @@ impl TaskSpan {
 
         df.write_data(&table_ref, schema, overriden, UpdateType::Changes)
             .await
+            .boxed()
             .map_err(|source| Error::UnableToUpdateTraces { source })?;
 
         Ok(())
