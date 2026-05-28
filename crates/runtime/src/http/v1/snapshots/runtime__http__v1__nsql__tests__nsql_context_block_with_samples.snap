@@ -1,0 +1,41 @@
+---
+source: crates/runtime/src/http/v1/nsql.rs
+expression: "render_nsql_context_block(&tables, schema_context, function_context,\n&sample_context_blocks,)"
+---
+# Spice.ai NSQL Context
+
+Use this context to write SQL for the Spice runtime. Return only valid SQL code, without markdown fences. Quote column names that contain capitals. For tables with schemas and catalogs, use `"catalog"."schema"."table"`, not `"catalog.schema.table"`. Schema metadata includes table and column comments/descriptions when supplied by the connector or Spicepod.
+
+## Datasets
+- `sales.orders`
+- `support_tickets`
+
+## Schemas
+| table_reference | column_name | data_type | nullable | description |
+| --- | --- | --- | --- | --- |
+| sales.orders | order_id | Int64 | false | Unique order identifier |
+| sales.orders | customer_id | Utf8 | false | Customer account identifier |
+| support_tickets | ticket_id | Int64 | false | Support ticket identifier |
+| support_tickets | sentiment | Utf8 | true | Model-derived sentiment label |
+
+## SQL Functions
+Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions:
+
+### Spice-specific functions
+- `text_search`: Runs full-text search over a configured searchable dataset. Syntax: `text_search(table => 'dataset', query => 'text')`.
+
+### User-defined functions
+- `ticket_priority`: scalar function from `sql` with `stable` volatility. Syntax: `ticket_priority(sentiment utf8) -> int64`. Converts support-ticket sentiment into a priority score.
+
+## Sample Data
+
+### Distinct value samples for `support_tickets`
+| sentiment |
+| --- |
+| positive |
+| negative |
+
+### Example rows for `sales.orders`
+| order_id | customer_id |
+| --- | --- |
+| 42 | CUST-1 |

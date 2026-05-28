@@ -1503,6 +1503,73 @@ mod tests {
     }
 
     #[test]
+    fn nsql_context_block_snapshot() {
+        let tables = vec![
+            TableReference::parse_str("sales.orders"),
+            TableReference::parse_str("support_tickets"),
+        ];
+        let schema_context = r#"
+| table_reference | column_name | data_type | nullable | description |
+| --- | --- | --- | --- | --- |
+| sales.orders | order_id | Int64 | false | Unique order identifier |
+| sales.orders | customer_id | Utf8 | false | Customer account identifier |
+| support_tickets | ticket_id | Int64 | false | Support ticket identifier |
+| support_tickets | sentiment | Utf8 | true | Model-derived sentiment label |
+"#;
+        let function_context = r#"
+Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions:
+
+### Spice-specific functions
+- `text_search`: Runs full-text search over a configured searchable dataset. Syntax: `text_search(table => 'dataset', query => 'text')`.
+
+### User-defined functions
+- `ticket_priority`: scalar function from `sql` with `stable` volatility. Syntax: `ticket_priority(sentiment utf8) -> int64`. Converts support-ticket sentiment into a priority score.
+"#;
+        let sample_context_blocks = vec![
+            SampleContextBlock {
+                title: "Distinct value samples for `support_tickets`".to_string(),
+                content: "| sentiment |\n| --- |\n| positive |\n| negative |".to_string(),
+            },
+            SampleContextBlock {
+                title: "Example rows for `sales.orders`".to_string(),
+                content: "| order_id | customer_id |\n| --- | --- |\n| 42 | CUST-1 |".to_string(),
+            },
+        ];
+
+        insta::assert_snapshot!(
+            "nsql_context_block_with_samples",
+            render_nsql_context_block(
+                &tables,
+                schema_context,
+                function_context,
+                &sample_context_blocks,
+            )
+        );
+    }
+
+    #[test]
+    fn nsql_user_function_context_snapshot() {
+        let app = app_with_functions(
+            true,
+            vec![
+                test_function("Haversine_Km", true),
+                test_table_function("Rows_Fn", true),
+            ],
+        );
+        let available_names = HashSet::from(["haversine_km".to_string(), "rows_fn".to_string()]);
+        let user_function_infos = vec![
+            test_user_function_info("Rows_Fn"),
+            test_user_function_info("Haversine_Km"),
+        ];
+        let entries = user_function_context_entries(&app, &available_names, user_function_infos);
+        let mut output = String::new();
+
+        write_user_function_context_entries(&mut output, &entries);
+
+        insta::assert_snapshot!("nsql_user_function_context", output);
+    }
+
+    #[test]
     fn user_function_context_entries_include_registered_spicepod_signatures() {
         let app = app_with_functions(
             true,
