@@ -20,7 +20,6 @@ use std::{
 };
 
 use super::SampleFrom;
-use crate::datafusion::DataFusion;
 use crate::datafusion::error::format_datafusion_error;
 use arrow::{array::RecordBatch, compute::concat_batches};
 use datafusion::{
@@ -38,6 +37,7 @@ use datafusion::{
     },
 };
 use futures::TryStreamExt;
+use runtime_datafusion::query_engine::{QueryEngine, QueryRequest};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu, ensure};
@@ -89,7 +89,7 @@ impl Display for TopSamplesParams {
 impl SampleFrom for TopSamplesParams {
     async fn sample(
         &self,
-        df: Arc<DataFusion>,
+        df: Arc<dyn QueryEngine>,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
         let order_by = sanitize_order_by(self.order_by.as_str())
             .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
@@ -99,26 +99,25 @@ impl SampleFrom for TopSamplesParams {
         let tbl_quoted = quote_table_reference(&tbl);
 
         let batches = async {
-            df.query_builder(&format!(
-                "SELECT * FROM {tbl} ORDER BY {order_by} LIMIT {limit}",
-                limit = self.limit,
-                tbl = tbl_quoted,
-            ))
-            .build()
-            .run()
-            .await
-            .boxed()?
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .boxed()
+            let stream = df
+                .execute_query(QueryRequest::new(format!(
+                    "SELECT * FROM {tbl} ORDER BY {order_by} LIMIT {limit}",
+                    limit = self.limit,
+                    tbl = tbl_quoted,
+                )))
+                .await?;
+            stream
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
         }
         .instrument(current_span)
         .await?;
 
-        let schema = Arc::new(df.get_arrow_schema(tbl).await.boxed()?);
+        let schema = Arc::new(df.get_arrow_schema(tbl).await?);
 
-        concat_batches(&schema, batches.iter()).boxed()
+        concat_batches(&schema, batches.iter())
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
     }
 }
 

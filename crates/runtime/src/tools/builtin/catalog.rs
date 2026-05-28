@@ -17,6 +17,7 @@ limitations under the License.
 use async_trait::async_trait;
 
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
+use runtime_datafusion::query_engine::QueryEngine;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::{ResultExt, Snafu};
 use spicepod::component::tool::Tool;
@@ -131,6 +132,8 @@ impl BuiltinToolCatalog {
                 self.model_table_allowlist.clone()
             };
 
+        let query_engine: Arc<dyn QueryEngine> = self.rt.datafusion();
+
         match id {
             "get_readiness" => Ok(Arc::new(GetReadinessTool::new(
                 Arc::clone(&self.rt),
@@ -150,23 +153,26 @@ impl BuiltinToolCatalog {
                     .with_table_allowlist(table_allowlist),
             )),
             "sql" => Ok(Arc::new(SqlTool::new(
-                self.rt.datafusion(),
+                Arc::clone(&query_engine),
                 Some(name),
                 description,
                 table_allowlist,
             ))),
             "sample_distinct_columns" => Ok(Arc::new(
-                SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::DistinctColumns)
-                    .with_overrides(Some(name), description)
-                    .with_table_allowlist(table_allowlist),
+                SampleDataTool::new(
+                    Arc::clone(&query_engine),
+                    SampleTableMethod::DistinctColumns,
+                )
+                .with_overrides(Some(name), description)
+                .with_table_allowlist(table_allowlist),
             )),
             "random_sample" => Ok(Arc::new(
-                SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::RandomSample)
+                SampleDataTool::new(Arc::clone(&query_engine), SampleTableMethod::RandomSample)
                     .with_overrides(Some(name), description)
                     .with_table_allowlist(table_allowlist),
             )),
             "top_n_sample" => Ok(Arc::new(
-                SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::TopNSample)
+                SampleDataTool::new(Arc::clone(&query_engine), SampleTableMethod::TopNSample)
                     .with_overrides(Some(name), description)
                     .with_table_allowlist(table_allowlist),
             )),
