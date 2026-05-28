@@ -33,6 +33,7 @@ pub(super) async fn provision_scp_app(
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
     deployment_mode: &DeploymentMode,
+    wait_for_ready: bool,
 ) -> anyhow::Result<RunState> {
     let api_url = args.spice_cloud_api_url.trim_end_matches('/');
     let cloud = commands::build_cloud_client(Some(api_url), args.api_key.as_deref())?;
@@ -132,32 +133,36 @@ pub(super) async fn provision_scp_app(
     eprintln!("[stdio] Creating deployment...");
     commands::create_deployment(&cloud, app_id, args.channel.as_ref()).await?;
 
-    let poll_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
-        .build()?;
-    commands::wait_for_deployment_ready(
-        &poll_client,
-        &cname,
-        &api_key,
-        Duration::from_secs(args.ready_wait),
-    )
-    .await?;
+    if wait_for_ready {
+        let poll_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(600))
+            .build()?;
+        commands::wait_for_deployment_ready(
+            &poll_client,
+            &cname,
+            &api_key,
+            Duration::from_secs(args.ready_wait),
+        )
+        .await?;
 
-    if deployment_mode == &DeploymentMode::Cluster {
-        let executor_wait_timeout = std::env::var("SPIDAPTER_DEPLOYMENT_READY_WAIT")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(120);
+        if deployment_mode == &DeploymentMode::Cluster {
+            let executor_wait_timeout = std::env::var("SPIDAPTER_DEPLOYMENT_READY_WAIT")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(120);
 
-        // after the deployment is reported "ready", wait for executors to connect.
-        // not all executors may be connected yet. executors should know to create missing tables when they join: https://github.com/spiceai/spiceai/issues/9848
-        eprintln!(
-            "[stdio] Deployment is ready, waiting an additional {executor_wait_timeout}s for executors to connect..."
-        );
-        tokio::time::sleep(Duration::from_secs(executor_wait_timeout)).await;
+            // after the deployment is reported "ready", wait for executors to connect.
+            // not all executors may be connected yet. executors should know to create missing tables when they join: https://github.com/spiceai/spiceai/issues/9848
+            eprintln!(
+                "[stdio] Deployment is ready, waiting an additional {executor_wait_timeout}s for executors to connect..."
+            );
+            tokio::time::sleep(Duration::from_secs(executor_wait_timeout)).await;
+        }
+
+        eprintln!("[stdio] Spice Cloud deployment ready for app '{app_name}' at {flight_url}");
+    } else {
+        eprintln!("[stdio] Spice Cloud deployment started for app '{app_name}' at {flight_url} (not waiting for ready)");
     }
-
-    eprintln!("[stdio] Spice Cloud deployment ready for app '{app_name}' at {flight_url}");
 
     let sql_url = format!("https://{cname}.spiceai.io/v1/sql");
 

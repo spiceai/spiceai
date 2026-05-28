@@ -632,6 +632,7 @@ impl Handler for SpidapterHandler {
                         &setup_config,
                         &datasets,
                         &deployment_mode,
+                        true,
                     )
                     .await
                 }
@@ -732,6 +733,7 @@ impl Handler for SpidapterHandler {
                         &setup_config,
                         &datasets,
                         &deployment_mode,
+                        false, // DynamoDB/postgres-debezium writes bypass spiced; don't block on readiness
                     )
                     .await
                 }
