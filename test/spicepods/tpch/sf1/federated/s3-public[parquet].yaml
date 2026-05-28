@@ -1,6 +1,10 @@
 version: v1
 kind: Spicepod
 name: s3-public[parquet]-federated
+runtime:
+  query:
+    # Debug run: cap Ballista shuffle partition fan-out for SF1.
+    target_partitions: 8
 datasets:
   - from: s3://spiceai-public-datasets/tpch/customer/customer.parquet
     name: customer

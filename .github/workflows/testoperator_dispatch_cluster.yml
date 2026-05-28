@@ -205,7 +205,8 @@ jobs:
             local ephemeral_storage_limit="${14}"
             local cayenne_file_path="${15}"
             local cayenne_metadata_dir="${16}"
-            local dispatch_id="${17}"
+            local skip_teardown="${17}"
+            local dispatch_id="${18}"
             local payload
 
             payload="$(python3 - \
@@ -227,6 +228,7 @@ jobs:
               "${ephemeral_storage_limit}" \
               "${cayenne_file_path}" \
               "${cayenne_metadata_dir}" \
+              "${skip_teardown}" \
               "${dispatch_id}" <<'PY'
           import json
           import sys
@@ -249,6 +251,7 @@ jobs:
               "ephemeral_storage_limit",
               "cayenne_file_path",
               "cayenne_metadata_dir",
+              "skip_teardown",
               "dispatch_id",
           ]
           print(json.dumps({"ref": sys.argv[1], "inputs": dict(zip(keys, sys.argv[2:]))}))
@@ -356,6 +359,7 @@ jobs:
             ephemeral_storage_limit="$(field '.tests.bench.ephemeral_storage_limit' '')"
             cayenne_file_path="$(field '.tests.bench.cayenne_file_path' '')"
             cayenne_metadata_dir="$(field '.tests.bench.cayenne_metadata_dir' '')"
+            skip_teardown="$(field '.tests.bench.skip_teardown' 'false')"
 
             echo "  spicepod_path=${spicepod_path}"
             echo "  query_set=${query_set}  scale_factor=${scale_factor}"
@@ -363,6 +367,7 @@ jobs:
             echo "  storage: app=${app_storage_size_gb:-<none>} executor=${executor_storage_size_gb:-<none>} ephemeral=${ephemeral_storage_limit:-<none>}"
             echo "  shuffle_location=${shuffle_location:-<default>}"
             echo "  cayenne_file_path=${cayenne_file_path:-<default>} cayenne_metadata_dir=${cayenne_metadata_dir:-<default>}"
+            echo "  skip_teardown=${skip_teardown}"
             dispatch_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${#dispatched_runs[@]}"
             echo "  custom_image_tag=${IMAGE_TAG}"
             echo "  dispatch_id=${dispatch_id}"
@@ -385,6 +390,7 @@ jobs:
               "${ephemeral_storage_limit}" \
               "${cayenne_file_path}" \
               "${cayenne_metadata_dir}" \
+              "${skip_teardown}" \
               "${dispatch_id}"
 
             dispatched_runs+=("${entry_path}")

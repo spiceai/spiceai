@@ -100,7 +100,15 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let result = run_inner(args, app, spiced_instance).await;
 
     if let Some(session) = system_adapter_session {
-        session.teardown().await;
+        if std::env::var("TESTOPERATOR_SKIP_SYSTEM_ADAPTER_TEARDOWN")
+            .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        {
+            println!(
+                "Skipping system adapter teardown because TESTOPERATOR_SKIP_SYSTEM_ADAPTER_TEARDOWN is set"
+            );
+        } else {
+            session.teardown().await;
+        }
     }
 
     result

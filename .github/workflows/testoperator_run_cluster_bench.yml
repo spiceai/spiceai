@@ -136,6 +136,11 @@ on:
         required: true
         default: '600'
         type: string
+      skip_teardown:
+        description: 'Skip system-adapter teardown so the Spice Cloud app remains available for log collection/debugging'
+        required: false
+        default: false
+        type: boolean
       runner_type:
         description: 'Runner type'
         required: true
@@ -176,6 +181,7 @@ env:
   CB_VALIDATE_RESULTS: ${{ github.event.inputs.validate_results || 'true' }}
   CB_UPDATE_SNAPSHOTS: ${{ github.event.inputs.update_snapshots || 'default' }}
   CB_READY_WAIT: ${{ github.event.inputs.ready_wait || '600' }}
+  CB_SKIP_TEARDOWN: ${{ github.event.inputs.skip_teardown || 'false' }}
   CB_RUNNER_TYPE: ${{ github.event.inputs.runner_type || 'spiceai-dev-runners' }}
 
 jobs:
@@ -298,6 +304,7 @@ jobs:
           SCALE_FACTOR: ${{ env.CB_SCALE_FACTOR }}
           VALIDATE_RESULTS: ${{ env.CB_VALIDATE_RESULTS }}
           READY_WAIT: ${{ env.CB_READY_WAIT }}
+          SKIP_TEARDOWN: ${{ env.CB_SKIP_TEARDOWN }}
           INSTA_UPDATE: ${{ steps.determine_update_snapshots.outputs.update_snapshots }}
           SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
           SCENARIO_QUERY_FILE: ${{ env.CB_SCENARIO_QUERY_FILE }}
@@ -324,6 +331,10 @@ jobs:
           # env vars, which testoperator's child process inherits from this step's
           # env block.
           export SPIDAPTER_EXECUTOR_REPLICAS="${EXECUTOR_REPLICAS}"
+          if [ "${SKIP_TEARDOWN}" = "true" ]; then
+            export TESTOPERATOR_SKIP_SYSTEM_ADAPTER_TEARDOWN=true
+            echo "TESTOPERATOR_SKIP_SYSTEM_ADAPTER_TEARDOWN=true"
+          fi
 
           resolve_spidapter_template() {
             local value="$1"

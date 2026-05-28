@@ -43,7 +43,7 @@ use futures::{Stream, StreamExt};
 use parking_lot::Mutex;
 use runtime_request_context::RequestContext;
 use snafu::Snafu;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span};
 
@@ -372,6 +372,13 @@ impl QueryHandle {
         scheduler: &SchedulerServer<LogicalPlanNode, PhysicalPlanNode>,
         cancel: &CancellationToken,
     ) -> Result<Vec<PartitionLocation>> {
+        let wait_started = Instant::now();
+        tracing::info!(
+            target: "ballista_debug",
+            job_id = %self.ballista_job_id,
+            "SPICE_BALLISTA_DEBUG distributed_wait_start"
+        );
+
         // Subscribe to job state events from the scheduler's broadcast channel
         let mut receiver = scheduler.subscribe_job_updates();
 
@@ -394,10 +401,23 @@ impl QueryHandle {
 
                             match event.state {
                                 BallistaJobState::Completed => {
+                                    tracing::info!(
+                                        target: "ballista_debug",
+                                        job_id = %self.ballista_job_id,
+                                        wait_ms = wait_started.elapsed().as_millis(),
+                                        "SPICE_BALLISTA_DEBUG distributed_completed_event"
+                                    );
                                     // Job completed - fetch the partition locations from the scheduler
                                     return self.fetch_completed_job_locations(scheduler).await;
                                 }
                                 BallistaJobState::Failed(error_message) => {
+                                    tracing::info!(
+                                        target: "ballista_debug",
+                                        job_id = %self.ballista_job_id,
+                                        wait_ms = wait_started.elapsed().as_millis(),
+                                        error = %error_message,
+                                        "SPICE_BALLISTA_DEBUG distributed_failed_event"
+                                    );
                                     let err = QueryHandleError::JobFailed {
                                         message: error_message,
                                     };
@@ -535,7 +555,26 @@ impl QueryHandle {
 
             match job_status.status {
                 Some(job_status::Status::Successful(success)) => {
+                    let fetch_started = Instant::now();
                     let locations = self.convert_partition_locations(success.partition_location)?;
+                    let total_rows: u64 = locations
+                        .iter()
+                        .map(|loc| loc.partition_stats.num_rows().unwrap_or(0))
+                        .sum();
+                    let total_bytes: u64 = locations
+                        .iter()
+                        .map(|loc| loc.partition_stats.num_bytes().unwrap_or(0))
+                        .sum();
+                    tracing::info!(
+                        target: "ballista_debug",
+                        job_id = %self.ballista_job_id,
+                        attempt,
+                        locations = locations.len(),
+                        total_rows,
+                        total_bytes,
+                        fetch_locations_ms = fetch_started.elapsed().as_millis(),
+                        "SPICE_BALLISTA_DEBUG distributed_locations_ready"
+                    );
                     self.finish_tracker_success();
                     return Ok(locations);
                 }
@@ -820,6 +859,22 @@ impl QueryHandle {
 
     /// Creates a stream that lazily fetches results from the partition locations.
     fn fetch_results_stream(&self, locations: Vec<PartitionLocation>) -> SendableRecordBatchStream {
+        let total_rows: u64 = locations
+            .iter()
+            .map(|loc| loc.partition_stats.num_rows().unwrap_or(0))
+            .sum();
+        let total_bytes: u64 = locations
+            .iter()
+            .map(|loc| loc.partition_stats.num_bytes().unwrap_or(0))
+            .sum();
+        tracing::info!(
+            target: "ballista_debug",
+            job_id = %self.ballista_job_id,
+            locations = locations.len(),
+            total_rows,
+            total_bytes,
+            "SPICE_BALLISTA_DEBUG distributed_fetch_results_stream"
+        );
         let use_tls = self.df.cluster_config.client_tls_config().is_some();
 
         // If TLS is configured, create a custom endpoint override function
@@ -949,6 +1004,20 @@ impl PartitionResultStream {
     ) -> NextPartitionResultStream {
         Box::pin(async move {
             let executor_meta = &location.executor_meta;
+            let connect_started = Instant::now();
+            tracing::info!(
+                target: "ballista_debug",
+                job_id = %location.partition_id.job_id,
+                stage_id = location.partition_id.stage_id,
+                partition_id = location.partition_id.partition_id,
+                executor_id = %executor_meta.id,
+                host = %executor_meta.host,
+                port = executor_meta.port,
+                path = %location.path,
+                rows = location.partition_stats.num_rows().unwrap_or(0),
+                bytes = location.partition_stats.num_bytes().unwrap_or(0),
+                "SPICE_BALLISTA_DEBUG result_partition_fetch_start"
+            );
 
             // Create Ballista client to connect to executor
             let mut client = ballista_core::client::BallistaClient::try_new(
@@ -969,6 +1038,8 @@ impl PartitionResultStream {
                 )))
             })?;
 
+            let client_connect_ms = connect_started.elapsed().as_millis();
+            let fetch_started = Instant::now();
             let stream = client
                 .fetch_partition(
                     &executor_meta.id,
@@ -987,6 +1058,17 @@ impl PartitionResultStream {
                         ),
                     )))
                 })?;
+
+            tracing::info!(
+                target: "ballista_debug",
+                job_id = %location.partition_id.job_id,
+                stage_id = location.partition_id.stage_id,
+                partition_id = location.partition_id.partition_id,
+                executor_id = %executor_meta.id,
+                client_connect_ms,
+                fetch_stream_ms = fetch_started.elapsed().as_millis(),
+                "SPICE_BALLISTA_DEBUG result_partition_fetch_stream_ready"
+            );
 
             Ok(stream)
         })

@@ -1629,6 +1629,41 @@ pub async fn initialize_cluster_executor(
     })
 }
 
+async fn resolve_runtime_query_target_partitions(rt: &Runtime) -> Option<usize> {
+    let target_partitions = if let Some(runtime) = rt.config.runtime.as_ref() {
+        runtime
+            .query
+            .as_ref()
+            .and_then(|query| query.target_partitions)
+    } else {
+        let app_ref = rt.app();
+        let app_guard = app_ref.read().await;
+        app_guard
+            .as_ref()
+            .and_then(|app| app.runtime.query.as_ref())
+            .and_then(|query| query.target_partitions)
+    };
+
+    let target_partitions = match target_partitions {
+        Some(0) => {
+            tracing::warn!(
+                "Ignoring runtime.query.target_partitions=0; value must be greater than 0"
+            );
+            None
+        }
+        Some(value) => Some(value),
+        None => None,
+    };
+
+    tracing::info!(
+        target: "ballista_debug",
+        configured_target_partitions = ?target_partitions,
+        "SPICE_BALLISTA_DEBUG resolved_runtime_query_target_partitions"
+    );
+
+    target_partitions
+}
+
 async fn create_scheduler_server(
     rt: &Arc<Runtime>,
 ) -> crate::Result<(
@@ -1805,19 +1840,25 @@ async fn create_scheduler_server(
         }
     });
 
-    // Create the session builder that will build SessionState from SessionConfig
-    // Uses the dynamic total_executor_slots to set target_partitions
+    let configured_target_partitions = resolve_runtime_query_target_partitions(rt).await;
+
+    // Create the session builder that will build SessionState from SessionConfig.
+    // Explicit `runtime.query.target_partitions` wins. If it is not set, use
+    // the aggregate executor slots once executors register, with Ballista's
+    // standalone default as the bootstrap fallback.
     let slots_for_session = Arc::clone(&total_executor_slots);
     let session_builder: ballista_scheduler::scheduler_server::SessionBuilder =
         Arc::new(move |incoming_cfg| {
-            // Get dynamic target_partitions based on cluster capacity
             let total_slots = slots_for_session.load(Ordering::Relaxed);
-            let target_partitions = if total_slots > 0 { total_slots } else { 16 };
+            let target_partitions = configured_target_partitions
+                .unwrap_or_else(|| if total_slots > 0 { total_slots } else { 16 });
 
-            tracing::debug!(
+            tracing::info!(
+                target: "ballista_debug",
                 total_slots,
+                configured_target_partitions = ?configured_target_partitions,
                 target_partitions,
-                "Cluster session_builder: setting target_partitions based on cluster capacity"
+                "SPICE_BALLISTA_DEBUG cluster_session_target_partitions"
             );
 
             // Inherit any `SpiceRequestContextConfig` set on the incoming
@@ -1870,19 +1911,20 @@ async fn create_scheduler_server(
                 .build())
         });
 
-    // Create config_producer that dynamically sets target_partitions based on cluster capacity
-    // Reads from the atomic counter updated by the background task above
+    // Create config_producer with the same target_partitions semantics as the
+    // session builder. Reads from the atomic counter updated by the background task above.
     let slots_for_config = Arc::clone(&total_executor_slots);
     let config_producer: ConfigProducer = Arc::new(move || {
         let total_slots = slots_for_config.load(Ordering::Relaxed);
+        let target_partitions = configured_target_partitions
+            .unwrap_or_else(|| if total_slots > 0 { total_slots } else { 16 });
 
-        // Use total slots if executors have registered, otherwise fall back to default
-        let target_partitions = if total_slots > 0 { total_slots } else { 16 };
-
-        tracing::debug!(
+        tracing::info!(
+            target: "ballista_debug",
             total_slots,
+            configured_target_partitions = ?configured_target_partitions,
             target_partitions,
-            "Cluster config_producer: setting target_partitions based on cluster capacity"
+            "SPICE_BALLISTA_DEBUG cluster_config_target_partitions"
         );
 
         SessionConfig::new_with_ballista()

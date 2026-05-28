@@ -345,6 +345,7 @@ impl Query {
         request_context: Arc<RequestContext>,
         span: Span,
     ) -> Result<QueryHandle> {
+        let submit_started = Instant::now();
         crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
 
         // Get the scheduler server
@@ -356,10 +357,15 @@ impl Query {
         // request's trace ids to executors through Ballista's
         // `TaskDefinition` props; the scheduler-side session builder reads
         // it back out and re-injects it on the built session config.
+        //
+        // Do not set `target_partitions` here. The scheduler owns the
+        // cluster-wide semantics: explicit `runtime.query.target_partitions`
+        // wins, otherwise it falls back to aggregate executor slots.
         let session_config = datafusion::prelude::SessionConfig::new_with_ballista()
             .with_option_extension(SpiceRequestContextConfig::from_request_context(
                 &request_context,
             ));
+        let session_started = Instant::now();
         let session_ctx = scheduler
             .state
             .session_manager
@@ -368,11 +374,18 @@ impl Query {
             .map_err(|e| Error::SessionCreationFailed {
                 message: e.to_string(),
             })?;
+        tracing::info!(
+            target: "ballista_debug",
+            job_id,
+            session_ms = session_started.elapsed().as_millis(),
+            "SPICE_BALLISTA_DEBUG distributed_session_ready"
+        );
 
         // Get the session state for planning
         let session = session_ctx.state();
 
         // Get logical plan and cache key, reusing existing cache infrastructure
+        let planning_started = Instant::now();
         let (plan, mut tracker, cache_key) = match &self.sql {
             QueryMethod::Text {
                 sql,
@@ -397,7 +410,13 @@ impl Query {
                 .await?
                 {
                     cache::PlanOrCached::Cached(cached_result) => {
-                        tracing::debug!(job_id, "Returning cached result for distributed query");
+                        tracing::info!(
+                            target: "ballista_debug",
+                            job_id,
+                            planning_ms = planning_started.elapsed().as_millis(),
+                            total_ms = submit_started.elapsed().as_millis(),
+                            "SPICE_BALLISTA_DEBUG distributed_plan_cache_hit"
+                        );
                         // Return a QueryHandle with cached results
                         let schema = cached_result.data.schema();
                         return Ok(QueryHandle::new_with_cached_result(
@@ -435,10 +454,13 @@ impl Query {
                     if !cached_result.is_stale(ttl, now)
                         && let Ok(records) = cached_result.records().await
                     {
-                        tracing::debug!(
+                        tracing::info!(
+                            target: "ballista_debug",
                             job_id,
                             cache_key = plan_cache_key.as_u64(),
-                            "Returning cached result for distributed query (plan)"
+                            planning_ms = planning_started.elapsed().as_millis(),
+                            total_ms = submit_started.elapsed().as_millis(),
+                            "SPICE_BALLISTA_DEBUG distributed_plan_cache_hit"
                         );
                         let stream = ::cache::result::query::CachedStream::new(
                             Arc::new(records),
@@ -459,7 +481,15 @@ impl Query {
             }
         };
 
+        tracing::info!(
+            target: "ballista_debug",
+            job_id,
+            planning_ms = planning_started.elapsed().as_millis(),
+            "SPICE_BALLISTA_DEBUG distributed_plan_ready"
+        );
+
         // Validate query operations
+        let validation_started = Instant::now();
         if let Err(e) = validate_sql_query_operations(&plan, &self.df) {
             let e = find_datafusion_root(e);
             return Err(Error::UnableToExecuteQuery { source: e });
@@ -475,6 +505,18 @@ impl Query {
         let schema = Arc::new(plan.schema().as_arrow().clone());
 
         let input_tables = get_logical_plan_input_tables(&plan);
+        let input_table_names = input_tables
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::info!(
+            target: "ballista_debug",
+            job_id,
+            validation_ms = validation_started.elapsed().as_millis(),
+            input_tables = %input_table_names,
+            "SPICE_BALLISTA_DEBUG distributed_validation_done"
+        );
         if input_tables
             .iter()
             .any(|tr| matches!(tr.schema(), Some(SPICE_RUNTIME_SCHEMA)))
@@ -513,6 +555,7 @@ impl Query {
         });
 
         // Submit the job to the Ballista scheduler
+        let scheduler_submit_started = Instant::now();
         let ballista_job_id = scheduler
             .submit_job(job_id, session_ctx, &plan, None)
             .await
@@ -520,10 +563,13 @@ impl Query {
                 message: e.to_string(),
             })?;
 
-        tracing::debug!(
+        tracing::info!(
+            target: "ballista_debug",
             job_id,
             ballista_job_id = %ballista_job_id,
-            "Job submitted to Ballista scheduler"
+            scheduler_submit_ms = scheduler_submit_started.elapsed().as_millis(),
+            total_submit_ms = submit_started.elapsed().as_millis(),
+            "SPICE_BALLISTA_DEBUG distributed_job_submitted"
         );
 
         Ok(QueryHandle::new(

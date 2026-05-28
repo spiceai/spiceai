@@ -10,5 +10,6 @@ tests:
     app_storage_size_gb: 50
     executor_storage_size_gb: 100
     ephemeral_storage_limit: 1Gi
+    skip_teardown: true
     runner_type: spiceai-dev-runners
     validate_results: false
