@@ -197,7 +197,7 @@ mod tests {
         df.mark_dataset_writable(&table_name)
             .expect("dataset marked writable");
 
-        let query_engine: Arc<dyn QueryEngine> = Arc::clone(&df);
+        let query_engine = Arc::clone(&df) as Arc<dyn QueryEngine>;
         let tool = SqlTool::new(query_engine, None, None, None);
         (df, tool)
     }
