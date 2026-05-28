@@ -51,9 +51,48 @@ pub trait PartitionDiscoverer: Send + Sync {
     ) -> Result<Vec<PartitionValue>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
-/// Combined bound for partition-management operations that need both expression
-/// resolution (for serializing partition values) and source discovery (for
-/// finding new partition values).
-pub trait PartitionOperations: PartitionExprResolver + PartitionDiscoverer {}
+/// Result of polling a partition discovery job.
+#[derive(Debug)]
+pub enum DiscoveryJobPollResult {
+    /// The job is still executing.
+    StillRunning,
+    /// The job completed successfully with the discovered partition values.
+    Completed(Vec<PartitionValue>),
+    /// The job failed with the given error message.
+    Failed(String),
+}
 
-impl<T: PartitionExprResolver + PartitionDiscoverer + ?Sized> PartitionOperations for T {}
+/// Submits and polls partition discovery as Ballista jobs instead of
+/// blocking on a synchronous `SELECT DISTINCT`.
+#[async_trait]
+pub trait PartitionDiscoverySubmitter: Send + Sync {
+    /// Build and submit a discovery job for the given table. Returns the
+    /// Ballista job ID on success.
+    async fn submit_discovery_job(
+        &self,
+        table: &TableReference,
+        partition_by: &[PartitionedBy],
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Poll the status of a previously submitted discovery job.
+    /// `partition_expressions` are the raw SQL expression strings so that
+    /// result columns can be mapped back to partition keys.
+    async fn poll_discovery_job(
+        &self,
+        job_id: &str,
+        partition_expressions: &[String],
+    ) -> Result<DiscoveryJobPollResult, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Combined bound for partition-management operations that need expression
+/// resolution (for serializing partition values), synchronous source discovery,
+/// and async job-based discovery.
+pub trait PartitionOperations:
+    PartitionExprResolver + PartitionDiscoverer + PartitionDiscoverySubmitter
+{
+}
+
+impl<T: PartitionExprResolver + PartitionDiscoverer + PartitionDiscoverySubmitter + ?Sized>
+    PartitionOperations for T
+{
+}

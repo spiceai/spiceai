@@ -510,6 +510,45 @@ impl PartitionStore {
         self.apply_assignments(&requests).await
     }
 
+    /// Sets or clears the active discovery job ID for a table's partition
+    /// metadata. No-op if the table metadata doesn't exist yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails.
+    pub async fn set_discovery_job_id(
+        &self,
+        table: &TableReference,
+        job_id: Option<String>,
+    ) -> Result<()> {
+        let key = normalized_table_name(table);
+        let scope = self.scope;
+        let key_for_err = key.clone();
+        self.cluster
+            .mutate(|state| {
+                let map = scope.map_mut(state);
+                let Some(metadata) = map.get_mut(&key) else {
+                    return MutationOutcome::NoChange;
+                };
+                if metadata.active_discovery_job_id == job_id {
+                    return MutationOutcome::NoChange;
+                }
+                metadata.active_discovery_job_id = job_id.clone();
+                MutationOutcome::Apply
+            })
+            .await
+            .map_err(|e| match e {
+                MutateError::ConcurrentModification { .. } => {
+                    Error::ConcurrentModification { table: key_for_err }
+                }
+                other => Error::MetadataAccess {
+                    table: key_for_err,
+                    source: other,
+                },
+            })?;
+        Ok(())
+    }
+
     /// Replace this table's metadata wholesale (atomic OCC write). Used
     /// by callers that compute the new metadata externally and just need
     /// to persist it.

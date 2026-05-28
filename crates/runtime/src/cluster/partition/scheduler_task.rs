@@ -116,7 +116,7 @@ impl PartitionAssignmentTask {
                 _ = interval.tick() => {
                     let cycle_start = Instant::now();
 
-                    match self.run_assignment_cycle().await {
+                    match self.run_management_cycle().await {
                         Ok(()) => {
                             self.status.update_component_status("partition_metadata", ComponentStatus::Ready);
                         }
@@ -149,30 +149,53 @@ impl PartitionAssignmentTask {
         Ok(())
     }
 
-    /// Underlying logic for a single assignment cycle.
-    /// Delegates to [`super::service::PartitionService::reconcile_all`].
-    async fn run_assignment_cycle(&self) -> Result<()> {
+    /// Underlying logic for a single management cycle.
+    ///
+    /// Three steps:
+    /// 1. Poll completed discovery jobs and apply diffs.
+    /// 2. Submit new discovery jobs for dynamic tables that need them.
+    /// 3. Assign pending (unassigned) partitions to executors.
+    async fn run_management_cycle(&self) -> Result<()> {
         let Some(service) = &self.df.partition_service else {
-            tracing::warn!("Partition service not initialized, skipping assignment cycle");
+            tracing::warn!("Partition service not initialized, skipping management cycle");
             return Ok(());
         };
 
-        // Defer the cycle while any accelerated table is still loading — the
-        // notify path inside reconcile_all calls partition_value_to_bytes,
-        // which needs each table's schema in the SessionContext. Skipping is
-        // safe: the next periodic tick will retry.
+        // Defer the cycle while any accelerated table is still loading.
         let app_snapshot = service.app.read().await.clone();
-        if let Some(app) = app_snapshot
+        if let Some(app) = &app_snapshot
             && let Some(not_ready) =
-                super::first_unready_accelerated_table(&app, self.df.as_ref()).await
+                super::first_unready_accelerated_table(app, self.df.as_ref()).await
         {
             tracing::debug!(
                 table = %not_ready,
-                "Deferring partition assignment cycle: accelerated table not yet registered"
+                "Deferring partition management cycle: accelerated table not yet registered"
             );
             return Ok(());
         }
 
+        // Step 1: Poll completed discovery jobs and apply diffs.
+        service
+            .check_and_process_discovery_jobs(self.df.as_ref())
+            .await
+            .map_err(|e| Error::AssignmentCycle { source: e })?;
+
+        // Step 2: Submit new discovery jobs for dynamic tables.
+        if let Some(app) = &app_snapshot {
+            let dynamic_tables: Vec<_> = super::accelerated_tables(app)
+                .into_iter()
+                .filter(|(_, p)| super::try_static_partition_values(p).is_none())
+                .collect();
+
+            if !dynamic_tables.is_empty() {
+                service
+                    .submit_discovery_for_pending_tables(&dynamic_tables, self.df.as_ref())
+                    .await
+                    .map_err(|e| Error::AssignmentCycle { source: e })?;
+            }
+        }
+
+        // Step 3: Assign pending partitions to executors.
         service
             .reconcile_all(self.df.as_ref())
             .await

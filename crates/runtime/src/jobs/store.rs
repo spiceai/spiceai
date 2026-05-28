@@ -144,6 +144,20 @@ impl JobStore {
         Ok(state)
     }
 
+    /// Creates a new pending job for a pre-built `LogicalPlan`.
+    ///
+    /// Unlike [`create_job`](Self::create_job), this stores only a
+    /// human-readable `display_sql` string (not an executable SQL statement)
+    /// and carries no parameters, timeout, or max-size constraints. The
+    /// actual plan lives only in memory on the submitting scheduler.
+    pub async fn create_job_for_plan(&self, display_sql: String) -> Result<JobState> {
+        let job_id = Self::generate_job_id();
+        let mut state = JobState::new_pending(job_id, display_sql, None);
+        state.read_only = true;
+        self.write_job_state(&mut state).await?;
+        Ok(state)
+    }
+
     /// Gets the current state of a job.
     pub async fn get_job(&self, job_id: &str) -> Result<JobState> {
         let path = self.job_state_path(job_id);

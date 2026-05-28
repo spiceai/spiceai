@@ -24,8 +24,10 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use datafusion::logical_expr::LogicalPlan;
+
 use crate::datafusion::DataFusion;
-use crate::datafusion::query::{QueryBuilder, QueryHandle, QueryHandleError};
+use crate::datafusion::query::{Query, QueryBuilder, QueryHandle, QueryHandleError};
 use crate::http::v1::queries::SubmitQueryRequest;
 use crate::jobs::state::JobErrorCode;
 
@@ -166,6 +168,64 @@ impl JobExecutor {
         self.job_store.list_jobs(status_filter).await
     }
 
+    /// Submits a pre-built `LogicalPlan` for async distributed execution.
+    ///
+    /// Unlike [`submit`](Self::submit), the plan is not built from SQL — it
+    /// is provided directly and submitted to Ballista via
+    /// `Query::from_logical_plan`. The `display_sql` string is stored in the
+    /// job state for `/v1/queries` visibility but is never parsed or executed.
+    ///
+    /// The `LogicalPlan` lives only in memory; if the scheduler crashes
+    /// mid-execution the job stays "Running" until TTL — the periodic
+    /// partition management cycle will re-submit discovery for that table.
+    pub async fn submit_plan(&self, plan: LogicalPlan, display_sql: String) -> Result<JobState> {
+        let state = self.job_store.create_job_for_plan(display_sql).await?;
+        let job_id = state.job_id.clone();
+
+        let cancel_token = CancellationToken::new();
+        {
+            let mut active = self.active_jobs.write().await;
+            active.insert(
+                job_id.clone(),
+                ActiveJobInfo {
+                    cancel_token: cancel_token.clone(),
+                    query_handle: None,
+                },
+            );
+        }
+
+        let job_store = Arc::clone(&self.job_store);
+        let df = Arc::clone(&self.df);
+        let active_jobs = Arc::clone(&self.active_jobs);
+        let job_id_clone = job_id.clone();
+
+        tokio::spawn(
+            async move {
+                let result = Self::execute_plan_job(
+                    &job_store,
+                    df,
+                    &job_id_clone,
+                    plan,
+                    &active_jobs,
+                    cancel_token,
+                )
+                .await;
+
+                {
+                    let mut active = active_jobs.write().await;
+                    active.remove(&job_id_clone);
+                }
+
+                if let Err(e) = result {
+                    tracing::error!(job_id = %job_id_clone, error = %e, "Plan job execution failed");
+                }
+            }
+            .instrument(tracing::info_span!("plan_job_execution", job_id = %job_id)),
+        );
+
+        Ok(state)
+    }
+
     /// Executes a job using `Query::submit_distributed` and writes results to the store.
     async fn execute_job(
         job_store: &JobStore,
@@ -286,6 +346,89 @@ impl JobExecutor {
                 // Mark job as succeeded
                 job_store.complete_job(job_id, job_result).await?;
 
+                Ok(())
+            }
+        }
+    }
+
+    /// Executes a pre-built `LogicalPlan` job using `Query::from_logical_plan`
+    /// + `submit_distributed`, then writes results to the store.
+    ///
+    /// Mirrors [`execute_job`](Self::execute_job) but skips SQL parsing and
+    /// parameter binding since the plan is already constructed.
+    async fn execute_plan_job(
+        job_store: &JobStore,
+        df: Arc<DataFusion>,
+        job_id: &str,
+        plan: LogicalPlan,
+        active_jobs: &RwLock<std::collections::HashMap<String, ActiveJobInfo>>,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        job_store.set_job_running(job_id).await?;
+
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        let query = Query::from_logical_plan(&df, &plan);
+        let query_handle = match query.submit_distributed(job_id).await {
+            Ok(handle) => handle,
+            Err(e) => {
+                let error_code = Self::query_error_to_code(&e);
+                job_store
+                    .fail_job(job_id, error_code, e.to_string())
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        tracing::debug!(
+            job_id,
+            ballista_job_id = %query_handle.ballista_job_id(),
+            "Plan submitted for distributed execution"
+        );
+
+        {
+            let mut active = active_jobs.write().await;
+            if let Some(info) = active.get_mut(job_id) {
+                info.query_handle = Some(query_handle.clone());
+            }
+        }
+
+        // No timeout for plan jobs — the periodic management cycle handles
+        // liveness. Use a never-completing future as the timeout stand-in.
+        tokio::select! {
+            () = cancel.cancelled() => {
+                tracing::debug!(job_id = %job_id, "Plan job cancelled before completion");
+                if let Err(e) = query_handle.cancel().await {
+                    tracing::error!("Failed to cancel the distributed plan job '{job_id}': {e}");
+                }
+                Ok(())
+            },
+            result_stream = query_handle.into_stream() => {
+                let result_stream = match result_stream {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        let (error_code, error_msg) = Self::handle_error_to_code_and_msg(&e);
+                        job_store.fail_job(job_id, error_code, error_msg).await?;
+                        return Ok(());
+                    }
+                };
+
+                let job_result = match job_store
+                    .write_result_chunks_from_stream(job_id, result_stream)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        job_store
+                            .fail_job(job_id, JobErrorCode::FetchingResultsFailed, e.to_string())
+                            .await?;
+                        return Ok(());
+                    }
+                };
+
+                job_store.complete_job(job_id, job_result).await?;
                 Ok(())
             }
         }

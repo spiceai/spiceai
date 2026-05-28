@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub(crate) mod discovery;
+pub mod discovery;
 pub mod scheduler_task;
 mod startup;
 
@@ -32,6 +32,9 @@ pub use runtime_cluster::{
 };
 pub use runtime_cluster::{executor_selection, service, store, write_through};
 
+pub use discovery::{
+    batches_to_partition_values, build_discovery_plan, try_static_partition_values,
+};
 pub use startup::{
     accelerated_tables, executor_request_initial_partitions, first_unready_accelerated_table,
     initialize_partition_metadata, validate_partition_keys,

@@ -137,6 +137,11 @@ pub struct TablePartitionMetadata {
     /// Stored so that auto-generated labels like `"expr0"` can be resolved back to the
     /// original SQL expression for query routing.
     pub partition_expressions: Vec<String>,
+    /// Job ID of an in-flight partition discovery Ballista job, if any.
+    /// Set when the scheduler submits a discovery query and cleared when the
+    /// job completes (or fails). Prevents duplicate submissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_discovery_job_id: Option<String>,
 }
 
 impl TablePartitionMetadata {
@@ -152,6 +157,7 @@ impl TablePartitionMetadata {
             schema_version: 1,
             updated_at,
             partition_expressions,
+            active_discovery_job_id: None,
         }
     }
 

@@ -39,6 +39,141 @@ use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
 use util::session_state::builder_from_existing;
 
+/// Convert record batches from a partition discovery query into
+/// `PartitionValue` maps. Each row becomes one `PartitionValue` where the
+/// column values are keyed by the corresponding partition expression string.
+///
+/// # Errors
+///
+/// Returns an error if column values cannot be converted to strings.
+pub fn batches_to_partition_values(
+    batches: &[arrow::record_batch::RecordBatch],
+    partition_expressions: &[String],
+    table_name: &str,
+) -> Result<Vec<PartitionValue>> {
+    let mut partition_values = Vec::new();
+    for batch in batches {
+        let num_rows = batch.num_rows();
+        let num_cols = batch.num_columns();
+        if num_cols != partition_expressions.len() {
+            return Err(Error::PartitionDiscovery {
+                table: table_name.to_string(),
+                source: format!(
+                    "Expected {} columns but got {num_cols}",
+                    partition_expressions.len()
+                )
+                .into(),
+            });
+        }
+
+        for row_idx in 0..num_rows {
+            let mut value_parts = HashMap::new();
+            for col_idx in 0..num_cols {
+                let column = batch.column(col_idx);
+                let value = if column.is_null(row_idx) {
+                    None
+                } else {
+                    Some(
+                        arrow::util::display::array_value_to_string(column, row_idx)
+                            .boxed()
+                            .context(PartitionDiscoverySnafu {
+                                table: table_name.to_string(),
+                            })?,
+                    )
+                };
+                if let Some(pname) = partition_expressions.get(col_idx) {
+                    value_parts.insert(pname.clone(), value);
+                }
+            }
+            partition_values.push(value_parts);
+        }
+    }
+    Ok(partition_values)
+}
+
+/// Build the `LogicalPlan` (and a display SQL string) for a partition
+/// discovery query that reads directly from the federated source provider.
+///
+/// The resulting plan uses `UNNAMED_TABLE` as its table name, so Ballista's
+/// `is_accelerated` guard passes naturally with no flag changes.
+///
+/// # Errors
+///
+/// Returns an error if the table is not an accelerated table, or if the
+/// plan cannot be constructed.
+pub async fn build_discovery_plan(
+    table: &TableReference,
+    partitioning: &[PartitionedBy],
+    df: &DataFusion,
+) -> Result<(datafusion::logical_expr::LogicalPlan, String)> {
+    let table_name = table.to_string();
+    let partition_exprs: Vec<String> = partitioning
+        .iter()
+        .map(|p| {
+            let PartitionedBy { name, expression } = p;
+            format!("{expression} AS {name}")
+        })
+        .collect();
+
+    let display_sql = format!(
+        "SELECT DISTINCT {} FROM {}",
+        partition_exprs.join(", "),
+        table_name
+    );
+
+    // Wait for the table provider to be registered.
+    df.runtime_status().wait_for_dataset_registered(table).await;
+
+    let table_opt = df.get_table(table).await;
+    let Some(acc) = table_opt.as_ref().and_then(|t| {
+        find_concrete_table_provider::<AcceleratedTable>(t)
+            .map(AcceleratedTable::get_federated_table)
+    }) else {
+        return Err(Error::NotAcceleratedTable { table: table_name });
+    };
+
+    let ctx = SessionContext::new_with_state(builder_from_existing(&df.ctx.state()).build());
+    let provider = acc.table_provider().await;
+    let schema = provider.schema();
+    let df_schema = schema
+        .to_dfschema()
+        .boxed()
+        .context(PartitionDiscoverySnafu {
+            table: table_name.clone(),
+        })?;
+
+    let exprs = partition_exprs
+        .iter()
+        .map(|e| {
+            ctx.parse_sql_expr(e, &df_schema)
+                .boxed()
+                .context(PartitionDiscoverySnafu {
+                    table: table_name.clone(),
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let plan = ctx
+        .read_table(provider)
+        .boxed()
+        .context(PartitionDiscoverySnafu {
+            table: table_name.clone(),
+        })?
+        .select(exprs)
+        .boxed()
+        .context(PartitionDiscoverySnafu {
+            table: table_name.clone(),
+        })?
+        .distinct()
+        .boxed()
+        .context(PartitionDiscoverySnafu {
+            table: table_name.clone(),
+        })?
+        .into_unoptimized_plan();
+
+    Ok((plan, display_sql))
+}
+
 /// Query the source table for the partition values present right now.
 ///
 /// If every partition expression has a statically known value set (e.g.
@@ -88,33 +223,8 @@ pub(crate) async fn query_source_partitions(
 
     let batches = execute_partition_discovery_query(df, table, partition_exprs).await?;
 
-    let mut partition_values = Vec::new();
-    for batch in batches {
-        let num_rows = batch.num_rows();
-        let num_cols = batch.num_columns();
-
-        for row_idx in 0..num_rows {
-            let mut value_parts = HashMap::new();
-            for col_idx in 0..num_cols {
-                let column = batch.column(col_idx);
-                let value = if column.is_null(row_idx) {
-                    None
-                } else {
-                    Some(
-                        arrow::util::display::array_value_to_string(column, row_idx)
-                            .boxed()
-                            .context(PartitionDiscoverySnafu {
-                                table: table_name.clone(),
-                            })?,
-                    )
-                };
-                if let Some(pname) = partitioning.get(col_idx).map(|p| p.expression.clone()) {
-                    value_parts.insert(pname, value);
-                }
-            }
-            partition_values.push(value_parts);
-        }
-    }
+    let expressions: Vec<String> = partitioning.iter().map(|p| p.expression.clone()).collect();
+    let partition_values = batches_to_partition_values(&batches, &expressions, &table_name)?;
 
     tracing::debug!(
         table = %table_name,
@@ -244,7 +354,7 @@ const MAX_NUM_BUCKETS: i64 = 1_000_000;
 ///
 /// Returns `None` otherwise, causing the caller to fall back to the slow path
 /// (`SELECT DISTINCT … FROM source`).
-fn try_static_partition_values(partitioning: &[PartitionedBy]) -> Option<Vec<PartitionValue>> {
+pub fn try_static_partition_values(partitioning: &[PartitionedBy]) -> Option<Vec<PartitionValue>> {
     let [partition] = partitioning else {
         return None;
     };

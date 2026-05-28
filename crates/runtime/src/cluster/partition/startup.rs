@@ -43,10 +43,13 @@ use crate::{
 
 /// Initialize acceleration partition metadata for all accelerated tables on scheduler startup.
 ///
-/// Delegates to [`PartitionService::seed_table`] per table, which runs the
-/// standard source-vs-store diff and writes new partitions as unassigned
-/// (no assignment, no executor notification — executors typically haven't
-/// connected yet at this point in startup).
+/// **Static** partitions (e.g. `bucket(N, col)`) are seeded immediately via
+/// [`PartitionService::seed_table`] since their values are known without querying
+/// the source.
+///
+/// **Dynamic** partitions are submitted as non-blocking Ballista discovery
+/// jobs via [`PartitionService::submit_discovery_for_pending_tables`] so that
+/// startup is not blocked on potentially slow source queries.
 ///
 /// Failures are logged per-table and do not abort the loop.
 pub async fn initialize_partition_metadata(
@@ -66,16 +69,53 @@ pub async fn initialize_partition_metadata(
         "Initializing partition metadata for accelerated tables"
     );
 
+    let mut dynamic_tables: Vec<(TableReference, Vec<PartitionedBy>)> = Vec::new();
+
     for (table, partitioning) in tables {
+        if super::try_static_partition_values(&partitioning).is_some() {
+            // Static: seed immediately (no source query needed).
+            if let Err(e) = partition_service
+                .seed_table(&table, &partitioning, df.as_ref())
+                .await
+            {
+                tracing::warn!(
+                    table = %table,
+                    error = %e,
+                    "Failed to seed static partition metadata"
+                );
+            }
+        } else {
+            // Dynamic: collect for non-blocking submission.
+            // Still initialize the metadata entry so the store knows about
+            // the table, but skip the source query.
+            let partition_expressions: Vec<String> =
+                partitioning.iter().map(|p| p.expression.clone()).collect();
+            if let Err(e) = partition_service
+                .partition_store
+                .initialize_metadata(&table, partition_expressions)
+                .await
+            {
+                tracing::warn!(
+                    table = %table,
+                    error = %e,
+                    "Failed to initialize partition metadata for dynamic table"
+                );
+            }
+            dynamic_tables.push((table, partitioning));
+        }
+    }
+
+    // Submit discovery jobs for dynamic tables (non-blocking).
+    if !dynamic_tables.is_empty() {
+        tracing::info!(
+            count = dynamic_tables.len(),
+            "Submitting non-blocking discovery jobs for dynamic partition tables"
+        );
         if let Err(e) = partition_service
-            .seed_table(&table, &partitioning, df.as_ref())
+            .submit_discovery_for_pending_tables(&dynamic_tables, df.as_ref())
             .await
         {
-            tracing::warn!(
-                table = %table,
-                error = %e,
-                "Failed to initialize partition metadata"
-            );
+            tracing::warn!(error = %e, "Failed to submit discovery jobs for dynamic tables");
         }
     }
 

@@ -709,6 +709,9 @@ pub struct DataFusion {
     pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
     /// Partition service for discovering/assigning partitions (scheduler mode only).
     pub(crate) partition_service: Option<Arc<PartitionService>>,
+    /// Job executor for submitting discovery queries as Ballista jobs.
+    /// Set after construction via [`set_job_executor`](Self::set_job_executor).
+    pub(crate) job_executor: OnceLock<Arc<crate::jobs::JobExecutor>>,
     /// Tracks executor `PartitionsLoaded` acks so dataset readiness on the
     /// scheduler reflects actual data availability on executors. Only set
     /// in scheduler mode.
@@ -752,6 +755,12 @@ impl DataFusion {
     #[must_use]
     pub fn data_update_broadcaster(&self) -> DataUpdateBroadcaster {
         self.data_update_broadcaster.clone()
+    }
+
+    /// Wire the job executor into this `DataFusion` instance. Called once
+    /// during scheduler startup after `JobExecutor` is constructed.
+    pub fn set_job_executor(&self, executor: Arc<crate::jobs::JobExecutor>) {
+        let _ = self.job_executor.set(executor);
     }
 
     #[must_use]
@@ -3588,6 +3597,67 @@ impl runtime_cluster::context::PartitionDiscoverer for DataFusion {
         crate::cluster::partition::discovery::query_source_partitions(table, partition_by, self)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
+}
+
+#[async_trait::async_trait]
+impl runtime_cluster::context::PartitionDiscoverySubmitter for DataFusion {
+    async fn submit_discovery_job(
+        &self,
+        table: &TableReference,
+        partition_by: &[spicepod::partitioning::PartitionedBy],
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let job_executor = self
+            .job_executor
+            .get()
+            .ok_or("JobExecutor not initialized")?;
+        let (plan, display_sql) =
+            crate::cluster::partition::build_discovery_plan(table, partition_by, self).await?;
+        let job_state = job_executor.submit_plan(plan, display_sql).await?;
+        Ok(job_state.job_id)
+    }
+
+    async fn poll_discovery_job(
+        &self,
+        job_id: &str,
+        partition_expressions: &[String],
+    ) -> Result<runtime_cluster::DiscoveryJobPollResult, Box<dyn std::error::Error + Send + Sync>>
+    {
+        use runtime_cluster::DiscoveryJobPollResult;
+
+        let job_executor = self
+            .job_executor
+            .get()
+            .ok_or("JobExecutor not initialized")?;
+        let state = job_executor.get_status(job_id).await?;
+        match state.status {
+            crate::jobs::JobStatus::Pending | crate::jobs::JobStatus::Running => {
+                Ok(DiscoveryJobPollResult::StillRunning)
+            }
+            crate::jobs::JobStatus::Failed
+            | crate::jobs::JobStatus::Cancelled
+            | crate::jobs::JobStatus::Closed => {
+                let msg = state
+                    .error
+                    .map(|e| e.message)
+                    .unwrap_or_else(|| format!("Job {} in status {}", job_id, state.status));
+                Ok(DiscoveryJobPollResult::Failed(msg))
+            }
+            crate::jobs::JobStatus::Succeeded => {
+                let result = state.result.as_ref().ok_or("No result in succeeded job")?;
+                let mut all_batches = Vec::new();
+                for &chunk_idx in &result.chunk_indices {
+                    let batches = job_executor.get_chunk(job_id, chunk_idx).await?;
+                    all_batches.extend(batches);
+                }
+                let values = crate::cluster::partition::batches_to_partition_values(
+                    &all_batches,
+                    partition_expressions,
+                    job_id,
+                )?;
+                Ok(DiscoveryJobPollResult::Completed(values))
+            }
+        }
     }
 }
 
