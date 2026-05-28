@@ -79,8 +79,7 @@ runs:
             git fetch origin "${BRANCH_NAME}"
             git rebase -X theirs "origin/${BRANCH_NAME}"
           fi
-          AUTHENTICATED_REMOTE_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}"
-          git push "${AUTHENTICATED_REMOTE_URL}" "HEAD:${BRANCH_NAME}"
+          git push origin "HEAD:${BRANCH_NAME}"
 
           if [[ -n "${EXISTING_PR_NUMBER}" ]]; then
             PR_URL="$(gh pr view "${EXISTING_PR_NUMBER}" --json url --jq .url)"
