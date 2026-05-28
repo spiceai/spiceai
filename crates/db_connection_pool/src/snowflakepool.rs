@@ -557,46 +557,37 @@ mod tests {
 
     #[test]
     fn test_empty_is_err() {
-        assert!(matches!("".parse::<SnowflakeAccountIdentifier>(), Err(_)));
+        assert!("".parse::<SnowflakeAccountIdentifier>().is_err());
     }
 
     #[test]
     fn test_leading_dot_is_err() {
-        assert!(matches!(
-            ".myaccount".parse::<SnowflakeAccountIdentifier>(),
-            Err(_)
-        ));
+        assert!(".myaccount".parse::<SnowflakeAccountIdentifier>().is_err());
     }
 
     #[test]
     fn test_trailing_dot_is_err() {
-        assert!(matches!(
-            "myorg.".parse::<SnowflakeAccountIdentifier>(),
-            Err(_)
-        ));
+        assert!("myorg.".parse::<SnowflakeAccountIdentifier>().is_err());
     }
 
     #[test]
     fn test_org_based_with_invalid_character_is_err() {
-        assert!(matches!(
-            "myorg.my$account".parse::<SnowflakeAccountIdentifier>(),
-            Err(_)
-        ));
+        assert!("myorg.my$account"
+            .parse::<SnowflakeAccountIdentifier>()
+            .is_err());
     }
 
     #[test]
     fn test_legacy_with_empty_region_segment_is_err() {
-        assert!(matches!(
-            "xy12345..aws".parse::<SnowflakeAccountIdentifier>(),
-            Err(_)
-        ));
+        assert!("xy12345..aws"
+            .parse::<SnowflakeAccountIdentifier>()
+            .is_err());
     }
 
     #[test]
     fn test_legacy_with_empty_cloud_segment_is_err() {
-        assert!(matches!(
-            "xy12345.us-east-1.".parse::<SnowflakeAccountIdentifier>(),
-            Err(_)
-        ));
+        assert!("xy12345.us-east-1."
+            .parse::<SnowflakeAccountIdentifier>()
+            .is_err());
     }
 }
