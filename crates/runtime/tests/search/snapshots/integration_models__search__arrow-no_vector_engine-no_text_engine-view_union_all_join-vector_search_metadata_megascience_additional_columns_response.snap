@@ -1,0 +1,69 @@
+---
+source: crates/runtime/tests/search/mod.rs
+expression: normalize_search_response(resp)
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "_score": "0.73",
+      "data": {
+        "question": "Simplify the expression according to the order of operations.\na) $-|-9|$  \nb) $-(-9)$  \nc) $2-(-6)$  \nd) $2-|-6|$"
+      },
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "a) $-|-9| = -9$  \nb) $-(-9) = 9$  \nc) $2-(-6) = 2 + 6 = 8$  \nd) $2-|-6| = 2 - 6 = -4$"
+        ]
+      },
+      "primary_key": {
+        "id": 708
+      }
+    },
+    {
+      "_score": "0.70",
+      "data": {
+        "question": "Evaluate the function \\( h(x) = -3x - 4 \\) at the given values:\na. \\( h(7) \\)\nb. \\( h(-4) \\)"
+      },
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "a. \\( h(7) = -3(7) - 4 = -21 - 4 = \\boxed{-25} \\)\nb. \\( h(-4) = -3(-4) - 4 = 12 - 4 = \\boxed{8} \\)"
+        ]
+      },
+      "primary_key": {
+        "id": 255
+      }
+    },
+    {
+      "_score": "0.66",
+      "data": {
+        "question": "What is the `car` of the list `l` where `l` is `((a b c) x y z)`?"
+      },
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "`(a b c)`, because `(a b c)` is the first S-expression of this non-empty list."
+        ]
+      },
+      "primary_key": {
+        "id": 868
+      }
+    },
+    {
+      "_score": "0.64",
+      "data": {
+        "question": "Evaluate the function \\( G(x) = x - 1 \\) at the following values of \\( x \\):\na. \\( x = 3 \\)\nb. \\( x = -5 \\)\nc. \\( x = 0 \\)"
+      },
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "a. \\( G(3) = 3 - 1 = \\boxed{2} \\)\nb. \\( G(-5) = -5 - 1 = \\boxed{-6} \\)\nc. \\( G(0) = 0 - 1 = \\boxed{-1} \\)"
+        ]
+      },
+      "primary_key": {
+        "id": 251
+      }
+    }
+  ]
+}
