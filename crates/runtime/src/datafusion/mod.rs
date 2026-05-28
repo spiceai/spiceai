@@ -2535,7 +2535,7 @@ impl DataFusion {
             let normalized_refresh_schema = if needs_dict_normalization
                 && arrow_tools::schema::has_dictionary_types(refresh_schema)
             {
-                Arc::new(arrow_tools::schema::normalize_dictionary_types(
+                Arc::new(arrow_tools::type_rewrite::normalize_dictionary_types(
                     refresh_schema,
                 ))
             } else {

@@ -253,7 +253,7 @@ impl AcceleratorEngineRegistry {
         let schema = if needs_dictionary_normalization
             && arrow_tools::schema::has_dictionary_types(&schema)
         {
-            let normalized = arrow_tools::schema::normalize_dictionary_types(&schema);
+            let normalized = arrow_tools::type_rewrite::normalize_dictionary_types(&schema);
             tracing::debug!(
                 "Normalized Arrow Dictionary types in schema for {engine} acceleration"
             );

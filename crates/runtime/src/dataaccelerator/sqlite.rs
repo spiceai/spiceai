@@ -742,7 +742,7 @@ mod tests {
         ]));
 
         // Normalize the schema so the accelerator sees plain Utf8 instead of Dictionary.
-        let accel_schema = Arc::new(arrow_tools::schema::normalize_dictionary_types(
+        let accel_schema = Arc::new(arrow_tools::type_rewrite::normalize_dictionary_types(
             &source_schema,
         ));
         assert_eq!(accel_schema.field(1).data_type(), &DataType::Utf8);
