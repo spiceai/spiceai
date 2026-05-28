@@ -177,6 +177,7 @@ mod tests {
             )
             .build(),
         );
+        df.set_self_ref();
 
         // Bare table name (not under `runtime.*`) so the writability
         // gate is the only thing being exercised — the validator treats
