@@ -970,8 +970,8 @@ impl Refresher {
         refresh_task_runner =
             refresh_task_runner.with_snapshot_refresh_state(self.snapshot_refresh_state.clone());
 
-        refresh_task_runner =
-            refresh_task_runner.with_initial_load_completed(Arc::clone(&self.initial_load_completed));
+        refresh_task_runner = refresh_task_runner
+            .with_initial_load_completed(Arc::clone(&self.initial_load_completed));
 
         let mut refresh_task_runner = refresh_task_runner.build();
 

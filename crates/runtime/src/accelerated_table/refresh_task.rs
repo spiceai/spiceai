@@ -2001,10 +2001,8 @@ impl RefreshTask {
         // Mark initial load complete BEFORE updating the runtime status to Ready.
         // This closes the race window where `is_ready()` returns true but
         // `AcceleratedTable::scan` still sees `initial_load_completed == false`.
-        if is_ready {
-            if let Some(flag) = &self.initial_load_completed {
-                flag.store(true, std::sync::atomic::Ordering::Release);
-            }
+        if is_ready && let Some(flag) = &self.initial_load_completed {
+            flag.store(true, std::sync::atomic::Ordering::Release);
         }
 
         // runtime status update
