@@ -55,6 +55,13 @@ pub struct CayenneContext {
     runtime_env: Arc<RuntimeEnv>,
 }
 
+/// Default byte budget for the in-memory PK keyset cache when
+/// `cayenne_pk_keyset_cache_mb` is unset. 256 MiB preserves historical behavior;
+/// raise the param on memory-rich hosts so high-cardinality tables keep their
+/// keyset resident instead of rebuilding it from a full-table scan every CDC
+/// batch.
+pub(crate) const DEFAULT_PK_KEYSET_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
 impl CayenneContext {
     /// Create a new Cayenne context from configuration.
     ///
@@ -168,6 +175,17 @@ impl CayenneContext {
     #[must_use]
     pub(crate) fn pk_conflict_detection(&self) -> PkConflictDetection {
         self.config.pk_conflict_detection
+    }
+
+    /// Byte budget for the in-memory PK keyset cache used during upsert conflict
+    /// detection. See [`DEFAULT_PK_KEYSET_CACHE_MAX_BYTES`].
+    #[must_use]
+    pub(crate) fn pk_keyset_cache_max_bytes(&self) -> usize {
+        self.config
+            .pk_keyset_cache_mb
+            .map_or(DEFAULT_PK_KEYSET_CACHE_MAX_BYTES, |mb| {
+                mb.saturating_mul(1024 * 1024)
+            })
     }
 
     /// Build the compaction picker config from the underlying `VortexConfig`.

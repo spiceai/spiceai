@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 pub use opentelemetry::KeyValue;
-use opentelemetry::metrics::{Counter, Histogram};
+use opentelemetry::global;
+use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::metrics::{Gauge, UpDownCounter};
 use std::{sync::OnceLock, time::Duration};
 
@@ -362,10 +363,26 @@ pub fn track_hash_index_lookup_rows(rows: u64, dimensions: &[KeyValue]) {
         .add(rows, dimensions);
 }
 
+/// Meter for Cayenne operational (operator-facing) metrics.
+///
+/// Unlike the anonymous-telemetry [`meter::METER`], these instruments bind to
+/// the OpenTelemetry **global** provider that the runtime installs during
+/// `init_metrics` with the operator's Prometheus `/metrics`, `spice.runtime.metrics`,
+/// and OTLP readers. Cayenne write-path and scan timings are operator
+/// observability, not product-usage telemetry, so they must NOT route to the
+/// anonymous provider. Bound lazily on first record — by which point startup has
+/// already installed the global provider — mirroring the `dataset_acceleration`
+/// metrics' `global::meter` pattern.
+static CAYENNE_OPERATIONAL_METER: OnceLock<Meter> = OnceLock::new();
+
+fn cayenne_operational_meter() -> &'static Meter {
+    CAYENNE_OPERATIONAL_METER.get_or_init(|| global::meter("cayenne"))
+}
+
 static CAYENNE_SCAN_LISTING_TABLE_CACHE_ENTRIES: OnceLock<Gauge<u64>> = OnceLock::new();
 
 pub fn track_cayenne_scan_listing_table_cache_entries(entries: u64, dimensions: &[KeyValue]) {
-    let Some(m) = meter::METER.get() else { return };
+    let m = cayenne_operational_meter();
     CAYENNE_SCAN_LISTING_TABLE_CACHE_ENTRIES
         .get_or_init(|| {
             m.u64_gauge("cayenne_scan_listing_table_cache_entries")
@@ -379,7 +396,7 @@ pub fn track_cayenne_scan_listing_table_cache_entries(entries: u64, dimensions: 
 static CAYENNE_LISTING_FENCE_WAIT_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
 
 pub fn track_cayenne_listing_fence_wait_duration(duration: Duration, dimensions: &[KeyValue]) {
-    let Some(m) = meter::METER.get() else { return };
+    let m = cayenne_operational_meter();
     CAYENNE_LISTING_FENCE_WAIT_DURATION_MS
         .get_or_init(|| {
             m.f64_histogram("cayenne_listing_fence_wait_duration_ms")
@@ -396,7 +413,7 @@ pub fn track_cayenne_listing_fence_wait_duration(duration: Duration, dimensions:
 static CAYENNE_LISTING_SCAN_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
 
 pub fn track_cayenne_listing_scan_duration(duration: Duration, dimensions: &[KeyValue]) {
-    let Some(m) = meter::METER.get() else { return };
+    let m = cayenne_operational_meter();
     CAYENNE_LISTING_SCAN_DURATION_MS
         .get_or_init(|| {
             m.f64_histogram("cayenne_listing_scan_duration_ms")
@@ -413,7 +430,7 @@ pub fn track_cayenne_listing_scan_duration(duration: Duration, dimensions: &[Key
 static CAYENNE_WRITE_PHASE_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
 
 pub fn track_cayenne_write_phase_duration(duration: Duration, dimensions: &[KeyValue]) {
-    let Some(m) = meter::METER.get() else { return };
+    let m = cayenne_operational_meter();
     CAYENNE_WRITE_PHASE_DURATION_MS
         .get_or_init(|| {
             m.f64_histogram("cayenne_write_phase_duration_ms")
