@@ -802,18 +802,25 @@ pub async fn run(args: Args) -> Result<()> {
         Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await
     });
 
-    // Spice Cloud Connect. Default off — only
-    // activates when an identity is on disk or an adoption code is
-    // available. Failures here are non-fatal: spiced keeps running.
-    let cloud_connect_handle =
-        cloud_connect::maybe_start(env!("CARGO_PKG_VERSION"), Arc::clone(&rt)).await;
-
+    let mut components_loaded = false;
     tokio::select! {
-        () = Arc::clone(&rt).load_components() => {},
+        () = Arc::clone(&rt).load_components() => { components_loaded = true; },
         () = runtime::shutdown_signal() => {
             tracing::debug!("Cancelling runtime initializing!");
         },
     }
+
+    // Spice Cloud Connect. Default off — only activates when an identity is
+    // on disk or an adoption code is available. Failures here are non-fatal:
+    // spiced keeps running. Started only after `load_components()` completes
+    // so an adopted control plane can't issue RunQuery / GetRuntimeInfo
+    // against a half-loaded runtime (datasets/models still registering).
+    let cloud_connect_handle = if components_loaded {
+        cloud_connect::maybe_start(env!("CARGO_PKG_VERSION"), Arc::clone(&rt)).await
+    } else {
+        // Shutting down before components finished loading — don't start.
+        None
+    };
 
     let result = match server_thread.await {
         // Don't treat force terminated as an error

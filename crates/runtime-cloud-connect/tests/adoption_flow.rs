@@ -142,8 +142,9 @@ async fn spawn_server(mock: MockServer) -> std::net::SocketAddr {
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await;
     });
-    // Give the server a moment to bind.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // No readiness sleep: the listener is already bound before this task is
+    // spawned, so a client can connect immediately — the TCP connection
+    // queues in the backlog until tonic starts accepting.
     addr
 }
 
