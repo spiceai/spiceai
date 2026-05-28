@@ -42,19 +42,19 @@ use crate::allowlist::ResolvedTableAwareAllowlist;
 /// Errors returned by [`QueryEngine`] methods.
 #[derive(Snafu, Debug)]
 pub enum Error {
-    #[snafu(display("Failed to retrieve schema for table '{table_ref}'"))]
+    #[snafu(display("Failed to retrieve schema for table '{table_ref}': {source}"))]
     GetSchema {
         table_ref: String,
         source: DataFusionError,
     },
 
-    #[snafu(display("Failed to retrieve public table names"))]
+    #[snafu(display("Failed to retrieve public table names: {source}"))]
     GetTableNames { source: DataFusionError },
 
-    #[snafu(display("Query execution failed"))]
+    #[snafu(display("Query execution failed: {source}"))]
     QueryExecution { source: DataFusionError },
 
-    #[snafu(display("Failed to write data to table '{table_ref}'"))]
+    #[snafu(display("Failed to write data to table '{table_ref}': {source}"))]
     WriteData {
         table_ref: String,
         source: DataFusionError,
