@@ -618,14 +618,13 @@ impl Runtime {
     pub async fn responses_api_support_for_model(
         &self,
         model_name: &str,
-    ) -> crate::model::ResponsesApiSupport {
+    ) -> Option<crate::model::ResponsesApiSupport> {
         self.llm_runtime_stores
             .responses_api_support()
             .read()
             .await
             .get(model_name)
             .cloned()
-            .unwrap_or(crate::model::ResponsesApiSupport::Unavailable)
     }
 
     pub async fn responses_supported_model_names(&self) -> HashSet<String> {

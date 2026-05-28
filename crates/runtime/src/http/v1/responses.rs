@@ -141,6 +141,7 @@ fn responses_support_gate(model_id: &str, support: &ResponsesApiSupport) -> Opti
         ))),
         (status = 400, description = "The specified model provider does not support the Responses API or the request is invalid"),
         (status = 404, description = "The specified model was not found"),
+        (status = 503, description = "The specified model is unavailable via the Responses API"),
         (status = 500, description = "An internal server error occurred while processing the response", content((
             serde_json::Value = "application/json",
             example = json!({
@@ -179,9 +180,10 @@ pub(crate) async fn post(
         let model_id = model_id.clone();
         let stream = req.stream.unwrap_or(false);
 
-        let responses_support = rt.responses_api_support_for_model(&model_id).await;
-        if let Some(response) = responses_support_gate(&model_id, &responses_support) {
-            return response;
+        if let Some(responses_support) = rt.responses_api_support_for_model(&model_id).await {
+            if let Some(response) = responses_support_gate(&model_id, &responses_support) {
+                return response;
+            }
         }
 
         let Some(model) = llms.read().await.get(&model_id).cloned() else {
