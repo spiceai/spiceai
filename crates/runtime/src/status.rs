@@ -402,10 +402,35 @@ impl RuntimeStatus {
         }
     }
 
+    /// Waits for a component to leave the `Initializing` state — used by
+    /// callers that only need the component registered, not fully ready.
+    async fn wait_for_component_registered(&self, component_name: &str) {
+        let mut receiver = self.get_or_create_notifier(component_name);
+
+        loop {
+            if !matches!(*receiver.borrow(), ComponentStatus::Initializing) {
+                return;
+            }
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     /// Waits for a dataset to become ready.
     pub async fn wait_for_dataset_ready(&self, dataset: &TableReference) {
         let component_name = format!("dataset:{dataset}");
         self.wait_for_component_ready(&component_name).await;
+    }
+
+    /// Waits for a dataset to be registered (any status other than
+    /// `Initializing`). Useful when the caller only needs the table
+    /// provider to exist, not for the dataset to be fully loaded — e.g.
+    /// scheduler-side partition discovery, where waiting for `Ready`
+    /// would deadlock because `Ready` is gated on executor data loads.
+    pub async fn wait_for_dataset_registered(&self, dataset: &TableReference) {
+        let component_name = format!("dataset:{dataset}");
+        self.wait_for_component_registered(&component_name).await;
     }
 
     /// Waits for a model to become ready.

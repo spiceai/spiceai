@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::implicit_hasher)]
+#[cfg(feature = "bedrock")]
+use llms::bedrock::chat::{BedrockConverse, guardrail::GuardRail};
 use llms::{
     HealthCheck,
     anthropic::Anthropic,
-    bedrock::chat::{BedrockConverse, guardrail::GuardRail},
     chat::{Chat, Error as LlmError},
     google::Google,
     openai::{ChatBackend, UsageTier},

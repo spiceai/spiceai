@@ -25,6 +25,7 @@ use data_components::{Read, ReadWrite};
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 
 use crate::component::dataset::Dataset;
+use crate::datafusion::udf::deny_spice_specific_functions;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
 use snafu::prelude::*;
@@ -139,7 +140,8 @@ impl DataConnectorFactory for SnowflakeFactory {
                     .context(UnableToCreateSnowflakeConnectionPoolSnafu)?,
             );
 
-            let table_factory = SnowflakeTableFactory::new(pool);
+            let table_factory = SnowflakeTableFactory::new(pool)
+                .with_function_support(deny_spice_specific_functions().as_ref().clone());
 
             Ok(Arc::new(Snowflake { table_factory }) as Arc<dyn DataConnector>)
         })
