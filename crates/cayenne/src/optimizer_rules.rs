@@ -48,15 +48,20 @@ limitations under the License.
 //!    excluded — their semantics require the *absence* of a match, so sharing
 //!    the filter would drop rows the anti-join is supposed to preserve).
 //!
-//! 3. **Same-source large semi/anti sort-merge rewrite.** `DataFusion` does
+//! 3. **Large hash-join sort-merge rewrite.** `DataFusion` does
 //!    not create dynamic filters for anti joins, and semi/anti joins with a
 //!    large same-source LEFT input can leave a large non-spillable
 //!    `HashJoinInput[N]` reservation behind.
-//!    [`CayenneAntiJoinSortMergeRewriter`] rewrites only same-source Cayenne
-//!    semi/anti `HashJoinExec` nodes to `SortMergeJoinExec` with explicit
-//!    spillable `SortExec` inputs above a 10M-row exact build-side threshold.
-//!    Ordinary inner/outer joins stay with `HashJoinExec` unless another
-//!    optimizer rule supplies a more targeted win.
+//!    [`CayenneAntiJoinSortMergeRewriter`] rewrites Cayenne `HashJoinExec`
+//!    nodes to `SortMergeJoinExec` with explicit spillable `SortExec` inputs:
+//!    - **Semi/anti joins** are rewritten when the build is same-source and
+//!      exceeds the row or byte gate.
+//!    - **Inner joins** are rewritten only when the byte gate is configured and
+//!      the estimated build-side hash table exceeds it. This protects small
+//!      inner joins that benefit from the hash-join + dynamic-filter plan, while
+//!      rescuing large inner joins (e.g. tpch Q18 `orders ⨝ lineitem`) whose
+//!      non-spillable build would otherwise exhaust the memory pool.
+//!    Outer joins stay with `HashJoinExec`.
 //!
 //! [`CayenneJoinRewriter`] still handles the ordinary inner-join probe side by
 //! swapping the default in-list accumulator for [`ExactLeftAccumulator`], which
@@ -387,13 +392,20 @@ fn try_rewrite_large_same_source_join(
     hash_join: &HashJoinExec,
     config: &ConfigOptions,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
-    // Semi/anti joins are the clear-win target: `HashJoinExec` builds the LEFT
-    // input into a non-spillable hash table, while these q21-shaped joins do
-    // not have the same dynamic-filter fallback as ordinary inner joins.
-    if !matches!(
-        hash_join.join_type(),
+    // Semi/anti joins are the original q21 target: `HashJoinExec` builds the LEFT
+    // input into a non-spillable hash table and they have no dynamic-filter
+    // fallback. Inner joins are also rewritten, but only when the byte gate fires
+    // — large inner-join builds (e.g. tpch Q18 `orders ⨝ lineitem`) can blow the
+    // pool too, and SMJ's spillable sort is the only escape. Small inner joins
+    // keep their HashJoinExec + dynamic-filter plan via the stricter byte gate
+    // applied below.
+    let join_type = *hash_join.join_type();
+    let is_semi_anti = matches!(
+        join_type,
         JoinType::LeftAnti | JoinType::RightAnti | JoinType::LeftSemi | JoinType::RightSemi,
-    ) {
+    );
+    let is_inner = matches!(join_type, JoinType::Inner);
+    if !(is_semi_anti || is_inner) {
         return Ok(None);
     }
 
@@ -405,7 +417,11 @@ fn try_rewrite_large_same_source_join(
         return Ok(None);
     }
 
-    if !has_single_same_source_pair_for_all_join_keys(hash_join) {
+    // Same-source self-join is part of the q21 shape and only meaningful for
+    // semi/anti. Inner joins commonly span sources (tpch Q18 orders ⨝ lineitem),
+    // so skip that restriction and lean on the byte gate to keep the rule
+    // narrow.
+    if is_semi_anti && !has_single_same_source_pair_for_all_join_keys(hash_join) {
         return Ok(None);
     }
 
@@ -428,11 +444,21 @@ fn try_rewrite_large_same_source_join(
         Some(_) => build_side_memory_estimate(hash_join.left().as_ref(), build_row_count),
         None => None,
     };
-    let should_rewrite = match (memory_gate_bytes, estimated_build_bytes) {
-        // Memory gate active + byte estimate available — byte gate alone decides.
-        (Some(gate_bytes), Some(bytes)) => bytes > gate_bytes,
-        // Memory gate active but no byte estimate, or no gate configured — fall back to row gate.
-        (Some(_), None) | (None, _) => row_gate_passes,
+    let should_rewrite = if is_inner {
+        // Inner joins give up the CayenneJoinRewriter + CayenneDynamicFilterSharing
+        // benefits on rewrite, so only fire when the byte gate is both configured
+        // and definitively exceeded. No row-gate fallback for inner joins.
+        matches!(
+            (memory_gate_bytes, estimated_build_bytes),
+            (Some(gate_bytes), Some(bytes)) if bytes > gate_bytes,
+        )
+    } else {
+        match (memory_gate_bytes, estimated_build_bytes) {
+            // Memory gate active + byte estimate available — byte gate alone decides.
+            (Some(gate_bytes), Some(bytes)) => bytes > gate_bytes,
+            // Memory gate active but no byte estimate, or no gate configured — fall back to row gate.
+            (Some(_), None) | (None, _) => row_gate_passes,
+        }
     };
 
     if !should_rewrite {
@@ -442,7 +468,8 @@ fn try_rewrite_large_same_source_join(
             row_count_threshold,
             estimated_build_bytes,
             memory_gate_bytes,
-            "Keeping same-source Cayenne HashJoinExec because neither row nor byte gate fires"
+            is_inner,
+            "Keeping Cayenne HashJoinExec because byte/row gate did not fire"
         );
         return Ok(None);
     }
@@ -488,7 +515,8 @@ fn try_rewrite_large_same_source_join(
         row_count_threshold,
         estimated_build_bytes,
         memory_gate_bytes,
-        "Replacing large same-source Cayenne HashJoinExec with SortMergeJoinExec"
+        is_inner,
+        "Replacing large Cayenne HashJoinExec with SortMergeJoinExec"
     );
 
     Ok(Some(Arc::new(join)))
