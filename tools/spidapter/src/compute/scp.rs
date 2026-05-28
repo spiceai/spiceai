@@ -168,6 +168,8 @@ pub(super) async fn provision_scp_app(
         sql_url,
         cloud,
         storage: FederatedStorageConfig::Cayenne, // will be replaced by setup() caller
+        ec2_guards: vec![],
+        dynamodb_guard: None,
     })))
 }
 

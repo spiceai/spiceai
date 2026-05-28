@@ -165,6 +165,8 @@ pub(super) async fn provision_local_single_node(
         sql_url,
         working_dir,
         storage: setup_config.storage.clone(),
+        ec2_guards: vec![],
+        dynamodb_guard: None,
     })))
 }
 
@@ -386,6 +388,8 @@ pub(super) async fn provision_local_spiced_cluster(
         sql_url: scheduler_sql_url,
         working_dir,
         storage: setup_config.storage.clone(),
+        ec2_guards: vec![],
+        dynamodb_guard: None,
     })))
 }
 

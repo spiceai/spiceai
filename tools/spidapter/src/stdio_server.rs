@@ -76,6 +76,8 @@ struct ScpRunState {
     sql_url: String,
     cloud: CloudClient,
     storage: FederatedStorageConfig,
+    ec2_guards: Vec<Ec2Guard>,
+    dynamodb_guard: Option<DynamoDbGuard>,
 }
 
 /// State for an active benchmark run provisioned via `setup`.
@@ -121,6 +123,8 @@ struct LocalRunState {
     sql_url: String,
     working_dir: PathBuf,
     storage: FederatedStorageConfig,
+    ec2_guards: Vec<Ec2Guard>,
+    dynamodb_guard: Option<DynamoDbGuard>,
 }
 
 enum LocalProcesses {
@@ -157,6 +161,65 @@ impl Drop for LocalRunState {
 struct Ec2InstanceInfo {
     instance_id: String,
     region: String,
+}
+
+/// RAII guard that terminates an EC2 instance when dropped.
+struct Ec2Guard {
+    instance_id: String,
+    region: String,
+}
+
+impl Drop for Ec2Guard {
+    fn drop(&mut self) {
+        let instance_id = self.instance_id.clone();
+        let region = self.region.clone();
+        eprintln!("[stdio] Ec2Guard: terminating instance {instance_id} (region={region})");
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                eprintln!("[stdio] Ec2Guard: failed to build tokio runtime for cleanup");
+                return;
+            };
+            if let Err(e) = rt.block_on(terminate_ec2_instance(&region, &instance_id)) {
+                eprintln!(
+                    "[stdio] Ec2Guard: failed to terminate instance {instance_id}: {e}"
+                );
+            }
+        })
+        .join()
+        .ok();
+    }
+}
+
+/// RAII guard that deletes DynamoDB tables when dropped.
+struct DynamoDbGuard {
+    info: DynamoDbTeardownInfo,
+}
+
+impl Drop for DynamoDbGuard {
+    fn drop(&mut self) {
+        eprintln!(
+            "[stdio] DynamoDbGuard: deleting {} table(s)",
+            self.info.table_names.len()
+        );
+        let info = self.info.clone();
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                eprintln!("[stdio] DynamoDbGuard: failed to build tokio runtime for cleanup");
+                return;
+            };
+            if let Err(e) = rt.block_on(delete_dynamodb_tables(&info)) {
+                eprintln!("[stdio] DynamoDbGuard: failed to delete DynamoDB tables: {e}");
+            }
+        })
+        .join()
+        .ok();
+    }
 }
 
 /// Configuration for the federated storage backend for a benchmark run.
@@ -331,16 +394,26 @@ impl Handler for SpidapterHandler {
             metadata.keys().collect::<Vec<_>>()
         );
 
+        // Guards accumulate as resources are provisioned. If setup returns Err at any
+        // point before they are moved into RunState, their Drop impls clean up.
+        let mut ec2_guards: Vec<Ec2Guard> = Vec::new();
+        let mut dynamodb_guard: Option<DynamoDbGuard> = None;
+
         // Build the FederatedStorageConfig (same logic as setup()).
         let storage = match self.args.storage {
             FederatedStorage::Cayenne => FederatedStorageConfig::Cayenne,
             FederatedStorage::Postgres => {
+                let run_id_str = run_id.to_string();
+                let short_id = run_id_str.split('-').next().unwrap_or_default();
+
                 let ec2_instance: Option<Ec2PostgresInstance> = if is_ec2_mode(&self.args) {
-                    let run_id_str = run_id.to_string();
-                    let short_id = run_id_str.split('-').next().unwrap_or_default();
                     let instance = launch_postgres_ec2(&self.args, short_id)
                         .await
                         .map_err(|e| format!("Failed to provision EC2 PostgreSQL instance: {e}"))?;
+                    ec2_guards.push(Ec2Guard {
+                        instance_id: instance.instance_id.clone(),
+                        region: instance.region.clone(),
+                    });
                     Some(instance)
                 } else {
                     None
@@ -363,16 +436,9 @@ impl Handler for SpidapterHandler {
                     "FederatedStorage::Postgres requires PG_HOST or EC2 provisioning".to_string()
                 })?;
 
-                if let Err(e) = setup_postgres_for_wal(&pg, &datasets).await {
-                    if let Some(ref ec2) = ec2_instance
-                        && let Err(te) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
-                    {
-                        eprintln!(
-                            "[stdio] warning: failed to terminate EC2 instance after WAL setup failure: {te}"
-                        );
-                    }
-                    return Err(format!("Failed to set up PostgreSQL for WAL CDC: {e}"));
-                }
+                setup_postgres_for_wal(&pg, &datasets)
+                    .await
+                    .map_err(|e| format!("Failed to set up PostgreSQL for WAL CDC: {e}"))?;
 
                 let ec2 = ec2_instance.map(|e| Ec2InstanceInfo {
                     instance_id: e.instance_id,
@@ -400,39 +466,34 @@ impl Handler for SpidapterHandler {
                     (None, launch_ec2_debezium(&self.args, short_id).await)
                 };
 
-                // Unwrap the Debezium EC2 result, cleaning up Postgres EC2 on failure.
-                let ec2_deb = match ec2_deb_result {
-                    Ok(inst) => inst,
-                    Err(e) => {
-                        if let Some(Ok(ref pg_ec2)) = ec2_pg_result {
-                            if let Err(te) =
-                                terminate_ec2_instance(&pg_ec2.region, &pg_ec2.instance_id).await
-                            {
-                                eprintln!(
-                                    "[stdio] warning: failed to terminate Postgres EC2 after Debezium launch failure: {te}"
-                                );
-                            }
-                        }
-                        return Err(format!("Failed to provision EC2 Debezium instance: {e}"));
+                // Push guards for successful launches before unwrapping errors — this
+                // ensures the successfully-provisioned instance is terminated if its
+                // counterpart failed.
+                let ec2_pg_instance: Option<Ec2PostgresInstance> = match ec2_pg_result {
+                    None => None,
+                    Some(Ok(inst)) => {
+                        ec2_guards.push(Ec2Guard {
+                            instance_id: inst.instance_id.clone(),
+                            region: inst.region.clone(),
+                        });
+                        Some(inst)
+                    }
+                    Some(Err(e)) => {
+                        return Err(format!("Failed to provision EC2 PostgreSQL instance: {e}"));
                     }
                 };
 
-                // Unwrap the Postgres EC2 result (if launched), cleaning up Debezium EC2 on failure.
-                let ec2_pg_instance: Option<Ec2PostgresInstance> = match ec2_pg_result {
-                    Some(Ok(inst)) => Some(inst),
-                    Some(Err(e)) => {
-                        if let Err(te) =
-                            terminate_ec2_instance(&ec2_deb.region, &ec2_deb.instance_id).await
-                        {
-                            eprintln!(
-                                "[stdio] warning: failed to terminate Debezium EC2 after Postgres launch failure: {te}"
-                            );
-                        }
-                        return Err(format!(
-                            "Failed to provision EC2 PostgreSQL instance: {e}"
-                        ));
+                let ec2_deb = match ec2_deb_result {
+                    Ok(inst) => {
+                        ec2_guards.push(Ec2Guard {
+                            instance_id: inst.instance_id.clone(),
+                            region: inst.region.clone(),
+                        });
+                        inst
                     }
-                    None => None,
+                    Err(e) => {
+                        return Err(format!("Failed to provision EC2 Debezium instance: {e}"));
+                    }
                 };
 
                 let pg = if let Some(ref ec2) = ec2_pg_instance {
@@ -453,31 +514,15 @@ impl Handler for SpidapterHandler {
                         .to_string()
                 })?;
 
-                if let Err(e) = setup_postgres_for_debezium(&pg, &datasets).await {
-                    if let Some(ref ec2) = ec2_pg_instance {
-                        if let Err(te) =
-                            terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
-                        {
-                            eprintln!(
-                                "[stdio] warning: failed to terminate Postgres EC2 after Debezium setup failure: {te}"
-                            );
-                        }
-                    }
-                    if let Err(te) =
-                        terminate_ec2_instance(&ec2_deb.region, &ec2_deb.instance_id).await
-                    {
-                        eprintln!(
-                            "[stdio] warning: failed to terminate Debezium EC2 after setup failure: {te}"
-                        );
-                    }
-                    return Err(format!("Failed to set up PostgreSQL for Debezium CDC: {e}"));
-                }
+                setup_postgres_for_debezium(&pg, &datasets)
+                    .await
+                    .map_err(|e| format!("Failed to set up PostgreSQL for Debezium CDC: {e}"))?;
 
                 let kafka_brokers = ec2_deb.kafka_brokers.clone();
                 let debezium_connect_url = ec2_deb.connect_url.clone();
                 let ec2_debezium = Some(Ec2InstanceInfo {
-                    instance_id: ec2_deb.instance_id,
-                    region: ec2_deb.region,
+                    instance_id: ec2_deb.instance_id.clone(),
+                    region: ec2_deb.region.clone(),
                 });
                 let ec2 = ec2_pg_instance.map(|e| Ec2InstanceInfo {
                     instance_id: e.instance_id,
@@ -514,10 +559,18 @@ impl Handler for SpidapterHandler {
         setup_config.aws_region_override = self.args.aws_region.clone();
 
         // DynamoDB: create tables now so spicebench can write via the native sink.
-        if let FederatedStorageConfig::DynamoDB { .. } = &setup_config.storage {
+        if let FederatedStorageConfig::DynamoDB { ref region, .. } = setup_config.storage {
+            let region = region.clone();
             let prefix = create_dynamodb_tables(&setup_config, &datasets)
                 .await
                 .map_err(|e| format!("Failed to create DynamoDB tables: {e}"))?;
+            let table_names = datasets
+                .keys()
+                .map(|name| format!("{prefix}.{name}"))
+                .collect();
+            dynamodb_guard = Some(DynamoDbGuard {
+                info: DynamoDbTeardownInfo { table_names, region },
+            });
             if let FederatedStorageConfig::DynamoDB {
                 prefix: ref mut p, ..
             } = setup_config.storage
@@ -547,7 +600,7 @@ impl Handler for SpidapterHandler {
 
         // For Cayenne: provision spiced first (Flight URL needed to build SinkConfig).
         // For all other backends: build SinkConfig first, then provision spiced.
-        let (sink, state) = match &setup_config.storage {
+        let (sink, mut state) = match &setup_config.storage {
             FederatedStorageConfig::Cayenne => {
                 let deployment_mode = setup_config.storage.deployment_mode();
                 let provision_result = match self.args.compute {
@@ -707,29 +760,7 @@ impl Handler for SpidapterHandler {
                         s
                     }
                     Err(e) => {
-                        let (ec2, ec2_debezium) = match &setup_config.storage {
-                            FederatedStorageConfig::Postgres { ec2, .. } => (ec2.as_ref(), None),
-                            FederatedStorageConfig::PostgresDebezium {
-                                ec2, ec2_debezium, ..
-                            } => (ec2.as_ref(), ec2_debezium.as_ref()),
-                            _ => (None, None),
-                        };
-                        if let Some(ec2) = ec2
-                            && let Err(te) =
-                                terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
-                        {
-                            eprintln!(
-                                "[stdio] warning: failed to terminate EC2 Postgres instance on setup failure: {te}"
-                            );
-                        }
-                        if let Some(ec2) = ec2_debezium
-                            && let Err(te) =
-                                terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
-                        {
-                            eprintln!(
-                                "[stdio] warning: failed to terminate EC2 Debezium instance on setup failure: {te}"
-                            );
-                        }
+                        // ec2_guards and dynamodb_guard drop here, cleaning up AWS resources.
                         return Err(format!("Setup failed: provisioning failed: {e}"));
                     }
                 };
@@ -768,6 +799,18 @@ impl Handler for SpidapterHandler {
             }
             _ => None,
         };
+
+        // Move guards into the run state so they live for the duration of the run.
+        match &mut state {
+            RunState::Scp(scp) => {
+                scp.ec2_guards = ec2_guards;
+                scp.dynamodb_guard = dynamodb_guard;
+            }
+            RunState::Local(local) => {
+                local.ec2_guards = ec2_guards;
+                local.dynamodb_guard = dynamodb_guard;
+            }
+        }
 
         self.runs.insert(run_id, state);
         self.run_datasets.insert(run_id, datasets);
@@ -839,7 +882,7 @@ impl Handler for SpidapterHandler {
     async fn teardown(&mut self, run_id: Uuid) -> Result<TeardownResponse, String> {
         eprintln!("[stdio] teardown: run_id={run_id}");
 
-        let Some(state) = self.runs.remove(&run_id) else {
+        let Some(mut state) = self.runs.remove(&run_id) else {
             eprintln!("[stdio] teardown: run_id={run_id} not found (already torn down?)");
             return Ok(TeardownResponse { ok: true });
         };
@@ -848,6 +891,19 @@ impl Handler for SpidapterHandler {
         let storage = match &state {
             RunState::Scp(scp) => scp.storage.clone(),
             RunState::Local(local) => local.storage.clone(),
+        };
+
+        // Extract guards now; they drop at end of function, AFTER Postgres cleanup below.
+        // This ensures the EC2 instance (which hosts Postgres) is still alive during teardown.
+        let (ec2_guards, dynamodb_guard) = match &mut state {
+            RunState::Scp(scp) => (
+                std::mem::take(&mut scp.ec2_guards),
+                scp.dynamodb_guard.take(),
+            ),
+            RunState::Local(local) => (
+                std::mem::take(&mut local.ec2_guards),
+                local.dynamodb_guard.take(),
+            ),
         };
 
         match state {
@@ -869,61 +925,20 @@ impl Handler for SpidapterHandler {
             }
         }
 
-        match storage {
-            FederatedStorageConfig::Postgres { pg, ec2, .. } => {
-                teardown_postgres(&pg, &run_datasets)
+        // Postgres cleanup must happen before the EC2 guards drop (EC2 hosts Postgres).
+        match &storage {
+            FederatedStorageConfig::Postgres { pg, .. }
+            | FederatedStorageConfig::PostgresDebezium { pg, .. } => {
+                teardown_postgres(pg, &run_datasets)
                     .await
                     .map_err(|e| format!("Failed to teardown PostgreSQL: {e}"))?;
-                if let Some(ec2) = ec2
-                    && let Err(e) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
-                {
-                    eprintln!(
-                        "[stdio] warning: failed to terminate EC2 Postgres instance {}: {e}",
-                        ec2.instance_id
-                    );
-                }
             }
-            FederatedStorageConfig::PostgresDebezium {
-                pg,
-                ec2,
-                ec2_debezium,
-                ..
-            } => {
-                teardown_postgres(&pg, &run_datasets)
-                    .await
-                    .map_err(|e| format!("Failed to teardown PostgreSQL (Debezium): {e}"))?;
-                if let Some(ec2) = ec2
-                    && let Err(e) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
-                {
-                    eprintln!(
-                        "[stdio] warning: failed to terminate EC2 Postgres instance {}: {e}",
-                        ec2.instance_id
-                    );
-                }
-                if let Some(ec2) = ec2_debezium
-                    && let Err(e) = terminate_ec2_instance(&ec2.region, &ec2.instance_id).await
-                {
-                    eprintln!(
-                        "[stdio] warning: failed to terminate EC2 Debezium instance {}: {e}",
-                        ec2.instance_id
-                    );
-                }
-            }
-            FederatedStorageConfig::DynamoDB { prefix, region, .. } => {
-                let table_names = run_datasets
-                    .keys()
-                    .map(|name| format!("{prefix}.{name}"))
-                    .collect();
-                let info = DynamoDbTeardownInfo {
-                    table_names,
-                    region,
-                };
-                delete_dynamodb_tables(&info)
-                    .await
-                    .map_err(|e| format!("Failed to delete DynamoDB tables: {e}"))?;
-            }
-            FederatedStorageConfig::Cayenne => {}
+            FederatedStorageConfig::DynamoDB { .. } | FederatedStorageConfig::Cayenne => {}
         }
+
+        // Guards drop here: EC2 instances are terminated, DynamoDB tables are deleted.
+        drop(ec2_guards);
+        drop(dynamodb_guard);
 
         Ok(TeardownResponse { ok: true })
     }

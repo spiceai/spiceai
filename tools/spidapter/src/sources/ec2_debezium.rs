@@ -212,7 +212,7 @@ services:
       - "29092:29092"
 
   debezium:
-    image: debezium/connect:2.7
+    image: quay.io/debezium/connect:2.7
     depends_on:
       - redpanda
     ports:
