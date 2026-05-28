@@ -660,6 +660,16 @@ impl SpiceTestQueryWorker {
                         Ok(pretty) => eprintln!("{pretty}"),
                         Err(e) => eprintln!("Failed to format expected batches: {e}"),
                     }
+                } else if matches!(
+                    &validation_reason,
+                    validation::QueryValidationFailReason::NoExpectedAnswerAtScaleFactor
+                ) {
+                    eprintln!(
+                        "\nNo static expected answer exists for query '{}' at scale factor {}. \
+                         Static TPCH answers are only available at scale factor 1.0; validating at \
+                         other scale factors requires a configured reference schema.",
+                        query.name, self.scale_factor
+                    );
                 } else {
                     eprintln!(
                         "\nExpected results: See TPCH specification for query {}",

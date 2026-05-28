@@ -46,6 +46,11 @@ use super::Query;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryValidationFailReason {
     NoExpectedAnswer,
+    /// A static TPCH answer exists for the query, but only at scale factor 1.0.
+    /// Validating at any other scale factor requires a configured reference
+    /// schema, so this is reported distinctly from [`Self::NoExpectedAnswer`]
+    /// (which means no expected answer exists for the query at all).
+    NoExpectedAnswerAtScaleFactor,
     NoAnswer,
     SchemaMismatch,
     RowCountMismatch {
@@ -128,12 +133,12 @@ static TPCH_ANSWERS: LazyLock<BTreeMap<Arc<str>, Vec<RecordBatch>>> = LazyLock::
 });
 
 #[must_use]
-pub fn has_static_tpch_answer(query: &Query) -> bool {
+pub(crate) fn has_static_tpch_answer(query: &Query) -> bool {
     TPCH_ANSWERS.contains_key(&query.name)
 }
 
 #[must_use]
-pub fn should_validate_with_static_tpch_answer(query: &Query, scale_factor: f64) -> bool {
+pub(crate) fn should_validate_with_static_tpch_answer(query: &Query, scale_factor: f64) -> bool {
     (scale_factor - 1.0).abs() < f64::EPSILON && has_static_tpch_answer(query)
 }
 
@@ -552,8 +557,12 @@ pub fn validate_tpch_query_at_scale(
     if has_static_tpch_answer(query)
         && !should_validate_with_static_tpch_answer(query, scale_factor)
     {
+        // A static answer exists, but only at scale factor 1.0. Report this
+        // distinctly from `NoExpectedAnswer` so callers can tell the query has a
+        // known SF=1 answer and that validating at this scale factor needs a
+        // reference schema instead.
         return Ok(QueryValidationResult::Fail(
-            QueryValidationFailReason::NoExpectedAnswer,
+            QueryValidationFailReason::NoExpectedAnswerAtScaleFactor,
         ));
     }
 
@@ -711,7 +720,7 @@ mod test {
 
         assert_eq!(
             validate_tpch_query_at_scale(&query, &batches, 100.0).expect("should validate"),
-            QueryValidationResult::Fail(QueryValidationFailReason::NoExpectedAnswer)
+            QueryValidationResult::Fail(QueryValidationFailReason::NoExpectedAnswerAtScaleFactor)
         );
     }
 
