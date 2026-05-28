@@ -51,7 +51,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Returns `10^exp` as `i128`, or `None` on overflow.
 #[inline]
-#[must_use] 
+#[must_use]
 pub fn pow10_i128(exp: i8) -> Option<i128> {
     let mut acc: i128 = 1;
     for _ in 0..exp {
