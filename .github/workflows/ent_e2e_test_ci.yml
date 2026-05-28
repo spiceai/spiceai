@@ -824,8 +824,11 @@ jobs:
       - name: Install Clickhouse
         if: matrix.target.target_os == 'linux'
         run: |
-          curl https://clickhouse.com/ | sh
-          sudo ./clickhouse install
+          CLICKHOUSE_VERSION="26.3.9.8"
+          curl -fsSL 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg] https://packages.clickhouse.com/deb stable main" | sudo tee /etc/apt/sources.list.d/clickhouse.list
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y clickhouse-common-static=${CLICKHOUSE_VERSION} clickhouse-server=${CLICKHOUSE_VERSION} clickhouse-client=${CLICKHOUSE_VERSION}
           sudo -u clickhouse /usr/bin/clickhouse-server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
           sleep 5
           clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
@@ -835,8 +838,12 @@ jobs:
       - name: Install Clickhouse
         if: matrix.target.target_os == 'darwin'
         run: |
-          curl https://clickhouse.com/ | sh
-          sudo ./clickhouse install
+          CLICKHOUSE_VERSION="26.3.9.8-lts"
+          BASE_URL="https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}"
+          curl -fsSL "${BASE_URL}/clickhouse-macos-aarch64" -o clickhouse-macos-aarch64
+          mv clickhouse-macos-aarch64 clickhouse
+          chmod +x clickhouse
+          sudo ./clickhouse install --noninteractive
           sudo clickhouse server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
           sleep 5
           clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
@@ -905,7 +912,7 @@ jobs:
         run: |
           killall spice || true
           cat spice.log
-
+          
   test_quickstart_duckdb:
     env:
       duckdb_version: v0.10.2
