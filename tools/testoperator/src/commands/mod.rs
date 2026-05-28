@@ -93,7 +93,7 @@ pub(crate) async fn build_test_with_validation(
     let queries = query_set
         .get_queries(query_overrides, None, None, args.scale_factor)
         .await?;
-    let reference_schema = validation_reference_schema(args, app, &query_set, &queries, false)?;
+    let reference_schema = validation_reference_schema(args, app, &query_set, &queries, false);
 
     let mut test_builder = test_builder
         .with_query_set(queries)
@@ -133,36 +133,36 @@ fn validation_reference_schema(
     query_set: &QuerySet,
     queries: &[Query],
     allow_generated_reference_schema: bool,
-) -> anyhow::Result<Option<String>> {
+) -> Option<String> {
     if let Some(reference_schema) = &args.reference_schema {
-        return Ok(Some(reference_schema.clone()));
+        return Some(reference_schema.clone());
     }
 
     if !args.validate {
-        return Ok(None);
+        return None;
     }
 
     if !supports_automatic_reference_validation(query_set) {
-        return Ok(None);
+        return None;
     }
 
     let table_names = reference_table_names(queries);
     if table_names.is_empty() {
-        return Ok(None);
+        return None;
     }
 
     if let Some(reference_schema) = detect_reference_schema(app, &table_names) {
-        return Ok(Some(reference_schema));
+        return Some(reference_schema);
     }
 
     if args.common.is_external_instance() || args.common.is_system_adapter() {
-        return Ok(None);
+        return None;
     }
 
     if allow_generated_reference_schema && has_unqualified_datasets(app, &table_names) {
-        Ok(Some(AUTOMATIC_REFERENCE_SCHEMA.to_string()))
+        Some(AUTOMATIC_REFERENCE_SCHEMA.to_string())
     } else {
-        Ok(None)
+        None
     }
 }
 
@@ -243,7 +243,7 @@ async fn add_automatic_reference_datasets(
 ) -> anyhow::Result<()> {
     let query_set = args.load_query_set()?;
     let queries = benchmark_queries(args, &query_set).await?;
-    if validation_reference_schema(args, app, &query_set, &queries, true)?.as_deref()
+    if validation_reference_schema(args, app, &query_set, &queries, true).as_deref()
         != Some(AUTOMATIC_REFERENCE_SCHEMA)
     {
         return Ok(());
