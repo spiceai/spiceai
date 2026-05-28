@@ -148,7 +148,10 @@ mod tests {
     //! exists to document the behavior shared with the other tool
     //! surfaces that consult `current_principal_requires_read_only`.
     use super::*;
-    use crate::{datafusion::builder::DataFusionBuilder, status::RuntimeStatus};
+    use crate::{
+        datafusion::{DataFusion, builder::DataFusionBuilder},
+        status::RuntimeStatus,
+    };
     use arrow::datatypes::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
     use datafusion::sql::TableReference;
@@ -194,7 +197,8 @@ mod tests {
         df.mark_dataset_writable(&table_name)
             .expect("dataset marked writable");
 
-        let tool = SqlTool::new(Arc::clone(&df), None, None, None);
+        let query_engine: Arc<dyn QueryEngine> = Arc::clone(&df);
+        let tool = SqlTool::new(query_engine, None, None, None);
         (df, tool)
     }
 
