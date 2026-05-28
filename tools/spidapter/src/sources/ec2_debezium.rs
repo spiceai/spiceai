@@ -31,7 +31,6 @@ const CONNECT_PORT: u16 = 8083;
 /// A provisioned EC2 instance running Redpanda (Kafka-compatible) and Debezium Connect.
 pub(crate) struct Ec2DebeziumInstance {
     pub(crate) instance_id: String,
-    pub(crate) host: String,
     /// Bootstrap server string for Kafka clients: `"{host}:9092"`.
     pub(crate) kafka_brokers: String,
     /// Debezium Connect REST endpoint: `"http://{host}:8083"`.
@@ -145,7 +144,9 @@ pub(crate) async fn launch_ec2_debezium(
         .ok_or_else(|| anyhow::anyhow!("EC2 RunInstances did not return an instance ID"))?
         .to_string();
 
-    eprintln!("[stdio] EC2 Debezium: instance {instance_id} launched, waiting for running state...");
+    eprintln!(
+        "[stdio] EC2 Debezium: instance {instance_id} launched, waiting for running state..."
+    );
     wait_for_instance_running(&ec2, &instance_id).await?;
 
     let host = if args.ec2_associate_public_ip {
@@ -163,7 +164,6 @@ pub(crate) async fn launch_ec2_debezium(
         instance_id,
         kafka_brokers: format!("{host}:{KAFKA_PORT}"),
         connect_url: format!("http://{host}:{CONNECT_PORT}"),
-        host,
         region,
     })
 }

@@ -31,10 +31,10 @@ pub(super) fn composite_key_str(cols: &[String]) -> Option<String> {
     }
 }
 
-/// Type mapping for DynamoDB spicepod column declarations.
+/// Type mapping for `DynamoDB` spicepod column declarations.
 ///
 /// Maps Arrow types to the types the Spice acceleration engine will see when reading
-/// back from DynamoDB. Must stay in sync with how `DynamoDbSink` encodes values:
+/// back from `DynamoDB`. Must stay in sync with how `DynamoDbSink` encodes values:
 /// - `Decimal128/256` → stored as `N` (number string) → declared as `Float64`
 /// - `Timestamp` → stored as `S` (ISO 8601 string) → declared as `Utf8`
 pub(super) fn dynamodb_arrow_type_to_spicepod_str(dt: &arrow::datatypes::DataType) -> String {

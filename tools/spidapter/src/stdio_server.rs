@@ -156,22 +156,33 @@ impl Drop for LocalRunState {
     }
 }
 
-/// EC2 instance provisioned for a benchmark run (used for teardown).
-#[derive(Debug, Clone)]
-struct Ec2InstanceInfo {
-    instance_id: String,
+/// RAII guard that terminates an EC2 instance when dropped.
+///
+/// Call [`disarm`](Self::disarm) before async teardown to extract the cleanup data and
+/// prevent the sequential blocking [`Drop`] from running.
+struct Ec2Guard {
+    instance_id: Option<String>,
     region: String,
 }
 
-/// RAII guard that terminates an EC2 instance when dropped.
-struct Ec2Guard {
-    instance_id: String,
-    region: String,
+impl Ec2Guard {
+    fn new(instance_id: String, region: String) -> Self {
+        Self {
+            instance_id: Some(instance_id),
+            region,
+        }
+    }
+
+    fn disarm(&mut self) -> Option<(String, String)> {
+        self.instance_id.take().map(|id| (id, self.region.clone()))
+    }
 }
 
 impl Drop for Ec2Guard {
     fn drop(&mut self) {
-        let instance_id = self.instance_id.clone();
+        let Some(instance_id) = self.instance_id.take() else {
+            return;
+        };
         let region = self.region.clone();
         eprintln!("[stdio] Ec2Guard: terminating instance {instance_id} (region={region})");
         std::thread::spawn(move || {
@@ -183,9 +194,7 @@ impl Drop for Ec2Guard {
                 return;
             };
             if let Err(e) = rt.block_on(terminate_ec2_instance(&region, &instance_id)) {
-                eprintln!(
-                    "[stdio] Ec2Guard: failed to terminate instance {instance_id}: {e}"
-                );
+                eprintln!("[stdio] Ec2Guard: failed to terminate instance {instance_id}: {e}");
             }
         })
         .join()
@@ -193,18 +202,33 @@ impl Drop for Ec2Guard {
     }
 }
 
-/// RAII guard that deletes DynamoDB tables when dropped.
+/// RAII guard that deletes `DynamoDB` tables when dropped.
+///
+/// Call [`disarm`](Self::disarm) before async teardown to extract the cleanup data and
+/// prevent the sequential blocking [`Drop`] from running.
 struct DynamoDbGuard {
-    info: DynamoDbTeardownInfo,
+    info: Option<DynamoDbTeardownInfo>,
+}
+
+impl DynamoDbGuard {
+    fn new(info: DynamoDbTeardownInfo) -> Self {
+        Self { info: Some(info) }
+    }
+
+    fn disarm(&mut self) -> Option<DynamoDbTeardownInfo> {
+        self.info.take()
+    }
 }
 
 impl Drop for DynamoDbGuard {
     fn drop(&mut self) {
+        let Some(info) = self.info.take() else {
+            return;
+        };
         eprintln!(
             "[stdio] DynamoDbGuard: deleting {} table(s)",
-            self.info.table_names.len()
+            info.table_names.len()
         );
-        let info = self.info.clone();
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -229,15 +253,12 @@ enum FederatedStorageConfig {
     Postgres {
         pg: PgConfig,
         acceleration: AccelerationEngine,
-        ec2: Option<Ec2InstanceInfo>,
     },
     PostgresDebezium {
         pg: PgConfig,
         kafka_brokers: String,
         debezium_connect_url: String,
         acceleration: AccelerationEngine,
-        ec2: Option<Ec2InstanceInfo>,
-        ec2_debezium: Option<Ec2InstanceInfo>,
     },
     DynamoDB {
         prefix: String,
@@ -394,6 +415,11 @@ impl Handler for SpidapterHandler {
             metadata.keys().collect::<Vec<_>>()
         );
 
+        eprintln!(
+            "DATASETS: {:#?}",
+            datasets,
+        );
+
         // Guards accumulate as resources are provisioned. If setup returns Err at any
         // point before they are moved into RunState, their Drop impls clean up.
         let mut ec2_guards: Vec<Ec2Guard> = Vec::new();
@@ -410,10 +436,10 @@ impl Handler for SpidapterHandler {
                     let instance = launch_postgres_ec2(&self.args, short_id)
                         .await
                         .map_err(|e| format!("Failed to provision EC2 PostgreSQL instance: {e}"))?;
-                    ec2_guards.push(Ec2Guard {
-                        instance_id: instance.instance_id.clone(),
-                        region: instance.region.clone(),
-                    });
+                    ec2_guards.push(Ec2Guard::new(
+                        instance.instance_id.clone(),
+                        instance.region.clone(),
+                    ));
                     Some(instance)
                 } else {
                     None
@@ -440,61 +466,71 @@ impl Handler for SpidapterHandler {
                     .await
                     .map_err(|e| format!("Failed to set up PostgreSQL for WAL CDC: {e}"))?;
 
-                let ec2 = ec2_instance.map(|e| Ec2InstanceInfo {
-                    instance_id: e.instance_id,
-                    region: e.region,
-                });
-
                 FederatedStorageConfig::Postgres {
                     pg,
                     acceleration: self.args.acceleration,
-                    ec2,
                 }
             }
             FederatedStorage::PostgresDebezium => {
                 let run_id_str = run_id.to_string();
                 let short_id = run_id_str.split('-').next().unwrap_or_default();
 
-                // Launch Postgres EC2 (if EC2 mode) and Debezium EC2 concurrently.
-                let (ec2_pg_result, ec2_deb_result) = if is_ec2_mode(&self.args) {
-                    let (pg_res, deb_res) = tokio::join!(
-                        launch_postgres_ec2(&self.args, short_id),
-                        launch_ec2_debezium(&self.args, short_id)
-                    );
-                    (Some(pg_res), deb_res)
-                } else {
-                    (None, launch_ec2_debezium(&self.args, short_id).await)
-                };
+                // In EC2 mode: launch Postgres + Debezium EC2 instances concurrently.
+                // In local mode: read KAFKA_BROKERS and DEBEZIUM_CONNECT_URL from env.
+                let (ec2_pg_instance, kafka_brokers, debezium_connect_url) =
+                    if is_ec2_mode(&self.args) {
+                        let (pg_res, deb_res) = tokio::join!(
+                            launch_postgres_ec2(&self.args, short_id),
+                            launch_ec2_debezium(&self.args, short_id)
+                        );
 
-                // Push guards for successful launches before unwrapping errors — this
-                // ensures the successfully-provisioned instance is terminated if its
-                // counterpart failed.
-                let ec2_pg_instance: Option<Ec2PostgresInstance> = match ec2_pg_result {
-                    None => None,
-                    Some(Ok(inst)) => {
-                        ec2_guards.push(Ec2Guard {
-                            instance_id: inst.instance_id.clone(),
-                            region: inst.region.clone(),
-                        });
-                        Some(inst)
-                    }
-                    Some(Err(e)) => {
-                        return Err(format!("Failed to provision EC2 PostgreSQL instance: {e}"));
-                    }
-                };
+                        let ec2_pg = match pg_res {
+                            Ok(inst) => {
+                                ec2_guards.push(Ec2Guard::new(
+                                    inst.instance_id.clone(),
+                                    inst.region.clone(),
+                                ));
+                                Some(inst)
+                            }
+                            Err(e) => {
+                                return Err(format!(
+                                    "Failed to provision EC2 PostgreSQL instance: {e}"
+                                ));
+                            }
+                        };
 
-                let ec2_deb = match ec2_deb_result {
-                    Ok(inst) => {
-                        ec2_guards.push(Ec2Guard {
-                            instance_id: inst.instance_id.clone(),
-                            region: inst.region.clone(),
-                        });
-                        inst
-                    }
-                    Err(e) => {
-                        return Err(format!("Failed to provision EC2 Debezium instance: {e}"));
-                    }
-                };
+                        let ec2_deb = match deb_res {
+                            Ok(inst) => {
+                                ec2_guards.push(Ec2Guard::new(
+                                    inst.instance_id.clone(),
+                                    inst.region.clone(),
+                                ));
+                                inst
+                            }
+                            Err(e) => {
+                                return Err(format!(
+                                    "Failed to provision EC2 Debezium instance: {e}"
+                                ));
+                            }
+                        };
+
+                        (
+                            ec2_pg,
+                            ec2_deb.kafka_brokers,
+                            ec2_deb.connect_url,
+                        )
+                    } else {
+                        let kafka_brokers = std::env::var("KAFKA_BROKERS").map_err(|_| {
+                            "KAFKA_BROKERS env var is required for local postgres-debezium mode"
+                                .to_string()
+                        })?;
+                        let debezium_connect_url =
+                            std::env::var("DEBEZIUM_CONNECT_URL").map_err(|_| {
+                                "DEBEZIUM_CONNECT_URL env var is required for local postgres-debezium mode"
+                                    .to_string()
+                            })?;
+                        (None, kafka_brokers, debezium_connect_url)
+                    };
 
                 let pg = if let Some(ref ec2) = ec2_pg_instance {
                     Some(PgConfig {
@@ -518,24 +554,11 @@ impl Handler for SpidapterHandler {
                     .await
                     .map_err(|e| format!("Failed to set up PostgreSQL for Debezium CDC: {e}"))?;
 
-                let kafka_brokers = ec2_deb.kafka_brokers.clone();
-                let debezium_connect_url = ec2_deb.connect_url.clone();
-                let ec2_debezium = Some(Ec2InstanceInfo {
-                    instance_id: ec2_deb.instance_id.clone(),
-                    region: ec2_deb.region.clone(),
-                });
-                let ec2 = ec2_pg_instance.map(|e| Ec2InstanceInfo {
-                    instance_id: e.instance_id,
-                    region: e.region,
-                });
-
                 FederatedStorageConfig::PostgresDebezium {
                     pg,
                     kafka_brokers,
                     debezium_connect_url,
                     acceleration: self.args.acceleration,
-                    ec2,
-                    ec2_debezium,
                 }
             }
             FederatedStorage::DynamoDB => {
@@ -568,9 +591,10 @@ impl Handler for SpidapterHandler {
                 .keys()
                 .map(|name| format!("{prefix}.{name}"))
                 .collect();
-            dynamodb_guard = Some(DynamoDbGuard {
-                info: DynamoDbTeardownInfo { table_names, region },
-            });
+            dynamodb_guard = Some(DynamoDbGuard::new(DynamoDbTeardownInfo {
+                table_names,
+                region,
+            }));
             if let FederatedStorageConfig::DynamoDB {
                 prefix: ref mut p, ..
             } = setup_config.storage
@@ -588,33 +612,141 @@ impl Handler for SpidapterHandler {
         } = setup_config.storage
         {
             let table_names: Vec<&str> = datasets.keys().map(String::as_str).collect();
-            register_debezium_postgres_connector(
-                debezium_connect_url,
-                pg,
-                &pg.host,
-                &table_names,
-            )
-            .await
-            .map_err(|e| format!("Failed to register Debezium PostgreSQL connector: {e}"))?;
+            let debezium_pg_host = std::env::var("PG_DEBEZIUM_HOST")
+                .unwrap_or_else(|_| pg.host.clone());
+            register_debezium_postgres_connector(debezium_connect_url, pg, &debezium_pg_host, &table_names)
+                .await
+                .map_err(|e| format!("Failed to register Debezium PostgreSQL connector: {e}"))?;
         }
 
         // For Cayenne: provision spiced first (Flight URL needed to build SinkConfig).
         // For all other backends: build SinkConfig first, then provision spiced.
-        let (sink, mut state) = match &setup_config.storage {
-            FederatedStorageConfig::Cayenne => {
-                let deployment_mode = setup_config.storage.deployment_mode();
-                let provision_result = match self.args.compute {
-                    SpiceCompute::Cloud => {
-                        provision_scp_app(
+        let (sink, mut state) = if matches!(&setup_config.storage, FederatedStorageConfig::Cayenne)
+        {
+            let deployment_mode = setup_config.storage.deployment_mode();
+            let provision_result = match self.args.compute {
+                SpiceCompute::Cloud => {
+                    provision_scp_app(
+                        run_id,
+                        &self.args,
+                        &setup_config,
+                        &datasets,
+                        &deployment_mode,
+                    )
+                    .await
+                }
+                SpiceCompute::Local => {
+                    provision_local_spiced_cluster(
+                        run_id,
+                        Duration::from_secs(self.args.ready_wait),
+                        &setup_config,
+                        &datasets,
+                        &self.args,
+                    )
+                    .await
+                }
+            };
+            let mut state = match provision_result {
+                Ok(s) => s,
+                Err(e) => return Err(format!("Cayenne setup: provisioning failed: {e}")),
+            };
+            match &mut state {
+                RunState::Scp(scp) => scp.storage = setup_config.storage.clone(),
+                RunState::Local(local) => local.storage = setup_config.storage.clone(),
+            }
+
+            let sql_url = state.sql_url().to_string();
+            let api_key = state.api_key().map(str::to_string);
+            post_setup_sink_action(&datasets, &sql_url, api_key.as_deref())
+                .await
+                .map_err(|e| format!("Cayenne post-setup SQL failed: {e}"))?;
+
+            let mut db_kwargs = HashMap::from([
+                (
+                    "uri".to_string(),
+                    serde_json::Value::String(state.flight_url().to_string()),
+                ),
+                (
+                    "username".to_string(),
+                    serde_json::Value::String(String::new()),
+                ),
+                (
+                    "password".to_string(),
+                    serde_json::Value::String(state.password().to_string()),
+                ),
+                (
+                    "spicebench.write_schema".to_string(),
+                    serde_json::Value::String("spicebench.bench".to_string()),
+                ),
+            ]);
+            if let RunState::Local(local_state) = &state
+                && let Some(ak) = &local_state.flight_api_key
+            {
+                db_kwargs.insert(
+                    "adbc.flight.sql.rpc.call_header.authorization".to_string(),
+                    serde_json::Value::String(format!("Bearer {ak}")),
+                );
+            }
+            (
+                SinkConfig::Adbc {
+                    driver: AdbcDriver::Flightsql,
+                    db_kwargs,
+                },
+                state,
+            )
+        } else {
+            let sink = match &setup_config.storage {
+                FederatedStorageConfig::Postgres { pg, .. }
+                | FederatedStorageConfig::PostgresDebezium { pg, .. } => {
+                    let mut write_db_kwargs = pg.adbc_kwargs();
+                    write_db_kwargs.insert(
+                        "spicebench.write_schema".to_string(),
+                        serde_json::Value::String(pg.schema.clone()),
+                    );
+                    SinkConfig::Adbc {
+                        driver: AdbcDriver::Postgresql,
+                        db_kwargs: write_db_kwargs,
+                    }
+                }
+                FederatedStorageConfig::DynamoDB { .. } => {
+                    let region = resolve_aws_region(&setup_config);
+                    let access_key_id = std::env::var("AWS_ACCESS_KEY_ID").ok();
+                    let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+                    let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+                    SinkConfig::DynamoDb {
+                        region,
+                        access_key_id,
+                        secret_access_key,
+                        session_token,
+                    }
+                }
+                FederatedStorageConfig::Cayenne => unreachable!(),
+            };
+
+            let deployment_mode = setup_config.storage.deployment_mode();
+            let provision_result = match self.args.compute {
+                SpiceCompute::Cloud => {
+                    provision_scp_app(
+                        run_id,
+                        &self.args,
+                        &setup_config,
+                        &datasets,
+                        &deployment_mode,
+                    )
+                    .await
+                }
+                SpiceCompute::Local => match deployment_mode {
+                    DeploymentMode::SingleNode => {
+                        provision_local_single_node(
                             run_id,
-                            &self.args,
+                            Duration::from_secs(self.args.ready_wait),
                             &setup_config,
                             &datasets,
-                            &deployment_mode,
+                            &self.args,
                         )
                         .await
                     }
-                    SpiceCompute::Local => {
+                    DeploymentMode::Cluster => {
                         provision_local_spiced_cluster(
                             run_id,
                             Duration::from_secs(self.args.ready_wait),
@@ -624,149 +756,26 @@ impl Handler for SpidapterHandler {
                         )
                         .await
                     }
-                };
-                let mut state = match provision_result {
-                    Ok(s) => s,
-                    Err(e) => return Err(format!("Cayenne setup: provisioning failed: {e}")),
-                };
-                match &mut state {
-                    RunState::Scp(scp) => scp.storage = setup_config.storage.clone(),
-                    RunState::Local(local) => local.storage = setup_config.storage.clone(),
+                },
+            };
+
+            let state = match provision_result {
+                Ok(mut s) => {
+                    match &mut s {
+                        RunState::Scp(scp) => scp.storage = setup_config.storage.clone(),
+                        RunState::Local(local) => {
+                            local.storage = setup_config.storage.clone();
+                        }
+                    }
+                    s
                 }
-
-                let sql_url = state.sql_url().to_string();
-                let api_key = state.api_key().map(str::to_string);
-                post_setup_sink_action(&datasets, &sql_url, api_key.as_deref())
-                    .await
-                    .map_err(|e| format!("Cayenne post-setup SQL failed: {e}"))?;
-
-                let mut db_kwargs = HashMap::from([
-                    (
-                        "uri".to_string(),
-                        serde_json::Value::String(state.flight_url().to_string()),
-                    ),
-                    (
-                        "username".to_string(),
-                        serde_json::Value::String(String::new()),
-                    ),
-                    (
-                        "password".to_string(),
-                        serde_json::Value::String(state.password().to_string()),
-                    ),
-                    (
-                        "spicebench.write_schema".to_string(),
-                        serde_json::Value::String("spicebench.bench".to_string()),
-                    ),
-                ]);
-                if let RunState::Local(local_state) = &state
-                    && let Some(ak) = &local_state.flight_api_key
-                {
-                    db_kwargs.insert(
-                        "adbc.flight.sql.rpc.call_header.authorization".to_string(),
-                        serde_json::Value::String(format!("Bearer {ak}")),
-                    );
+                Err(e) => {
+                    // ec2_guards and dynamodb_guard drop here, cleaning up AWS resources.
+                    return Err(format!("Setup failed: provisioning failed: {e}"));
                 }
-                (
-                    SinkConfig::Adbc {
-                        driver: AdbcDriver::Flightsql,
-                        db_kwargs,
-                    },
-                    state,
-                )
-            }
-            _ => {
-                let sink = match &setup_config.storage {
-                    FederatedStorageConfig::Postgres { pg, .. } => {
-                        let mut write_db_kwargs = pg.adbc_kwargs();
-                        write_db_kwargs.insert(
-                            "spicebench.write_schema".to_string(),
-                            serde_json::Value::String(pg.schema.clone()),
-                        );
-                        SinkConfig::Adbc {
-                            driver: AdbcDriver::Postgresql,
-                            db_kwargs: write_db_kwargs,
-                        }
-                    }
-                    FederatedStorageConfig::DynamoDB { .. } => {
-                        let region = resolve_aws_region(&setup_config);
-                        let access_key_id = std::env::var("AWS_ACCESS_KEY_ID").ok();
-                        let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
-                        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
-                        SinkConfig::DynamoDb {
-                            region,
-                            access_key_id,
-                            secret_access_key,
-                            session_token,
-                        }
-                    }
-                    FederatedStorageConfig::PostgresDebezium { pg, .. } => {
-                        let mut write_db_kwargs = pg.adbc_kwargs();
-                        write_db_kwargs.insert(
-                            "spicebench.write_schema".to_string(),
-                            serde_json::Value::String(pg.schema.clone()),
-                        );
-                        SinkConfig::Adbc {
-                            driver: AdbcDriver::Postgresql,
-                            db_kwargs: write_db_kwargs,
-                        }
-                    }
-                    FederatedStorageConfig::Cayenne => unreachable!(),
-                };
+            };
 
-                let deployment_mode = setup_config.storage.deployment_mode();
-                let provision_result = match self.args.compute {
-                    SpiceCompute::Cloud => {
-                        provision_scp_app(
-                            run_id,
-                            &self.args,
-                            &setup_config,
-                            &datasets,
-                            &deployment_mode,
-                        )
-                        .await
-                    }
-                    SpiceCompute::Local => match deployment_mode {
-                        DeploymentMode::SingleNode => {
-                            provision_local_single_node(
-                                run_id,
-                                Duration::from_secs(self.args.ready_wait),
-                                &setup_config,
-                                &datasets,
-                                &self.args,
-                            )
-                            .await
-                        }
-                        DeploymentMode::Cluster => {
-                            provision_local_spiced_cluster(
-                                run_id,
-                                Duration::from_secs(self.args.ready_wait),
-                                &setup_config,
-                                &datasets,
-                                &self.args,
-                            )
-                            .await
-                        }
-                    },
-                };
-
-                let state = match provision_result {
-                    Ok(mut s) => {
-                        match &mut s {
-                            RunState::Scp(scp) => scp.storage = setup_config.storage.clone(),
-                            RunState::Local(local) => {
-                                local.storage = setup_config.storage.clone();
-                            }
-                        }
-                        s
-                    }
-                    Err(e) => {
-                        // ec2_guards and dynamodb_guard drop here, cleaning up AWS resources.
-                        return Err(format!("Setup failed: provisioning failed: {e}"));
-                    }
-                };
-
-                (sink, state)
-            }
+            (sink, state)
         };
 
         let mut read_db_kwargs = HashMap::from([
@@ -925,7 +934,7 @@ impl Handler for SpidapterHandler {
             }
         }
 
-        // Postgres cleanup must happen before the EC2 guards drop (EC2 hosts Postgres).
+        // Postgres cleanup must happen before EC2 guards run (EC2 hosts Postgres).
         match &storage {
             FederatedStorageConfig::Postgres { pg, .. }
             | FederatedStorageConfig::PostgresDebezium { pg, .. } => {
@@ -936,9 +945,37 @@ impl Handler for SpidapterHandler {
             FederatedStorageConfig::DynamoDB { .. } | FederatedStorageConfig::Cayenne => {}
         }
 
-        // Guards drop here: EC2 instances are terminated, DynamoDB tables are deleted.
-        drop(ec2_guards);
-        drop(dynamodb_guard);
+        // Disarm guards and run all AWS cleanup concurrently.
+        let mut cleanup: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        for mut guard in ec2_guards {
+            if let Some((instance_id, region)) = guard.disarm() {
+                cleanup.spawn(async move {
+                    eprintln!(
+                        "[stdio] teardown: terminating EC2 instance {instance_id} (region={region})"
+                    );
+                    if let Err(e) = terminate_ec2_instance(&region, &instance_id).await {
+                        eprintln!(
+                            "[stdio] teardown: warning: failed to terminate EC2 instance {instance_id}: {e}"
+                        );
+                    }
+                });
+            }
+        }
+        if let Some(mut guard) = dynamodb_guard
+            && let Some(info) = guard.disarm() {
+                cleanup.spawn(async move {
+                    eprintln!(
+                        "[stdio] teardown: deleting {} DynamoDB table(s)",
+                        info.table_names.len()
+                    );
+                    if let Err(e) = delete_dynamodb_tables(&info).await {
+                        eprintln!(
+                            "[stdio] teardown: warning: failed to delete DynamoDB tables: {e}"
+                        );
+                    }
+                });
+            }
+        while cleanup.join_next().await.is_some() {}
 
         Ok(TeardownResponse { ok: true })
     }
@@ -1033,10 +1070,20 @@ impl Handler for SpidapterHandler {
 pub async fn run_stdio_server(args: &StdioArgs) -> anyhow::Result<()> {
     let handler = SpidapterHandler::new(args);
     let mut server = Server::new(handler);
-    server
-        .run_stdio()
-        .await
-        .map_err(|e| anyhow::anyhow!("Stdio server error: {e}"))
+    // Wrap in a select so that SIGINT/Ctrl-C drops the server future immediately.
+    // Dropping the future cascades through any in-flight handler call (e.g. setup()),
+    // dropping all local RAII guards (Ec2Guard, DynamoDbGuard) and running their
+    // cleanup logic before the process exits.
+    tokio::select! {
+        r = server.run_stdio() => {
+            r.map_err(|e| anyhow::anyhow!("Stdio server error: {e}"))
+        }
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("[stdio] Received interrupt, cleaning up resources...");
+            // server drops here → SpidapterHandler drops → RunState drops → guards drop
+            Ok(())
+        }
+    }
 }
 
 async fn post_setup_sink_action(

@@ -143,19 +143,17 @@ pub(super) async fn provision_local_single_node(
     if !matches!(
         setup_config.storage,
         FederatedStorageConfig::DynamoDB { .. } | FederatedStorageConfig::PostgresDebezium { .. }
-    ) {
-        if let Err(error) = wait_for_runtime_ready(
-            &http_url,
-            &mut child,
-            ready_wait,
-            local_flight_api_key.as_deref(),
-        )
-        .await
-        {
-            let _ = stop_child_process(&mut child, "spiced").await;
-            let _ = cleanup_local_artifacts(&working_dir).await;
-            return Err(error);
-        }
+    ) && let Err(error) = wait_for_runtime_ready(
+        &http_url,
+        &mut child,
+        ready_wait,
+        local_flight_api_key.as_deref(),
+    )
+    .await
+    {
+        let _ = stop_child_process(&mut child, "spiced").await;
+        let _ = cleanup_local_artifacts(&working_dir).await;
+        return Err(error);
     }
 
     Ok(RunState::Local(Box::new(LocalRunState {
@@ -357,22 +355,20 @@ pub(super) async fn provision_local_spiced_cluster(
     if !matches!(
         setup_config.storage,
         FederatedStorageConfig::DynamoDB { .. } | FederatedStorageConfig::PostgresDebezium { .. }
-    ) {
-        if let Err(error) = wait_for_runtime_ready(
-            &scheduler_http_url,
-            &mut scheduler_child,
-            ready_wait,
-            local_flight_api_key.as_deref(),
-        )
-        .await
-        {
-            for c in &mut executor_children {
-                let _ = stop_child_process(c, "executor").await;
-            }
-            let _ = stop_child_process(&mut scheduler_child, "scheduler").await;
-            let _ = cleanup_local_artifacts(&working_dir).await;
-            return Err(error);
+    ) && let Err(error) = wait_for_runtime_ready(
+        &scheduler_http_url,
+        &mut scheduler_child,
+        ready_wait,
+        local_flight_api_key.as_deref(),
+    )
+    .await
+    {
+        for c in &mut executor_children {
+            let _ = stop_child_process(c, "executor").await;
         }
+        let _ = stop_child_process(&mut scheduler_child, "scheduler").await;
+        let _ = cleanup_local_artifacts(&working_dir).await;
+        return Err(error);
     }
 
     Ok(RunState::Local(Box::new(LocalRunState {

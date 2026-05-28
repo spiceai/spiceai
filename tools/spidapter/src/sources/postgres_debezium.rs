@@ -28,7 +28,7 @@ use uuid::Uuid;
 use super::postgres_cdc::{PgConfig, pg_create_table_ddl, pg_error_message};
 use super::{arrow_type_to_spicepod_str, composite_key_str};
 
-/// Set up PostgreSQL for Debezium CDC: verify `wal_level`, create schema, drop+create tables.
+/// Set up `PostgreSQL` for Debezium CDC: verify `wal_level`, create schema, drop+create tables.
 /// The replication slot and publication are managed by Debezium itself.
 pub(crate) async fn setup_postgres_for_debezium(
     pg: &PgConfig,
@@ -75,9 +75,9 @@ pub(crate) async fn setup_postgres_for_debezium(
     Ok(())
 }
 
-/// Register the Debezium PostgreSQL connector via the Kafka Connect REST API.
+/// Register the Debezium `PostgreSQL` connector via the Kafka Connect REST API.
 ///
-/// `debezium_host` — hostname the Debezium container uses to reach PostgreSQL.
+/// `debezium_host` — hostname the Debezium container uses to reach `PostgreSQL`.
 /// Defaults to `pg.host` but can be overridden via `PG_DEBEZIUM_HOST` when the
 /// Debezium container runs in Docker and needs a different hostname (e.g. `host.docker.internal`).
 pub(crate) async fn register_debezium_postgres_connector(
@@ -137,7 +137,7 @@ pub(crate) async fn register_debezium_postgres_connector(
 }
 
 /// Generate a [`SpicepodDefinition`] that reads from Kafka topics populated by the Debezium
-/// PostgreSQL connector.
+/// `PostgreSQL` connector.
 ///
 /// Topic naming: `spicebench.{schema}.{table_name}`.
 pub(crate) fn generate_postgres_debezium_spicepod(
