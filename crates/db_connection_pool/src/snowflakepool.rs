@@ -467,6 +467,12 @@ fn decode_pkcs8_encrypted_data(data: &SecretDocument, password: &str) -> Result<
 mod tests {
     use super::*;
 
+    fn assert_invalid_account_identifier(account_identifier: &str) {
+        let _error = account_identifier
+            .parse::<SnowflakeAccountIdentifier>()
+            .expect_err("reject invalid Snowflake account identifier");
+    }
+
     #[test]
     fn test_org_based_format() {
         let id: SnowflakeAccountIdentifier = "myorg.myaccount"
@@ -557,43 +563,31 @@ mod tests {
 
     #[test]
     fn test_empty_is_err() {
-        assert!("".parse::<SnowflakeAccountIdentifier>().is_err());
+        assert_invalid_account_identifier("");
     }
 
     #[test]
     fn test_leading_dot_is_err() {
-        assert!(".myaccount".parse::<SnowflakeAccountIdentifier>().is_err());
+        assert_invalid_account_identifier(".myaccount");
     }
 
     #[test]
     fn test_trailing_dot_is_err() {
-        assert!("myorg.".parse::<SnowflakeAccountIdentifier>().is_err());
+        assert_invalid_account_identifier("myorg.");
     }
 
     #[test]
     fn test_org_based_with_invalid_character_is_err() {
-        assert!(
-            "myorg.my$account"
-                .parse::<SnowflakeAccountIdentifier>()
-                .is_err()
-        );
+        assert_invalid_account_identifier("myorg.my$account");
     }
 
     #[test]
     fn test_legacy_with_empty_region_segment_is_err() {
-        assert!(
-            "xy12345..aws"
-                .parse::<SnowflakeAccountIdentifier>()
-                .is_err()
-        );
+        assert_invalid_account_identifier("xy12345..aws");
     }
 
     #[test]
     fn test_legacy_with_empty_cloud_segment_is_err() {
-        assert!(
-            "xy12345.us-east-1."
-                .parse::<SnowflakeAccountIdentifier>()
-                .is_err()
-        );
+        assert_invalid_account_identifier("xy12345.us-east-1.");
     }
 }
