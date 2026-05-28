@@ -85,7 +85,7 @@ impl SpiceModelTool for SqlTool {
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sql", tool = self.name().to_string(), input = arg);
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
-            let req: SqlToolParams = serde_json::from_str(arg)?;
+            let SqlToolParams { query } = serde_json::from_str(arg)?;
 
             // Defer the read-only gate to the calling principal. The strict
             // read-only validator still fires for ReadOnly / anonymous
@@ -98,7 +98,7 @@ impl SpiceModelTool for SqlTool {
             // checks per-table writability and `access: read_write`.
             let read_only = crate::http::v1::current_principal_requires_read_only().await;
 
-            let mut query_request = QueryRequest::new(&req.query).read_only(self.read_only);
+            let mut query_request = QueryRequest::new(&query).read_only(read_only);
 
             if let Some(ref allowlist) = self.allowed_tables {
                 query_request = query_request.allow_tables(allowlist.clone());
