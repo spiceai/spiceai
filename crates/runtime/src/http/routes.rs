@@ -98,6 +98,7 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::responses::post,
         v1::models::get,
         v1::workers::get,
+        v1::nsql::get_context,
         v1::nsql::post,
         v1::inference::get,
         v1::inference::post,
@@ -402,6 +403,7 @@ pub(crate) fn routes(
             .route("/v1/models", get(v1::models::get))
             .route("/v1/models/{name}/predict", get(v1::inference::get))
             .route("/v1/predict", post(v1::inference::post))
+            .route("/v1/nsql/context", get(v1::nsql::get_context))
             .route("/v1/nsql", post(v1::nsql::post).layer(ModelContextLayer))
             .route(
                 "/v1/chat/completions",
