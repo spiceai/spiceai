@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod decimal;
 pub mod format;
 pub mod record_batch;
 pub mod schema;
