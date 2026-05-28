@@ -52,8 +52,15 @@ pub(super) async fn provision_scp_app(
     eprintln!("[stdio] Flight endpoint: {flight_url}");
     eprintln!("[stdio] App name: {app_name}");
 
+    // DynamoDB and postgres-debezium load large datasets entirely into spiced's
+    // accelerated cache, so default to 64Gi unless the caller overrides explicitly.
+    let default_memory_limit = match &setup_config.storage {
+        FederatedStorageConfig::DynamoDB { .. }
+        | FederatedStorageConfig::PostgresDebezium { .. } => Some("64Gi".to_string()),
+        _ => None,
+    };
     let app_create_config = commands::AppCreateConfig {
-        app_memory_limit: args.app_memory_limit.clone(),
+        app_memory_limit: args.app_memory_limit.clone().or(default_memory_limit),
         app_cpu_limit: args.app_cpu_limit.clone(),
         app_cpu_request: args.app_cpu_request.clone(),
         app_memory_request: args.app_memory_request.clone(),

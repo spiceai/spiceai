@@ -415,11 +415,6 @@ impl Handler for SpidapterHandler {
             metadata.keys().collect::<Vec<_>>()
         );
 
-        eprintln!(
-            "DATASETS: {:#?}",
-            datasets,
-        );
-
         // Guards accumulate as resources are provisioned. If setup returns Err at any
         // point before they are moved into RunState, their Drop impls clean up.
         let mut ec2_guards: Vec<Ec2Guard> = Vec::new();
