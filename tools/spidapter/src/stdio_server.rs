@@ -1613,11 +1613,22 @@ fn generate_adbc_spicepod(
     let short_id = run_id_str.split('-').next().unwrap_or_default();
 
     let mut spicepod = SpicepodDefinition::new(format!("spidapter-{short_id}"));
+    let runtime_params = HashMap::from([
+        (
+            "cayenne_sort_merge_min_rows".to_string(),
+            "1000000".to_string(),
+        ),
+        (
+            "cayenne_sort_merge_memory_pool_fraction".to_string(),
+            "0.5".to_string(),
+        ),
+    ]);
     spicepod.runtime = Runtime {
         telemetry: TelemetryConfig {
             enabled: false,
             ..TelemetryConfig::default()
         },
+        params: runtime_params,
         auth: flight_api_key.map(|key| Auth {
             api_key: Some(ApiKeyAuth {
                 enabled: true,
