@@ -564,29 +564,43 @@ impl ExecutorRegistry {
     /// one `FlightSQL` table provider per selected executor. The caller decides whether the
     /// table should actually be partitioned (e.g. `AcceleratedPartitionProvider` checks
     /// `AcceleratedTable` downcast in the runtime crate).
+    #[must_use]
     pub fn resolve_accelerated_partitions(
         &self,
         table: &TableReference,
         schema: &SchemaRef,
     ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
-        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
-            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
-            return Vec::new();
-        };
         let Ok(connections) = self.connections.try_read() else {
             tracing::warn!("Failed to acquire read lock on connections");
             return Vec::new();
         };
-
+        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
+            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
+            return Vec::new();
+        };
+        let executors = ready_executors(&connections, &flight_sql_clients);
         get_partitions_from_store(
             &self.accelerations_partition_store,
-            &connections,
-            &flight_sql_clients,
+            &executors,
             table,
             schema,
             self.node_id.as_deref(),
         )
     }
+}
+
+/// Returns executors that have both an active connection and a `FlightSQL` client.
+fn ready_executors<'a>(
+    connections: &'a HashMap<String, ExecutorConnection>,
+    flight_sql_clients: &'a HashMap<String, FlightSqlClient>,
+) -> HashMap<String, (&'a ExecutorConnection, &'a FlightSqlClient)> {
+    connections
+        .iter()
+        .filter_map(|(id, conn)| {
+            let client = flight_sql_clients.get(id)?;
+            Some((id.clone(), (conn, client)))
+        })
+        .collect()
 }
 
 pub(crate) fn flight_sql_table_provider(
@@ -607,22 +621,19 @@ pub(crate) fn flight_sql_table_provider(
 
 /// Shared logic for `get_partitions` across accelerated and federated partition providers.
 ///
-/// Uses the given [`PartitionStore`] to look up partition metadata, validates liveness against
-/// `connections`, selects a minimal executor set, and returns `(FlightSQL provider, partition values)` pairs.
+/// Uses the given [`PartitionStore`] to look up partition metadata, checks readiness (both an
+/// active connection and a `FlightSQL` client) via the `executors` map, selects a minimal
+/// executor set, and returns `(FlightSQL provider, partition values)` pairs.
 pub(crate) fn get_partitions_from_store(
     partition_store: &PartitionStore,
-    connections: &HashMap<String, ExecutorConnection>,
-    flight_sql_clients: &HashMap<String, FlightSqlClient>,
+    executors: &HashMap<String, (&ExecutorConnection, &FlightSqlClient)>,
     table: &TableReference,
     schema: &SchemaRef,
     node_id: Option<&str>,
 ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
     let Some(table_metadata) = partition_store.get_cached_table_metadata(table) else {
         // No partition metadata — route to a single live executor to avoid duplicate results.
-        let Some((executor_id, client)) = flight_sql_clients
-            .iter()
-            .filter(|(eid, _)| connections.contains_key(*eid))
-            .min_by(|(a, _), (b, _)| a.cmp(b))
+        let Some((executor_id, (_, client))) = executors.iter().min_by_key(|(id, _)| id.as_str())
         else {
             tracing::warn!(
                 "No partition assignments for table {table:?} and no connected executors with FlightSQL clients"
@@ -640,7 +651,7 @@ pub(crate) fn get_partitions_from_store(
             metrics::record_query_executor_count(node_id, 1);
         }
         return vec![(
-            flight_sql_table_provider(executor_id, client.clone(), table, Arc::clone(schema)),
+            flight_sql_table_provider(executor_id, (*client).clone(), table, Arc::clone(schema)),
             Vec::new(),
         )];
     };
@@ -661,7 +672,7 @@ pub(crate) fn get_partitions_from_store(
     let mut executor_partition_map: HashMap<String, Vec<PartitionValue>> = HashMap::new();
     for partition_meta in &table_metadata.partitions {
         for executor_id in &partition_meta.assigned_executors {
-            if !connections.contains_key(executor_id) {
+            if !executors.contains_key(executor_id) {
                 tracing::debug!(
                     "Executor '{}' has partition assignment but is no longer alive; excluding from selection",
                     executor_id
@@ -713,10 +724,14 @@ pub(crate) fn get_partitions_from_store(
     selected_executors
         .into_iter()
         .filter_map(|executor_id| {
-            let client = flight_sql_clients.get(&executor_id)?;
+            let (_, client) = executors.get(&executor_id)?;
             let partition_values = executor_partition_map.remove(&executor_id)?;
-            let provider =
-                flight_sql_table_provider(&executor_id, client.clone(), table, Arc::clone(schema));
+            let provider = flight_sql_table_provider(
+                &executor_id,
+                (*client).clone(),
+                table,
+                Arc::clone(schema),
+            );
             Some((provider, partition_values))
         })
         .collect()
@@ -759,25 +774,26 @@ impl TablePartitionProvider for FederatedPartitionProvider {
         table: &TableReference,
         schema: &SchemaRef,
     ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
-        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
-            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
-            return Vec::new();
-        };
         let Ok(connections) = self.connections.try_read() else {
             tracing::warn!("Failed to acquire read lock on connections");
             return Vec::new();
         };
+        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
+            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
+            return Vec::new();
+        };
+
+        let executors = ready_executors(&connections, &flight_sql_clients);
 
         get_partitions_from_store(
             &self.partition_store,
-            &connections,
-            &flight_sql_clients,
+            &executors,
             table,
             schema,
             self.node_id.as_deref(),
         )
         .into_iter()
-        .map(|(provider, _)| (provider, vec![])) // For now, do not need partition values. Executors only have required data.
+        .map(|(provider, _)| (provider, vec![]))
         .collect()
     }
 }
@@ -930,6 +946,63 @@ mod tests {
         // Original executor should still be registered
         let executors = registry.connected_executors().await;
         assert_eq!(executors, vec!["executor-1"]);
+    }
+
+    /// Regression test: an executor that is in `connections` but not yet in
+    /// `flight_sql_clients` (e.g. reconnected but hasn't sent
+    /// `AllocateInitialPartitions` yet) must NOT appear in `ready_executors`.
+    #[test]
+    fn ready_executors_excludes_missing_flight_client() {
+        let (tx, _rx) = mpsc::channel(1);
+        let conn = ExecutorConnection::new(tx);
+
+        let mut connections: HashMap<String, ExecutorConnection> = HashMap::new();
+        connections.insert("exec-1".to_string(), conn);
+
+        let flight_sql_clients: HashMap<String, FlightSqlClient> = HashMap::new();
+
+        let ready = ready_executors(&connections, &flight_sql_clients);
+        assert!(
+            ready.is_empty(),
+            "executor without FlightSQL client should not be ready"
+        );
+    }
+
+    /// Verify `ready_executors` includes executors present in both maps.
+    #[tokio::test]
+    async fn ready_executors_includes_fully_registered() {
+        let (tx, _rx) = mpsc::channel(1);
+        let conn = ExecutorConnection::new(tx);
+
+        let mut connections: HashMap<String, ExecutorConnection> = HashMap::new();
+        connections.insert("exec-1".to_string(), conn);
+
+        let mut flight_sql_clients: HashMap<String, FlightSqlClient> = HashMap::new();
+        flight_sql_clients.insert("exec-1".to_string(), dummy_flight_sql_client());
+
+        let ready = ready_executors(&connections, &flight_sql_clients);
+        assert_eq!(ready.len(), 1);
+        assert!(ready.contains_key("exec-1"));
+    }
+
+    /// Verify only the intersection is returned when maps partially overlap.
+    #[tokio::test]
+    async fn ready_executors_returns_intersection() {
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+
+        let mut connections: HashMap<String, ExecutorConnection> = HashMap::new();
+        connections.insert("exec-1".to_string(), ExecutorConnection::new(tx1));
+        connections.insert("exec-2".to_string(), ExecutorConnection::new(tx2));
+
+        // Only exec-2 has a FlightSQL client (exec-1 just reconnected).
+        let mut flight_sql_clients: HashMap<String, FlightSqlClient> = HashMap::new();
+        flight_sql_clients.insert("exec-2".to_string(), dummy_flight_sql_client());
+
+        let ready = ready_executors(&connections, &flight_sql_clients);
+        assert_eq!(ready.len(), 1);
+        assert!(ready.contains_key("exec-2"));
+        assert!(!ready.contains_key("exec-1"));
     }
 
     #[tokio::test]
