@@ -1117,7 +1117,7 @@ async fn test_duckdb_connection_pool_concurrent_queries() -> Result<(), String> 
 }
 
 /// A Parquet file written with an all-null column has `DataType::Null` in its Arrow schema
-/// metadata (logical type Unknown). DuckDB doesn't have a Null type and silently coerces
+/// metadata (logical type Unknown). `DuckDB` doesn't have a Null type and silently coerces
 /// it to INT32 when creating the acceleration table. Without the fix this produces a schema
 /// mismatch at query time; with the fix the accelerator normalises the column to INT32 before
 /// creating the table so both sides agree.
