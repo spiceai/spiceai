@@ -96,8 +96,16 @@ pub async fn partition_value_to_bytes(
     tbl: &TableReference,
     resolver: &dyn PartitionExprResolver,
 ) -> Result<Bytes, DataFusionError> {
+    // Sort keys so the resulting AND-tree (and its proto bytes) is
+    // independent of HashMap iteration order. The scheduler uses these
+    // bytes as a stable identifier for a partition when matching
+    // executor PartitionsLoaded acks against assigned partitions, so a
+    // non-deterministic encoding would produce false misses.
+    let mut entries: Vec<_> = p.into_iter().collect();
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
     let mut expr: Option<Expr> = None;
-    for (partition_expr, val) in p {
+    for (partition_expr, val) in entries {
         let partition_by = resolver.try_parse_expr(tbl, &partition_expr).await?;
         let e = match val {
             None => partition_by.is_null(),
@@ -225,4 +233,28 @@ pub fn normalized_table_name(table: &TableReference) -> String {
         .clone()
         .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
         .to_string()
+}
+
+/// Serialize each partition `Expr` to its proto byte form for inclusion in a
+/// `PartitionsLoaded` ack. Failed encodes are logged and dropped so a single
+/// malformed expression doesn't suppress the entire ack — the scheduler will
+/// still receive every partition that *did* serialize, which is the encoding
+/// the scheduler uses on the assignment side too.
+///
+/// `context` is included in the warning message so we can tell which table /
+/// code path produced the failure.
+#[must_use]
+pub fn encode_partition_exprs(exprs: &[Expr], context: &str) -> Vec<Vec<u8>> {
+    exprs
+        .iter()
+        .filter_map(|e| match e.to_bytes() {
+            Ok(b) => Some(b.to_vec()),
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to encode partition Expr for {context} PartitionsLoaded ack: {err}"
+                );
+                None
+            }
+        })
+        .collect()
 }

@@ -349,6 +349,9 @@ impl RuntimeBuilder {
                                 accelerations_partitions_store,
                                 catalog_partitions_store,
                                 partition_service,
+                                partition_load_tracker: Arc::new(
+                                    runtime_cluster::PartitionLoadTracker::new(),
+                                ),
                             })
                         }
                         Err(e) => {
@@ -394,11 +397,15 @@ impl RuntimeBuilder {
                         accelerations_partitions_store,
                         catalog_partitions_store,
                         partition_service,
+                        partition_load_tracker: Arc::new(
+                            runtime_cluster::PartitionLoadTracker::new(),
+                        ),
                     })
                 }
             }
             Some(ClusterRole::Executor) => Some(DistributedNode::Executor {
                 partition_assignments: Arc::new(RwLock::new(HashMap::new())),
+                outbound_broadcaster: crate::cluster::ExecutorOutboundBroadcaster::default(),
             }),
             None => None, // No cluster config means we're running in standalone mode
         };
@@ -425,12 +432,14 @@ impl RuntimeBuilder {
         if let Some(DistributedNode::Scheduler {
             executor_registry,
             partition_service,
+            partition_load_tracker,
             ..
         }) = distributed.as_ref()
         {
             df_builder = df_builder
                 .with_executor_registry(Arc::clone(executor_registry))
-                .with_partition_service(Arc::clone(partition_service));
+                .with_partition_service(Arc::clone(partition_service))
+                .with_partition_load_tracker(Arc::clone(partition_load_tracker));
         }
 
         if let Some(resolved_cluster_config) = self.resolved_cluster_config {
