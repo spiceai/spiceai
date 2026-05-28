@@ -479,15 +479,9 @@ mod tests {
         let body_json: serde_json::Value =
             serde_json::from_slice(&body).expect("body should be valid json");
 
-        assert_eq!(
-            body_json["error"]["type"].as_str(),
-            Some("invalid_request_error")
-        );
-        assert_eq!(body_json["error"]["param"].as_str(), Some("model"));
-        assert_eq!(
-            body_json["error"]["code"].as_str(),
-            Some("invalid_request_error")
-        );
+        assert_eq!(body_json["type"].as_str(), Some("invalid_request_error"));
+        assert_eq!(body_json["param"].as_str(), Some("model"));
+        assert_eq!(body_json["code"].as_str(), Some("invalid_request_error"));
     }
 
     #[tokio::test]
