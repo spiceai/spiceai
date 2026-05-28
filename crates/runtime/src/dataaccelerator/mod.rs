@@ -2372,8 +2372,28 @@ mod accelerator_compat_tests {
                             table_type
                         );
                     }
+                } else if matches!(engine, Engine::DuckDB) {
+                    // DuckDB normalises YearMonth/DayTime intervals to MonthDayNano
+                    // because its native INTERVAL type maps to the MonthDayNano layout.
+                    let expected_type = match original_type {
+                        DataType::Interval(
+                            arrow::datatypes::IntervalUnit::YearMonth
+                            | arrow::datatypes::IntervalUnit::DayTime,
+                        ) => &DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
+                        other => other,
+                    };
+                    assert_eq!(
+                        expected_type,
+                        table_type,
+                        "{:?}: Field {} ({}) data type mismatch. Expected {:?}, got {:?}",
+                        engine,
+                        i,
+                        original_field.name(),
+                        expected_type,
+                        table_type
+                    );
                 } else {
-                    // For non-Vortex engines, types should match exactly
+                    // For all other engines, types should match exactly
                     assert_eq!(
                         original_type,
                         table_type,
