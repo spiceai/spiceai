@@ -32,7 +32,6 @@ use super::bootstrap::{
     KAFKA_SASL_MECHANISM, KAFKA_SASL_PASSWORD, KAFKA_SASL_USERNAME, start_kafka_docker_container,
 };
 use super::{run_and_snapshot_query, wait_for_query_rows};
-use crate::utils::runtime_ready_check;
 use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
 
 const DEBEZIUM_PORT: u16 = 19095;
@@ -64,7 +63,7 @@ fn make_debezium_dataset(topic: &str, name: &str, port: u16) -> Dataset {
     let mut dataset = Dataset::new(format!("debezium:{topic}"), name.to_string());
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset.columns = vec![
-        Column::new("id").with_type("int"),
+        Column::new("id").with_type("int4"),
         Column::new("name").with_type("text"),
         Column::new("version").with_type("bigint"),
     ];
@@ -222,8 +221,6 @@ async fn debezium_declared_schema_empty_topic() -> anyhow::Result<()> {
                 }
                 () = cloned_rt.load_components() => {}
             }
-
-            runtime_ready_check(&rt).await;
 
             // Schema should reflect the declared columns.
             run_and_snapshot_query(

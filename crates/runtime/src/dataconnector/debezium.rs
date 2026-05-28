@@ -32,7 +32,6 @@ use data_components::cdc::ChangesStream;
 use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
-use data_components::kafka::is_unknown_topic_or_partition;
 use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset};
 use data_components::schema::merge_inferred_with_declared;
 use datafusion::datasource::TableProvider;
@@ -580,14 +579,22 @@ async fn get_metadata_from_kafka(
             connector_component: ConnectorComponent::from(dataset),
         })?;
 
-    let msg = match kafka_consumer
-        .next_json::<ChangeEventKey, ChangeEvent>()
-        .await
+    // Use fetch_latest_message (watermark-based, non-blocking) instead of next_json().
+    // next_json() blocks indefinitely when the topic exists but has no messages;
+    // fetch_latest_message() returns Ok(None) immediately in that case by checking
+    // the high-watermark offset before attempting to read.
+    let (key, value) = match KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
+        topic,
+        kafka_config,
+        Duration::from_secs(30),
+    )
+    .await
     {
-        Ok(Some(msg)) => msg,
-        Ok(None) => {
-            // No messages in Kafka yet. If a declared schema is available, use it so
-            // the dataset can be registered immediately and start receiving changes.
+        Ok(Some((key, value))) => (key, value),
+        // Topic is empty (exists but has no messages) or topic is not yet known to the broker.
+        // In both cases the subscribed consumer will begin at offset 0 once messages arrive
+        // (auto.offset.reset = "smallest"), so no explicit seek is required.
+        Ok(None) | Err(data_components::kafka::Error::MetadataTopicNotFound { .. }) => {
             if let Some(declared) = declared_schema {
                 tracing::debug!(
                     dataset = %dataset_name,
@@ -603,45 +610,11 @@ async fn get_metadata_from_kafka(
                 if let Some(sys) = debezium_kafka_sys {
                     let _ = set_metadata_to_accelerator(sys, &metadata).await;
                 }
-                kafka_consumer.restart_topic(topic).boxed().context(
-                    super::UnableToGetReadProviderSnafu {
-                        dataconnector: "debezium",
-                        connector_component: ConnectorComponent::from(dataset),
-                    },
-                )?;
                 return Ok((kafka_consumer, metadata, Arc::clone(declared)));
             }
             return Err(super::DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "debezium".to_string(),
-                source: "No message received from Kafka.".into(),
-                connector_component: ConnectorComponent::from(dataset),
-            });
-        }
-        // The topic doesn't exist on the broker yet. Treat this like the empty-topic case:
-        // if a declared schema is provided, initialize with it so the dataset is ready
-        // immediately. The subscribed consumer will start receiving messages from the
-        // earliest offset once the topic is created (auto.offset.reset = "smallest").
-        Err(ref e) if is_unknown_topic_or_partition(e) => {
-            if let Some(declared) = declared_schema {
-                tracing::debug!(
-                    dataset = %dataset_name,
-                    "Kafka topic not found; using declared schema for Debezium dataset"
-                );
-                let metadata = DebeziumKafkaMetadata {
-                    consumer_group_id: kafka_consumer.group_id().to_string(),
-                    topic: topic.to_string(),
-                    primary_keys: primary_keys_from_acceleration(dataset),
-                    schema_fields: vec![],
-                    offsets: Vec::new(),
-                };
-                if let Some(sys) = debezium_kafka_sys {
-                    let _ = set_metadata_to_accelerator(sys, &metadata).await;
-                }
-                return Ok((kafka_consumer, metadata, Arc::clone(declared)));
-            }
-            return Err(super::DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "debezium".to_string(),
-                source: format!("Kafka topic '{topic}' not found. Create the topic or declare `columns` with types to initialize without it.").into(),
+                source: format!("No message received from Kafka topic '{topic}'. Create the topic with data or declare `columns` with types to initialize without it.").into(),
                 connector_component: ConnectorComponent::from(dataset),
             });
         }
@@ -653,12 +626,12 @@ async fn get_metadata_from_kafka(
         }
     };
 
-    let primary_keys = msg
-        .key()
+    let primary_keys = key
+        .as_ref()
         .map(ChangeEventKey::get_primary_key)
         .unwrap_or_default();
 
-    let Some(schema_fields) = msg.value().get_schema_fields() else {
+    let Some(schema_fields) = value.get_schema_fields() else {
         return Err(super::DataConnectorError::UnableToGetReadProvider {
             dataconnector: "debezium".to_string(),
             source: "Could not get Arrow schema from Debezium message".into(), // TODO: what action can a user take from this error?
