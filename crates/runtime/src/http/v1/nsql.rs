@@ -21,7 +21,7 @@ use crate::{
         LLMChatCompletionsModelStore,
         nsql::{
             DEFAULT_NSQL_CONTEXT_SAMPLE_LIMIT, MAX_NSQL_CONTEXT_SAMPLE_LIMIT, NsqlContextError,
-            NsqlContextOptions, build_nsql_context,
+            NsqlContextJsonResponse, NsqlContextOptions, build_nsql_context,
         },
     },
 };
@@ -166,13 +166,6 @@ pub struct ContextRequest {
     pub datasets: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-struct NsqlContextJsonResponse {
-    /// The rendered NSQL context block injected into `/v1/nsql` model requests.
-    context: String,
-}
-
 impl ContextRequest {
     fn context_options(&self) -> Result<NsqlContextOptions, (StatusCode, String)> {
         validate_context_limit("sampling_limit", self.include_sampling, self.sampling_limit)?;
@@ -220,7 +213,10 @@ fn context_response_format(
     }
 }
 
-fn nsql_context_response(context: String, accept: Option<&TypedHeader<Accept>>) -> Response {
+fn nsql_context_response(
+    context: NsqlContextJsonResponse,
+    accept: Option<&TypedHeader<Accept>>,
+) -> Response {
     let Some(response_format) = context_response_format(accept) else {
         return (
             StatusCode::NOT_ACCEPTABLE,
@@ -229,17 +225,16 @@ fn nsql_context_response(context: String, accept: Option<&TypedHeader<Accept>>) 
             .into_response();
     };
 
+    let context_block = context.context.clone();
     match response_format {
-        NsqlContextResponseFormat::Json => {
-            Json(NsqlContextJsonResponse { context }).into_response()
-        }
+        NsqlContextResponseFormat::Json => Json(context).into_response(),
         NsqlContextResponseFormat::Markdown => {
             let mut headers = HeaderMap::new();
             headers.insert(
                 CONTENT_TYPE,
                 HeaderValue::from_static("text/markdown; charset=utf-8"),
             );
-            (StatusCode::OK, headers, context).into_response()
+            (StatusCode::OK, headers, context_block).into_response()
         }
         NsqlContextResponseFormat::PlainText => {
             let mut headers = HeaderMap::new();
@@ -247,7 +242,7 @@ fn nsql_context_response(context: String, accept: Option<&TypedHeader<Accept>>) 
                 CONTENT_TYPE,
                 HeaderValue::from_static("text/plain; charset=utf-8"),
             );
-            (StatusCode::OK, headers, context).into_response()
+            (StatusCode::OK, headers, context_block).into_response()
         }
     }
 }
@@ -291,7 +286,80 @@ fn nsql_context_error_response(error: &NsqlContextError) -> (StatusCode, String)
         ), (
             NsqlContextJsonResponse = "application/json",
             example = json!({
-                "context": "# Spice.ai NSQL Context\n\n## Datasets\n- `sales_data`"
+                "context": "# Spice.ai NSQL Context\n- Write SQL for the Spice runtime...",
+                "instructions": ["Write SQL for the Spice runtime, which uses Apache DataFusion with the SQL parser configured for the PostgreSQL dialect."],
+                "sql": {
+                    "engine": "Apache DataFusion",
+                    "dialect": "PostgreSQL",
+                    "parser": "DataFusion SQL parser configured with PostgreSQL dialect",
+                    "notes": ["Spice supports standard DataFusion SQL plus Spice-specific functions."]
+                },
+                "datasets": [{
+                    "name": "sales.orders",
+                    "schema": "sales",
+                    "table": "orders",
+                    "description": "Customer orders",
+                    "metadata": {"description": "Customer orders"},
+                    "columns": [{
+                        "name": "customer_id",
+                        "data_type": "Utf8",
+                        "nullable": false,
+                        "description": "Customer account identifier",
+                        "metadata": {"description": "Customer account identifier"},
+                        "primary_key": false,
+                        "unique": false,
+                        "indexed": true,
+                        "vector_search": true,
+                        "full_text_search": true
+                    }],
+                    "primary_key": ["order_id"],
+                    "unique_constraints": [],
+                    "foreign_keys": [{
+                        "columns": ["customer_id"],
+                        "foreign_table": "spice.sales.customers",
+                        "foreign_columns": ["id"]
+                    }],
+                    "indexes": [{
+                        "name": "customer_id",
+                        "columns": ["customer_id"],
+                        "kind": "enabled",
+                        "source": "spicepod.acceleration.indexes"
+                    }],
+                    "search": {
+                        "vector": [{
+                            "column": "customer_id",
+                            "function": "vector_search",
+                            "syntax": "vector_search(sales.orders, 'query text', customer_id)",
+                            "model": "embed_model",
+                            "engine": "duckdb_vector_index",
+                            "row_id_columns": ["order_id"],
+                            "vector_size": 384,
+                            "chunked": false,
+                            "index": {"name": "duckdb_vector_index", "columns": ["customer_id", "order_id"], "kind": "duckdb_vector_index", "source": "runtime_index"},
+                            "required_columns": ["customer_id", "order_id"],
+                            "notes": []
+                        }],
+                        "full_text": [{
+                            "column": "customer_id",
+                            "function": "text_search",
+                            "syntax": "text_search(sales.orders, 'query text', customer_id)",
+                            "engine": "tantivy",
+                            "index_store": "memory",
+                            "row_id_columns": ["order_id"],
+                            "index": {"name": "full_text", "columns": ["customer_id", "order_id"], "kind": "full_text", "source": "runtime_index"},
+                            "required_columns": ["customer_id", "order_id"],
+                            "notes": []
+                        }]
+                    }
+                }],
+                "functions": {
+                    "summary": "Spice SQL runs on Apache DataFusion with the SQL parser configured for the PostgreSQL dialect.",
+                    "json": [],
+                    "spice_specific": [],
+                    "spark_compatibility": {"description": "Spark-compatible scalar functions are available.", "functions": []},
+                    "user_defined": []
+                },
+                "samples": []
             })
         ))),
         (status = 400, description = "Invalid request parameters", content((
@@ -338,7 +406,7 @@ pub(crate) async fn get_context(
         }
     };
 
-    nsql_context_response(context.block, accept.as_ref())
+    nsql_context_response(context.json, accept.as_ref())
 }
 
 /// Text-to-SQL (NSQL)
@@ -731,8 +799,11 @@ mod tests {
     use crate::{
         datafusion::udf::UserFunctionInfo,
         model::nsql::{
-            SampleContextBlock, render_nsql_context_block, user_function_context_entries,
-            write_user_function_context_entries,
+            NsqlColumnContext, NsqlDatasetContext, NsqlDatasetSearchContext, NsqlForeignKeyContext,
+            NsqlFullTextSearchContext, NsqlIndexContext, NsqlVectorSearchContext,
+            SampleContextBlock, all_context_function_names_for_test,
+            nsql_function_context_for_test, render_nsql_context_block,
+            user_function_context_entries, write_user_function_context_entries,
         },
     };
     use app::AppBuilder;
@@ -750,7 +821,7 @@ mod tests {
         runtime::{Functions, Runtime as SpicepodRuntime},
     };
     use std::{
-        collections::{HashMap, HashSet},
+        collections::{BTreeMap, HashMap, HashSet},
         str::FromStr,
     };
 
@@ -855,7 +926,8 @@ mod tests {
 
     #[test]
     fn nsql_context_response_defaults_to_markdown() {
-        let response = nsql_context_response("context".to_string(), None);
+        let response =
+            nsql_context_response(NsqlContextJsonResponse::minimal_for_test("context"), None);
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -872,7 +944,10 @@ mod tests {
     #[test]
     fn nsql_context_response_negotiates_plain_text() {
         let accept = accept_header("text/plain");
-        let response = nsql_context_response("context".to_string(), Some(&accept));
+        let response = nsql_context_response(
+            NsqlContextJsonResponse::minimal_for_test("context"),
+            Some(&accept),
+        );
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -889,7 +964,10 @@ mod tests {
     #[tokio::test]
     async fn nsql_context_response_negotiates_json() {
         let accept = accept_header("application/json");
-        let response = nsql_context_response("context".to_string(), Some(&accept));
+        let response = nsql_context_response(
+            NsqlContextJsonResponse::minimal_for_test("context"),
+            Some(&accept),
+        );
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -911,13 +989,24 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&body).expect("response body should be JSON");
 
-        assert_eq!(body, json!({ "context": "context" }));
+        assert_eq!(body["context"], json!("context"));
+        assert_eq!(body["sql"]["engine"], json!("Apache DataFusion"));
+        assert_eq!(body["sql"]["dialect"], json!("PostgreSQL"));
+        assert!(
+            body["datasets"]
+                .as_array()
+                .expect("datasets should be an array")
+                .is_empty()
+        );
     }
 
     #[test]
     fn nsql_context_response_rejects_unsupported_accept() {
         let accept = accept_header("application/xml");
-        let response = nsql_context_response("context".to_string(), Some(&accept));
+        let response = nsql_context_response(
+            NsqlContextJsonResponse::minimal_for_test("context"),
+            Some(&accept),
+        );
 
         assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
     }
@@ -994,11 +1083,23 @@ mod tests {
 Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions:
 
 ### Spice-specific functions
-- `text_search`: Runs full-text search over a configured searchable dataset. Syntax: `text_search(table => 'dataset', query => 'text')`.
+- `text_search`: Runs full-text search over a configured searchable dataset. Syntax: `text_search(dataset, 'query text'[, column])`.
+- `vector_search`: Runs vector search over a configured embedding/vector index. Syntax: `vector_search(dataset, 'query text'[, column])`.
 
 ### User-defined functions
 - `ticket_priority`: scalar function from `sql` with `stable` volatility. Syntax: `ticket_priority(sentiment utf8) -> int64`. Converts support-ticket sentiment into a priority score.
     ";
+        let relationship_context = r"
+### `sales.orders`
+- Primary key: `order_id`
+- Foreign keys:
+    - (`customer_id`) references `spice.sales.customers` (`id`)
+- Indexes:
+    - `customer_id`: `customer_id` (enabled, spicepod.acceleration.indexes)
+- Search indexes:
+    - vector search on `customer_id` using `embed_model`. Syntax: `vector_search(sales.orders, 'query text', customer_id)`. Engine/index: `duckdb_vector_index`. Row id: `order_id`.
+    - full-text search on `customer_id` using `tantivy`. Syntax: `text_search(sales.orders, 'query text', customer_id)`. Row id: `order_id`.
+        ";
         let sample_context_blocks = vec![
             SampleContextBlock {
                 title: "Distinct value samples for `support_tickets`".to_string(),
@@ -1015,10 +1116,130 @@ Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. Th
             render_nsql_context_block(
                 &tables,
                 schema_context,
+                relationship_context,
                 function_context,
                 &sample_context_blocks,
             )
         );
+    }
+
+    #[test]
+    fn nsql_context_json_response_snapshot() {
+        let mut response = NsqlContextJsonResponse::minimal_for_test("# Spice.ai NSQL Context");
+        response.datasets = vec![NsqlDatasetContext {
+            name: "sales.orders".to_string(),
+            catalog: Some("spice".to_string()),
+            schema: Some("sales".to_string()),
+            table: "orders".to_string(),
+            description: Some("Customer orders".to_string()),
+            metadata: BTreeMap::from([("description".to_string(), "Customer orders".to_string())]),
+            columns: vec![
+                NsqlColumnContext {
+                    name: "order_id".to_string(),
+                    data_type: "Int64".to_string(),
+                    nullable: false,
+                    description: Some("Unique order identifier".to_string()),
+                    source_type: Some("bigint".to_string()),
+                    metadata: BTreeMap::from([
+                        (
+                            "description".to_string(),
+                            "Unique order identifier".to_string(),
+                        ),
+                        ("source_type".to_string(), "bigint".to_string()),
+                    ]),
+                    primary_key: true,
+                    unique: false,
+                    indexed: true,
+                    vector_search: false,
+                    full_text_search: false,
+                },
+                NsqlColumnContext {
+                    name: "customer_id".to_string(),
+                    data_type: "Utf8".to_string(),
+                    nullable: false,
+                    description: Some("Customer account identifier".to_string()),
+                    source_type: Some("text".to_string()),
+                    metadata: BTreeMap::from([
+                        (
+                            "description".to_string(),
+                            "Customer account identifier".to_string(),
+                        ),
+                        ("source_type".to_string(), "text".to_string()),
+                    ]),
+                    primary_key: false,
+                    unique: false,
+                    indexed: true,
+                    vector_search: true,
+                    full_text_search: true,
+                },
+            ],
+            primary_key: vec!["order_id".to_string()],
+            unique_constraints: vec![vec!["order_id".to_string()]],
+            foreign_keys: vec![NsqlForeignKeyContext {
+                columns: vec!["customer_id".to_string()],
+                foreign_table: "spice.sales.customers".to_string(),
+                foreign_columns: vec!["id".to_string()],
+            }],
+            indexes: vec![NsqlIndexContext {
+                name: Some("customer_id".to_string()),
+                columns: vec!["customer_id".to_string()],
+                kind: "enabled".to_string(),
+                source: "spicepod.acceleration.indexes".to_string(),
+            }],
+            search: NsqlDatasetSearchContext {
+                vector: vec![NsqlVectorSearchContext {
+                    column: "customer_id".to_string(),
+                    function: "vector_search".to_string(),
+                    syntax: "vector_search(sales.orders, 'query text', customer_id)".to_string(),
+                    model: "embed_model".to_string(),
+                    engine: Some("duckdb_vector_index".to_string()),
+                    row_id_columns: vec!["order_id".to_string()],
+                    vector_size: Some(384),
+                    chunked: false,
+                    input_mode: Some("scalar".to_string()),
+                    required_columns: vec!["customer_id".to_string(), "order_id".to_string()],
+                    index: Some(NsqlIndexContext {
+                        name: Some("duckdb_vector_index".to_string()),
+                        columns: vec!["customer_id".to_string(), "order_id".to_string()],
+                        kind: "duckdb_vector_index".to_string(),
+                        source: "runtime_index".to_string(),
+                    }),
+                    notes: vec![],
+                }],
+                full_text: vec![NsqlFullTextSearchContext {
+                    column: "customer_id".to_string(),
+                    function: "text_search".to_string(),
+                    syntax: "text_search(sales.orders, 'query text', customer_id)".to_string(),
+                    engine: "tantivy".to_string(),
+                    index_store: "memory".to_string(),
+                    row_id_columns: vec!["order_id".to_string()],
+                    required_columns: vec!["customer_id".to_string(), "order_id".to_string()],
+                    index: Some(NsqlIndexContext {
+                        name: Some("full_text".to_string()),
+                        columns: vec!["customer_id".to_string(), "order_id".to_string()],
+                        kind: "full_text".to_string(),
+                        source: "runtime_index".to_string(),
+                    }),
+                    notes: vec![],
+                }],
+            },
+        }];
+        let app = AppBuilder::new("test").build();
+        response.functions = nsql_function_context_for_test(
+            &app,
+            &all_context_function_names_for_test(),
+            true,
+            true,
+        );
+        response.samples = vec![SampleContextBlock {
+            title: "Example rows for `sales.orders`".to_string(),
+            content: "| order_id | customer_id |\n| --- | --- |\n| 42 | CUST-1 |".to_string(),
+        }];
+
+        let response = serde_json::to_string_pretty(&response)
+            .expect("structured NSQL context should serialize");
+
+        insta::assert_snapshot!("nsql_context_json_response", response);
     }
 
     #[test]

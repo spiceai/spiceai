@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     error::Error as StdError,
     fmt::Write,
     sync::Arc,
@@ -24,16 +24,25 @@ use std::{
 use async_openai::types::chat::{
     ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
 };
-use datafusion::execution::FunctionRegistry;
-use datafusion::sql::TableReference;
+use data_components::{
+    DESCRIPTION_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, SOURCE_TYPE_METADATA_KEY,
+};
+use datafusion::{
+    arrow::datatypes::Schema,
+    common::{Constraint, Constraints, utils::quote_identifier},
+    execution::FunctionRegistry,
+    sql::TableReference,
+};
 use datafusion_functions_json::udfs::{
     json_as_text_udf, json_contains_udf, json_from_scalar_udf, json_get_array_udf,
     json_get_bool_udf, json_get_float_udf, json_get_int_udf, json_get_json_udf, json_get_str_udf,
     json_get_udf, json_length_udf, json_object_keys_udf,
 };
+use datafusion_table_providers::util::column_reference::ColumnReference;
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
+use runtime_datafusion_index::IndexedTableProvider;
 use runtime_datafusion_udfs::{
     bucket::BUCKET_SCALAR_UDF_NAME,
     cosine_distance::COSINE_DISTANCE_UDF_NAME,
@@ -44,10 +53,10 @@ use runtime_datafusion_udfs::{
     truncate::TRUNCATE_SCALAR_UDF_NAME,
 };
 use runtime_request_context::RequestContext;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::Snafu;
-use spicepod::component::function::Function;
+use spicepod::{component::function::Function, semantic::Column};
 use tracing::Span;
 use tracing_futures::Instrument;
 
@@ -56,6 +65,7 @@ use runtime_datafusion_udfs::{ai::AI_UDF_NAME, embed::EMBED_UDF_NAME};
 
 use crate::{
     Runtime,
+    component::column::full_text_search_config,
     datafusion::{
         SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA,
         pg_catalog::{COL_DESCRIPTION_UDF_NAME, OBJ_DESCRIPTION_UDF_NAME},
@@ -66,8 +76,12 @@ use crate::{
             json_properties::FLATTEN_JSON_PROPERTIES_UDTF_NAME, json_tree::JSON_TREE_UDTF_NAME,
         },
     },
+    embeddings::table::{EmbeddingInputMode, EmbeddingTable},
     embeddings::udtf::VECTOR_SEARCH_UDTF_NAME,
-    search::{full_text::udtf::TEXT_SEARCH_UDTF_NAME, rerank::RERANK_UDTF_NAME, rrf::RRF_UDF_NAME},
+    search::{
+        full_text::udtf::TEXT_SEARCH_UDTF_NAME, rerank::RERANK_UDTF_NAME, rrf::RRF_UDF_NAME,
+        util::find_concrete_table_provider,
+    },
     tools::{
         SpiceModelTool,
         builtin::{
@@ -91,6 +105,16 @@ pub(crate) const DEFAULT_NSQL_CONTEXT_SAMPLE_LIMIT: usize = 3;
 pub(crate) const MAX_NSQL_CONTEXT_SAMPLE_LIMIT: usize = 100;
 
 const DATA_SAMPLING_MAX_CONCURRENT: usize = 10;
+
+const NSQL_CONTEXT_INSTRUCTIONS: [&str; 5] = [
+    "Write SQL for the Spice runtime, which uses Apache DataFusion with the SQL parser configured for the PostgreSQL dialect.",
+    "Return only valid SQL code, without markdown fences.",
+    "Quote column names that contain capitals or special characters with double quotes.",
+    "For tables with schemas and catalogs, use \"catalog\".\"schema\".\"table\", not \"catalog.schema.table\".",
+    "Use table and column descriptions, primary keys, foreign keys, unique constraints, and indexes when choosing joins and filters.",
+];
+
+const NSQL_FUNCTION_CONTEXT_SUMMARY: &str = "Spice SQL runs on Apache DataFusion with the SQL parser configured for the PostgreSQL dialect. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions. Function references are filtered to functions registered in the current DataFusion context";
 
 #[derive(Debug, Snafu)]
 pub(crate) enum NsqlContextError {
@@ -117,13 +141,195 @@ pub(crate) enum NsqlContextError {
     },
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct SampleContextBlock {
     pub(crate) title: String,
     pub(crate) content: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub(crate) struct NsqlContextJsonResponse {
+    /// The rendered NSQL context block injected into `/v1/nsql` model requests.
+    pub(crate) context: String,
+
+    /// High-level SQL generation instructions.
+    pub(crate) instructions: Vec<String>,
+
+    /// SQL engine and dialect details for Spice SQL.
+    pub(crate) sql: NsqlSqlContext,
+
+    /// In-scope datasets with schema, metadata, relationship, key, and index details.
+    pub(crate) datasets: Vec<NsqlDatasetContext>,
+
+    /// Available function groups filtered to the current DataFusion context.
+    pub(crate) functions: NsqlFunctionContext,
+
+    /// Optional sample blocks included when requested.
+    pub(crate) samples: Vec<SampleContextBlock>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub(crate) struct NsqlSqlContext {
+    pub(crate) engine: String,
+    pub(crate) dialect: String,
+    pub(crate) parser: String,
+    pub(crate) notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub(crate) struct NsqlDatasetContext {
+    pub(crate) name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) catalog: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) schema: Option<String>,
+    pub(crate) table: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<String>,
+    pub(crate) metadata: BTreeMap<String, String>,
+    pub(crate) columns: Vec<NsqlColumnContext>,
+    pub(crate) primary_key: Vec<String>,
+    pub(crate) unique_constraints: Vec<Vec<String>>,
+    pub(crate) foreign_keys: Vec<NsqlForeignKeyContext>,
+    pub(crate) indexes: Vec<NsqlIndexContext>,
+    pub(crate) search: NsqlDatasetSearchContext,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub(crate) struct NsqlColumnContext {
+    pub(crate) name: String,
+    pub(crate) data_type: String,
+    pub(crate) nullable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source_type: Option<String>,
+    pub(crate) metadata: BTreeMap<String, String>,
+    pub(crate) primary_key: bool,
+    pub(crate) unique: bool,
+    pub(crate) indexed: bool,
+    pub(crate) vector_search: bool,
+    pub(crate) full_text_search: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub(crate) struct NsqlForeignKeyContext {
+    pub(crate) columns: Vec<String>,
+    pub(crate) foreign_table: String,
+    pub(crate) foreign_columns: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub(crate) struct NsqlIndexContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
+    pub(crate) columns: Vec<String>,
+    pub(crate) kind: String,
+    pub(crate) source: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub(crate) struct NsqlDatasetSearchContext {
+    pub(crate) vector: Vec<NsqlVectorSearchContext>,
+    pub(crate) full_text: Vec<NsqlFullTextSearchContext>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub(crate) struct NsqlVectorSearchContext {
+    pub(crate) column: String,
+    pub(crate) function: String,
+    pub(crate) syntax: String,
+    pub(crate) model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) engine: Option<String>,
+    pub(crate) row_id_columns: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) vector_size: Option<usize>,
+    pub(crate) chunked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) input_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) index: Option<NsqlIndexContext>,
+    pub(crate) required_columns: Vec<String>,
+    pub(crate) notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub(crate) struct NsqlFullTextSearchContext {
+    pub(crate) column: String,
+    pub(crate) function: String,
+    pub(crate) syntax: String,
+    pub(crate) engine: String,
+    pub(crate) index_store: String,
+    pub(crate) row_id_columns: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) index: Option<NsqlIndexContext>,
+    pub(crate) required_columns: Vec<String>,
+    pub(crate) notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub(crate) struct NsqlFunctionContext {
+    pub(crate) summary: String,
+    pub(crate) json: Vec<NsqlFunctionContextEntry>,
+    pub(crate) spice_specific: Vec<NsqlFunctionContextEntry>,
+    pub(crate) spark_compatibility: NsqlSparkFunctionContext,
+    pub(crate) user_defined: Vec<UserFunctionContextEntry>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub(crate) struct NsqlSparkFunctionContext {
+    pub(crate) description: String,
+    pub(crate) functions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub(crate) struct NsqlFunctionContextEntry {
+    pub(crate) name: String,
+    pub(crate) syntax: String,
+    pub(crate) description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) example: Option<String>,
+}
+
+#[cfg(test)]
+impl NsqlContextJsonResponse {
+    pub(crate) fn minimal_for_test(context: impl Into<String>) -> Self {
+        Self {
+            context: context.into(),
+            instructions: nsql_context_instructions(),
+            sql: nsql_sql_context(),
+            datasets: vec![],
+            functions: NsqlFunctionContext {
+                summary: NSQL_FUNCTION_CONTEXT_SUMMARY.to_string(),
+                json: vec![],
+                spice_specific: vec![],
+                spark_compatibility: NsqlSparkFunctionContext {
+                    description: "Spark-compatible scalar functions are available for arrays, maps, structs, dates, strings, hashes, URLs, XML, and other common Spark SQL expressions.".to_string(),
+                    functions: vec![],
+                },
+                user_defined: vec![],
+            },
+            samples: vec![],
+        }
+    }
+}
+
 pub(crate) struct NsqlContext {
-    pub(crate) block: String,
+    pub(crate) json: NsqlContextJsonResponse,
     pub(crate) message: ChatCompletionRequestMessage,
     pub(crate) table_allowlist: Option<ResolvedTableAwareAllowlist>,
 }
@@ -195,6 +401,724 @@ async fn table_schema_context(
         TableSchemaTool::new(rt, None, None).with_table_allowlist(table_allowlist);
     let params = TableSchemaToolParams::new(tables.iter().map(ToString::to_string).collect());
     tool_context_text(&table_schema_tool, &params).await
+}
+
+#[derive(Clone, Debug)]
+struct AppTableContext {
+    metadata: HashMap<String, String>,
+    columns: Vec<Column>,
+    legacy_embeddings: Vec<spicepod::component::embeddings::ColumnEmbeddingConfig>,
+    vector_store: Option<spicepod::vector::VectorStore>,
+    full_text_search: Option<spicepod::fts::FtsStore>,
+    configured_primary_key: Option<Vec<String>>,
+    configured_indexes: Vec<NsqlIndexContext>,
+}
+
+#[derive(Clone, Debug)]
+struct ConfiguredVectorSearchColumn {
+    column: String,
+    model: String,
+    engine: Option<String>,
+    row_id_columns: Vec<String>,
+    vector_size: Option<usize>,
+    chunked: bool,
+    aggregation: Option<String>,
+    max_elements_per_row: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct ConfiguredFullTextSearchColumn {
+    column: String,
+    engine: String,
+    index_store: String,
+    row_id_columns: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SearchFunctionAvailability {
+    vector_search: bool,
+    text_search: bool,
+}
+
+fn nsql_context_instructions() -> Vec<String> {
+    NSQL_CONTEXT_INSTRUCTIONS
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn nsql_sql_context() -> NsqlSqlContext {
+    NsqlSqlContext {
+        engine: "Apache DataFusion".to_string(),
+        dialect: "PostgreSQL".to_string(),
+        parser: "DataFusion SQL parser configured with PostgreSQL dialect".to_string(),
+        notes: vec![
+            "Spice supports standard DataFusion SQL plus Spice-specific, JSON, Spark compatibility, and registered user-defined functions listed in this context.".to_string(),
+            "Not every PostgreSQL extension is implemented; prefer the functions listed in this response when generating SQL for Spice.".to_string(),
+            "Table functions such as text_search, vector_search, json_tree, and list_udfs are used in the FROM clause.".to_string(),
+            "Use LIMIT for exploratory or broad-result queries unless the user explicitly asks for all rows.".to_string(),
+        ],
+    }
+}
+
+fn column_reference_columns(reference: &str) -> Vec<String> {
+    ColumnReference::try_from(reference).map_or_else(
+        |_| vec![reference.to_string()],
+        |columns| columns.iter().map(ToString::to_string).collect(),
+    )
+}
+
+fn configured_acceleration_indexes(
+    acceleration: &spicepod::acceleration::Acceleration,
+) -> Vec<NsqlIndexContext> {
+    let mut indexes = acceleration
+        .indexes
+        .iter()
+        .map(|(columns, index_type)| NsqlIndexContext {
+            name: Some(columns.clone()),
+            columns: column_reference_columns(columns),
+            kind: index_type.to_string(),
+            source: "spicepod.acceleration.indexes".to_string(),
+        })
+        .collect_vec();
+
+    if let Some(primary_key) = &acceleration.primary_key {
+        indexes.push(NsqlIndexContext {
+            name: Some(primary_key.clone()),
+            columns: column_reference_columns(primary_key),
+            kind: "primary_key".to_string(),
+            source: "spicepod.acceleration.primary_key".to_string(),
+        });
+    }
+
+    indexes.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.columns.cmp(&right.columns))
+    });
+    indexes
+}
+
+fn app_table_context(table: &TableReference, app: &app::App) -> Option<AppTableContext> {
+    if let Some(dataset) = app
+        .datasets
+        .iter()
+        .find(|dataset| table.resolved_eq(&TableReference::parse_str(&dataset.name)))
+    {
+        let configured_primary_key = dataset
+            .acceleration
+            .as_ref()
+            .and_then(|acceleration| acceleration.primary_key.as_deref())
+            .map(column_reference_columns)
+            .or_else(|| dataset.primary_key_override());
+        let configured_indexes = dataset
+            .acceleration
+            .as_ref()
+            .map_or_else(Vec::new, configured_acceleration_indexes);
+
+        return Some(AppTableContext {
+            metadata: dataset.metadata(),
+            columns: dataset.columns.clone(),
+            legacy_embeddings: dataset.embeddings.clone(),
+            vector_store: dataset.vectors.clone(),
+            full_text_search: dataset.full_text_search.clone(),
+            configured_primary_key,
+            configured_indexes,
+        });
+    }
+
+    app.views
+        .iter()
+        .find(|view| table.resolved_eq(&TableReference::parse_str(&view.name)))
+        .map(|view| AppTableContext {
+            metadata: view.metadata(),
+            columns: view.columns.clone(),
+            legacy_embeddings: vec![],
+            vector_store: view.vectors.clone(),
+            full_text_search: None,
+            configured_primary_key: view.primary_key_override(),
+            configured_indexes: view
+                .acceleration
+                .as_ref()
+                .map_or_else(Vec::new, configured_acceleration_indexes),
+        })
+}
+
+fn constraint_column_names(schema: &Schema, indices: &[usize]) -> Option<Vec<String>> {
+    indices
+        .iter()
+        .map(|index| {
+            schema
+                .fields()
+                .get(*index)
+                .map(|field| field.name().clone())
+        })
+        .collect()
+}
+
+fn key_context_from_constraints(
+    schema: &Schema,
+    constraints: Option<&Constraints>,
+) -> (Vec<String>, Vec<Vec<String>>) {
+    let Some(constraints) = constraints else {
+        return (vec![], vec![]);
+    };
+
+    let mut primary_key = Vec::new();
+    let mut unique_constraints = Vec::new();
+
+    for constraint in constraints.iter() {
+        match constraint {
+            Constraint::PrimaryKey(indices) => {
+                if primary_key.is_empty()
+                    && let Some(columns) = constraint_column_names(schema, indices)
+                {
+                    primary_key = columns;
+                }
+            }
+            Constraint::Unique(indices) => {
+                if let Some(columns) = constraint_column_names(schema, indices) {
+                    unique_constraints.push(columns);
+                }
+            }
+        }
+    }
+
+    (primary_key, unique_constraints)
+}
+
+fn foreign_keys_from_metadata(metadata: &HashMap<String, String>) -> Vec<NsqlForeignKeyContext> {
+    let Some(foreign_keys) = metadata.get(FOREIGN_KEYS_METADATA_KEY) else {
+        return vec![];
+    };
+
+    match serde_json::from_str::<Vec<NsqlForeignKeyContext>>(foreign_keys) {
+        Ok(foreign_keys) => foreign_keys,
+        Err(error) => {
+            tracing::warn!(%error, "Failed to parse foreign key metadata for NSQL context");
+            vec![]
+        }
+    }
+}
+
+fn runtime_indexes_from_provider(
+    table_provider: Option<&Arc<dyn datafusion::datasource::TableProvider>>,
+) -> Vec<NsqlIndexContext> {
+    let Some(table_provider) = table_provider else {
+        return vec![];
+    };
+
+    find_concrete_table_provider::<IndexedTableProvider>(table_provider).map_or_else(
+        Vec::new,
+        |indexed_table| {
+            indexed_table
+                .get_all_indexes()
+                .into_iter()
+                .map(|index| {
+                    let mut columns = index.required_columns();
+                    columns.sort();
+                    NsqlIndexContext {
+                        name: Some(index.name().to_string()),
+                        columns,
+                        kind: index.name().to_string(),
+                        source: "runtime_index".to_string(),
+                    }
+                })
+                .collect()
+        },
+    )
+}
+
+fn search_function_availability(available_names: &HashSet<String>) -> SearchFunctionAvailability {
+    SearchFunctionAvailability {
+        vector_search: available_names.contains(VECTOR_SEARCH_UDTF_NAME),
+        text_search: available_names.contains(TEXT_SEARCH_UDTF_NAME),
+    }
+}
+
+fn is_vector_search_index(kind: &str) -> bool {
+    matches!(
+        kind,
+        "NativeVectorIndex"
+            | "duckdb_vector_index"
+            | "elasticsearch_index"
+            | "s3_vector_index"
+            | "ChunkedSearchIndex"
+            | "ChunkedVectorIndex"
+    )
+}
+
+fn is_full_text_search_index(kind: &str) -> bool {
+    matches!(kind, "full_text" | "elasticsearch_text_index")
+}
+
+fn search_index_for_column(
+    indexes: &[NsqlIndexContext],
+    column: &str,
+    index_kind: fn(&str) -> bool,
+) -> Option<NsqlIndexContext> {
+    indexes
+        .iter()
+        .find(|index| index_kind(&index.kind) && index.columns.iter().any(|c| c == column))
+        .cloned()
+}
+
+fn configured_vector_search_columns(
+    app_context: &AppTableContext,
+) -> Vec<ConfiguredVectorSearchColumn> {
+    let dataset_engine = app_context
+        .vector_store
+        .as_ref()
+        .filter(|store| store.enabled)
+        .and_then(|store| store.engine.clone());
+
+    let mut configured = app_context
+        .columns
+        .iter()
+        .flat_map(|column| {
+            let dataset_engine = dataset_engine.clone();
+            column
+                .embeddings
+                .iter()
+                .map(move |embedding| ConfiguredVectorSearchColumn {
+                    column: column.name.clone(),
+                    model: embedding.model.clone(),
+                    engine: embedding.engine.clone().or_else(|| dataset_engine.clone()),
+                    row_id_columns: embedding.row_ids.clone().unwrap_or_default(),
+                    vector_size: embedding.vector_size,
+                    chunked: embedding
+                        .chunking
+                        .as_ref()
+                        .is_some_and(|chunking| chunking.enabled),
+                    aggregation: embedding
+                        .aggregation
+                        .map(|aggregation| aggregation.to_string()),
+                    max_elements_per_row: embedding.max_elements_per_row,
+                })
+        })
+        .collect_vec();
+
+    configured.extend(app_context.legacy_embeddings.iter().map(|embedding| {
+        ConfiguredVectorSearchColumn {
+            column: embedding.column.clone(),
+            model: embedding.model.clone(),
+            engine: dataset_engine.clone(),
+            row_id_columns: embedding.primary_keys.clone().unwrap_or_default(),
+            vector_size: embedding.vector_size,
+            chunked: embedding
+                .chunking
+                .as_ref()
+                .is_some_and(|chunking| chunking.enabled),
+            aggregation: embedding
+                .aggregation
+                .map(|aggregation| aggregation.to_string()),
+            max_elements_per_row: embedding.max_elements_per_row,
+        }
+    }));
+
+    let mut seen_columns = HashSet::new();
+    configured.retain(|column| seen_columns.insert(column.column.clone()));
+    configured.sort_by(|left, right| left.column.cmp(&right.column));
+    configured
+}
+
+fn configured_full_text_search_columns(
+    table: &TableReference,
+    app_context: &AppTableContext,
+    primary_key: &[String],
+) -> Vec<ConfiguredFullTextSearchColumn> {
+    let dataset_engine = app_context
+        .full_text_search
+        .as_ref()
+        .filter(|store| store.enabled)
+        .and_then(|store| store.engine.clone());
+    let dataset_config_primary_key = full_text_search_config(&app_context.columns, table)
+        .map(|config| config.primary_key)
+        .unwrap_or_default();
+
+    let mut configured = app_context
+        .columns
+        .iter()
+        .filter_map(|column| {
+            let full_text_search = column
+                .full_text_search
+                .as_ref()
+                .filter(|config| config.enabled)?;
+
+            let row_id_columns = full_text_search
+                .row_ids
+                .clone()
+                .filter(|row_ids| !row_ids.is_empty())
+                .or_else(|| {
+                    (!dataset_config_primary_key.is_empty())
+                        .then_some(dataset_config_primary_key.clone())
+                })
+                .unwrap_or_else(|| primary_key.to_vec());
+
+            Some(ConfiguredFullTextSearchColumn {
+                column: column.name.clone(),
+                engine: full_text_search
+                    .engine
+                    .clone()
+                    .or_else(|| dataset_engine.clone())
+                    .unwrap_or_else(|| "tantivy".to_string()),
+                index_store: full_text_search.index_store.unwrap_or_default().to_string(),
+                row_id_columns,
+            })
+        })
+        .collect_vec();
+
+    configured.sort_by(|left, right| left.column.cmp(&right.column));
+    configured
+}
+
+fn embedding_input_mode_context(input_mode: EmbeddingInputMode) -> String {
+    match input_mode {
+        EmbeddingInputMode::Scalar => "scalar".to_string(),
+        EmbeddingInputMode::ListMulti {
+            aggregation,
+            max_elements_per_row,
+        } => format!(
+            "list_multi; aggregation={aggregation}; max_elements_per_row={max_elements_per_row}"
+        ),
+    }
+}
+
+fn quoted_identifier(name: &str) -> String {
+    quote_identifier(name).to_string()
+}
+
+fn vector_search_syntax(table: &TableReference, column: &str) -> String {
+    format!(
+        "{VECTOR_SEARCH_UDTF_NAME}({table}, 'query text', {})",
+        quoted_identifier(column)
+    )
+}
+
+fn text_search_syntax(table: &TableReference, column: &str) -> String {
+    format!(
+        "{TEXT_SEARCH_UDTF_NAME}({table}, 'query text', {})",
+        quoted_identifier(column)
+    )
+}
+
+fn vector_search_contexts(
+    table: &TableReference,
+    table_provider: Option<&Arc<dyn datafusion::datasource::TableProvider>>,
+    runtime_indexes: &[NsqlIndexContext],
+    app_context: &AppTableContext,
+    primary_key: &[String],
+    available: SearchFunctionAvailability,
+) -> Vec<NsqlVectorSearchContext> {
+    if !available.vector_search {
+        return vec![];
+    }
+
+    let embedding_table = table_provider.and_then(find_concrete_table_provider::<EmbeddingTable>);
+
+    configured_vector_search_columns(app_context)
+        .into_iter()
+        .filter_map(|configured| {
+            let index = search_index_for_column(
+                runtime_indexes,
+                &configured.column,
+                is_vector_search_index,
+            );
+            let embedding_config = embedding_table
+                .and_then(|table| table.embedded_columns.get(&configured.column));
+
+            if index.is_none() && embedding_config.is_none() {
+                return None;
+            }
+
+            let row_id_columns = if configured.row_id_columns.is_empty() {
+                primary_key.to_vec()
+            } else {
+                configured.row_id_columns.clone()
+            };
+            let vector_size = configured.vector_size.or_else(|| {
+                embedding_config.and_then(|config| usize::try_from(config.vector_size).ok())
+            });
+            let model = if configured.model.is_empty() {
+                embedding_config.map_or_else(String::new, |config| config.model_name.clone())
+            } else {
+                configured.model.clone()
+            };
+            if model.is_empty() {
+                return None;
+            }
+
+            let required_columns = index.as_ref().map_or_else(
+                || {
+                    row_id_columns
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::once(configured.column.clone()))
+                        .collect_vec()
+                },
+                |index| index.columns.clone(),
+            );
+            let mut notes = Vec::new();
+            if configured.chunked {
+                notes.push(
+                    "This column is chunked; vector_search returns the most relevant chunk in the value column."
+                        .to_string(),
+                );
+            }
+            if configured.aggregation.is_some() || configured.max_elements_per_row.is_some() {
+                notes.push(
+                    "This column is configured for multi-vector search; similarity is aggregated across list elements."
+                        .to_string(),
+                );
+            }
+            if index.is_none() {
+                notes.push(
+                    "No separate vector engine index is configured; vector_search uses the embedding table path for this column."
+                        .to_string(),
+                );
+            }
+
+            Some(NsqlVectorSearchContext {
+                column: configured.column.clone(),
+                function: VECTOR_SEARCH_UDTF_NAME.to_string(),
+                syntax: vector_search_syntax(table, &configured.column),
+                model,
+                engine: configured
+                    .engine
+                    .clone()
+                    .or_else(|| index.as_ref().map(|index| index.kind.clone())),
+                row_id_columns,
+                vector_size,
+                chunked: configured.chunked,
+                input_mode: embedding_config.map(|config| embedding_input_mode_context(config.input_mode)),
+                required_columns,
+                index,
+                notes,
+            })
+        })
+        .collect_vec()
+}
+
+fn full_text_search_contexts(
+    table: &TableReference,
+    runtime_indexes: &[NsqlIndexContext],
+    app_context: &AppTableContext,
+    primary_key: &[String],
+    available: SearchFunctionAvailability,
+) -> Vec<NsqlFullTextSearchContext> {
+    if !available.text_search {
+        return vec![];
+    }
+
+    configured_full_text_search_columns(table, app_context, primary_key)
+        .into_iter()
+        .filter_map(|configured| {
+            let index = search_index_for_column(
+                runtime_indexes,
+                &configured.column,
+                is_full_text_search_index,
+            )?;
+            let required_columns = index.columns.clone();
+
+            Some(NsqlFullTextSearchContext {
+                column: configured.column.clone(),
+                function: TEXT_SEARCH_UDTF_NAME.to_string(),
+                syntax: text_search_syntax(table, &configured.column),
+                engine: configured.engine,
+                index_store: configured.index_store,
+                row_id_columns: configured.row_id_columns,
+                required_columns,
+                index: Some(index),
+                notes: vec![],
+            })
+        })
+        .collect_vec()
+}
+
+fn dataset_search_context(
+    table: &TableReference,
+    table_provider: Option<&Arc<dyn datafusion::datasource::TableProvider>>,
+    runtime_indexes: &[NsqlIndexContext],
+    app_context: Option<&AppTableContext>,
+    primary_key: &[String],
+    available: SearchFunctionAvailability,
+) -> NsqlDatasetSearchContext {
+    let Some(app_context) = app_context else {
+        return NsqlDatasetSearchContext::default();
+    };
+
+    NsqlDatasetSearchContext {
+        vector: vector_search_contexts(
+            table,
+            table_provider,
+            runtime_indexes,
+            app_context,
+            primary_key,
+            available,
+        ),
+        full_text: full_text_search_contexts(
+            table,
+            runtime_indexes,
+            app_context,
+            primary_key,
+            available,
+        ),
+    }
+}
+
+fn dataset_context_from_schema(
+    table: &TableReference,
+    schema: Schema,
+    constraints: Option<&Constraints>,
+    runtime_indexes: Vec<NsqlIndexContext>,
+    table_provider: Option<&Arc<dyn datafusion::datasource::TableProvider>>,
+    app_context: Option<AppTableContext>,
+    search_functions: SearchFunctionAvailability,
+) -> NsqlDatasetContext {
+    let mut metadata = schema.metadata().clone();
+    if let Some(app_context) = &app_context {
+        metadata.extend(app_context.metadata.clone());
+    }
+
+    let (mut primary_key, unique_constraints) = key_context_from_constraints(&schema, constraints);
+    if primary_key.is_empty()
+        && let Some(configured_primary_key) = app_context
+            .as_ref()
+            .and_then(|context| context.configured_primary_key.clone())
+    {
+        primary_key = configured_primary_key;
+    }
+
+    let mut indexes = runtime_indexes;
+    if let Some(app_context) = &app_context {
+        indexes.extend(app_context.configured_indexes.clone());
+    }
+    indexes.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.columns.cmp(&right.columns))
+    });
+
+    let primary_key_columns = primary_key.iter().cloned().collect::<BTreeSet<_>>();
+    let unique_columns = unique_constraints
+        .iter()
+        .flatten()
+        .chain(
+            indexes
+                .iter()
+                .filter(|index| index.kind == "unique")
+                .flat_map(|index| index.columns.iter()),
+        )
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let indexed_columns = indexes
+        .iter()
+        .flat_map(|index| index.columns.iter().cloned())
+        .collect::<BTreeSet<_>>();
+
+    let search = dataset_search_context(
+        table,
+        table_provider,
+        &indexes,
+        app_context.as_ref(),
+        &primary_key,
+        search_functions,
+    );
+    let vector_search_columns = search
+        .vector
+        .iter()
+        .map(|search| search.column.clone())
+        .collect::<BTreeSet<_>>();
+    let full_text_search_columns = search
+        .full_text
+        .iter()
+        .map(|search| search.column.clone())
+        .collect::<BTreeSet<_>>();
+
+    let app_columns = app_context
+        .as_ref()
+        .map(|context| context.columns.as_slice())
+        .unwrap_or_default();
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let mut field_metadata = field.metadata().clone();
+            if let Some(app_column) = app_columns
+                .iter()
+                .find(|column| column.name == *field.name())
+            {
+                field_metadata.extend(app_column.metadata());
+            }
+
+            let description = field_metadata.get(DESCRIPTION_METADATA_KEY).cloned();
+            let source_type = field_metadata.get(SOURCE_TYPE_METADATA_KEY).cloned();
+
+            NsqlColumnContext {
+                name: field.name().clone(),
+                data_type: field.data_type().to_string(),
+                nullable: field.is_nullable(),
+                description,
+                source_type,
+                primary_key: primary_key_columns.contains(field.name()),
+                unique: unique_columns.contains(field.name()),
+                indexed: indexed_columns.contains(field.name()),
+                vector_search: vector_search_columns.contains(field.name()),
+                full_text_search: full_text_search_columns.contains(field.name()),
+                metadata: field_metadata.into_iter().collect(),
+            }
+        })
+        .collect();
+
+    let description = metadata.get(DESCRIPTION_METADATA_KEY).cloned();
+    let foreign_keys = foreign_keys_from_metadata(&metadata);
+
+    NsqlDatasetContext {
+        name: table.to_string(),
+        catalog: table.catalog().map(ToString::to_string),
+        schema: table.schema().map(ToString::to_string),
+        table: table.table().to_string(),
+        description,
+        foreign_keys,
+        metadata: metadata.into_iter().collect(),
+        columns,
+        primary_key,
+        unique_constraints,
+        indexes,
+        search,
+    }
+}
+
+async fn dataset_contexts(
+    tables: &[TableReference],
+    rt: Arc<Runtime>,
+    app: &app::App,
+    search_functions: SearchFunctionAvailability,
+) -> Result<Vec<NsqlDatasetContext>, Box<dyn StdError + Send + Sync>> {
+    let df = rt.datafusion();
+    let mut contexts = Vec::with_capacity(tables.len());
+
+    for table in tables {
+        let schema = df.get_arrow_schema(table.clone()).await?;
+        let table_provider = df.get_table(table).await;
+        let runtime_indexes = runtime_indexes_from_provider(table_provider.as_ref());
+        let constraints = table_provider
+            .as_ref()
+            .and_then(|provider| provider.constraints());
+        contexts.push(dataset_context_from_schema(
+            table,
+            schema,
+            constraints,
+            runtime_indexes,
+            table_provider.as_ref(),
+            app_table_context(table, app),
+            search_functions,
+        ));
+    }
+
+    Ok(contexts)
 }
 
 async fn sample_context_blocks(
@@ -286,6 +1210,7 @@ fn available_function_names(rt: &Runtime) -> HashSet<String> {
     function_names
 }
 
+#[derive(Clone, Debug)]
 struct FunctionContextEntry {
     name: String,
     syntax: &'static str,
@@ -306,6 +1231,15 @@ impl FunctionContextEntry {
     fn with_example(mut self, example: &'static str) -> Self {
         self.example = Some(example);
         self
+    }
+
+    fn to_context_entry(&self) -> NsqlFunctionContextEntry {
+        NsqlFunctionContextEntry {
+            name: self.name.clone(),
+            syntax: self.syntax.to_string(),
+            description: self.description.to_string(),
+            example: self.example.map(ToString::to_string),
+        }
     }
 }
 
@@ -408,22 +1342,22 @@ fn spice_function_entries() -> Vec<FunctionContextEntry> {
         .with_example("SELECT * FROM json_tree('{\"items\":[1,2]}')"),
         FunctionContextEntry::new(
             TEXT_SEARCH_UDTF_NAME,
-            "text_search(table => 'dataset', query => 'text')",
-            "Runs full-text search over a configured searchable dataset.",
+            "text_search(dataset, 'query text'[, column])",
+            "Runs full-text search over a dataset column with a configured full-text search index. Pass column when a table has more than one full-text search column.",
         )
-        .with_example("SELECT * FROM text_search(table => 'docs', query => 'refund policy')"),
+        .with_example("SELECT * FROM text_search(docs, 'refund policy', body)"),
         FunctionContextEntry::new(
             VECTOR_SEARCH_UDTF_NAME,
-            "vector_search(table => 'dataset', query => 'text')",
-            "Runs vector search over a configured searchable dataset.",
+            "vector_search(dataset, 'query text'[, column])",
+            "Runs vector search over a dataset column with a configured embedding/vector index. Pass column when a table has more than one vector-search column.",
         )
-        .with_example("SELECT * FROM vector_search(table => 'docs', query => 'refund policy')"),
+        .with_example("SELECT * FROM vector_search(docs, 'refund policy', body)"),
         FunctionContextEntry::new(
             RRF_UDF_NAME,
             "rrf(text_search(...), vector_search(...))",
             "Combines text and vector search results with reciprocal rank fusion.",
         )
-        .with_example("SELECT * FROM rrf(text_search(table => 'docs', query => 'refund'), vector_search(table => 'docs', query => 'refund'))"),
+        .with_example("SELECT * FROM rrf(text_search(docs, 'refund', body), vector_search(docs, 'refund', body))"),
         FunctionContextEntry::new(
             RERANK_UDTF_NAME,
             "rerank(input => TABLE(...), model => 'model')",
@@ -511,29 +1445,83 @@ fn spice_function_entries() -> Vec<FunctionContextEntry> {
     ]
 }
 
+fn available_context_entries(
+    entries: Vec<FunctionContextEntry>,
+    available_names: &HashSet<String>,
+    search_functions: SearchFunctionAvailability,
+) -> Vec<NsqlFunctionContextEntry> {
+    entries
+        .iter()
+        .filter(|entry| {
+            let name = entry.name.to_ascii_lowercase();
+            if name == TEXT_SEARCH_UDTF_NAME {
+                return available_names.contains(&name) && search_functions.text_search;
+            }
+            if name == VECTOR_SEARCH_UDTF_NAME {
+                return available_names.contains(&name) && search_functions.vector_search;
+            }
+            if name == RRF_UDF_NAME || name == RERANK_UDTF_NAME {
+                return available_names.contains(&name)
+                    && search_functions.text_search
+                    && search_functions.vector_search;
+            }
+            available_names.contains(&name)
+        })
+        .map(FunctionContextEntry::to_context_entry)
+        .collect_vec()
+}
+
+#[cfg(test)]
+pub(crate) fn all_context_function_names_for_test() -> HashSet<String> {
+    let mut names = json_function_entries()
+        .into_iter()
+        .chain(spice_function_entries())
+        .map(|entry| entry.name.to_ascii_lowercase())
+        .filter(|name| cfg!(feature = "models") || (name != AI_UDF_NAME && name != EMBED_UDF_NAME))
+        .collect::<HashSet<_>>();
+
+    names.extend(
+        datafusion_spark::all_default_scalar_functions()
+            .into_iter()
+            .map(|function| function.name().to_ascii_lowercase()),
+    );
+    names
+}
+
+#[cfg(test)]
+pub(crate) fn nsql_function_context_for_test(
+    app: &app::App,
+    available_names: &HashSet<String>,
+    vector_search: bool,
+    text_search: bool,
+) -> NsqlFunctionContext {
+    nsql_function_context(
+        app,
+        available_names,
+        SearchFunctionAvailability {
+            vector_search,
+            text_search,
+        },
+    )
+}
+
 fn write_function_entries(
     output: &mut String,
     section: &str,
-    entries: Vec<FunctionContextEntry>,
-    available_names: &HashSet<String>,
+    entries: &[NsqlFunctionContextEntry],
 ) {
-    let available_entries = entries
-        .into_iter()
-        .filter(|entry| available_names.contains(&entry.name.to_ascii_lowercase()))
-        .collect_vec();
-
-    if available_entries.is_empty() {
+    if entries.is_empty() {
         return;
     }
 
     let _ = writeln!(output, "\n### {section}");
-    for entry in available_entries {
+    for entry in entries {
         let _ = write!(
             output,
             "- `{}`: {} Syntax: `{}`.",
             entry.name, entry.description, entry.syntax
         );
-        if let Some(example) = entry.example {
+        if let Some(example) = &entry.example {
             let _ = write!(output, " Example: `{example}`.");
         }
         let _ = writeln!(output);
@@ -547,7 +1535,8 @@ fn write_wrapped_function_names(output: &mut String, names: &[String]) {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct UserFunctionContextEntry {
     pub(crate) name: String,
     pub(crate) syntax: Option<String>,
@@ -664,33 +1653,47 @@ pub(crate) fn write_user_function_context_entries(
     }
 }
 
-fn write_user_function_context(
-    output: &mut String,
+fn user_function_context(
     app: &app::App,
     available_names: &HashSet<String>,
-) {
-    let user_functions = user_function_context_entries(app, available_names, user_function_infos());
-    write_user_function_context_entries(output, &user_functions);
+) -> Vec<UserFunctionContextEntry> {
+    user_function_context_entries(app, available_names, user_function_infos())
 }
 
-fn nsql_function_context(rt: &Runtime, app: &app::App) -> String {
-    let available_names = available_function_names(rt);
-    let mut context = String::from(
-        "Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions. Function references are filtered to functions registered in the current DataFusion context:\n",
-    );
+impl NsqlFunctionContext {
+    fn render_markdown(&self) -> String {
+        let mut context = format!("{}:\n", self.summary);
 
-    write_function_entries(
-        &mut context,
-        "JSON functions",
-        json_function_entries(),
-        &available_names,
-    );
-    write_function_entries(
-        &mut context,
-        "Spice-specific functions",
-        spice_function_entries(),
-        &available_names,
-    );
+        write_function_entries(&mut context, "JSON functions", &self.json);
+        write_function_entries(
+            &mut context,
+            "Spice-specific functions",
+            &self.spice_specific,
+        );
+
+        if !self.spark_compatibility.functions.is_empty() {
+            let _ = writeln!(
+                context,
+                "\n### Spark compatibility scalar functions\n{}",
+                self.spark_compatibility.description
+            );
+            write_wrapped_function_names(&mut context, &self.spark_compatibility.functions);
+        }
+
+        write_user_function_context_entries(&mut context, &self.user_defined);
+        context
+    }
+}
+
+fn nsql_function_context(
+    app: &app::App,
+    available_names: &HashSet<String>,
+    search_functions: SearchFunctionAvailability,
+) -> NsqlFunctionContext {
+    let json =
+        available_context_entries(json_function_entries(), available_names, search_functions);
+    let spice_specific =
+        available_context_entries(spice_function_entries(), available_names, search_functions);
 
     let mut spark_function_names = datafusion_spark::all_default_scalar_functions()
         .into_iter()
@@ -700,26 +1703,152 @@ fn nsql_function_context(rt: &Runtime, app: &app::App) -> String {
         .collect_vec();
     spark_function_names.sort_by_key(|name| name.to_ascii_lowercase());
 
-    if !spark_function_names.is_empty() {
-        let _ = writeln!(
-            context,
-            "\n### Spark compatibility scalar functions\nSpark-compatible scalar functions are available for arrays, maps, structs, dates, strings, hashes, URLs, XML, and other common Spark SQL expressions."
-        );
-        write_wrapped_function_names(&mut context, &spark_function_names);
+    NsqlFunctionContext {
+        summary: NSQL_FUNCTION_CONTEXT_SUMMARY.to_string(),
+        json,
+        spice_specific,
+        spark_compatibility: NsqlSparkFunctionContext {
+            description: "Spark-compatible scalar functions are available for arrays, maps, structs, dates, strings, hashes, URLs, XML, and other common Spark SQL expressions.".to_string(),
+            functions: spark_function_names,
+        },
+        user_defined: user_function_context(app, available_names),
+    }
+}
+
+pub(crate) fn render_nsql_dataset_relationship_context(datasets: &[NsqlDatasetContext]) -> String {
+    let mut context = String::new();
+
+    for dataset in datasets {
+        let has_relationship_context = !dataset.primary_key.is_empty()
+            || !dataset.unique_constraints.is_empty()
+            || !dataset.foreign_keys.is_empty()
+            || !dataset.indexes.is_empty()
+            || !dataset.search.vector.is_empty()
+            || !dataset.search.full_text.is_empty();
+        if !has_relationship_context {
+            continue;
+        }
+
+        let _ = writeln!(context, "\n### `{}`", dataset.name);
+
+        if !dataset.primary_key.is_empty() {
+            let keys = dataset
+                .primary_key
+                .iter()
+                .map(|column| format!("`{column}`"))
+                .join(", ");
+            let _ = writeln!(context, "- Primary key: {keys}");
+        }
+
+        if !dataset.unique_constraints.is_empty() {
+            let _ = writeln!(context, "- Unique constraints:");
+            for columns in &dataset.unique_constraints {
+                let columns = columns
+                    .iter()
+                    .map(|column| format!("`{column}`"))
+                    .join(", ");
+                let _ = writeln!(context, "  - ({columns})");
+            }
+        }
+
+        if !dataset.foreign_keys.is_empty() {
+            let _ = writeln!(context, "- Foreign keys:");
+            for foreign_key in &dataset.foreign_keys {
+                let columns = foreign_key
+                    .columns
+                    .iter()
+                    .map(|column| format!("`{column}`"))
+                    .join(", ");
+                let foreign_columns = foreign_key
+                    .foreign_columns
+                    .iter()
+                    .map(|column| format!("`{column}`"))
+                    .join(", ");
+                let _ = writeln!(
+                    context,
+                    "  - ({columns}) references `{}` ({foreign_columns})",
+                    foreign_key.foreign_table
+                );
+            }
+        }
+
+        if !dataset.indexes.is_empty() {
+            let _ = writeln!(context, "- Indexes:");
+            for index in &dataset.indexes {
+                let columns = index
+                    .columns
+                    .iter()
+                    .map(|column| format!("`{column}`"))
+                    .join(", ");
+                if let Some(name) = &index.name {
+                    let _ = writeln!(
+                        context,
+                        "  - `{name}`: {columns} ({}, {})",
+                        index.kind, index.source
+                    );
+                } else {
+                    let _ = writeln!(context, "  - {columns} ({}, {})", index.kind, index.source);
+                }
+            }
+        }
+
+        if !dataset.search.vector.is_empty() || !dataset.search.full_text.is_empty() {
+            let _ = writeln!(context, "- Search indexes:");
+            for search in &dataset.search.vector {
+                let _ = write!(
+                    context,
+                    "  - vector search on `{}` using `{}`. Syntax: `{}`.",
+                    search.column, search.model, search.syntax
+                );
+                if let Some(engine) = &search.engine {
+                    let _ = write!(context, " Engine/index: `{engine}`.");
+                }
+                if !search.row_id_columns.is_empty() {
+                    let keys = search
+                        .row_id_columns
+                        .iter()
+                        .map(|column| format!("`{column}`"))
+                        .join(", ");
+                    let _ = write!(context, " Row id: {keys}.");
+                }
+                let _ = writeln!(context);
+            }
+            for search in &dataset.search.full_text {
+                let _ = write!(
+                    context,
+                    "  - full-text search on `{}` using `{}`. Syntax: `{}`.",
+                    search.column, search.engine, search.syntax
+                );
+                if !search.row_id_columns.is_empty() {
+                    let keys = search
+                        .row_id_columns
+                        .iter()
+                        .map(|column| format!("`{column}`"))
+                        .join(", ");
+                    let _ = write!(context, " Row id: {keys}.");
+                }
+                let _ = writeln!(context);
+            }
+        }
     }
 
-    write_user_function_context(&mut context, app, &available_names);
     context
 }
 
 pub(crate) fn render_nsql_context_block(
     tables: &[TableReference],
     schema_context: &str,
+    relationship_context: &str,
     function_context: &str,
     sample_context_blocks: &[SampleContextBlock],
 ) -> String {
-    let mut context = String::from(
-        "# Spice.ai NSQL Context\n\nUse this context to write SQL for the Spice runtime. Return only valid SQL code, without markdown fences. Quote column names that contain capitals. For tables with schemas and catalogs, use `\"catalog\".\"schema\".\"table\"`, not `\"catalog.schema.table\"`. Schema metadata includes table and column comments/descriptions when supplied by the connector or Spicepod.\n",
+    let mut context = String::from("# Spice.ai NSQL Context\n");
+    for instruction in NSQL_CONTEXT_INSTRUCTIONS {
+        let _ = writeln!(context, "- {instruction}");
+    }
+    let _ = writeln!(
+        context,
+        "- Schema metadata includes table and column comments/descriptions when supplied by the connector or Spicepod."
     );
 
     let _ = writeln!(context, "\n## Datasets");
@@ -736,6 +1865,12 @@ pub(crate) fn render_nsql_context_block(
         let _ = writeln!(context, "No schema information is available.");
     } else {
         context.push_str(schema_context.trim());
+        context.push('\n');
+    }
+
+    if !relationship_context.trim().is_empty() {
+        let _ = writeln!(context, "\n## Dataset Relationships");
+        context.push_str(relationship_context.trim());
         context.push('\n');
     }
 
@@ -862,18 +1997,131 @@ pub(crate) async fn build_nsql_context(
         vec![]
     };
 
+    let available_names = available_function_names(&rt);
+    let configured_search_functions = search_function_availability(&available_names);
+
+    let dataset_contexts =
+        dataset_contexts(&tables, Arc::clone(&rt), &app, configured_search_functions)
+            .instrument(Span::current())
+            .await
+            .map_err(|source| {
+                tracing::error!("Error getting structured dataset context: {source}");
+                NsqlContextError::SchemaContext { source }
+            })?;
+
+    let dataset_search_functions = SearchFunctionAvailability {
+        vector_search: dataset_contexts
+            .iter()
+            .any(|dataset| !dataset.search.vector.is_empty()),
+        text_search: dataset_contexts
+            .iter()
+            .any(|dataset| !dataset.search.full_text.is_empty()),
+    };
+    let function_context = nsql_function_context(&app, &available_names, dataset_search_functions);
+    let function_context_block = function_context.render_markdown();
+    let relationship_context = render_nsql_dataset_relationship_context(&dataset_contexts);
+
     let context_block = render_nsql_context_block(
         &tables,
         &schema_context,
-        &nsql_function_context(&rt, &app),
+        &relationship_context,
+        &function_context_block,
         &sample_context_blocks,
     );
     let message = context_message(&context_block)
         .map_err(|message| NsqlContextError::ContextMessage { message })?;
+    let json = NsqlContextJsonResponse {
+        context: context_block.clone(),
+        instructions: nsql_context_instructions(),
+        sql: nsql_sql_context(),
+        datasets: dataset_contexts,
+        functions: function_context,
+        samples: sample_context_blocks.clone(),
+    };
 
     Ok(NsqlContext {
-        block: context_block,
+        json,
         message,
         table_allowlist: table_allowlist_opt,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry_names(entries: &[NsqlFunctionContextEntry]) -> BTreeSet<String> {
+        entries
+            .iter()
+            .map(|entry| entry.name.to_ascii_lowercase())
+            .collect()
+    }
+
+    #[test]
+    fn function_context_includes_registered_json_and_spark_functions() {
+        let app = app::AppBuilder::new("test").build();
+        let available_names = all_context_function_names_for_test();
+
+        let context = nsql_function_context_for_test(&app, &available_names, true, true);
+
+        let json_names = entry_names(&context.json);
+        for expected_name in json_function_entries()
+            .iter()
+            .map(|entry| entry.name.as_str())
+        {
+            assert!(
+                json_names.contains(expected_name),
+                "missing JSON function {expected_name} from NSQL context"
+            );
+        }
+
+        let expected_spark_names = datafusion_spark::all_default_scalar_functions()
+            .into_iter()
+            .map(|function| function.name().to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        let actual_spark_names = context
+            .spark_compatibility
+            .functions
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+
+        assert!(
+            expected_spark_names.len() > 20,
+            "expected DataFusion Spark compatibility to expose many functions"
+        );
+        assert_eq!(actual_spark_names, expected_spark_names);
+    }
+
+    #[test]
+    fn function_context_requires_text_and_vector_search_for_fusion_and_rerank() {
+        let app = app::AppBuilder::new("test").build();
+        let available_names = HashSet::from([
+            TEXT_SEARCH_UDTF_NAME.to_string(),
+            VECTOR_SEARCH_UDTF_NAME.to_string(),
+            RRF_UDF_NAME.to_string(),
+            RERANK_UDTF_NAME.to_string(),
+        ]);
+
+        let text_only = nsql_function_context_for_test(&app, &available_names, false, true);
+        let text_only_names = entry_names(&text_only.spice_specific);
+        assert!(text_only_names.contains(TEXT_SEARCH_UDTF_NAME));
+        assert!(!text_only_names.contains(VECTOR_SEARCH_UDTF_NAME));
+        assert!(!text_only_names.contains(RRF_UDF_NAME));
+        assert!(!text_only_names.contains(RERANK_UDTF_NAME));
+
+        let vector_only = nsql_function_context_for_test(&app, &available_names, true, false);
+        let vector_only_names = entry_names(&vector_only.spice_specific);
+        assert!(!vector_only_names.contains(TEXT_SEARCH_UDTF_NAME));
+        assert!(vector_only_names.contains(VECTOR_SEARCH_UDTF_NAME));
+        assert!(!vector_only_names.contains(RRF_UDF_NAME));
+        assert!(!vector_only_names.contains(RERANK_UDTF_NAME));
+
+        let hybrid = nsql_function_context_for_test(&app, &available_names, true, true);
+        let hybrid_names = entry_names(&hybrid.spice_specific);
+        assert!(hybrid_names.contains(TEXT_SEARCH_UDTF_NAME));
+        assert!(hybrid_names.contains(VECTOR_SEARCH_UDTF_NAME));
+        assert!(hybrid_names.contains(RRF_UDF_NAME));
+        assert!(hybrid_names.contains(RERANK_UDTF_NAME));
+    }
 }

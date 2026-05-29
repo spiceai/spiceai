@@ -1,10 +1,14 @@
 ---
 source: crates/runtime/src/http/v1/nsql.rs
-expression: "render_nsql_context_block(&tables, schema_context, function_context,\n&sample_context_blocks,)"
+expression: "render_nsql_context_block(&tables, schema_context, relationship_context,\nfunction_context, &sample_context_blocks,)"
 ---
 # Spice.ai NSQL Context
-
-Use this context to write SQL for the Spice runtime. Return only valid SQL code, without markdown fences. Quote column names that contain capitals. For tables with schemas and catalogs, use `"catalog"."schema"."table"`, not `"catalog.schema.table"`. Schema metadata includes table and column comments/descriptions when supplied by the connector or Spicepod.
+- Write SQL for the Spice runtime, which uses Apache DataFusion with the SQL parser configured for the PostgreSQL dialect.
+- Return only valid SQL code, without markdown fences.
+- Quote column names that contain capitals or special characters with double quotes.
+- For tables with schemas and catalogs, use "catalog"."schema"."table", not "catalog.schema.table".
+- Use table and column descriptions, primary keys, foreign keys, unique constraints, and indexes when choosing joins and filters.
+- Schema metadata includes table and column comments/descriptions when supplied by the connector or Spicepod.
 
 ## Datasets
 - `sales.orders`
@@ -18,11 +22,23 @@ Use this context to write SQL for the Spice runtime. Return only valid SQL code,
 | support_tickets | ticket_id | Int64 | false | Support ticket identifier |
 | support_tickets | sentiment | Utf8 | true | Model-derived sentiment label |
 
+## Dataset Relationships
+### `sales.orders`
+- Primary key: `order_id`
+- Foreign keys:
+    - (`customer_id`) references `spice.sales.customers` (`id`)
+- Indexes:
+    - `customer_id`: `customer_id` (enabled, spicepod.acceleration.indexes)
+- Search indexes:
+    - vector search on `customer_id` using `embed_model`. Syntax: `vector_search(sales.orders, 'query text', customer_id)`. Engine/index: `duckdb_vector_index`. Row id: `order_id`.
+    - full-text search on `customer_id` using `tantivy`. Syntax: `text_search(sales.orders, 'query text', customer_id)`. Row id: `order_id`.
+
 ## SQL Functions
 Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions:
 
 ### Spice-specific functions
-- `text_search`: Runs full-text search over a configured searchable dataset. Syntax: `text_search(table => 'dataset', query => 'text')`.
+- `text_search`: Runs full-text search over a configured searchable dataset. Syntax: `text_search(dataset, 'query text'[, column])`.
+- `vector_search`: Runs vector search over a configured embedding/vector index. Syntax: `vector_search(dataset, 'query text'[, column])`.
 
 ### User-defined functions
 - `ticket_priority`: scalar function from `sql` with `stable` volatility. Syntax: `ticket_priority(sentiment utf8) -> int64`. Converts support-ticket sentiment into a priority score.
