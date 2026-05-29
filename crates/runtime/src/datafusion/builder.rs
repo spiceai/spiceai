@@ -180,7 +180,7 @@ impl CayenneOptimizerRules {
                 filter_propagation: false,
                 cross_join_reassociation: true,
                 inlist_to_range: false,
-                semi_join_pushdown: false,
+                semi_join_pushdown: true,
             },
             physical: CayennePhysicalOptimizerRules {
                 dynamic_filter_sharing: true,

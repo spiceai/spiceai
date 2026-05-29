@@ -996,9 +996,9 @@ mod test {
             selected_rules
         );
 
-        // `semi_join_pushdown` is opt-in: off under `auto`, on under `all`, and
+        // `semi_join_pushdown` is on under both `auto` and `all`, and is also
         // selectable by token (including its aliases) without enabling anything else.
-        assert!(!CayenneOptimizerRules::auto_enabled().semi_join_pushdown());
+        assert!(CayenneOptimizerRules::auto_enabled().semi_join_pushdown());
         assert!(CayenneOptimizerRules::all_enabled().semi_join_pushdown());
         let mut semi_join_only = CayenneOptimizerRules::none();
         semi_join_only.set_semi_join_pushdown(true);
