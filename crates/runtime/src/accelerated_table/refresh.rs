@@ -970,6 +970,9 @@ impl Refresher {
         refresh_task_runner =
             refresh_task_runner.with_snapshot_refresh_state(self.snapshot_refresh_state.clone());
 
+        refresh_task_runner = refresh_task_runner
+            .with_initial_load_completed(Arc::clone(&self.initial_load_completed));
+
         let mut refresh_task_runner = refresh_task_runner.build();
 
         let (start_refresh, mut on_refresh_complete) = refresh_task_runner.start()?;
@@ -1208,7 +1211,8 @@ impl Refresher {
         .with_metrics(self.metrics.clone())
         .with_on_stream_batch_process_callback(on_batch_process_callback)
         .with_last_updated_at(Arc::clone(&self.last_updated_at))
-        .with_s3_express_acceleration(self.is_s3_express_acceleration);
+        .with_s3_express_acceleration(self.is_s3_express_acceleration)
+        .with_initial_load_completed(Arc::clone(&self.initial_load_completed));
 
         let caching = self.caching.clone();
         let refresh = Arc::clone(&self.refresh);
