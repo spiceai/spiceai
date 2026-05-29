@@ -52,6 +52,7 @@ runtime = { path = "../../crates/runtime" }
 runtime-auth = { path = "../../crates/runtime-auth" }
 runtime-async = { path = "../../crates/runtime-async" }
 runtime-cloud-connect = { workspace = true }
+runtime-datafusion = { path = "../../crates/runtime-datafusion" }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 rustls.workspace = true

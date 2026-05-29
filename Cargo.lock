@@ -16117,10 +16117,12 @@ dependencies = [
  "snafu",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tracing",
  "tracing-futures",
  "url",
  "util",
+ "uuid 1.21.0",
 ]
 
 [[package]]
@@ -18036,6 +18038,7 @@ dependencies = [
  "runtime-async",
  "runtime-auth",
  "runtime-cloud-connect",
+ "runtime-datafusion",
  "rustls 0.23.36",
  "serde_json",
  "snafu",
