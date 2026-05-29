@@ -26,6 +26,18 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
+/// Tabular result of a `RunQuery`, carried to the control plane as native
+/// Arrow rather than JSON. `arrow_ipc` is an Arrow IPC **stream** (schema +
+/// record batches) that the cloud side decodes directly; the runtime never
+/// flattens rows to JSON. `row_count` and `truncated` are metadata the
+/// control plane surfaces alongside the data.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct QueryResult {
+    pub arrow_ipc: Vec<u8>,
+    pub row_count: u64,
+    pub truncated: bool,
+}
+
 /// Surface area the cloud-connect client needs from the runtime.
 ///
 /// All methods are best-effort. Implementations should return a
@@ -54,13 +66,14 @@ pub trait RuntimeHandle: Send + Sync + 'static {
         })
     }
 
-    /// Execute a SQL query and serialize results to JSON. Returns
-    /// `Err(message)` if the query fails. Implementations should cap
-    /// the result size to `max_rows`.
+    /// Execute a SQL query and return the results as native Arrow (an
+    /// Arrow IPC stream) plus metadata. Returns `Err(message)` if the
+    /// query fails. Implementations should cap the result size to
+    /// `max_rows` and a byte budget, setting `truncated` accordingly.
     ///
     /// Default implementation returns a stub error so out-of-the-box
     /// CloudConnect doesn't accidentally execute SQL in test harnesses.
-    async fn execute_sql(&self, _sql: &str, _max_rows: u32) -> Result<serde_json::Value, String> {
+    async fn execute_sql(&self, _sql: &str, _max_rows: u32) -> Result<QueryResult, String> {
         Err("RunQuery is not implemented in this build".to_string())
     }
 

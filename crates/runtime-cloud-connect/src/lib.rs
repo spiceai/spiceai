@@ -42,7 +42,6 @@ limitations under the License.
 //! handle whose tokio task crashes/disconnects are isolated from the rest
 //! of the process; the runtime stays up.
 
-pub mod arrow_json;
 pub mod config;
 pub mod handlers;
 pub mod identity;

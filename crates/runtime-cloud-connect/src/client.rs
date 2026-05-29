@@ -365,30 +365,28 @@ impl ClientDriver {
                 let identifier = live_identifier.read().await.clone();
                 let started = std::time::Instant::now();
                 match self.runtime.execute_sql(&cmd.sql, cmd.max_rows).await {
-                    Ok(payload) => {
+                    Ok(result) => {
                         let duration_ms = started.elapsed().as_millis() as u64;
-                        let row_count = payload
-                            .get("row_count")
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(0);
-                        let truncated = payload
-                            .get("truncated")
-                            .and_then(serde_json::Value::as_bool)
-                            .unwrap_or(false);
                         emit_run_query_audit(
                             tx,
                             &identifier,
                             &RunQueryAudit {
                                 command_id: &cmd.command_id,
                                 sql_hash: &sql_hash,
-                                row_count,
-                                truncated,
+                                row_count: result.row_count,
+                                truncated: result.truncated,
                                 duration_ms,
                                 success: true,
                             },
                         )
                         .await;
-                        send_result(tx, &cmd.command_id, true, "", payload).await;
+                        // Tabular data rides as native Arrow IPC; payload_json
+                        // carries only the row-count / truncation metadata.
+                        let meta = serde_json::json!({
+                            "row_count": result.row_count,
+                            "truncated": result.truncated,
+                        });
+                        send_query_result(tx, &cmd.command_id, result.arrow_ipc, meta).await;
                     }
                     Err(err) => {
                         let duration_ms = started.elapsed().as_millis() as u64;
@@ -686,10 +684,33 @@ async fn send_result(
             success,
             error: error.to_string(),
             payload_json: payload_json_str,
+            result_arrow_ipc: Vec::new(),
         })),
     };
     if let Err(err) = tx.send(msg).await {
         tracing::warn!("Cloud Connect: failed to send CommandResult: {err}");
+    }
+}
+
+/// Send a successful tabular `CommandResult` whose data is a native Arrow IPC
+/// stream (`arrow_ipc`) with row-count / truncation metadata in `meta`.
+async fn send_query_result(
+    tx: &mpsc::Sender<proto::ClientMessage>,
+    command_id: &str,
+    arrow_ipc: Vec<u8>,
+    meta: serde_json::Value,
+) {
+    let msg = proto::ClientMessage {
+        body: Some(proto::client_message::Body::Result(proto::CommandResult {
+            command_id: command_id.to_string(),
+            success: true,
+            error: String::new(),
+            payload_json: serde_json::to_string(&meta).unwrap_or_default(),
+            result_arrow_ipc: arrow_ipc,
+        })),
+    };
+    if let Err(err) = tx.send(msg).await {
+        tracing::warn!("Cloud Connect: failed to send query CommandResult: {err}");
     }
 }
 

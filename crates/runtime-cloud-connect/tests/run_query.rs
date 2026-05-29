@@ -35,9 +35,14 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow::array::{Int64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::StreamWriter;
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use runtime_cloud_connect::config::CloudConnectConfig;
-use runtime_cloud_connect::handlers::RuntimeHandle;
+use runtime_cloud_connect::handlers::{QueryResult, RuntimeHandle};
 use runtime_cloud_connect::identity::IdentityStore;
 use runtime_cloud_connect::proto;
 use runtime_cloud_connect::proto::cloud_connect_server::{CloudConnect, CloudConnectServer};
@@ -52,17 +57,17 @@ use tonic::{Request, Response, Status, Streaming};
 /// shape the real spiced impl produces. Each test sets up the handle
 /// with a fixed payload to return.
 struct ScriptedRuntime {
-    payload: serde_json::Value,
+    result: QueryResult,
     captured_sql: Mutex<Option<String>>,
     captured_max_rows: Mutex<Option<u32>>,
 }
 
 #[async_trait]
 impl RuntimeHandle for ScriptedRuntime {
-    async fn execute_sql(&self, sql: &str, max_rows: u32) -> Result<serde_json::Value, String> {
+    async fn execute_sql(&self, sql: &str, max_rows: u32) -> Result<QueryResult, String> {
         *self.captured_sql.lock().await = Some(sql.to_string());
         *self.captured_max_rows.lock().await = Some(max_rows);
-        Ok(self.payload.clone())
+        Ok(self.result.clone())
     }
 }
 
@@ -153,21 +158,68 @@ async fn spawn_server(mock: MockServer) -> std::net::SocketAddr {
     addr
 }
 
-/// Build a `{columns, rows, row_count, truncated}` envelope mirroring the
-/// real spiced impl, for the mock to return.
-fn envelope(columns: Vec<(&str, &str)>, rows: Vec<Vec<Value>>, truncated: bool) -> Value {
-    let cols: Vec<Value> = columns
-        .into_iter()
-        .map(|(name, ty)| serde_json::json!({"name": name, "data_type": ty}))
+/// Encode record batches into an Arrow IPC stream (the wire shape the
+/// real spiced impl produces for RunQuery).
+fn encode_ipc(schema: &Schema, batches: &[RecordBatch]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let mut w = StreamWriter::try_new(&mut buf, schema).expect("ipc writer");
+        for b in batches {
+            w.write(b).expect("ipc write");
+        }
+        w.finish().expect("ipc finish");
+    }
+    buf
+}
+
+/// Decode an Arrow IPC stream into (column names, batches) for assertions.
+fn decode_ipc(bytes: &[u8]) -> (Vec<String>, Vec<RecordBatch>) {
+    let reader = StreamReader::try_new(std::io::Cursor::new(bytes.to_vec()), None).expect("reader");
+    let columns = reader
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
         .collect();
-    let row_count = rows.len();
-    let rows: Vec<Value> = rows.into_iter().map(Value::Array).collect();
-    serde_json::json!({
-        "columns": cols,
-        "rows": rows,
-        "row_count": row_count,
-        "truncated": truncated,
-    })
+    let batches = reader.collect::<Result<Vec<_>, _>>().expect("batches");
+    (columns, batches)
+}
+
+/// Build a `QueryResult` carrying an `(id: Int64, name: Utf8)` batch as
+/// native Arrow IPC — the same shape the real spiced impl emits.
+fn id_name_result(ids: &[i64], names: &[&str], truncated: bool) -> QueryResult {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![
+            Arc::new(Int64Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(names.to_vec())),
+        ],
+    )
+    .expect("batch");
+    QueryResult {
+        arrow_ipc: encode_ipc(&schema, &[batch]),
+        row_count: ids.len() as u64,
+        truncated,
+    }
+}
+
+/// Build a single-column `(id: Int64)` `QueryResult`.
+fn id_result(ids: &[i64], truncated: bool) -> QueryResult {
+    let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Int64Array::from(ids.to_vec()))],
+    )
+    .expect("batch");
+    QueryResult {
+        arrow_ipc: encode_ipc(&schema, &[batch]),
+        row_count: ids.len() as u64,
+        truncated,
+    }
 }
 
 fn config_with(
@@ -205,17 +257,9 @@ async fn run_query_returns_documented_envelope_and_audit() {
     preseed_identity(&identity_path);
 
     // 2 rows of (id, name) — same shape the cloud portal Query tab
-    // renders.
-    let payload = envelope(
-        vec![("id", "Int64"), ("name", "Utf8")],
-        vec![
-            vec![Value::from(1_i64), Value::from("alpha")],
-            vec![Value::from(2_i64), Value::from("beta")],
-        ],
-        false,
-    );
+    // renders, carried as native Arrow IPC.
     let runtime: Arc<dyn RuntimeHandle> = Arc::new(ScriptedRuntime {
-        payload,
+        result: id_name_result(&[1, 2], &["alpha", "beta"], false),
         captured_sql: Mutex::new(None),
         captured_max_rows: Mutex::new(None),
     });
@@ -261,22 +305,30 @@ async fn run_query_returns_documented_envelope_and_audit() {
         "result.success=true, error={}",
         result.error
     );
-    let payload: Value = serde_json::from_str(&result.payload_json).expect("parse payload");
-    assert!(payload.is_object());
-    let cols = payload["columns"].as_array().expect("columns");
-    assert_eq!(cols.len(), 2);
-    assert_eq!(cols[0]["name"], "id");
-    assert_eq!(cols[0]["data_type"], "Int64");
-    assert_eq!(cols[1]["name"], "name");
-    assert_eq!(cols[1]["data_type"], "Utf8");
-    let rows = payload["rows"].as_array().expect("rows");
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0], 1);
-    assert_eq!(rows[0][1], "alpha");
-    assert_eq!(rows[1][0], 2);
-    assert_eq!(rows[1][1], "beta");
-    assert_eq!(payload["row_count"], 2);
-    assert_eq!(payload["truncated"], false);
+    // Metadata rides in payload_json; tabular data is native Arrow IPC.
+    let meta: Value = serde_json::from_str(&result.payload_json).expect("parse payload");
+    assert_eq!(meta["row_count"], 2);
+    assert_eq!(meta["truncated"], false);
+    // Decode the Arrow IPC and verify columns + values round-tripped.
+    let (columns, batches) = decode_ipc(&result.result_arrow_ipc);
+    assert_eq!(columns, vec!["id".to_string(), "name".to_string()]);
+    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(total_rows, 2);
+    let batch = &batches[0];
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id col");
+    let names = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name col");
+    assert_eq!(ids.value(0), 1);
+    assert_eq!(names.value(0), "alpha");
+    assert_eq!(ids.value(1), 2);
+    assert_eq!(names.value(1), "beta");
 
     // Verify audit EventLog.
     let audit = state.last_audit.clone().expect("audit event");
@@ -305,13 +357,9 @@ async fn run_query_propagates_truncation_flag() {
     let identity_path = dir.path().join("identity.json");
     preseed_identity(&identity_path);
 
-    let payload = envelope(
-        vec![("id", "Int64")],
-        vec![vec![Value::from(1_i64)], vec![Value::from(2_i64)]],
-        true, // server-side runtime says we truncated.
-    );
     let runtime: Arc<dyn RuntimeHandle> = Arc::new(ScriptedRuntime {
-        payload,
+        // server-side runtime says we truncated.
+        result: id_result(&[1, 2], true),
         captured_sql: Mutex::new(None),
         captured_max_rows: Mutex::new(None),
     });
@@ -350,9 +398,12 @@ async fn run_query_propagates_truncation_flag() {
     let state = mock_state.lock().await;
     let result = state.last_result.clone().unwrap();
     assert!(result.success);
-    let payload: Value = serde_json::from_str(&result.payload_json).unwrap();
-    assert_eq!(payload["truncated"], true);
-    assert_eq!(payload["row_count"], 2);
+    let meta: Value = serde_json::from_str(&result.payload_json).unwrap();
+    assert_eq!(meta["truncated"], true);
+    assert_eq!(meta["row_count"], 2);
+    // Data is still present as Arrow IPC even when truncated.
+    let (_, batches) = decode_ipc(&result.result_arrow_ipc);
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
 
     let audit_payload: Value =
         serde_json::from_str(&state.last_audit.clone().unwrap().event_json).unwrap();
@@ -375,11 +426,7 @@ async fn run_query_failure_is_safe_and_audited() {
     struct ErrRuntime;
     #[async_trait]
     impl RuntimeHandle for ErrRuntime {
-        async fn execute_sql(
-            &self,
-            sql: &str,
-            _max_rows: u32,
-        ) -> Result<serde_json::Value, String> {
+        async fn execute_sql(&self, sql: &str, _max_rows: u32) -> Result<QueryResult, String> {
             // Pretend the planner echoed our SQL back in the error —
             // the client must NOT pass that through to the cloud.
             Err(format!("plan error near `{sql}`: table not found"))

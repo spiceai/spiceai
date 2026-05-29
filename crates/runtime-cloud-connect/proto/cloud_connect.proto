@@ -93,7 +93,14 @@ message CommandResult {
   string command_id = 1;
   bool success = 2;
   string error = 3;
+  // Small structured payloads (e.g. GetRuntimeInfo) and RunQuery metadata
+  // ({"row_count":N,"truncated":bool}). Tabular RunQuery data rides in
+  // result_arrow_ipc instead.
   string payload_json = 4;
+  // Arrow IPC stream bytes for tabular results (RunQuery). Empty for
+  // non-tabular commands. The cloud control plane decodes these natively;
+  // results are never JSON-encoded on the wire.
+  bytes result_arrow_ipc = 5;
 }
 
 message Telemetry {

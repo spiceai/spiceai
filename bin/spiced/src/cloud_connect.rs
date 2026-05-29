@@ -37,7 +37,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use runtime::Runtime;
 use runtime_cloud_connect::config::CloudConnectConfig;
-use runtime_cloud_connect::handlers::RuntimeHandle;
+use runtime_cloud_connect::handlers::{QueryResult, RuntimeHandle};
 use runtime_cloud_connect::{CloudConnect, identity::IdentityStore};
 
 /// Read the optional `cloud-endpoint` override file written by
@@ -160,25 +160,17 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         })
     }
 
-    /// Execute a SQL statement and return the rows plus column metadata
-    /// in the wire shape consumed by the Spice Cloud portal's Query tab:
-    ///
-    /// ```json
-    /// {
-    ///   "columns": [{ "name": "...", "data_type": "..." }],
-    ///   "rows": [[v1, v2, ...], ...],
-    ///   "row_count": N,
-    ///   "truncated": bool
-    /// }
-    /// ```
+    /// Execute a SQL statement and return the results as a native Arrow IPC
+    /// stream (schema + record batches) plus row-count / truncation metadata.
+    /// The runtime never flattens rows to JSON — the cloud control plane
+    /// decodes the Arrow directly and renders JSON only at its REST edge.
     ///
     /// Caps:
     /// - `max_rows == 0` → default cap of [`DEFAULT_RUN_QUERY_ROW_CAP`].
     /// - Hard ceiling of [`RUN_QUERY_HARD_ROW_CAP`] rows regardless.
-    /// - Payload byte budget of
-    ///   [`runtime_cloud_connect::arrow_json::PAYLOAD_SIZE_BUDGET_BYTES`]
+    /// - Byte budget of [`RUN_QUERY_BYTE_BUDGET`] on the encoded IPC stream
     ///   — exceeding either cap sets `truncated: true`.
-    async fn execute_sql(&self, sql: &str, max_rows: u32) -> Result<serde_json::Value, String> {
+    async fn execute_sql(&self, sql: &str, max_rows: u32) -> Result<QueryResult, String> {
         let cap = resolve_run_query_cap(max_rows);
 
         let df = self.runtime.datafusion();
@@ -217,18 +209,54 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             batches.push(batch);
         }
 
-        let mut envelope = runtime_cloud_connect::arrow_json::encode_record_batches_with_schema(
-            &batches,
-            Some(stream_schema.as_ref()),
-            cap,
-        );
-        // Propagate the source-side truncation flag if we cut off the
-        // upstream stream before exhausting it.
-        if source_truncated && let Some(obj) = envelope.as_object_mut() {
-            obj.insert("truncated".to_string(), serde_json::Value::Bool(true));
-        }
-        Ok(envelope)
+        // Encode the collected batches to an Arrow IPC stream, enforcing
+        // the byte budget. If encoding would exceed the budget we stop
+        // writing further batches and mark the result truncated.
+        let (arrow_ipc, encoded_rows, byte_truncated) =
+            encode_ipc_bounded(stream_schema.as_ref(), &batches, RUN_QUERY_BYTE_BUDGET)?;
+        Ok(QueryResult {
+            arrow_ipc,
+            row_count: encoded_rows,
+            truncated: source_truncated || byte_truncated,
+        })
     }
+}
+
+/// Byte budget for an encoded RunQuery Arrow IPC stream. A coarse secondary
+/// guard on top of the row cap so a few very wide rows can't blow past the
+/// gRPC message size; the last batch written may push modestly over before
+/// we stop.
+pub const RUN_QUERY_BYTE_BUDGET: usize = 5 * 1024 * 1024;
+
+/// Encode `batches` into an Arrow IPC stream (`schema` first), stopping once
+/// the buffer exceeds `budget`. Returns the bytes, the number of rows
+/// actually written, and whether the budget cut the stream short.
+fn encode_ipc_bounded(
+    schema: &arrow::datatypes::Schema,
+    batches: &[arrow::record_batch::RecordBatch],
+    budget: usize,
+) -> Result<(Vec<u8>, u64, bool), String> {
+    use arrow::ipc::writer::StreamWriter;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut buf, schema)
+        .map_err(|e| format!("arrow ipc init failed: {e}"))?;
+    let mut rows: u64 = 0;
+    let mut truncated = false;
+    for batch in batches {
+        writer
+            .write(batch)
+            .map_err(|e| format!("arrow ipc write failed: {e}"))?;
+        rows += batch.num_rows() as u64;
+        if writer.get_ref().len() > budget {
+            truncated = true;
+            break;
+        }
+    }
+    writer
+        .finish()
+        .map_err(|e| format!("arrow ipc finish failed: {e}"))?;
+    drop(writer);
+    Ok((buf, rows, truncated))
 }
 
 /// Default row cap when the cloud control plane sets `max_rows = 0`.
