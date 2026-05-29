@@ -1,5 +1,0 @@
----
-source: crates/runtime/tests/search/mod.rs
-description: "SELECT id, answer FROM vector_search(qs, 'second', answer) order by _score desc, id LIMIT 4"
----
-"HTTP error: 400 Bad Request - Arrow error: Invalid argument error: column types must match schema types, expected FixedSizeList(256 x Float32) but found FixedSizeList(256 x Float32, field: '') at column index 2"

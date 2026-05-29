@@ -132,9 +132,21 @@ fn wal_stream(
 
     try_stream! {
         let mut first_emitted = !mark_ready_on_first;
+        // If the caller passed `None`, the upfront connect failed transiently
+        // (see `start_wal_stream`) — count it as a prior failure so the next
+        // successful connect emits an INFO "resumed" line.
+        let initial_failed = initial_client.is_none();
         let mut client_slot: Option<ReplicationClient> = initial_client;
         let mut backoff = super::resilience::Backoff::default_for_stream();
         let mut last_emitted_commit_lsn = confirmed_flush.load(Ordering::Relaxed);
+        // Counts consecutive failed connect/recv attempts in the current
+        // outage cycle. Reset to 0 on each successful connect. Used to:
+        //   - Demote repeat WARN noise to DEBUG once an outage is established
+        //     (the first failure is still WARN so it's not lost).
+        //   - Emit an INFO "resumed" log on recovery so operators get a
+        //     positive signal — they currently have to infer recovery from
+        //     the absence of further WARNs.
+        let mut reconnect_attempts: u32 = u32::from(initial_failed);
 
         // Outer reconnect loop: runs until we hit a fatal error or the stream
         // reaches a natural end (rare — Postgres replication slots are
@@ -147,14 +159,26 @@ fn wal_stream(
                 None => {
                     loop {
                         match ReplicationClient::connect(config.clone()).await {
-                            Ok(c) => { backoff.reset(); break c; }
+                            Ok(c) => {
+                                backoff.reset();
+                                if reconnect_attempts > 0 {
+                                    tracing::info!(
+                                        dataset = %dataset_name,
+                                        attempts = reconnect_attempts,
+                                        "replication connection resumed"
+                                    );
+                                    reconnect_attempts = 0;
+                                }
+                                break c;
+                            }
                             Err(e) if super::resilience::is_transient_pgwire(&e) => {
                                 metrics.inc_reconnect();
-                                tracing::warn!(
-                                    dataset = %dataset_name,
-                                    error = %e,
-                                    retry_in_ms = %backoff.current().as_millis(),
-                                    "replication connect failed transiently; backing off"
+                                reconnect_attempts = reconnect_attempts.saturating_add(1);
+                                log_transient_reconnect(
+                                    reconnect_attempts,
+                                    &dataset_name,
+                                    &e.to_string(),
+                                    backoff.current().as_millis(),
                                 );
                                 backoff.wait().await;
                             }
@@ -182,10 +206,12 @@ fn wal_stream(
                     metrics.inc_recv_error();
                     if super::resilience::is_transient_pgwire(&e) {
                         metrics.inc_reconnect();
-                        tracing::warn!(
-                            dataset = %dataset_name,
-                            error = %e,
-                            "replication recv failed transiently; reconnecting"
+                        reconnect_attempts = reconnect_attempts.saturating_add(1);
+                        log_transient_reconnect(
+                            reconnect_attempts,
+                            &dataset_name,
+                            &e.to_string(),
+                            backoff.current().as_millis(),
                         );
                         // Drop this client, loop back to outer reconnect.
                         break 'recv;
@@ -420,6 +446,44 @@ fn resolve_relation(
     })
 }
 
+/// Threshold at which we stop logging individual reconnect attempts at WARN
+/// level. The first failure is WARN so an outage is visible immediately; on
+/// every subsequent failure within the same outage we drop to DEBUG to keep
+/// the log volume sublinear in outage duration. The recovery INFO log is the
+/// signal operators should grep for at the end of an outage.
+const RECONNECT_WARN_THRESHOLD: u32 = 1;
+
+/// Whether a reconnect attempt at `attempt` should log at WARN level. Above
+/// the threshold, attempts log at DEBUG to keep log volume sublinear in outage
+/// duration. Extracted as a pure function so the level transition can be
+/// unit-tested without standing up a tracing subscriber.
+fn reconnect_logs_at_warn(attempt: u32) -> bool {
+    attempt <= RECONNECT_WARN_THRESHOLD
+}
+
+/// Emit a per-attempt log for a transient connect/recv failure. The first
+/// attempt of an outage cycle is WARN (so an outage is loud and greppable);
+/// subsequent attempts are DEBUG to avoid flooding logs during long outages.
+fn log_transient_reconnect(attempt: u32, dataset: &str, error: &str, retry_in_ms: u128) {
+    if reconnect_logs_at_warn(attempt) {
+        tracing::warn!(
+            dataset = %dataset,
+            attempt,
+            retry_in_ms = %retry_in_ms,
+            error = %error,
+            "replication connection lost; reconnecting"
+        );
+    } else {
+        tracing::debug!(
+            dataset = %dataset,
+            attempt,
+            retry_in_ms = %retry_in_ms,
+            error = %error,
+            "replication connection still down; reconnecting"
+        );
+    }
+}
+
 fn keepalive_applied_lsn(
     confirmed_flush: &AtomicU64,
     transaction_pending: bool,
@@ -519,5 +583,36 @@ mod tests {
 
         assert_eq!(applied, 100);
         assert_eq!(confirmed.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn reconnect_first_attempt_logs_at_warn() {
+        // The first failure of an outage cycle must stay at WARN so the
+        // outage is visible in default-level logs. Demoting all attempts to
+        // DEBUG would mean an outage is silent unless DEBUG is enabled.
+        assert!(reconnect_logs_at_warn(1));
+    }
+
+    #[test]
+    fn reconnect_subsequent_attempts_drop_to_debug() {
+        // Every attempt after the first within the same outage cycle drops
+        // to DEBUG. This is the volume-suppression behavior that #10971
+        // requested: a 1-hour outage no longer floods the log with 3600+
+        // WARN lines per dataset.
+        for attempt in 2..=100 {
+            assert!(
+                !reconnect_logs_at_warn(attempt),
+                "attempt {attempt} should log at DEBUG, not WARN",
+            );
+        }
+    }
+
+    #[test]
+    fn reconnect_log_helper_handles_saturating_attempt_count() {
+        // Helper should be callable across the full u32 range (including
+        // the saturated max value) without panicking — the production
+        // counter uses `saturating_add` so it can sit at u32::MAX for an
+        // arbitrarily long outage.
+        log_transient_reconnect(u32::MAX, "events", "connection refused", 500);
     }
 }
