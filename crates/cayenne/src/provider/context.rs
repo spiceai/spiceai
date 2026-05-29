@@ -24,7 +24,7 @@ use vortex::VortexSessionDefault;
 use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions};
 use vortex_session::VortexSession;
 
-use crate::metadata::{PkConflictDetection, VortexConfig};
+use crate::metadata::{DeletionMode, PkConflictDetection, VortexConfig};
 
 /// Shared context for Cayenne table operations.
 ///
@@ -181,6 +181,14 @@ impl CayenneContext {
     #[must_use]
     pub(crate) fn pk_conflict_detection(&self) -> PkConflictDetection {
         self.config.pk_conflict_detection
+    }
+
+    /// How primary-key deletions are recorded and applied for PK tables.
+    /// `position` enables merge-on-read position-delete vectors; `key` (default)
+    /// keeps the above-scan key-based filter.
+    #[must_use]
+    pub(crate) fn deletion_mode(&self) -> DeletionMode {
+        self.config.deletion_mode
     }
 
     /// Byte budget for the in-memory PK keyset cache used during upsert conflict

@@ -624,6 +624,19 @@ impl CayenneAccelerator {
                 }
             }
 
+            if let Some((key, value)) = ["cayenne_deletion_mode", "deletion_mode"]
+                .iter()
+                .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
+            {
+                if let Some(mode) = cayenne::metadata::DeletionMode::parse(value) {
+                    config.deletion_mode = mode;
+                } else {
+                    tracing::warn!(
+                        "Dataset '{table_name}' contains an invalid `{key}` value: '{value}'. Expected one of: auto, key, position. Defaulting to auto."
+                    );
+                }
+            }
+
             // Parse sort columns
             if let Some(sort_cols_str) = acceleration
                 .params
@@ -1068,8 +1081,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    25,
-    { S3_PARAMS_LEN + 25 },
+    26,
+    { S3_PARAMS_LEN + 26 },
 >(
     S3_PARAMETERS,
     [
@@ -1103,6 +1116,10 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("pk_conflict_detection")
             .description("Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts and applies on_conflict behavior. 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness and the ingestion path cannot replay existing rows, such as steady-state append-only CDC after bootstrap.")
             .one_of(&["auto", "none"])
+            .default("auto"),
+        ParameterSpec::component("deletion_mode")
+            .description("How primary-key deletions are recorded and applied. 'auto' (default) resolves to 'position' (merge-on-read): per-file row-position bitmaps are pushed into the Vortex scan, skipping deleted pages at the storage layer with no per-row CPU. For a primary-key table positions are captured via a row_idx() read-back after each write, with key-based fallback for any row whose position is not yet known; a table without a primary key uses the existing position-based strategy. 'key' is the explicit opt-out: deletes are applied above the Vortex scan via a per-row RowConverter probe.")
+            .one_of(&["auto", "key", "position"])
             .default("auto"),
         ParameterSpec::component("upload_concurrency")
             .description("Maximum number of concurrent file uploads when writing multiple Vortex files. Defaults to available CPU parallelism."),

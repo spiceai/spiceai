@@ -281,6 +281,94 @@ impl PkConflictDetection {
     }
 }
 
+/// How Cayenne records and applies primary-key deletions for upsert/delete on
+/// tables that have a primary key (`Int64Pk` / `RowConverterBased` strategies).
+///
+/// PK-less tables always use position-based deletion regardless of this setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeletionMode {
+    /// Resolve the mode from the table's configuration (the default). `Auto`
+    /// resolves to [`Self::Position`] — the merge-on-read path — for every table:
+    /// a primary-key table captures positions via the `row_idx()` read-back
+    /// (with key-based fallback for not-yet-captured rows), and a PK-less table
+    /// uses the long-standing `PositionBased` strategy. The presence of a primary
+    /// key selects the *mechanism*; the resolved *mode* is position either way.
+    /// Use [`Self::Key`] to explicitly opt out. See [`Self::resolved`].
+    #[default]
+    Auto,
+    /// Record deletions by primary-key bytes + sequence number and apply them
+    /// above the Vortex scan via a `RowConverter`/`HashSet` probe per scanned
+    /// row. Position-independent and reorganization-proof, but pays an
+    /// O(scanned-rows) re-encode on every scan with a non-empty delete set and
+    /// is invisible to Vortex page-skipping.
+    Key,
+    /// Record deletions as per-file row-position `RoaringBitmap`s and push them
+    /// into the Vortex scan (`Selection::ExcludeRoaring`), so deleted pages are
+    /// skipped at the storage layer with zero per-row CPU. Requires the writer
+    /// to know each row's `(file, file-local position)`, captured via a
+    /// `row_idx()` read-back after each write. Rows whose position is unknown
+    /// (cold-rebuilt keysets, over-budget bloom tables, inlined rows) fall back
+    /// to the `Key` path, so a table can mix both within one snapshot.
+    Position,
+}
+
+impl DeletionMode {
+    /// Parse a spicepod parameter value.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "key" => Some(Self::Key),
+            "position" => Some(Self::Position),
+            _ => None,
+        }
+    }
+
+    /// Return the spicepod/config string for this mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Key => "key",
+            Self::Position => "position",
+        }
+    }
+
+    /// Resolve `Auto` against the table's configuration, returning a concrete
+    /// [`Self::Key`] or [`Self::Position`].
+    ///
+    /// `Auto` resolves to **position** — the merge-on-read path that pushes
+    /// per-file position deletes into the Vortex scan. For a table **with** a
+    /// primary key, positions are captured by the `row_idx()` read-back after
+    /// each write (and any row whose position isn't yet known falls back to a
+    /// key-based delete, so this is always correct — under bursty back-to-back
+    /// writes the capture may not have run yet and the key path is used); for a
+    /// table **without** a primary key it is the long-standing `PositionBased`
+    /// strategy. So the *mechanism* is chosen by the presence of a PK, but the
+    /// resolved *mode* is position either way.
+    ///
+    /// `Key` is the explicit opt-out (apply deletes above the scan). It only has
+    /// meaning with a PK; a PK-less table can only do position-based deletion, so
+    /// `Key` there resolves to `Position`.
+    #[must_use]
+    pub const fn resolved(self, has_primary_key: bool) -> Self {
+        match self {
+            Self::Auto | Self::Position => Self::Position,
+            // `Key` is only honored when there is a key to record.
+            Self::Key if has_primary_key => Self::Key,
+            Self::Key => Self::Position,
+        }
+    }
+
+    /// Whether this mode (already resolved via [`Self::resolved`]) records and
+    /// applies deletions as per-file row positions.
+    #[must_use]
+    pub const fn is_position(self) -> bool {
+        matches!(self, Self::Position)
+    }
+}
+
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -406,6 +494,13 @@ pub struct VortexConfig {
     /// param is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pk_keyset_cache_mb: Option<usize>,
+    /// How primary-key deletions are recorded and applied for PK tables.
+    /// Defaults to [`DeletionMode::Key`] (current behavior). Set to `position`
+    /// via `cayenne_deletion_mode` to push deletes into the Vortex scan as
+    /// per-file row-position bitmaps (merge-on-read), eliminating the per-row
+    /// `RowConverter` deletion tax above the scan.
+    #[serde(default)]
+    pub deletion_mode: DeletionMode,
 }
 
 fn default_concurrency() -> usize {
@@ -491,6 +586,7 @@ impl Default for VortexConfig {
             inline_flush_max_bytes: default_inline_flush_max_bytes(),
             pk_conflict_detection: PkConflictDetection::default(),
             pk_keyset_cache_mb: None,
+            deletion_mode: DeletionMode::default(),
         }
     }
 }

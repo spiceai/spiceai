@@ -22,6 +22,7 @@ limitations under the License.
 
 use super::super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use super::CayenneDeletionSink;
+use arrow::row::{OwnedRow, RowConverter};
 use crate::provider::Error;
 use crate::provider::deletion_strategy::PositionDeletionVector;
 use crate::provider::utils::convert_to_u64_box;
@@ -602,6 +603,124 @@ impl CayenneDeletionSink {
         Ok(matching_positions)
     }
 
+    /// Scan a single (freshly written) data file and return `(primary-key,
+    /// file-local position)` for **every** row, in physical scan order.
+    ///
+    /// Used by the `deletion_mode: position` write-time read-back to upgrade
+    /// keyset entries from `FileUnlocated` to `FilePositioned`, so a later upsert
+    /// of one of these keys can tombstone the prior version by position (pushed
+    /// into the Vortex scan) instead of by key (applied above the scan).
+    ///
+    /// The keys are `RowConverter`-encoded into the SAME `OwnedRow` form the PK
+    /// keyset uses, so they collide with the existing keyset entries. The
+    /// position is a manual physical-order counter — identical to the row index
+    /// `Selection::ExcludeRoaring` consumes (see `scan_file_for_key_matches`),
+    /// so captured positions line up with how deletes are applied.
+    pub(crate) async fn scan_file_for_all_positions(
+        &self,
+        file_path: &str,
+        object_store: &Arc<dyn ObjectStore>,
+        pk_column_names: &[String],
+        converter: &RowConverter,
+    ) -> crate::provider::Result<Vec<(OwnedRow, u64)>> {
+        debug_assert!(
+            !pk_column_names.is_empty(),
+            "scan_file_for_all_positions requires at least one primary-key column"
+        );
+        let table_name = &self.table_metadata.table_name;
+        let vortex_session = VortexSession::default();
+
+        let vxf = vortex_session
+            .open_options()
+            .open_object_store(object_store, file_path)
+            .await
+            .map_err(|e| Error::Vortex {
+                operation: "open vortex file for position read-back",
+                table: table_name.clone(),
+                source: Box::new(e),
+            })?;
+
+        // Project ONLY the primary-key columns — no data columns, no row_idx
+        // column (positions are tracked with the manual counter below).
+        let mut scan_builder = vxf.scan().map_err(|e| Error::Vortex {
+            operation: "build vortex scan for position read-back",
+            table: table_name.clone(),
+            source: Box::new(e),
+        })?;
+        {
+            use vortex::expr::{root, select};
+            let cols: Vec<&str> = pk_column_names.iter().map(String::as_str).collect();
+            scan_builder = scan_builder.with_projection(select(cols, root()));
+        }
+
+        let mut stream = scan_builder.into_stream().map_err(|e| Error::Vortex {
+            operation: "start vortex scan stream for position read-back",
+            table: table_name.clone(),
+            source: Box::new(e),
+        })?;
+
+        let mut entries: Vec<(OwnedRow, u64)> = Vec::new();
+        let mut row_position: u64 = 0;
+        // PK column indices in the projected batch, in `converter` field order.
+        // Resolved once on the first chunk (schema is stable per file).
+        let mut pk_indices: Option<Vec<usize>> = None;
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.map_err(|e| Error::Vortex {
+                operation: "read vortex chunk for position read-back",
+                table: table_name.clone(),
+                source: Box::new(e),
+            })?;
+            let arrow_array = chunk.into_arrow_preferred().map_err(|e| Error::Vortex {
+                operation: "convert vortex chunk to arrow for position read-back",
+                table: table_name.clone(),
+                source: Box::new(e),
+            })?;
+            if arrow_array.is_empty() {
+                continue;
+            }
+            let struct_array = arrow_array
+                .as_any()
+                .downcast_ref::<arrow::array::StructArray>()
+                .ok_or_else(|| Error::Internal {
+                    table: table_name.clone(),
+                    message: "Vortex position read-back scan did not return StructArray".to_string(),
+                })?;
+            let batch = arrow::record_batch::RecordBatch::from(struct_array);
+
+            let indices: &[usize] = if let Some(indices) = &pk_indices {
+                indices.as_slice()
+            } else {
+                let resolved: Vec<usize> = pk_column_names
+                    .iter()
+                    .map(|name| {
+                        batch.schema().index_of(name).map_err(|_| Error::Internal {
+                            table: table_name.clone(),
+                            message: format!(
+                                "Primary-key column '{name}' not found in Vortex file schema"
+                            ),
+                        })
+                    })
+                    .collect::<crate::provider::Result<Vec<_>>>()?;
+                pk_indices = Some(resolved);
+                pk_indices.as_deref().unwrap_or(&[])
+            };
+
+            let pk_columns: Vec<arrow::array::ArrayRef> =
+                indices.iter().map(|&i| Arc::clone(batch.column(i))).collect();
+            let rows = converter
+                .convert_columns(&pk_columns)
+                .map_err(Error::from)?;
+
+            for row_index in 0..batch.num_rows() {
+                entries.push((rows.row(row_index).owned(), row_position));
+                row_position += 1;
+            }
+        }
+
+        Ok(entries)
+    }
+
     /// Persist per-file position-based deletions.
     ///
     /// Each entry in `row_ids` maps a source data file path to the
@@ -631,16 +750,11 @@ impl CayenneDeletionSink {
             return Ok(0);
         }
 
-        // Get the position-based cache from the PkDeletionStrategy (only valid for PositionBased)
-        let cached_deleted_row_ids = self
-            .pk_deletion_strategy
-            .position_based_cache()
-            .ok_or_else(|| Error::Internal {
-                table: table_name.clone(),
-                message:
-                    "persist_position_based_deletions called with incompatible PkDeletionStrategy"
-                        .to_string(),
-            })?;
+        // The per-file position-delete cache. For PK-less tables this is the
+        // `PositionBased` cache; for PK tables under `deletion_mode: position`
+        // it is the `position_deletions` cache that sits alongside the key
+        // index (located rows are tombstoned by position, unlocated rows by key).
+        let cached_deleted_row_ids = self.pk_deletion_strategy.position_cache();
 
         // Read existing deletions to merge with new ones (wait-free).
         // The cache value type is `Arc<PositionDeletionVector>` so a clone of the
