@@ -42,7 +42,7 @@ pub struct CloudConnectConfig {
     pub endpoint: String,
 
     /// Optional PEM-encoded CA certificate to verify the server. When
-    /// `None`, the system WebPKI roots are used. Mainly for self-hosted
+    /// `None`, the system `WebPKI` roots are used. Mainly for self-hosted
     /// control planes during development.
     pub ca_cert_pem: Option<String>,
 
@@ -59,7 +59,7 @@ pub struct CloudConnectConfig {
     pub config_dir: PathBuf,
 
     /// First-contact adoption code, if any. May be `None` even when
-    /// CloudConnect is enabled — that means the identity file is present
+    /// `CloudConnect` is enabled — that means the identity file is present
     /// and the client should reconnect with the stored identity.
     pub adoption_code: Option<String>,
 

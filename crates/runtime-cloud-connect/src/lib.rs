@@ -106,7 +106,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Handle for a running CloudConnect client.
+/// Handle for a running `CloudConnect` client.
 ///
 /// Dropping the handle does **not** cancel the background task. Call
 /// [`CloudConnect::shutdown`] to stop it cleanly.
@@ -126,7 +126,16 @@ impl CloudConnect {
     /// - Otherwise, if `adoption_code` is `Some`, the client sends the code
     ///   as the first-contact credential and waits to be adopted.
     /// - If both are absent, this function returns `Ok(None)` and the client
-    ///   is **not started** — i.e. CloudConnect is disabled.
+    ///   is **not started** — i.e. `CloudConnect` is disabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::IdentityLoad`] if an identity file exists at
+    /// `config.identity_path` but cannot be read or parsed.
+    #[expect(
+        clippy::unused_async,
+        reason = "spawns a background tokio task, so it must be called from within a tokio runtime context"
+    )]
     pub async fn start(
         config: CloudConnectConfig,
         runtime: Arc<dyn RuntimeHandle>,

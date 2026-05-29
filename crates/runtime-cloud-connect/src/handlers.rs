@@ -72,7 +72,7 @@ pub trait RuntimeHandle: Send + Sync + 'static {
     /// `max_rows` and a byte budget, setting `truncated` accordingly.
     ///
     /// Default implementation returns a stub error so out-of-the-box
-    /// CloudConnect doesn't accidentally execute SQL in test harnesses.
+    /// `CloudConnect` doesn't accidentally execute SQL in test harnesses.
     async fn execute_sql(&self, _sql: &str, _max_rows: u32) -> Result<QueryResult, String> {
         Err("RunQuery is not implemented in this build".to_string())
     }
@@ -138,7 +138,7 @@ pub trait RuntimeHandle: Send + Sync + 'static {
 }
 
 /// Minimal no-op runtime handle, useful for unit tests and as a stand-in
-/// when CloudConnect is exercised outside the real spiced binary.
+/// when `CloudConnect` is exercised outside the real spiced binary.
 #[derive(Debug, Default, Clone)]
 pub struct NoopRuntimeHandle;
 

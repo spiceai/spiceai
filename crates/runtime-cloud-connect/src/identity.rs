@@ -104,6 +104,11 @@ pub struct IdentityStore;
 
 impl IdentityStore {
     /// Read an identity file, returning `Ok(None)` if it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file exists but cannot be read (for any reason
+    /// other than not-found) or its contents fail to parse as an [`Identity`].
     pub fn load_optional(path: &Path) -> Result<Option<Identity>> {
         match std::fs::read_to_string(path) {
             Ok(s) => {
@@ -121,6 +126,11 @@ impl IdentityStore {
     }
 
     /// Persist an identity to disk atomically with `0600` perms on Unix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parent directory cannot be created, the
+    /// identity cannot be serialized, or the file cannot be written.
     pub fn store(path: &Path, identity: &Identity) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context(IoSnafu {
@@ -132,6 +142,10 @@ impl IdentityStore {
     }
 
     /// Remove the identity file. No-op if it doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file exists but cannot be removed.
     pub fn clear(path: &Path) -> Result<()> {
         match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
@@ -146,6 +160,10 @@ impl IdentityStore {
     /// Generate a fresh ed25519 keypair as PEM-encoded PKCS#8 (private)
     /// and SPKI (public) strings. Used at adoption time before sending
     /// `AdoptAck`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if PEM encoding of the generated key material fails.
     pub fn generate_keypair() -> Result<KeyPairPem> {
         let signing_key = SigningKey::generate(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
@@ -193,9 +211,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Err(err) = std::fs::remove_file(&tmp_path)
         && err.kind() != std::io::ErrorKind::NotFound
     {
-        return Err(err).context(IoSnafu {
-            path: tmp_path.clone(),
-        });
+        return Err(err).context(IoSnafu { path: tmp_path });
     }
 
     {

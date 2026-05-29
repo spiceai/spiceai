@@ -22,7 +22,7 @@ limitations under the License.
 //!
 //! ## Opt-in semantics
 //!
-//! CloudConnect is **disabled by default**. It activates only if one of
+//! `CloudConnect` is **disabled by default**. It activates only if one of
 //! the following is true at boot:
 //!
 //! 1. `$SPICE_CONFIG_DIR/identity.json` exists.
@@ -34,9 +34,10 @@ limitations under the License.
 use std::path::Path;
 use std::sync::Arc;
 
+use app::{App, AppBuilder};
 use async_trait::async_trait;
 use runtime::Runtime;
-use runtime_cloud_connect::config::CloudConnectConfig;
+use runtime_cloud_connect::config::{CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig};
 use runtime_cloud_connect::handlers::{QueryResult, RuntimeHandle};
 use runtime_cloud_connect::{CloudConnect, identity::IdentityStore};
 
@@ -62,7 +63,7 @@ fn build_config(runtime_version: &str) -> CloudConnectConfig {
 }
 
 /// Start the Cloud Connect client if any of the opt-in conditions are
-/// met. The returned `Option<CloudConnect>` is `None` when CloudConnect
+/// met. The returned `Option<CloudConnect>` is `None` when `CloudConnect`
 /// is disabled — which is the default for vanilla OSS installs.
 pub async fn maybe_start(runtime_version: &str, runtime: Arc<Runtime>) -> Option<CloudConnect> {
     let config = build_config(runtime_version);
@@ -171,6 +172,8 @@ impl RuntimeHandle for SpicedRuntimeHandle {
     /// - Byte budget of [`RUN_QUERY_BYTE_BUDGET`] on the encoded IPC stream
     ///   — exceeding either cap sets `truncated: true`.
     async fn execute_sql(&self, sql: &str, max_rows: u32) -> Result<QueryResult, String> {
+        use futures::StreamExt as _;
+
         let cap = resolve_run_query_cap(max_rows);
 
         let df = self.runtime.datafusion();
@@ -185,7 +188,6 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         // zero batches (empty result set) still has a real schema, so
         // without this snapshot the envelope would advertise empty columns.
         let stream_schema = stream.schema();
-        use futures::StreamExt as _;
 
         // Collect up to `cap` rows worth of batches. We stop streaming
         // once we have enough rows so we don't pull the rest of a huge
@@ -225,9 +227,89 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             truncated: source_truncated || byte_truncated,
         })
     }
+
+    /// Apply a cloud-managed spicepod and hot-reload it into the running
+    /// runtime — no restart required.
+    ///
+    /// 1. The YAML is validated by building an [`App`] from it on a sibling
+    ///    temp file, so a malformed control-plane push is rejected with a
+    ///    clear error and the previous good `spicepod-cloud-managed.yml` is
+    ///    left untouched.
+    /// 2. The validated file is promoted to the canonical path so a later
+    ///    process restart also picks it up.
+    /// 3. The new app is hot-applied via [`Runtime::apply_app`] — the same
+    ///    catalog/dataset/view/model/function/worker diff-reconcile the pods
+    ///    watcher performs on a file change — so the configuration takes
+    ///    effect immediately.
+    async fn apply_spicepod(
+        &self,
+        config_dir: &Path,
+        spicepod_yaml: &str,
+    ) -> Result<serde_json::Value, String> {
+        let (new_app, path) = stage_cloud_managed_spicepod(config_dir, spicepod_yaml).await?;
+
+        let datasets = new_app.datasets.len();
+        let models = new_app.models.len();
+        let catalogs = new_app.catalogs.len();
+        let views = new_app.views.len();
+
+        let changed = Arc::clone(&self.runtime).apply_app(Arc::new(new_app)).await;
+
+        Ok(serde_json::json!({
+            "path": path.display().to_string(),
+            "applied": true,
+            "reload": if changed { "hot" } else { "unchanged" },
+            "datasets": datasets,
+            "models": models,
+            "catalogs": catalogs,
+            "views": views,
+        }))
+    }
 }
 
-/// Byte budget for an encoded RunQuery Arrow IPC stream. A coarse secondary
+/// Validate a cloud-managed spicepod and persist it to disk.
+///
+/// Writes `spicepod_yaml` to a sibling `*.incoming.yml` temp file, builds an
+/// [`App`] from it to validate (parse + resolve), and only on success
+/// atomically promotes the temp file to the canonical
+/// [`CLOUD_MANAGED_SPICEPOD_FILE`] path. On any failure the canonical file is
+/// left untouched and the temp file is cleaned up. Returns the built `App`
+/// (ready to hot-apply) and the canonical path it was written to.
+///
+/// Factored out of [`SpicedRuntimeHandle::apply_spicepod`] so the
+/// file-staging + validation can be unit-tested without a running runtime.
+async fn stage_cloud_managed_spicepod(
+    config_dir: &Path,
+    spicepod_yaml: &str,
+) -> Result<(App, std::path::PathBuf), String> {
+    let path = config_dir.join(CLOUD_MANAGED_SPICEPOD_FILE);
+    tokio::fs::create_dir_all(config_dir)
+        .await
+        .map_err(|e| format!("create config dir: {e}"))?;
+
+    // Validate on a temp file first so a bad push never clobbers the last
+    // known-good spicepod on disk.
+    let incoming = config_dir.join("spicepod-cloud-managed.incoming.yml");
+    tokio::fs::write(&incoming, spicepod_yaml)
+        .await
+        .map_err(|e| format!("write spicepod: {e}"))?;
+
+    match AppBuilder::build_from_path(incoming.clone()).await {
+        Ok(app) => {
+            tokio::fs::rename(&incoming, &path)
+                .await
+                .map_err(|e| format!("persist spicepod: {e}"))?;
+            Ok((app, path))
+        }
+        Err(e) => {
+            // Best-effort cleanup; ignore failure (temp file is inert).
+            let _ = tokio::fs::remove_file(&incoming).await;
+            Err(format!("invalid spicepod: {e}"))
+        }
+    }
+}
+
+/// Byte budget for an encoded `RunQuery` Arrow IPC stream. A coarse secondary
 /// guard on top of the row cap so a few very wide rows can't blow past the
 /// gRPC message size; the last batch written may push modestly over before
 /// we stop.
@@ -304,5 +386,74 @@ mod tests {
         // we never serialize more than 10_000 rows.
         assert_eq!(resolve_run_query_cap(99_999), RUN_QUERY_HARD_ROW_CAP);
         assert_eq!(resolve_run_query_cap(u32::MAX), RUN_QUERY_HARD_ROW_CAP);
+    }
+
+    /// Minimal valid spicepod (no components — an empty app is valid).
+    const VALID_SPICEPOD: &str = "version: v2\nkind: Spicepod\nname: cloud-managed-test\n";
+    /// Invalid YAML (unclosed flow sequence) — guaranteed to fail parsing.
+    const INVALID_SPICEPOD: &str = "name: [unclosed";
+
+    /// Create (and clean) a unique temp dir for a test without pulling in a
+    /// temp-file crate. Names are per-test + per-process so parallel tests
+    /// don't collide.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("spice-cc-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[tokio::test]
+    async fn stage_valid_spicepod_writes_canonical_and_returns_app() {
+        let dir = scratch_dir("valid");
+        let (app, path) = stage_cloud_managed_spicepod(&dir, VALID_SPICEPOD)
+            .await
+            .expect("valid spicepod stages");
+
+        assert_eq!(app.name, "cloud-managed-test");
+        assert_eq!(path, dir.join(CLOUD_MANAGED_SPICEPOD_FILE));
+        // Canonical file written with the supplied content.
+        let on_disk = std::fs::read_to_string(&path).expect("canonical file exists");
+        assert_eq!(on_disk, VALID_SPICEPOD);
+        // The temp .incoming file was renamed away, not left behind.
+        assert!(!dir.join("spicepod-cloud-managed.incoming.yml").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stage_invalid_spicepod_preserves_previous_good_file() {
+        let dir = scratch_dir("invalid-preserves");
+        // Land a known-good canonical file first.
+        stage_cloud_managed_spicepod(&dir, VALID_SPICEPOD)
+            .await
+            .expect("first valid stage");
+        let canonical = dir.join(CLOUD_MANAGED_SPICEPOD_FILE);
+
+        // A subsequent invalid push must be rejected and must NOT clobber it.
+        let err = stage_cloud_managed_spicepod(&dir, INVALID_SPICEPOD)
+            .await
+            .expect_err("invalid spicepod rejected");
+        assert!(err.contains("invalid spicepod"), "unexpected error: {err}");
+
+        let on_disk = std::fs::read_to_string(&canonical).expect("canonical still present");
+        assert_eq!(on_disk, VALID_SPICEPOD, "previous good config preserved");
+        assert!(!dir.join("spicepod-cloud-managed.incoming.yml").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stage_invalid_spicepod_when_none_exists_leaves_no_canonical() {
+        let dir = scratch_dir("invalid-fresh");
+        let err = stage_cloud_managed_spicepod(&dir, INVALID_SPICEPOD)
+            .await
+            .expect_err("invalid spicepod rejected");
+        assert!(err.contains("invalid spicepod"), "unexpected error: {err}");
+        // Nothing should have been promoted to the canonical path.
+        assert!(!dir.join(CLOUD_MANAGED_SPICEPOD_FILE).exists());
+        assert!(!dir.join("spicepod-cloud-managed.incoming.yml").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

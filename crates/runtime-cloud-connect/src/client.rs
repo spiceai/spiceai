@@ -379,7 +379,8 @@ impl ClientDriver {
                 };
                 match exec_outcome {
                     Ok(result) => {
-                        let duration_ms = started.elapsed().as_millis() as u64;
+                        let duration_ms =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                         emit_run_query_audit(
                             tx,
                             &identifier,
@@ -402,7 +403,8 @@ impl ClientDriver {
                         send_query_result(tx, &cmd.command_id, result.arrow_ipc, meta).await;
                     }
                     Err(err) => {
-                        let duration_ms = started.elapsed().as_millis() as u64;
+                        let duration_ms =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                         emit_run_query_audit(
                             tx,
                             &identifier,
@@ -779,14 +781,14 @@ fn bounded_prefix(s: &str, max: usize) -> &str {
 }
 
 /// Trim a runtime error string to a short, safe summary. We deliberately
-/// avoid surfacing the full DataFusion error message because it can
+/// avoid surfacing the full `DataFusion` error message because it can
 /// echo back the SQL fragment, table contents, or row values that
 /// triggered the failure.
 ///
 /// Strategy:
 /// 1. Take the first line only.
 /// 2. Strip any literal occurrences of the original `sql` (and substrings
-///    long enough to leak meaningful query content) — DataFusion errors
+///    long enough to leak meaningful query content) — `DataFusion` errors
 ///    sometimes include the SQL without quoting.
 /// 3. Replace any backtick-, single-quote-, or double-quote-delimited
 ///    spans with a `<redacted>` placeholder — these almost always carry
@@ -900,7 +902,7 @@ fn redact_quoted_spans(input: &str) -> String {
     out
 }
 
-/// Fields describing a single RunQuery invocation for the audit log.
+/// Fields describing a single `RunQuery` invocation for the audit log.
 struct RunQueryAudit<'a> {
     command_id: &'a str,
     sql_hash: &'a str,
@@ -910,7 +912,7 @@ struct RunQueryAudit<'a> {
     success: bool,
 }
 
-/// Emit a `kind: "audit"` EventLog describing a RunQuery invocation.
+/// Emit a `kind: "audit"` `EventLog` describing a `RunQuery` invocation.
 async fn emit_run_query_audit(
     tx: &mpsc::Sender<proto::ClientMessage>,
     identifier: &str,
