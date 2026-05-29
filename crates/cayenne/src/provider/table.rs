@@ -1507,7 +1507,11 @@ impl PkBloom {
     /// little-endian.
     fn serialize_into(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.bit_mask.to_le_bytes());
-        out.extend_from_slice(&u64::try_from(self.inserted_keys).unwrap_or(u64::MAX).to_le_bytes());
+        out.extend_from_slice(
+            &u64::try_from(self.inserted_keys)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
         out.extend_from_slice(&u64::try_from(self.bits.len()).unwrap_or(0).to_le_bytes());
         for word in &self.bits {
             out.extend_from_slice(&word.to_le_bytes());
@@ -1519,7 +1523,8 @@ impl PkBloom {
     fn deserialize_from(bytes: &[u8]) -> Option<Self> {
         let bit_mask = u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?);
         let inserted_keys = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?);
-        let num_words = usize::try_from(u64::from_le_bytes(bytes.get(16..24)?.try_into().ok()?)).ok()?;
+        let num_words =
+            usize::try_from(u64::from_le_bytes(bytes.get(16..24)?.try_into().ok()?)).ok()?;
         // Reject impossible word counts before allocating.
         if num_words == 0 || num_words > bytes.len().saturating_sub(24) / 8 {
             return None;
@@ -1576,9 +1581,11 @@ impl PkBloom {
 /// full-scan fallback).
 const PK_INDEX_SIDECAR_MAGIC: u32 = 0x4350_4b42;
 const PK_INDEX_SIDECAR_VERSION: u32 = 1;
-/// Filename for the per-table PK-index bloom checkpoint, stored at the table
-/// root (one file, overwritten each compaction — never accumulates).
-const PK_INDEX_SIDECAR_FILENAME: &str = "pk_index.bloom";
+/// Upper bound on the persisted PK-index blob. Extreme-cardinality tables skip
+/// persistence (and fall back to a runtime rebuild) to bound the metastore and
+/// snapshot footprint. The bloom is right-sized (~10 bits/key), so this caps the
+/// covered live-key count at roughly 200M.
+const PK_INDEX_PERSIST_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 /// Serialize a checkpoint: `magic | version | snapshot_id_len | snapshot_id | bloom`.
 fn serialize_pk_bloom_sidecar(bloom: &PkBloom, snapshot_id: &str) -> Vec<u8> {
@@ -1586,7 +1593,11 @@ fn serialize_pk_bloom_sidecar(bloom: &PkBloom, snapshot_id: &str) -> Vec<u8> {
     out.extend_from_slice(&PK_INDEX_SIDECAR_MAGIC.to_le_bytes());
     out.extend_from_slice(&PK_INDEX_SIDECAR_VERSION.to_le_bytes());
     let snapshot_bytes = snapshot_id.as_bytes();
-    out.extend_from_slice(&u64::try_from(snapshot_bytes.len()).unwrap_or(0).to_le_bytes());
+    out.extend_from_slice(
+        &u64::try_from(snapshot_bytes.len())
+            .unwrap_or(0)
+            .to_le_bytes(),
+    );
     out.extend_from_slice(snapshot_bytes);
     bloom.serialize_into(&mut out);
     out
@@ -4237,19 +4248,10 @@ impl CayenneTableProvider {
     }
 
     // ---- Phase 3: persist/checkpoint the PK existence index across restarts ----
-
-    /// Local filesystem path of the per-table PK-index bloom sidecar, or `None`
-    /// for object-store (s3) tables — those safely fall back to a full keyset
-    /// rebuild on restart (persistence is a local-only optimization for now).
-    fn pk_index_sidecar_path(&self) -> Option<std::path::PathBuf> {
-        if self.table_metadata.path.starts_with("s3://") {
-            return None;
-        }
-        // The snapshot dir is `<root>/<table_id>/<snapshot_id>`; its parent is the
-        // table root, independent of which snapshot id we probe with.
-        let probe = self.snapshot_dir_path_for("pk-index-probe");
-        Some(probe.parent()?.join(PK_INDEX_SIDECAR_FILENAME))
-    }
+    // Persisted in the metastore (`cayenne_pk_index`) so it is captured by
+    // metastore snapshots — letting both a restart AND a node bootstrapped from a
+    // snapshot skip the O(total-rows) full keyset rebuild. Works uniformly for
+    // local and object-store tables.
 
     /// Insert one batch's primary keys (no deletion filter — a superset is safe
     /// for the upsert bloom; deleted keys only cost a harmless false positive)
@@ -4295,7 +4297,12 @@ impl CayenneTableProvider {
             .await?;
         let mut stream = datafusion_physical_plan::execute_stream(scan_plan, ctx.task_ctx())?;
         while let Some(batch) = stream.next().await {
-            Self::insert_batch_pks_into_bloom(&batch?, &projected_pk_indices, converter, &mut bloom)?;
+            Self::insert_batch_pks_into_bloom(
+                &batch?,
+                &projected_pk_indices,
+                converter,
+                &mut bloom,
+            )?;
         }
         Ok(bloom)
     }
@@ -4360,10 +4367,11 @@ impl CayenneTableProvider {
         }
     }
 
-    async fn try_persist_pk_bloom_checkpoint(&self, snapshot_id: &str, total_rows: u64) -> Result<()> {
-        let Some(path) = self.pk_index_sidecar_path() else {
-            return Ok(());
-        };
+    async fn try_persist_pk_bloom_checkpoint(
+        &self,
+        snapshot_id: &str,
+        total_rows: u64,
+    ) -> Result<()> {
         let Some(pk_indices) = self.primary_key_indices()? else {
             return Ok(());
         };
@@ -4371,29 +4379,38 @@ impl CayenneTableProvider {
         let max_bytes = self.context.pk_keyset_cache_max_bytes();
         let expected_keys = usize::try_from(total_rows).unwrap_or(usize::MAX);
         let bloom = self
-            .build_snapshot_pk_bloom(snapshot_id, &pk_indices, &converter, expected_keys, max_bytes)
+            .build_snapshot_pk_bloom(
+                snapshot_id,
+                &pk_indices,
+                &converter,
+                expected_keys,
+                max_bytes,
+            )
             .await?;
 
         let bytes = serialize_pk_bloom_sidecar(&bloom, snapshot_id);
-        // Atomic publish: write a temp file then rename over the sidecar.
-        let tmp_path = path.with_file_name(format!("{PK_INDEX_SIDECAR_FILENAME}.tmp"));
-        tokio::fs::write(&tmp_path, &bytes)
+        // Bound the metastore/snapshot footprint: extreme-cardinality tables skip
+        // persistence and fall back to a runtime rebuild on restart/bootstrap.
+        if bytes.len() > PK_INDEX_PERSIST_MAX_BYTES {
+            tracing::debug!(
+                table = self.table_metadata.table_name.as_str(),
+                blob_bytes = bytes.len(),
+                max_bytes = PK_INDEX_PERSIST_MAX_BYTES,
+                "Skipping PK-index checkpoint persistence: blob exceeds the persist budget"
+            );
+            return Ok(());
+        }
+
+        self.catalog
+            .upsert_pk_index(&self.table_metadata.table_id, snapshot_id, &bytes)
             .await
-            .map_err(|e| Error::Internal {
-                table: self.table_metadata.table_name.clone(),
-                message: format!("write PK-index sidecar tmp file: {e}"),
-            })?;
-        tokio::fs::rename(&tmp_path, &path)
-            .await
-            .map_err(|e| Error::Internal {
-                table: self.table_metadata.table_name.clone(),
-                message: format!("rename PK-index sidecar into place: {e}"),
-            })?;
+            .map_err(|source| Error::Catalog { source })?;
         tracing::debug!(
             table = self.table_metadata.table_name.as_str(),
             snapshot_id,
             keys = bloom.inserted_keys,
-            "Persisted PK-index bloom checkpoint"
+            blob_bytes = bytes.len(),
+            "Persisted PK-index bloom checkpoint to the metastore"
         );
         Ok(())
     }
@@ -4415,18 +4432,22 @@ impl CayenneTableProvider {
         if !self.upsert_bloom_eligible() {
             return Ok(None);
         }
-        let Some(path) = self.pk_index_sidecar_path() else {
+        let Some((checkpoint_snapshot, bytes)) = self
+            .catalog
+            .get_pk_index(&self.table_metadata.table_id)
+            .await
+            .map_err(|source| Error::Catalog { source })?
+        else {
             return Ok(None);
         };
-        let Ok(bytes) = tokio::fs::read(&path).await else {
-            return Ok(None);
-        };
-        let Some((mut bloom, checkpoint_snapshot)) = deserialize_pk_bloom_sidecar(&bytes) else {
-            return Ok(None);
-        };
+        // Gate on the snapshot tag: the bloom covers the full current snapshot
+        // only if nothing rewrote it since the checkpoint (compaction re-persists).
         if checkpoint_snapshot != self.get_current_snapshot_id() {
             return Ok(None);
         }
+        let Some((mut bloom, _blob_snapshot)) = deserialize_pk_bloom_sidecar(&bytes) else {
+            return Ok(None);
+        };
         self.extend_bloom_with_protected_and_inline(pk_indices, converter, &mut bloom)
             .await?;
         tracing::debug!(
@@ -4653,7 +4674,9 @@ impl CayenneTableProvider {
                 .await
             {
                 Ok(Some(index)) => index,
-                _ => CachedPkIndex::Exact(self.load_existing_keyset(&pk_indices, &converter).await?),
+                _ => {
+                    CachedPkIndex::Exact(self.load_existing_keyset(&pk_indices, &converter).await?)
+                }
             };
             record_cayenne_write_phase(
                 self.table_metadata.table_name.as_str(),
@@ -11164,12 +11187,13 @@ mod tests {
             .await
             .expect("compaction rewrite");
 
-        let sidecar = provider
-            .pk_index_sidecar_path()
-            .expect("local tables have a sidecar path");
         assert!(
-            sidecar.exists(),
-            "compaction must persist the PK-index bloom sidecar"
+            catalog
+                .get_pk_index(&provider.table_metadata.table_id)
+                .await
+                .expect("query pk index")
+                .is_some(),
+            "compaction must persist the PK-index bloom checkpoint to the metastore"
         );
 
         // Simulate a restart: open a fresh provider (empty cache) over the same

@@ -396,11 +396,14 @@ pub struct VortexConfig {
     #[serde(default)]
     pub pk_conflict_detection: PkConflictDetection,
     /// Byte budget (set in MB via `cayenne_pk_keyset_cache_mb`) for the in-memory
-    /// primary-key keyset cache used to detect upsert conflicts. When a table's
-    /// keyset exceeds this budget the cache is dropped and rebuilt from a
-    /// full-table scan on the next CDC batch — the dominant ingest cost on
-    /// high-cardinality tables. Raise on memory-rich hosts so large keysets stay
-    /// resident. `None` uses the built-in default (256 MiB).
+    /// primary-key index used to detect upsert conflicts. Within budget an exact
+    /// keyset is kept. Over budget, `OnConflict::Upsert` tables fall back to a
+    /// bounded bloom existence filter (O(batch) maintenance, no per-batch
+    /// rebuild); `DoNothing` tables rebuild the keyset from a full-table scan on
+    /// the next batch (a bloom's false positives are harmless for upsert but
+    /// would wrongly drop rows under `DoNothing`). `None` uses the built-in default
+    /// (256 MiB); the accelerator auto-derives a memory-aware default when the
+    /// param is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pk_keyset_cache_mb: Option<usize>,
 }

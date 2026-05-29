@@ -62,6 +62,12 @@ pub struct CayenneContext {
 /// batch.
 pub(crate) const DEFAULT_PK_KEYSET_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
+/// Hard ceiling on the configurable PK keyset cache budget. The budget doubles as
+/// the bloom allocation size (`PkBloom::with_byte_budget`), so an out-of-range or
+/// typo'd `cayenne_pk_keyset_cache_mb` must not be able to request a
+/// near-`usize::MAX` allocation. Matches the auto-default's 8 GiB ceiling.
+pub(crate) const PK_KEYSET_CACHE_MAX_CONFIGURABLE_BYTES: usize = 8 * 1024 * 1024 * 1024;
+
 impl CayenneContext {
     /// Create a new Cayenne context from configuration.
     ///
@@ -184,7 +190,11 @@ impl CayenneContext {
         self.config
             .pk_keyset_cache_mb
             .map_or(DEFAULT_PK_KEYSET_CACHE_MAX_BYTES, |mb| {
+                // Cap the configured budget: it doubles as the bloom allocation
+                // size, so a huge/typo'd value would otherwise saturate and try
+                // to allocate ~`usize::MAX`. `0` is preserved (forces the bloom).
                 mb.saturating_mul(1024 * 1024)
+                    .min(PK_KEYSET_CACHE_MAX_CONFIGURABLE_BYTES)
             })
     }
 

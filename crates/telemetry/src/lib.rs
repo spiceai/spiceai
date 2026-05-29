@@ -371,8 +371,7 @@ pub fn track_hash_index_lookup_rows(rows: u64, dimensions: &[KeyValue]) {
 /// and OTLP readers. Cayenne write-path and scan timings are operator
 /// observability, not product-usage telemetry, so they must NOT route to the
 /// anonymous provider. Bound lazily on first record — by which point startup has
-/// already installed the global provider — mirroring the `dataset_acceleration`
-/// metrics' `global::meter` pattern.
+/// already installed the global provider.
 static CAYENNE_OPERATIONAL_METER: OnceLock<Meter> = OnceLock::new();
 
 fn cayenne_operational_meter() -> &'static Meter {

@@ -569,14 +569,21 @@ impl CayenneAccelerator {
                 config.segment_cache_mb,
             );
 
-            // Operator override if set; otherwise an optimal default scaled to
+            // Operator override if set (0 → warn + minimum of 1 MB, mirroring
+            // upload_concurrency); otherwise an optimal default scaled to
             // available machine memory (see `default_pk_keyset_cache_mb`).
             config.pk_keyset_cache_mb = Some(
-                parse_optional_usize(
+                match parse_optional_usize(
                     acceleration,
                     &["cayenne_pk_keyset_cache_mb", "pk_keyset_cache_mb"],
-                )
-                .map_or_else(default_pk_keyset_cache_mb, |(_key, mb)| mb),
+                ) {
+                    Some((key, 0)) => {
+                        tracing::warn!("Invalid {key} value of 0. Using minimum value of 1 MB.");
+                        1
+                    }
+                    Some((_key, mb)) => mb,
+                    None => default_pk_keyset_cache_mb(),
+                },
             );
 
             // Parse file size options
@@ -1083,7 +1090,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Size of the in-memory Vortex segment cache in MB. Set > 0 to cache decompressed data segments. Default: 256 MB")
             .default("256"),
         ParameterSpec::component("pk_keyset_cache_mb")
-            .description("Byte budget (in MB) for the in-memory primary-key keyset cache used to detect upsert conflicts during CDC ingestion. When a table's keyset exceeds this budget it is rebuilt from a full-table scan every batch, which dominates ingest latency on high-cardinality tables. Raise on memory-rich hosts so large keysets stay resident. Default: 256 MB."),
+            .description("Byte budget (in MB) for the in-memory primary-key index used to detect upsert conflicts during CDC ingestion. Within budget an exact keyset is kept; over budget, upsert tables fall back to a bounded bloom existence filter (avoiding the per-batch full-table rebuild) while DoNothing tables rebuild from a scan. When unset, an optimal default is derived from available machine memory."),
         ParameterSpec::component("target_file_size_mb")
             .description("Target size for Vortex data files in MB. Default: 256 MB. Adjust as needed for S3 Express or remote upload scenarios.")
             .default("256"),
