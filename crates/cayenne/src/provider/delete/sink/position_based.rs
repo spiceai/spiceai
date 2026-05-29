@@ -22,10 +22,10 @@ limitations under the License.
 
 use super::super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use super::CayenneDeletionSink;
-use arrow::row::{OwnedRow, RowConverter};
 use crate::provider::Error;
 use crate::provider::deletion_strategy::PositionDeletionVector;
 use crate::provider::utils::convert_to_u64_box;
+use arrow::row::{OwnedRow, RowConverter};
 use datafusion::datasource::listing::ListingTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
@@ -684,7 +684,8 @@ impl CayenneDeletionSink {
                 .downcast_ref::<arrow::array::StructArray>()
                 .ok_or_else(|| Error::Internal {
                     table: table_name.clone(),
-                    message: "Vortex position read-back scan did not return StructArray".to_string(),
+                    message: "Vortex position read-back scan did not return StructArray"
+                        .to_string(),
                 })?;
             let batch = arrow::record_batch::RecordBatch::from(struct_array);
 
@@ -706,8 +707,10 @@ impl CayenneDeletionSink {
                 pk_indices.as_deref().unwrap_or(&[])
             };
 
-            let pk_columns: Vec<arrow::array::ArrayRef> =
-                indices.iter().map(|&i| Arc::clone(batch.column(i))).collect();
+            let pk_columns: Vec<arrow::array::ArrayRef> = indices
+                .iter()
+                .map(|&i| Arc::clone(batch.column(i)))
+                .collect();
             let rows = converter
                 .convert_columns(&pk_columns)
                 .map_err(Error::from)?;

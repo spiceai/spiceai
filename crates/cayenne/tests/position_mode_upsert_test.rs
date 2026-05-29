@@ -82,8 +82,9 @@ async fn test_position_mode_composite_pk_upsert_impl(
 
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        Arc::new(CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?);
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table(
         "pos_upsert",
         Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -133,15 +134,18 @@ async fn test_position_mode_resurrection_impl(
         table_name: "pos_resurrect".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
-        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: position_mode_config(),
     };
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        Arc::new(CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?);
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table(
         "pos_resurrect",
         Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -185,15 +189,18 @@ async fn test_position_mode_without_capture_falls_back_to_key_impl(
         table_name: "pos_fallback".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
-        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: position_mode_config(),
     };
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        Arc::new(CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?);
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table(
         "pos_fallback",
         Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -214,15 +221,29 @@ async fn test_position_mode_without_capture_falls_back_to_key_impl(
         .await?
         .collect()
         .await?;
-    assert_eq!(batches.iter().map(arrow::record_batch::RecordBatch::num_rows).sum::<usize>(), 2);
-    let batch = &batches[0];
-    let names = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("name column");
-    assert_eq!(names.value(0), "Updated");
-    assert_eq!(names.value(1), "Bob");
+    // Collect (id, name) across all batches — `collect()` may split rows over
+    // several `RecordBatch`es, so inspecting only `batches[0]` could miss rows.
+    let mut rows: Vec<(i64, String)> = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id column");
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name column");
+        for i in 0..batch.num_rows() {
+            rows.push((ids.value(i), names.value(i).to_string()));
+        }
+    }
+    assert_eq!(
+        rows,
+        vec![(1, "Updated".to_string()), (2, "Bob".to_string())],
+        "key-fallback upsert must update id=1 and leave id=2 unchanged"
+    );
 
     Ok(())
 }
@@ -230,9 +251,21 @@ async fn test_position_mode_without_capture_falls_back_to_key_impl(
 fn collect_triplets(batches: &[arrow::record_batch::RecordBatch]) -> Vec<(i64, i64, i64)> {
     let mut out = Vec::new();
     for batch in batches {
-        let a = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("col0");
-        let b = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("col1");
-        let c = batch.column(2).as_any().downcast_ref::<Int64Array>().expect("col2");
+        let a = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("col0");
+        let b = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("col1");
+        let c = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("col2");
         for i in 0..batch.num_rows() {
             out.push((a.value(i), b.value(i), c.value(i)));
         }
@@ -243,8 +276,16 @@ fn collect_triplets(batches: &[arrow::record_batch::RecordBatch]) -> Vec<(i64, i
 fn collect_pairs(batches: &[arrow::record_batch::RecordBatch]) -> Vec<(i64, i64)> {
     let mut out = Vec::new();
     for batch in batches {
-        let a = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("col0");
-        let b = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("col1");
+        let a = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("col0");
+        let b = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("col1");
         for i in 0..batch.num_rows() {
             out.push((a.value(i), b.value(i)));
         }

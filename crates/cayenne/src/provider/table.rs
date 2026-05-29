@@ -17,9 +17,7 @@ limitations under the License.
 //! This module contains the main `CayenneTableProvider` struct which implements
 //! `DataFusion`'s `TableProvider` trait for Cayenne tables.
 
-use super::constants::{
-    STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
-};
+use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 use super::delete::{
     CayenneDeletionSink, DeletionIdentifier, DeletionVectorWriteResult, DeletionVectorWriteSpec,
     DeletionVectorWriter, FileBasedDeletionSink, Int64PkDeletionFilterExec,
@@ -117,10 +115,10 @@ use super::deletion_strategy::{
     Int64PkDeletionSnapshot, PkDeletionStrategy, PkDeletionStrategyWithCache, PositionBitmap,
     PositionDeletionVector, RowConverterDeletionSnapshot,
 };
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use super::staging_wal::PreparedStagedAppend;
 use super::vortex_format::PositionDeletionAccessPlanProvider;
 use arc_swap::ArcSwap;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
 const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
@@ -282,8 +280,16 @@ fn approx_pk_keyset_entry_bytes(key: &OwnedRow) -> usize {
         + PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES
 }
 
+/// Approximate resident bytes a captured-file path adds to the keyset's
+/// `captured_files` set: the heap string (counted once per file — the `Arc<str>`
+/// is shared with the keyset's `FilePositioned` values) plus the fat pointer and
+/// `HashSet` slot overhead.
+fn approx_captured_file_bytes(path: &str) -> usize {
+    path.len() + std::mem::size_of::<Arc<str>>() + PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES
+}
+
 /// Per-table accounting of Cayenne's off-pool resident state — the PK keyset and
-/// the key-based deletion indexes — against the DataFusion [`MemoryPool`] that
+/// the key-based deletion indexes — against the `DataFusion` [`MemoryPool`] that
 /// `runtime.query.memory_limit` controls (a `TrackConsumersPool` over a
 /// `GreedyMemoryPool`). This closes the audit's MEM-1/2 gap: before, that state
 /// was invisible to the pool, so queries planned against the full budget while
@@ -1928,14 +1934,18 @@ impl PkDeletionSnapshot {
 fn pk_deletion_snapshot_for_strategy(strategy: &PkDeletionStrategyWithCache) -> PkDeletionSnapshot {
     match strategy {
         PkDeletionStrategyWithCache::PositionBased { .. } => PkDeletionSnapshot::PositionBased,
-        PkDeletionStrategyWithCache::Int64Pk { deletion_snapshot, .. } => {
+        PkDeletionStrategyWithCache::Int64Pk {
+            deletion_snapshot, ..
+        } => {
             let snapshot = deletion_snapshot.load_full();
             PkDeletionSnapshot::Int64Pk {
                 deleted_pk_values: Arc::clone(&snapshot.deleted_pk),
                 insert_records: Arc::clone(&snapshot.insert_records),
             }
         }
-        PkDeletionStrategyWithCache::RowConverterBased { deletion_snapshot, .. } => {
+        PkDeletionStrategyWithCache::RowConverterBased {
+            deletion_snapshot, ..
+        } => {
             let snapshot = deletion_snapshot.load_full();
             PkDeletionSnapshot::RowConverterBased {
                 deleted_row_keys: Arc::clone(&snapshot.deleted_row_keys),
@@ -2060,10 +2070,7 @@ impl OnConflictValidationStream {
         } = validation_result.map_err(datafusion_common::DataFusionError::from)?;
 
         for (file_path, rows) in batch_delete_specs {
-            self.delete_specs
-                .entry(file_path)
-                .or_default()
-                .extend(rows);
+            self.delete_specs.entry(file_path).or_default().extend(rows);
         }
 
         self.deleted_pk_i64.extend(deleted_pk_i64);
@@ -3643,18 +3650,20 @@ impl CayenneTableProvider {
     /// before-numbers (up to ~5.7 M× speedup at 1 M cached deletions).
     fn get_max_delete_sequence(&self) -> i64 {
         match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk { deletion_snapshot, .. } => deletion_snapshot
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => deletion_snapshot
                 .load()
                 .deleted_pk
                 .max_sequence_number()
                 .unwrap_or(0),
-            PkDeletionStrategyWithCache::RowConverterBased { deletion_snapshot, .. } => {
-                deletion_snapshot
-                    .load()
-                    .deleted_row_keys
-                    .max_sequence_number()
-                    .unwrap_or(0)
-            }
+            PkDeletionStrategyWithCache::RowConverterBased {
+                deletion_snapshot, ..
+            } => deletion_snapshot
+                .load()
+                .deleted_row_keys
+                .max_sequence_number()
+                .unwrap_or(0),
             PkDeletionStrategyWithCache::PositionBased { .. } => 0,
         }
     }
@@ -4211,6 +4220,11 @@ impl CayenneTableProvider {
     /// `deletion_mode: position`. The post-write maintenance loop normally runs
     /// this asynchronously; this entry point lets a caller (or a test) capture
     /// eagerly and deterministically. A no-op for key-mode / PK-less tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if listing the snapshot's data files, resolving the
+    /// object store, or the per-file position read-back scan fails.
     pub async fn run_position_capture(&self) -> CatalogResult<()> {
         if self.should_capture_positions() {
             self.capture_new_file_positions().await
@@ -4235,22 +4249,24 @@ impl CayenneTableProvider {
     /// row whose position has not yet been captured simply falls back to a
     /// key-based delete, which is always correct.
     async fn capture_new_file_positions(&self) -> CatalogResult<()> {
-        let Some(pk_indices) = self.primary_key_indices().map_err(|err| {
-            CatalogError::InvalidOperationNoSource {
-                message: format!("Position capture: failed to resolve primary key indices: {err}"),
-            }
-        })?
+        let Some(pk_indices) =
+            self.primary_key_indices()
+                .map_err(|err| CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Position capture: failed to resolve primary key indices: {err}"
+                    ),
+                })?
         else {
             return Ok(());
         };
         if pk_indices.is_empty() {
             return Ok(());
         }
-        let converter =
-            self.build_pk_converter(&pk_indices)
-                .map_err(|err| CatalogError::InvalidOperationNoSource {
-                    message: format!("Position capture: failed to build PK converter: {err}"),
-                })?;
+        let converter = self.build_pk_converter(&pk_indices).map_err(|err| {
+            CatalogError::InvalidOperationNoSource {
+                message: format!("Position capture: failed to build PK converter: {err}"),
+            }
+        })?;
         let pk_column_names: Vec<String> = self.table_metadata.primary_key.clone();
 
         // Enumerate current snapshot data files. The object-store location of
@@ -4264,12 +4280,11 @@ impl CayenneTableProvider {
             &self.table_metadata.table_id,
             &snapshot_id,
         );
-        let table_url =
-            ListingTableUrl::parse(&snapshot_dir_url).map_err(|err| {
-                CatalogError::InvalidOperationNoSource {
-                    message: format!("Position capture: invalid snapshot URL: {err}"),
-                }
-            })?;
+        let table_url = ListingTableUrl::parse(&snapshot_dir_url).map_err(|err| {
+            CatalogError::InvalidOperationNoSource {
+                message: format!("Position capture: invalid snapshot URL: {err}"),
+            }
+        })?;
         let options = Self::create_listing_options(
             self.context.file_format(),
             &self.pk_deletion_strategy,
@@ -4282,11 +4297,12 @@ impl CayenneTableProvider {
             .map_err(|err| CatalogError::InvalidOperationNoSource {
                 message: format!("Position capture: failed to list snapshot files: {err}"),
             })?;
-        let object_store = state.runtime_env().object_store(&table_url).map_err(|err| {
-            CatalogError::InvalidOperationNoSource {
+        let object_store = state
+            .runtime_env()
+            .object_store(&table_url)
+            .map_err(|err| CatalogError::InvalidOperationNoSource {
                 message: format!("Position capture: failed to resolve object store: {err}"),
-            }
-        })?;
+            })?;
 
         // Snapshot the already-captured set. Only the exact keyset tracks
         // positions; a bloom/None keyset means everything stays key-based.
@@ -4348,10 +4364,24 @@ impl CayenneTableProvider {
                             };
                         }
                     }
-                    keyset.captured_files.insert(Arc::clone(&file_path));
+                    // Track the file-path string + set slot now held resident.
+                    if keyset.captured_files.insert(Arc::clone(&file_path)) {
+                        keyset.approx_bytes = keyset
+                            .approx_bytes
+                            .saturating_add(approx_captured_file_bytes(&file_path));
+                    }
                 }
             }
         }
+
+        // Republish the keyset's resident size: the capture pass grew
+        // `captured_files`, which is part of the keyset's accounted footprint.
+        let keyset_bytes = self
+            .pk_keyset_cache
+            .lock()
+            .as_ref()
+            .map_or(0, CachedPkIndex::approx_bytes);
+        self.table_memory.set_keyset_bytes(keyset_bytes);
 
         Ok(())
     }
@@ -4432,16 +4462,16 @@ impl CayenneTableProvider {
         // ArcSwap loads are wait-free; the resulting `Arc<...Index>` is an immutable
         // snapshot of the deletion state at this instant.
         let deleted_pk_i64: Option<Arc<DeletionIndex>> = match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk { deletion_snapshot, .. } => {
-                Some(Arc::clone(&deletion_snapshot.load_full().deleted_pk))
-            }
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => Some(Arc::clone(&deletion_snapshot.load_full().deleted_pk)),
             _ => None,
         };
 
         let deleted_row_keys: Option<Arc<KeyDeletionIndex>> = match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::RowConverterBased { deletion_snapshot, .. } => {
-                Some(Arc::clone(&deletion_snapshot.load_full().deleted_row_keys))
-            }
+            PkDeletionStrategyWithCache::RowConverterBased {
+                deletion_snapshot, ..
+            } => Some(Arc::clone(&deletion_snapshot.load_full().deleted_row_keys)),
             _ => None,
         };
 
@@ -5073,8 +5103,7 @@ impl CayenneTableProvider {
                         match ctx.on_conflict {
                             OnConflict::DoNothingAll | OnConflict::DoNothing(_) => false,
                             OnConflict::Upsert(_) => {
-                                let is_inlined_conflict =
-                                    matches!(existing, RowLocation::Inlined);
+                                let is_inlined_conflict = matches!(existing, RowLocation::Inlined);
                                 match &self.pk_deletion_strategy {
                                     PkDeletionStrategyWithCache::Int64Pk { .. } => {
                                         if let Some(arr) = int64_pk_array {
@@ -5109,8 +5138,10 @@ impl CayenneTableProvider {
                                 // inlined rows are covered by the key-based lists
                                 // populated above. Exactly one delete kind per
                                 // conflict, so no double-masking.
-                                if let RowLocation::FilePositioned { file_path, position } =
-                                    existing
+                                if let RowLocation::FilePositioned {
+                                    file_path,
+                                    position,
+                                } = existing
                                 {
                                     delete_specs
                                         .entry(Arc::clone(file_path))
@@ -5428,7 +5459,9 @@ impl CayenneTableProvider {
         delete_sequence: i64,
     ) {
         match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk { deletion_snapshot, .. } => {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => {
                 if deleted_pk_i64.is_empty() {
                     return;
                 }
@@ -5441,7 +5474,9 @@ impl CayenneTableProvider {
                     Arc::clone(&current.insert_records),
                 )));
             }
-            PkDeletionStrategyWithCache::RowConverterBased { deletion_snapshot, .. } => {
+            PkDeletionStrategyWithCache::RowConverterBased {
+                deletion_snapshot, ..
+            } => {
                 if deleted_row_keys.is_empty() {
                     return;
                 }
@@ -5709,7 +5744,9 @@ impl CayenneTableProvider {
         // This follows Iceberg's pattern where deletes are tracked by PK + sequence number.
         // For upserts, we also update insert records so the new row isn't filtered out.
         match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk { deletion_snapshot, .. } => {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => {
                 // Build new deletion + insert snapshots and publish both in one
                 // ArcSwap store so readers never observe mismatched generations.
                 // Writers are serialised by the per-table write lock so the load+rebuild+store
@@ -5740,7 +5777,9 @@ impl CayenneTableProvider {
                     self.table_metadata.table_name
                 );
             }
-            PkDeletionStrategyWithCache::RowConverterBased { deletion_snapshot, .. } => {
+            PkDeletionStrategyWithCache::RowConverterBased {
+                deletion_snapshot, ..
+            } => {
                 // Consume `results` to take owned `Box<[u8]>` keys; the second
                 // extend_max then MOVES them in instead of cloning. The branch
                 // is invariantly the sole `KeyBased` producer (one spec built
@@ -6945,12 +6984,12 @@ impl CayenneTableProvider {
             PkDeletionStrategyWithCache::PositionBased {
                 cached_deleted_row_ids,
             } => !cached_deleted_row_ids.load().is_empty(),
-            PkDeletionStrategyWithCache::Int64Pk { deletion_snapshot, .. } => {
-                !deletion_snapshot.load().deleted_pk.is_empty()
-            }
-            PkDeletionStrategyWithCache::RowConverterBased { deletion_snapshot, .. } => {
-                !deletion_snapshot.load().deleted_row_keys.is_empty()
-            }
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => !deletion_snapshot.load().deleted_pk.is_empty(),
+            PkDeletionStrategyWithCache::RowConverterBased {
+                deletion_snapshot, ..
+            } => !deletion_snapshot.load().deleted_row_keys.is_empty(),
         }
     }
 
@@ -7729,7 +7768,9 @@ impl CayenneTableProvider {
 
         let mut keep_mask = Vec::with_capacity(batch.num_rows());
         match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk { deletion_snapshot, .. } => {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => {
                 let pk_index = *pk_indices.first().ok_or_else(|| Error::Internal {
                     table: self.table_metadata.table_name.clone(),
                     message: "Int64 PK strategy requires a primary key column".to_string(),
@@ -7766,7 +7807,9 @@ impl CayenneTableProvider {
                     );
                 }
             }
-            PkDeletionStrategyWithCache::RowConverterBased { deletion_snapshot, .. } => {
+            PkDeletionStrategyWithCache::RowConverterBased {
+                deletion_snapshot, ..
+            } => {
                 let converter = self.build_pk_converter(&pk_indices)?;
                 let pk_columns: Vec<_> = pk_indices
                     .iter()
@@ -10239,7 +10282,11 @@ mod tests {
 
         account.set_keyset_bytes(400);
         assert_eq!(account.reserved_bytes(), 400);
-        assert_eq!(pool.reserved(), 400, "the keyset reservation reaches the pool");
+        assert_eq!(
+            pool.reserved(),
+            400,
+            "the keyset reservation reaches the pool"
+        );
 
         account.set_deletion_bytes(600);
         assert_eq!(

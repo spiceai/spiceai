@@ -354,10 +354,11 @@ impl DeletionMode {
     #[must_use]
     pub const fn resolved(self, has_primary_key: bool) -> Self {
         match self {
-            Self::Auto | Self::Position => Self::Position,
             // `Key` is only honored when there is a key to record.
             Self::Key if has_primary_key => Self::Key,
-            Self::Key => Self::Position,
+            // Everything else is position-based: `Auto` and `Position` always,
+            // and `Key` on a PK-less table (there is no key to record).
+            Self::Auto | Self::Position | Self::Key => Self::Position,
         }
     }
 
@@ -495,10 +496,11 @@ pub struct VortexConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pk_keyset_cache_mb: Option<usize>,
     /// How primary-key deletions are recorded and applied for PK tables.
-    /// Defaults to [`DeletionMode::Key`] (current behavior). Set to `position`
-    /// via `cayenne_deletion_mode` to push deletes into the Vortex scan as
-    /// per-file row-position bitmaps (merge-on-read), eliminating the per-row
-    /// `RowConverter` deletion tax above the scan.
+    /// Defaults to [`DeletionMode::Auto`], which resolves to `position`
+    /// (merge-on-read): deletes are pushed into the Vortex scan as per-file
+    /// row-position bitmaps, eliminating the per-row `RowConverter` deletion tax
+    /// above the scan. Set `cayenne_deletion_mode: key` to opt out and keep the
+    /// above-scan key-based filter.
     #[serde(default)]
     pub deletion_mode: DeletionMode,
 }

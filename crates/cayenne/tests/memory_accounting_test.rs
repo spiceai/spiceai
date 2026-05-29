@@ -18,7 +18,7 @@ limitations under the License.
 #![allow(clippy::clone_on_ref_ptr)]
 
 //! Tests that Cayenne's off-pool resident state (PK keyset + key-based deletion
-//! indexes) is accounted against the DataFusion query `MemoryPool` that
+//! indexes) is accounted against the `DataFusion` query `MemoryPool` that
 //! `runtime.query.memory_limit` controls — making `memory_limit` reflect real
 //! Cayenne RSS — and that this accounting never changes query results.
 
@@ -66,7 +66,9 @@ fn table_options(name: &str, base_path: String, vortex_config: VortexConfig) -> 
         table_name: name.to_string(),
         schema: schema(),
         primary_key: vec!["id".to_string()],
-        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
         base_path,
         partition_column: None,
         vortex_config,
@@ -74,7 +76,12 @@ fn table_options(name: &str, base_path: String, vortex_config: VortexConfig) -> 
 }
 
 async fn insert_sql(ctx: &SessionContext, sql: &str) {
-    ctx.sql(sql).await.expect("sql").collect().await.expect("collect");
+    ctx.sql(sql)
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
 }
 
 /// The reservation tracks keyset bytes after inserts and deletion-index bytes
@@ -108,7 +115,11 @@ async fn test_accounting_tracks_keyset_and_deletions_impl(
         "a fresh table reserves nothing"
     );
 
-    insert_sql(&ctx, "INSERT INTO mem_track VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')").await;
+    insert_sql(
+        &ctx,
+        "INSERT INTO mem_track VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')",
+    )
+    .await;
     let after_insert = table.accounted_memory_bytes();
     assert!(
         after_insert > 0,
@@ -132,8 +143,16 @@ async fn test_accounting_tracks_keyset_and_deletions_impl(
     let rows: Vec<(i64, String)> = batches
         .iter()
         .flat_map(|b| {
-            let ids = b.column(0).as_any().downcast_ref::<Int64Array>().expect("id");
-            let names = b.column(1).as_any().downcast_ref::<StringArray>().expect("name");
+            let ids = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id");
+            let names = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("name");
             (0..b.num_rows())
                 .map(|i| (ids.value(i), names.value(i).to_string()))
                 .collect::<Vec<_>>()
@@ -188,7 +207,11 @@ async fn test_accounting_against_bounded_pool_preserves_correctness_impl(
         Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
     )?;
 
-    insert_sql(&ctx, "INSERT INTO mem_bounded VALUES (1,'a'),(2,'b'),(3,'c')").await;
+    insert_sql(
+        &ctx,
+        "INSERT INTO mem_bounded VALUES (1,'a'),(2,'b'),(3,'c')",
+    )
+    .await;
     insert_sql(&ctx, "INSERT INTO mem_bounded VALUES (1,'A'),(2,'B')").await;
 
     // The table's reservation is part of the shared pool's reserved total.
@@ -207,8 +230,16 @@ async fn test_accounting_against_bounded_pool_preserves_correctness_impl(
         .collect()
         .await?;
     let batch = &batches[0];
-    let n = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("n");
-    let s = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("s");
+    let n = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("n");
+    let s = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("s");
     assert_eq!(n.value(0), 3, "three live rows after upserts");
     assert_eq!(s.value(0), 6, "sum of ids 1+2+3");
 

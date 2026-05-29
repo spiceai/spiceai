@@ -184,8 +184,8 @@ impl CayenneContext {
     }
 
     /// How primary-key deletions are recorded and applied for PK tables.
-    /// `position` enables merge-on-read position-delete vectors; `key` (default)
-    /// keeps the above-scan key-based filter.
+    /// The default `auto` resolves to `position` (merge-on-read position-delete
+    /// vectors); `key` is the opt-out that keeps the above-scan key-based filter.
     #[must_use]
     pub(crate) fn deletion_mode(&self) -> DeletionMode {
         self.config.deletion_mode

@@ -113,7 +113,9 @@ async fn query_sum(table: &Arc<CayenneTableProvider>) -> Vec<RecordBatch> {
 async fn setup(mode: DeletionMode, rows: usize, frac: f64) -> Fixture {
     let dir = tempfile::tempdir().expect("temp dir");
     let data_path = dir.path().join("data");
-    tokio::fs::create_dir_all(&data_path).await.expect("data dir");
+    tokio::fs::create_dir_all(&data_path)
+        .await
+        .expect("data dir");
     let db_path = dir.path().join("catalog.db");
     let catalog = Arc::new(
         CayenneCatalog::new(format!("sqlite://{}", db_path.to_string_lossy())).expect("catalog"),
@@ -171,8 +173,10 @@ fn bench_deletion_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("position_vs_key_deletion_scan");
     group.sample_size(10);
 
-    let modes: [(&str, DeletionMode); 2] =
-        [("key", DeletionMode::Key), ("position", DeletionMode::Position)];
+    let modes: [(&str, DeletionMode); 2] = [
+        ("key", DeletionMode::Key),
+        ("position", DeletionMode::Position),
+    ];
 
     for &frac in DELETION_FRACTIONS {
         for (label, mode) in modes {
