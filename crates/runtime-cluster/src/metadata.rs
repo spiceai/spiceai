@@ -19,12 +19,17 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_schema::Schema;
 use bytes::Bytes;
 use datafusion::{
-    common::DFSchema, error::DataFusionError, prelude::SessionContext, sql::TableReference,
+    common::{DFSchema, Statistics},
+    error::DataFusionError,
+    prelude::SessionContext,
+    sql::TableReference,
 };
 use datafusion_expr::{Expr, ExprSchemable, lit};
 use datafusion_proto::bytes::Serializeable;
+use datafusion_proto_common::protobuf_common::Statistics as ProtoStatistics;
+use prost::Message;
 use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::context::PartitionExprResolver;
 
@@ -41,6 +46,40 @@ use crate::context::PartitionExprResolver;
 /// ```
 pub type PartitionValue = HashMap<String, Option<String>>;
 
+/// A `DataFusion` [`Statistics`] that round-trips through serde via its
+/// `datafusion-proto` representation.
+///
+/// `Statistics` is not itself `serde`-serializable, but it has a canonical
+/// protobuf encoding (the same `datafusion-proto` mechanism this module already
+/// uses to serialize `Expr`). This newtype delegates to that encoding, so the
+/// full statistics — per-column min/max, distinct counts, etc. — round-trip
+/// losslessly, even when callers only populate a subset such as `num_rows`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SerializableStatistics(pub Statistics);
+
+impl From<Statistics> for SerializableStatistics {
+    fn from(stats: Statistics) -> Self {
+        Self(stats)
+    }
+}
+
+impl Serialize for SerializableStatistics {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ProtoStatistics::from(&self.0)
+            .encode_to_vec()
+            .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SerializableStatistics {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes = <Vec<u8>>::deserialize(deserializer)?;
+        let proto = ProtoStatistics::decode(bytes.as_slice()).map_err(serde::de::Error::custom)?;
+        let stats = Statistics::try_from(&proto).map_err(serde::de::Error::custom)?;
+        Ok(Self(stats))
+    }
+}
+
 /// Metadata for a single partition of an accelerated table
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PartitionMetadata {
@@ -52,6 +91,16 @@ pub struct PartitionMetadata {
     /// Timestamp when partition was last assigned
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_assigned_at: Option<u128>,
+    /// Statistics for the data in this partition, used by the query planner on
+    /// the coordinator (e.g. to pick hash-join build sides).
+    ///
+    /// Carries full `DataFusion` [`Statistics`]; today only `num_rows` is
+    /// populated (from the partition's record count), with column-level
+    /// statistics left `Absent`. The abstraction is in place so richer
+    /// statistics — or statistics from non-cayenne sources — can be filled in
+    /// later without a metadata format change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statistics: Option<SerializableStatistics>,
 }
 
 impl PartitionMetadata {
@@ -61,7 +110,31 @@ impl PartitionMetadata {
             partition_value,
             assigned_executors: Vec::new(),
             last_assigned_at: None,
+            statistics: None,
         }
+    }
+
+    /// Sets the partition statistics to carry just a row-count estimate,
+    /// leaving column-level statistics `Absent`. This is the minimal
+    /// population used today; richer statistics can be set via
+    /// [`PartitionMetadata::statistics`] directly.
+    #[must_use]
+    pub fn with_row_count(mut self, num_rows: usize) -> Self {
+        let stats = Statistics {
+            num_rows: datafusion::common::stats::Precision::Inexact(num_rows),
+            total_byte_size: datafusion::common::stats::Precision::Absent,
+            column_statistics: Vec::new(),
+        };
+        self.statistics = Some(SerializableStatistics(stats));
+        self
+    }
+
+    /// Returns the row-count estimate for this partition, if known.
+    #[must_use]
+    pub fn num_rows(&self) -> Option<usize> {
+        self.statistics
+            .as_ref()
+            .and_then(|s| s.0.num_rows.get_value().copied())
     }
 
     #[must_use]
@@ -257,4 +330,56 @@ pub fn encode_partition_exprs(exprs: &[Expr], context: &str) -> Vec<Vec<u8>> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::common::{ColumnStatistics, stats::Precision};
+
+    #[test]
+    fn serializable_statistics_round_trips_through_json() {
+        // Full statistics, including column-level min/max and distinct counts,
+        // must survive a JSON round-trip losslessly.
+        let stats = Statistics {
+            num_rows: Precision::Inexact(59_986_052),
+            total_byte_size: Precision::Exact(1_234_567),
+            column_statistics: vec![
+                ColumnStatistics {
+                    null_count: Precision::Exact(0),
+                    distinct_count: Precision::Inexact(15_000_000),
+                    ..ColumnStatistics::new_unknown()
+                },
+                ColumnStatistics::new_unknown(),
+            ],
+        };
+
+        let wrapped = SerializableStatistics(stats.clone());
+        let json = serde_json::to_string(&wrapped).expect("serialize");
+        let decoded: SerializableStatistics = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(decoded.0, stats);
+    }
+
+    #[test]
+    fn partition_metadata_row_count_round_trips() {
+        let mut pv = HashMap::new();
+        pv.insert("bucket".to_string(), Some("3".to_string()));
+        let pm = PartitionMetadata::new(pv).with_row_count(42);
+
+        assert_eq!(pm.num_rows(), Some(42));
+
+        let json = serde_json::to_string(&pm).expect("serialize");
+        let decoded: PartitionMetadata = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.num_rows(), Some(42));
+        assert_eq!(decoded, pm);
+    }
+
+    #[test]
+    fn partition_metadata_without_stats_omits_field() {
+        let pm = PartitionMetadata::new(HashMap::new());
+        assert_eq!(pm.num_rows(), None);
+        let json = serde_json::to_string(&pm).expect("serialize");
+        assert!(!json.contains("statistics"), "absent stats should be skipped: {json}");
+    }
 }

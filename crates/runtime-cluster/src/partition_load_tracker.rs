@@ -188,6 +188,7 @@ mod tests {
                 .map(ToString::to_string)
                 .collect(),
             last_assigned_at: None,
+            statistics: None,
         }
     }
 

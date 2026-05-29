@@ -25,7 +25,11 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
-use datafusion::{catalog::TableProvider, sql::TableReference};
+use datafusion::{
+    catalog::TableProvider,
+    common::{Statistics, stats::Precision},
+    sql::TableReference,
+};
 use datafusion_expr::{Expr, TableScan};
 use flight_client::cookie::CookieStore;
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;
@@ -608,15 +612,19 @@ pub(crate) fn flight_sql_table_provider(
     client: FlightSqlClient,
     table: &TableReference,
     schema: SchemaRef,
+    statistics: Option<Statistics>,
 ) -> Arc<dyn TableProvider> {
-    Arc::new(FlightSQLTable::create_with_schema(
-        "flightsql",
-        executor_id,
-        client,
-        table.clone(),
-        schema,
-        Arc::new(CookieStore::new()),
-    )) as Arc<dyn TableProvider>
+    Arc::new(
+        FlightSQLTable::create_with_schema(
+            "flightsql",
+            executor_id,
+            client,
+            table.clone(),
+            schema,
+            Arc::new(CookieStore::new()),
+        )
+        .with_statistics(statistics),
+    ) as Arc<dyn TableProvider>
 }
 
 /// Shared logic for `get_partitions` across accelerated and federated partition providers.
@@ -651,7 +659,7 @@ pub(crate) fn get_partitions_from_store(
             metrics::record_query_executor_count(node_id, 1);
         }
         return vec![(
-            flight_sql_table_provider(executor_id, (*client).clone(), table, Arc::clone(schema)),
+            flight_sql_table_provider(executor_id, (*client).clone(), table, Arc::clone(schema), None),
             Vec::new(),
         )];
     };
@@ -668,8 +676,14 @@ pub(crate) fn get_partitions_from_store(
         return Vec::new();
     }
 
-    // Build executor -> partitions map, excluding dead executors
+    // Build executor -> partitions map, excluding dead executors. Also
+    // accumulate a per-executor row-count estimate by summing the partition
+    // statistics the executor serves; this becomes the `num_rows` of that
+    // executor's scan so the coordinator's planner can size joins. The value is
+    // `None` (unknown) unless every partition served by the executor has a
+    // known row count, to avoid undercounting.
     let mut executor_partition_map: HashMap<String, Vec<PartitionValue>> = HashMap::new();
+    let mut executor_row_counts: HashMap<String, Option<usize>> = HashMap::new();
     for partition_meta in &table_metadata.partitions {
         for executor_id in &partition_meta.assigned_executors {
             if !executors.contains_key(executor_id) {
@@ -683,6 +697,13 @@ pub(crate) fn get_partitions_from_store(
                 .entry(executor_id.clone())
                 .or_default()
                 .push(partition_meta.partition_value.clone());
+            let count = executor_row_counts
+                .entry(executor_id.clone())
+                .or_insert(Some(0));
+            *count = match (*count, partition_meta.num_rows()) {
+                (Some(acc), Some(rows)) => Some(acc + rows),
+                _ => None,
+            };
         }
     }
 
@@ -726,11 +747,19 @@ pub(crate) fn get_partitions_from_store(
         .filter_map(|executor_id| {
             let (_, client) = executors.get(&executor_id)?;
             let partition_values = executor_partition_map.remove(&executor_id)?;
+            let statistics = executor_row_counts
+                .get(&executor_id)
+                .copied()
+                .flatten()
+                .map(|num_rows| {
+                    Statistics::new_unknown(schema).with_num_rows(Precision::Inexact(num_rows))
+                });
             let provider = flight_sql_table_provider(
                 &executor_id,
                 (*client).clone(),
                 table,
                 Arc::clone(schema),
+                statistics,
             );
             Some((provider, partition_values))
         })
