@@ -2015,8 +2015,15 @@ impl OnConflictValidationStream {
 }
 
 pub(crate) fn record_cayenne_write_phase(table_name: &str, phase: &'static str, start: Instant) {
+    let elapsed = start.elapsed();
+    tracing::debug!(
+        table = table_name,
+        phase,
+        duration_ms = elapsed.as_millis(),
+        "Cayenne write phase completed"
+    );
     telemetry::track_cayenne_write_phase_duration(
-        start.elapsed(),
+        elapsed,
         &[
             telemetry::KeyValue::new("table", table_name.to_string()),
             telemetry::KeyValue::new("phase", phase),
@@ -5319,6 +5326,7 @@ impl CayenneTableProvider {
         &self,
         on_conflict_deletions: OnConflictDeletions,
     ) -> CatalogResult<()> {
+        let on_conflict_start = std::time::Instant::now();
         let OnConflictDeletions {
             delete_specs,
             deleted_pk_i64,
@@ -5335,6 +5343,10 @@ impl CayenneTableProvider {
         if !has_file_deletions && !has_inlined_deletions {
             return Ok(());
         }
+
+        let file_deletion_count = deleted_pk_i64.len() + deleted_row_keys.len();
+        let inlined_deletion_count = deleted_inlined_pk_i64.len() + deleted_inlined_row_keys.len();
+        let delete_spec_count = delete_specs.len();
 
         let inlined_rewrite = if has_inlined_deletions {
             self.build_inlined_data_rewrite_for_pk_keys(
@@ -6064,6 +6076,7 @@ impl CayenneTableProvider {
     /// Returns `Ok(true)` if the pass produced a new snapshot.
     async fn run_one_compaction_pass(&self) -> Result<bool> {
         use super::compaction::{FileEntry, pick_candidates};
+        let pass_start = std::time::Instant::now();
 
         // Cheap early-out using in-memory counters. During the common
         // "accumulation phase" of many small appends we have not yet created
@@ -6118,6 +6131,14 @@ impl CayenneTableProvider {
         // the full current snapshot so compaction preserves a single coherent
         // snapshot boundary instead of mixing old and newly written file sets.
         self.rewrite_current_snapshot_for_compaction().await?;
+
+        tracing::info!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            tier = candidate.tier.as_str(),
+            duration_ms = pass_start.elapsed().as_millis(),
+            "Completed tiered compaction pass"
+        );
         Ok(true)
     }
 
@@ -6301,6 +6322,7 @@ impl CayenneTableProvider {
     /// in-memory listing table is swapped, deletion caches are cleared, and
     /// old snapshot dirs are reaped in the background.
     async fn rewrite_current_snapshot_for_compaction(&self) -> Result<()> {
+        let compaction_start = std::time::Instant::now();
         let ctx = self.create_session_context();
         let mut stream = self.visible_file_stream_for_rewrite(&ctx).await?;
 
@@ -6422,7 +6444,8 @@ impl CayenneTableProvider {
             table = self.table_metadata.table_name.as_str(),
             rows = total_rows,
             new_snapshot_id = new_snapshot_id.as_str(),
-            "Compaction snapshot committed"
+            duration_ms = compaction_start.elapsed().as_millis(),
+            "Snapshot compaction completed"
         );
 
         Ok(())

@@ -422,7 +422,7 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         keep_count += usize::from(visible);
                     }
 
-                    tracing::debug!(
+                    tracing::trace!(
                         "KeyBasedDeletionFilterStream: keeping {} of {} rows",
                         keep_count,
                         batch_size
