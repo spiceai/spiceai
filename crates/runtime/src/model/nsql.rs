@@ -756,8 +756,8 @@ pub(crate) fn render_nsql_context_block(
 }
 
 fn validate_requested_datasets(
-    datasets: &Option<Vec<String>>,
-    table_allowlist: &Option<ResolvedTableAwareAllowlist>,
+    datasets: Option<&[String]>,
+    table_allowlist: Option<&ResolvedTableAwareAllowlist>,
 ) -> Result<(), NsqlContextError> {
     if let (Some(requested_datasets), Some(allowlist)) = (datasets, table_allowlist) {
         for dataset in requested_datasets {
@@ -820,11 +820,10 @@ pub(crate) async fn build_nsql_context(
 
     let table_allowlist_opt = table_allowlist(model, &app)?;
 
-    validate_requested_datasets(&datasets, &table_allowlist_opt)?;
+    validate_requested_datasets(datasets.as_deref(), table_allowlist_opt.as_ref())?;
 
-    let tables = datasets
-        .map(|datasets| datasets.iter().map(TableReference::from).collect_vec())
-        .unwrap_or_else(|| {
+    let tables = datasets.map_or_else(
+        || {
             df.get_user_table_names()
                 .into_iter()
                 .filter(|table| {
@@ -833,7 +832,9 @@ pub(crate) async fn build_nsql_context(
                         .is_none_or(|allowlist| allowlist.table_is_allowed(table))
                 })
                 .collect()
-        });
+        },
+        |datasets| datasets.iter().map(TableReference::from).collect_vec(),
+    );
 
     let schema_context =
         table_schema_context(&tables, Arc::clone(&rt), table_allowlist_opt.clone())

@@ -200,14 +200,14 @@ fn context_response_content_type(accept: Option<&TypedHeader<Accept>>) -> Header
     }
 }
 
-fn nsql_context_response(context: String, accept: Option<TypedHeader<Accept>>) -> Response {
+fn nsql_context_response(context: String, accept: Option<&TypedHeader<Accept>>) -> Response {
     let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, context_response_content_type(accept.as_ref()));
+    headers.insert(CONTENT_TYPE, context_response_content_type(accept));
     (StatusCode::OK, headers, context).into_response()
 }
 
-fn nsql_context_error_response(error: NsqlContextError) -> (StatusCode, String) {
-    let status = match &error {
+fn nsql_context_error_response(error: &NsqlContextError) -> (StatusCode, String) {
+    let status = match error {
         NsqlContextError::DatasetNotFound { .. } => StatusCode::BAD_REQUEST,
         NsqlContextError::AppNotPrepared
         | NsqlContextError::InvalidModelDatasets { .. }
@@ -279,12 +279,12 @@ pub(crate) async fn get_context(
     {
         Ok(context) => context,
         Err(error) => {
-            let (status, message) = nsql_context_error_response(error);
+            let (status, message) = nsql_context_error_response(&error);
             return (status, message).into_response();
         }
     };
 
-    nsql_context_response(context.block, accept)
+    nsql_context_response(context.block, accept.as_ref())
 }
 
 /// Text-to-SQL (NSQL)
@@ -469,7 +469,7 @@ pub(crate) async fn handle_nsql_query(
     {
         Ok(context) => context,
         Err(error) => {
-            let (status, message) = nsql_context_error_response(error);
+            let (status, message) = nsql_context_error_response(&error);
             return (status, headers, message);
         }
     };
