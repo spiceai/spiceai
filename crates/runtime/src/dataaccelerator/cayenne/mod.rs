@@ -159,6 +159,26 @@ impl Default for CayenneAccelerator {
     }
 }
 
+/// Optimal default byte budget (in MB) for the Cayenne primary-key keyset cache
+/// when the operator has not set `cayenne_pk_keyset_cache_mb`.
+///
+/// Scales with available machine memory (cgroup-aware via
+/// [`crate::resource_monitor::get_total_memory`]) so high-cardinality tables keep
+/// their upsert keyset resident instead of rebuilding it from a full-table scan
+/// on every CDC batch — the dominant ingest cost on large tables. Clamped to
+/// [256 MiB, 8 GiB]: the floor preserves historical behavior on small hosts; the
+/// ceiling bounds per-table cache memory on very large hosts.
+fn default_pk_keyset_cache_mb() -> usize {
+    const MIB: u64 = 1024 * 1024;
+    const FLOOR_MB: u64 = 256;
+    const CEIL_MB: u64 = 8 * 1024;
+    // ~1/32 of available memory: generous enough for SF100-class keysets
+    // (hundreds of MB to low GB) while leaving ample headroom for the query
+    // pool and other tables.
+    let scaled_mb = crate::resource_monitor::get_total_memory() / 32 / MIB;
+    usize::try_from(scaled_mb.clamp(FLOOR_MB, CEIL_MB)).unwrap_or(256)
+}
+
 fn parse_usize(acceleration: &Acceleration, key: &str, default: usize) -> usize {
     acceleration
         .params
@@ -547,6 +567,23 @@ impl CayenneAccelerator {
                 acceleration,
                 "cayenne_segment_cache_mb",
                 config.segment_cache_mb,
+            );
+
+            // Operator override if set (0 → warn + minimum of 1 MB, mirroring
+            // upload_concurrency); otherwise an optimal default scaled to
+            // available machine memory (see `default_pk_keyset_cache_mb`).
+            config.pk_keyset_cache_mb = Some(
+                match parse_optional_usize(
+                    acceleration,
+                    &["cayenne_pk_keyset_cache_mb", "pk_keyset_cache_mb"],
+                ) {
+                    Some((key, 0)) => {
+                        tracing::warn!("Invalid {key} value of 0. Using minimum value of 1 MB.");
+                        1
+                    }
+                    Some((_key, mb)) => mb,
+                    None => default_pk_keyset_cache_mb(),
+                },
             );
 
             // Parse file size options
@@ -1031,8 +1068,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    24,
-    { S3_PARAMS_LEN + 24 },
+    25,
+    { S3_PARAMS_LEN + 25 },
 >(
     S3_PARAMETERS,
     [
@@ -1052,6 +1089,8 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("segment_cache_mb")
             .description("Size of the in-memory Vortex segment cache in MB. Set > 0 to cache decompressed data segments. Default: 256 MB")
             .default("256"),
+        ParameterSpec::component("pk_keyset_cache_mb")
+            .description("Byte budget (in MB) for the in-memory primary-key index used to detect upsert conflicts during CDC ingestion. Within budget an exact keyset is kept; over budget, upsert tables fall back to a bounded bloom existence filter (avoiding the per-batch full-table rebuild) while DoNothing tables rebuild from a scan. When unset, an optimal default is derived from available machine memory."),
         ParameterSpec::component("target_file_size_mb")
             .description("Target size for Vortex data files in MB. Default: 256 MB. Adjust as needed for S3 Express or remote upload scenarios.")
             .default("256"),
