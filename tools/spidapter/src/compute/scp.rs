@@ -52,15 +52,8 @@ pub(super) async fn provision_scp_app(
     eprintln!("[stdio] Flight endpoint: {flight_url}");
     eprintln!("[stdio] App name: {app_name}");
 
-    // DynamoDB and postgres-debezium load large datasets entirely into spiced's
-    // accelerated cache, so default to 64Gi unless the caller overrides explicitly.
-    let default_memory_limit = match &setup_config.storage {
-        FederatedStorageConfig::DynamoDB { .. }
-        | FederatedStorageConfig::PostgresDebezium { .. } => Some("64Gi".to_string()),
-        _ => None,
-    };
     let app_create_config = commands::AppCreateConfig {
-        app_memory_limit: args.app_memory_limit.clone().or(default_memory_limit),
+        app_memory_limit: args.app_memory_limit.clone(),
         app_cpu_limit: args.app_cpu_limit.clone(),
         app_cpu_request: args.app_cpu_request.clone(),
         app_memory_request: args.app_memory_request.clone(),
@@ -75,6 +68,27 @@ pub(super) async fn provision_scp_app(
         ephemeral_storage_limit_gb: args.ephemeral_storage_limit_gb.clone(),
         organization_tag: args.organization_tag.clone(),
     };
+    eprintln!(
+        "[stdio] App resource config: \
+         app_memory_limit={:?}, app_memory_request={:?}, app_cpu_limit={:?}, app_cpu_request={:?}, \
+         app_replicas={:?}, app_storage_size_gb={:?}, \
+         executor_replicas={}, executor_memory_limit={:?}, executor_memory_request={:?}, \
+         executor_cpu_limit={:?}, executor_cpu_request={:?}, executor_storage_size_gb={:?}, \
+         ephemeral_storage_limit_gb={:?}",
+        app_create_config.app_memory_limit,
+        app_create_config.app_memory_request,
+        app_create_config.app_cpu_limit,
+        app_create_config.app_cpu_request,
+        app_create_config.app_replicas,
+        app_create_config.app_storage_size_gb,
+        app_create_config.executor_replicas,
+        app_create_config.executor_memory_limit,
+        app_create_config.executor_memory_request,
+        app_create_config.executor_cpu_limit,
+        app_create_config.executor_cpu_request,
+        app_create_config.executor_storage_size_gb,
+        app_create_config.ephemeral_storage_limit_gb,
+    );
     let app_id =
         commands::ensure_spice_cloud_app(&cloud, &app_name, &app_create_config, deployment_mode)
             .await?;
