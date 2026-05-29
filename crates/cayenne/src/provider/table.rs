@@ -4376,7 +4376,15 @@ impl CayenneTableProvider {
             return Ok(());
         };
         let converter = self.build_pk_converter(&pk_indices)?;
-        let max_bytes = self.context.pk_keyset_cache_max_bytes();
+        // Size the persistence bloom against the *persist* budget, not the (much
+        // larger, up to 8 GiB) in-memory keyset budget. A checkpoint bloom whose
+        // serialized form exceeds `PK_INDEX_PERSIST_MAX_BYTES` is discarded below
+        // anyway, so building it at the in-memory budget would let compaction
+        // allocate — and potentially OOM on — a blob it will never store.
+        let max_bytes = self
+            .context
+            .pk_keyset_cache_max_bytes()
+            .min(PK_INDEX_PERSIST_MAX_BYTES);
         let expected_keys = usize::try_from(total_rows).unwrap_or(usize::MAX);
         let bloom = self
             .build_snapshot_pk_bloom(
@@ -4445,9 +4453,24 @@ impl CayenneTableProvider {
         if checkpoint_snapshot != self.get_current_snapshot_id() {
             return Ok(None);
         }
-        let Some((mut bloom, _blob_snapshot)) = deserialize_pk_bloom_sidecar(&bytes) else {
+        let Some((mut bloom, blob_snapshot)) = deserialize_pk_bloom_sidecar(&bytes) else {
             return Ok(None);
         };
+        // Defense in depth: the metastore `checkpoint_snapshot` column and the
+        // snapshot id embedded in the blob are written together, so they should
+        // always agree. But if a row is ever inconsistent/corrupt such that the
+        // column matches the current snapshot while the blob was produced for a
+        // different snapshot, trusting it could admit Bloom false negatives and
+        // break upsert correctness. Fail closed to the full rebuild on mismatch.
+        if blob_snapshot != checkpoint_snapshot {
+            tracing::debug!(
+                table = self.table_metadata.table_name.as_str(),
+                checkpoint_snapshot = checkpoint_snapshot.as_str(),
+                blob_snapshot = blob_snapshot.as_str(),
+                "PK-index sidecar snapshot mismatch (metastore column vs blob); rebuilding keyset"
+            );
+            return Ok(None);
+        }
         self.extend_bloom_with_protected_and_inline(pk_indices, converter, &mut bloom)
             .await?;
         tracing::debug!(
