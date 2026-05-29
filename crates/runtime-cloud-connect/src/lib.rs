@@ -169,10 +169,19 @@ impl CloudConnect {
     /// Waits for the background task to exit (≤ 10s drain budget).
     pub async fn shutdown(&self) {
         self.shutdown.trigger();
-        let Some(handle) = self.task.lock().await.take() else {
+        let Some(mut handle) = self.task.lock().await.take() else {
             return;
         };
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle).await;
+        // Give the task its drain budget; if it doesn't exit in time, abort
+        // it rather than dropping the JoinHandle (which would detach the task
+        // and leave it running past shutdown).
+        if tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle)
+            .await
+            .is_err()
+        {
+            tracing::warn!("Cloud Connect: task did not exit within 10s; aborting");
+            handle.abort();
+        }
     }
 }
 

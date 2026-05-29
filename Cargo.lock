@@ -16020,8 +16020,6 @@ version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "async-trait",
- "base64 0.22.1",
- "chrono",
  "dirs",
  "ed25519-dalek",
  "gethostname",
