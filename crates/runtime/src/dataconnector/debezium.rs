@@ -560,7 +560,7 @@ async fn get_metadata_from_kafka(
     declared_schema: Option<&SchemaRef>,
 ) -> super::DataConnectorResult<(KafkaConsumer, DebeziumKafkaMetadata, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
-    tracing::debug!(dataset = %dataset_name, topic, "Creating Kafka consumer");
+    eprintln!("[debezium] {dataset_name}: creating Kafka consumer for topic {topic}");
     let kafka_consumer = KafkaConsumer::create_for_dataset(
         &dataset_name,
         kafka_config.consumer_group_id.clone(),
@@ -571,7 +571,7 @@ async fn get_metadata_from_kafka(
         dataconnector: "debezium",
         connector_component: ConnectorComponent::from(dataset),
     })?;
-    tracing::debug!(dataset = %dataset_name, topic, "Kafka consumer created, subscribing");
+    eprintln!("[debezium] {dataset_name}: consumer created, subscribing to {topic}");
 
     kafka_consumer
         .subscribe(topic)
@@ -580,25 +580,22 @@ async fn get_metadata_from_kafka(
             dataconnector: "debezium",
             connector_component: ConnectorComponent::from(dataset),
         })?;
-    tracing::debug!(dataset = %dataset_name, topic, "Subscribed to topic, checking for messages via fetch_latest_message");
+    eprintln!("[debezium] {dataset_name}: subscribed, calling fetch_latest_message");
 
-    // Use fetch_latest_message (watermark-based, non-blocking) instead of next_json().
-    // next_json() blocks indefinitely when the topic exists but has no messages;
-    // fetch_latest_message() returns Ok(None) immediately in that case by checking
-    // the high-watermark offset before attempting to read.
     let fetch_result = KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
         topic,
         kafka_config,
         Duration::from_secs(30),
     )
     .await;
-    tracing::debug!(dataset = %dataset_name, topic, "fetch_latest_message returned");
+    eprintln!("[debezium] {dataset_name}: fetch_latest_message returned: {}", match &fetch_result {
+        Ok(Some(_)) => "Ok(Some(msg))".to_string(),
+        Ok(None) => "Ok(None)".to_string(),
+        Err(e) => format!("Err({e})"),
+    });
 
     let (key, value) = match fetch_result {
         Ok(Some((key, value))) => (key, value),
-        // Topic is empty (exists but has no messages) or topic is not yet known to the broker.
-        // In both cases the subscribed consumer will begin at offset 0 once messages arrive
-        // (auto.offset.reset = "smallest"), so no explicit seek is required.
         Ok(None) | Err(data_components::kafka::Error::MetadataTopicNotFound { .. }) => {
             if let Some(declared) = declared_schema {
                 tracing::debug!(

@@ -548,13 +548,13 @@ impl KafkaConsumer {
     /// # Errors
     /// Returns an error if topic metadata or watermarks cannot be fetched within `timeout`.
     pub fn topic_has_messages(&self, topic: &str, timeout: Duration) -> Result<bool> {
-        tracing::debug!(topic, "topic_has_messages: fetching metadata");
+        eprintln!("[kafka] topic_has_messages: fetching metadata for {topic}");
         let metadata = self.consumer.fetch_metadata(Some(topic), timeout).context(
             UnableToRestartTopicSnafu {
                 message: "Failed to fetch topic metadata".to_string(),
             },
         )?;
-        tracing::debug!(topic, "topic_has_messages: metadata fetched");
+        eprintln!("[kafka] topic_has_messages: metadata fetched for {topic}");
 
         let topic_metadata = metadata
             .topics()
@@ -565,11 +565,7 @@ impl KafkaConsumer {
             })?;
 
         for partition in topic_metadata.partitions() {
-            tracing::debug!(
-                topic,
-                partition = partition.id(),
-                "topic_has_messages: fetching watermarks"
-            );
+            eprintln!("[kafka] topic_has_messages: fetching watermarks for {topic} partition {}", partition.id());
             let (low, high) = self
                 .consumer
                 .fetch_watermarks(topic, partition.id(), timeout)
@@ -579,13 +575,7 @@ impl KafkaConsumer {
                         partition.id()
                     ),
                 })?;
-            tracing::debug!(
-                topic,
-                partition = partition.id(),
-                low,
-                high,
-                "topic_has_messages: watermarks fetched"
-            );
+            eprintln!("[kafka] topic_has_messages: watermarks for {topic} partition {} low={low} high={high}", partition.id());
             if high > low {
                 return Ok(true);
             }
@@ -687,12 +677,9 @@ impl KafkaConsumer {
         let temp_group_id = format!("spice-schema-peek-{}", uuid::Uuid::new_v4());
         let mut peek_config = kafka_config.clone();
         peek_config.metrics_store = None; // Avoid skewing real consumer metrics
-        tracing::debug!(topic, "fetch_latest_message: creating temp consumer");
+        eprintln!("[kafka] fetch_latest_message: creating temp consumer for {topic}");
         let temp_consumer = Self::create(temp_group_id, &peek_config, None)?;
-        tracing::debug!(
-            topic,
-            "fetch_latest_message: temp consumer created, fetching metadata"
-        );
+        eprintln!("[kafka] fetch_latest_message: temp consumer created, fetching metadata for {topic}");
 
         // Fetch topic metadata to discover partitions
         let metadata = temp_consumer
@@ -701,7 +688,7 @@ impl KafkaConsumer {
             .context(UnableToRestartTopicSnafu {
                 message: "Failed to fetch topic metadata".to_string(),
             })?;
-        tracing::debug!(topic, "fetch_latest_message: metadata fetched");
+        eprintln!("[kafka] fetch_latest_message: metadata fetched for {topic}");
 
         let topic_metadata = metadata
             .topics()
@@ -714,11 +701,7 @@ impl KafkaConsumer {
         // Find the partition with the highest watermark (most recent data)
         let mut best_partition: Option<(i32, i64)> = None;
         for partition in topic_metadata.partitions() {
-            tracing::debug!(
-                topic,
-                partition = partition.id(),
-                "fetch_latest_message: fetching watermarks"
-            );
+            eprintln!("[kafka] fetch_latest_message: fetching watermarks for {topic} partition {}", partition.id());
             let (low, high) = temp_consumer
                 .consumer
                 .fetch_watermarks(topic, partition.id(), timeout)
@@ -728,13 +711,7 @@ impl KafkaConsumer {
                         partition.id()
                     ),
                 })?;
-            tracing::debug!(
-                topic,
-                partition = partition.id(),
-                low,
-                high,
-                "fetch_latest_message: watermarks fetched"
-            );
+            eprintln!("[kafka] fetch_latest_message: watermarks for {topic} partition {} low={low} high={high}", partition.id());
 
             if high > low {
                 match &best_partition {
@@ -745,7 +722,7 @@ impl KafkaConsumer {
         }
 
         let Some((partition_id, high_watermark)) = best_partition else {
-            tracing::debug!(topic, "fetch_latest_message: topic is empty");
+            eprintln!("[kafka] fetch_latest_message: topic {topic} is empty, returning Ok(None)");
             return Ok(None); // No messages available
         };
 
