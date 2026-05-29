@@ -180,10 +180,10 @@ pub(crate) async fn post(
         let model_id = model_id.clone();
         let stream = req.stream.unwrap_or(false);
 
-        if let Some(responses_support) = rt.responses_api_support_for_model(&model_id).await {
-            if let Some(response) = responses_support_gate(&model_id, &responses_support) {
-                return response;
-            }
+        if let Some(responses_support) = rt.responses_api_support_for_model(&model_id).await
+            && let Some(response) = responses_support_gate(&model_id, &responses_support)
+        {
+            return response;
         }
 
         let Some(model) = llms.read().await.get(&model_id).cloned() else {
