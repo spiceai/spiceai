@@ -295,7 +295,7 @@ impl TursoMetastore {
         )
     ";
 
-    /// Schema for the `cayenne_pk_index` table. Mirrors the SQLite definition;
+    /// Schema for the `cayenne_pk_index` table. Mirrors the `SQLite` definition;
     /// captured in metastore snapshots via `EXPECTED_TABLES`.
     const PK_INDEX_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_pk_index (
