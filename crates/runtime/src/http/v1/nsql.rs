@@ -57,10 +57,17 @@ const DEFAULT_NSQL_RETRIES: u8 = 10;
 // NSQL streaming keep alive interval in seconds
 const NSQL_STREAM_KEEP_ALIVE: u64 = 30;
 
-static NSQL_CONTEXT_RESPONSE_MEDIA_TYPES: [MediaType<'static>; 2] = [
+static NSQL_CONTEXT_RESPONSE_MEDIA_TYPES: [MediaType<'static>; 3] = [
     MediaType::new(names::TEXT, names::MARKDOWN),
     MediaType::new(names::TEXT, names::PLAIN),
+    MediaType::new(names::APPLICATION, names::JSON),
 ];
+
+enum NsqlContextResponseFormat {
+    Markdown,
+    PlainText,
+    Json,
+}
 
 fn clean_model_based_sql(input: &str) -> String {
     let no_dashes = match input.strip_prefix("--") {
@@ -159,6 +166,13 @@ pub struct ContextRequest {
     pub datasets: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+struct NsqlContextJsonResponse {
+    /// The rendered NSQL context block injected into `/v1/nsql` model requests.
+    context: String,
+}
+
 impl ContextRequest {
     fn context_options(&self) -> Result<NsqlContextOptions, (StatusCode, String)> {
         validate_context_limit("sampling_limit", self.include_sampling, self.sampling_limit)?;
@@ -190,30 +204,52 @@ fn return_sql_only(accept: Option<&TypedHeader<Accept>>) -> bool {
     accept.is_some_and(|a| accept_header_types(a).contains(&"application/sql".to_string()))
 }
 
-fn context_response_content_type(accept: Option<&TypedHeader<Accept>>) -> Option<HeaderValue> {
+fn context_response_format(
+    accept: Option<&TypedHeader<Accept>>,
+) -> Option<NsqlContextResponseFormat> {
     let content_type = accept.map_or(Some(&NSQL_CONTEXT_RESPONSE_MEDIA_TYPES[0]), |header| {
         header.0.negotiate(&NSQL_CONTEXT_RESPONSE_MEDIA_TYPES)
     })?;
 
     if content_type.subty == names::PLAIN {
-        Some(HeaderValue::from_static("text/plain; charset=utf-8"))
+        Some(NsqlContextResponseFormat::PlainText)
+    } else if content_type.subty == names::JSON {
+        Some(NsqlContextResponseFormat::Json)
     } else {
-        Some(HeaderValue::from_static("text/markdown; charset=utf-8"))
+        Some(NsqlContextResponseFormat::Markdown)
     }
 }
 
 fn nsql_context_response(context: String, accept: Option<&TypedHeader<Accept>>) -> Response {
-    let Some(content_type) = context_response_content_type(accept) else {
+    let Some(response_format) = context_response_format(accept) else {
         return (
             StatusCode::NOT_ACCEPTABLE,
-            "Supported response content types are text/markdown and text/plain",
+            "Supported response content types are text/markdown, text/plain, and application/json",
         )
             .into_response();
     };
 
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, content_type);
-    (StatusCode::OK, headers, context).into_response()
+    match response_format {
+        NsqlContextResponseFormat::Json => {
+            Json(NsqlContextJsonResponse { context }).into_response()
+        }
+        NsqlContextResponseFormat::Markdown => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/markdown; charset=utf-8"),
+            );
+            (StatusCode::OK, headers, context).into_response()
+        }
+        NsqlContextResponseFormat::PlainText => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            (StatusCode::OK, headers, context).into_response()
+        }
+    }
 }
 
 fn nsql_context_error_response(error: &NsqlContextError) -> (StatusCode, String) {
@@ -233,7 +269,7 @@ fn nsql_context_error_response(error: &NsqlContextError) -> (StatusCode, String)
 ///
 /// Return the same context block that `/v1/nsql` injects into the configured NSQL model.
 ///
-/// The response is a markdown/plain-text block containing the in-scope datasets, schemas,
+/// The response is a markdown/plain-text block or JSON object containing the in-scope datasets, schemas,
 /// Spice-specific SQL functions, registered user-defined functions, JSON/Spark compatibility functions,
 /// and optional sample data.
 #[cfg_attr(feature = "openapi", utoipa::path(
@@ -242,7 +278,7 @@ fn nsql_context_error_response(error: &NsqlContextError) -> (StatusCode, String)
     operation_id = "get_nsql_context",
     tag = "SQL",
     params(
-        ("Accept" = String, Header, description = "The format of the response, one of 'text/markdown' (default) or 'text/plain'."),
+        ("Accept" = String, Header, description = "The format of the response, one of 'text/markdown' (default), 'text/plain', or 'application/json'."),
         ContextRequest
     ),
     responses(
@@ -252,12 +288,17 @@ fn nsql_context_error_response(error: &NsqlContextError) -> (StatusCode, String)
         ), (
             String = "text/plain",
             example = "# Spice.ai NSQL Context\n\n## Datasets\n- `sales_data`"
+        ), (
+            NsqlContextJsonResponse = "application/json",
+            example = json!({
+                "context": "# Spice.ai NSQL Context\n\n## Datasets\n- `sales_data`"
+            })
         ))),
         (status = 400, description = "Invalid request parameters", content((
             String = "text/plain", example = "Dataset 'sales.orders' not found"
         ))),
         (status = 406, description = "Requested response content type is not available", content((
-            String = "text/plain", example = "Supported response content types are text/markdown and text/plain"
+            String = "text/plain", example = "Supported response content types are text/markdown, text/plain, and application/json"
         ))),
         (status = 500, description = "Internal server error", content((
             String, example = "Unexpected internal error. App not prepared in runtime."
@@ -698,6 +739,7 @@ mod tests {
     use axum_extra::extract::Query as ExtraQuery;
     use datafusion::sql::TableReference;
     use http::Uri;
+    use http_body_util::BodyExt;
     use serde_json::json;
     use spicepod::component::{
         function::{
@@ -844,9 +886,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn nsql_context_response_negotiates_json() {
+        let accept = accept_header("application/json");
+        let response = nsql_context_response("context".to_string(), Some(&accept));
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .expect("content type should be set")
+                .to_str()
+                .expect("content type should be valid ASCII"),
+            "application/json"
+        );
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body should collect")
+            .to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("response body should be JSON");
+
+        assert_eq!(body, json!({ "context": "context" }));
+    }
+
     #[test]
     fn nsql_context_response_rejects_unsupported_accept() {
-        let accept = accept_header("application/json");
+        let accept = accept_header("application/xml");
         let response = nsql_context_response("context".to_string(), Some(&accept));
 
         assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
