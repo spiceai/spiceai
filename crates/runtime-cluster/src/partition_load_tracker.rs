@@ -283,6 +283,7 @@ mod tests {
             schema_version: 1,
             updated_at: 1,
             partition_expressions: vec!["date".into()],
+            active_discovery_job_id: None,
         };
 
         assert!(
