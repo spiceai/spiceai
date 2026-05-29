@@ -43,7 +43,7 @@ use cayenne::{
     CayenneTableProvider,
     logical_optimizer::{
         CayenneInListToRangeRewrite, CayennePropagateFilterAcrossEquiJoinKeys,
-        CayenneReassociateCrossJoin,
+        CayennePushDownSemiJoin, CayenneReassociateCrossJoin,
     },
 };
 #[cfg(not(windows))]
@@ -154,11 +154,15 @@ pub(crate) struct CayenneOptimizerRules {
     physical: CayennePhysicalOptimizerRules,
 }
 
+// Each field toggles one Cayenne logical optimizer rule; a flag bag is the
+// natural shape here, so the >3-bools pedantic lint does not apply.
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CayenneLogicalOptimizerRules {
     filter_propagation: bool,
     cross_join_reassociation: bool,
     inlist_to_range: bool,
+    semi_join_pushdown: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,6 +180,7 @@ impl CayenneOptimizerRules {
                 filter_propagation: false,
                 cross_join_reassociation: true,
                 inlist_to_range: false,
+                semi_join_pushdown: false,
             },
             physical: CayennePhysicalOptimizerRules {
                 dynamic_filter_sharing: true,
@@ -192,6 +197,7 @@ impl CayenneOptimizerRules {
                 filter_propagation: true,
                 cross_join_reassociation: true,
                 inlist_to_range: true,
+                semi_join_pushdown: true,
             },
             physical: CayennePhysicalOptimizerRules {
                 dynamic_filter_sharing: true,
@@ -208,6 +214,7 @@ impl CayenneOptimizerRules {
                 filter_propagation: false,
                 cross_join_reassociation: false,
                 inlist_to_range: false,
+                semi_join_pushdown: false,
             },
             physical: CayennePhysicalOptimizerRules {
                 dynamic_filter_sharing: false,
@@ -242,6 +249,15 @@ impl CayenneOptimizerRules {
 
     pub fn set_inlist_to_range(&mut self, enabled: bool) {
         self.logical.inlist_to_range = enabled;
+    }
+
+    #[must_use]
+    pub const fn semi_join_pushdown(self) -> bool {
+        self.logical.semi_join_pushdown
+    }
+
+    pub fn set_semi_join_pushdown(&mut self, enabled: bool) {
+        self.logical.semi_join_pushdown = enabled;
     }
 
     #[must_use]
@@ -850,6 +866,9 @@ fn with_cayenne_logical_optimizers(
     if cayenne_optimizer_rules.inlist_to_range() {
         insert_cayenne_inlist_to_range_rewrite(&mut optimizer_rules);
     }
+    if cayenne_optimizer_rules.semi_join_pushdown() {
+        insert_cayenne_push_down_semi_join(&mut optimizer_rules);
+    }
     optimizer_rules.extend(trailing_rules);
     state.with_optimizer_rules(optimizer_rules)
 }
@@ -934,6 +953,36 @@ fn insert_cayenne_inlist_to_range_rewrite(rules: &mut Vec<Arc<dyn OptimizerRule 
                     is_cayenne_accelerated_table_provider,
                 ),
             ),
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn insert_cayenne_push_down_semi_join(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
+    // Run after `decorrelate_predicate_subquery` has turned `col IN (subquery)`
+    // into the `LeftSemi` join this rule pushes down, and before `push_down_filter`
+    // consumes the rewritten tree.
+    if !rules
+        .iter()
+        .any(|rule| rule.name() == "cayenne_push_down_semi_join")
+    {
+        let insert_at = rules
+            .iter()
+            .position(|rule| rule.name() == "decorrelate_predicate_subquery")
+            .map_or_else(
+                || {
+                    rules
+                        .iter()
+                        .position(|rule| rule.name() == "push_down_filter")
+                        .unwrap_or(rules.len())
+                },
+                |position| position + 1,
+            );
+        rules.insert(
+            insert_at,
+            Arc::new(CayennePushDownSemiJoin::new_with_table_provider_predicate(
+                is_cayenne_accelerated_table_provider,
+            )),
         );
     }
 }

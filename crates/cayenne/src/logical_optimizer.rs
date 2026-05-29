@@ -531,6 +531,336 @@ impl OptimizerRule for CayenneInListToRangeRewrite {
     }
 }
 
+/// Minimum upper-bound row count of the landing scan before a semi-join is
+/// pushed down onto it. Below this the pushed-down semi-join can't recoup its
+/// overhead, so the join is left where `DataFusion` placed it. Scans whose row
+/// count is unknown are allowed through — we only skip when we can *prove* the
+/// scan is small.
+const MIN_SEMI_JOIN_PUSHDOWN_SCAN_ROWS: usize = 100_000;
+
+/// Logical optimizer rule that pushes a `LeftSemi`/`RightSemi` join down through
+/// inner joins (and identity-preserving `Projection`/`Filter` wrappers) so it
+/// prunes the base Cayenne table scan that sources its join key *before* the
+/// expensive multi-way joins build their non-spillable hash tables.
+///
+/// TPC-H Q18 is the motivating shape: `o_orderkey IN (SELECT l_orderkey FROM
+/// lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 300)` decorrelates into
+/// a `LeftSemi` join at the very top of the plan, so the full
+/// `customer ⋈ orders ⋈ lineitem` join is materialised and only *then* filtered
+/// by the handful of qualifying orderkeys — leaving a multi-GB non-spillable
+/// `HashJoinInput` build behind. Pushing the semi-join down to the `orders` scan
+/// prunes orders to those orderkeys first, collapsing the downstream build from
+/// billions of rows to thousands (and avoiding the OOM without paying the
+/// sort-merge tax).
+///
+/// Soundness rests on the reordering law `(R ⋈ T) ⋉ₖ S ≡ (R ⋉ₖ S) ⋈ T`, valid
+/// whenever every semi-join key column `k` is sourced solely from `R`. The rule
+/// therefore only descends through:
+///
+///   * `Inner` joins with default SQL NULL equality, into the *single* side that
+///     carries every key column (never an outer/anti join — its row-preservation
+///     or null-padding could change which kept rows survive);
+///   * identity-preserving `Projection`/`Filter` wrappers that still expose every
+///     key column (a projection that recomputes a key drops the qualified column
+///     from the child schema, which ends the descent — the key-transform guard).
+///
+/// It only *lands* on a Cayenne `TableScan` carrying every key column. If no
+/// such scan is reachable the plan is left untouched, so the rule never makes a
+/// non-pushable shape worse.
+pub struct CayennePushDownSemiJoin {
+    is_cayenne_table_source: TableSourcePredicate,
+}
+
+impl Default for CayennePushDownSemiJoin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CayennePushDownSemiJoin {
+    /// Create a new instance of the rule.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::new_with_table_provider_predicate(|provider| {
+            provider.as_any().is::<CayenneTableProvider>()
+        })
+    }
+
+    /// Create a new instance with a caller-provided table-provider predicate.
+    #[must_use]
+    pub fn new_with_table_provider_predicate(
+        is_cayenne_table_provider: impl Fn(&dyn TableProvider) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        let is_cayenne_table_provider: TableProviderPredicate = Arc::new(is_cayenne_table_provider);
+        Self::new_with_table_source_predicate(move |source| {
+            source
+                .as_any()
+                .downcast_ref::<DefaultTableSource>()
+                .is_some_and(|source| is_cayenne_table_provider(source.table_provider.as_ref()))
+        })
+    }
+
+    /// Create a new instance with a caller-provided table-source predicate.
+    #[must_use]
+    pub fn new_with_table_source_predicate(
+        is_cayenne_table_source: impl Fn(&dyn TableSource) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            is_cayenne_table_source: Arc::new(is_cayenne_table_source),
+        }
+    }
+
+    /// Recursively plant `LeftSemi(<cayenne scan>, filter_side)` as deep as
+    /// possible inside `node`, rebuilding the structure above it. Returns `None`
+    /// when no eligible Cayenne scan carrying every `kept_keys` column is
+    /// reachable through inner joins / identity wrappers.
+    fn push_to_cayenne_scan(
+        &self,
+        node: &LogicalPlan,
+        filter_side: &Arc<LogicalPlan>,
+        key_pairs: &[(Column, Column)],
+        kept_keys: &[Column],
+    ) -> Result<Option<LogicalPlan>, DataFusionError> {
+        match node {
+            // Landing: a Cayenne scan carrying every kept-side key column.
+            LogicalPlan::TableScan(scan)
+                if (self.is_cayenne_table_source)(scan.source.as_ref())
+                    && kept_keys.iter().all(|key| table_scan_has_column(scan, key)) =>
+            {
+                if !scan_large_enough_for_semi_join_pushdown(scan) {
+                    return Ok(None);
+                }
+                Ok(Some(build_landed_semi_join(
+                    node.clone(),
+                    filter_side,
+                    key_pairs,
+                )?))
+            }
+            // Inner join: descend into the single side that carries all keys.
+            LogicalPlan::Join(inner)
+                if inner.join_type == JoinType::Inner
+                    && inner.null_equality == NullEquality::NullEqualsNothing =>
+            {
+                let left_has = kept_keys
+                    .iter()
+                    .all(|key| schema_has_column(inner.left.schema(), key));
+                let right_has = kept_keys
+                    .iter()
+                    .all(|key| schema_has_column(inner.right.schema(), key));
+                match (left_has, right_has) {
+                    (true, false) => {
+                        let Some(new_left) = self.push_to_cayenne_scan(
+                            &inner.left,
+                            filter_side,
+                            key_pairs,
+                            kept_keys,
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        Ok(Some(rebuild_inner_join(
+                            inner,
+                            Arc::new(new_left),
+                            Arc::clone(&inner.right),
+                        )?))
+                    }
+                    (false, true) => {
+                        let Some(new_right) = self.push_to_cayenne_scan(
+                            &inner.right,
+                            filter_side,
+                            key_pairs,
+                            kept_keys,
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        Ok(Some(rebuild_inner_join(
+                            inner,
+                            Arc::clone(&inner.left),
+                            Arc::new(new_right),
+                        )?))
+                    }
+                    // Keys split across both sides (or neither side carries them
+                    // all): there is no single side to push into.
+                    _ => Ok(None),
+                }
+            }
+            // Identity wrapper: descend if the child still exposes every key.
+            LogicalPlan::Projection(projection)
+                if kept_keys
+                    .iter()
+                    .all(|key| schema_has_column(projection.input.schema(), key)) =>
+            {
+                let Some(new_input) = self.push_to_cayenne_scan(
+                    &projection.input,
+                    filter_side,
+                    key_pairs,
+                    kept_keys,
+                )?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(LogicalPlan::Projection(Projection::try_new(
+                    projection.expr.clone(),
+                    Arc::new(new_input),
+                )?)))
+            }
+            LogicalPlan::Filter(filter)
+                if kept_keys
+                    .iter()
+                    .all(|key| schema_has_column(filter.input.schema(), key)) =>
+            {
+                let Some(new_input) =
+                    self.push_to_cayenne_scan(&filter.input, filter_side, key_pairs, kept_keys)?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(LogicalPlan::Filter(Filter::try_new(
+                    filter.predicate.clone(),
+                    Arc::new(new_input),
+                )?)))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+impl std::fmt::Debug for CayennePushDownSemiJoin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CayennePushDownSemiJoin").finish()
+    }
+}
+
+impl OptimizerRule for CayennePushDownSemiJoin {
+    fn name(&self) -> &'static str {
+        "cayenne_push_down_semi_join"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        // TopDown: handle the outermost semi-join first, planting it deep. The
+        // resulting scan-anchored `LeftSemi` is rejected on re-entry (its kept
+        // side is a bare `TableScan`), so the rewrite is idempotent.
+        Some(ApplyOrder::TopDown)
+    }
+
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>, DataFusionError> {
+        let LogicalPlan::Join(join) = plan else {
+            return Ok(Transformed::no(plan));
+        };
+        // Only plain `LeftSemi`/`RightSemi` equi-joins with default NULL equality
+        // and no residual non-equi filter — anything else changes the kept-row
+        // set in ways the reordering law does not cover.
+        if !matches!(join.join_type, JoinType::LeftSemi | JoinType::RightSemi)
+            || join.null_equality != NullEquality::NullEqualsNothing
+            || join.filter.is_some()
+            || join.on.is_empty()
+        {
+            return Ok(Transformed::no(LogicalPlan::Join(join)));
+        }
+
+        let kept_on_left = matches!(join.join_type, JoinType::LeftSemi);
+        let (kept_side, filter_side) = if kept_on_left {
+            (&join.left, &join.right)
+        } else {
+            (&join.right, &join.left)
+        };
+
+        // Nothing to do unless the kept side has structure to descend through —
+        // a bare scan is already where the semi-join belongs (this is also what
+        // makes the rewrite idempotent).
+        if !matches!(
+            kept_side.as_ref(),
+            LogicalPlan::Join(_) | LogicalPlan::Projection(_) | LogicalPlan::Filter(_)
+        ) {
+            return Ok(Transformed::no(LogicalPlan::Join(join)));
+        }
+
+        // Column-vs-column equi-keys only, oriented `(kept_column, filter_column)`.
+        // Bail on any expression key — we cannot trace its provenance to a scan.
+        let mut key_pairs: Vec<(Column, Column)> = Vec::with_capacity(join.on.len());
+        for (left_expr, right_expr) in &join.on {
+            let (kept_expr, filter_expr) = if kept_on_left {
+                (left_expr, right_expr)
+            } else {
+                (right_expr, left_expr)
+            };
+            let (Expr::Column(kept_column), Expr::Column(filter_column)) = (kept_expr, filter_expr)
+            else {
+                return Ok(Transformed::no(LogicalPlan::Join(join)));
+            };
+            key_pairs.push((kept_column.clone(), filter_column.clone()));
+        }
+        let kept_keys: Vec<Column> = key_pairs.iter().map(|(kept, _)| kept.clone()).collect();
+
+        match self.push_to_cayenne_scan(kept_side, filter_side, &key_pairs, &kept_keys)? {
+            Some(rewritten) => Ok(Transformed::yes(rewritten)),
+            None => Ok(Transformed::no(LogicalPlan::Join(join))),
+        }
+    }
+}
+
+/// Build the scan-anchored `LeftSemi` join planted by [`CayennePushDownSemiJoin`].
+/// The kept (scan) side is always on the left, so the join keeps scan rows that
+/// match the filter side — the same membership the original outer semi-join
+/// computed, just evaluated before the expensive joins.
+fn build_landed_semi_join(
+    scan: LogicalPlan,
+    filter_side: &Arc<LogicalPlan>,
+    key_pairs: &[(Column, Column)],
+) -> Result<LogicalPlan, DataFusionError> {
+    let on = key_pairs
+        .iter()
+        .map(|(kept, filter)| (column_expr(kept), column_expr(filter)))
+        .collect();
+    Ok(LogicalPlan::Join(Join::try_new(
+        Arc::new(scan),
+        Arc::clone(filter_side),
+        on,
+        None,
+        JoinType::LeftSemi,
+        JoinConstraint::On,
+        NullEquality::NullEqualsNothing,
+    )?))
+}
+
+fn rebuild_inner_join(
+    inner: &Join,
+    new_left: Arc<LogicalPlan>,
+    new_right: Arc<LogicalPlan>,
+) -> Result<LogicalPlan, DataFusionError> {
+    Ok(LogicalPlan::Join(Join::try_new(
+        new_left,
+        new_right,
+        inner.on.clone(),
+        inner.filter.clone(),
+        inner.join_type,
+        inner.join_constraint,
+        inner.null_equality,
+    )?))
+}
+
+fn schema_has_column(schema: &datafusion::common::DFSchemaRef, column: &Column) -> bool {
+    schema.has_column(column)
+        || schema
+            .qualified_field_with_unqualified_name(&column.name)
+            .is_ok()
+}
+
+fn scan_large_enough_for_semi_join_pushdown(scan: &datafusion::logical_expr::TableScan) -> bool {
+    match table_scan_upper_bound_rows(scan) {
+        Some(rows) => rows >= MIN_SEMI_JOIN_PUSHDOWN_SCAN_ROWS,
+        None => true,
+    }
+}
+
 fn is_single_cayenne_table_scan_input(
     plan: &LogicalPlan,
     is_cayenne_table_source: &TableSourcePredicate,
@@ -1668,6 +1998,257 @@ mod tests {
             }
         })?;
         Ok((transformed.data, any_changed))
+    }
+
+    fn push_down_semi_join_rule() -> CayennePushDownSemiJoin {
+        CayennePushDownSemiJoin::new_with_table_source_predicate(|_| true)
+    }
+
+    fn col(table: &str, column: &str) -> Expr {
+        Expr::Column(Column::new(Some(table), column))
+    }
+
+    /// Schemas for a Q18-shaped `customer ⋈ orders ⋈ lineitem` semi-joined
+    /// against a qualifying-orderkey subquery (`sq`).
+    fn q18_schemas() -> (Arc<Schema>, Arc<Schema>, Arc<Schema>, Arc<Schema>) {
+        (
+            Arc::new(Schema::new(vec![
+                Field::new("c_custkey", DataType::Int64, false),
+                Field::new("c_name", DataType::Utf8, true),
+            ])),
+            Arc::new(Schema::new(vec![
+                Field::new("o_orderkey", DataType::Int64, false),
+                Field::new("o_custkey", DataType::Int64, false),
+            ])),
+            Arc::new(Schema::new(vec![
+                Field::new("l_orderkey", DataType::Int64, false),
+                Field::new("l_quantity", DataType::Int64, false),
+            ])),
+            Arc::new(Schema::new(vec![Field::new(
+                "sq_orderkey",
+                DataType::Int64,
+                false,
+            )])),
+        )
+    }
+
+    /// Build `LeftSemi( (customer ⋈ orders) ⋈ lineitem, sq )` on
+    /// `orders.o_orderkey = sq.sq_orderkey`. `cust_orders_join_type` lets a test
+    /// place an outer join on the path to `orders`; `orders_rows` drives the
+    /// size gate.
+    fn build_q18_semi_join(
+        cust_orders_join_type: JoinType,
+        orders_rows: usize,
+    ) -> Result<LogicalPlan> {
+        let (customer_s, orders_s, lineitem_s, sq_s) = q18_schemas();
+        let customer = stat_table_scan("customer", &customer_s, 1_500_000)?;
+        let orders = stat_table_scan("orders", &orders_s, orders_rows)?;
+        let lineitem = stat_table_scan("lineitem", &lineitem_s, 60_000_000)?;
+        let sq = stat_table_scan("sq", &sq_s, 5_000)?;
+
+        let cust_orders = LogicalPlan::Join(Join::try_new(
+            Arc::new(customer),
+            Arc::new(orders),
+            vec![(col("customer", "c_custkey"), col("orders", "o_custkey"))],
+            None,
+            cust_orders_join_type,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+        let three_way = LogicalPlan::Join(Join::try_new(
+            Arc::new(cust_orders),
+            Arc::new(lineitem),
+            vec![(col("orders", "o_orderkey"), col("lineitem", "l_orderkey"))],
+            None,
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+        Ok(LogicalPlan::Join(Join::try_new(
+            Arc::new(three_way),
+            Arc::new(sq),
+            vec![(col("orders", "o_orderkey"), col("sq", "sq_orderkey"))],
+            None,
+            JoinType::LeftSemi,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?))
+    }
+
+    /// Return the table name under the left (kept) child of the first
+    /// `LeftSemi` join, if that child is a bare `TableScan`.
+    fn left_semi_landing_scan(plan: &LogicalPlan) -> Option<String> {
+        let mut result = None;
+        let _ = plan.apply(|node| {
+            if let LogicalPlan::Join(join) = node
+                && join.join_type == JoinType::LeftSemi
+                && let LogicalPlan::TableScan(scan) = join.left.as_ref()
+            {
+                result = Some(scan.table_name.table().to_string());
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        result
+    }
+
+    #[test]
+    fn semi_join_pushed_through_inner_joins_to_scan() -> Result<()> {
+        let plan = build_q18_semi_join(JoinType::Inner, 15_000_000)?;
+        let original_schema = Arc::clone(plan.schema());
+
+        let transformed = push_down_semi_join_rule().rewrite(
+            plan.clone(),
+            &datafusion::optimizer::OptimizerContext::new(),
+        )?;
+
+        assert!(
+            transformed.transformed,
+            "Q18-shaped semi-join should push down to the orders scan; plan was:\n{plan}"
+        );
+        // Semi-join preserves the kept-side schema, so pushing it down must not
+        // change the overall output schema.
+        assert_eq!(transformed.data.schema(), &original_schema);
+        // The outermost join is no longer the semi-join — it moved below.
+        assert!(
+            !matches!(&transformed.data, LogicalPlan::Join(j) if j.join_type == JoinType::LeftSemi),
+            "top join should no longer be the semi-join; plan was:\n{}",
+            transformed.data
+        );
+        // ...and it now sits directly over the orders scan.
+        assert_eq!(
+            left_semi_landing_scan(&transformed.data).as_deref(),
+            Some("orders"),
+            "semi-join should be planted on the orders scan; plan was:\n{}",
+            transformed.data
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn semi_join_already_on_bare_scan_is_unchanged() -> Result<()> {
+        let (_, orders_s, _, sq_s) = q18_schemas();
+        let orders = stat_table_scan("orders", &orders_s, 15_000_000)?;
+        let sq = stat_table_scan("sq", &sq_s, 5_000)?;
+        let plan = LogicalPlan::Join(Join::try_new(
+            Arc::new(orders),
+            Arc::new(sq),
+            vec![(col("orders", "o_orderkey"), col("sq", "sq_orderkey"))],
+            None,
+            JoinType::LeftSemi,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+
+        let transformed = push_down_semi_join_rule().rewrite(
+            plan.clone(),
+            &datafusion::optimizer::OptimizerContext::new(),
+        )?;
+        assert!(
+            !transformed.transformed,
+            "a semi-join already on a bare scan must be left unchanged (idempotence); plan was:\n{plan}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn semi_join_not_pushed_through_outer_join() -> Result<()> {
+        // A LEFT join sits between the semi-join and the orders scan: pushing the
+        // semi-join past it could drop rows the outer join is meant to preserve,
+        // so the rule must not descend.
+        let plan = build_q18_semi_join(JoinType::Left, 15_000_000)?;
+        let transformed = push_down_semi_join_rule().rewrite(
+            plan.clone(),
+            &datafusion::optimizer::OptimizerContext::new(),
+        )?;
+        assert!(
+            !transformed.transformed,
+            "semi-join must not be pushed through an outer join; plan was:\n{plan}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn semi_join_not_pushed_when_no_cayenne_scan() -> Result<()> {
+        // With a predicate that treats no source as Cayenne, there is no eligible
+        // landing scan, so the rule leaves the plan untouched.
+        let plan = build_q18_semi_join(JoinType::Inner, 15_000_000)?;
+        let rule = CayennePushDownSemiJoin::new_with_table_source_predicate(|_| false);
+        let transformed = rule.rewrite(
+            plan.clone(),
+            &datafusion::optimizer::OptimizerContext::new(),
+        )?;
+        assert!(
+            !transformed.transformed,
+            "no Cayenne landing scan => no pushdown; plan was:\n{plan}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn semi_join_not_pushed_to_small_scan() -> Result<()> {
+        // orders is below the size gate, so the pushdown can't recoup its cost.
+        let plan = build_q18_semi_join(JoinType::Inner, 10_000)?;
+        let transformed = push_down_semi_join_rule().rewrite(
+            plan.clone(),
+            &datafusion::optimizer::OptimizerContext::new(),
+        )?;
+        assert!(
+            !transformed.transformed,
+            "semi-join must not be pushed onto a small scan; plan was:\n{plan}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn semi_join_with_expression_key_is_unchanged() -> Result<()> {
+        // A non-column (key-transforming) semi-join key can't be traced to a
+        // scan, so the rule bails.
+        let (customer_s, orders_s, lineitem_s, sq_s) = q18_schemas();
+        let customer = stat_table_scan("customer", &customer_s, 1_500_000)?;
+        let orders = stat_table_scan("orders", &orders_s, 15_000_000)?;
+        let lineitem = stat_table_scan("lineitem", &lineitem_s, 60_000_000)?;
+        let sq = stat_table_scan("sq", &sq_s, 5_000)?;
+        let cust_orders = LogicalPlan::Join(Join::try_new(
+            Arc::new(customer),
+            Arc::new(orders),
+            vec![(col("customer", "c_custkey"), col("orders", "o_custkey"))],
+            None,
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+        let three_way = LogicalPlan::Join(Join::try_new(
+            Arc::new(cust_orders),
+            Arc::new(lineitem),
+            vec![(col("orders", "o_orderkey"), col("lineitem", "l_orderkey"))],
+            None,
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+        let plan = LogicalPlan::Join(Join::try_new(
+            Arc::new(three_way),
+            Arc::new(sq),
+            // expression key: o_orderkey + 1 (not a plain column)
+            vec![(
+                col("orders", "o_orderkey") + datafusion_expr::lit(1_i64),
+                col("sq", "sq_orderkey"),
+            )],
+            None,
+            JoinType::LeftSemi,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNothing,
+        )?);
+        let transformed = push_down_semi_join_rule().rewrite(
+            plan.clone(),
+            &datafusion::optimizer::OptimizerContext::new(),
+        )?;
+        assert!(
+            !transformed.transformed,
+            "expression (non-column) semi-join key must not be pushed; plan was:\n{plan}"
+        );
+        Ok(())
     }
 
     #[test]

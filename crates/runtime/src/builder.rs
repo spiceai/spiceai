@@ -789,6 +789,9 @@ fn parse_cayenne_optimizer_rules(
             "inlist_to_range" | "in_list_to_range" => {
                 rules.set_inlist_to_range(true);
             }
+            "semi_join_pushdown" | "push_down_semi_join" | "semi_join" => {
+                rules.set_semi_join_pushdown(true);
+            }
             "dynamic_filter_sharing" | "dynamic_filters" => {
                 rules.set_dynamic_filter_sharing(true);
             }
@@ -991,6 +994,23 @@ mod test {
                 true,
             ),
             selected_rules
+        );
+
+        // `semi_join_pushdown` is opt-in: off under `auto`, on under `all`, and
+        // selectable by token (including its aliases) without enabling anything else.
+        assert!(!CayenneOptimizerRules::auto_enabled().semi_join_pushdown());
+        assert!(CayenneOptimizerRules::all_enabled().semi_join_pushdown());
+        let mut semi_join_only = CayenneOptimizerRules::none();
+        semi_join_only.set_semi_join_pushdown(true);
+        assert_eq!(
+            parse_cayenne_optimizer_rules(
+                &HashMap::from([(
+                    CAYENNE_OPTIMIZER_RULES_PARAM.to_string(),
+                    "semi-join".to_string(),
+                )]),
+                false,
+            ),
+            semi_join_only
         );
 
         assert_eq!(
