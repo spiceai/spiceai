@@ -36,6 +36,7 @@ use datafusion::logical_expr::ScalarUDF;
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::supported_functions::{FunctionRestriction, FunctionSupport};
 use parking_lot::RwLock;
+use runtime_datafusion::query_engine::QueryEngine;
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::{
     ai::{AI_UDF_NAME, Ai},

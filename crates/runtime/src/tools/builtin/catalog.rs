@@ -142,6 +142,8 @@ impl BuiltinToolCatalog {
                 self.model_table_allowlist.clone()
             };
 
+        let query_engine: Arc<dyn QueryEngine> = self.rt.datafusion();
+
         match id {
             "get_readiness" => Ok(Arc::new(GetReadinessTool::new(
                 Arc::clone(&self.status),
