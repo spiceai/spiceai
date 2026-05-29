@@ -4448,6 +4448,20 @@ impl CayenneTableProvider {
         else {
             return Ok(None);
         };
+        // Defensive read-side bound mirroring the write-side persist cap: a
+        // corrupted or manually-modified metastore row could carry an oversized
+        // `index_blob` that would drive a large allocation in
+        // `deserialize_pk_bloom_sidecar` before we could fall back. Fail closed to
+        // the full rebuild when it exceeds the persist budget.
+        if bytes.len() > PK_INDEX_PERSIST_MAX_BYTES {
+            tracing::debug!(
+                table = self.table_metadata.table_name.as_str(),
+                blob_bytes = bytes.len(),
+                max_bytes = PK_INDEX_PERSIST_MAX_BYTES,
+                "Persisted PK-index blob exceeds the persist budget; rebuilding keyset"
+            );
+            return Ok(None);
+        }
         // Gate on the snapshot tag: the bloom covers the full current snapshot
         // only if nothing rewrote it since the checkpoint (compaction re-persists).
         if checkpoint_snapshot != self.get_current_snapshot_id() {
