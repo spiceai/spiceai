@@ -645,8 +645,7 @@ mod tests {
         }
 
         assert_eq!(
-            validation_reference_schema(&args, &app, &query_set, &queries, false)
-                .expect("should get reference schema"),
+            validation_reference_schema(&args, &app, &query_set, &queries, false),
             Some("arrow".to_string())
         );
 
@@ -694,8 +693,7 @@ mod tests {
         add_unqualified_datasets(&mut app, &table_names);
 
         assert_eq!(
-            validation_reference_schema(&args, &app, &query_set, &queries, false)
-                .expect("should not assume generated schema exists"),
+            validation_reference_schema(&args, &app, &query_set, &queries, false),
             None
         );
 
@@ -709,8 +707,7 @@ mod tests {
                 .any(|dataset| dataset.name == "__test_reference.order_line")
         );
         assert_eq!(
-            validation_reference_schema(&args, &app, &query_set, &queries, false)
-                .expect("should detect generated schema"),
+            validation_reference_schema(&args, &app, &query_set, &queries, false),
             Some("__test_reference".to_string())
         );
     }
