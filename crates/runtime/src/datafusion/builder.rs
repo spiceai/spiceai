@@ -1523,8 +1523,11 @@ mod tests {
 
         assert_eq!(
             logical_rule_names,
-            vec!["cayenne_reassociate_cross_join"],
-            "Default Cayenne logical optimizer selection should keep risky legacy logical rewrites off while enabling the scoped cross-join reassociation"
+            vec![
+                "cayenne_push_down_semi_join",
+                "cayenne_reassociate_cross_join"
+            ],
+            "Default Cayenne logical optimizer selection should keep the risky legacy logical rewrites (filter propagation, in-list range) off while enabling the scoped cross-join reassociation and the Q18 semi-join pushdown"
         );
         assert_eq!(
             physical_rule_names,
@@ -1625,6 +1628,8 @@ mod tests {
         cross_join_reassociation.set_cross_join_reassociation(true);
         let mut inlist_to_range = CayenneOptimizerRules::none();
         inlist_to_range.set_inlist_to_range(true);
+        let mut semi_join_pushdown = CayenneOptimizerRules::none();
+        semi_join_pushdown.set_semi_join_pushdown(true);
         let mut dynamic_filter_sharing = CayenneOptimizerRules::none();
         dynamic_filter_sharing.set_dynamic_filter_sharing(true);
         let mut anti_join_sort_merge = CayenneOptimizerRules::none();
@@ -1646,6 +1651,11 @@ mod tests {
             (
                 inlist_to_range,
                 vec!["cayenne_inlist_to_range_rewrite"],
+                vec![],
+            ),
+            (
+                semi_join_pushdown,
+                vec!["cayenne_push_down_semi_join"],
                 vec![],
             ),
             (
