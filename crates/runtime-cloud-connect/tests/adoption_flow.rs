@@ -25,6 +25,14 @@ limitations under the License.
 //! - `ApplySpicepod` round-trip: server sends ApplySpicepod → client
 //!   writes the YAML to disk and replies with success.
 
+#![expect(
+    clippy::unwrap_used,
+    clippy::doc_markdown,
+    clippy::struct_field_names,
+    clippy::items_after_statements,
+    reason = "integration-test harness — readability over lint strictness"
+)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;

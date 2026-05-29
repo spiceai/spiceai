@@ -32,6 +32,14 @@ limitations under the License.
 //! arithmetic (DEFAULT / HARD) is covered by unit tests inside
 //! `bin/spiced/src/cloud_connect.rs`.
 
+#![expect(
+    clippy::unwrap_used,
+    clippy::doc_markdown,
+    clippy::struct_field_names,
+    clippy::items_after_statements,
+    reason = "integration-test harness — readability over lint strictness"
+)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
