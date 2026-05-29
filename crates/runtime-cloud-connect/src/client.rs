@@ -364,7 +364,20 @@ impl ClientDriver {
                 );
                 let identifier = live_identifier.read().await.clone();
                 let started = std::time::Instant::now();
-                match self.runtime.execute_sql(&cmd.sql, cmd.max_rows).await {
+                // Race the query against shutdown so a slow cloud-originated
+                // query can't hold the driver task until the shutdown timeout
+                // — abandon it and exit promptly if shutdown fires mid-query.
+                let exec_outcome = tokio::select! {
+                    r = self.runtime.execute_sql(&cmd.sql, cmd.max_rows) => r,
+                    () = self.shutdown.wait() => {
+                        tracing::info!(
+                            command_id = %cmd.command_id,
+                            "Cloud Connect: shutdown during RunQuery; abandoning command"
+                        );
+                        return Some(ExitReason::Shutdown);
+                    }
+                };
+                match exec_outcome {
                     Ok(result) => {
                         let duration_ms = started.elapsed().as_millis() as u64;
                         emit_run_query_audit(

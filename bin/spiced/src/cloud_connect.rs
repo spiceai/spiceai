@@ -197,7 +197,12 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             let batch = batch.map_err(|e| e.to_string())?;
             let take_rows = cap.saturating_sub(collected_rows);
             if take_rows == 0 {
-                source_truncated = true;
+                // We've hit the cap. Only flag truncation if this next
+                // batch actually carries rows — an empty trailing batch
+                // means the result ended exactly at the cap, not beyond it.
+                if batch.num_rows() > 0 {
+                    source_truncated = true;
+                }
                 break;
             }
             if batch.num_rows() > take_rows {

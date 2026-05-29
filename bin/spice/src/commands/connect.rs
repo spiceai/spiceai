@@ -54,10 +54,11 @@ CLOUD CONNECT ADOPTION:
   spice connect status                    Show the current adoption state.
   spice connect forget                    Clear the local identity on disk.
                                           A running `spiced` keeps its
-                                          in-memory identity and active stream
-                                          until it is restarted (or the cloud
-                                          sends Forget / the stream drops), so
-                                          restart spiced to stop remote
+                                          in-memory identity until it is
+                                          restarted or the cloud sends a Forget
+                                          command (a mere stream drop just
+                                          reconnects with the same identity),
+                                          so restart spiced to stop remote
                                           management immediately.
 
 LEGACY POD-ADD BEHAVIOR:
