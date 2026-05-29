@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 
-use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
+use arrow::datatypes::SchemaRef;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -26,6 +26,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 use futures::TryStreamExt;
+pub use runtime_datafusion::query_engine::{DataUpdate, UpdateType};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
 use datafusion::sql::TableReference;
@@ -167,24 +168,6 @@ impl DataUpdateBroadcaster {
 }
 
 use crate::datafusion::error::find_datafusion_root;
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum UpdateType {
-    Append,
-    Overwrite,
-    Changes,
-}
-
-#[derive(Debug, Clone)]
-pub struct DataUpdate {
-    pub schema: SchemaRef,
-    pub data: Vec<RecordBatch>,
-    /// The type of update to perform.
-    /// If `UpdateType::Append`, the runtime will append the data to the existing dataset.
-    /// If `UpdateType::Overwrite`, the runtime will overwrite the existing data with the new data.
-    /// If `UpdateType::Changes`, the runtime will apply the changes to the existing data.
-    pub update_type: UpdateType,
-}
 
 pub struct StreamingDataUpdate {
     pub data: SendableRecordBatchStream,
@@ -364,6 +347,7 @@ mod tests {
     use super::*;
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use datafusion::physical_plan::collect;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::sql::TableReference;

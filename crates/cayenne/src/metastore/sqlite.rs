@@ -377,6 +377,21 @@ impl SqliteMetastore {
         )
     ";
 
+    /// Schema for the `cayenne_pk_index` table.
+    ///
+    /// One row per table holding the serialized primary-key existence bloom
+    /// checkpoint (see `provider::table`), tagged with the snapshot id it covers.
+    /// Lets restart / snapshot-bootstrap skip the full-table keyset rebuild;
+    /// captured in metastore snapshots via `EXPECTED_TABLES`.
+    const PK_INDEX_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_pk_index (
+            table_id TEXT NOT NULL PRIMARY KEY,
+            snapshot_id TEXT NOT NULL,
+            index_blob BLOB NOT NULL,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+        )
+    ";
+
     /// Schema for the `cayenne_inlined_data` table.
     ///
     /// Stores small batches of insert data as Arrow IPC blobs directly in the
@@ -531,7 +546,7 @@ impl MetastoreBackend for SqliteMetastore {
             .call(|conn| {
                 // Create tables in a transaction
                 conn.execute_batch(&format!(
-                    "{}; {}; {}; {}; {}; {}; {}; {}; {};",
+                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
                     Self::TABLE_TABLE_DDL,
                     Self::TABLE_NAME_UNIQUE_INDEX_DDL,
                     Self::DELETE_FILE_TABLE_DDL,
@@ -540,7 +555,8 @@ impl MetastoreBackend for SqliteMetastore {
                     Self::SNAPSHOT_SEQUENCE_TABLE_DDL,
                     Self::TABLE_STATISTICS_DDL,
                     Self::INLINED_DATA_TABLE_DDL,
-                    Self::INLINED_DELETE_TABLE_DDL
+                    Self::INLINED_DELETE_TABLE_DDL,
+                    Self::PK_INDEX_TABLE_DDL
                 ))?;
 
                 // Backfill new columns for existing deployments (SQLite doesn't support IF NOT EXISTS for ALTER TABLE until v3.35)

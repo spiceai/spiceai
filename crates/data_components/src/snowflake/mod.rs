@@ -81,6 +81,14 @@ impl SnowflakeTableFactory {
         self.function_support = Some(function_support);
         self
     }
+
+    /// Returns the currently configured [`FunctionSupport`], if any. Used by
+    /// connector tests to confirm the Spice deny-list is wired through to the
+    /// federation layer.
+    #[must_use]
+    pub fn function_support(&self) -> Option<&FunctionSupport> {
+        self.function_support.as_ref()
+    }
 }
 
 /// Parses a Snowflake table path string (e.g. `db.schema.table` or `"my.schema".table`)

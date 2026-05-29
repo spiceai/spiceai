@@ -31,7 +31,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::{any::Any, panic::AssertUnwindSafe, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
@@ -57,6 +57,7 @@ pub struct RefreshTaskRunnerBuilder {
     /// Shared with `CachingAccelerationScanExec`.
     accelerator_write_mutex: Arc<Mutex<()>>,
     last_updated_at: Arc<AtomicI64>,
+    initial_load_completed: Option<Arc<AtomicBool>>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
     snapshot_refresh_state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
@@ -90,6 +91,7 @@ impl RefreshTaskRunnerBuilder {
             resource_monitor: None,
             accelerator_write_mutex,
             last_updated_at: Arc::new(AtomicI64::new(0)),
+            initial_load_completed: None,
             is_s3_express_acceleration: false,
             snapshot_refresh_state: None,
         }
@@ -132,6 +134,12 @@ impl RefreshTaskRunnerBuilder {
     #[must_use]
     pub fn with_last_updated_at(mut self, last_updated_at: Arc<AtomicI64>) -> Self {
         self.last_updated_at = last_updated_at;
+        self
+    }
+
+    #[must_use]
+    pub fn with_initial_load_completed(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.initial_load_completed = Some(flag);
         self
     }
 
@@ -182,6 +190,10 @@ impl RefreshTaskRunnerBuilder {
 
         refresh_task_builder =
             refresh_task_builder.with_snapshot_refresh_state(self.snapshot_refresh_state);
+
+        if let Some(flag) = self.initial_load_completed {
+            refresh_task_builder = refresh_task_builder.with_initial_load_completed(flag);
+        }
 
         let refresh_task = Arc::new(refresh_task_builder.build());
 

@@ -123,12 +123,6 @@ use arc_swap::ArcSwap;
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
 const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
-/// Byte budget for the in-memory PK keyset cache (Option A from iter 5/6).
-/// Using a byte budget instead of a hard entry count allows small-PK tables
-/// (e.g. single Int64) to cache far more rows before eviction, while still
-/// protecting memory on wide composite-PK tables. At ~40-64 bytes per entry
-/// (key bytes + `RowLocation` + `HashMap` overhead) this is ~2-4M rows for int64 PKs.
-const PK_KEYSET_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 // Approximate per-entry `HashMap` control/allocation overhead used for the
 // cache budget. The exact value is allocator-dependent, so keep this estimate
 // centralized with `approx_pk_keyset_entry_bytes`.
@@ -1187,7 +1181,7 @@ pub struct CayenneTableProvider {
     /// later serialized writes reuse it and publish successful write deltas.
     /// Delete paths invalidate this cache because arbitrary predicates can
     /// remove keys without telling us which keys were affected.
-    pk_keyset_cache: Arc<ParkingMutex<Option<CachedPkKeyset>>>,
+    pk_keyset_cache: Arc<ParkingMutex<Option<CachedPkIndex>>>,
     /// Coalesces inline-memtable checkpoint checks spawned after inline writes.
     /// The check takes `write_lock` in the background after the scheduling
     /// writer returns, so inline commits do not hold the writer lock while
@@ -1444,6 +1438,216 @@ impl CachedPkKeyset {
     }
 }
 
+/// Number of hash probes for [`PkBloom`]. Seven keeps the false-positive rate
+/// near 1% at the ~10 bits/key fill level; the bloom is sized to the whole byte
+/// budget, so at realistic fills the rate is far lower.
+const PK_BLOOM_NUM_HASHES: u32 = 7;
+
+/// Seeded FNV-1a-64. Dependency-free and adequate for a Bloom filter; two
+/// independent seeds feed the Kirsch–Mitzenmacher double-hashing scheme below.
+fn pk_bloom_hash(bytes: &[u8], seed: u64) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ seed;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Bounded Bloom filter of live primary keys.
+///
+/// Used as the existence index for **`OnConflict::Upsert`** tables whose exact
+/// keyset would exceed the configured byte budget (`pk_keyset_cache_max_bytes`).
+/// Sized to the budget, it stays resident and is maintained incrementally,
+/// avoiding the O(total-rows) full keyset rebuild on every CDC batch.
+///
+/// Correctness invariants:
+/// - **No false negatives** as long as every inserted key is added and keys are
+///   never removed — so a real upsert conflict is never missed.
+/// - A **false positive** yields a redundant key-based delete tombstone, which
+///   masks no older version (none exists) and is harmless under upsert.
+/// - Only valid for upsert. `DoNothing` needs an exact answer (a false positive
+///   would wrongly drop a genuinely new row), so those tables keep the exact path.
+struct PkBloom {
+    bits: Vec<u64>,
+    /// `num_bits - 1`; `num_bits` is a power of two so indexing masks instead of mods.
+    bit_mask: u64,
+    /// Keys inserted (observability + false-positive-rate estimation).
+    inserted_keys: usize,
+}
+
+impl PkBloom {
+    /// Allocate a bloom whose bit array fits within `budget_bytes`, using the
+    /// largest power-of-two bit count that does not exceed the budget.
+    fn with_byte_budget(budget_bytes: usize) -> Self {
+        Self::with_num_bits_pow2(budget_bytes.saturating_mul(8))
+    }
+
+    /// Right-size a bloom for `expected_keys` (~10 bits/key, ~1% FPR), never
+    /// exceeding `max_bytes`. Used when persisting a compaction checkpoint so the
+    /// sidecar stays small rather than the full byte budget.
+    fn with_expected_keys(expected_keys: usize, max_bytes: usize) -> Self {
+        let want_bits = expected_keys.saturating_mul(10);
+        let cap_bits = max_bytes.saturating_mul(8).max(64);
+        Self::with_num_bits_pow2(want_bits.min(cap_bits))
+    }
+
+    /// Allocate with the largest power-of-two bit count `<= target_bits` (min 64).
+    fn with_num_bits_pow2(target_bits: usize) -> Self {
+        let num_bits: usize = 1usize << target_bits.max(64).ilog2();
+        let words = (num_bits / 64).max(1);
+        Self {
+            bits: vec![0u64; words],
+            bit_mask: u64::try_from(num_bits.saturating_sub(1)).unwrap_or(u64::MAX),
+            inserted_keys: 0,
+        }
+    }
+
+    /// Serialize as `bit_mask(8) | inserted_keys(8) | num_words(8) | words(8·W)`,
+    /// little-endian.
+    fn serialize_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.bit_mask.to_le_bytes());
+        out.extend_from_slice(
+            &u64::try_from(self.inserted_keys)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&u64::try_from(self.bits.len()).unwrap_or(0).to_le_bytes());
+        for word in &self.bits {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+
+    /// Inverse of [`serialize_into`]. Returns `None` on any length/format mismatch
+    /// so a corrupt sidecar safely falls back to a full keyset rebuild.
+    fn deserialize_from(bytes: &[u8]) -> Option<Self> {
+        let bit_mask = u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?);
+        let inserted_keys = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?);
+        let num_words =
+            usize::try_from(u64::from_le_bytes(bytes.get(16..24)?.try_into().ok()?)).ok()?;
+        // Reject impossible word counts before allocating.
+        if num_words == 0 || num_words > bytes.len().saturating_sub(24) / 8 {
+            return None;
+        }
+        // `num_bits` must be a power of two and consistent with `bit_mask`.
+        let num_bits = u64::try_from(num_words).ok()?.checked_mul(64)?;
+        if num_bits != bit_mask.checked_add(1)? || !num_bits.is_power_of_two() {
+            return None;
+        }
+        let mut bits = Vec::with_capacity(num_words);
+        let mut offset = 24usize;
+        for _ in 0..num_words {
+            let end = offset.checked_add(8)?;
+            bits.push(u64::from_le_bytes(bytes.get(offset..end)?.try_into().ok()?));
+            offset = end;
+        }
+        Some(Self {
+            bits,
+            bit_mask,
+            inserted_keys: usize::try_from(inserted_keys).unwrap_or(0),
+        })
+    }
+
+    fn probe_bits(key: &[u8]) -> impl Iterator<Item = u64> {
+        let h1 = pk_bloom_hash(key, 0x517c_c1b7_2722_0a95);
+        // Force odd so successive probes stride across the whole bit space.
+        let h2 = pk_bloom_hash(key, 0x9e37_79b9_7f4a_7c15) | 1;
+        (0..PK_BLOOM_NUM_HASHES).map(move |i| h1.wrapping_add(u64::from(i).wrapping_mul(h2)))
+    }
+
+    fn insert(&mut self, key: &[u8]) {
+        for hash in Self::probe_bits(key) {
+            let bit = hash & self.bit_mask;
+            let word = usize::try_from(bit >> 6).unwrap_or(0);
+            self.bits[word] |= 1u64 << (bit & 63);
+        }
+        self.inserted_keys = self.inserted_keys.saturating_add(1);
+    }
+
+    fn maybe_contains(&self, key: &[u8]) -> bool {
+        for hash in Self::probe_bits(key) {
+            let bit = hash & self.bit_mask;
+            let word = usize::try_from(bit >> 6).unwrap_or(0);
+            if self.bits[word] & (1u64 << (bit & 63)) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Magic ("CPKB") + version for the persisted PK-index bloom sidecar. Bumping
+/// the version invalidates older sidecars (they deserialize to `None` → safe
+/// full-scan fallback).
+const PK_INDEX_SIDECAR_MAGIC: u32 = 0x4350_4b42;
+const PK_INDEX_SIDECAR_VERSION: u32 = 1;
+/// Upper bound on the persisted PK-index blob. Extreme-cardinality tables skip
+/// persistence (and fall back to a runtime rebuild) to bound the metastore and
+/// snapshot footprint. The bloom is right-sized (~10 bits/key), so this caps the
+/// covered live-key count at roughly 200M.
+const PK_INDEX_PERSIST_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Serialize a checkpoint: `magic | version | snapshot_id_len | snapshot_id | bloom`.
+fn serialize_pk_bloom_sidecar(bloom: &PkBloom, snapshot_id: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&PK_INDEX_SIDECAR_MAGIC.to_le_bytes());
+    out.extend_from_slice(&PK_INDEX_SIDECAR_VERSION.to_le_bytes());
+    let snapshot_bytes = snapshot_id.as_bytes();
+    out.extend_from_slice(
+        &u64::try_from(snapshot_bytes.len())
+            .unwrap_or(0)
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(snapshot_bytes);
+    bloom.serialize_into(&mut out);
+    out
+}
+
+/// Inverse of [`serialize_pk_bloom_sidecar`]; returns `None` on any
+/// magic/version/length mismatch so a corrupt or stale-format sidecar falls back
+/// to the full keyset rebuild.
+fn deserialize_pk_bloom_sidecar(bytes: &[u8]) -> Option<(PkBloom, String)> {
+    let magic = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
+    let version = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
+    if magic != PK_INDEX_SIDECAR_MAGIC || version != PK_INDEX_SIDECAR_VERSION {
+        return None;
+    }
+    let snapshot_len =
+        usize::try_from(u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?)).ok()?;
+    let snapshot_end = 16usize.checked_add(snapshot_len)?;
+    let snapshot_id = std::str::from_utf8(bytes.get(16..snapshot_end)?)
+        .ok()?
+        .to_string();
+    let bloom = PkBloom::deserialize_from(bytes.get(snapshot_end..)?)?;
+    Some((bloom, snapshot_id))
+}
+
+/// Cached primary-key existence index for upsert/insert conflict detection.
+///
+/// Tables keep an [`Exact`](Self::Exact) keyset while it fits the byte budget;
+/// upsert tables that exceed it fall back to a bounded [`Bloom`](Self::Bloom)
+/// (see [`PkBloom`]) instead of dropping the cache and rebuilding from a
+/// full-table scan every batch.
+enum CachedPkIndex {
+    Exact(CachedPkKeyset),
+    Bloom(PkBloom),
+}
+
+impl CachedPkIndex {
+    fn len(&self) -> usize {
+        match self {
+            Self::Exact(keyset) => keyset.len(),
+            Self::Bloom(bloom) => bloom.inserted_keys,
+        }
+    }
+}
+
+/// Borrowed view of a [`CachedPkIndex`] handed to per-batch validation.
+enum PkExistenceRef<'a> {
+    Exact(&'a HashMap<OwnedRow, RowLocation>),
+    Bloom(&'a PkBloom),
+}
+
 #[derive(Default)]
 struct InlinedDeletionMaps {
     int64_pk: HashMap<i64, i64>,
@@ -1652,7 +1856,7 @@ struct OnConflictContext<'a> {
     converter: &'a RowConverter,
     on_conflict: &'a OnConflict,
     upsert_options: &'a UpsertOptions,
-    existing_keys: &'a HashMap<OwnedRow, RowLocation>,
+    existing: PkExistenceRef<'a>,
     incoming_keys: &'a HashSet<OwnedRow>,
 }
 
@@ -1664,7 +1868,7 @@ struct OnConflictValidationStream {
     converter: RowConverter,
     on_conflict: OnConflict,
     upsert_options: UpsertOptions,
-    existing_keys: Option<CachedPkKeyset>,
+    existing_keys: Option<CachedPkIndex>,
     incoming_keys: HashSet<OwnedRow>,
     kept_keys: HashSet<OwnedRow>,
     delete_specs: HashMap<i64, Vec<i64>>,
@@ -1682,7 +1886,7 @@ impl OnConflictValidationStream {
         inner: SendableRecordBatchStream,
         pk_indices: Vec<usize>,
         converter: RowConverter,
-        existing_keys: CachedPkKeyset,
+        existing_keys: CachedPkIndex,
         on_conflict: OnConflict,
         post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
     ) -> Self {
@@ -1717,19 +1921,23 @@ impl OnConflictValidationStream {
             return Ok(None);
         }
 
-        let existing_keys = self.existing_keys.as_ref().ok_or_else(|| {
+        let existing_index = self.existing_keys.as_ref().ok_or_else(|| {
             datafusion_common::DataFusionError::Internal(format!(
                 "On-conflict validation for table {} was polled after finalization",
                 self.table.table_name()
             ))
         })?;
+        let existing = match existing_index {
+            CachedPkIndex::Exact(keyset) => PkExistenceRef::Exact(&keyset.keys),
+            CachedPkIndex::Bloom(bloom) => PkExistenceRef::Bloom(bloom),
+        };
 
         let mut ctx = OnConflictContext {
             pk_indices: &self.pk_indices,
             converter: &self.converter,
             on_conflict: &self.on_conflict,
             upsert_options: &self.upsert_options,
-            existing_keys: &existing_keys.keys,
+            existing,
             incoming_keys: &self.incoming_keys,
         };
 
@@ -1772,7 +1980,7 @@ impl OnConflictValidationStream {
 
     fn store_existing_keyset(&mut self) {
         if let Some(existing_keys) = self.existing_keys.take() {
-            self.table.store_cached_pk_keyset(existing_keys);
+            self.table.store_cached_pk_index(existing_keys);
         }
     }
 
@@ -1806,10 +2014,13 @@ impl OnConflictValidationStream {
     }
 }
 
-pub(crate) fn record_cayenne_write_phase(_table_name: &str, phase: &'static str, start: Instant) {
+pub(crate) fn record_cayenne_write_phase(table_name: &str, phase: &'static str, start: Instant) {
     telemetry::track_cayenne_write_phase_duration(
         start.elapsed(),
-        &[telemetry::KeyValue::new("phase", phase)],
+        &[
+            telemetry::KeyValue::new("table", table_name.to_string()),
+            telemetry::KeyValue::new("phase", phase),
+        ],
     );
 }
 
@@ -3735,24 +3946,60 @@ impl CayenneTableProvider {
         self.scan_file_statistics.clear();
     }
 
-    fn take_cached_pk_keyset(&self) -> Option<CachedPkKeyset> {
+    fn take_cached_pk_index(&self) -> Option<CachedPkIndex> {
         self.pk_keyset_cache.lock().take()
     }
 
-    fn store_cached_pk_keyset(&self, keyset: CachedPkKeyset) {
-        if keyset.approx_bytes > PK_KEYSET_CACHE_MAX_BYTES {
-            tracing::debug!(
-                table = self.table_metadata.table_name.as_str(),
-                key_count = keyset.len(),
-                approx_bytes = keyset.approx_bytes,
-                max_bytes = PK_KEYSET_CACHE_MAX_BYTES,
-                "Skipping primary-key keyset cache because it exceeds the configured byte budget"
-            );
-            *self.pk_keyset_cache.lock() = None;
-            return;
-        }
+    /// Whether this table may fall back to a bounded bloom existence filter when
+    /// its exact keyset exceeds the budget. Only safe for `Upsert`: a bloom false
+    /// positive yields a harmless redundant delete under upsert, but would wrongly
+    /// drop a genuinely new row under `DoNothing` semantics.
+    fn upsert_bloom_eligible(&self) -> bool {
+        matches!(self.table_metadata.on_conflict, Some(OnConflict::Upsert(_)))
+    }
 
-        *self.pk_keyset_cache.lock() = Some(keyset);
+    /// Build a bloom existence filter over `keyset`'s keys, sized to `max_bytes`.
+    fn bloom_from_keyset(keyset: &CachedPkKeyset, max_bytes: usize) -> PkBloom {
+        let mut bloom = PkBloom::with_byte_budget(max_bytes);
+        for key in keyset.keys.keys() {
+            bloom.insert(key.as_ref());
+        }
+        bloom
+    }
+
+    fn store_cached_pk_index(&self, index: CachedPkIndex) {
+        let max_bytes = self.context.pk_keyset_cache_max_bytes();
+        let to_store = match index {
+            CachedPkIndex::Exact(keyset) if keyset.approx_bytes > max_bytes => {
+                if self.upsert_bloom_eligible() {
+                    // Convert the over-budget exact keyset to a bounded bloom so
+                    // subsequent CDC batches skip the full-table keyset rebuild.
+                    tracing::debug!(
+                        table = self.table_metadata.table_name.as_str(),
+                        key_count = keyset.len(),
+                        approx_bytes = keyset.approx_bytes,
+                        max_bytes,
+                        "Converting over-budget primary-key keyset to a bounded bloom existence filter"
+                    );
+                    CachedPkIndex::Bloom(Self::bloom_from_keyset(&keyset, max_bytes))
+                } else {
+                    // DoNothing needs exact answers; drop and rebuild next batch
+                    // rather than risk a bloom false positive dropping a new row.
+                    tracing::debug!(
+                        table = self.table_metadata.table_name.as_str(),
+                        key_count = keyset.len(),
+                        approx_bytes = keyset.approx_bytes,
+                        max_bytes,
+                        "Skipping primary-key keyset cache because it exceeds the configured byte budget"
+                    );
+                    *self.pk_keyset_cache.lock() = None;
+                    return;
+                }
+            }
+            other => other,
+        };
+
+        *self.pk_keyset_cache.lock() = Some(to_store);
     }
 
     pub(crate) fn clear_cached_pk_keyset(&self) {
@@ -3764,38 +4011,71 @@ impl CayenneTableProvider {
             return;
         }
 
+        let max_bytes = self.context.pk_keyset_cache_max_bytes();
         let mut guard = self.pk_keyset_cache.lock();
-        let Some(keyset) = guard.as_mut() else {
+        // Take ownership so an over-budget Exact keyset can be replaced by a
+        // bloom without a borrow conflict; the index is restored before return.
+        let Some(mut index) = guard.take() else {
             return;
         };
 
-        let location = RowLocation {
-            source,
-            data_file_id: DEFAULT_DATA_FILE_ID,
-            row_id: -1,
-        };
-
-        let mut incoming_bytes = 0usize;
-        for key in keys {
-            if !keyset.keys.contains_key(key) {
-                let entry_bytes = approx_pk_keyset_entry_bytes(key);
-                incoming_bytes = incoming_bytes.saturating_add(entry_bytes);
-                if keyset.approx_bytes.saturating_add(entry_bytes) > PK_KEYSET_CACHE_MAX_BYTES {
-                    tracing::debug!(
-                        table = self.table_metadata.table_name.as_str(),
-                        key_count = keyset.len(),
-                        incoming_key_count = keys.len(),
-                        current_bytes = keyset.approx_bytes,
-                        incoming_bytes,
-                        max_bytes = PK_KEYSET_CACHE_MAX_BYTES,
-                        "Clearing primary-key keyset cache because the write would exceed the byte budget"
-                    );
-                    *guard = None;
-                    return;
+        let mut convert_to_bloom = false;
+        match &mut index {
+            CachedPkIndex::Bloom(bloom) => {
+                for key in keys {
+                    bloom.insert(key.as_ref());
                 }
             }
-            keyset.insert(key.clone(), location);
+            CachedPkIndex::Exact(keyset) => {
+                let location = RowLocation {
+                    source,
+                    data_file_id: DEFAULT_DATA_FILE_ID,
+                    row_id: -1,
+                };
+                for key in keys {
+                    if !keyset.keys.contains_key(key)
+                        && keyset
+                            .approx_bytes
+                            .saturating_add(approx_pk_keyset_entry_bytes(key))
+                            > max_bytes
+                    {
+                        convert_to_bloom = true;
+                        break;
+                    }
+                    keyset.insert(key.clone(), location);
+                }
+            }
         }
+
+        if convert_to_bloom {
+            if self.upsert_bloom_eligible() {
+                let mut bloom = match &index {
+                    CachedPkIndex::Exact(keyset) => Self::bloom_from_keyset(keyset, max_bytes),
+                    CachedPkIndex::Bloom(_) => PkBloom::with_byte_budget(max_bytes),
+                };
+                for key in keys {
+                    bloom.insert(key.as_ref());
+                }
+                tracing::debug!(
+                    table = self.table_metadata.table_name.as_str(),
+                    incoming_key_count = keys.len(),
+                    max_bytes,
+                    "Converting over-budget primary-key keyset to a bounded bloom existence filter on incremental update"
+                );
+                index = CachedPkIndex::Bloom(bloom);
+            } else {
+                tracing::debug!(
+                    table = self.table_metadata.table_name.as_str(),
+                    incoming_key_count = keys.len(),
+                    max_bytes,
+                    "Clearing primary-key keyset cache because the write would exceed the byte budget"
+                );
+                // `guard` already holds None from the take() above.
+                return;
+            }
+        }
+
+        *guard = Some(index);
     }
 
     pub(crate) fn record_inlined_pk_keys(&self, keys: &HashSet<OwnedRow>) {
@@ -3965,6 +4245,254 @@ impl CayenneTableProvider {
         }
 
         Ok(keyset)
+    }
+
+    // ---- Phase 3: persist/checkpoint the PK existence index across restarts ----
+    // Persisted in the metastore (`cayenne_pk_index`) so it is captured by
+    // metastore snapshots — letting both a restart AND a node bootstrapped from a
+    // snapshot skip the O(total-rows) full keyset rebuild. Works uniformly for
+    // local and object-store tables.
+
+    /// Insert one batch's primary keys (no deletion filter — a superset is safe
+    /// for the upsert bloom; deleted keys only cost a harmless false positive)
+    /// into `bloom`. `pk_col_indices` are the PK columns' positions in `batch`.
+    fn insert_batch_pks_into_bloom(
+        batch: &RecordBatch,
+        pk_col_indices: &[usize],
+        converter: &RowConverter,
+        bloom: &mut PkBloom,
+    ) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let pk_columns: Vec<_> = pk_col_indices
+            .iter()
+            .map(|idx| Arc::clone(batch.column(*idx)))
+            .collect();
+        let rows = converter.convert_columns(&pk_columns)?;
+        for row_idx in 0..batch.num_rows() {
+            bloom.insert(rows.row(row_idx).as_ref());
+        }
+        Ok(())
+    }
+
+    /// Build a right-sized bloom of the PK values in a single snapshot (used to
+    /// checkpoint the freshly-compacted current snapshot, which contains exactly
+    /// the live rows and no deletions).
+    async fn build_snapshot_pk_bloom(
+        &self,
+        snapshot_id: &str,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+        expected_keys: usize,
+        max_bytes: usize,
+    ) -> Result<PkBloom> {
+        let ctx = self.create_session_context();
+        let pk_projection = pk_indices.to_vec();
+        let projected_pk_indices: Vec<usize> = (0..pk_indices.len()).collect();
+        let mut bloom = PkBloom::with_expected_keys(expected_keys, max_bytes);
+
+        let scan_plan = self
+            .create_snapshot_scan_plan(&ctx.state(), snapshot_id, Some(&pk_projection), &[], None)
+            .await?;
+        let mut stream = datafusion_physical_plan::execute_stream(scan_plan, ctx.task_ctx())?;
+        while let Some(batch) = stream.next().await {
+            Self::insert_batch_pks_into_bloom(
+                &batch?,
+                &projected_pk_indices,
+                converter,
+                &mut bloom,
+            )?;
+        }
+        Ok(bloom)
+    }
+
+    /// Fold the post-checkpoint delta — every protected snapshot and inline entry
+    /// (all created after the checkpoint, since compaction clears both) — into a
+    /// bloom loaded from the sidecar, making it a superset of all current keys.
+    async fn extend_bloom_with_protected_and_inline(
+        &self,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+        bloom: &mut PkBloom,
+    ) -> Result<()> {
+        let protected_snapshots = self.protected_snapshots.load_full();
+        let ctx = self.create_session_context();
+        let pk_projection = pk_indices.to_vec();
+        let projected_pk_indices: Vec<usize> = (0..pk_indices.len()).collect();
+
+        for (snapshot_id, _max_delete_seq) in protected_snapshots.iter() {
+            let scan_plan = self
+                .create_snapshot_scan_plan(
+                    &ctx.state(),
+                    snapshot_id,
+                    Some(&pk_projection),
+                    &[],
+                    None,
+                )
+                .await?;
+            let mut stream = datafusion_physical_plan::execute_stream(scan_plan, ctx.task_ctx())?;
+            while let Some(batch) = stream.next().await {
+                Self::insert_batch_pks_into_bloom(
+                    &batch?,
+                    &projected_pk_indices,
+                    converter,
+                    bloom,
+                )?;
+            }
+        }
+
+        if self.cached_inlined_row_count() > 0 {
+            let inlined_batches = self.read_inlined_batches().await?;
+            for batch in &inlined_batches {
+                // Inlined batches carry the full table schema, so use pk_indices directly.
+                Self::insert_batch_pks_into_bloom(batch, pk_indices, converter, bloom)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Persist a PK-index bloom checkpoint for the just-compacted snapshot.
+    /// Best-effort: any failure only means the next restart pays a full scan.
+    async fn persist_pk_bloom_checkpoint(&self, snapshot_id: &str, total_rows: u64) {
+        if let Err(err) = self
+            .try_persist_pk_bloom_checkpoint(snapshot_id, total_rows)
+            .await
+        {
+            tracing::debug!(
+                table = self.table_metadata.table_name.as_str(),
+                error = %err,
+                "Failed to persist PK-index bloom checkpoint; restart will rebuild from a full scan"
+            );
+        }
+    }
+
+    async fn try_persist_pk_bloom_checkpoint(
+        &self,
+        snapshot_id: &str,
+        total_rows: u64,
+    ) -> Result<()> {
+        let Some(pk_indices) = self.primary_key_indices()? else {
+            return Ok(());
+        };
+        let converter = self.build_pk_converter(&pk_indices)?;
+        // Size the persistence bloom against the *persist* budget, not the (much
+        // larger, up to 8 GiB) in-memory keyset budget. A checkpoint bloom whose
+        // serialized form exceeds `PK_INDEX_PERSIST_MAX_BYTES` is discarded below
+        // anyway, so building it at the in-memory budget would let compaction
+        // allocate — and potentially OOM on — a blob it will never store.
+        let max_bytes = self
+            .context
+            .pk_keyset_cache_max_bytes()
+            .min(PK_INDEX_PERSIST_MAX_BYTES);
+        let expected_keys = usize::try_from(total_rows).unwrap_or(usize::MAX);
+        let bloom = self
+            .build_snapshot_pk_bloom(
+                snapshot_id,
+                &pk_indices,
+                &converter,
+                expected_keys,
+                max_bytes,
+            )
+            .await?;
+
+        let bytes = serialize_pk_bloom_sidecar(&bloom, snapshot_id);
+        // Bound the metastore/snapshot footprint: extreme-cardinality tables skip
+        // persistence and fall back to a runtime rebuild on restart/bootstrap.
+        if bytes.len() > PK_INDEX_PERSIST_MAX_BYTES {
+            tracing::debug!(
+                table = self.table_metadata.table_name.as_str(),
+                blob_bytes = bytes.len(),
+                max_bytes = PK_INDEX_PERSIST_MAX_BYTES,
+                "Skipping PK-index checkpoint persistence: blob exceeds the persist budget"
+            );
+            return Ok(());
+        }
+
+        self.catalog
+            .upsert_pk_index(&self.table_metadata.table_id, snapshot_id, &bytes)
+            .await
+            .map_err(|source| Error::Catalog { source })?;
+        tracing::debug!(
+            table = self.table_metadata.table_name.as_str(),
+            snapshot_id,
+            keys = bloom.inserted_keys,
+            blob_bytes = bytes.len(),
+            "Persisted PK-index bloom checkpoint to the metastore"
+        );
+        Ok(())
+    }
+
+    /// Try to reconstruct the PK existence index from the persisted sidecar,
+    /// skipping the full-table keyset scan. Returns `None` (→ caller falls back to
+    /// the full `load_existing_keyset`) unless the table is upsert-eligible, the
+    /// sidecar exists and validates, AND its checkpoint snapshot still equals the
+    /// current snapshot (guaranteeing the bloom covers the full current snapshot —
+    /// upsert tables only add sequence-tagged protected/inline data after a
+    /// checkpoint, never rewriting the current snapshot except via compaction,
+    /// which re-persists). The post-checkpoint delta is folded in to keep the
+    /// no-false-negative invariant.
+    async fn try_load_persisted_pk_index(
+        &self,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+    ) -> Result<Option<CachedPkIndex>> {
+        if !self.upsert_bloom_eligible() {
+            return Ok(None);
+        }
+        let Some((checkpoint_snapshot, bytes)) = self
+            .catalog
+            .get_pk_index(&self.table_metadata.table_id)
+            .await
+            .map_err(|source| Error::Catalog { source })?
+        else {
+            return Ok(None);
+        };
+        // Defensive read-side bound mirroring the write-side persist cap: a
+        // corrupted or manually-modified metastore row could carry an oversized
+        // `index_blob` that would drive a large allocation in
+        // `deserialize_pk_bloom_sidecar` before we could fall back. Fail closed to
+        // the full rebuild when it exceeds the persist budget.
+        if bytes.len() > PK_INDEX_PERSIST_MAX_BYTES {
+            tracing::debug!(
+                table = self.table_metadata.table_name.as_str(),
+                blob_bytes = bytes.len(),
+                max_bytes = PK_INDEX_PERSIST_MAX_BYTES,
+                "Persisted PK-index blob exceeds the persist budget; rebuilding keyset"
+            );
+            return Ok(None);
+        }
+        // Gate on the snapshot tag: the bloom covers the full current snapshot
+        // only if nothing rewrote it since the checkpoint (compaction re-persists).
+        if checkpoint_snapshot != self.get_current_snapshot_id() {
+            return Ok(None);
+        }
+        let Some((mut bloom, blob_snapshot)) = deserialize_pk_bloom_sidecar(&bytes) else {
+            return Ok(None);
+        };
+        // Defense in depth: the metastore `checkpoint_snapshot` column and the
+        // snapshot id embedded in the blob are written together, so they should
+        // always agree. But if a row is ever inconsistent/corrupt such that the
+        // column matches the current snapshot while the blob was produced for a
+        // different snapshot, trusting it could admit Bloom false negatives and
+        // break upsert correctness. Fail closed to the full rebuild on mismatch.
+        if blob_snapshot != checkpoint_snapshot {
+            tracing::debug!(
+                table = self.table_metadata.table_name.as_str(),
+                checkpoint_snapshot = checkpoint_snapshot.as_str(),
+                blob_snapshot = blob_snapshot.as_str(),
+                "PK-index sidecar snapshot mismatch (metastore column vs blob); rebuilding keyset"
+            );
+            return Ok(None);
+        }
+        self.extend_bloom_with_protected_and_inline(pk_indices, converter, &mut bloom)
+            .await?;
+        tracing::debug!(
+            table = self.table_metadata.table_name.as_str(),
+            checkpoint_snapshot = checkpoint_snapshot.as_str(),
+            "Loaded PK-index bloom checkpoint; skipped full-table keyset rebuild"
+        );
+        Ok(Some(CachedPkIndex::Bloom(bloom)))
     }
 
     fn process_visible_inlined_batches_into_keyset(
@@ -4161,7 +4689,7 @@ impl CayenneTableProvider {
         }
 
         let converter = self.build_pk_converter(&pk_indices)?;
-        let existing_keys = if let Some(existing_keys) = self.take_cached_pk_keyset() {
+        let existing_keys = if let Some(existing_keys) = self.take_cached_pk_index() {
             tracing::trace!(
                 "prepare_stream_for_insert: reused {} cached existing keys for table {}",
                 existing_keys.len(),
@@ -4169,7 +4697,29 @@ impl CayenneTableProvider {
             );
             existing_keys
         } else {
-            let existing_keys = self.load_existing_keyset(&pk_indices, &converter).await?;
+            // The full-table keyset rebuild is the dominant CDC-upsert cost for
+            // tables whose keyset exceeds the cache budget, yet it runs *before*
+            // the `vortex_write` phase timer and is otherwise invisible in
+            // per-phase telemetry. Time it explicitly (emitted only on a cache
+            // miss / cold rebuild) so retests attribute the cost correctly.
+            let keyset_rebuild_start = Instant::now();
+            // Fast path: reconstruct the index from the persisted bloom checkpoint
+            // (+ bounded post-checkpoint delta) and skip the full-table keyset
+            // scan. Falls back to the full scan on any miss/mismatch/corruption.
+            let existing_keys = match self
+                .try_load_persisted_pk_index(&pk_indices, &converter)
+                .await
+            {
+                Ok(Some(index)) => index,
+                _ => {
+                    CachedPkIndex::Exact(self.load_existing_keyset(&pk_indices, &converter).await?)
+                }
+            };
+            record_cayenne_write_phase(
+                self.table_metadata.table_name.as_str(),
+                "keyset_rebuild",
+                keyset_rebuild_start,
+            );
             tracing::debug!(
                 "prepare_stream_for_insert: loaded {} existing keys for table {}",
                 existing_keys.len(),
@@ -4262,51 +4812,87 @@ impl CayenneTableProvider {
                 });
             }
 
-            let keep_row = if let Some(existing) = ctx.existing_keys.get(&key) {
-                match ctx.on_conflict {
-                    OnConflict::DoNothingAll | OnConflict::DoNothing(_) => false,
-                    OnConflict::Upsert(_) => {
-                        let is_inlined_conflict = existing.source == RowSource::Inlined;
-                        match &self.pk_deletion_strategy {
-                            PkDeletionStrategyWithCache::Int64Pk { .. } => {
-                                if let Some(arr) = int64_pk_array {
-                                    if is_inlined_conflict {
-                                        deleted_inlined_pk_i64.push(arr.value(row_idx));
-                                    } else {
-                                        deleted_pk_i64.push(arr.value(row_idx));
+            let keep_row = match ctx.existing {
+                PkExistenceRef::Exact(existing_keys) => {
+                    if let Some(existing) = existing_keys.get(&key) {
+                        match ctx.on_conflict {
+                            OnConflict::DoNothingAll | OnConflict::DoNothing(_) => false,
+                            OnConflict::Upsert(_) => {
+                                let is_inlined_conflict = existing.source == RowSource::Inlined;
+                                match &self.pk_deletion_strategy {
+                                    PkDeletionStrategyWithCache::Int64Pk { .. } => {
+                                        if let Some(arr) = int64_pk_array {
+                                            if is_inlined_conflict {
+                                                deleted_inlined_pk_i64.push(arr.value(row_idx));
+                                            } else {
+                                                deleted_pk_i64.push(arr.value(row_idx));
+                                            }
+                                        }
+                                    }
+                                    PkDeletionStrategyWithCache::RowConverterBased { .. } => {
+                                        // Convert the OwnedRow's byte view into a `Box<[u8]>` for the
+                                        // delete-list — `deleted_row_keys` and `deleted_inlined_row_keys`
+                                        // are typed `Vec<Box<[u8]>>` so they can be forwarded to the
+                                        // `commit_on_conflict_deletions` catalog call without a second
+                                        // re-encoding. This is one allocation per conflict row; the
+                                        // arena-indexed key design discussed in iter 3 would amortize it.
+                                        let row_key = key.as_ref().to_vec().into_boxed_slice();
+                                        if is_inlined_conflict {
+                                            deleted_inlined_row_keys.push(row_key);
+                                        } else {
+                                            deleted_row_keys.push(row_key);
+                                        }
+                                    }
+                                    PkDeletionStrategyWithCache::PositionBased { .. } => {
+                                        // Position-based doesn't need PK values
                                     }
                                 }
-                            }
-                            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                                // Convert the OwnedRow's byte view into a `Box<[u8]>` for the
-                                // delete-list — `deleted_row_keys` and `deleted_inlined_row_keys`
-                                // are typed `Vec<Box<[u8]>>` so they can be forwarded to the
-                                // `commit_on_conflict_deletions` catalog call without a second
-                                // re-encoding. This is one allocation per conflict row; the
-                                // arena-indexed key design discussed in iter 3 would amortize it.
-                                let row_key = key.as_ref().to_vec().into_boxed_slice();
-                                if is_inlined_conflict {
-                                    deleted_inlined_row_keys.push(row_key);
-                                } else {
-                                    deleted_row_keys.push(row_key);
-                                }
-                            }
-                            PkDeletionStrategyWithCache::PositionBased { .. } => {
-                                // Position-based doesn't need PK values
-                            }
-                        }
 
-                        if !is_inlined_conflict && existing.row_id >= 0 {
-                            delete_specs
-                                .entry(existing.data_file_id)
-                                .or_default()
-                                .push(existing.row_id);
+                                if !is_inlined_conflict && existing.row_id >= 0 {
+                                    delete_specs
+                                        .entry(existing.data_file_id)
+                                        .or_default()
+                                        .push(existing.row_id);
+                                }
+                                true
+                            }
                         }
+                    } else {
                         true
                     }
                 }
-            } else {
-                true
+                PkExistenceRef::Bloom(bloom) => {
+                    // Over-budget upsert table: existence is approximate. The bloom
+                    // is only built for `OnConflict::Upsert` (a false positive is a
+                    // harmless redundant delete for upsert, but would wrongly drop a
+                    // new row under DoNothing), so the row is always kept here.
+                    debug_assert!(
+                        matches!(ctx.on_conflict, OnConflict::Upsert(_)),
+                        "bloom existence index is only valid for upsert tables"
+                    );
+                    // A bloom hit (possibly a false positive) emits a key-based
+                    // delete to BOTH the file and inline lists, so the prior version
+                    // is masked wherever it lives. A false positive matches nothing
+                    // and is a no-op. No `delete_specs` — we have no row location.
+                    if bloom.maybe_contains(key.as_ref()) {
+                        match &self.pk_deletion_strategy {
+                            PkDeletionStrategyWithCache::Int64Pk { .. } => {
+                                if let Some(arr) = int64_pk_array {
+                                    let value = arr.value(row_idx);
+                                    deleted_pk_i64.push(value);
+                                    deleted_inlined_pk_i64.push(value);
+                                }
+                            }
+                            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
+                                let row_key = key.as_ref().to_vec().into_boxed_slice();
+                                deleted_row_keys.push(row_key.clone());
+                                deleted_inlined_row_keys.push(row_key);
+                            }
+                            PkDeletionStrategyWithCache::PositionBased { .. } => {}
+                        }
+                    }
+                    true
+                }
             };
 
             if deduplicate_batch {
@@ -5812,6 +6398,15 @@ impl CayenneTableProvider {
             // Persist accumulated stats from the rewrite — keeps DataFusion's
             // synchronous statistics path consistent with the new snapshot.
             self.persist_table_stats(&stats_acc).await;
+        }
+
+        // Checkpoint the PK existence index for fast restart (best-effort). The
+        // new current snapshot now holds all live rows, and protected snapshots /
+        // inline entries were just cleared, so a bloom of this snapshot's keys is a
+        // complete checkpoint tagged with `new_snapshot_id`.
+        if self.upsert_bloom_eligible() {
+            self.persist_pk_bloom_checkpoint(&new_snapshot_id, total_rows)
+                .await;
         }
 
         // Cleanup must wait for in-flight scans whose plan-build already
@@ -10368,6 +10963,312 @@ mod tests {
             .await
             .expect("query created");
         df.collect().await.expect("collect succeeded")
+    }
+
+    /// Phase 2 (bloom fallback) helper: create an int64-PK upsert table with an
+    /// explicit keyset-cache budget (MB). `pk_keyset_cache_mb = 0` forces the
+    /// bounded-bloom existence path once any key is recorded, exercising the
+    /// over-budget fallback deterministically without needing millions of rows.
+    async fn create_budgeted_upsert_table(
+        table_name: &str,
+        pk_keyset_cache_mb: usize,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, TempDir) {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                pk_keyset_cache_mb: Some(pk_keyset_cache_mb),
+                ..VortexConfig::default()
+            },
+        };
+
+        let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+        (provider, temp_dir)
+    }
+
+    fn id_value_batch(schema: SchemaRef, ids: &[i64], values: &[i64]) -> RecordBatch {
+        use arrow::array::Int64Array;
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(Int64Array::from(values.to_vec())),
+            ],
+        )
+        .expect("id/value batch is valid")
+    }
+
+    /// Read back all `(id, value)` pairs, sorted by id, for assertion.
+    async fn collect_id_value_pairs(
+        ctx: &SessionContext,
+        provider: &CayenneTableProvider,
+        table_name: &str,
+    ) -> Vec<(i64, i64)> {
+        use arrow::array::Int64Array;
+        let batches = read_all(ctx, provider, table_name).await;
+        let mut pairs = Vec::new();
+        for batch in &batches {
+            let id_idx = batch.schema().index_of("id").expect("id column");
+            let value_idx = batch.schema().index_of("value").expect("value column");
+            let ids = batch
+                .column(id_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64");
+            let values = batch
+                .column(value_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value is Int64");
+            for row in 0..batch.num_rows() {
+                pairs.push((ids.value(row), values.value(row)));
+            }
+        }
+        pairs.sort_unstable();
+        pairs
+    }
+
+    #[test]
+    fn test_pk_bloom_has_no_false_negatives() {
+        // A bloom must never report an inserted key as absent — a false negative
+        // would drop a real upsert conflict. It should also keep the
+        // false-positive rate low for absent keys at a realistic fill.
+        let mut bloom = PkBloom::with_byte_budget(1024 * 1024);
+        let present: Vec<[u8; 8]> = (0..50_000u64).map(u64::to_be_bytes).collect();
+        for key in &present {
+            bloom.insert(key);
+        }
+        for key in &present {
+            assert!(
+                bloom.maybe_contains(key),
+                "bloom must never miss an inserted key"
+            );
+        }
+        let mut false_positives = 0usize;
+        for absent in 1_000_000u64..1_010_000 {
+            if bloom.maybe_contains(&absent.to_be_bytes()) {
+                false_positives += 1;
+            }
+        }
+        assert!(
+            false_positives < 1_000,
+            "false-positive rate should stay well under 10% (saw {false_positives}/10000)"
+        );
+    }
+
+    #[test]
+    fn test_pk_bloom_sidecar_roundtrip() {
+        let mut bloom = PkBloom::with_expected_keys(10_000, 64 * 1024 * 1024);
+        let keys: Vec<[u8; 8]> = (0..10_000u64).map(u64::to_be_bytes).collect();
+        for key in &keys {
+            bloom.insert(key);
+        }
+
+        let bytes = serialize_pk_bloom_sidecar(&bloom, "snap-abc-123");
+        let (restored, snapshot_id) =
+            deserialize_pk_bloom_sidecar(&bytes).expect("sidecar roundtrips");
+
+        assert_eq!(snapshot_id, "snap-abc-123");
+        assert_eq!(restored.bit_mask, bloom.bit_mask);
+        assert_eq!(restored.inserted_keys, bloom.inserted_keys);
+        for key in &keys {
+            assert!(
+                restored.maybe_contains(key),
+                "a restored bloom must retain every inserted key (no false negatives across persistence)"
+            );
+        }
+
+        // Truncated / garbage / wrong-magic inputs must fail closed (→ full-scan fallback).
+        assert!(deserialize_pk_bloom_sidecar(&bytes[..6]).is_none());
+        assert!(deserialize_pk_bloom_sidecar(b"GARBAGE!").is_none());
+        assert!(deserialize_pk_bloom_sidecar(&[]).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_over_budget_upsert_keyset_converts_to_bloom() {
+        let ctx = SessionContext::new();
+        // Budget 0 => any recorded key exceeds the budget.
+        let (provider, _tmp) =
+            create_budgeted_upsert_table("bloom_conversion", 0, ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])).await;
+
+        let guard = provider.pk_keyset_cache.lock();
+        assert!(
+            matches!(guard.as_ref(), Some(CachedPkIndex::Bloom(_))),
+            "an upsert table over its keyset byte budget must cache a bloom, not drop the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bloom_path_upsert_keeps_latest_per_key() {
+        let ctx = SessionContext::new();
+        // Budget 0 forces the bloom existence path from batch 2 onward.
+        let (provider, _tmp) =
+            create_budgeted_upsert_table("bloom_upsert_latest", 0, ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Batch 1 builds the index, then converts to a bloom (budget 0).
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30]),
+        )
+        .await;
+        // Batch 2 (bloom path): update 2 and 3, insert 4.
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[2, 3, 4], &[200, 300, 40]),
+        )
+        .await;
+        // Batch 3 (bloom path): update 1, insert 5.
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 5], &[111, 50]),
+        )
+        .await;
+
+        let pairs = collect_id_value_pairs(&ctx, &provider, "bloom_upsert_latest").await;
+        assert_eq!(
+            pairs,
+            vec![(1, 111), (2, 200), (3, 300), (4, 40), (5, 50)],
+            "bloom-path upserts must keep exactly one latest row per key (no drops, no duplicates)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persisted_bloom_loaded_on_reopen_preserves_correctness() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        // Shared catalog + data dir so we can reopen the same table (restart sim).
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: "bloom_restart".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                pk_keyset_cache_mb: Some(0),
+                ..VortexConfig::default()
+            },
+        };
+        let provider =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .create(options)
+                .await
+                .expect("table created");
+
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30]),
+        )
+        .await;
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[2, 4], &[200, 40]),
+        )
+        .await;
+
+        // Force a compaction, which persists the PK-index bloom checkpoint.
+        provider
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("compaction rewrite");
+
+        assert!(
+            catalog
+                .get_pk_index(&provider.table_metadata.table_id)
+                .await
+                .expect("query pk index")
+                .is_some(),
+            "compaction must persist the PK-index bloom checkpoint to the metastore"
+        );
+
+        // Simulate a restart: open a fresh provider (empty cache) over the same
+        // catalog + data directory.
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("bloom_restart")
+                .await
+                .expect("reopen table");
+
+        // The cold path must reconstruct the index from the sidecar (a Bloom),
+        // not a full keyset scan.
+        let pk_indices = reopened
+            .primary_key_indices()
+            .expect("pk indices")
+            .expect("table has a primary key");
+        let converter = reopened.build_pk_converter(&pk_indices).expect("converter");
+        let loaded = reopened
+            .try_load_persisted_pk_index(&pk_indices, &converter)
+            .await
+            .expect("load persisted index");
+        assert!(
+            matches!(loaded, Some(CachedPkIndex::Bloom(_))),
+            "reopen must load the persisted bloom checkpoint instead of a full scan"
+        );
+
+        // An upsert after the checkpoint-accelerated reopen must remain correct.
+        insert_batch(
+            &reopened,
+            id_value_batch(Arc::clone(&schema), &[1, 5], &[111, 50]),
+        )
+        .await;
+        let pairs = collect_id_value_pairs(&ctx, &reopened, "bloom_restart").await;
+        assert_eq!(
+            pairs,
+            vec![(1, 111), (2, 200), (3, 30), (4, 40), (5, 50)],
+            "upserts after a checkpoint-accelerated reopen must stay correct (no drops/duplicates)"
+        );
     }
 
     #[tokio::test]

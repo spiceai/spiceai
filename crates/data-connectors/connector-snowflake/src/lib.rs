@@ -24,7 +24,10 @@ limitations under the License.
 //! this crate, not the entire runtime.
 
 use async_trait::async_trait;
-use data_components::snowflake::{SnowflakeTableFactory, quote_snowflake_table_path};
+use data_components::snowflake::{
+    SnowflakeConnectionPool as DynSnowflakeConnectionPool, SnowflakeTableFactory,
+    quote_snowflake_table_path,
+};
 use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
@@ -34,6 +37,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
+use runtime::datafusion::udf::deny_spice_specific_functions;
 use runtime::parameters::ParameterSpec;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
@@ -114,7 +118,7 @@ impl DataConnectorFactory for SnowflakeFactory {
                     .context(UnableToCreateSnowflakeConnectionPoolSnafu)?,
             );
 
-            let table_factory = SnowflakeTableFactory::new(pool);
+            let table_factory = build_snowflake_table_factory(pool);
 
             Ok(Arc::new(Snowflake { table_factory }) as Arc<dyn DataConnector>)
         })
@@ -131,6 +135,20 @@ impl DataConnectorFactory for SnowflakeFactory {
     fn reserved_keywords(&self) -> &'static [&'static str] {
         RESERVED_KEYWORDS
     }
+}
+
+/// Build the [`SnowflakeTableFactory`] with the Spice function deny-list
+/// installed.
+///
+/// Wiring `deny_spice_specific_functions` here prevents federation pushdown
+/// from unparsing Spice-only UDFs (e.g. `json_get_str`) into Snowflake SQL,
+/// which the remote engine rejects with "Unknown function". Without it, any
+/// query that references one of these UDFs against a Snowflake-federated
+/// dataset fails at the remote engine instead of falling back to local
+/// `DataFusion` evaluation.
+fn build_snowflake_table_factory(pool: Arc<DynSnowflakeConnectionPool>) -> SnowflakeTableFactory {
+    SnowflakeTableFactory::new(pool)
+        .with_function_support(deny_spice_specific_functions().as_ref().clone())
 }
 
 /// The name used to identify this connector in configuration.
@@ -242,6 +260,13 @@ impl DataConnector for Snowflake {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::logical_expr::{ColumnarValue, ScalarUDF, Volatility, create_udf};
+    use datafusion_table_providers::sql::db_connection_pool::dbconnection::DbConnection;
+    use datafusion_table_providers::sql::db_connection_pool::{DbConnectionPool, JoinPushDown};
+    use std::any::Any;
+    use std::error::Error;
 
     #[test]
     fn test_factory_prefix() {
@@ -320,5 +345,77 @@ mod tests {
         quote_snowflake_table_path(r#""unterminated.table"#)
             .expect_err("should reject unterminated quoted identifier");
         quote_snowflake_table_path("a.b.c.d").expect_err("should reject 4-part identifier");
+    }
+
+    struct MockConn;
+
+    impl DbConnection<Arc<SnowflakeApi>, &'static dyn Sync> for MockConn {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    struct MockPool;
+
+    #[async_trait]
+    impl DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> for MockPool {
+        async fn connect(
+            &self,
+        ) -> std::result::Result<
+            Box<dyn DbConnection<Arc<SnowflakeApi>, &'static dyn Sync>>,
+            Box<dyn Error + Send + Sync>,
+        > {
+            Ok(Box::new(MockConn))
+        }
+
+        fn join_push_down(&self) -> JoinPushDown {
+            JoinPushDown::Disallow
+        }
+    }
+
+    fn stub_udf(name: &str) -> Arc<ScalarUDF> {
+        Arc::new(create_udf(
+            name,
+            vec![DataType::Utf8],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        ))
+    }
+
+    #[test]
+    fn build_snowflake_table_factory_installs_spice_deny_list() {
+        // Regression test for https://github.com/spiceai/spiceai/issues/10703.
+        // The extracted `connector-snowflake` crate (the one actually wired
+        // into `bin/spiced`) was missing the
+        // `.with_function_support(deny_spice_specific_functions()...)` call
+        // that exists on the orphaned `crates/runtime/src/dataconnector/
+        // snowflake.rs`. Without this wiring, Spice-only UDFs like
+        // `json_get_str` get unparsed into Snowflake SQL during federation
+        // pushdown and the remote engine rejects them with
+        // "Unknown function JSON_GET_STR".
+        let pool: Arc<DynSnowflakeConnectionPool> = Arc::new(MockPool);
+        let factory = build_snowflake_table_factory(pool);
+
+        let function_support = factory
+            .function_support()
+            .expect("connector-snowflake must install the Spice deny-list");
+
+        assert!(
+            !function_support.supports_scalar(&stub_udf("json_get_str")),
+            "json_get_str must be denied so federation falls back to local DataFusion"
+        );
+        assert!(
+            !function_support.supports_scalar(&stub_udf("cosine_distance")),
+            "cosine_distance must be denied (Snowflake does not have an exact equivalent)"
+        );
+        assert!(
+            function_support.supports_scalar(&stub_udf("upper")),
+            "non-Spice functions like upper() must still federate to Snowflake"
+        );
     }
 }
