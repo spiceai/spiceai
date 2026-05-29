@@ -7,4 +7,15 @@ expression: response
 +------------------------+------------------------------------------------------------------+
 | nsql                   | how many records (as 'total_records') are in taxi_trips dataset? |
 | tool_use::table_schema | {"tables":["dataset_not_in_spice"],"output":"full"}              |
+| sql_query              | truncated                                                        |
+| sql_query              | truncated                                                        |
+| sql_query              | truncated                                                        |
+| sql_query              | truncated                                                        |
+| sql_query              | truncated                                                        |
+| sql_query              | truncated                                                        |
+| sql_query              | truncated                                                        |
+| sql_query              | truncated                                                        |
+| sql_query              | truncated                                                        |
+| sql_query              | truncated                                                        |
+| sql_query              | truncated                                                        |
 +------------------------+------------------------------------------------------------------+
