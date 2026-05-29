@@ -506,10 +506,9 @@ impl ClientDriver {
         // Tokio worker thread on the async dispatch path.
         let store_path = self.config.identity_path.clone();
         let store_identity = identity.clone();
-        let persist = tokio::task::spawn_blocking(move || {
-            IdentityStore::store(&store_path, &store_identity)
-        })
-        .await;
+        let persist =
+            tokio::task::spawn_blocking(move || IdentityStore::store(&store_path, &store_identity))
+                .await;
         let persist_err: Option<String> = match persist {
             Ok(Ok(())) => None,
             Ok(Err(e)) => Some(e.to_string()),
