@@ -13,15 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::{
-    datafusion::DataFusion,
-    tools::{SpiceModelTool, utils::parameters},
-};
+use crate::tools::{SpiceModelTool, utils::parameters};
 use arrow::util::pretty::pretty_format_batches;
 use arrow_tools::record_batch::{truncate_numeric_column_length, truncate_string_columns};
 use async_trait::async_trait;
 use datafusion::sql::TableReference;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
+use runtime_datafusion::query_engine::QueryEngine;
 use serde_json::Value;
 use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
@@ -38,7 +36,7 @@ use super::{
 pub struct SampleDataTool {
     method: SampleTableMethod,
 
-    df: Arc<DataFusion>,
+    df: Arc<dyn QueryEngine>,
 
     // Overrides
     name: Option<String>,
@@ -49,7 +47,7 @@ pub struct SampleDataTool {
 
 impl SampleDataTool {
     #[must_use]
-    pub fn new(df: Arc<DataFusion>, method: SampleTableMethod) -> Self {
+    pub fn new(df: Arc<dyn QueryEngine>, method: SampleTableMethod) -> Self {
         Self {
             df,
             method,
