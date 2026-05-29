@@ -37,6 +37,7 @@ use axum_extra::{TypedHeader, extract::Query};
 use futures::{StreamExt, TryStreamExt};
 use headers_accept::Accept;
 use http::{HeaderMap, HeaderValue, header::CONTENT_TYPE};
+use mediatype::{MediaType, names};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use arrow::array::RecordBatch;
@@ -55,6 +56,11 @@ const DEFAULT_NSQL_RETRIES: u8 = 10;
 
 // NSQL streaming keep alive interval in seconds
 const NSQL_STREAM_KEEP_ALIVE: u64 = 30;
+
+static NSQL_CONTEXT_RESPONSE_MEDIA_TYPES: [MediaType<'static>; 2] = [
+    MediaType::new(names::TEXT, names::MARKDOWN),
+    MediaType::new(names::TEXT, names::PLAIN),
+];
 
 fn clean_model_based_sql(input: &str) -> String {
     let no_dashes = match input.strip_prefix("--") {
@@ -111,7 +117,7 @@ pub struct Request {
     pub stream: bool,
 
     /// Whether sample data is included in the context for SQL generation. Default: false
-    #[serde(default = "default_sample_data_enabled")]
+    #[serde(default = "default_sample_data_enabled", alias = "sampledataenabled")]
     pub sample_data_enabled: bool,
 
     /// Names of datasets to sample from when constructing model context; this is a sampling hint and does not restrict which tables queries can target. If omitted, all datasets are used.
@@ -119,7 +125,7 @@ pub struct Request {
     pub datasets: Option<Vec<String>>,
 
     /// Stable prompt-cache key forwarded to the configured NSQL model for provider-specific cache handling.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "promptcachekey")]
     pub prompt_cache_key: Option<String>,
 }
 
@@ -184,25 +190,29 @@ fn return_sql_only(accept: Option<&TypedHeader<Accept>>) -> bool {
     accept.is_some_and(|a| accept_header_types(a).contains(&"application/sql".to_string()))
 }
 
-fn context_response_content_type(accept: Option<&TypedHeader<Accept>>) -> HeaderValue {
-    if accept.is_some_and(|header| {
-        let accepted = accept_header_types(header);
-        accepted
-            .iter()
-            .any(|content_type| content_type == "text/plain")
-            && !accepted
-                .iter()
-                .any(|content_type| content_type == "text/markdown")
-    }) {
-        HeaderValue::from_static("text/plain; charset=utf-8")
+fn context_response_content_type(accept: Option<&TypedHeader<Accept>>) -> Option<HeaderValue> {
+    let content_type = accept.map_or(Some(&NSQL_CONTEXT_RESPONSE_MEDIA_TYPES[0]), |header| {
+        header.0.negotiate(&NSQL_CONTEXT_RESPONSE_MEDIA_TYPES)
+    })?;
+
+    if content_type.subty == names::PLAIN {
+        Some(HeaderValue::from_static("text/plain; charset=utf-8"))
     } else {
-        HeaderValue::from_static("text/markdown; charset=utf-8")
+        Some(HeaderValue::from_static("text/markdown; charset=utf-8"))
     }
 }
 
 fn nsql_context_response(context: String, accept: Option<&TypedHeader<Accept>>) -> Response {
+    let Some(content_type) = context_response_content_type(accept) else {
+        return (
+            StatusCode::NOT_ACCEPTABLE,
+            "Supported response content types are text/markdown and text/plain",
+        )
+            .into_response();
+    };
+
     let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, context_response_content_type(accept));
+    headers.insert(CONTENT_TYPE, content_type);
     (StatusCode::OK, headers, context).into_response()
 }
 
@@ -244,7 +254,10 @@ fn nsql_context_error_response(error: &NsqlContextError) -> (StatusCode, String)
             example = "# Spice.ai NSQL Context\n\n## Datasets\n- `sales_data`"
         ))),
         (status = 400, description = "Invalid request parameters", content((
-            String = "application/json", example = "Model nsql not found"
+            String = "text/plain", example = "Dataset 'sales.orders' not found"
+        ))),
+        (status = 406, description = "Requested response content type is not available", content((
+            String = "text/plain", example = "Supported response content types are text/markdown and text/plain"
         ))),
         (status = 500, description = "Internal server error", content((
             String, example = "Unexpected internal error. App not prepared in runtime."
@@ -694,7 +707,10 @@ mod tests {
         model::Model,
         runtime::{Functions, Runtime as SpicepodRuntime},
     };
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet},
+        str::FromStr,
+    };
 
     fn app_with_models(models: Vec<Model>) -> app::App {
         let mut builder = AppBuilder::new("test");
@@ -767,6 +783,10 @@ mod tests {
         }
     }
 
+    fn accept_header(value: &str) -> TypedHeader<Accept> {
+        TypedHeader(Accept::from_str(value).expect("accept header should parse"))
+    }
+
     #[test]
     fn request_defaults_to_no_model_and_no_sample_data() {
         let request: Request = serde_json::from_value(json!({
@@ -776,6 +796,60 @@ mod tests {
 
         assert_eq!(request.model, None);
         assert!(!request.sample_data_enabled);
+    }
+
+    #[test]
+    fn request_accepts_legacy_lowercase_field_aliases() {
+        let request: Request = serde_json::from_value(json!({
+            "query": "show total sales",
+            "sampledataenabled": true,
+            "promptcachekey": "sales-dashboard"
+        }))
+        .expect("request should deserialize legacy lowercase aliases");
+
+        assert!(request.sample_data_enabled);
+        assert_eq!(request.prompt_cache_key.as_deref(), Some("sales-dashboard"));
+    }
+
+    #[test]
+    fn nsql_context_response_defaults_to_markdown() {
+        let response = nsql_context_response("context".to_string(), None);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .expect("content type should be set")
+                .to_str()
+                .expect("content type should be valid ASCII"),
+            "text/markdown; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn nsql_context_response_negotiates_plain_text() {
+        let accept = accept_header("text/plain");
+        let response = nsql_context_response("context".to_string(), Some(&accept));
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .expect("content type should be set")
+                .to_str()
+                .expect("content type should be valid ASCII"),
+            "text/plain; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn nsql_context_response_rejects_unsupported_accept() {
+        let accept = accept_header("application/json");
+        let response = nsql_context_response("context".to_string(), Some(&accept));
+
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
     }
 
     #[test]
@@ -838,15 +912,15 @@ mod tests {
             TableReference::parse_str("sales.orders"),
             TableReference::parse_str("support_tickets"),
         ];
-        let schema_context = r#"
+        let schema_context = r"
 | table_reference | column_name | data_type | nullable | description |
 | --- | --- | --- | --- | --- |
 | sales.orders | order_id | Int64 | false | Unique order identifier |
 | sales.orders | customer_id | Utf8 | false | Customer account identifier |
 | support_tickets | ticket_id | Int64 | false | Support ticket identifier |
 | support_tickets | sentiment | Utf8 | true | Model-derived sentiment label |
-"#;
-        let function_context = r#"
+    ";
+        let function_context = r"
 Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions:
 
 ### Spice-specific functions
@@ -854,7 +928,7 @@ Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. Th
 
 ### User-defined functions
 - `ticket_priority`: scalar function from `sql` with `stable` volatility. Syntax: `ticket_priority(sentiment utf8) -> int64`. Converts support-ticket sentiment into a priority score.
-"#;
+    ";
         let sample_context_blocks = vec![
             SampleContextBlock {
                 title: "Distinct value samples for `support_tickets`".to_string(),
