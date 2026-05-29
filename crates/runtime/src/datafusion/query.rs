@@ -89,8 +89,8 @@ use crate::datafusion::{
 };
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
-use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use runtime_datafusion::config::request_context_config::SpiceRequestContextConfig;
+use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
 
@@ -1041,10 +1041,10 @@ impl Query {
         }
     }
 
-    pub fn from_logical_plan(df: &Arc<DataFusion>, plan: &LogicalPlan) -> Self {
+    pub fn from_logical_plan(df: &Arc<DataFusion>, plan: LogicalPlan) -> Self {
         Self {
             df: Arc::clone(df),
-            sql: QueryMethod::Plan(Box::new(plan.clone())),
+            sql: QueryMethod::Plan(Box::new(plan)),
             tracker: None,
             query_id: uuid::Uuid::new_v4(),
             cancellation_token: None,

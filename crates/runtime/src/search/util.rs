@@ -34,7 +34,8 @@ use snafu::ResultExt;
 use tokio::sync::RwLock;
 
 use crate::accelerated_table::AcceleratedTable;
-use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use runtime_query_engine::query_engine::QueryEngine;
 
 use crate::embeddings::table::EmbeddingTable;
 use crate::search::SearchGenerationSnafu;
@@ -156,7 +157,7 @@ pub async fn parse_explicit_primary_keys(
 }
 
 pub(crate) async fn get_primary_keys_from_table(
-    df: &Arc<DataFusion>,
+    df: &Arc<dyn QueryEngine>,
     table: &TableReference,
 ) -> Result<Vec<String>> {
     let tbl_ref = df
@@ -175,7 +176,7 @@ pub(crate) async fn get_primary_keys_from_table(
 /// table from the [`TableProvider`] constraints, and if not provided, use the explicit primary
 /// keys defined in the spicepod configuration.
 pub async fn get_primary_keys_with_overrides(
-    df: &Arc<DataFusion>,
+    df: &Arc<dyn QueryEngine>,
     tables: &[TableReference],
     explicit_primary_keys: &HashMap<TableReference, Vec<String>>,
 ) -> Result<HashMap<TableReference, Vec<String>>> {
@@ -198,7 +199,7 @@ pub async fn get_primary_keys_with_overrides(
     Ok(tbl_to_pks)
 }
 
-pub async fn user_tables_that_can_search(df: &Arc<DataFusion>) -> Result<Vec<TableReference>> {
+pub async fn user_tables_that_can_search(df: &Arc<dyn QueryEngine>) -> Result<Vec<TableReference>> {
     let mut searchable_tables = Vec::new();
 
     for t in df.get_user_table_names() {
@@ -225,7 +226,7 @@ pub async fn user_tables_that_can_search(df: &Arc<DataFusion>) -> Result<Vec<Tab
 ///
 /// This includes per-row embeddings and chunked embeddings.
 pub async fn embedding_columns_from_table(
-    df: &Arc<DataFusion>,
+    df: &Arc<dyn QueryEngine>,
     tbl: &TableReference,
 ) -> Option<Vec<String>> {
     let table_provider = df.get_table(tbl).await?;
@@ -283,7 +284,7 @@ pub async fn embedding_columns_from_table(
 ///     - `tbl` does not exist
 ///     - `tbl` does not have relevant full text search support.
 pub async fn full_text_search_candidates(
-    df: &Arc<DataFusion>,
+    df: &Arc<dyn QueryEngine>,
     tbl: &TableReference,
 ) -> Option<Result<Vec<Arc<dyn CandidateGeneration>>>> {
     let base_table_provider = df.get_table(tbl).await?;

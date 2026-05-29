@@ -22,8 +22,8 @@ use crate::{
     tools::{SpiceModelTool, utils::parameters},
 };
 use futures::TryStreamExt;
-use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
-use runtime_datafusion::query_engine::{QueryEngine, QueryRequest};
+use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
+use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

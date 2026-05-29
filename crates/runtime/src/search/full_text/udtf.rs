@@ -36,7 +36,6 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     prelude::Expr,
     scalar::ScalarValue,
-    sql::TableReference,
 };
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 
@@ -56,11 +55,11 @@ use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::{
     datafusion::DataFusion,
     embeddings::udtf::parse_limit_scalar,
-    search::util::{find_index_in_table_provider, table_ref_from_column_expr, to_column_expr},
+    search::util::{find_index_in_table_provider, table_ref_from_column_expr},
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 
-pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
+use runtime_search::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFuncArgs};
 
 /// Creates a `UserDefined` signature that allows named parameters (like `rank_weight => X`)
 /// to pass through for RRF (Reciprocal Rank Fusion) operations.
@@ -86,55 +85,6 @@ pub static TEXT_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
         .unwrap_or_else(|_| unreachable!("valid parameter names for text_search"))
 });
 
-#[derive(Debug, PartialEq, Clone)]
-pub struct TextSearchTableFuncArgs {
-    pub tbl: TableReference,
-    pub query: String,
-
-    pub column: Option<String>,
-    pub limit: Option<usize>,
-    pub include_score: Option<bool>,
-}
-
-impl TextSearchTableFuncArgs {
-    // Find column to perform full text search upon. Use either column specified in
-    // [`TextSearchTableFuncArgs`] or if there is only one column in `search_fields`.
-    fn column(&self, search_fields: &[String]) -> datafusion::error::Result<String> {
-        let TextSearchTableFuncArgs { column, tbl, .. } = &self;
-        let col: String = if let Some(col) = column {
-            if !search_fields.contains(col) {
-                return Err(DataFusionError::Plan(format!(
-                    "User function 'text_search' is called on table '{tbl}' that does not have a full text search index on '{col}' column. Index is on column(s): {}.{}",
-                    search_fields.join(", "),
-                    suggest_column(col, search_fields)
-                        .map(|s| format!(" Did you mean '{s}'?"))
-                        .unwrap_or_default()
-                )));
-            }
-            col.clone()
-        } else {
-            let mut fields = search_fields.iter();
-
-            match (fields.next(), fields.next()) {
-                (Some(field), None) => field.clone(),
-                (Some(_), Some(_)) => {
-                    return Err(DataFusionError::Plan(format!(
-                        "User function 'text_search' is called on table '{tbl}' that has {} full text search columns ({}). Must call 'text_search' with column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`",
-                        search_fields.len(),
-                        search_fields.join(", ")
-                    )));
-                }
-                _ => {
-                    return Err(DataFusionError::Plan(format!(
-                        "User function 'text_search' is called on table '{tbl}' that has no associated full text search index"
-                    )));
-                }
-            }
-        };
-        Ok(col)
-    }
-}
-
 /// Collect the sorted, deduped set of indexed column names across every FTS index on a
 /// table. Used on error paths to build "Indexed column(s): …" messages — never on the
 /// happy query path.
@@ -151,25 +101,7 @@ fn all_indexed_fields(fts_indexes: &[&FullTextDatabaseIndex]) -> Vec<String> {
 /// Suggest the closest indexed column for a misspelled column name using
 /// case-insensitive Levenshtein distance. Returns `None` if no column is reasonably close.
 fn suggest_column(target: &str, candidates: &[String]) -> Option<String> {
-    let target_lower = target.to_lowercase();
-    let (best, distance) = candidates
-        .iter()
-        .map(|c| {
-            (
-                c,
-                util::levenshtein::distance(&target_lower, &c.to_lowercase()),
-            )
-        })
-        .min_by_key(|(_, d)| *d)?;
-
-    // Only suggest if the edit distance is small relative to the target length.
-    // This avoids nonsense suggestions for wildly different names.
-    let threshold = target.len().div_ceil(2).max(2);
-    if distance <= threshold {
-        Some(best.clone())
-    } else {
-        None
-    }
+    runtime_search::udtf::closest_column(target, candidates)
 }
 
 #[derive(Debug)]
@@ -294,30 +226,7 @@ impl TextSearchTableFunc {
 
 impl TextSearchTableFunc {
     pub(crate) fn to_expr(args: &TextSearchTableFuncArgs) -> Vec<Expr> {
-        let mut expr = vec![
-            Expr::Column(to_column_expr(&args.tbl)),
-            Expr::Literal(ScalarValue::Utf8(Some(args.query.clone())), None),
-        ];
-
-        if let Some(col) = args.column.as_ref() {
-            expr.push(Expr::Column(Column::new_unqualified(col)));
-        }
-
-        if let Some(limit) = args.limit {
-            expr.push(Expr::Literal(
-                ScalarValue::UInt64(Some(u64::try_from(limit).unwrap_or(u64::MAX))),
-                None,
-            ));
-        }
-
-        if let Some(include_score) = args.include_score {
-            expr.push(Expr::Literal(
-                ScalarValue::Boolean(Some(include_score)),
-                None,
-            ));
-        }
-
-        expr
+        args.to_expr()
     }
 
     fn parse_args(args: &[Expr]) -> DataFusionResult<TextSearchTableFuncArgs> {

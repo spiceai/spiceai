@@ -13,10 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::{
-    Runtime,
-    tools::{SpiceModelTool, utils::parameters},
-};
+use crate::tools::{SpiceModelTool, utils::parameters};
 use app::App;
 use arrow_schema::{Field, Schema};
 use arrow_tools::format::table_schemas_to_markdown_table;
@@ -32,7 +29,8 @@ use async_openai::{
 use async_trait::async_trait;
 use datafusion::{error::DataFusionError, sql::TableReference};
 use itertools::Itertools;
-use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
+use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
+use runtime_query_engine::query_engine::QueryEngine;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -40,6 +38,7 @@ use snafu::ResultExt;
 use spicepod::semantic::Column;
 use std::collections::HashMap;
 use std::{borrow::Cow, sync::Arc};
+use tokio::sync::RwLock;
 use tracing_futures::Instrument;
 
 /// A tool to retrieve the schema of one or more available SQL tables.
@@ -74,14 +73,20 @@ impl TableSchemaToolParams {
 pub struct TableSchemaTool {
     name: String,
     description: Option<String>,
-    rt: Arc<Runtime>,
+    df: Arc<dyn QueryEngine>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
 
     table_allowlist: Option<ResolvedTableAwareAllowlist>,
 }
 
 impl TableSchemaTool {
     #[must_use]
-    pub fn new(rt: Arc<Runtime>, name: Option<&str>, description: Option<&str>) -> Self {
+    pub fn new(
+        df: Arc<dyn QueryEngine>,
+        app: Arc<RwLock<Option<Arc<App>>>>,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Self {
         Self {
             name: name.unwrap_or("table_schema").to_string(),
             description: Some(
@@ -89,7 +94,8 @@ impl TableSchemaTool {
                     .unwrap_or("Return the column schema of one or more datasets. Call this before writing a `sql` query so you know exact column names, types, nullability, and (with `output=full`) descriptions and semantic metadata. Pass `tables` as fully-qualified names from `list_datasets`. `output` is `full` (default, includes metadata) or `minimal` (names + types only).")
                     .to_string(),
             ),
-            rt,
+            df,
+            app,
             table_allowlist: None,
         }
     }
@@ -108,7 +114,7 @@ impl TableSchemaTool {
         let TableSchemaToolParams { tables, output } = req;
 
         // Precompute extra column details only if needed (for `full` output).
-        let column_info = match (output, self.rt.read_app().await) {
+        let column_info = match (output, self.app.read().await.clone()) {
             (OutputType::Full, Some(app)) => tables
                 .iter()
                 .map(|t| {
@@ -134,9 +140,8 @@ impl TableSchemaTool {
                         .boxed();
                     }
                     let base_schema = self
-                        .rt
-                        .datafusion()
-                        .get_arrow_schema(t)
+                        .df
+                        .get_arrow_schema(TableReference::parse_str(t.as_str()))
                         .instrument(span.clone())
                         .await
                         .boxed()?;

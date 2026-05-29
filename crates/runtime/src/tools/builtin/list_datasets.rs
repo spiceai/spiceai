@@ -13,26 +13,27 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::{
-    Runtime,
-    datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA},
-    tools::SpiceModelTool,
-};
+use crate::tools::SpiceModelTool;
+use app::App;
 use async_trait::async_trait;
 use datafusion::sql::TableReference;
 use itertools::Itertools;
-use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
+use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
+use runtime_query_engine::query_engine::QueryEngine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::ResultExt;
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use tokio::sync::RwLock;
 use tracing_futures::Instrument;
 
 pub struct ListDatasetsTool {
     name: String,
     description: String,
     table_allowlist: Option<ResolvedTableAwareAllowlist>,
-    rt: Arc<Runtime>,
+    df: Arc<dyn QueryEngine>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
 }
 
 impl ListDatasetsTool {
@@ -41,22 +42,18 @@ impl ListDatasetsTool {
         name: Option<&str>,
         description: Option<&str>,
         table_allowlist: Option<ResolvedTableAwareAllowlist>,
-        rt: Arc<Runtime>,
+        df: Arc<dyn QueryEngine>,
+        app: Arc<RwLock<Option<Arc<App>>>>,
     ) -> Self {
         Self {
-            rt,
+            df,
+            app,
             name: name.unwrap_or("list_datasets").to_string(),
             description: description
                 .unwrap_or("List every dataset, view, and catalog visible to this runtime, with each entry's fully-qualified table name, description, columns, and capability flags (e.g. `can_search_documents`). Call this first whenever you need to discover what data is available before issuing `sql`, `search`, `table_schema`, or sample tools. Takes no arguments. Returns a JSON array; use the `table` field as the identifier for follow-up tool calls.")
                 .to_string(),
             table_allowlist,
         }
-    }
-}
-
-impl From<&Arc<Runtime>> for ListDatasetsTool {
-    fn from(rt: &Arc<Runtime>) -> Self {
-        Self::new(None, None, None, Arc::clone(rt))
     }
 }
 
@@ -79,7 +76,7 @@ impl SpiceModelTool for ListDatasetsTool {
 
         let result: Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> = async {
             let elements =
-                get_dataset_elements(Arc::clone(&self.rt), self.table_allowlist.as_ref())
+                get_dataset_elements(Arc::clone(&self.df), Arc::clone(&self.app), self.table_allowlist.as_ref())
                     .await
                     .iter()
                     .map(serde_json::value::to_value)
@@ -107,12 +104,13 @@ impl SpiceModelTool for ListDatasetsTool {
 
 /// Return all datasets available in the runtime, with the properties visible to LLMs.
 pub async fn get_dataset_elements(
-    rt: Arc<Runtime>,
+    df: Arc<dyn QueryEngine>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
     opt_include: Option<&ResolvedTableAwareAllowlist>,
 ) -> Vec<ListDatasetElement> {
-    let mut tables = get_table_elements(Arc::clone(&rt), opt_include).await;
-    let views = get_view_elements(Arc::clone(&rt), opt_include).await;
-    let catalogs = get_catalog_elements(Arc::clone(&rt), opt_include).await;
+    let mut tables = get_table_elements(Arc::clone(&app), opt_include).await;
+    let views = get_view_elements(Arc::clone(&app), opt_include).await;
+    let catalogs = get_catalog_elements(df, Arc::clone(&app), opt_include).await;
     tables.extend(views.into_iter());
     tables.extend(catalogs.into_iter());
 
@@ -120,10 +118,10 @@ pub async fn get_dataset_elements(
 }
 
 pub async fn get_table_elements(
-    rt: Arc<Runtime>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
     opt_include: Option<&ResolvedTableAwareAllowlist>,
 ) -> Vec<ListDatasetElement> {
-    let Some(app) = rt.read_app().await else {
+    let Some(app) = app.read().await.clone() else {
         return vec![];
     };
 
@@ -144,17 +142,18 @@ pub async fn get_table_elements(
 }
 
 pub async fn get_catalog_elements(
-    rt: Arc<Runtime>,
+    df: Arc<dyn QueryEngine>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
     opt_include: Option<&ResolvedTableAwareAllowlist>,
 ) -> Vec<ListDatasetElement> {
-    let Some(ref app) = rt.read_app().await else {
+    let Some(ref app) = *app.read().await else {
         return vec![];
     };
 
     app.catalogs
         .iter()
         .flat_map(|c| {
-            let Some(ctlg) = rt.datafusion().ctx.catalog(c.name.as_str()) else {
+            let Some(ctlg) = df.session_context().catalog(c.name.as_str()) else {
                 return vec![];
             };
             ctlg.schema_names()
@@ -185,10 +184,10 @@ pub async fn get_catalog_elements(
 }
 
 pub async fn get_view_elements(
-    rt: Arc<Runtime>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
     opt_include: Option<&ResolvedTableAwareAllowlist>,
 ) -> Vec<ListDatasetElement> {
-    let Some(app) = rt.read_app().await else {
+    let Some(app) = app.read().await.clone() else {
         return vec![];
     };
 

@@ -16,7 +16,7 @@ limitations under the License.
 */
 use std::sync::Arc;
 
-use crate::Runtime;
+use crate::status;
 use async_trait::async_trait;
 use serde_json::Value;
 use snafu::ResultExt;
@@ -25,16 +25,20 @@ use tools::SpiceModelTool;
 pub struct GetReadinessTool {
     name: String,
     description: String,
-    rt: Arc<Runtime>,
+    status: Arc<status::RuntimeStatus>,
 }
 
 impl GetReadinessTool {
     #[must_use]
-    pub fn new(rt: Arc<Runtime>, name: Option<&str>, description: Option<&str>) -> Self {
+    pub fn new(
+        status: Arc<status::RuntimeStatus>,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Self {
         Self {
             name: name.unwrap_or("get_readiness").to_string(),
             description: description.unwrap_or("Report the readiness state of every Spice runtime component (datasets, accelerators, models, embeddings, catalogs). Call this when diagnosing why a query, model, or search call is failing or returning empty results, or to verify the runtime is healthy before issuing other tool calls. Takes no arguments. Returns a JSON object mapping component name to status (e.g. 'Ready', 'Initializing', 'Error').").to_string(),
-            rt,
+            status,
         }
     }
 }
@@ -54,7 +58,7 @@ impl SpiceModelTool for GetReadinessTool {
     async fn call(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::get_readiness", tool = self.name().to_string());
 
-        let statuses = self.rt.status().get_all_statuses();
+        let statuses = self.status.get_all_statuses();
         let statuses_map: serde_json::Map<String, Value> = statuses
             .iter()
             .map(|(k, v)| (k.clone(), Value::String(v.to_string())))

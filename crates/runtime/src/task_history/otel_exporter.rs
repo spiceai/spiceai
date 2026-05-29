@@ -31,7 +31,7 @@ use spicepod::component::runtime::{
     TaskHistoryCapturedContext, TaskHistoryCapturedOutput, TaskHistoryCapturedPlan,
 };
 
-use runtime_datafusion::query_engine::{QueryEngine, QueryRequest};
+use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
 
 use super::TaskSpan;
 

@@ -42,11 +42,11 @@ use crate::{
     Runtime,
     parameters::Parameters,
     tools::{
-        options::SpiceToolsOptions,
         registry::{TOOL_EMBEDDING_MODEL_PARAM, prepare_model_tools},
         utils::{create_table_allowlist, get_tools_with_allowlist},
     },
 };
+use runtime_tools::options::SpiceToolsOptions;
 
 pub type LLMChatCompletionsModelStore = HashMap<String, Arc<dyn Chat>>;
 

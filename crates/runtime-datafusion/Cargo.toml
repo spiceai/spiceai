@@ -21,11 +21,11 @@ datafusion-datasource.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-table-providers.workspace = true
 futures.workspace = true
-globset.workspace = true
 itertools.workspace = true
 opentelemetry.workspace = true
 parking_lot.workspace = true
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
+runtime-query-engine = { path = "../runtime-query-engine" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-request-context = { path = "../runtime-request-context" }
 search = { path = "../search", default-features = false }

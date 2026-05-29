@@ -152,55 +152,7 @@ enum SourceShape {
 ///
 /// `ListMulti` — the source column is a list of strings per row
 /// (`List<Utf8>` / `LargeList<Utf8>` and their `Utf8View` / `LargeUtf8`
-/// variants). One embedding vector is produced per list element; at
-/// query time per-element similarities are aggregated into a single
-/// per-row score via `aggregation`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EmbeddingInputMode {
-    Scalar,
-    ListMulti {
-        aggregation: EmbeddingAggregation,
-        max_elements_per_row: usize,
-    },
-}
-
-impl EmbeddingInputMode {
-    #[must_use]
-    pub fn is_list_multi(&self) -> bool {
-        matches!(self, Self::ListMulti { .. })
-    }
-}
-
-#[derive(Clone)]
-pub struct EmbeddingColumnConfig {
-    /// The name of the embedding model to use for this column.
-    /// Can be used as a key into [`EmbeddingModelStore`] for [`EmbeddingTable`].
-    pub model_name: String,
-
-    /// Expected size of its embedding. precompute to avoid async lock waits from `embedding_models` data structure.
-    pub vector_size: i32,
-
-    /// If `true`, assume embedding column is in the base table and does not need to be generated at query time.
-    pub in_base_table: bool,
-
-    // If None, either no chunking is needed, or [`in_base_table`] is true.
-    pub chunker: Option<Arc<dyn Chunker>>,
-
-    /// Shape of the source column. Determines the output Arrow type and
-    /// whether the search path uses MaxSim-over-elements.
-    pub input_mode: EmbeddingInputMode,
-}
-
-impl std::fmt::Debug for EmbeddingColumnConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EmbeddingColumnConfig")
-            .field("model_name", &self.model_name)
-            .field("vector_size", &self.vector_size)
-            .field("in_base_table", &self.in_base_table)
-            .field("input_mode", &self.input_mode)
-            .finish_non_exhaustive()
-    }
-}
+pub use runtime_search::udtf::{EmbeddingColumnConfig, EmbeddingInputMode};
 
 impl EmbeddingTable {
     pub async fn from_spicepod_columns(

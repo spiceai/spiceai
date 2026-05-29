@@ -20,12 +20,11 @@ use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
 
-use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
+use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 
 use crate::search::search_engine::SearchEngine;
 use crate::tools::builtin::list_datasets::get_dataset_elements;
 use crate::{
-    Runtime,
     search::{
         request::{SearchRequest, SearchRequestBaseJson},
         types::to_pretty,
@@ -33,23 +32,38 @@ use crate::{
     },
     tools::{SpiceModelTool, utils::parameters},
 };
+use app::App;
+use cache::TabledCacheProvider;
+use cache::result::search::CachedSearchResult;
+use runtime_query_engine::query_engine::QueryEngine;
 use runtime_request_context::{AsyncMarker, RequestContext};
+use tokio::sync::RwLock;
 
 pub struct SearchTool {
     name: String,
     description: String,
-    rt: Arc<Runtime>,
+    df: Arc<dyn QueryEngine>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
+    search_cache: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
     table_allowlist: Option<ResolvedTableAwareAllowlist>,
 }
 impl SearchTool {
     #[must_use]
-    pub fn new(rt: Arc<Runtime>, name: Option<&str>, description: Option<&str>) -> Self {
+    pub fn new(
+        df: Arc<dyn QueryEngine>,
+        app: Arc<RwLock<Option<Arc<App>>>>,
+        search_cache: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Self {
         Self {
             name: name.unwrap_or("search").to_string(),
             description: description
                 .unwrap_or("Run a hybrid (vector + keyword) similarity search over datasets configured with embeddings. Use this for natural-language or semantic lookups (e.g. 'find documents about X') instead of exact SQL filtering. Provide `text` for the query; optionally restrict with `datasets` (only datasets whose `can_search_documents=true` in `list_datasets` are valid), `where_cond` (a SQL predicate without the `WHERE` keyword), `additional_columns`, and `limit`. Returns matched rows grouped per dataset with similarity scores.")
                 .to_string(),
-            rt,
+            df,
+            app,
+            search_cache,
             table_allowlist: None,
         }
     }
@@ -82,8 +96,8 @@ impl SpiceModelTool for SearchTool {
             tracing::trace!("search tool use function call request: {req:?}");
 
             let vs = SearchEngine::new(
-                self.rt.datafusion(),
-                parse_explicit_primary_keys(Arc::clone(&self.rt.app)).await,
+                Arc::clone(&self.df),
+                parse_explicit_primary_keys(Arc::clone(&self.app)).await,
             );
 
             let mut search_request = SearchRequest::try_from(req)?;
@@ -95,11 +109,15 @@ impl SpiceModelTool for SearchTool {
                         .collect::<Vec<String>>(),
                 ),
                 (None, Some(allowlist)) => {
-                    let tables = get_dataset_elements(Arc::clone(&self.rt), Some(allowlist))
-                        .await
-                        .into_iter()
-                        .map(|d| d.table)
-                        .collect::<Vec<String>>();
+                    let tables = get_dataset_elements(
+                        Arc::clone(&self.df),
+                        Arc::clone(&self.app),
+                        Some(allowlist),
+                    )
+                    .await
+                    .into_iter()
+                    .map(|d| d.table)
+                    .collect::<Vec<String>>();
                     Some(tables)
                 }
             };
@@ -107,11 +125,7 @@ impl SpiceModelTool for SearchTool {
             let request_context = RequestContext::current(AsyncMarker::new().await);
 
             let (result, _) = vs
-                .search_with_cache(
-                    &search_request,
-                    self.rt.datafusion().search_cache_provider(),
-                    request_context,
-                )
+                .search_with_cache(&search_request, self.search_cache.clone(), request_context)
                 .await
                 .boxed()?;
 

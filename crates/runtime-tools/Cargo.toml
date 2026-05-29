@@ -1,0 +1,47 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "runtime-tools"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+arrow-schema.workspace = true
+arrow_tools = { path = "../arrow_tools" }
+app = { path = "../app" }
+async-openai.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+datafusion.workspace = true
+fundu.workspace = true
+futures.workspace = true
+itertools.workspace = true
+globset.workspace = true
+http.workspace = true
+rmcp = { workspace = true, optional = true }
+runtime-auth = { path = "../runtime-auth" }
+runtime-query-engine = { path = "../runtime-query-engine" }
+runtime-request-context = { path = "../runtime-request-context" }
+schemars.workspace = true
+serde.workspace = true
+secrecy.workspace = true
+serde_json.workspace = true
+snafu.workspace = true
+spicepod = { path = "../spicepod" }
+tools = { path = "../tools" }
+tokio.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tracing-futures.workspace = true
+url.workspace = true
+utoipa = { version = "5", optional = true }
+util = { path = "../util" }
+
+[features]
+default = []
+mcp = ["dep:rmcp"]
+openapi = ["dep:utoipa"]

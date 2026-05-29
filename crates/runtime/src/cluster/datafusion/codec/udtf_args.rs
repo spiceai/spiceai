@@ -26,11 +26,9 @@ limitations under the License.
 
 // Re-export the protobuf types for use in the codec
 pub use runtime_proto::{
-    ListUdfsArgs, RrfArgs, RrfNestedQuery, RrfTextSearchQuery, RrfVectorSearchQuery,
-    TextSearchArgs, UdtfArgs, VectorSearchArgs,
+    ListUdfsArgs, RrfArgs, RrfNestedQuery, TextSearchArgs, UdtfArgs, VectorSearchArgs,
 };
 
-use runtime_proto::rrf_nested_query::Query;
 use runtime_proto::udtf_args::Args;
 
 /// Extension trait for `UdtfArgs` to provide convenient construction.
@@ -74,39 +72,11 @@ impl UdtfArgsExt for UdtfArgs {
     }
 }
 
-/// Extension trait for `RrfNestedQuery` to provide convenient construction.
-pub trait RrfNestedQueryExt {
-    /// Create a text search nested query.
-    fn text_search(args: TextSearchArgs, rank_weight: Option<f64>) -> RrfNestedQuery;
-
-    /// Create a vector search nested query.
-    fn vector_search(args: VectorSearchArgs, rank_weight: Option<f64>) -> RrfNestedQuery;
-}
-
-impl RrfNestedQueryExt for RrfNestedQuery {
-    fn text_search(args: TextSearchArgs, rank_weight: Option<f64>) -> RrfNestedQuery {
-        RrfNestedQuery {
-            query: Some(Query::TextSearch(RrfTextSearchQuery {
-                args: Some(args),
-                rank_weight,
-            })),
-        }
-    }
-
-    fn vector_search(args: VectorSearchArgs, rank_weight: Option<f64>) -> RrfNestedQuery {
-        RrfNestedQuery {
-            query: Some(Query::VectorSearch(RrfVectorSearchQuery {
-                args: Some(args),
-                rank_weight,
-            })),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use prost::Message;
+    use runtime_search::rrf::RrfNestedQueryExt;
 
     #[test]
     fn test_list_udfs_serialization() {

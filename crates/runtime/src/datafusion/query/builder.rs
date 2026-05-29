@@ -18,7 +18,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use datafusion::common::ParamValues;
 use datafusion::logical_expr::LogicalPlan;
-use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
+use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;

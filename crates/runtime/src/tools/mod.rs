@@ -14,72 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use catalog::SpiceToolCatalog;
-use factory::default_catalog_names;
-use std::{borrow::Cow, sync::Arc};
+pub use runtime_tools::tooling::Tooling;
+use std::sync::Arc;
 pub use tools::SpiceModelTool;
-use tools::rename::with_name;
 
 pub mod builtin;
-pub mod catalog;
 pub mod factory;
-#[cfg(feature = "mcp")]
-pub mod mcp;
-pub mod memory;
-pub mod options;
 pub(crate) mod registry;
 pub mod utils;
-
-/// [`Tooling`] define several ways to access and load tools into the runtime.
-/// Tools can be defined singularly, or as a set of tools a user may want to
-/// include all together (i.e. a catalog).
-pub enum Tooling {
-    Tool(Arc<dyn SpiceModelTool>),
-    FunctionTool(Arc<dyn SpiceModelTool>),
-    Catalog(Arc<dyn SpiceToolCatalog>),
-}
-
-impl Tooling {
-    #[must_use]
-    pub async fn tools(&self) -> Vec<Arc<dyn SpiceModelTool>> {
-        match self {
-            Tooling::Tool(t) | Tooling::FunctionTool(t) => vec![Arc::clone(t)],
-            Tooling::Catalog(c) => {
-                let catalog_name = c.name();
-                if default_catalog_names().contains(&catalog_name) {
-                    return c.all().await;
-                }
-
-                // If non-default catalog, tool name must be prefixed by catalog.
-                c.all()
-                    .await
-                    .iter()
-                    .map(|t| with_name(t, format!("{catalog_name}/{}", t.name()).as_str()))
-                    .collect()
-            }
-        }
-    }
-
-    #[must_use]
-    pub fn name(&self) -> Cow<'_, str> {
-        match self {
-            Tooling::Tool(t) | Tooling::FunctionTool(t) => t.name(),
-            Tooling::Catalog(c) => Cow::Borrowed(c.name()),
-        }
-    }
-}
-
-impl From<Arc<dyn SpiceModelTool>> for Tooling {
-    fn from(tool: Arc<dyn SpiceModelTool>) -> Self {
-        Tooling::Tool(tool)
-    }
-}
-
-impl From<Arc<dyn SpiceToolCatalog>> for Tooling {
-    fn from(catalog: Arc<dyn SpiceToolCatalog>) -> Self {
-        Tooling::Catalog(catalog)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -146,9 +88,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_default_catalog() {
-        let t = Tooling::Catalog(Arc::new(MockCatalog {
-            name: "not_in_default_catalogs".to_string(),
-        }));
+        let t = Tooling::Catalog {
+            tools: Arc::new(MockCatalog {
+                name: "not_in_default_catalogs".to_string(),
+            }),
+            default_catalog_names: vec![],
+        };
         assert_eq!(
             t.tools()
                 .await
@@ -165,9 +110,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_catalog() {
-        let t = Tooling::Catalog(Arc::new(MockCatalog {
-            name: default_catalog_names()[0].to_string(),
-        }));
+        let t = Tooling::Catalog {
+            tools: Arc::new(MockCatalog {
+                name: default_catalog_names()[0].to_string(),
+            }),
+            default_catalog_names: default_catalog_names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        };
         assert_eq!(
             t.tools()
                 .await

@@ -21,12 +21,13 @@ use std::{collections::HashMap, sync::Arc};
 use crate::Runtime;
 
 #[cfg(feature = "mcp")]
-use super::mcp::factory::McpCatalogFactory;
+use runtime_tools::mcp::factory::McpCatalogFactory;
 
-use super::{
-    SpiceModelTool, Tooling, builtin::catalog::BuiltinToolCatalog, catalog::SpiceToolCatalog,
-    memory::catalog::MemoryToolCatalog,
-};
+use runtime_tools::catalog::SpiceToolCatalog;
+
+use runtime_tools::memory::catalog::MemoryToolCatalog;
+
+use super::{Tooling, builtin::catalog::BuiltinToolCatalog};
 
 pub enum ToolFactory {
     Catalog(Arc<dyn ToolCatalogFactory>),
@@ -41,13 +42,24 @@ impl ToolFactory {
         env: HashMap<String, SecretString>,
     ) -> Result<Tooling, Box<dyn std::error::Error + Send + Sync>> {
         match self {
-            ToolFactory::Catalog(c) => c
-                .construct(component, params_with_secrets, env)
-                .await
-                .map(Into::into),
+            ToolFactory::Catalog(c) => {
+                let catalog = c.construct(component, params_with_secrets, env).await?;
+                Ok(Tooling::Catalog {
+                    tools: catalog,
+                    default_catalog_names: default_catalog_names()
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                })
+            }
             ToolFactory::Tool(t) => t.construct(component, params_with_secrets).map(Into::into),
         }
     }
+}
+
+#[must_use]
+pub fn default_catalog_names<'a>() -> Vec<&'a str> {
+    vec![MemoryToolCatalog::name(), BuiltinToolCatalog::name()]
 }
 
 impl From<Arc<dyn ToolCatalogFactory>> for ToolFactory {
@@ -62,36 +74,26 @@ impl From<Arc<dyn IndividualToolFactory>> for ToolFactory {
     }
 }
 
-/// A factory that can create individual [`SpiceModelTool`]s from a spicepod [`Tool`] component.
-pub trait IndividualToolFactory: Send + Sync {
-    fn construct(
-        &self,
-        component: &Tool,
-        params_with_secrets: HashMap<String, SecretString>,
-    ) -> Result<Arc<dyn SpiceModelTool>, Box<dyn std::error::Error + Send + Sync>>;
-}
-
-/// A factory that can creates [`SpiceToolCatalog`]s from a spicepod [`Tool`] component.
-#[async_trait]
-pub trait ToolCatalogFactory: Send + Sync {
-    async fn construct(
-        &self,
-        component: &Tool,
-        params_with_secrets: HashMap<String, SecretString>,
-        env: HashMap<String, SecretString>,
-    ) -> Result<Arc<dyn SpiceToolCatalog>, Box<dyn std::error::Error + Send + Sync>>;
-}
+pub use runtime_tools::factory::{IndividualToolFactory, ToolCatalogFactory};
 
 pub async fn register_all_factories(rt: Arc<Runtime>) {
     let tool_factories = rt.tool_factories();
     let mut registry = tool_factories.lock().await;
     registry.insert(
         "builtin".to_string(),
-        ToolFactory::Tool(Arc::new(BuiltinToolCatalog::new(Arc::clone(&rt)))),
+        ToolFactory::Tool(Arc::new(BuiltinToolCatalog::new(
+            rt.datafusion() as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
+            Arc::clone(&rt.app),
+            rt.status(),
+            rt.datafusion().search_cache_provider(),
+        ))),
     );
     registry.insert(
         "memory".to_string(),
-        ToolFactory::Tool(Arc::new(MemoryToolCatalog::new(rt))),
+        ToolFactory::Tool(Arc::new(MemoryToolCatalog::new(
+            rt.datafusion() as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
+            Arc::clone(&rt.app),
+        ))),
     );
     #[cfg(feature = "mcp")]
     registry.insert(
@@ -113,14 +115,17 @@ pub async fn unregister_all_factories(rt: &Runtime) {
 #[must_use]
 pub fn default_available_catalogs(rt: Arc<Runtime>) -> Vec<Arc<dyn SpiceToolCatalog>> {
     vec![
-        Arc::new(BuiltinToolCatalog::new(Arc::clone(&rt))),
-        Arc::new(MemoryToolCatalog::new(rt)),
+        Arc::new(BuiltinToolCatalog::new(
+            rt.datafusion() as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
+            Arc::clone(&rt.app),
+            rt.status(),
+            rt.datafusion().search_cache_provider(),
+        )),
+        Arc::new(MemoryToolCatalog::new(
+            rt.datafusion() as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
+            Arc::clone(&rt.app),
+        )),
     ]
-}
-
-#[must_use]
-pub fn default_catalog_names<'a>() -> Vec<&'a str> {
-    vec![MemoryToolCatalog::name(), BuiltinToolCatalog::name()]
 }
 
 /// Forge creates `Tooling` from a `Tool` component. It uses the `from` field to determine if it should create a [`SpiceToolCatalog`] or a [`SpiceModelTool`].

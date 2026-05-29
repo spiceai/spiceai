@@ -29,7 +29,7 @@ use datafusion::sql::TableReference;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::constraints::UpsertOptions;
 use futures::TryStreamExt;
-use runtime_datafusion::query_engine::{QueryEngine, QueryRequest};
+use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
 use snafu::prelude::*;
 use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;

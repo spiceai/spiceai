@@ -27,11 +27,8 @@ use crate::datafusion::udtf::json_properties::{
     FLATTEN_JSON_PROPERTIES_UDTF_NAME, FlattenJsonPropertiesScalar, FlattenJsonPropertiesTableFunc,
 };
 use crate::datafusion::udtf::json_tree::{JSON_TREE_UDTF_NAME, JsonTreeScalar, JsonTreeTableFunc};
-use crate::embeddings::udtf::{VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFunc};
-use crate::search::full_text::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFunc};
-use crate::search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
-use crate::search::rrf;
-use crate::search::rrf::RRF_UDF_NAME;
+use crate::embeddings::udtf::VectorSearchTableFunc;
+use crate::search::full_text::udtf::TextSearchTableFunc;
 use crate::search::util::parse_explicit_primary_keys;
 use datafusion::execution::FunctionRegistry;
 use datafusion::functions::math::random::RandomFunc;
@@ -39,12 +36,16 @@ use datafusion::logical_expr::ScalarUDF;
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::supported_functions::{FunctionRestriction, FunctionSupport};
 use parking_lot::RwLock;
-use runtime_datafusion::query_engine::QueryEngine;
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::{
     ai::{AI_UDF_NAME, Ai},
     embed::{self, EMBED_UDF_NAME},
 };
+use runtime_query_engine::query_engine::QueryEngine;
+use runtime_search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
+use runtime_search::rrf;
+use runtime_search::rrf::RRF_UDF_NAME;
+use runtime_search::udtf::{TEXT_SEARCH_UDTF_NAME, VECTOR_SEARCH_UDTF_NAME};
 use runtime_secrets::{ExposeSecret, get_params_with_secrets};
 #[cfg(not(feature = "models"))]
 const EMBED_UDF_NAME: &str = "embed";
@@ -114,11 +115,11 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     // UDF stub (so `rerank(...)` can appear nested inside another UDTF's arg
     // list, same trick vector_search/text_search/rrf use) and a UDTF (the
     // actual `FROM rerank(...)` implementation).
-    let session_ctx: Arc<SessionContext> = Arc::clone(ctx);
+    let weak_df: std::sync::Weak<dyn runtime_query_engine::query_engine::QueryEngine> =
+        Arc::downgrade(&runtime.df) as _;
     ctx.register_udf(
         RerankTableFunc::new(
-            Arc::downgrade(&runtime.df),
-            Arc::clone(&session_ctx),
+            weak_df.clone(),
             runtime.rerankers(),
             runtime.completion_llms(),
         )
@@ -127,8 +128,7 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     ctx.register_udtf(
         RERANK_UDTF_NAME,
         Arc::new(RerankTableFunc::new(
-            Arc::downgrade(&runtime.df),
-            session_ctx,
+            weak_df,
             runtime.rerankers(),
             runtime.completion_llms(),
         )),
@@ -297,7 +297,7 @@ async fn maybe_register_function_as_tool(runtime: &crate::Runtime, decl: &Functi
     }
     let df_dyn = Arc::clone(&runtime.df) as Arc<dyn QueryEngine>;
     let df_weak = Arc::downgrade(&df_dyn);
-    match crate::tools::builtin::function_tool::build(decl, df_weak) {
+    match runtime_tools::builtin::function_tool::build(decl, df_weak) {
         Ok(adapter) => {
             let tool: Arc<dyn tools::SpiceModelTool> = Arc::new(adapter);
             let name = decl.name.clone();

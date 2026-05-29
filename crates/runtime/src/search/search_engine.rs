@@ -21,28 +21,27 @@ use super::request::SearchRequest;
 use super::util::user_tables_that_can_search;
 use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
-use crate::search::candidate::vector_udtf::VectorUDTFGeneration;
 use crate::search::{DataFusionSnafu, FormattingSnafu};
 use datafusion::common::{Column, DFSchema, SchemaError};
 use datafusion::error::DataFusionError;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_expr::Expr;
 use datafusion_expr::sqlparser::ast;
-use datafusion_expr::{Expr, LogicalPlan};
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
+use runtime_search::candidate::vector_udtf::VectorUDTFGeneration;
 #[cfg(not(feature = "models"))]
 const EMBED_UDF_NAME: &str = "embed";
+use runtime_datafusion::SPICE_DEFAULT_CATALOG;
+use runtime_datafusion::SPICE_DEFAULT_SCHEMA;
+use runtime_query_engine::query_engine::QueryEngine;
 use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
 #[cfg(feature = "duckdb")]
 use search::index::duckdb::DuckDBVectorIndex;
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
-use search::pipeline::QueryEngine;
 
-use crate::datafusion::{DataFusion, resolved_equality};
 use crate::search::{
     SearchPipelineSnafu,
-    candidate::vector::ChunkedNonIndexVectorGeneration,
     util::{
         embedding_columns_from_table, find_concrete_table_provider, find_index_in_table_provider,
         full_text_search_candidates, get_primary_keys_with_overrides,
@@ -60,6 +59,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use itertools::Itertools;
+use runtime_search::candidate::vector::ChunkedNonIndexVectorGeneration;
 use search::index::SearchIndex;
 use search::index::chunking::ChunkedSearchIndex;
 use search::index::native_vector::NativeVectorIndex;
@@ -75,23 +75,42 @@ use super::types::VectorSearchResult;
 
 /// A Component that can perform search operations.
 pub struct SearchEngine {
-    pub df: Arc<DataFusion>,
+    pub df: Arc<dyn QueryEngine>,
 
     // For tables, explicitly defined primary keys for datasets.
     // Are in [`ResolvedTableReference`] format.
     // Before use, must be resolved with spice defaults, `.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)`.
     explicit_primary_keys: HashMap<TableReference, Vec<String>>,
+
+    search_cache: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
 }
 
 impl SearchEngine {
     pub fn new(
-        df: Arc<DataFusion>,
+        df: Arc<dyn QueryEngine>,
         explicit_primary_keys: HashMap<TableReference, Vec<String>>,
     ) -> Self {
         SearchEngine {
             df,
             explicit_primary_keys,
+            search_cache: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_search_cache(
+        mut self,
+        cache: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
+    ) -> Self {
+        self.search_cache = cache;
+        self
+    }
+
+    #[must_use]
+    pub fn search_cache(
+        &self,
+    ) -> Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>> {
+        self.search_cache.clone()
     }
 
     fn get_vector_index(
@@ -184,7 +203,7 @@ impl SearchEngine {
                 )));
             }
 
-            let state = self.df.ctx.state();
+            let state = self.df.session_context().state();
             let Some(embed_udf) = state.scalar_functions().get(EMBED_UDF_NAME) else {
                 return Err(Error::EmbeddingError {
                     source: Box::from(format!(
@@ -379,12 +398,12 @@ impl SearchEngine {
                     // Ensure columns for a specific table aren't used on all tables.
                     let table_cols: Vec<_> = additional_columns
                         .iter()
-                        .filter(|&c| c.relation.as_ref().is_none_or(|rel| resolved_equality(tbl.clone(), rel.clone())))
+                        .filter(|&c| c.relation.as_ref().is_none_or(|rel| tbl.clone().resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA) == rel.clone().resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)))
                         .cloned()
                         .map(Expr::Column)
                         .collect();
 
-                    let pipe = SearchPipeline::new(generators, ReciprocalRankFusion, Arc::new(DatafusionQueryEngine(Arc::clone(&self.df))));
+                    let pipe = SearchPipeline::new(generators, ReciprocalRankFusion, Arc::clone(&self.df));
                     let agg_result = pipe.run(
                         query.clone(),
                         &tbl,
@@ -424,7 +443,7 @@ impl SearchEngine {
 }
 
 async fn get_filter_for_table(
-    df: &Arc<DataFusion>,
+    df: &Arc<dyn QueryEngine>,
     tbl: &TableReference,
     filter_opt: Option<&ast::Expr>,
 ) -> Result<Option<Expr>, super::Error> {
@@ -439,7 +458,7 @@ async fn get_filter_for_table(
         .context(DataFusionSnafu)?;
 
     match df
-        .ctx
+        .session_context()
         .state()
         .create_logical_expr(&filter.to_string(), &schema)
     {
@@ -471,10 +490,13 @@ fn is_field_not_found_on_unrelated_table(tbl: &TableReference, e: &DataFusionErr
     };
 
     // Unrelated table is only if a different relation is explicit set on the column.
-    !field
-        .relation
-        .as_ref()
-        .is_none_or(|rel| resolved_equality(tbl.clone(), rel.clone()))
+    !field.relation.as_ref().is_none_or(|rel| {
+        tbl.clone()
+            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+            == rel
+                .clone()
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+    })
 }
 
 fn wrap_cache_to_result(
@@ -586,28 +608,4 @@ fn wrap_cache_to_result(
     });
 
     wrapped_results
-}
-
-pub struct DatafusionQueryEngine(Arc<DataFusion>);
-
-#[async_trait::async_trait]
-impl QueryEngine for DatafusionQueryEngine {
-    async fn run(&self, plan: LogicalPlan) -> Result<SendableRecordBatchStream, DataFusionError> {
-        Ok(self
-            .0
-            .query_from_logical_plan(&plan)
-            .run()
-            .await
-            .map_err(|e| {
-                // Either get internal DataFusion error, or wrap as `DataFusionError::External`.
-                match e
-                    .attempt_internal_datafusion_err()
-                    .boxed()
-                    .map_err(DataFusionError::External)
-                {
-                    Ok(e) | Err(e) => e,
-                }
-            })?
-            .data)
-    }
 }

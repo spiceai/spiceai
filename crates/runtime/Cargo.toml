@@ -139,6 +139,9 @@ runtime-async = { path = "../runtime-async" }
 runtime-auth = { path = "../runtime-auth" }
 runtime-cluster = { path = "../runtime-cluster" }
 runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-query-engine = { path = "../runtime-query-engine" }
+runtime-search = { path = "../runtime-search" }
+runtime-tools = { path = "../runtime-tools" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-object-store = { path = "../runtime-object-store" }
@@ -289,6 +292,7 @@ elasticsearch = [
     "dep:elasticsearch",
     "dep:duration-parse",
     "search/elasticsearch",
+    "runtime-search/elasticsearch",
 ]
 duckdb = [
     "dep:duckdb",
@@ -316,7 +320,7 @@ iceberg-write = []
 imap = ["data_components/imap"]
 kafka = ["data_components/kafka"]
 keyring-secret-store = ["runtime-secrets/keyring-secret-store"]
-mcp = ["dep:rmcp", "tools/mcp"]
+mcp = ["dep:rmcp", "runtime-tools/mcp", "tools/mcp"]
 metal = ["llms/metal"]
 models = [
     "bedrock",
@@ -337,6 +341,7 @@ openapi = [
     "dep:utoipa",
     "mcp",
     "runtime-api-types/openapi",
+    "runtime-tools/openapi",
 ]
 oracle = ["data_components/oracle"]
 pingora = ["cache/pingora"]

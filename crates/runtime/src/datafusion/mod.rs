@@ -45,12 +45,13 @@ use crate::dataupdate::{
     UpdateType,
 };
 use crate::federated_table::FederatedTable;
-use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
 use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
+use runtime_search::udtf::TEXT_SEARCH_UDTF_NAME;
 
+use cache::result::query::QueryResult;
 use snafu::ResultExt;
 use {
     crate::cluster::{ExecutorControlStreamRegistry, ExecutorRegistry, ResolvedClusterConfig},
@@ -75,8 +76,8 @@ use datafusion::catalog::SchemaProvider;
 use datafusion::common::{Constraint, Constraints, ToDFSchema};
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
-use datafusion::execution::SessionState;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::{SendableRecordBatchStream, SessionState};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
@@ -100,9 +101,8 @@ use runtime_acceleration::snapshot::AccelerationLayout;
 ))]
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
-use runtime_datafusion::{
-    query_engine::Error as QueryEngineError, schema_provider::SpiceSchemaProvider,
-};
+use runtime_datafusion::schema_provider::SpiceSchemaProvider;
+use runtime_query_engine::query_engine::Error as QueryEngineError;
 use runtime_table_partition::provider::PartitionTableProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
@@ -3357,13 +3357,6 @@ impl DataFusion {
             .table_names())
     }
 
-    /// Create a [`Query`] based on a constructed [`LogicalPlan`].
-    ///
-    /// The `plan` should be valid, constructed off the [`DataFusion`]'s [`SessionContext`].
-    pub fn query_from_logical_plan(self: &Arc<Self>, plan: &LogicalPlan) -> Query {
-        Query::from_logical_plan(self, plan)
-    }
-
     pub fn query_builder<'a>(self: &Arc<Self>, sql: &'a str) -> QueryBuilder<'a> {
         QueryBuilder::new(sql, Arc::clone(self))
     }
@@ -3595,7 +3588,7 @@ impl runtime_cluster::context::PartitionDiscoverer for DataFusion {
 }
 
 #[async_trait::async_trait]
-impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
+impl runtime_query_engine::query_engine::QueryEngine for DataFusion {
     fn session_context(&self) -> &Arc<SessionContext> {
         &self.ctx
     }
@@ -3615,7 +3608,7 @@ impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
     async fn get_arrow_schema(
         &self,
         table_ref: TableReference,
-    ) -> runtime_datafusion::query_engine::Result<Schema> {
+    ) -> runtime_query_engine::query_engine::Result<Schema> {
         DataFusion::get_arrow_schema(self, table_ref.clone())
             .await
             .map_err(|e| QueryEngineError::GetSchema {
@@ -3628,7 +3621,7 @@ impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
         DataFusion::get_user_table_names(self)
     }
 
-    fn get_public_table_names(&self) -> runtime_datafusion::query_engine::Result<Vec<String>> {
+    fn get_public_table_names(&self) -> runtime_query_engine::query_engine::Result<Vec<String>> {
         DataFusion::get_public_table_names(self).map_err(|e| QueryEngineError::GetTableNames {
             source: DataFusionError::External(Box::new(e)),
         })
@@ -3644,9 +3637,8 @@ impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
 
     async fn execute_query(
         &self,
-        request: runtime_datafusion::query_engine::QueryRequest,
-    ) -> runtime_datafusion::query_engine::Result<datafusion::execution::SendableRecordBatchStream>
-    {
+        request: runtime_query_engine::query_engine::QueryRequest,
+    ) -> runtime_query_engine::query_engine::Result<SendableRecordBatchStream> {
         let arc_self = self
             .datafusion_ref
             .get()
@@ -3667,14 +3659,37 @@ impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
         if let Some(allowlist) = request.table_allowlist {
             qb = qb.allow_tables(allowlist);
         }
-        let result = qb
-            .build()
+        let QueryResult { data, .. } =
+            qb.build()
+                .run()
+                .await
+                .map_err(|e| QueryEngineError::QueryExecution {
+                    source: DataFusionError::External(Box::new(e)),
+                })?;
+        Ok(data)
+    }
+
+    async fn execute_plan(
+        &self,
+        plan: LogicalPlan,
+    ) -> runtime_query_engine::query_engine::Result<SendableRecordBatchStream> {
+        let arc_self = self
+            .datafusion_ref
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| QueryEngineError::QueryExecution {
+                source: DataFusionError::Internal(
+                    "DataFusion self-reference not initialized (call set_self_ref first)"
+                        .to_string(),
+                ),
+            })?;
+        let QueryResult { data, .. } = Query::from_logical_plan(&arc_self, plan)
             .run()
             .await
             .map_err(|e| QueryEngineError::QueryExecution {
                 source: DataFusionError::External(Box::new(e)),
             })?;
-        Ok(result.data)
+        Ok(data)
     }
 
     async fn write_data(
@@ -3682,8 +3697,8 @@ impl runtime_datafusion::query_engine::QueryEngine for DataFusion {
         table_ref: &TableReference,
         schema: Arc<Schema>,
         data: Vec<RecordBatch>,
-        update_type: runtime_datafusion::query_engine::UpdateType,
-    ) -> runtime_datafusion::query_engine::Result<()> {
+        update_type: runtime_query_engine::query_engine::UpdateType,
+    ) -> runtime_query_engine::query_engine::Result<()> {
         let update = DataUpdate {
             schema,
             data,

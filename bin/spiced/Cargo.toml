@@ -51,6 +51,7 @@ runtime = { path = "../../crates/runtime" }
 runtime-auth = { path = "../../crates/runtime-auth" }
 runtime-async = { path = "../../crates/runtime-async" }
 runtime-datafusion = { path = "../../crates/runtime-datafusion" }
+runtime-query-engine = { path = "../../crates/runtime-query-engine" }
 rustls.workspace = true
 yaml = { path = "../../crates/yaml" }
 snafu.workspace = true

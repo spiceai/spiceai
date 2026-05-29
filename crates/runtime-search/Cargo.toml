@@ -1,0 +1,35 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "runtime-search"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+chunking = { path = "../chunking" }
+arrow-schema.workspace = true
+async-trait.workspace = true
+datafusion.workspace = true
+datafusion-expr.workspace = true
+datafusion-functions-json = { workspace = true }
+futures.workspace = true
+itertools.workspace = true
+llms = { path = "../llms", default-features = false }
+runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
+runtime-proto = { path = "../runtime-proto" }
+runtime-query-engine = { path = "../runtime-query-engine" }
+search = { path = "../search", default-features = false }
+snafu.workspace = true
+spicepod = { path = "../spicepod" }
+tokio.workspace = true
+tonic.workspace = true
+util = { path = "../util" }
+tracing.workspace = true
+
+[features]
+default = []
+elasticsearch = []

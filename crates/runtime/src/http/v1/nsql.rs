@@ -22,13 +22,7 @@ use crate::{
     http::v1::{ResponseMetadata, ResponseMimeType, to_http_response},
     model::LLMChatCompletionsModelStore,
     tools::{
-        builtin::{
-            sample::{
-                SampleTableMethod, SampleTableParams, distinct::DistinctColumnsParams,
-                random::RandomSampleParams, tool::SampleDataTool,
-            },
-            table_schema::{TableSchemaTool, TableSchemaToolParams},
-        },
+        builtin::table_schema::{TableSchemaTool, TableSchemaToolParams},
         utils::create_tool_use_messages,
     },
 };
@@ -46,12 +40,16 @@ use datafusion::sql::TableReference;
 use futures::{StreamExt, TryStreamExt};
 use headers_accept::Accept;
 use http::HeaderMap;
-use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
+use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use arrow::array::RecordBatch;
 use itertools::Itertools;
 use llms::chat::nsql::{FailedAttempt, QueryGenerationContext, default::DefaultSqlGeneration};
+use runtime_tools::builtin::sample::{
+    SampleTableMethod, SampleTableParams, distinct::DistinctColumnsParams,
+    random::RandomSampleParams, tool::SampleDataTool,
+};
 use serde::{Deserialize, Serialize};
 use spicepod::component::model::ModelType;
 use std::{sync::Arc, time::Duration};
@@ -376,8 +374,13 @@ pub(crate) async fn handle_nsql_query(
 
     // Create assistant/tool result messages for calling `table_schema` tool for all or provided tables.
     let schema_messages = match create_tool_use_messages(
-        &TableSchemaTool::new(Arc::clone(&rt), None, None)
-            .with_table_allowlist(table_allowlist_opt.clone()),
+        &TableSchemaTool::new(
+            rt.datafusion() as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
+            Arc::clone(&rt.app),
+            None,
+            None,
+        )
+        .with_table_allowlist(table_allowlist_opt.clone()),
         "schemas-nsql",
         &TableSchemaToolParams::new(tables.iter().map(ToString::to_string).collect::<Vec<_>>()),
     )

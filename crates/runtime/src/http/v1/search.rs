@@ -149,7 +149,7 @@ pub(crate) async fn post(
     };
 
     let request_context = RequestContext::current(AsyncMarker::new().await);
-    let cache_provider = vs.df.search_cache_provider();
+    let cache_provider = vs.search_cache();
     match vs
         .search_with_cache(
             &search_request,

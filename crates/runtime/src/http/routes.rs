@@ -32,8 +32,6 @@ use crate::http::v1::{
 };
 use runtime_request_context::{Protocol, RequestContext};
 
-#[cfg(feature = "mcp")]
-use crate::tools::mcp::server::RuntimeServer;
 use app::App;
 use axum::{extract::State, routing::patch};
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
@@ -42,6 +40,8 @@ use opentelemetry::KeyValue;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpService, session::local::LocalSessionManager, tower::StreamableHttpServerConfig,
 };
+#[cfg(feature = "mcp")]
+use runtime_tools::mcp::server::RuntimeServer;
 use spicepod::component::runtime::CorsConfig;
 #[cfg(feature = "mcp")]
 use spicepod::component::runtime::McpConfig;
@@ -456,7 +456,7 @@ pub(crate) fn routes(
         let runtime_arc = Arc::clone(rt);
         let mcp_config = mcp_server_config(mcp_config);
         let mcp_service = StreamableHttpService::new(
-            move || Ok(RuntimeServer::from(&runtime_arc)),
+            move || Ok(RuntimeServer::new(Arc::clone(&runtime_arc.tools))),
             Arc::new(LocalSessionManager::default()),
             mcp_config,
         );

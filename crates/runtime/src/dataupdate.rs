@@ -26,7 +26,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 use futures::TryStreamExt;
-pub use runtime_datafusion::query_engine::{DataUpdate, UpdateType};
+pub use runtime_query_engine::query_engine::{DataUpdate, UpdateType};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
 use datafusion::sql::TableReference;

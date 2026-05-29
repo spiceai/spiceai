@@ -18,7 +18,9 @@ use std::sync::Arc;
 use datafusion::sql::TableReference;
 use search::generation::{CandidateGeneration, text_search::index::FullTextDatabaseIndex};
 
-use crate::{datafusion::DataFusion, search::candidate::text::TextSearchCandidate};
+use runtime_query_engine::query_engine::QueryEngine;
+
+use runtime_search::candidate::text::TextSearchCandidate;
 
 pub mod connector;
 pub mod table;
@@ -30,7 +32,7 @@ pub mod elasticsearch;
 /// Constructs a [`CandidateGeneration`] for full text search on the underlying [`tantivy::Index`] with full filter and column support via the underlying [`TableProvider`].
 pub async fn as_candidate_generations(
     database_index: &FullTextDatabaseIndex,
-    df: Arc<DataFusion>,
+    df: Arc<dyn QueryEngine>,
     tbl: TableReference,
 ) -> Result<Vec<Arc<dyn CandidateGeneration>>, search::generation::Error> {
     let mut generators = vec![];
@@ -53,10 +55,10 @@ pub async fn as_candidate_generations(
 #[cfg(feature = "elasticsearch")]
 pub async fn as_es_text_candidate_generations(
     indexes: Vec<&search::index::elasticsearch::ElasticsearchTextIndex>,
-    df: Arc<DataFusion>,
+    df: Arc<dyn QueryEngine>,
     tbl: TableReference,
 ) -> Result<Vec<Arc<dyn CandidateGeneration>>, search::generation::Error> {
-    use crate::search::candidate::elasticsearch_text::ElasticsearchTextSearchCandidate;
+    use runtime_search::candidate::elasticsearch_text::ElasticsearchTextSearchCandidate;
 
     let mut generators = vec![];
     for idx in indexes {

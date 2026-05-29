@@ -16,30 +16,29 @@ limitations under the License.
 
 use async_trait::async_trait;
 
-use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
-use runtime_datafusion::query_engine::QueryEngine;
+use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
+use runtime_query_engine::query_engine::QueryEngine;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::{ResultExt, Snafu};
 use spicepod::component::tool::Tool;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{
-    Runtime,
-    datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA},
-    tools::{
-        catalog::SpiceToolCatalog, factory::IndividualToolFactory, options::SpiceToolsOptions,
-    },
-};
+use crate::{status, tools::factory::IndividualToolFactory};
+use app::App;
+use cache::TabledCacheProvider;
+use cache::result::search::CachedSearchResult;
+use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use runtime_tools::catalog::SpiceToolCatalog;
+use runtime_tools::options::SpiceToolsOptions;
+use tokio::sync::RwLock;
+
+use runtime_tools::builtin::get_current_datetime::GetCurrentDateTimeTool;
+use runtime_tools::builtin::sample::{SampleTableMethod, tool::SampleDataTool};
+use tools::SpiceModelTool;
 
 use super::{
-    SpiceModelTool,
-    get_current_datetime::GetCurrentDateTimeTool,
-    get_readiness::GetReadinessTool,
-    list_datasets::ListDatasetsTool,
-    sample::{SampleTableMethod, tool::SampleDataTool},
-    search::SearchTool,
-    sql::SqlTool,
-    table_schema::TableSchemaTool,
+    get_readiness::GetReadinessTool, list_datasets::ListDatasetsTool, search::SearchTool,
+    sql::SqlTool, table_schema::TableSchemaTool,
 };
 
 #[derive(Debug, Snafu)]
@@ -57,15 +56,26 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone)]
 pub struct BuiltinToolCatalog {
-    rt: Arc<Runtime>,
+    df: Arc<dyn QueryEngine>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
+    status: Arc<status::RuntimeStatus>,
+    search_cache: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
     /// An optional table allowlist. Overriden by any per-tool `table_allowlist` param.
     model_table_allowlist: Option<ResolvedTableAwareAllowlist>,
 }
 
 impl BuiltinToolCatalog {
-    pub(crate) fn new(rt: Arc<Runtime>) -> Self {
+    pub(crate) fn new(
+        df: Arc<dyn QueryEngine>,
+        app: Arc<RwLock<Option<Arc<App>>>>,
+        status: Arc<status::RuntimeStatus>,
+        search_cache: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
+    ) -> Self {
         Self {
-            rt,
+            df,
+            app,
+            status,
+            search_cache,
             model_table_allowlist: None,
         }
     }
@@ -132,11 +142,9 @@ impl BuiltinToolCatalog {
                 self.model_table_allowlist.clone()
             };
 
-        let query_engine: Arc<dyn QueryEngine> = self.rt.datafusion();
-
         match id {
             "get_readiness" => Ok(Arc::new(GetReadinessTool::new(
-                Arc::clone(&self.rt),
+                Arc::clone(&self.status),
                 Some(name),
                 description,
             ))),
@@ -145,34 +153,42 @@ impl BuiltinToolCatalog {
                 description,
             ))),
             "search" => Ok(Arc::new(
-                SearchTool::new(Arc::clone(&self.rt), Some(name), description)
-                    .with_table_allowlist(table_allowlist),
+                SearchTool::new(
+                    Arc::clone(&self.df),
+                    Arc::clone(&self.app),
+                    self.search_cache.clone(),
+                    Some(name),
+                    description,
+                )
+                .with_table_allowlist(table_allowlist),
             )),
             "table_schema" => Ok(Arc::new(
-                TableSchemaTool::new(Arc::clone(&self.rt), Some(name), description)
-                    .with_table_allowlist(table_allowlist),
+                TableSchemaTool::new(
+                    Arc::clone(&self.df),
+                    Arc::clone(&self.app),
+                    Some(name),
+                    description,
+                )
+                .with_table_allowlist(table_allowlist),
             )),
             "sql" => Ok(Arc::new(SqlTool::new(
-                Arc::clone(&query_engine),
+                Arc::clone(&self.df),
                 Some(name),
                 description,
                 table_allowlist,
             ))),
             "sample_distinct_columns" => Ok(Arc::new(
-                SampleDataTool::new(
-                    Arc::clone(&query_engine),
-                    SampleTableMethod::DistinctColumns,
-                )
-                .with_overrides(Some(name), description)
-                .with_table_allowlist(table_allowlist),
+                SampleDataTool::new(Arc::clone(&self.df), SampleTableMethod::DistinctColumns)
+                    .with_overrides(Some(name), description)
+                    .with_table_allowlist(table_allowlist),
             )),
             "random_sample" => Ok(Arc::new(
-                SampleDataTool::new(Arc::clone(&query_engine), SampleTableMethod::RandomSample)
+                SampleDataTool::new(Arc::clone(&self.df), SampleTableMethod::RandomSample)
                     .with_overrides(Some(name), description)
                     .with_table_allowlist(table_allowlist),
             )),
             "top_n_sample" => Ok(Arc::new(
-                SampleDataTool::new(Arc::clone(&query_engine), SampleTableMethod::TopNSample)
+                SampleDataTool::new(Arc::clone(&self.df), SampleTableMethod::TopNSample)
                     .with_overrides(Some(name), description)
                     .with_table_allowlist(table_allowlist),
             )),
@@ -180,7 +196,8 @@ impl BuiltinToolCatalog {
                 Some(name),
                 description,
                 table_allowlist,
-                Arc::clone(&self.rt),
+                Arc::clone(&self.df),
+                Arc::clone(&self.app),
             ))),
             _ => Err(Error::UnknownBuiltinTool { id: id.to_string() }),
         }

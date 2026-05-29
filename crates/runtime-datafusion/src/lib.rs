@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod allowlist;
 pub mod analyzer_rule;
 pub mod composed_catalog;
 pub mod config;
@@ -27,7 +26,6 @@ pub mod managed_runtime;
 pub mod optimizer_rule;
 pub mod param_utils;
 pub mod query_cancel_registry;
-pub mod query_engine;
 pub mod schema_provider;
 pub mod sort_columns;
 pub mod url_table;

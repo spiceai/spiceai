@@ -35,7 +35,6 @@ use arrow_schema::{DataType, Field, SchemaRef};
 use async_openai::types::embeddings::EmbeddingInput;
 use datafusion::common::exec_err;
 use datafusion::datasource::ViewTable;
-use datafusion::logical_expr::expr::FieldMetadata;
 use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
@@ -55,7 +54,6 @@ use datafusion_expr::{
 };
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
 use futures::FutureExt;
-use itertools::Itertools;
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
 #[cfg(not(feature = "models"))]
@@ -65,7 +63,7 @@ use search::generation::util::get_primary_keys;
 use std::{
     any::Any,
     cmp::min,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::{Arc, LazyLock, Weak},
 };
 
@@ -74,15 +72,15 @@ use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
 use snafu::ResultExt;
 
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
-use crate::search::candidate::vector::ChunkedNonIndexVectorGeneration;
 use crate::{
     datafusion::DataFusion,
     embedding_col,
     embeddings::table::{EmbeddingColumnConfig, EmbeddingTable},
     model::EmbeddingModelStore,
-    search::util::{find_concrete_table_provider, table_ref_from_column_expr, to_column_expr},
+    search::util::{find_concrete_table_provider, table_ref_from_column_expr},
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_search::candidate::vector::ChunkedNonIndexVectorGeneration;
 
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
 use {
@@ -105,7 +103,7 @@ use search::index::elasticsearch::ElasticsearchIndex;
 
 use tokio::sync::RwLock;
 
-pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";
+use runtime_search::udtf::{DistanceMetric, VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFuncArgs};
 
 /// Upper bound on the number of query strings accepted by `vector_search` when
 /// invoked in late-interaction (multi-query) mode. Each query produces its own
@@ -137,137 +135,6 @@ pub static VECTOR_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
         Err(_) => Signature::variadic_any(Volatility::Stable),
     }
 });
-
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub enum DistanceMetric {
-    /// Cosine similarity (default). Score = `1 - cosine_distance(q, v)`.
-    /// Best default; if embeddings are L2-normalized, this is equivalent to dot product.
-    Cosine,
-    /// Negated Euclidean distance: `Score = -array_distance(q, v)`. Use when
-    /// your embedding model/index was trained against L2 distance.
-    L2,
-    /// Dot product. Score = `inner_product(q, v)`. Prefer `Cosine` with
-    /// L2-normalized embeddings when possible — they are equivalent up to a
-    /// constant for unit vectors.
-    Dot,
-}
-
-impl DistanceMetric {
-    pub fn parse(s: &str) -> DataFusionResult<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "cosine" | "cos" => Ok(Self::Cosine),
-            "l2" | "euclidean" | "euclid" => Ok(Self::L2),
-            "dot" | "inner" | "ip" => Ok(Self::Dot),
-            other => Err(DataFusionError::Plan(format!(
-                "Unsupported distance_metric '{other}' for {VECTOR_SEARCH_UDTF_NAME}. Supported: 'cosine', 'l2', 'dot'."
-            ))),
-        }
-    }
-
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Cosine => "cosine",
-            Self::L2 => "l2",
-            Self::Dot => "dot",
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct VectorSearchTableFuncArgs {
-    pub tbl: TableReference,
-    /// Primary query string. For single-string queries this is the only
-    /// query; for multi-string (late-interaction) queries it is the
-    /// first element of `queries` and retained here for backward
-    /// compatibility with existing consumers that read `query` directly.
-    pub query: String,
-    /// All query strings. Always contains at least one entry (mirroring
-    /// `query` for single-string mode). Length > 1 triggers the
-    /// late-interaction search path when paired with a multi-vector
-    /// column.
-    pub queries: Vec<String>,
-
-    pub column: Option<String>,
-    pub limit: Option<usize>,
-    pub include_score: Option<bool>,
-    /// Similarity/distance metric used to rank candidate vectors. Defaults to
-    /// `Cosine` for backward compatibility.
-    pub distance_metric: Option<DistanceMetric>,
-}
-
-impl VectorSearchTableFuncArgs {
-    /// Check [`Self::column`] is valid, attempt to pick a default, and retrieve the associated [`EmbeddingColumnConfig`].
-    fn get_column_and_config(
-        &self,
-        embedded_columns: &HashMap<String, EmbeddingColumnConfig>,
-    ) -> DataFusionResult<(String, EmbeddingColumnConfig)> {
-        let cfg = self
-            .column
-            .as_ref()
-            .and_then(|c| embedded_columns.get(c))
-            .cloned();
-        match (self.column.as_deref(), cfg) {
-            (Some(col), Some(cfg)) => Ok((col.to_string(), cfg)),
-            (Some(col), None) => {
-                // Sort for deterministic error text / tests — `HashMap::keys()` has
-                // nondeterministic iteration order, which would make error messages
-                // (and the Levenshtein suggestion) flaky across runs.
-                let mut available: Vec<String> = embedded_columns.keys().cloned().collect();
-                available.sort();
-                let suggestion = closest_column(col, &available)
-                    .map(|s| format!(" Did you mean '{s}'?"))
-                    .unwrap_or_default();
-                Err(DataFusionError::Plan(format!(
-                    "User function 'vector_search' is called on table '{}' that does not have an embedding index on '{col}' column. Indexed column(s): {}.{suggestion}",
-                    self.tbl,
-                    available.iter().join(", ")
-                )))
-            }
-            (None, _) => {
-                if embedded_columns.len() > 1 {
-                    let mut available: Vec<String> = embedded_columns.keys().cloned().collect();
-                    available.sort();
-                    return Err(DataFusionError::Plan(format!(
-                        "User function 'vector_search' is called on table '{}' that has {} vector search columns ({}). Must call 'vector_search' with column parameter, e.g. `vector_search(\"my table\", 'my query', my_embedded_col)`.",
-                        self.tbl,
-                        embedded_columns.len(),
-                        available.iter().join(", ")
-                    )));
-                }
-                if let Some((col, cfg)) = embedded_columns.iter().next() {
-                    Ok((col.clone(), cfg.clone()))
-                } else {
-                    Err(DataFusionError::Plan(format!(
-                        "User function 'vector_search' is called on table '{}' that has no associated embedding index.",
-                        self.tbl,
-                    )))
-                }
-            }
-        }
-    }
-}
-
-/// Suggest the closest available column to `target` using case-insensitive
-/// Levenshtein distance. Returns `None` if nothing is reasonably close.
-fn closest_column(target: &str, candidates: &[String]) -> Option<String> {
-    let target_lower = target.to_lowercase();
-    let (best, distance) = candidates
-        .iter()
-        .map(|c| {
-            (
-                c,
-                util::levenshtein::distance(&target_lower, &c.to_lowercase()),
-            )
-        })
-        .min_by_key(|(_, d)| *d)?;
-    let threshold = target.len().div_ceil(2).max(2);
-    if distance <= threshold {
-        Some(best.clone())
-    } else {
-        None
-    }
-}
 
 #[derive(Debug)]
 pub struct VectorSearchTableFunc {
@@ -331,56 +198,7 @@ impl VectorSearchTableFunc {
 
 impl VectorSearchTableFunc {
     pub fn to_expr(args: &VectorSearchTableFuncArgs) -> DataFusionResult<Vec<Expr>> {
-        // Multi-query searches round-trip as a `make_array(...)` call;
-        // single-query stays as a bare Utf8 literal for backwards
-        // compatibility with pre-multi-query consumers.
-        let query_expr = if args.queries.len() > 1 {
-            let make_array = datafusion::functions_nested::make_array::make_array_udf();
-            Expr::ScalarFunction(ScalarFunction::new_udf(
-                make_array,
-                args.queries
-                    .iter()
-                    .map(|q| Expr::Literal(ScalarValue::Utf8(Some(q.clone())), None))
-                    .collect(),
-            ))
-        } else {
-            let q = args
-                .queries
-                .first()
-                .cloned()
-                .unwrap_or_else(|| args.query.clone());
-            Expr::Literal(ScalarValue::Utf8(Some(q)), None)
-        };
-        let mut expr = vec![Expr::Column(to_column_expr(&args.tbl)), query_expr];
-
-        if let Some(col) = args.column.as_ref() {
-            expr.push(Expr::Column(Column::new_unqualified(col)));
-        }
-        if let Some(limit) = args.limit {
-            let limit_u64 = u64::try_from(limit).map_err(|_| {
-                DataFusionError::Plan(format!(
-                    "vector_search: limit value {limit} is out of range for u64."
-                ))
-            })?;
-            expr.push(Expr::Literal(ScalarValue::UInt64(Some(limit_u64)), None));
-        }
-        if let Some(include_score) = args.include_score {
-            expr.push(Expr::Literal(
-                ScalarValue::Boolean(Some(include_score)),
-                None,
-            ));
-        }
-        if let Some(metric) = args.distance_metric {
-            let meta = FieldMetadata::new(BTreeMap::from([(
-                "spice.parameter_name".to_string(),
-                "distance_metric".to_string(),
-            )]));
-            expr.push(Expr::Literal(
-                ScalarValue::Utf8(Some(metric.as_str().to_string())),
-                Some(meta),
-            ));
-        }
-        Ok(expr)
+        args.to_expr()
     }
 
     /// Parse the query argument of `vector_search(tbl, <query>, ...)`.

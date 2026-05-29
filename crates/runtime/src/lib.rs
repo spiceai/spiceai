@@ -67,7 +67,7 @@ pub use http::get_api_doc;
 use llms::rerank::RerankerModelStore;
 use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
-use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
+use crate::tools::{Tooling, factory::default_available_catalogs};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use snafu::prelude::*;
@@ -1680,7 +1680,7 @@ impl Runtime {
                     Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
                         yield Arc::clone(tool);
                     }
-                    Tooling::Catalog(catalog) => {
+                    Tooling::Catalog { tools: catalog, .. } => {
                         // Do not list tools from default catalogs. They are already listed individually as tools.
                         if default_catalog_names.contains(&name.as_str()) {
                             continue;
@@ -1699,7 +1699,7 @@ impl Runtime {
         let tools = self.tools.read().await;
         let tool: Arc<dyn SpiceModelTool> =
             if let Some((catalog_name, name)) = tool_name.split_once('/') {
-                let Some(Tooling::Catalog(catalog)) = tools.get(catalog_name) else {
+                let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(catalog_name) else {
                     return None;
                 };
                 return catalog.get(name).await;

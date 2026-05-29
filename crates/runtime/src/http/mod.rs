@@ -125,10 +125,13 @@ pub(crate) async fn start<A>(
 where
     A: ToSocketAddrs + Debug,
 {
-    let vsearch = Arc::new(SearchEngine::new(
-        Arc::clone(&rt.df),
-        parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
-    ));
+    let vsearch = Arc::new(
+        SearchEngine::new(
+            Arc::clone(&rt.df) as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
+            parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
+        )
+        .with_search_cache(rt.df.search_cache_provider()),
+    );
     let app = rt.app.as_ref().read().await;
     let cors_config: Cow<'_, CorsConfig> = match app.as_ref() {
         Some(app) => Cow::Borrowed(&app.runtime.cors),

@@ -18,11 +18,8 @@ use crate::Runtime;
 use crate::cluster::datafusion::codec::udtf_args::{
     RrfArgs, TextSearchArgs, UdtfArgs, UdtfArgsExt, VectorSearchArgs,
 };
-use crate::embeddings::udtf::{
-    DistanceMetric, VectorSearchTableFunc, VectorSearchTableFuncArgs, VectorSearchUDTFProvider,
-};
-use crate::search::full_text::udtf::{TextSearchTableFunc, TextSearchTableFuncArgs};
-use crate::search::rrf::ReciprocalRankFusion;
+use crate::embeddings::udtf::{VectorSearchTableFunc, VectorSearchUDTFProvider};
+use crate::search::full_text::udtf::TextSearchTableFunc;
 use crate::udtfs::{ListUDFTable, ListUDFTableFunc};
 use arrow_schema::SchemaRef;
 use ballista_core::serde::BallistaLogicalExtensionCodec;
@@ -36,6 +33,8 @@ use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use prost::Message;
 use runtime_proto::rrf_nested_query::Query;
 use runtime_proto::udtf_args::Args;
+use runtime_search::rrf::ReciprocalRankFusion;
+use runtime_search::udtf::{DistanceMetric, TextSearchTableFuncArgs, VectorSearchTableFuncArgs};
 use search::provider::{SearchQueryProvider, UdtfSource};
 use std::collections::HashMap;
 use std::fmt::Debug;
