@@ -61,7 +61,7 @@ pub(super) fn build_local_extra_envs(_setup_config: &SetupConfig) -> HashMap<Str
     let mut map = HashMap::new();
     map.insert(
         "SPICED_LOG".to_string(),
-        "info,runtime::accelerated_table::refresh_task::changes=trace".to_string(),
+        "info,cayenne=off,runtime::accelerated_table::refresh_task::changes=trace".to_string(),
     );
     map
 }

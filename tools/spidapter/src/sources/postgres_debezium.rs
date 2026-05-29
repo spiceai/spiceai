@@ -126,9 +126,33 @@ pub(crate) async fn register_debezium_postgres_connector(
         .await
         .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
 
-    if status.is_success() || status.as_u16() == 409 {
+    if status.is_success() {
         eprintln!("[stdio] Debezium: PostgreSQL connector registered (status={status})");
         Ok(())
+    } else if status.as_u16() == 409 {
+        // Connector already exists from a previous run — update its config via PUT
+        // so it points to the new schema/tables instead of the old ones.
+        eprintln!("[stdio] Debezium: connector already exists, updating config via PUT...");
+        let config = body["config"].clone();
+        let put_resp = client
+            .put(format!("{connect_url}/connectors/spicebench-postgres/config"))
+            .json(&config)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to PUT Debezium connector config: {e}"))?;
+        let put_status = put_resp.status();
+        let put_body = put_resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
+        if put_status.is_success() {
+            eprintln!("[stdio] Debezium: connector config updated (status={put_status})");
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "Debezium connector config update failed: status={put_status}, body={put_body}"
+            ))
+        }
     } else {
         Err(anyhow::anyhow!(
             "Debezium Connect registration failed: status={status}, body={response_body}"
@@ -170,6 +194,14 @@ pub(crate) fn generate_postgres_debezium_spicepod(
             (
                 "kafka_security_protocol".to_string(),
                 "PLAINTEXT".to_string(),
+            ),
+            (
+                "batch_max_size".to_string(),
+                "50000".to_string(),
+            ),
+            (
+                "batch_max_duration".to_string(),
+                "1s".to_string(),
             ),
         ])));
 
