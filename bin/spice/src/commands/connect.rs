@@ -112,13 +112,13 @@ pub enum ConnectCommand {
 /// Returns an error if I/O fails or the legacy pod-add path errors.
 pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
     if let Some(cmd) = args.command {
-        return execute_subcommand(cmd);
+        return execute_subcommand(&cmd);
     }
 
     let Some(target) = args.target.as_deref() else {
         // No positional argument and no subcommand — default to status
         // so that `spice connect` with no args is informative.
-        return execute_subcommand(ConnectCommand::Status);
+        return execute_subcommand(&ConnectCommand::Status);
     };
 
     if runtime_cloud_connect::is_valid_adoption_code(target) {
@@ -132,7 +132,7 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
     execute_add_or_connect(ctx, add_args, true).await
 }
 
-fn execute_subcommand(cmd: ConnectCommand) -> Result<()> {
+fn execute_subcommand(cmd: &ConnectCommand) -> Result<()> {
     match cmd {
         ConnectCommand::Status => print_status(),
         ConnectCommand::Forget => forget_identity(),
@@ -148,10 +148,10 @@ fn stage_adoption_code(code: &str, endpoint: Option<&str>) -> Result<()> {
         })?;
     }
 
-    let endpoint_path = pending_path
-        .parent()
-        .map(|p| p.join("cloud-endpoint"))
-        .unwrap_or_else(|| PathBuf::from("cloud-endpoint"));
+    let endpoint_path = pending_path.parent().map_or_else(
+        || PathBuf::from("cloud-endpoint"),
+        |p| p.join("cloud-endpoint"),
+    );
 
     // If the user did NOT pass `--endpoint`, remove any previous override
     // so the next `spiced` start doesn't silently re-use a stale endpoint
@@ -254,10 +254,10 @@ fn forget_identity() -> Result<()> {
     let identity_path = runtime_cloud_connect::config::CloudConnectConfig::default_identity_path();
     let pending_path =
         runtime_cloud_connect::config::CloudConnectConfig::default_pending_adopt_code_path();
-    let endpoint_path = pending_path
-        .parent()
-        .map(|p| p.join("cloud-endpoint"))
-        .unwrap_or_else(|| PathBuf::from("cloud-endpoint"));
+    let endpoint_path = pending_path.parent().map_or_else(
+        || PathBuf::from("cloud-endpoint"),
+        |p| p.join("cloud-endpoint"),
+    );
 
     let had_identity = identity_path.exists();
     let had_pending = pending_path.exists();

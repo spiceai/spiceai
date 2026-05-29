@@ -511,6 +511,18 @@ pub struct LogErrors(pub bool);
 #[expect(clippy::struct_field_names)]
 pub struct Runtime {
     app: Arc<RwLock<Option<Arc<App>>>>,
+    /// Serializes [`Runtime::apply_app`] so that concurrent callers cannot
+    /// interleave their diff-and-swap. `apply_app` computes diffs under a read
+    /// lock and only takes the app write lock for the final swap; that is sound
+    /// when applies are serialized, but `apply_app` now has two independent
+    /// callers — the on-disk pods watcher and Spice Cloud Connect's
+    /// `apply_spicepod` — which can fire concurrently. Without this mutex two
+    /// applies could diff against the same old app, interleave their
+    /// catalog/dataset/view mutations, and last-writer-wins the swap. Holding
+    /// this mutex (not the app write lock) for the whole apply avoids that while
+    /// keeping the read-lock-for-diff / write-lock-for-swap discipline, so the
+    /// diff phase can still read the app `RwLock` without deadlocking.
+    apply_app_lock: Arc<tokio::sync::Mutex<()>>,
     df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
     completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,

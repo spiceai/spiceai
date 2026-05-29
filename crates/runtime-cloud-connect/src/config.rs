@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn default_config_dir_respects_env_var() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         // SAFETY: tests gate env-var mutations behind a mutex.
         unsafe {
             std::env::set_var("SPICE_CONFIG_DIR", "/tmp/spice-test");
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn from_env_uses_default_endpoint_when_unset() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         unsafe {
             std::env::remove_var("SPICE_CLOUD_ENDPOINT");
             std::env::remove_var("SPICE_ADOPT_CODE");

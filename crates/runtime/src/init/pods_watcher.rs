@@ -58,13 +58,24 @@ impl Runtime {
     /// applied, `false` if it was identical (a no-op). When there is no
     /// current app yet, `new_app` is installed and `true` is returned.
     ///
-    /// Diffs are applied while holding only a read lock on the app; the write
-    /// lock is taken only for the final swap, matching the watcher's locking
-    /// discipline (no other path mutates the app concurrently).
+    /// Diffs are computed while holding only a read lock on the app; the write
+    /// lock is taken only for the final swap. This whole method is serialized by
+    /// [`Runtime::apply_app_lock`] because it now has two independent callers —
+    /// the on-disk pods watcher loop and Spice Cloud Connect's `apply_spicepod`
+    /// — which can invoke it concurrently. Without serialization two applies
+    /// could diff against the same old app, interleave their catalog/dataset/
+    /// view mutations, and overwrite `self.app` last-writer-wins. We hold the
+    /// dedicated mutex (rather than the app write lock) for the duration so the
+    /// diff phase can still read the app `RwLock` without deadlocking.
     pub async fn apply_app(self: Arc<Self>, new_app: Arc<App>) -> bool {
+        // Serialize the entire diff-and-swap so concurrent callers (pods watcher
+        // + Cloud Connect) apply one-at-a-time. Must be the first statement.
+        let _serialize = self.apply_app_lock.lock().await;
+
         // It is safe to operate by read lock until we actually need to update
-        // the app state, as there is no other logic that can update the app,
-        // so a write lock is not needed for the diff phase.
+        // the app state: with applies serialized by `_serialize`, no other path
+        // mutates the app during the diff phase, so a write lock is not needed
+        // until the final swap.
         if let Some(ref current_app) = self.read_app().await {
             if *current_app == new_app {
                 return false;

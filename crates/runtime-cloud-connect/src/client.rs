@@ -557,9 +557,20 @@ impl ClientDriver {
         // an empty identifier until the next reconnect).
         *live_identifier.write().await = identity.identifier.clone();
 
-        // Clear the pending code file — adoption succeeded.
+        // Clear the pending code file — adoption succeeded. Use async fs so the
+        // adoption dispatch path does not block a Tokio worker; treat a missing
+        // file as success.
         if let Some(ref path) = self.config.pending_adopt_code_path {
-            let _ = std::fs::remove_file(path);
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::warn!(
+                        "Cloud Connect: failed to remove pending adoption code at {}: {err}",
+                        path.display()
+                    );
+                }
+            }
         }
         // Clear the adoption_code in-memory so future reconnects use
         // identity-only credentials.
@@ -599,8 +610,10 @@ impl ClientDriver {
         cmd: proto::Forget,
         live_identifier: &Arc<RwLock<String>>,
     ) {
-        // Clear identity from disk and memory.
-        if let Err(err) = IdentityStore::clear(&self.config.identity_path) {
+        // Clear identity from disk and memory. Use the async clear so the
+        // remote `Forget` path does not block a Tokio worker on `std::fs` I/O
+        // while the Cloud Connect stream is active.
+        if let Err(err) = IdentityStore::clear_async(&self.config.identity_path).await {
             tracing::warn!(
                 "Cloud Connect: failed to clear identity at {}: {err}",
                 self.config.identity_path.display()

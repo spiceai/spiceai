@@ -157,6 +157,24 @@ impl IdentityStore {
         }
     }
 
+    /// Async variant of [`IdentityStore::clear`] for use on the Tokio driver
+    /// task, where blocking on synchronous `std::fs` I/O would stall a worker
+    /// thread. Same semantics: no-op if the file doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file exists but cannot be removed.
+    pub async fn clear_async(path: &Path) -> Result<()> {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(Error::Io {
+                path: path.to_path_buf(),
+                source: err,
+            }),
+        }
+    }
+
     /// Generate a fresh ed25519 keypair as PEM-encoded PKCS#8 (private)
     /// and SPKI (public) strings. Used at adoption time before sending
     /// `AdoptAck`.
@@ -287,7 +305,7 @@ mod tests {
 
     #[test]
     fn round_trip_identity() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("identity.json");
         let identity = sample_identity();
 
@@ -303,7 +321,7 @@ mod tests {
 
     #[test]
     fn load_optional_returns_none_when_missing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("does-not-exist.json");
         let loaded = IdentityStore::load_optional(&path).expect("load");
         assert!(loaded.is_none());
@@ -311,24 +329,28 @@ mod tests {
 
     #[test]
     fn clear_removes_identity() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("identity.json");
-        IdentityStore::store(&path, &sample_identity()).unwrap();
+        IdentityStore::store(&path, &sample_identity()).expect("store identity");
         assert!(path.exists());
-        IdentityStore::clear(&path).unwrap();
+        IdentityStore::clear(&path).expect("clear identity");
         assert!(!path.exists());
         // Idempotent.
-        IdentityStore::clear(&path).unwrap();
+        IdentityStore::clear(&path).expect("clear identity");
     }
 
     #[cfg(unix)]
     #[test]
     fn store_writes_with_0600_perms() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("identity.json");
-        IdentityStore::store(&path, &sample_identity()).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        IdentityStore::store(&path, &sample_identity()).expect("store identity");
+        let mode = std::fs::metadata(&path)
+            .expect("read metadata")
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600);
     }
 

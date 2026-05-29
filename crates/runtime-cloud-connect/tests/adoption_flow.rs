@@ -205,9 +205,20 @@ async fn first_contact_adoption_persists_identity_and_acks() {
     assert!(identity.identity_cert_pem.contains("UNIT-TEST"));
     assert!(identity.public_key_pem.contains("PUBLIC KEY"));
 
-    // Server should have received the Hello, AdoptAck, and a successful CommandResult.
-    // Give a bit more time for the result to land.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Server should have received the Hello, AdoptAck, and a successful
+    // CommandResult. The CommandResult lands last, so poll for it (rather than
+    // sleeping a fixed duration) to avoid flakiness on slow CI, mirroring the
+    // `adopted` wait above.
+    let mut result_seen = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if mock_state.lock().await.last_result.is_some() {
+            result_seen = true;
+            break;
+        }
+    }
+    assert!(result_seen, "server should see CommandResult within ~3s");
+
     let s = mock_state.lock().await;
     let hello = s.last_hello.clone().expect("server saw Hello");
     assert_eq!(hello.kind, proto::InstanceKind::Standalone as i32);
@@ -297,8 +308,19 @@ async fn apply_spicepod_writes_file_and_acks() {
     assert_eq!(written_yaml, yaml);
     assert!(written_path.exists(), "file should be on disk");
 
-    // Server should see the CommandResult for the apply.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Server should see the CommandResult for the apply. Poll for it with a
+    // bounded timeout instead of a fixed sleep so the assertion does not race
+    // on loaded CI, mirroring the `applied_seen` wait above.
+    let mut result_seen = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if mock_state.lock().await.last_result.is_some() {
+            result_seen = true;
+            break;
+        }
+    }
+    assert!(result_seen, "server should see CommandResult within ~3s");
+
     let s = mock_state.lock().await;
     let hello = s.last_hello.clone().expect("server saw Hello");
     assert_eq!(hello.identifier, "inst_pre_adopted");

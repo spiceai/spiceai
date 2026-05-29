@@ -158,8 +158,11 @@ mod tests {
         assert_eq!(info["datasets"], 0);
         assert_eq!(info["models"], 0);
         let err = h.execute_sql("select 1", 10).await;
-        assert!(err.is_err());
-        let up = h.upgrade_runtime("v9.9.9").await.unwrap();
+        err.expect_err("execute_sql is unimplemented for the no-op handle");
+        let up = h
+            .upgrade_runtime("v9.9.9")
+            .await
+            .expect("upgrade_runtime returns Ok");
         assert_eq!(up["status"], "unsupported");
     }
 }

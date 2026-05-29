@@ -94,7 +94,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(100), handle)
             .await
             .expect("waiter should resolve")
-            .unwrap();
+            .expect("waiter task did not panic");
     }
 
     #[tokio::test]
@@ -111,6 +111,6 @@ mod tests {
         )
         .await
         .expect("waiter must observe the latched signal")
-        .unwrap();
+        .expect("waiter task did not panic");
     }
 }

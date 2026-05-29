@@ -471,6 +471,7 @@ impl RuntimeBuilder {
 
         let mut rt = Runtime {
             app: shared_app,
+            apply_app_lock: Arc::new(tokio::sync::Mutex::new(())),
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
             completion_llms: Arc::new(RwLock::new(HashMap::new())),
