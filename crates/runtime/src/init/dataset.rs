@@ -1266,8 +1266,10 @@ impl Runtime {
                             Vec::new()
                         };
                     let table_name = resolved_name.to_string();
+                    // Statistics flow via the periodic ExecutorStatistics reporter,
+                    // not this readiness ack.
                     let sent = b
-                        .broadcast_partitions_loaded(table_name.clone(), bytes)
+                        .broadcast_partitions_loaded(table_name.clone(), bytes, None)
                         .await;
                     tracing::info!(
                         "Broadcast initial PartitionsLoaded for {table_name} to {sent} scheduler(s)"
