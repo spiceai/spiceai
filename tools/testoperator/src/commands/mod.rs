@@ -28,6 +28,7 @@ use test_framework::{
     queries::{Query, QuerySet},
     spiced::{SpicedInstance, StartRequest},
     spicepod::Spicepod,
+    spicepod::component::dataset::CheckAvailability,
     spicepod_utils::from_app,
     spicetest::datasets::NotStarted,
     telemetry::{OtlpExporterConfig, Telemetry},
@@ -270,8 +271,18 @@ async fn add_automatic_reference_datasets(
 
             let mut reference_dataset = dataset.clone();
             reference_dataset.name = reference_name;
+            // A reference dataset is a minimal known-good source for validating
+            // query results, so strip acceleration and every optional dataset
+            // feature that adds startup/runtime overhead or failure modes
+            // unrelated to that validation.
             reference_dataset.acceleration = None;
             reference_dataset.depends_on.clear();
+            reference_dataset.embeddings.clear();
+            reference_dataset.vectors = None;
+            reference_dataset.full_text_search = None;
+            reference_dataset.replication = None;
+            reference_dataset.metrics = None;
+            reference_dataset.check_availability = CheckAvailability::Disabled;
             Some(reference_dataset)
         })
         .collect::<Vec<_>>();
