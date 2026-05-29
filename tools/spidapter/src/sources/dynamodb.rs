@@ -187,13 +187,27 @@ pub(crate) async fn create_dynamodb_tables(
         });
     }
 
+    let mut wait_tables: Vec<String> = Vec::new();
+
     while let Some(result) = create_tasks.join_next().await {
-        result.map_err(|e| anyhow::anyhow!("DynamoDB create task panicked: {e}"))??;
+        let (_dataset_name, physical_name, needs_wait) =
+            result.map_err(|e| anyhow::anyhow!("DynamoDB create task panicked: {e}"))??;
+        if needs_wait {
+            wait_tables.push(physical_name);
+        }
     }
 
-    // Tables may still be in CREATING state; the DynamoDB sink retries on
-    // ResourceInUseException until they become ACTIVE.
-    eprintln!("[stdio] DynamoDB: table creation requests sent (not waiting for ACTIVE)");
+    // Phase 2: wait for all newly-created tables to become ACTIVE concurrently.
+    let mut wait_tasks: tokio::task::JoinSet<anyhow::Result<()>> = tokio::task::JoinSet::new();
+    for physical_name in wait_tables {
+        let client = client.clone();
+        wait_tasks.spawn(async move { wait_for_table_active(&client, &physical_name).await });
+    }
+    while let Some(result) = wait_tasks.join_next().await {
+        result.map_err(|e| anyhow::anyhow!("DynamoDB wait task panicked: {e}"))??;
+    }
+
+    eprintln!("[stdio] DynamoDB: table pre-creation complete");
     Ok(prefix)
 }
 
