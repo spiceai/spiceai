@@ -44,8 +44,8 @@ pub use executor_registry::{
     ExecutorRegistry, FederatedPartitionProvider, RegisteredHandles, TablePartitions,
 };
 pub use metadata::{
-    PartitionMetadata, PartitionValue, TablePartitionMetadata, encode_partition_exprs,
-    normalized_table_name, partition_value_to_bytes,
+    PartitionMetadata, PartitionValue, TablePartitionMetadata, decode_statistics,
+    encode_partition_exprs, encode_statistics, normalized_table_name, partition_value_to_bytes,
 };
 pub use outbound_broadcaster::ExecutorOutboundBroadcaster;
 pub use partition_load_tracker::PartitionLoadTracker;
