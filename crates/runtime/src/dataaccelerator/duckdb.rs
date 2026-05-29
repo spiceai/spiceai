@@ -2257,15 +2257,21 @@ mod tests {
         super::normalize_schema_for_duckdb(&mut cmd).expect("normalize succeeds");
         let arrow = cmd.schema.as_arrow();
         assert_eq!(
-            arrow.field_with_name("id").unwrap().data_type(),
+            arrow.field_with_name("id").expect("id field").data_type(),
             &DataType::Int64
         );
         assert_eq!(
-            arrow.field_with_name("untyped").unwrap().data_type(),
+            arrow
+                .field_with_name("untyped")
+                .expect("untyped field")
+                .data_type(),
             &DataType::Int32
         );
         assert_eq!(
-            arrow.field_with_name("name").unwrap().data_type(),
+            arrow
+                .field_with_name("name")
+                .expect("name field")
+                .data_type(),
             &DataType::Utf8
         );
     }
@@ -2280,7 +2286,7 @@ mod tests {
         super::normalize_schema_for_duckdb(&mut cmd).expect("normalize succeeds");
         let arrow = cmd.schema.as_arrow();
         assert_eq!(
-            arrow.field_with_name("dur").unwrap().data_type(),
+            arrow.field_with_name("dur").expect("dur field").data_type(),
             &DataType::Interval(IntervalUnit::MonthDayNano)
         );
     }
