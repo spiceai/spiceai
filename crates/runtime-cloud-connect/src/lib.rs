@@ -140,12 +140,27 @@ impl CloudConnect {
         config: CloudConnectConfig,
         runtime: Arc<dyn RuntimeHandle>,
     ) -> Result<Option<Self>> {
-        use snafu::ResultExt as _;
-
         let identity_path = config.identity_path.clone();
-        let identity = IdentityStore::load_optional(&identity_path).context(IdentityLoadSnafu {
-            path: identity_path.clone(),
-        })?;
+        let identity = match IdentityStore::load_optional(&identity_path) {
+            Ok(identity) => identity,
+            // A corrupt/unreadable identity file must not wedge re-adoption:
+            // when an adoption code is available, proceed without the stored
+            // identity (a successful adoption rewrites identity.json). Only
+            // surface the load error when there is no code to fall back to.
+            Err(source) if config.adoption_code.is_some() => {
+                tracing::warn!(
+                    "Cloud Connect: identity at {} is unreadable ({source}); proceeding with the adoption code",
+                    identity_path.display()
+                );
+                None
+            }
+            Err(source) => {
+                return Err(Error::IdentityLoad {
+                    path: identity_path,
+                    source,
+                });
+            }
+        };
 
         if identity.is_none() && config.adoption_code.is_none() {
             tracing::debug!(

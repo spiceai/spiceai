@@ -265,6 +265,20 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             "views": views,
         }))
     }
+
+    /// Standalone `spiced` cannot self-restart: there is no supervisor to bring
+    /// the process back up, so a self-initiated exit would just take the
+    /// runtime down. Report `unsupported` (rather than the trait's hard error)
+    /// so the control plane surfaces it cleanly — operators restart spiced via
+    /// their own process manager (systemd, Docker, Kubernetes). Configuration
+    /// changes apply in-process via [`RuntimeHandle::apply_spicepod`], so a
+    /// restart is rarely needed.
+    async fn restart(&self, _graceful: bool) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({
+            "status": "unsupported",
+            "note": "standalone spiced does not self-restart; restart it via your process manager (systemd/Docker/Kubernetes). Configuration changes apply in-process via ApplySpicepod.",
+        }))
+    }
 }
 
 /// Validate a cloud-managed spicepod and persist it to disk.
@@ -296,6 +310,10 @@ async fn stage_cloud_managed_spicepod(
 
     match AppBuilder::build_from_path(incoming.clone()).await {
         Ok(app) => {
+            // `rename` replaces an existing destination on Unix but fails on
+            // Windows when the destination already exists, so remove any
+            // previous canonical file first for a cross-platform replace.
+            let _ = tokio::fs::remove_file(&path).await;
             tokio::fs::rename(&incoming, &path)
                 .await
                 .map_err(|e| format!("persist spicepod: {e}"))?;
@@ -311,8 +329,9 @@ async fn stage_cloud_managed_spicepod(
 
 /// Byte budget for an encoded `RunQuery` Arrow IPC stream. A coarse secondary
 /// guard on top of the row cap so a few very wide rows can't blow past the
-/// gRPC message size; the last batch written may push modestly over before
-/// we stop.
+/// gRPC message size. The budget is checked *before* appending each batch, so
+/// only the first batch (bounded by the row cap) can be emitted while already
+/// near the limit; subsequent batches are dropped once the buffer reaches it.
 pub const RUN_QUERY_BYTE_BUDGET: usize = 5 * 1024 * 1024;
 
 /// Encode `batches` into an Arrow IPC stream (`schema` first), stopping once
@@ -330,14 +349,18 @@ fn encode_ipc_bounded(
     let mut rows: u64 = 0;
     let mut truncated = false;
     for batch in batches {
+        // Enforce the budget BEFORE appending each batch so a wide batch can't
+        // push the encoded stream well past the cap. The first batch always
+        // writes (the buffer holds only the schema here); its size is bounded
+        // by the upstream row cap.
+        if writer.get_ref().len() >= budget {
+            truncated = true;
+            break;
+        }
         writer
             .write(batch)
             .map_err(|e| format!("arrow ipc write failed: {e}"))?;
         rows += batch.num_rows() as u64;
-        if writer.get_ref().len() > budget {
-            truncated = true;
-            break;
-        }
     }
     writer
         .finish()
