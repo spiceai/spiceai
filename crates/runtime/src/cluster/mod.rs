@@ -458,6 +458,8 @@ pub use scheduler_registry::SchedulerPeers;
 pub use scheduler_registry::start_scheduler_registry;
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
 pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
+#[cfg(not(windows))]
+pub(crate) use service::discover_cayenne_tables;
 
 /// mTLS configuration for cluster communications.
 ///

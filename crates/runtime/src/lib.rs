@@ -914,8 +914,10 @@ impl Runtime {
                 if let Some(n) = notifier {
                     n.notified().await;
                 }
+                // Statistics flow via the periodic ExecutorStatistics reporter, not
+                // this readiness ack.
                 let sent = broadcaster
-                    .broadcast_partitions_loaded(table_name.clone(), partition_expr_bytes)
+                    .broadcast_partitions_loaded(table_name.clone(), partition_expr_bytes, None)
                     .await;
                 tracing::debug!(
                     "Broadcast PartitionsLoaded for {table_name} to {sent} scheduler(s)"
@@ -924,6 +926,67 @@ impl Runtime {
         }
 
         Ok(())
+    }
+
+    /// Periodically recompute and rebroadcast this executor's per-table row-count
+    /// statistics to all schedulers. PartitionsLoaded is otherwise only sent on
+    /// initial load / assignment change, so during streaming ETL the coordinator's
+    /// in-memory stats would reflect only the first snapshot (or nothing if the
+    /// table had no data at initial-load time). A periodic rebroadcast keeps the
+    /// coordinator's join-sizing statistics fresh as the executor's local data grows.
+    pub(crate) async fn run_executor_statistics_reporter(
+        self: Arc<Self>,
+        shutdown: CancellationToken,
+    ) {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(45));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                _ = interval.tick() => {}
+            }
+            let Some(broadcaster) = self.executor_outbound_broadcaster() else {
+                continue;
+            };
+            let df = self.datafusion();
+
+            // Enumerate the tables this executor serves locally. The q18 tables
+            // are cayenne *catalog* tables (not spice.public datasets), so the
+            // dataset partition-assignment map doesn't cover them; enumerate the
+            // cayenne catalog directly. Also include any dataset assignments.
+            let mut tables: Vec<TableReference> = Vec::new();
+            #[cfg(not(windows))]
+            {
+                tables.extend(crate::cluster::discover_cayenne_tables(&df).await);
+            }
+            if let Some(assignments_lock) = self.partition_assignments() {
+                for resolved in assignments_lock.read().await.keys() {
+                    tables.push(TableReference::full(
+                        Arc::<str>::clone(&resolved.catalog),
+                        Arc::<str>::clone(&resolved.schema),
+                        Arc::<str>::clone(&resolved.table),
+                    ));
+                }
+            }
+            tables.sort_by_key(ToString::to_string);
+            tables.dedup_by_key(|t| t.to_string());
+            if tables.is_empty() {
+                continue;
+            }
+            tracing::info!(
+                count = tables.len(),
+                "q18-stats: executor statistics reporter tick"
+            );
+            for table in tables {
+                if let Some((statistics, column_names)) =
+                    crate::cluster::partition::local_executor_table_statistics(&df, &table).await
+                {
+                    broadcaster
+                        .broadcast_executor_statistics(table.to_string(), statistics, column_names)
+                        .await;
+                }
+            }
+        }
     }
 
     /// Returns the partition store for accelerated table partition metadata (scheduler only).
@@ -1186,6 +1249,20 @@ impl Runtime {
         };
 
         // Start Flight server
+        // On executors, periodically rebroadcast per-table row-count statistics so
+        // the coordinator's join-sizing stats stay fresh as streaming ETL grows
+        // local data (PartitionsLoaded is otherwise sent only on initial load /
+        // assignment change).
+        if self.df.cluster_config.effective_role() == Some(ClusterRole::Executor) {
+            let reporter_self = Arc::clone(&self);
+            let reporter_shutdown = CancellationToken::new();
+            tokio::spawn(async move {
+                reporter_self
+                    .run_executor_statistics_reporter(reporter_shutdown)
+                    .await;
+            });
+        }
+
         let flight_shutdown = CancellationToken::new();
         let self_ref = Arc::clone(&self);
         let cloned_tls_config = tls_config.clone();

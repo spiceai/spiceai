@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use runtime_proto::{
-    BytesArray, ExecutorControlMessage, PartitionsLoaded,
+    BytesArray, ExecutorControlMessage, ExecutorStatistics, PartitionsLoaded,
     executor_control_message::Message as ExecutorMessage,
 };
 use tokio::sync::{RwLock, mpsc};
@@ -94,6 +94,7 @@ impl ExecutorOutboundBroadcaster {
         &self,
         table_name: String,
         partition_expr_bytes: Vec<Vec<u8>>,
+        statistics: Option<Vec<u8>>,
     ) -> usize {
         let executor_id = self.inner.executor_id.read().await.clone();
         let payload = ExecutorControlMessage {
@@ -103,6 +104,7 @@ impl ExecutorOutboundBroadcaster {
                 partition_expr_bytes: Some(BytesArray {
                     items: partition_expr_bytes,
                 }),
+                statistics,
             })),
         };
 
@@ -129,6 +131,54 @@ impl ExecutorOutboundBroadcaster {
                     tracing::warn!(
                         scheduler = %scheduler_address,
                         "Timed out sending PartitionsLoaded; scheduler may miss this ack until next refresh"
+                    );
+                }
+            }
+        }
+        sent
+    }
+
+    /// Broadcasts a per-table [`ExecutorStatistics`] report to every connected
+    /// scheduler. Decoupled from `PartitionsLoaded` (readiness) so it can be sent
+    /// periodically for any table the executor serves, including cayenne catalog
+    /// tables. Best-effort with a short per-scheduler timeout.
+    pub async fn broadcast_executor_statistics(
+        &self,
+        table_name: String,
+        statistics: Vec<u8>,
+        column_names: Vec<String>,
+    ) -> usize {
+        let executor_id = self.inner.executor_id.read().await.clone();
+        let payload = ExecutorControlMessage {
+            executor_id,
+            message: Some(ExecutorMessage::ExecutorStatistics(ExecutorStatistics {
+                table_name,
+                statistics,
+                column_names,
+            })),
+        };
+
+        let targets: Vec<(String, mpsc::Sender<ExecutorControlMessage>)> = {
+            let streams = self.inner.streams.read().await;
+            streams
+                .iter()
+                .map(|(addr, tx)| (addr.clone(), tx.clone()))
+                .collect()
+        };
+
+        let mut sent = 0usize;
+        for (scheduler_address, tx) in targets {
+            match tokio::time::timeout(Duration::from_secs(5), tx.send(payload.clone())).await {
+                Ok(Ok(())) => sent += 1,
+                Ok(Err(err)) => {
+                    tracing::debug!(
+                        "ExecutorStatistics send to {scheduler_address} failed (channel closed): {err}"
+                    );
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        scheduler = %scheduler_address,
+                        "Timed out sending ExecutorStatistics"
                     );
                 }
             }

@@ -872,6 +872,9 @@ async fn handle_executor_message(
         ExecutorMessage::PartitionsLoaded(loaded) => {
             handle_partitions_loaded(executor_id, loaded, datafusion).await;
         }
+        ExecutorMessage::ExecutorStatistics(stats_msg) => {
+            handle_executor_statistics(executor_id, stats_msg, datafusion).await;
+        }
         ExecutorMessage::Shutdown(shutdown) => {
             let reason = if shutdown.reason.is_empty() {
                 "executor shutdown".to_string()
@@ -921,6 +924,52 @@ async fn notify_scheduler_executor_shutdown(
         .map_err(|e| format!("Failed to notify scheduler about executor shutdown: {e}"))?;
 
     Ok(())
+}
+
+/// Records a per-table [`ExecutorStatistics`] report into the scheduler's
+/// in-memory `ExecutorRegistry`, where it's read at query-planning time to size
+/// the coordinator's per-executor federated scans. Decoupled from readiness.
+async fn handle_executor_statistics(
+    executor_id: &str,
+    msg: &runtime_proto::ExecutorStatistics,
+    datafusion: &DataFusion,
+) {
+    let resolved = TableReference::parse_str(&msg.table_name)
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+    let table = TableReference::full(
+        Arc::<str>::clone(&resolved.catalog),
+        Arc::<str>::clone(&resolved.schema),
+        Arc::<str>::clone(&resolved.table),
+    );
+    let stats = runtime_cluster::decode_statistics(&msg.statistics);
+    let nr = stats.as_ref().and_then(|s| s.num_rows.get_value().copied());
+    let cols_with_minmax = stats.as_ref().map(|s| {
+        s.column_statistics
+            .iter()
+            .filter(|c| c.min_value.get_value().is_some())
+            .count()
+    });
+    let has_registry = datafusion.executor_registry().is_some();
+    // TEMP q18-stats diagnostics (on the scheduler — retrievable).
+    tracing::info!(
+        executor_id,
+        table = %table,
+        num_rows = ?nr,
+        cols_with_minmax = ?cols_with_minmax,
+        decoded = stats.is_some(),
+        has_registry,
+        "q18-stats: scheduler received ExecutorStatistics"
+    );
+    if let (Some(stats), Some(registry)) = (stats, datafusion.executor_registry()) {
+        registry
+            .record_executor_statistics(
+                table,
+                executor_id.to_string(),
+                stats,
+                msg.column_names.clone(),
+            )
+            .await;
+    }
 }
 
 /// Records a `PartitionsLoaded` ack from an executor and, if all assigned
@@ -978,6 +1027,8 @@ async fn handle_partitions_loaded(
         "Received PartitionsLoaded ack"
     );
 
+    // Statistics now flow via the dedicated ExecutorStatistics message
+    // (handle_executor_statistics); PartitionsLoaded is readiness-only.
     tracker
         .replace(table.clone(), executor_id.to_string(), partition_expr_bytes)
         .await;
@@ -1035,7 +1086,7 @@ async fn handle_partitions_loaded(
 /// register unpartitioned entries in the executor's partition map so that queries
 /// for Cayenne tables are forwarded to the executor.
 #[cfg(not(windows))]
-async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
+pub(crate) async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
     use crate::datafusion::cayenne_ddl::is_cayenne_catalog;
     use cayenne::CayenneSchemaProvider;
 
