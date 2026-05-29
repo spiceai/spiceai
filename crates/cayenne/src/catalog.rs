@@ -432,6 +432,25 @@ pub trait MetadataCatalog: Send + Sync {
     /// Clear table-level aggregate statistics for a table.
     async fn clear_table_statistics(&self, table_id: &str) -> CatalogResult<()>;
 
+    /// Upsert the persisted primary-key existence index (a bloom checkpoint),
+    /// tagged with the snapshot id it covers. Stored in the metastore so it is
+    /// captured by metastore snapshots — letting both a restart and a new node
+    /// bootstrapped from a snapshot skip the O(total-rows) full keyset rebuild.
+    async fn upsert_pk_index(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        index_blob: &[u8],
+    ) -> CatalogResult<()>;
+
+    /// Get the persisted PK existence index for a table as `(snapshot_id, blob)`,
+    /// or `None` if absent. Callers must treat the blob as an optimization hint
+    /// and fall back to a full rebuild on any mismatch/corruption.
+    async fn get_pk_index(&self, table_id: &str) -> CatalogResult<Option<(String, Vec<u8>)>>;
+
+    /// Clear the persisted PK existence index for a table.
+    async fn clear_pk_index(&self, table_id: &str) -> CatalogResult<()>;
+
     // ── Inlined data (data inlining for small writes) ──────────────────
 
     /// Add a small batch of insert data inlined in the metastore.

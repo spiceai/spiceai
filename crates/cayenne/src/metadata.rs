@@ -395,6 +395,17 @@ pub struct VortexConfig {
     /// when the source enforces PK uniqueness and ingestion cannot replay existing rows.
     #[serde(default)]
     pub pk_conflict_detection: PkConflictDetection,
+    /// Byte budget (set in MB via `cayenne_pk_keyset_cache_mb`) for the in-memory
+    /// primary-key index used to detect upsert conflicts. Within budget an exact
+    /// keyset is kept. Over budget, `OnConflict::Upsert` tables fall back to a
+    /// bounded bloom existence filter (O(batch) maintenance, no per-batch
+    /// rebuild); `DoNothing` tables rebuild the keyset from a full-table scan on
+    /// the next batch (a bloom's false positives are harmless for upsert but
+    /// would wrongly drop rows under `DoNothing`). `None` uses the built-in default
+    /// (256 MiB); the accelerator auto-derives a memory-aware default when the
+    /// param is unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pk_keyset_cache_mb: Option<usize>,
 }
 
 fn default_concurrency() -> usize {
@@ -479,6 +490,7 @@ impl Default for VortexConfig {
             inline_flush_max_segments: default_inline_flush_max_segments(),
             inline_flush_max_bytes: default_inline_flush_max_bytes(),
             pk_conflict_detection: PkConflictDetection::default(),
+            pk_keyset_cache_mb: None,
         }
     }
 }
