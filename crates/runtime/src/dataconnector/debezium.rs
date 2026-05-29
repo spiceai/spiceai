@@ -560,6 +560,7 @@ async fn get_metadata_from_kafka(
     declared_schema: Option<&SchemaRef>,
 ) -> super::DataConnectorResult<(KafkaConsumer, DebeziumKafkaMetadata, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
+    tracing::debug!(dataset = %dataset_name, topic, "Creating Kafka consumer");
     let kafka_consumer = KafkaConsumer::create_for_dataset(
         &dataset_name,
         kafka_config.consumer_group_id.clone(),
@@ -570,6 +571,7 @@ async fn get_metadata_from_kafka(
         dataconnector: "debezium",
         connector_component: ConnectorComponent::from(dataset),
     })?;
+    tracing::debug!(dataset = %dataset_name, topic, "Kafka consumer created, subscribing");
 
     kafka_consumer
         .subscribe(topic)
@@ -578,18 +580,21 @@ async fn get_metadata_from_kafka(
             dataconnector: "debezium",
             connector_component: ConnectorComponent::from(dataset),
         })?;
+    tracing::debug!(dataset = %dataset_name, topic, "Subscribed to topic, checking for messages via fetch_latest_message");
 
     // Use fetch_latest_message (watermark-based, non-blocking) instead of next_json().
     // next_json() blocks indefinitely when the topic exists but has no messages;
     // fetch_latest_message() returns Ok(None) immediately in that case by checking
     // the high-watermark offset before attempting to read.
-    let (key, value) = match KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
+    let fetch_result = KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
         topic,
         kafka_config,
         Duration::from_secs(30),
     )
-    .await
-    {
+    .await;
+    tracing::debug!(dataset = %dataset_name, topic, "fetch_latest_message returned");
+
+    let (key, value) = match fetch_result {
         Ok(Some((key, value))) => (key, value),
         // Topic is empty (exists but has no messages) or topic is not yet known to the broker.
         // In both cases the subscribed consumer will begin at offset 0 once messages arrive
