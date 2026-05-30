@@ -27,16 +27,15 @@ use async_openai::types::chat::{
 use data_components::{
     DESCRIPTION_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, SOURCE_TYPE_METADATA_KEY,
 };
-use datafusion::{
-    arrow::datatypes::Schema,
-    common::{Constraint, Constraints, utils::quote_identifier},
-    execution::FunctionRegistry,
-    sql::TableReference,
+use datafusion::arrow::{
+    array::{Array, BooleanArray, StringArray, UInt8Array, UInt64Array},
+    datatypes::Schema,
+    record_batch::RecordBatch,
 };
-use datafusion_functions_json::udfs::{
-    json_as_text_udf, json_contains_udf, json_from_scalar_udf, json_get_array_udf,
-    json_get_bool_udf, json_get_float_udf, json_get_int_udf, json_get_json_udf, json_get_str_udf,
-    json_get_udf, json_length_udf, json_object_keys_udf,
+use datafusion::{
+    DATAFUSION_VERSION,
+    common::{Constraint, Constraints, DataFusionError, utils::quote_identifier},
+    sql::TableReference,
 };
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use futures::{StreamExt, TryStreamExt};
@@ -71,10 +70,6 @@ use crate::{
         pg_catalog::{COL_DESCRIPTION_UDF_NAME, OBJ_DESCRIPTION_UDF_NAME},
         request_context_extension::get_current_datafusion,
         udf::{UserFunctionInfo, effective_user_function_volatility, user_function_infos},
-        udtf::{
-            flatten_json::FLATTEN_JSON_UDTF_NAME,
-            json_properties::FLATTEN_JSON_PROPERTIES_UDTF_NAME, json_tree::JSON_TREE_UDTF_NAME,
-        },
     },
     embeddings::table::{EmbeddingInputMode, EmbeddingTable},
     embeddings::udtf::VECTOR_SEARCH_UDTF_NAME,
@@ -96,10 +91,11 @@ use crate::{
     udtfs::LIST_UDFS_UDTF_NAME,
 };
 
-#[cfg(not(feature = "models"))]
-const AI_UDF_NAME: &str = "ai";
-#[cfg(not(feature = "models"))]
-const EMBED_UDF_NAME: &str = "embed";
+#[cfg(test)]
+use crate::datafusion::udtf::{
+    flatten_json::FLATTEN_JSON_UDTF_NAME, json_properties::FLATTEN_JSON_PROPERTIES_UDTF_NAME,
+    json_tree::JSON_TREE_UDTF_NAME,
+};
 
 pub(crate) const DEFAULT_NSQL_CONTEXT_SAMPLE_LIMIT: usize = 3;
 pub(crate) const MAX_NSQL_CONTEXT_SAMPLE_LIMIT: usize = 100;
@@ -139,6 +135,11 @@ pub(crate) enum NsqlContextError {
     SampleContext {
         source: Box<dyn StdError + Send + Sync>,
     },
+
+    #[snafu(display("{source}"))]
+    FunctionContext {
+        source: Box<dyn StdError + Send + Sync>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -174,6 +175,7 @@ pub(crate) struct NsqlContextJsonResponse {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct NsqlSqlContext {
     pub(crate) engine: String,
+    pub(crate) version: String,
     pub(crate) dialect: String,
     pub(crate) parser: String,
     pub(crate) notes: Vec<String>,
@@ -299,8 +301,14 @@ pub(crate) struct NsqlSparkFunctionContext {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct NsqlFunctionContextEntry {
     pub(crate) name: String,
-    pub(crate) syntax: String,
-    pub(crate) description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) syntax: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) function_type: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) signatures: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) example: Option<String>,
 }
@@ -450,6 +458,7 @@ fn nsql_context_instructions() -> Vec<String> {
 fn nsql_sql_context() -> NsqlSqlContext {
     NsqlSqlContext {
         engine: "Apache DataFusion".to_string(),
+        version: DATAFUSION_VERSION.to_string(),
         dialect: "PostgreSQL".to_string(),
         parser: "DataFusion SQL parser configured with PostgreSQL dialect".to_string(),
         notes: vec![
@@ -1189,296 +1198,456 @@ fn context_message(context: &str) -> Result<ChatCompletionRequestMessage, String
         .map_err(|error| error.to_string())
 }
 
-fn available_function_names(rt: &Runtime) -> HashSet<String> {
-    let mut function_names = rt
-        .df
-        .ctx
-        .udfs()
-        .into_iter()
-        .map(|name| name.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
+const NSQL_ROUTINES_QUERY: &str = r#"
+SELECT routine_name, function_type, description, syntax_example, data_type
+FROM information_schema.routines
+WHERE routine_type = 'FUNCTION'
+"#;
 
-    function_names.extend(
-        rt.df
-            .ctx
-            .state()
-            .table_functions()
-            .keys()
-            .map(|name| name.to_ascii_lowercase()),
-    );
+const NSQL_PARAMETERS_QUERY: &str = r#"
+SELECT specific_name, rid, ordinal_position, parameter_name, data_type, parameter_mode, is_variadic
+FROM information_schema.parameters
+WHERE parameter_mode IN ('IN', 'OUT')
+ORDER BY lower(specific_name), rid, ordinal_position
+"#;
 
-    function_names
+const NSQL_LIST_UDFS_QUERY: &str = r#"
+SELECT name, source, kind, volatility, "from", description
+FROM list_udfs()
+"#;
+
+#[derive(Clone, Debug, Default)]
+struct FunctionInventory {
+    names: HashSet<String>,
+    functions: BTreeMap<String, RegisteredFunction>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RegisteredFunction {
+    name: String,
+    function_type: Option<String>,
+    description: Option<String>,
+    syntax_example: Option<String>,
+    return_types: BTreeSet<String>,
+    signatures: BTreeMap<u8, RegisteredFunctionSignature>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RegisteredFunctionSignature {
+    parameters: Vec<RegisteredFunctionParameter>,
+    return_type: Option<String>,
+    variadic: bool,
 }
 
 #[derive(Clone, Debug)]
-struct FunctionContextEntry {
-    name: String,
-    syntax: &'static str,
-    description: &'static str,
-    example: Option<&'static str>,
+struct RegisteredFunctionParameter {
+    name: Option<String>,
+    data_type: String,
 }
 
-impl FunctionContextEntry {
-    fn new(name: impl Into<String>, syntax: &'static str, description: &'static str) -> Self {
-        Self {
-            name: name.into(),
-            syntax,
-            description,
-            example: None,
+fn non_empty_string(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
         }
-    }
+    })
+}
 
-    fn with_example(mut self, example: &'static str) -> Self {
-        self.example = Some(example);
-        self
+impl RegisteredFunctionSignature {
+    fn to_syntax(&self, function_name: &str) -> String {
+        let mut parameters = self
+            .parameters
+            .iter()
+            .map(|parameter| {
+                parameter.name.as_ref().map_or_else(
+                    || parameter.data_type.clone(),
+                    |name| format!("{name} {}", parameter.data_type),
+                )
+            })
+            .collect_vec();
+        if self.variadic {
+            parameters.push("...".to_string());
+        }
+
+        let mut syntax = format!("{function_name}({})", parameters.join(", "));
+        if let Some(return_type) = &self.return_type {
+            let _ = write!(syntax, " -> {return_type}");
+        }
+        syntax
+    }
+}
+
+impl RegisteredFunction {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            ..Default::default()
+        }
     }
 
     fn to_context_entry(&self) -> NsqlFunctionContextEntry {
+        let signatures = self
+            .signatures
+            .values()
+            .map(|signature| signature.to_syntax(&self.name))
+            .unique()
+            .collect_vec();
+        let syntax = self
+            .syntax_example
+            .clone()
+            .or_else(|| signatures.first().cloned());
+
         NsqlFunctionContextEntry {
             name: self.name.clone(),
-            syntax: self.syntax.to_string(),
-            description: self.description.to_string(),
-            example: self.example.map(ToString::to_string),
+            syntax,
+            description: self.description.clone(),
+            function_type: self.function_type.clone(),
+            signatures,
+            example: None,
         }
     }
 }
 
-fn json_function_entries() -> Vec<FunctionContextEntry> {
-    vec![
-        FunctionContextEntry::new(
-            json_get_udf().name(),
-            "json_get(json, path)",
-            "Returns a JSON union value at a path. Use typed helpers when a scalar type is known.",
-        )
-        .with_example("SELECT json_get(payload, 'metadata') FROM events"),
-        FunctionContextEntry::new(
-            json_get_str_udf().name(),
-            "json_get_str(json, path)",
-            "Returns a string value from JSON at a path.",
-        )
-        .with_example("SELECT json_get_str(payload, 'customer.name') FROM events"),
-        FunctionContextEntry::new(
-            json_get_int_udf().name(),
-            "json_get_int(json, path)",
-            "Returns an integer value from JSON at a path.",
-        )
-        .with_example("SELECT json_get_int(payload, 'order.id') FROM events"),
-        FunctionContextEntry::new(
-            json_get_float_udf().name(),
-            "json_get_float(json, path)",
-            "Returns a floating-point value from JSON at a path.",
-        )
-        .with_example("SELECT json_get_float(payload, 'score') FROM events"),
-        FunctionContextEntry::new(
-            json_get_bool_udf().name(),
-            "json_get_bool(json, path)",
-            "Returns a boolean value from JSON at a path.",
-        )
-        .with_example("SELECT json_get_bool(payload, 'active') FROM events"),
-        FunctionContextEntry::new(
-            json_get_json_udf().name(),
-            "json_get_json(json, path)",
-            "Returns a JSON string value from JSON at a path.",
-        )
-        .with_example("SELECT json_get_json(payload, 'items[0]') FROM events"),
-        FunctionContextEntry::new(
-            json_get_array_udf().name(),
-            "json_get_array(json, path)",
-            "Returns an array value from JSON at a path.",
-        )
-        .with_example("SELECT json_get_array(payload, 'tags') FROM events"),
-        FunctionContextEntry::new(
-            json_as_text_udf().name(),
-            "json_as_text(json, path)",
-            "Returns the JSON value at a path as text.",
-        )
-        .with_example("SELECT json_as_text(payload, 'metadata') FROM events"),
-        FunctionContextEntry::new(
-            json_contains_udf().name(),
-            "json_contains(json, value)",
-            "Returns whether a JSON value contains another JSON value.",
-        )
-        .with_example("SELECT * FROM events WHERE json_contains(payload, 'urgent')"),
-        FunctionContextEntry::new(
-            json_length_udf().name(),
-            "json_length(json[, path])",
-            "Returns the length of a JSON array or object.",
-        )
-        .with_example("SELECT json_length(payload, 'items') FROM orders"),
-        FunctionContextEntry::new(
-            json_object_keys_udf().name(),
-            "json_object_keys(json)",
-            "Returns object keys from a JSON value.",
-        )
-        .with_example("SELECT json_object_keys(payload) FROM events"),
-        FunctionContextEntry::new(
-            json_from_scalar_udf().name(),
-            "json_from_scalar(value)",
-            "Converts a scalar SQL value into JSON.",
-        )
-        .with_example("SELECT json_from_scalar(status) FROM tickets"),
-    ]
+impl FunctionInventory {
+    fn add_name(&mut self, name: &str) {
+        self.names.insert(name.to_ascii_lowercase());
+    }
+
+    fn function_mut(&mut self, name: &str) -> &mut RegisteredFunction {
+        let key = name.to_ascii_lowercase();
+        self.names.insert(key.clone());
+        self.functions
+            .entry(key)
+            .or_insert_with(|| RegisteredFunction::new(name.to_string()))
+    }
 }
 
-fn spice_function_entries() -> Vec<FunctionContextEntry> {
-    vec![
-        FunctionContextEntry::new(
-            FLATTEN_JSON_UDTF_NAME,
-            "flatten_json(json)",
-            "Flattens a JSON document into key/value rows. Use as a table function for literal JSON or with UNNEST for column values.",
-        )
-        .with_example("SELECT * FROM flatten_json('{\"a\":1}')"),
-        FunctionContextEntry::new(
-            FLATTEN_JSON_PROPERTIES_UDTF_NAME,
-            "flatten_json_properties(json_schema)",
-            "Flattens a JSON Schema document into rows describing nested properties.",
-        )
-        .with_example("SELECT * FROM flatten_json_properties(schema_json)"),
-        FunctionContextEntry::new(
-            JSON_TREE_UDTF_NAME,
-            "json_tree(json)",
-            "Walks a JSON document recursively and returns one row per node.",
-        )
-        .with_example("SELECT * FROM json_tree('{\"items\":[1,2]}')"),
-        FunctionContextEntry::new(
-            TEXT_SEARCH_UDTF_NAME,
-            "text_search(dataset, 'query text'[, column])",
-            "Runs full-text search over a dataset column with a configured full-text search index. Pass column when a table has more than one full-text search column.",
-        )
-        .with_example("SELECT * FROM text_search(docs, 'refund policy', body)"),
-        FunctionContextEntry::new(
-            VECTOR_SEARCH_UDTF_NAME,
-            "vector_search(dataset, 'query text'[, column])",
-            "Runs vector search over a dataset column with a configured embedding/vector index. Pass column when a table has more than one vector-search column.",
-        )
-        .with_example("SELECT * FROM vector_search(docs, 'refund policy', body)"),
-        FunctionContextEntry::new(
-            RRF_UDF_NAME,
-            "rrf(text_search(...), vector_search(...))",
-            "Combines text and vector search results with reciprocal rank fusion.",
-        )
-        .with_example("SELECT * FROM rrf(text_search(docs, 'refund', body), vector_search(docs, 'refund', body))"),
-        FunctionContextEntry::new(
-            RERANK_UDTF_NAME,
-            "rerank(input => TABLE(...), model => 'model')",
-            "Reranks search results with a configured reranker model.",
-        )
-        .with_example("SELECT * FROM rerank(input => TABLE(SELECT * FROM docs), model => 'reranker')"),
-        FunctionContextEntry::new(
-            COSINE_DISTANCE_UDF_NAME,
-            "cosine_distance(vector_a, vector_b)",
-            "Computes cosine distance between two vector/list values.",
-        )
-        .with_example("SELECT cosine_distance(embedding, query_embedding) FROM docs"),
-        FunctionContextEntry::new(
-            INNER_PRODUCT_UDF_NAME,
-            "inner_product(vector_a, vector_b)",
-            "Computes inner product between two vector/list values.",
-        )
-        .with_example("SELECT inner_product(embedding, query_embedding) FROM docs"),
-        FunctionContextEntry::new(
-            L2_DISTANCE_UDF_NAME,
-            "l2_distance(vector_a, vector_b)",
-            "Computes Euclidean distance between two vector/list values.",
-        )
-        .with_example("SELECT l2_distance(embedding, query_embedding) FROM docs"),
-        FunctionContextEntry::new(
-            L2_SQUARED_DISTANCE_UDF_NAME,
-            "l2_squared_distance(vector_a, vector_b)",
-            "Computes squared Euclidean distance between two vector/list values.",
-        )
-        .with_example("SELECT l2_squared_distance(embedding, query_embedding) FROM docs"),
-        FunctionContextEntry::new(
-            L2_NORM_UDF_NAME,
-            "l2_norm(vector)",
-            "Computes the L2 norm of a vector/list value.",
-        )
-        .with_example("SELECT l2_norm(embedding) FROM docs"),
-        FunctionContextEntry::new(
-            EMBED_UDF_NAME,
-            "embed(text[, model])",
-            "Generates an embedding using a configured embedding model.",
-        )
-        .with_example("SELECT embed('refund policy', 'embedding_model')"),
-        FunctionContextEntry::new(
-            AI_UDF_NAME,
-            "ai(message[, model])",
-            "Runs a prompt against a configured chat model from SQL.",
-        )
-        .with_example("SELECT ai('Summarize this ticket', 'llm_model')"),
-        FunctionContextEntry::new(
-            BUCKET_SCALAR_UDF_NAME,
-            "bucket(value, boundaries)",
-            "Assigns a value to a bucket using ordered boundaries.",
-        )
-        .with_example("SELECT bucket(amount, [10, 100, 1000]) FROM orders"),
-        FunctionContextEntry::new(
-            TRUNCATE_SCALAR_UDF_NAME,
-            "truncate(width, value)",
-            "Truncates a value using Iceberg/Spark-compatible semantics.",
-        )
-        .with_example("SELECT truncate(10, amount) FROM orders"),
-        FunctionContextEntry::new(
-            DIGEST_UDF_NAME,
-            "digest_many(col_a, col_b, ..., digest_function_name)",
-            "Hashes multiple column values using a DataFusion digest function such as md5.",
-        )
-        .with_example("SELECT digest_many(customer_id, order_id, 'md5') FROM orders"),
-        FunctionContextEntry::new(
-            OBJ_DESCRIPTION_UDF_NAME,
-            "obj_description(object_id)",
-            "Returns PostgreSQL-compatible object descriptions when available.",
-        )
-        .with_example("SELECT obj_description(table_oid)"),
-        FunctionContextEntry::new(
-            COL_DESCRIPTION_UDF_NAME,
-            "col_description(table_id, column_number)",
-            "Returns PostgreSQL-compatible column descriptions when available.",
-        )
-        .with_example("SELECT col_description(table_oid, 1)"),
-        FunctionContextEntry::new(
-            LIST_UDFS_UDTF_NAME,
-            "list_udfs()",
-            "Lists scalar and table UDFs registered in the Spice runtime.",
-        )
-        .with_example("SELECT * FROM list_udfs()"),
-    ]
+fn string_value(
+    batch: &RecordBatch,
+    column: &str,
+    row: usize,
+) -> Result<Option<String>, DataFusionError> {
+    let array = batch.column_by_name(column).ok_or_else(|| {
+        DataFusionError::Internal(format!(
+            "NSQL function inventory query missing column {column}"
+        ))
+    })?;
+    let values = array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "NSQL function inventory column {column} is not Utf8"
+            ))
+        })?;
+    if values.is_null(row) {
+        Ok(None)
+    } else {
+        Ok(Some(values.value(row).to_string()))
+    }
 }
 
-fn available_context_entries(
-    entries: Vec<FunctionContextEntry>,
-    available_names: &HashSet<String>,
+fn bool_value(batch: &RecordBatch, column: &str, row: usize) -> Result<bool, DataFusionError> {
+    let array = batch.column_by_name(column).ok_or_else(|| {
+        DataFusionError::Internal(format!(
+            "NSQL function inventory query missing column {column}"
+        ))
+    })?;
+    let values = array
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "NSQL function inventory column {column} is not Boolean"
+            ))
+        })?;
+    Ok(!values.is_null(row) && values.value(row))
+}
+
+fn u8_value(batch: &RecordBatch, column: &str, row: usize) -> Result<u8, DataFusionError> {
+    let array = batch.column_by_name(column).ok_or_else(|| {
+        DataFusionError::Internal(format!(
+            "NSQL function inventory query missing column {column}"
+        ))
+    })?;
+    let values = array.as_any().downcast_ref::<UInt8Array>().ok_or_else(|| {
+        DataFusionError::Internal(format!(
+            "NSQL function inventory column {column} is not UInt8"
+        ))
+    })?;
+    if values.is_null(row) {
+        return Err(DataFusionError::Internal(format!(
+            "NSQL function inventory column {column} unexpectedly contained NULL"
+        )));
+    }
+    Ok(values.value(row))
+}
+
+fn u64_value(batch: &RecordBatch, column: &str, row: usize) -> Result<u64, DataFusionError> {
+    let array = batch.column_by_name(column).ok_or_else(|| {
+        DataFusionError::Internal(format!(
+            "NSQL function inventory query missing column {column}"
+        ))
+    })?;
+    let values = array
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "NSQL function inventory column {column} is not UInt64"
+            ))
+        })?;
+    if values.is_null(row) {
+        return Err(DataFusionError::Internal(format!(
+            "NSQL function inventory column {column} unexpectedly contained NULL"
+        )));
+    }
+    Ok(values.value(row))
+}
+
+fn add_routine_batches(
+    inventory: &mut FunctionInventory,
+    batches: &[RecordBatch],
+) -> Result<(), DataFusionError> {
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            let Some(name) = string_value(batch, "routine_name", row)? else {
+                continue;
+            };
+            let function = inventory.function_mut(&name);
+            if function.function_type.is_none() {
+                function.function_type =
+                    non_empty_string(string_value(batch, "function_type", row)?);
+            }
+            if function.description.is_none() {
+                function.description = non_empty_string(string_value(batch, "description", row)?);
+            }
+            if function.syntax_example.is_none() {
+                function.syntax_example =
+                    non_empty_string(string_value(batch, "syntax_example", row)?);
+            }
+            if let Some(return_type) = non_empty_string(string_value(batch, "data_type", row)?) {
+                function.return_types.insert(return_type);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_parameter_batches(
+    inventory: &mut FunctionInventory,
+    batches: &[RecordBatch],
+) -> Result<(), DataFusionError> {
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            let Some(name) = string_value(batch, "specific_name", row)? else {
+                continue;
+            };
+            let rid = u8_value(batch, "rid", row)?;
+            let mode = string_value(batch, "parameter_mode", row)?.unwrap_or_default();
+            let data_type = string_value(batch, "data_type", row)?.unwrap_or_default();
+            if data_type.is_empty() {
+                continue;
+            }
+
+            let function = inventory.function_mut(&name);
+            let signature = function.signatures.entry(rid).or_default();
+            if mode == "OUT" {
+                signature.return_type = Some(data_type);
+                continue;
+            }
+
+            let ordinal_position = u64_value(batch, "ordinal_position", row)?;
+            if ordinal_position == 0 {
+                continue;
+            }
+            signature.variadic |= bool_value(batch, "is_variadic", row)?;
+            signature.parameters.push(RegisteredFunctionParameter {
+                name: non_empty_string(string_value(batch, "parameter_name", row)?),
+                data_type,
+            });
+        }
+    }
+
+    for function in inventory.functions.values_mut() {
+        for signature in function.signatures.values_mut() {
+            if signature.return_type.is_none()
+                && let Some(return_type) = function.return_types.iter().next()
+            {
+                signature.return_type = Some(return_type.clone());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn add_list_udf_batches(
+    inventory: &mut FunctionInventory,
+    batches: &[RecordBatch],
+) -> Result<(), DataFusionError> {
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            let Some(name) = string_value(batch, "name", row)? else {
+                continue;
+            };
+            inventory.add_name(&name);
+            if string_value(batch, "source", row)?.as_deref() == Some("user") {
+                continue;
+            }
+
+            let function = inventory.function_mut(&name);
+            if function.function_type.is_none() {
+                function.function_type = non_empty_string(string_value(batch, "kind", row)?);
+            }
+            if function.description.is_none() {
+                function.description = non_empty_string(string_value(batch, "description", row)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn registered_function_inventory(
+    rt: &Runtime,
+) -> Result<FunctionInventory, Box<dyn StdError + Send + Sync>> {
+    let routines = rt.df.ctx.sql(NSQL_ROUTINES_QUERY).await?.collect().await?;
+    let parameters = rt
+        .df
+        .ctx
+        .sql(NSQL_PARAMETERS_QUERY)
+        .await?
+        .collect()
+        .await?;
+    let list_udfs = rt.df.ctx.sql(NSQL_LIST_UDFS_QUERY).await?.collect().await?;
+
+    let mut inventory = FunctionInventory::default();
+    add_routine_batches(&mut inventory, &routines)?;
+    add_parameter_batches(&mut inventory, &parameters)?;
+    add_list_udf_batches(&mut inventory, &list_udfs)?;
+    Ok(inventory)
+}
+
+fn is_json_context_function(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("json") || name.contains("_json")
+}
+
+fn spark_function_names(inventory: &FunctionInventory) -> BTreeSet<String> {
+    datafusion_spark::all_default_scalar_functions()
+        .into_iter()
+        .map(|function| function.name().to_ascii_lowercase())
+        .filter(|name| inventory.names.contains(name))
+        .collect()
+}
+
+fn is_search_context_function_visible(
+    name: &str,
     search_functions: SearchFunctionAvailability,
-) -> Vec<NsqlFunctionContextEntry> {
-    entries
+) -> bool {
+    if name == TEXT_SEARCH_UDTF_NAME {
+        return search_functions.text_search;
+    }
+    if name == VECTOR_SEARCH_UDTF_NAME {
+        return search_functions.vector_search;
+    }
+    if name == RRF_UDF_NAME || name == RERANK_UDTF_NAME {
+        return search_functions.text_search && search_functions.vector_search;
+    }
+    false
+}
+
+fn is_spice_context_function(name: &str, search_functions: SearchFunctionAvailability) -> bool {
+    #[cfg(feature = "models")]
+    let is_model_function = name == EMBED_UDF_NAME || name == AI_UDF_NAME;
+    #[cfg(not(feature = "models"))]
+    let is_model_function = false;
+
+    is_search_context_function_visible(name, search_functions)
+        || is_model_function
+        || [
+            COSINE_DISTANCE_UDF_NAME,
+            INNER_PRODUCT_UDF_NAME,
+            L2_DISTANCE_UDF_NAME,
+            L2_SQUARED_DISTANCE_UDF_NAME,
+            L2_NORM_UDF_NAME,
+            BUCKET_SCALAR_UDF_NAME,
+            TRUNCATE_SCALAR_UDF_NAME,
+            DIGEST_UDF_NAME,
+            OBJ_DESCRIPTION_UDF_NAME,
+            COL_DESCRIPTION_UDF_NAME,
+            LIST_UDFS_UDTF_NAME,
+        ]
+        .contains(&name)
+}
+
+fn user_function_names(app: &app::App) -> HashSet<String> {
+    app.functions
         .iter()
-        .filter(|entry| {
-            let name = entry.name.to_ascii_lowercase();
-            if name == TEXT_SEARCH_UDTF_NAME {
-                return available_names.contains(&name) && search_functions.text_search;
-            }
-            if name == VECTOR_SEARCH_UDTF_NAME {
-                return available_names.contains(&name) && search_functions.vector_search;
-            }
-            if name == RRF_UDF_NAME || name == RERANK_UDTF_NAME {
-                return available_names.contains(&name)
-                    && search_functions.text_search
-                    && search_functions.vector_search;
-            }
-            available_names.contains(&name)
-        })
-        .map(FunctionContextEntry::to_context_entry)
+        .map(|function| function.name.to_ascii_lowercase())
+        .collect()
+}
+
+fn inventory_entries(
+    inventory: &FunctionInventory,
+    user_function_names: &HashSet<String>,
+    include: impl Fn(&str) -> bool,
+) -> Vec<NsqlFunctionContextEntry> {
+    inventory
+        .functions
+        .iter()
+        .filter(|(name, _)| !user_function_names.contains(*name))
+        .filter(|(name, _)| include(name))
+        .map(|(_, function)| function.to_context_entry())
         .collect_vec()
 }
 
 #[cfg(test)]
 pub(crate) fn all_context_function_names_for_test() -> HashSet<String> {
-    let mut names = json_function_entries()
-        .into_iter()
-        .chain(spice_function_entries())
-        .map(|entry| entry.name.to_ascii_lowercase())
-        .filter(|name| cfg!(feature = "models") || (name != AI_UDF_NAME && name != EMBED_UDF_NAME))
-        .collect::<HashSet<_>>();
+    let mut names = [
+        "json_get",
+        "json_get_str",
+        "json_get_int",
+        "json_get_float",
+        "json_get_bool",
+        "json_get_json",
+        "json_get_array",
+        "json_as_text",
+        "json_contains",
+        "json_length",
+        "json_object_keys",
+        "json_from_scalar",
+        FLATTEN_JSON_UDTF_NAME,
+        FLATTEN_JSON_PROPERTIES_UDTF_NAME,
+        JSON_TREE_UDTF_NAME,
+        TEXT_SEARCH_UDTF_NAME,
+        VECTOR_SEARCH_UDTF_NAME,
+        RRF_UDF_NAME,
+        RERANK_UDTF_NAME,
+        COSINE_DISTANCE_UDF_NAME,
+        INNER_PRODUCT_UDF_NAME,
+        L2_DISTANCE_UDF_NAME,
+        L2_SQUARED_DISTANCE_UDF_NAME,
+        L2_NORM_UDF_NAME,
+        BUCKET_SCALAR_UDF_NAME,
+        TRUNCATE_SCALAR_UDF_NAME,
+        DIGEST_UDF_NAME,
+        OBJ_DESCRIPTION_UDF_NAME,
+        COL_DESCRIPTION_UDF_NAME,
+        LIST_UDFS_UDTF_NAME,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<HashSet<_>>();
+
+    #[cfg(feature = "models")]
+    {
+        names.insert(AI_UDF_NAME.to_string());
+        names.insert(EMBED_UDF_NAME.to_string());
+    }
 
     names.extend(
         datafusion_spark::all_default_scalar_functions()
@@ -1489,15 +1658,34 @@ pub(crate) fn all_context_function_names_for_test() -> HashSet<String> {
 }
 
 #[cfg(test)]
+fn function_inventory_for_test(available_names: &HashSet<String>) -> FunctionInventory {
+    let mut inventory = FunctionInventory::default();
+    for name in available_names {
+        let function = inventory.function_mut(name);
+        function.function_type = Some("SCALAR".to_string());
+        function.signatures.insert(
+            0,
+            RegisteredFunctionSignature {
+                parameters: vec![],
+                return_type: None,
+                variadic: true,
+            },
+        );
+    }
+    inventory
+}
+
+#[cfg(test)]
 pub(crate) fn nsql_function_context_for_test(
     app: &app::App,
     available_names: &HashSet<String>,
     vector_search: bool,
     text_search: bool,
 ) -> NsqlFunctionContext {
+    let inventory = function_inventory_for_test(available_names);
     nsql_function_context(
         app,
-        available_names,
+        &inventory,
         SearchFunctionAvailability {
             vector_search,
             text_search,
@@ -1516,15 +1704,20 @@ fn write_function_entries(
 
     let _ = writeln!(output, "\n### {section}");
     for entry in entries {
-        let _ = write!(
-            output,
-            "- `{}`: {} Syntax: `{}`.",
-            entry.name, entry.description, entry.syntax
-        );
-        if let Some(example) = &entry.example {
-            let _ = write!(output, " Example: `{example}`.");
+        let _ = write!(output, "- `{}`", entry.name);
+        if let Some(description) = &entry.description {
+            let _ = write!(output, ": {description}");
         }
-        let _ = writeln!(output);
+        if let Some(function_type) = &entry.function_type {
+            let _ = write!(output, " ({function_type})");
+        }
+        if let Some(syntax) = &entry.syntax {
+            let _ = write!(output, ". Syntax: `{syntax}`");
+        }
+        if let Some(example) = &entry.example {
+            let _ = write!(output, ". Example: `{example}`");
+        }
+        let _ = writeln!(output, ".");
     }
 }
 
@@ -1687,21 +1880,18 @@ impl NsqlFunctionContext {
 
 fn nsql_function_context(
     app: &app::App,
-    available_names: &HashSet<String>,
+    inventory: &FunctionInventory,
     search_functions: SearchFunctionAvailability,
 ) -> NsqlFunctionContext {
-    let json =
-        available_context_entries(json_function_entries(), available_names, search_functions);
-    let spice_specific =
-        available_context_entries(spice_function_entries(), available_names, search_functions);
-
-    let mut spark_function_names = datafusion_spark::all_default_scalar_functions()
-        .into_iter()
-        .map(|function| function.name().to_string())
-        .filter(|name| available_names.contains(&name.to_ascii_lowercase()))
-        .unique_by(|name| name.to_ascii_lowercase())
-        .collect_vec();
-    spark_function_names.sort_by_key(|name| name.to_ascii_lowercase());
+    let user_function_names = user_function_names(app);
+    let json = inventory_entries(inventory, &user_function_names, is_json_context_function);
+    let spark_function_names = spark_function_names(inventory);
+    let spice_specific = inventory_entries(inventory, &user_function_names, |name| {
+        !is_json_context_function(name)
+            && !spark_function_names.contains(name)
+            && is_spice_context_function(name, search_functions)
+    });
+    let spark_function_names = spark_function_names.into_iter().collect_vec();
 
     NsqlFunctionContext {
         summary: NSQL_FUNCTION_CONTEXT_SUMMARY.to_string(),
@@ -1711,7 +1901,7 @@ fn nsql_function_context(
             description: "Spark-compatible scalar functions are available for arrays, maps, structs, dates, strings, hashes, URLs, XML, and other common Spark SQL expressions.".to_string(),
             functions: spark_function_names,
         },
-        user_defined: user_function_context(app, available_names),
+        user_defined: user_function_context(app, &inventory.names),
     }
 }
 
@@ -1846,6 +2036,10 @@ pub(crate) fn render_nsql_context_block(
     for instruction in NSQL_CONTEXT_INSTRUCTIONS {
         let _ = writeln!(context, "- {instruction}");
     }
+    let _ = writeln!(
+        context,
+        "- Apache DataFusion version: {DATAFUSION_VERSION}."
+    );
     let _ = writeln!(
         context,
         "- Schema metadata includes table and column comments/descriptions when supplied by the connector or Spicepod."
@@ -1997,8 +2191,16 @@ pub(crate) async fn build_nsql_context(
         vec![]
     };
 
-    let available_names = available_function_names(&rt);
-    let configured_search_functions = search_function_availability(&available_names);
+    let function_inventory = registered_function_inventory(&rt)
+        .instrument(Span::current())
+        .await
+        .map_err(|source| {
+            tracing::error!(
+                "Error getting registered function inventory for NSQL context: {source}"
+            );
+            NsqlContextError::FunctionContext { source }
+        })?;
+    let configured_search_functions = search_function_availability(&function_inventory.names);
 
     let dataset_contexts =
         dataset_contexts(&tables, Arc::clone(&rt), &app, configured_search_functions)
@@ -2017,7 +2219,8 @@ pub(crate) async fn build_nsql_context(
             .iter()
             .any(|dataset| !dataset.search.full_text.is_empty()),
     };
-    let function_context = nsql_function_context(&app, &available_names, dataset_search_functions);
+    let function_context =
+        nsql_function_context(&app, &function_inventory, dataset_search_functions);
     let function_context_block = function_context.render_markdown();
     let relationship_context = render_nsql_dataset_relationship_context(&dataset_contexts);
 
@@ -2065,10 +2268,15 @@ mod tests {
         let context = nsql_function_context_for_test(&app, &available_names, true, true);
 
         let json_names = entry_names(&context.json);
-        for expected_name in json_function_entries()
+        let expected_json_names = available_names
             .iter()
-            .map(|entry| entry.name.as_str())
-        {
+            .filter(|name| is_json_context_function(name))
+            .collect_vec();
+        assert!(
+            expected_json_names.len() > 10,
+            "expected many registered JSON functions"
+        );
+        for expected_name in expected_json_names {
             assert!(
                 json_names.contains(expected_name),
                 "missing JSON function {expected_name} from NSQL context"

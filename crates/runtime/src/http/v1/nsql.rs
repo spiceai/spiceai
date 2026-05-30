@@ -254,6 +254,7 @@ fn nsql_context_error_response(error: &NsqlContextError) -> (StatusCode, String)
         | NsqlContextError::InvalidModelDatasets { .. }
         | NsqlContextError::ContextMessage { .. }
         | NsqlContextError::SchemaContext { .. }
+        | NsqlContextError::FunctionContext { .. }
         | NsqlContextError::SampleContext { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     };
 
@@ -290,6 +291,7 @@ fn nsql_context_error_response(error: &NsqlContextError) -> (StatusCode, String)
                 "instructions": ["Write SQL for the Spice runtime, which uses Apache DataFusion with the SQL parser configured for the PostgreSQL dialect."],
                 "sql": {
                     "engine": "Apache DataFusion",
+                    "version": "52.5.0",
                     "dialect": "PostgreSQL",
                     "parser": "DataFusion SQL parser configured with PostgreSQL dialect",
                     "notes": ["Spice supports standard DataFusion SQL plus Spice-specific functions."]
