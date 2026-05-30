@@ -235,7 +235,7 @@ impl SpiceTestQueryWorker {
         }
 
         // Fall back to TPCH validation (which handles TPCH, parameterized TPCH, etc.)
-        validation::validate_tpch_query(query, actual_batches)
+        validation::validate_tpch_query_at_scale(query, actual_batches, self.scale_factor)
     }
 
     pub fn start(self) -> JoinHandle<Result<SpiceTestQueryWorkerResult>> {
@@ -566,6 +566,8 @@ impl SpiceTestQueryWorker {
             && self.executor.supports_validation()
             && let Some(batches) = &result.batches
         {
+            let mut reference_validation_passed = false;
+
             // Execute reference query if reference_schema is provided
             if let Some(ref_schema) = &self.reference_schema
                 && let Some(spice_client) = self.executor.as_spice_client()
@@ -616,10 +618,20 @@ impl SpiceTestQueryWorker {
                         "Query reference validation failed: {validation_reason:?}"
                     ));
                 }
+
+                reference_validation_passed = true;
             }
 
             // Also validate using existing validation logic (TPCH or custom validation data)
-            let validation_result = self.validate_query_results(query, batches)?;
+            let has_custom_expected = self
+                .validation_data
+                .as_ref()
+                .is_some_and(|validation_data| validation_data.contains_key(&query.name));
+            let validation_result = if reference_validation_passed && !has_custom_expected {
+                QueryValidationResult::Pass
+            } else {
+                self.validate_query_results(query, batches)?
+            };
 
             if let QueryValidationResult::Fail(validation_reason) = validation_result {
                 eprintln!(
@@ -640,6 +652,16 @@ impl SpiceTestQueryWorker {
                         Ok(pretty) => eprintln!("{pretty}"),
                         Err(e) => eprintln!("Failed to format expected batches: {e}"),
                     }
+                } else if matches!(
+                    &validation_reason,
+                    validation::QueryValidationFailReason::NoExpectedAnswerAtScaleFactor
+                ) {
+                    eprintln!(
+                        "\nNo static expected answer exists for query '{}' at scale factor {}. \
+                         Static TPCH answers are only available at scale factor 1.0; validating at \
+                         other scale factors requires a configured reference schema.",
+                        query.name, self.scale_factor
+                    );
                 } else {
                     eprintln!(
                         "\nExpected results: See TPCH specification for query {}",
