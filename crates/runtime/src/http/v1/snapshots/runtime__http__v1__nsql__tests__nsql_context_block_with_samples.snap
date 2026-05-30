@@ -8,6 +8,7 @@ expression: "render_nsql_context_block(&tables, schema_context, relationship_con
 - Quote column names that contain capitals or special characters with double quotes.
 - For tables with schemas and catalogs, use "catalog"."schema"."table", not "catalog.schema.table".
 - Use table and column descriptions, primary keys, foreign keys, unique constraints, and indexes when choosing joins and filters.
+- Apache DataFusion version: 52.5.0.
 - Schema metadata includes table and column comments/descriptions when supplied by the connector or Spicepod.
 
 ## Datasets

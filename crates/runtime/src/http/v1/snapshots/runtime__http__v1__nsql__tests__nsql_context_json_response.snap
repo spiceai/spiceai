@@ -13,6 +13,7 @@ expression: response
   ],
   "sql": {
     "engine": "Apache DataFusion",
+    "version": "52.5.0",
     "dialect": "PostgreSQL",
     "parser": "DataFusion SQL parser configured with PostgreSQL dialect",
     "notes": [
@@ -158,186 +159,246 @@ expression: response
     "summary": "Spice SQL runs on Apache DataFusion with the SQL parser configured for the PostgreSQL dialect. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions. Function references are filtered to functions registered in the current DataFusion context",
     "json": [
       {
-        "name": "json_get",
-        "syntax": "json_get(json, path)",
-        "description": "Returns a JSON union value at a path. Use typed helpers when a scalar type is known.",
-        "example": "SELECT json_get(payload, 'metadata') FROM events"
+        "name": "flatten_json",
+        "syntax": "flatten_json(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "flatten_json(...)"
+        ]
       },
       {
-        "name": "json_get_str",
-        "syntax": "json_get_str(json, path)",
-        "description": "Returns a string value from JSON at a path.",
-        "example": "SELECT json_get_str(payload, 'customer.name') FROM events"
-      },
-      {
-        "name": "json_get_int",
-        "syntax": "json_get_int(json, path)",
-        "description": "Returns an integer value from JSON at a path.",
-        "example": "SELECT json_get_int(payload, 'order.id') FROM events"
-      },
-      {
-        "name": "json_get_float",
-        "syntax": "json_get_float(json, path)",
-        "description": "Returns a floating-point value from JSON at a path.",
-        "example": "SELECT json_get_float(payload, 'score') FROM events"
-      },
-      {
-        "name": "json_get_bool",
-        "syntax": "json_get_bool(json, path)",
-        "description": "Returns a boolean value from JSON at a path.",
-        "example": "SELECT json_get_bool(payload, 'active') FROM events"
-      },
-      {
-        "name": "json_get_json",
-        "syntax": "json_get_json(json, path)",
-        "description": "Returns a JSON string value from JSON at a path.",
-        "example": "SELECT json_get_json(payload, 'items[0]') FROM events"
-      },
-      {
-        "name": "json_get_array",
-        "syntax": "json_get_array(json, path)",
-        "description": "Returns an array value from JSON at a path.",
-        "example": "SELECT json_get_array(payload, 'tags') FROM events"
+        "name": "flatten_json_properties",
+        "syntax": "flatten_json_properties(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "flatten_json_properties(...)"
+        ]
       },
       {
         "name": "json_as_text",
-        "syntax": "json_as_text(json, path)",
-        "description": "Returns the JSON value at a path as text.",
-        "example": "SELECT json_as_text(payload, 'metadata') FROM events"
+        "syntax": "json_as_text(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "json_as_text(...)"
+        ]
       },
       {
         "name": "json_contains",
-        "syntax": "json_contains(json, value)",
-        "description": "Returns whether a JSON value contains another JSON value.",
-        "example": "SELECT * FROM events WHERE json_contains(payload, 'urgent')"
-      },
-      {
-        "name": "json_length",
-        "syntax": "json_length(json[, path])",
-        "description": "Returns the length of a JSON array or object.",
-        "example": "SELECT json_length(payload, 'items') FROM orders"
-      },
-      {
-        "name": "json_object_keys",
-        "syntax": "json_object_keys(json)",
-        "description": "Returns object keys from a JSON value.",
-        "example": "SELECT json_object_keys(payload) FROM events"
+        "syntax": "json_contains(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "json_contains(...)"
+        ]
       },
       {
         "name": "json_from_scalar",
-        "syntax": "json_from_scalar(value)",
-        "description": "Converts a scalar SQL value into JSON.",
-        "example": "SELECT json_from_scalar(status) FROM tickets"
+        "syntax": "json_from_scalar(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "json_from_scalar(...)"
+        ]
+      },
+      {
+        "name": "json_get",
+        "syntax": "json_get(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "json_get(...)"
+        ]
+      },
+      {
+        "name": "json_get_array",
+        "syntax": "json_get_array(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "json_get_array(...)"
+        ]
+      },
+      {
+        "name": "json_get_bool",
+        "syntax": "json_get_bool(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "json_get_bool(...)"
+        ]
+      },
+      {
+        "name": "json_get_float",
+        "syntax": "json_get_float(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "json_get_float(...)"
+        ]
+      },
+      {
+        "name": "json_get_int",
+        "syntax": "json_get_int(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "json_get_int(...)"
+        ]
+      },
+      {
+        "name": "json_get_json",
+        "syntax": "json_get_json(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "json_get_json(...)"
+        ]
+      },
+      {
+        "name": "json_get_str",
+        "syntax": "json_get_str(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "json_get_str(...)"
+        ]
+      },
+      {
+        "name": "json_length",
+        "syntax": "json_length(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "json_length(...)"
+        ]
+      },
+      {
+        "name": "json_object_keys",
+        "syntax": "json_object_keys(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "json_object_keys(...)"
+        ]
+      },
+      {
+        "name": "json_tree",
+        "syntax": "json_tree(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "json_tree(...)"
+        ]
       }
     ],
     "spice_specific": [
       {
-        "name": "flatten_json",
-        "syntax": "flatten_json(json)",
-        "description": "Flattens a JSON document into key/value rows. Use as a table function for literal JSON or with UNNEST for column values.",
-        "example": "SELECT * FROM flatten_json('{\"a\":1}')"
-      },
-      {
-        "name": "flatten_json_properties",
-        "syntax": "flatten_json_properties(json_schema)",
-        "description": "Flattens a JSON Schema document into rows describing nested properties.",
-        "example": "SELECT * FROM flatten_json_properties(schema_json)"
-      },
-      {
-        "name": "json_tree",
-        "syntax": "json_tree(json)",
-        "description": "Walks a JSON document recursively and returns one row per node.",
-        "example": "SELECT * FROM json_tree('{\"items\":[1,2]}')"
-      },
-      {
-        "name": "text_search",
-        "syntax": "text_search(dataset, 'query text'[, column])",
-        "description": "Runs full-text search over a dataset column with a configured full-text search index. Pass column when a table has more than one full-text search column.",
-        "example": "SELECT * FROM text_search(docs, 'refund policy', body)"
-      },
-      {
-        "name": "vector_search",
-        "syntax": "vector_search(dataset, 'query text'[, column])",
-        "description": "Runs vector search over a dataset column with a configured embedding/vector index. Pass column when a table has more than one vector-search column.",
-        "example": "SELECT * FROM vector_search(docs, 'refund policy', body)"
-      },
-      {
-        "name": "rrf",
-        "syntax": "rrf(text_search(...), vector_search(...))",
-        "description": "Combines text and vector search results with reciprocal rank fusion.",
-        "example": "SELECT * FROM rrf(text_search(docs, 'refund', body), vector_search(docs, 'refund', body))"
-      },
-      {
-        "name": "rerank",
-        "syntax": "rerank(input => TABLE(...), model => 'model')",
-        "description": "Reranks search results with a configured reranker model.",
-        "example": "SELECT * FROM rerank(input => TABLE(SELECT * FROM docs), model => 'reranker')"
-      },
-      {
-        "name": "cosine_distance",
-        "syntax": "cosine_distance(vector_a, vector_b)",
-        "description": "Computes cosine distance between two vector/list values.",
-        "example": "SELECT cosine_distance(embedding, query_embedding) FROM docs"
-      },
-      {
-        "name": "inner_product",
-        "syntax": "inner_product(vector_a, vector_b)",
-        "description": "Computes inner product between two vector/list values.",
-        "example": "SELECT inner_product(embedding, query_embedding) FROM docs"
-      },
-      {
-        "name": "l2_distance",
-        "syntax": "l2_distance(vector_a, vector_b)",
-        "description": "Computes Euclidean distance between two vector/list values.",
-        "example": "SELECT l2_distance(embedding, query_embedding) FROM docs"
-      },
-      {
-        "name": "l2_squared_distance",
-        "syntax": "l2_squared_distance(vector_a, vector_b)",
-        "description": "Computes squared Euclidean distance between two vector/list values.",
-        "example": "SELECT l2_squared_distance(embedding, query_embedding) FROM docs"
-      },
-      {
-        "name": "l2_norm",
-        "syntax": "l2_norm(vector)",
-        "description": "Computes the L2 norm of a vector/list value.",
-        "example": "SELECT l2_norm(embedding) FROM docs"
-      },
-      {
         "name": "bucket",
-        "syntax": "bucket(value, boundaries)",
-        "description": "Assigns a value to a bucket using ordered boundaries.",
-        "example": "SELECT bucket(amount, [10, 100, 1000]) FROM orders"
-      },
-      {
-        "name": "truncate",
-        "syntax": "truncate(width, value)",
-        "description": "Truncates a value using Iceberg/Spark-compatible semantics.",
-        "example": "SELECT truncate(10, amount) FROM orders"
-      },
-      {
-        "name": "digest_many",
-        "syntax": "digest_many(col_a, col_b, ..., digest_function_name)",
-        "description": "Hashes multiple column values using a DataFusion digest function such as md5.",
-        "example": "SELECT digest_many(customer_id, order_id, 'md5') FROM orders"
-      },
-      {
-        "name": "obj_description",
-        "syntax": "obj_description(object_id)",
-        "description": "Returns PostgreSQL-compatible object descriptions when available.",
-        "example": "SELECT obj_description(table_oid)"
+        "syntax": "bucket(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "bucket(...)"
+        ]
       },
       {
         "name": "col_description",
-        "syntax": "col_description(table_id, column_number)",
-        "description": "Returns PostgreSQL-compatible column descriptions when available.",
-        "example": "SELECT col_description(table_oid, 1)"
+        "syntax": "col_description(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "col_description(...)"
+        ]
+      },
+      {
+        "name": "cosine_distance",
+        "syntax": "cosine_distance(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "cosine_distance(...)"
+        ]
+      },
+      {
+        "name": "digest_many",
+        "syntax": "digest_many(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "digest_many(...)"
+        ]
+      },
+      {
+        "name": "inner_product",
+        "syntax": "inner_product(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "inner_product(...)"
+        ]
+      },
+      {
+        "name": "l2_distance",
+        "syntax": "l2_distance(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "l2_distance(...)"
+        ]
+      },
+      {
+        "name": "l2_norm",
+        "syntax": "l2_norm(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "l2_norm(...)"
+        ]
+      },
+      {
+        "name": "l2_squared_distance",
+        "syntax": "l2_squared_distance(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "l2_squared_distance(...)"
+        ]
       },
       {
         "name": "list_udfs",
-        "syntax": "list_udfs()",
-        "description": "Lists scalar and table UDFs registered in the Spice runtime.",
-        "example": "SELECT * FROM list_udfs()"
+        "syntax": "list_udfs(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "list_udfs(...)"
+        ]
+      },
+      {
+        "name": "obj_description",
+        "syntax": "obj_description(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "obj_description(...)"
+        ]
+      },
+      {
+        "name": "rerank",
+        "syntax": "rerank(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "rerank(...)"
+        ]
+      },
+      {
+        "name": "rrf",
+        "syntax": "rrf(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "rrf(...)"
+        ]
+      },
+      {
+        "name": "text_search",
+        "syntax": "text_search(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "text_search(...)"
+        ]
+      },
+      {
+        "name": "truncate",
+        "syntax": "truncate(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "truncate(...)"
+        ]
+      },
+      {
+        "name": "vector_search",
+        "syntax": "vector_search(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "vector_search(...)"
+        ]
       }
     ],
     "spark_compatibility": {
