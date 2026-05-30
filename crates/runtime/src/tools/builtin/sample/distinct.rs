@@ -25,9 +25,9 @@ use tracing::Span;
 use tracing_futures::Instrument;
 use util::security::{quote_sql_identifier, quote_table_reference};
 
-use crate::datafusion::DataFusion;
 use arrow::compute::concat;
 use futures::{StreamExt, TryStreamExt};
+use runtime_datafusion::query_engine::{QueryEngine, QueryRequest};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
@@ -65,7 +65,7 @@ impl DistinctColumnsParams {
     ///  - If `d < n`, all distinct values are returned, concatenated with `n - d` duplicate rows.
     ///  - If `d >= n`, `n` distinct values are sampled, but no guarantee on which rows are returned.
     async fn sample_distinct_from_column(
-        df: Arc<DataFusion>,
+        df: Arc<dyn QueryEngine>,
         tbl: &TableReference,
         column: &str,
         n: usize,
@@ -92,7 +92,7 @@ impl DistinctColumnsParams {
     }
 
     async fn sample_from_column(
-        df: Arc<DataFusion>,
+        df: Arc<dyn QueryEngine>,
         tbl: &TableReference,
         col: &str,
         n: usize,
@@ -107,16 +107,15 @@ impl DistinctColumnsParams {
     }
 
     async fn _sample_col(
-        df: Arc<DataFusion>,
+        df: Arc<dyn QueryEngine>,
         query: &str,
     ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
-        let result = df.query_builder(query).build().run().await.boxed()?;
+        let stream = df.execute_query(QueryRequest::new(query)).await?;
 
-        let column = result
-            .data
+        let column = stream
             .try_collect::<Vec<RecordBatch>>()
             .await
-            .boxed()?
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
             .iter()
             .map(|batch| Arc::clone(batch.column(0)))
             .collect_vec();
@@ -124,14 +123,15 @@ impl DistinctColumnsParams {
         let array_slices: Vec<&dyn arrow::array::Array> =
             column.iter().map(AsRef::as_ref).collect();
 
-        concat(array_slices.as_slice()).boxed()
+        concat(array_slices.as_slice())
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
     }
 }
 
 impl SampleFrom for DistinctColumnsParams {
     async fn sample(
         &self,
-        df: Arc<DataFusion>,
+        df: Arc<dyn QueryEngine>,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
         let tbl = TableReference::parse_str(self.tbl.as_str());
         let Some(provider) = df.get_table(&tbl).await else {
@@ -244,6 +244,7 @@ mod tests {
             cols: None,
         };
 
+        let df = Arc::clone(&df) as Arc<dyn QueryEngine>;
         let sample = params
             .sample(Arc::clone(&df))
             .await

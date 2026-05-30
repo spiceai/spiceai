@@ -46,6 +46,11 @@ use super::Query;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryValidationFailReason {
     NoExpectedAnswer,
+    /// A static TPCH answer exists for the query, but only at scale factor 1.0.
+    /// Validating at any other scale factor requires a configured reference
+    /// schema, so this is reported distinctly from [`Self::NoExpectedAnswer`]
+    /// (which means no expected answer exists for the query at all).
+    NoExpectedAnswerAtScaleFactor,
     NoAnswer,
     SchemaMismatch,
     RowCountMismatch {
@@ -126,6 +131,16 @@ static TPCH_ANSWERS: LazyLock<BTreeMap<Arc<str>, Vec<RecordBatch>>> = LazyLock::
         map
     }
 });
+
+#[must_use]
+pub(crate) fn has_static_tpch_answer(query: &Query) -> bool {
+    TPCH_ANSWERS.contains_key(&query.name)
+}
+
+#[must_use]
+pub(crate) fn should_validate_with_static_tpch_answer(query: &Query, scale_factor: f64) -> bool {
+    (scale_factor - 1.0).abs() < f64::EPSILON && has_static_tpch_answer(query)
+}
 
 fn datatype_equivalent(expected_type: &DataType, actual_type: &DataType) -> bool {
     if expected_type == actual_type {
@@ -534,6 +549,26 @@ pub fn validate_tpch_query(
     validate_batches_as_strings(&expected_batches, &actual_batches)
 }
 
+pub fn validate_tpch_query_at_scale(
+    query: &Query,
+    batches: &[RecordBatch],
+    scale_factor: f64,
+) -> Result<QueryValidationResult> {
+    if has_static_tpch_answer(query)
+        && !should_validate_with_static_tpch_answer(query, scale_factor)
+    {
+        // A static answer exists, but only at scale factor 1.0. Report this
+        // distinctly from `NoExpectedAnswer` so callers can tell the query has a
+        // known SF=1 answer and that validating at this scale factor needs a
+        // reference schema instead.
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoExpectedAnswerAtScaleFactor,
+        ));
+    }
+
+    validate_tpch_query(query, batches)
+}
+
 /// Validate a query against expected results from a custom query set
 /// This is a generic validation function that can be used for custom queries
 pub fn validate_with_expected_batches(
@@ -667,6 +702,26 @@ mod test {
             .clone();
         let schema = batches[0].schema();
         assert_eq!(schema.fields().len(), 10);
+    }
+
+    #[test]
+    fn test_static_tpch_answers_are_sf1_only() {
+        let query = Query::new("tpch_q22".into(), "SELECT 1".into(), false);
+
+        assert!(has_static_tpch_answer(&query));
+        assert!(should_validate_with_static_tpch_answer(&query, 1.0));
+        assert!(!should_validate_with_static_tpch_answer(&query, 10.0));
+        assert!(!should_validate_with_static_tpch_answer(&query, 100.0));
+
+        let batches = TPCH_ANSWERS
+            .get("tpch_q22")
+            .expect("should have q22 answer")
+            .clone();
+
+        assert_eq!(
+            validate_tpch_query_at_scale(&query, &batches, 100.0).expect("should validate"),
+            QueryValidationResult::Fail(QueryValidationFailReason::NoExpectedAnswerAtScaleFactor)
+        );
     }
 
     #[test]

@@ -86,7 +86,7 @@ use snafu::{OptionExt, ResultExt};
 use spicepod::metric::Metrics;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::time::{Duration, UNIX_EPOCH};
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
 use telemetry::timing::MultiTimeMeasurement;
@@ -265,6 +265,11 @@ pub struct RefreshTaskBuilder {
     accelerator_write_mutex: Arc<Mutex<()>>,
     on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
     last_updated_at: Arc<AtomicI64>,
+    /// Shared flag that `AcceleratedTable::scan` checks to decide whether the
+    /// initial data load has completed. Set to `true` just before the status
+    /// transitions to `Ready` so there is no window where the runtime reports
+    /// ready but scans still see `initial_load_completed == false`.
+    initial_load_completed: Option<Arc<AtomicBool>>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
     /// State for `refresh_mode: snapshot`. Required when the refresh mode is
@@ -298,6 +303,7 @@ impl RefreshTaskBuilder {
             accelerator_write_mutex,
             on_stream_batch_process_callback: None,
             last_updated_at: Arc::new(AtomicI64::new(0)),
+            initial_load_completed: None,
             is_s3_express_acceleration: false,
             snapshot_refresh_state: None,
         }
@@ -349,6 +355,15 @@ impl RefreshTaskBuilder {
     #[must_use]
     pub fn with_last_updated_at(mut self, last_updated_at: Arc<AtomicI64>) -> RefreshTaskBuilder {
         self.last_updated_at = last_updated_at;
+        self
+    }
+
+    #[must_use]
+    pub fn with_initial_load_completed(
+        mut self,
+        initial_load_completed: Arc<AtomicBool>,
+    ) -> RefreshTaskBuilder {
+        self.initial_load_completed = Some(initial_load_completed);
         self
     }
 
@@ -422,6 +437,7 @@ impl RefreshTaskBuilder {
             accelerator_write_mutex: self.accelerator_write_mutex,
             on_stream_batch_process_callback: self.on_stream_batch_process_callback,
             last_updated_at: self.last_updated_at,
+            initial_load_completed: self.initial_load_completed,
             is_s3_express_acceleration: self.is_s3_express_acceleration,
             snapshot_refresh_state: self.snapshot_refresh_state,
             cdc_insert_plan_cache: Arc::new(Mutex::new(None)),
@@ -447,6 +463,8 @@ pub struct RefreshTask {
     accelerator_write_mutex: Arc<Mutex<()>>,
     on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
     last_updated_at: Arc<AtomicI64>,
+    /// Shared flag set to `true` just before status transitions to `Ready`.
+    initial_load_completed: Option<Arc<AtomicBool>>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
     /// Per-dataset state required for `RefreshMode::Snapshot`. `None` for all
@@ -1428,7 +1446,9 @@ impl RefreshTask {
             let disable_federation = self.disable_federation;
             let io_runtime = self.io_runtime.clone();
 
-            let managed_stream = managed_runtime::run_record_batch_stream_on_runtime(
+            let managed_stream: runtime_datafusion::managed_runtime::ManagedRecordBatchStream<
+                UpdateType,
+            > = managed_runtime::run_record_batch_stream_on_runtime(
                 cpu_runtime_handle,
                 request_context,
                 span,
@@ -1979,6 +1999,13 @@ impl RefreshTask {
     async fn set_refresh_status(&self, sql: Option<&str>, status: status::ComponentStatus) {
         let is_error = status.is_error();
         let is_ready = status == status::ComponentStatus::Ready;
+
+        // Mark initial load complete BEFORE updating the runtime status to Ready.
+        // This closes the race window where `is_ready()` returns true but
+        // `AcceleratedTable::scan` still sees `initial_load_completed == false`.
+        if is_ready && let Some(flag) = &self.initial_load_completed {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
 
         // runtime status update
         self.update_component_status(status).await;
