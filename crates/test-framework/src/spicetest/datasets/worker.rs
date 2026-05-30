@@ -623,15 +623,10 @@ impl SpiceTestQueryWorker {
             }
 
             // Also validate using existing validation logic (TPCH or custom validation data)
-            let has_custom_expected = self
-                .validation_data
-                .as_ref()
-                .is_some_and(|validation_data| validation_data.contains_key(&query.name));
-            let validation_result = if reference_validation_passed && !has_custom_expected {
-                QueryValidationResult::Pass
-            } else {
-                self.validate_query_results(query, batches)?
-            };
+            let validation_result = validation_result_after_reference_validation(
+                self.validate_query_results(query, batches)?,
+                reference_validation_passed,
+            );
 
             if let QueryValidationResult::Fail(validation_reason) = validation_result {
                 eprintln!(
@@ -767,6 +762,19 @@ impl SpiceTestQueryWorker {
     }
 }
 
+fn validation_result_after_reference_validation(
+    validation_result: QueryValidationResult,
+    reference_validation_passed: bool,
+) -> QueryValidationResult {
+    match validation_result {
+        QueryValidationResult::Fail(
+            validation::QueryValidationFailReason::NoExpectedAnswer
+            | validation::QueryValidationFailReason::NoExpectedAnswerAtScaleFactor,
+        ) if reference_validation_passed => QueryValidationResult::Pass,
+        validation_result => validation_result,
+    }
+}
+
 fn default_row_count_validation_skip_queries() -> HashSet<String> {
     [
         "tpcds_q8",
@@ -838,6 +846,59 @@ mod tests {
 
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn test_reference_validation_does_not_skip_static_validation_failures() {
+        let validation_result = validation_result_after_reference_validation(
+            QueryValidationResult::Fail(validation::QueryValidationFailReason::DataMismatch {
+                column: "order_count".to_string(),
+                row_number: 1,
+                expected: "42".to_string(),
+                actual: "41".to_string(),
+            }),
+            true,
+        );
+
+        assert!(matches!(
+            validation_result,
+            QueryValidationResult::Fail(validation::QueryValidationFailReason::DataMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_reference_validation_covers_missing_static_answer() {
+        assert_eq!(
+            validation_result_after_reference_validation(
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::NoExpectedAnswer
+                ),
+                true,
+            ),
+            QueryValidationResult::Pass
+        );
+        assert_eq!(
+            validation_result_after_reference_validation(
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::NoExpectedAnswerAtScaleFactor,
+                ),
+                true,
+            ),
+            QueryValidationResult::Pass
+        );
+    }
+
+    #[test]
+    fn test_missing_static_answer_fails_without_reference_validation() {
+        assert_eq!(
+            validation_result_after_reference_validation(
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::NoExpectedAnswer
+                ),
+                false,
+            ),
+            QueryValidationResult::Fail(validation::QueryValidationFailReason::NoExpectedAnswer)
+        );
+    }
 
     #[test]
     fn test_build_unique_query_sets_single_group() {
