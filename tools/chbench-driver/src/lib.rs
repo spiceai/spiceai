@@ -77,6 +77,9 @@ pub trait ChBenchDriver: Send + Sync {
     /// Returns microseconds since Unix epoch, or `None` if the table is empty
     /// or the column doesn't exist.
     async fn max_bench_ts(&self, table: &str) -> Result<Option<i64>>;
+
+    /// Read `COUNT(*)` from the *source* for a given table.
+    async fn row_count(&self, table: &str) -> Result<i64>;
 }
 
 /// Postgres-backed CH-benCH driver.
@@ -215,6 +218,19 @@ impl ChBenchDriver for PostgresChBenchDriver {
         }
         let ts: Option<chrono::DateTime<chrono::Utc>> = rows[0].get(0);
         Ok(ts.map(|t| t.timestamp_micros()))
+    }
+
+    async fn row_count(&self, table: &str) -> Result<i64> {
+        let query = format!("SELECT COUNT(*) FROM {table}");
+        let rows = self
+            .client
+            .query(&query, &[])
+            .await
+            .map_err(|source| Error::Sql {
+                action: format!("query COUNT(*) from {table}"),
+                source,
+            })?;
+        Ok(rows.first().map_or(0, |row| row.get::<_, i64>(0)))
     }
 }
 
