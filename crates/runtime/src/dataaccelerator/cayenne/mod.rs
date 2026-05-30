@@ -366,6 +366,16 @@ fn is_local_path(path: &str) -> bool {
     !path.contains("://") || path.starts_with("file://")
 }
 
+/// Strip a `file:`/`file://` scheme so on-disk storage detection receives a real
+/// filesystem path. `resolve_metadata_dir` can return such URIs (since
+/// `cayenne_file_path` accepts them); feeding `file:///x` straight into
+/// `Path::new` would make `Auto` storage detection misclassify it as `Unknown`.
+fn fs_probe_path(path: &str) -> &str {
+    path.strip_prefix("file://")
+        .or_else(|| path.strip_prefix("file:"))
+        .unwrap_or(path)
+}
+
 impl CayenneAccelerator {
     #[must_use]
     pub fn new() -> Self {
@@ -641,9 +651,13 @@ impl CayenneAccelerator {
             // under the Auto profile) for other profiles.
             let inline_flush_caps = if uses_small_write_refresh_profile(acceleration) {
                 let metadata_dir = CayenneAccelerator::resolve_metadata_dir(Some(acceleration));
-                let metastore_storage =
-                    resolve_acceleration_storage_async(acceleration.storage_profile, &metadata_dir)
-                        .await;
+                // `metadata_dir` may be a file:// URI; pass a real filesystem path
+                // so Auto storage detection doesn't misclassify it as Unknown.
+                let metastore_storage = resolve_acceleration_storage_async(
+                    acceleration.storage_profile,
+                    fs_probe_path(&metadata_dir),
+                )
+                .await;
                 let caps = inline_flush_caps_for(
                     crate::resource_monitor::get_total_memory(),
                     metastore_storage,
@@ -2602,6 +2616,22 @@ mod tests {
         // Other remote schemes are NOT local
         assert!(!is_local_path("gs://bucket/prefix"));
         assert!(!is_local_path("az://container/blob"));
+    }
+
+    #[test]
+    fn test_fs_probe_path_strips_file_scheme() {
+        // file:// URIs are reduced to their filesystem path for storage detection.
+        assert_eq!(
+            fs_probe_path("file:///data/cayenne/metadata"),
+            "/data/cayenne/metadata"
+        );
+        assert_eq!(fs_probe_path("file:/data/cayenne"), "/data/cayenne");
+        // Plain paths pass through unchanged.
+        assert_eq!(
+            fs_probe_path("/data/cayenne/metadata"),
+            "/data/cayenne/metadata"
+        );
+        assert_eq!(fs_probe_path("relative/metadata"), "relative/metadata");
     }
 
     #[test]
