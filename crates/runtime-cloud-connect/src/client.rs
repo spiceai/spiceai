@@ -195,7 +195,7 @@ impl ClientDriver {
             return Err(Error::NoCredentials);
         }
 
-        let channel = build_channel(&self.config)?;
+        let channel = build_channel(&self.config, self.identity.as_ref())?;
         let mut grpc = proto::cloud_connect_client::CloudConnectClient::new(channel)
             .max_decoding_message_size(16 * 1024 * 1024);
 
@@ -640,7 +640,7 @@ enum ExitReason {
     Forget,
 }
 
-fn build_channel(config: &CloudConnectConfig) -> Result<Channel> {
+fn build_channel(config: &CloudConnectConfig, identity: Option<&Identity>) -> Result<Channel> {
     let mut endpoint = Endpoint::from_shared(config.endpoint.clone())
         .map_err(|source| Error::InvalidEndpoint {
             endpoint: config.endpoint.clone(),
@@ -654,16 +654,25 @@ fn build_channel(config: &CloudConnectConfig) -> Result<Channel> {
         .keep_alive_while_idle(true);
 
     if !config.insecure {
-        // Server-authenticated TLS only. Client authentication is done
-        // at the application layer via `Hello.credential` (adoption code
-        // on first contact, persisted identity cert PEM thereafter).
-        // This is intentional for v0 — see the crate-level docs. The
-        // persisted private key currently signs nothing on the wire; it
-        // exists so a future revision can bind the identity cert to the
-        // transport (true mTLS) without re-running adoption.
+        // Server-authenticated TLS, plus mutual TLS once we hold an
+        // identity: the gateway-issued cert and its ed25519 private key
+        // are presented as a client certificate, binding the transport to
+        // this adopted instance (the gateway verifies the cert chains to
+        // its CA and matches the one it issued). Before adoption we have
+        // no identity, so we connect server-auth only and bootstrap with
+        // the adoption code carried in `Hello.credential`. A client cert
+        // is only sent when the gateway requests one, so presenting it is
+        // backward-compatible with a gateway that still authenticates at
+        // the application layer.
         let mut tls = ClientTlsConfig::new().with_native_roots();
         if let Some(ref ca_pem) = config.ca_cert_pem {
             tls = tls.ca_certificate(Certificate::from_pem(ca_pem.as_bytes()));
+        }
+        if let Some(id) = identity {
+            tls = tls.identity(tonic::transport::Identity::from_pem(
+                id.identity_cert_pem.as_bytes(),
+                id.private_key_pem.as_bytes(),
+            ));
         }
         endpoint = endpoint.tls_config(tls).context(TransportSnafu)?;
     }
