@@ -164,7 +164,7 @@ pub(crate) struct NsqlContextJsonResponse {
     /// In-scope datasets with schema, metadata, relationship, key, and index details.
     pub(crate) datasets: Vec<NsqlDatasetContext>,
 
-    /// Available function groups filtered to the current DataFusion context.
+    /// Available function groups filtered to the current `DataFusion` context.
     pub(crate) functions: NsqlFunctionContext,
 
     /// Optional sample blocks included when requested.
@@ -206,18 +206,28 @@ pub(crate) struct NsqlDatasetContext {
 pub(crate) struct NsqlColumnContext {
     pub(crate) name: String,
     pub(crate) data_type: String,
+    #[cfg_attr(feature = "openapi", schema(value_type = bool))]
     pub(crate) nullable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) source_type: Option<String>,
     pub(crate) metadata: BTreeMap<String, String>,
-    pub(crate) primary_key: bool,
-    pub(crate) unique: bool,
-    pub(crate) indexed: bool,
-    pub(crate) vector_search: bool,
-    pub(crate) full_text_search: bool,
+    #[cfg_attr(feature = "openapi", schema(value_type = bool))]
+    pub(crate) primary_key: NsqlColumnFlag,
+    #[cfg_attr(feature = "openapi", schema(value_type = bool))]
+    pub(crate) unique: NsqlColumnFlag,
+    #[cfg_attr(feature = "openapi", schema(value_type = bool))]
+    pub(crate) indexed: NsqlColumnFlag,
+    #[cfg_attr(feature = "openapi", schema(value_type = bool))]
+    pub(crate) vector_search: NsqlColumnFlag,
+    #[cfg_attr(feature = "openapi", schema(value_type = bool))]
+    pub(crate) full_text_search: NsqlColumnFlag,
 }
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(transparent)]
+pub(crate) struct NsqlColumnFlag(bool);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -978,29 +988,28 @@ fn dataset_search_context(
 
 fn dataset_context_from_schema(
     table: &TableReference,
-    schema: Schema,
+    schema: &Schema,
     constraints: Option<&Constraints>,
     runtime_indexes: Vec<NsqlIndexContext>,
     table_provider: Option<&Arc<dyn datafusion::datasource::TableProvider>>,
-    app_context: Option<AppTableContext>,
+    app_context: Option<&AppTableContext>,
     search_functions: SearchFunctionAvailability,
 ) -> NsqlDatasetContext {
     let mut metadata = schema.metadata().clone();
-    if let Some(app_context) = &app_context {
+    if let Some(app_context) = app_context {
         metadata.extend(app_context.metadata.clone());
     }
 
-    let (mut primary_key, unique_constraints) = key_context_from_constraints(&schema, constraints);
+    let (mut primary_key, unique_constraints) = key_context_from_constraints(schema, constraints);
     if primary_key.is_empty()
-        && let Some(configured_primary_key) = app_context
-            .as_ref()
-            .and_then(|context| context.configured_primary_key.clone())
+        && let Some(configured_primary_key) =
+            app_context.and_then(|context| context.configured_primary_key.clone())
     {
         primary_key = configured_primary_key;
     }
 
     let mut indexes = runtime_indexes;
-    if let Some(app_context) = &app_context {
+    if let Some(app_context) = app_context {
         indexes.extend(app_context.configured_indexes.clone());
     }
     indexes.sort_by(|left, right| {
@@ -1031,7 +1040,7 @@ fn dataset_context_from_schema(
         table,
         table_provider,
         &indexes,
-        app_context.as_ref(),
+        app_context,
         &primary_key,
         search_functions,
     );
@@ -1047,7 +1056,6 @@ fn dataset_context_from_schema(
         .collect::<BTreeSet<_>>();
 
     let app_columns = app_context
-        .as_ref()
         .map(|context| context.columns.as_slice())
         .unwrap_or_default();
     let columns = schema
@@ -1071,11 +1079,11 @@ fn dataset_context_from_schema(
                 nullable: field.is_nullable(),
                 description,
                 source_type,
-                primary_key: primary_key_columns.contains(field.name()),
-                unique: unique_columns.contains(field.name()),
-                indexed: indexed_columns.contains(field.name()),
-                vector_search: vector_search_columns.contains(field.name()),
-                full_text_search: full_text_search_columns.contains(field.name()),
+                primary_key: NsqlColumnFlag(primary_key_columns.contains(field.name())),
+                unique: NsqlColumnFlag(unique_columns.contains(field.name())),
+                indexed: NsqlColumnFlag(indexed_columns.contains(field.name())),
+                vector_search: NsqlColumnFlag(vector_search_columns.contains(field.name())),
+                full_text_search: NsqlColumnFlag(full_text_search_columns.contains(field.name())),
                 metadata: field_metadata.into_iter().collect(),
             }
         })
@@ -1116,13 +1124,14 @@ async fn dataset_contexts(
         let constraints = table_provider
             .as_ref()
             .and_then(|provider| provider.constraints());
+        let app_context = app_table_context(table, app);
         contexts.push(dataset_context_from_schema(
             table,
-            schema,
+            &schema,
             constraints,
             runtime_indexes,
             table_provider.as_ref(),
-            app_table_context(table, app),
+            app_context.as_ref(),
             search_functions,
         ));
     }
@@ -1157,6 +1166,10 @@ async fn sample_context_blocks(
             let allowlist = table_allowlist.clone();
             async move {
                 let method = SampleTableMethod::from(&params);
+                let sort_key = (
+                    params.dataset().to_string(),
+                    sample_context_method_order(&method),
+                );
                 let content = tool_context_text(
                     &SampleDataTool::new(rt.datafusion(), method.clone())
                         .with_table_allowlist(allowlist),
@@ -1165,29 +1178,46 @@ async fn sample_context_blocks(
                 .instrument(Span::current())
                 .await?;
 
-                Ok(SampleContextBlock {
-                    title: match method {
-                        SampleTableMethod::DistinctColumns => {
-                            format!("Distinct value samples for `{}`", params.dataset())
-                        }
-                        SampleTableMethod::RandomSample => {
-                            format!("Example rows for `{}`", params.dataset())
-                        }
-                        SampleTableMethod::TopNSample => {
-                            format!("Top rows for `{}`", params.dataset())
-                        }
+                Ok::<_, Box<dyn StdError + Send + Sync>>((
+                    sort_key,
+                    SampleContextBlock {
+                        title: match method {
+                            SampleTableMethod::DistinctColumns => {
+                                format!("Distinct value samples for `{}`", params.dataset())
+                            }
+                            SampleTableMethod::RandomSample => {
+                                format!("Example rows for `{}`", params.dataset())
+                            }
+                            SampleTableMethod::TopNSample => {
+                                format!("Top rows for `{}`", params.dataset())
+                            }
+                        },
+                        content,
                     },
-                    content,
-                })
+                ))
             }
         })
     });
 
-    futures::stream::iter(context_futures)
+    let mut context_blocks = futures::stream::iter(context_futures)
         .boxed()
         .buffer_unordered(DATA_SAMPLING_MAX_CONCURRENT)
         .try_collect::<Vec<_>>()
-        .await
+        .await?;
+    context_blocks.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    Ok(context_blocks
+        .into_iter()
+        .map(|(_, context_block)| context_block)
+        .collect())
+}
+
+fn sample_context_method_order(method: &SampleTableMethod) -> u8 {
+    match method {
+        SampleTableMethod::DistinctColumns => 0,
+        SampleTableMethod::RandomSample => 1,
+        SampleTableMethod::TopNSample => 2,
+    }
 }
 
 fn context_message(context: &str) -> Result<ChatCompletionRequestMessage, String> {
@@ -2211,16 +2241,8 @@ pub(crate) async fn build_nsql_context(
                 NsqlContextError::SchemaContext { source }
             })?;
 
-    let dataset_search_functions = SearchFunctionAvailability {
-        vector_search: dataset_contexts
-            .iter()
-            .any(|dataset| !dataset.search.vector.is_empty()),
-        text_search: dataset_contexts
-            .iter()
-            .any(|dataset| !dataset.search.full_text.is_empty()),
-    };
     let function_context =
-        nsql_function_context(&app, &function_inventory, dataset_search_functions);
+        nsql_function_context(&app, &function_inventory, configured_search_functions);
     let function_context_block = function_context.render_markdown();
     let relationship_context = render_nsql_dataset_relationship_context(&dataset_contexts);
 
@@ -2234,12 +2256,12 @@ pub(crate) async fn build_nsql_context(
     let message = context_message(&context_block)
         .map_err(|message| NsqlContextError::ContextMessage { message })?;
     let json = NsqlContextJsonResponse {
-        context: context_block.clone(),
+        context: context_block,
         instructions: nsql_context_instructions(),
         sql: nsql_sql_context(),
         datasets: dataset_contexts,
         functions: function_context,
-        samples: sample_context_blocks.clone(),
+        samples: sample_context_blocks,
     };
 
     Ok(NsqlContext {
