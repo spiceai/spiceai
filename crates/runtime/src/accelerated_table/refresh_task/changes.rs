@@ -905,14 +905,30 @@ impl RefreshTask {
 
             match op_type {
                 ChangeOperationType::Delete => {
+                    let op_start = Instant::now();
                     self.process_delete_batch(&change_batch, &row_indices, ctx, session_state)
                         .await?;
+                    tracing::trace!(
+                        dataset = %dataset_name,
+                        op = "delete",
+                        rows = row_indices.len(),
+                        duration_ms = elapsed_ms(op_start),
+                        "Append/change stream sub-batch processed"
+                    );
                     had_change = true;
                 }
                 ChangeOperationType::Upsert => {
+                    let op_start = Instant::now();
                     pending_finalize = self
                         .process_upsert_batch(&change_batch, &row_indices, ctx, session_state)
                         .await?;
+                    tracing::trace!(
+                        dataset = %dataset_name,
+                        op = "upsert",
+                        rows = row_indices.len(),
+                        duration_ms = elapsed_ms(op_start),
+                        "Append/change stream batch sub-batch processed"
+                    );
                     had_change = true;
                 }
                 ChangeOperationType::Truncate => {
@@ -948,16 +964,7 @@ impl RefreshTask {
         ctx: &SessionContext,
         session_state: &SessionState,
     ) -> crate::accelerated_table::Result<Option<PendingApplyFinalize>> {
-        let dataset_name = &self.dataset_name;
-
         let data_batch = change_batch.data_batch();
-
-        if !row_indices.is_empty() {
-            tracing::trace!(
-                "Processing upsert batch for {dataset_name} with {} rows",
-                row_indices.len()
-            );
-        }
 
         let target_schema = self.accelerator.schema();
 
@@ -1104,11 +1111,6 @@ impl RefreshTask {
         session_state: &SessionState,
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = &self.dataset_name;
-
-        tracing::trace!(
-            "Processing delete batch for {dataset_name} with {} rows",
-            row_indices.len()
-        );
 
         let (keyless_rows, keyed_rows): (Vec<_>, Vec<_>) = row_indices
             .iter()
