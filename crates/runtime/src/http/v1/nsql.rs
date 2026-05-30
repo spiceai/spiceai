@@ -943,11 +943,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nsql_context_response_negotiates_plain_text() {
+    #[tokio::test]
+    async fn nsql_context_response_negotiates_plain_text() {
         let accept = accept_header("text/plain");
         let response = nsql_context_response(
-            NsqlContextJsonResponse::minimal_for_test("context"),
+            NsqlContextJsonResponse::minimal_for_test(
+                "# Spice.ai NSQL Context\n\nNo datasets are currently in scope.",
+            ),
             Some(&accept),
         );
 
@@ -961,6 +963,16 @@ mod tests {
                 .expect("content type should be valid ASCII"),
             "text/plain; charset=utf-8"
         );
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body should collect")
+            .to_bytes();
+        let body = String::from_utf8(body.to_vec()).expect("response body should be UTF-8");
+
+        insta::assert_snapshot!("nsql_context_plain_text_response", body);
     }
 
     #[tokio::test]
