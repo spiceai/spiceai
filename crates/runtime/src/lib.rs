@@ -938,8 +938,16 @@ impl Runtime {
         self: Arc<Self>,
         shutdown: CancellationToken,
     ) {
+        use crate::cluster::partition::{StatsRichness, classify_stats_richness};
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(45));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Per-table cache of the last *rich* stats we broadcast, so a tick whose
+        // stats computation degrades (e.g. the aggregate query fails under ingest
+        // load and falls back to COUNT(*)) does not clobber the coordinator's
+        // richer stats. Distributed JoinSelection (q18 swap) only picks the small
+        // build side while the coordinator holds the column/distinct stats, so
+        // flapping between rich and degraded would intermittently OOM.
+        let mut last_rich: HashMap<String, (StatsRichness, Vec<u8>, Vec<String>)> = HashMap::new();
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => break,
@@ -978,12 +986,48 @@ impl Runtime {
                 "Reporting per-executor table statistics to schedulers"
             );
             for table in tables {
-                if let Some((statistics, column_names)) =
-                    crate::cluster::partition::local_executor_table_statistics(&df, &table).await
-                {
-                    broadcaster
-                        .broadcast_executor_statistics(table.to_string(), statistics, column_names)
-                        .await;
+                let table_key = table.to_string();
+                match crate::cluster::partition::local_executor_table_statistics(&df, &table).await {
+                    Some((stats, column_names)) => {
+                        let richness = classify_stats_richness(&stats);
+                        // Adopt the fresh stats when they're at least as rich as
+                        // what we last broadcast (so growing num_rows/min/max stay
+                        // current); otherwise re-broadcast the cached richer stats.
+                        let adopt = last_rich
+                            .get(&table_key)
+                            .is_none_or(|(cached, _, _)| richness >= *cached);
+                        if adopt {
+                            let encoded = runtime_cluster::encode_statistics(&stats);
+                            last_rich.insert(
+                                table_key.clone(),
+                                (richness, encoded.clone(), column_names.clone()),
+                            );
+                            broadcaster
+                                .broadcast_executor_statistics(table_key, encoded, column_names)
+                                .await;
+                        } else if let Some((_, encoded, names)) = last_rich.get(&table_key) {
+                            broadcaster
+                                .broadcast_executor_statistics(
+                                    table_key,
+                                    encoded.clone(),
+                                    names.clone(),
+                                )
+                                .await;
+                        }
+                    }
+                    // Computation failed entirely — keep the coordinator warm with
+                    // the last rich stats rather than going dark for this table.
+                    None => {
+                        if let Some((_, encoded, names)) = last_rich.get(&table_key) {
+                            broadcaster
+                                .broadcast_executor_statistics(
+                                    table_key,
+                                    encoded.clone(),
+                                    names.clone(),
+                                )
+                                .await;
+                        }
+                    }
                 }
             }
         }
