@@ -2739,16 +2739,6 @@ mod tests {
         assert_eq!(quiet.write_concurrency, Some(2));
     }
 
-    /// Recompute the expected memory/storage-derived flush caps the same way the
-    /// builder does, so assertions stay correct on any host (CI memory and
-    /// storage medium vary). Mirrors `get_vortex_config_with_footer_cache`.
-    async fn expected_inline_flush_caps(acceleration: &Acceleration) -> InlineFlushCaps {
-        let metadata_dir = CayenneAccelerator::resolve_metadata_dir(Some(acceleration));
-        let storage =
-            resolve_acceleration_storage_async(acceleration.storage_profile, &metadata_dir).await;
-        inline_flush_caps_for(crate::resource_monitor::get_total_memory(), storage)
-    }
-
     #[tokio::test]
     async fn test_vortex_config_defaults_use_small_write_refresh_profile() {
         let app = Arc::new(AppBuilder::new("test").build());
@@ -2795,12 +2785,12 @@ mod tests {
                 config.inline_max_buffer_bytes,
                 SMALL_WRITE_INLINE_MAX_BUFFER_BYTES
             );
-            let expected_caps =
-                expected_inline_flush_caps(dataset.acceleration.as_ref().expect("acceleration"))
-                    .await;
-            assert_eq!(config.inline_flush_max_rows, expected_caps.max_rows);
-            assert_eq!(config.inline_flush_max_segments, expected_caps.max_segments);
-            assert_eq!(config.inline_flush_max_bytes, expected_caps.max_bytes);
+            // Flush caps are memory/storage-derived; exact scaling is pinned in
+            // `test_inline_flush_caps_scale_with_memory_and_storage`. Here assert the
+            // deterministic [floor, ceiling] bounds they hold on any host/medium.
+            assert!((2 * 1_048_576..=256 * 1_048_576).contains(&config.inline_flush_max_bytes));
+            assert!((2_048..=262_144).contains(&config.inline_flush_max_rows));
+            assert!((16..=256).contains(&config.inline_flush_max_segments));
         }
 
         let mut dataset = DatasetBuilder::try_new("append_hot".to_string(), "append_hot")
@@ -2827,11 +2817,9 @@ mod tests {
             config.compaction_trigger_protected_snapshots,
             SMALL_WRITE_COMPACTION_TRIGGER_PROTECTED_SNAPSHOTS
         );
-        let expected_caps =
-            expected_inline_flush_caps(dataset.acceleration.as_ref().expect("acceleration")).await;
-        assert_eq!(config.inline_flush_max_rows, expected_caps.max_rows);
-        assert_eq!(config.inline_flush_max_segments, expected_caps.max_segments);
-        assert_eq!(config.inline_flush_max_bytes, expected_caps.max_bytes);
+        assert!((2 * 1_048_576..=256 * 1_048_576).contains(&config.inline_flush_max_bytes));
+        assert!((2_048..=262_144).contains(&config.inline_flush_max_rows));
+        assert!((16..=256).contains(&config.inline_flush_max_segments));
     }
 
     #[test]
