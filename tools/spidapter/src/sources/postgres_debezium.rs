@@ -19,7 +19,6 @@ use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode
 use spicepod::component::ComponentOrReference;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{Runtime, TelemetryConfig};
-use spicepod::metric::{Metric, Metrics};
 use spicepod::param::Params;
 use spicepod::semantic::Column;
 use spicepod::spec::SpicepodDefinition;
@@ -360,13 +359,17 @@ pub(crate) fn generate_postgres_debezium_spicepod(
             .map(|k| HashMap::from([(k.clone(), OnConflictBehavior::Upsert)]))
             .unwrap_or_default();
 
-        dataset.metrics = Some(Metrics {
-            metrics: vec![
-                Metric { name: "records_lag".to_string(), enabled: true },
-                Metric { name: "records_consumed_total".to_string(), enabled: true },
-                Metric { name: "bytes_consumed_total".to_string(), enabled: true },
-            ],
-        });
+        // Metrics are commented out because the cloud spicepod schema (SpicepodSchema.parse)
+        // expects metrics as {metrics: [...]} but the Rust Metrics struct serializes as a flat
+        // array [...], causing deployment creation to fail with "Invalid spicepod configuration".
+        // Uncomment once the cloud schema is updated to accept flat arrays.
+        // dataset.metrics = Some(Metrics {
+        //     metrics: vec![
+        //         Metric { name: "records_lag".to_string(), enabled: true },
+        //         Metric { name: "records_consumed_total".to_string(), enabled: true },
+        //         Metric { name: "bytes_consumed_total".to_string(), enabled: true },
+        //     ],
+        // });
 
         dataset.acceleration = Some(Acceleration {
             enabled: true,
