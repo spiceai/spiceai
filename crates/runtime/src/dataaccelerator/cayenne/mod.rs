@@ -366,14 +366,24 @@ fn is_local_path(path: &str) -> bool {
     !path.contains("://") || path.starts_with("file://")
 }
 
-/// Strip a `file:`/`file://` scheme so on-disk storage detection receives a real
-/// filesystem path. `resolve_metadata_dir` can return such URIs (since
-/// `cayenne_file_path` accepts them); feeding `file:///x` straight into
-/// `Path::new` would make `Auto` storage detection misclassify it as `Unknown`.
+/// Strip a `file:`/`file://` scheme (including an optional authority such as
+/// `localhost`) so on-disk storage detection receives a real filesystem path.
+/// `resolve_metadata_dir` can return such URIs (since `cayenne_file_path` accepts
+/// them); feeding `file:///x` or `file://localhost/x` into `Path::new` would make
+/// `Auto` storage detection misclassify it as `Unknown`. Returns a borrowed slice
+/// (no owned path), so callers can pass the result directly as `&str`.
 fn fs_probe_path(path: &str) -> &str {
-    path.strip_prefix("file://")
-        .or_else(|| path.strip_prefix("file:"))
-        .unwrap_or(path)
+    if let Some(rest) = path.strip_prefix("file://") {
+        // `rest` is either `/abs/path` (empty authority, e.g. `file:///x`) or
+        // `authority/abs/path` (e.g. `localhost/abs/path`); the filesystem path
+        // begins at the first '/'.
+        match rest.find('/') {
+            Some(slash) => &rest[slash..],
+            None => rest,
+        }
+    } else {
+        path.strip_prefix("file:").unwrap_or(path)
+    }
 }
 
 impl CayenneAccelerator {
@@ -2626,6 +2636,11 @@ mod tests {
             "/data/cayenne/metadata"
         );
         assert_eq!(fs_probe_path("file:/data/cayenne"), "/data/cayenne");
+        // An explicit authority (e.g. localhost) is dropped down to the path.
+        assert_eq!(
+            fs_probe_path("file://localhost/data/cayenne"),
+            "/data/cayenne"
+        );
         // Plain paths pass through unchanged.
         assert_eq!(
             fs_probe_path("/data/cayenne/metadata"),
