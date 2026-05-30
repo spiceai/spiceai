@@ -187,6 +187,7 @@ fn default_pk_keyset_cache_mb() -> usize {
 /// flush — fewer Vortex files, less small-file compaction and scan read-amp,
 /// which is the dominant sustained-ingest cost on large CDC tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(clippy::struct_field_names)]
 struct InlineFlushCaps {
     max_bytes: i64,
     max_rows: i64,
