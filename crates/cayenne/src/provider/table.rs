@@ -115,10 +115,10 @@ use super::deletion_strategy::{
     Int64PkDeletionSnapshot, PkDeletionStrategy, PkDeletionStrategyWithCache, PositionBitmap,
     PositionDeletionVector, RowConverterDeletionSnapshot,
 };
+use super::memory_account::CayenneMemoryAccount;
 use super::staging_wal::PreparedStagedAppend;
 use super::vortex_format::PositionDeletionAccessPlanProvider;
 use arc_swap::ArcSwap;
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
 const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
@@ -286,69 +286,6 @@ fn approx_pk_keyset_entry_bytes(key: &OwnedRow) -> usize {
 /// `HashSet` slot overhead.
 fn approx_captured_file_bytes(path: &str) -> usize {
     path.len() + std::mem::size_of::<Arc<str>>() + PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES
-}
-
-/// Per-table accounting of Cayenne's off-pool resident state — the PK keyset and
-/// the key-based deletion indexes — against the `DataFusion` [`MemoryPool`] that
-/// `runtime.query.memory_limit` controls (a `TrackConsumersPool` over a
-/// `GreedyMemoryPool`). This closes the audit's MEM-1/2 gap: before, that state
-/// was invisible to the pool, so queries planned against the full budget while
-/// the process drifted toward OOM. With the state registered, the pool reflects
-/// real Cayenne usage, so the query path sees the *actually available* budget
-/// and fails fast (`ResourcesExhausted`) instead of over-committing the host.
-///
-/// Accounting is intentionally **infallible** (`resize`, which over-commits the
-/// `GreedyMemoryPool` rather than erroring): a deletion index can never be
-/// silently dropped to fit a budget (that would resurrect deleted rows), so the
-/// real bound on deletions is compaction, and the real bound on the keyset is
-/// its memory-derived `pk_keyset_cache_max_bytes` cap with bloom fallback. The
-/// reservation's job here is visibility + correct cross-consumer back-pressure,
-/// not to gate Cayenne's own growth.
-struct CayenneMemoryAccount {
-    reservation: ParkingMutex<MemoryReservation>,
-    keyset_bytes: AtomicUsize,
-    deletion_bytes: AtomicUsize,
-}
-
-impl CayenneMemoryAccount {
-    fn new(table_id: &str, pool: &Arc<dyn MemoryPool>) -> Self {
-        Self {
-            reservation: ParkingMutex::new(
-                MemoryConsumer::new(format!("cayenne:{table_id}")).register(pool),
-            ),
-            keyset_bytes: AtomicUsize::new(0),
-            deletion_bytes: AtomicUsize::new(0),
-        }
-    }
-
-    fn resize_to_total(&self) {
-        let total = self
-            .keyset_bytes
-            .load(Ordering::Relaxed)
-            .saturating_add(self.deletion_bytes.load(Ordering::Relaxed));
-        // `resize` is infallible (over-commits the greedy pool). See the type
-        // docstring for why deletions must never fail-to-fit.
-        self.reservation.lock().resize(total);
-    }
-
-    /// Account the resident bytes of the PK keyset (exact keyset or bloom).
-    fn set_keyset_bytes(&self, bytes: usize) {
-        self.keyset_bytes.store(bytes, Ordering::Relaxed);
-        self.resize_to_total();
-    }
-
-    /// Account the resident bytes of the key-based deletion + insert-record
-    /// indexes (deleted keys + insert records). Reset to 0 at compaction.
-    fn set_deletion_bytes(&self, bytes: usize) {
-        self.deletion_bytes.store(bytes, Ordering::Relaxed);
-        self.resize_to_total();
-    }
-
-    /// Current total reserved bytes (keyset + deletions). For observability and
-    /// tests.
-    fn reserved_bytes(&self) -> usize {
-        self.reservation.lock().size()
-    }
 }
 
 #[derive(Default)]
@@ -1486,12 +1423,6 @@ enum RowLocation {
     /// `file_path` `Arc` is shared across all rows in the same file, so the
     /// per-entry cost is one pointer + the `u64` position.
     FilePositioned { file_path: Arc<str>, position: u64 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RowSource {
-    File,
-    Inlined,
 }
 
 struct CachedPkKeyset {
@@ -4122,7 +4053,7 @@ impl CayenneTableProvider {
         self.table_memory.set_keyset_bytes(0);
     }
 
-    fn record_pk_keys_as(&self, keys: &HashSet<OwnedRow>, source: RowSource) {
+    fn record_pk_keys_with_location(&self, keys: &HashSet<OwnedRow>, location: &RowLocation) {
         if keys.is_empty() {
             return;
         }
@@ -4146,10 +4077,6 @@ impl CayenneTableProvider {
                 // Existence-only insert. Under `deletion_mode: position`, real
                 // `(file, position)` for File rows is captured separately by the
                 // row_idx() read-back, which upgrades these to `FilePositioned`.
-                let location = match source {
-                    RowSource::Inlined => RowLocation::Inlined,
-                    RowSource::File => RowLocation::FileUnlocated,
-                };
                 for key in keys {
                     if !keyset.keys.contains_key(key)
                         && keyset
@@ -4200,11 +4127,11 @@ impl CayenneTableProvider {
     }
 
     pub(crate) fn record_inlined_pk_keys(&self, keys: &HashSet<OwnedRow>) {
-        self.record_pk_keys_as(keys, RowSource::Inlined);
+        self.record_pk_keys_with_location(keys, &RowLocation::Inlined);
     }
 
     pub(crate) fn record_file_pk_keys(&self, keys: &HashSet<OwnedRow>) {
-        self.record_pk_keys_as(keys, RowSource::File);
+        self.record_pk_keys_with_location(keys, &RowLocation::FileUnlocated);
     }
 
     /// Whether this table should capture file-local row positions for upsert
@@ -10273,57 +10200,6 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    #[test]
-    fn cayenne_memory_account_tracks_keyset_and_deletions() {
-        use datafusion::execution::memory_pool::GreedyMemoryPool;
-        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
-        let account = CayenneMemoryAccount::new("test_table", &pool);
-        assert_eq!(account.reserved_bytes(), 0);
-
-        account.set_keyset_bytes(400);
-        assert_eq!(account.reserved_bytes(), 400);
-        assert_eq!(
-            pool.reserved(),
-            400,
-            "the keyset reservation reaches the pool"
-        );
-
-        account.set_deletion_bytes(600);
-        assert_eq!(
-            account.reserved_bytes(),
-            1000,
-            "the reservation is keyset + deletion bytes"
-        );
-        assert_eq!(pool.reserved(), 1000);
-
-        // A keyset shrink (e.g. an exact->bloom downgrade) leaves the deletion
-        // accounting intact.
-        account.set_keyset_bytes(50);
-        assert_eq!(account.reserved_bytes(), 650);
-
-        // Compaction clears the deletions; clearing the keyset releases the rest.
-        account.set_deletion_bytes(0);
-        assert_eq!(account.reserved_bytes(), 50);
-        account.set_keyset_bytes(0);
-        assert_eq!(account.reserved_bytes(), 0);
-        assert_eq!(pool.reserved(), 0, "all reservation is released");
-    }
-
-    #[test]
-    fn cayenne_memory_account_overcommits_a_tight_pool() {
-        use datafusion::execution::memory_pool::GreedyMemoryPool;
-        // A deletion index can never be dropped to fit a budget (that would
-        // resurrect deleted rows), so accounting over-commits a tight pool
-        // rather than erroring — the over-commit is visible, not silent.
-        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(100));
-        let account = CayenneMemoryAccount::new("tight", &pool);
-        account.set_deletion_bytes(10_000);
-        assert_eq!(account.reserved_bytes(), 10_000);
-        assert!(
-            pool.reserved() >= 10_000,
-            "Cayenne over-commit must be visible in the pool's reserved total"
-        );
-    }
     use test_framework::arrow_record_batch_gen::*;
 
     fn protected_snapshot_id_at_unix_time(seconds: u64) -> String {

@@ -345,14 +345,16 @@ impl PkDeletionStrategyWithCache {
     pub(crate) fn position_cache(&self) -> &Arc<ArcSwap<PositionBitmap>> {
         match self {
             Self::PositionBased {
-                cached_deleted_row_ids,
-            } => cached_deleted_row_ids,
-            Self::Int64Pk {
-                position_deletions, ..
+                cached_deleted_row_ids: position_cache,
+            }
+            | Self::Int64Pk {
+                position_deletions: position_cache,
+                ..
             }
             | Self::RowConverterBased {
-                position_deletions, ..
-            } => position_deletions,
+                position_deletions: position_cache,
+                ..
+            } => position_cache,
         }
     }
 
