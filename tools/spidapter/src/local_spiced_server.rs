@@ -67,5 +67,6 @@ fn to_stdio_args(args: &LocalSpicedArgs) -> StdioArgs {
         ec2_associate_public_ip: false,
         ec2_iam_instance_profile: None,
         spiced_binary: "spiced".to_string(),
+        auto_load_complete: false,
     }
 }

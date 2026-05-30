@@ -235,6 +235,13 @@ pub struct StdioArgs {
     /// Name or path of the spiced binary to spawn (local backend only).
     #[arg(long, default_value = "spiced")]
     pub spiced_binary: String,
+
+    /// Set `auto_load_complete: true` on all dataset params in the generated spicepod.
+    /// This signals to the runtime that the initial data load is managed externally
+    /// (e.g. via Debezium CDC or DynamoDB scan) and the dataset should not wait for
+    /// an internal refresh to complete before marking itself ready.
+    #[arg(long, default_value_t = false)]
+    pub auto_load_complete: bool,
 }
 
 #[derive(Parser, Debug, Clone)]

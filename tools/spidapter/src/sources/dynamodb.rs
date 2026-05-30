@@ -341,6 +341,7 @@ pub(crate) fn generate_dynamodb_spicepod(
     datasets: &HashMap<String, DatasetConfig>,
     prefix: &str,
     acceleration_engine: &str,
+    auto_load_complete: bool,
 ) -> SpicepodDefinition {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
@@ -382,7 +383,9 @@ pub(crate) fn generate_dynamodb_spicepod(
             dynamodb_scan_segments(dataset_name).to_string(),
         );
         param_map.insert("schema_infer_max_records".to_string(), "200".to_string());
-        param_map.insert("auto_load_complete".to_string(), "true".to_string());
+        if auto_load_complete {
+            param_map.insert("auto_load_complete".to_string(), "true".to_string());
+        }
 
         let physical_name = if prefix.is_empty() {
             dataset_name.clone()

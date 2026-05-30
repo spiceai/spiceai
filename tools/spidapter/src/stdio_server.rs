@@ -1347,6 +1347,7 @@ async fn generate_initial_spicepod(
                 datasets,
                 prefix,
                 acceleration_engine_str(*acceleration),
+                args.auto_load_complete,
             ),
             FederatedStorageConfig::PostgresDebezium {
                 pg,
@@ -1359,6 +1360,7 @@ async fn generate_initial_spicepod(
                 pg,
                 acceleration_engine_str(*acceleration),
                 datasets,
+                args.auto_load_complete,
             ),
         }
     };

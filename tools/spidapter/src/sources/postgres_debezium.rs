@@ -293,6 +293,7 @@ pub(crate) fn generate_postgres_debezium_spicepod(
     pg: &PgConfig,
     acceleration_engine: &str,
     datasets: &HashMap<String, DatasetConfig>,
+    auto_load_complete: bool,
 ) -> SpicepodDefinition {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
@@ -314,32 +315,17 @@ pub(crate) fn generate_postgres_debezium_spicepod(
     for (dataset_name, config) in datasets {
         let topic = format!("spicebench.{}.{dataset_name}", pg.schema);
         let mut dataset = Dataset::new(format!("debezium:{topic}"), dataset_name.as_str());
-        dataset.params = Some(Params::from_string_map(HashMap::from([
-            (
-                "kafka_bootstrap_servers".to_string(),
-                kafka_brokers.to_string(),
-            ),
-            (
-                "kafka_security_protocol".to_string(),
-                "PLAINTEXT".to_string(),
-            ),
-            (
-                "batch_max_size".to_string(),
-                "50000".to_string(),
-            ),
-            (
-                "batch_max_duration".to_string(),
-                "1s".to_string(),
-            ),
-            (
-                "kafka_session_timeout_ms".to_string(),
-                "300000".to_string(),
-            ),
-            (
-                "auto_load_complete".to_string(),
-                "true".to_string(),
-            ),
-        ])));
+        let mut param_map = HashMap::from([
+            ("kafka_bootstrap_servers".to_string(), kafka_brokers.to_string()),
+            ("kafka_security_protocol".to_string(), "PLAINTEXT".to_string()),
+            ("batch_max_size".to_string(), "50000".to_string()),
+            ("batch_max_duration".to_string(), "1s".to_string()),
+            ("kafka_session_timeout_ms".to_string(), "300000".to_string()),
+        ]);
+        if auto_load_complete {
+            param_map.insert("auto_load_complete".to_string(), "true".to_string());
+        }
+        dataset.params = Some(Params::from_string_map(param_map));
 
         dataset.columns = config
             .schema
