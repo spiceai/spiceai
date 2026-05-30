@@ -1,0 +1,7 @@
+---
+source: crates/runtime/src/http/v1/nsql.rs
+expression: body
+---
+# Spice.ai NSQL Context
+
+No datasets are currently in scope.

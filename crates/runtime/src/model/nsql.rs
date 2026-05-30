@@ -1198,18 +1198,18 @@ fn context_message(context: &str) -> Result<ChatCompletionRequestMessage, String
         .map_err(|error| error.to_string())
 }
 
-const NSQL_ROUTINES_QUERY: &str = r#"
+const NSQL_ROUTINES_QUERY: &str = r"
 SELECT routine_name, function_type, description, syntax_example, data_type
 FROM information_schema.routines
 WHERE routine_type = 'FUNCTION'
-"#;
+";
 
-const NSQL_PARAMETERS_QUERY: &str = r#"
+const NSQL_PARAMETERS_QUERY: &str = r"
 SELECT specific_name, rid, ordinal_position, parameter_name, data_type, parameter_mode, is_variadic
 FROM information_schema.parameters
 WHERE parameter_mode IN ('IN', 'OUT')
 ORDER BY lower(specific_name), rid, ordinal_position
-"#;
+";
 
 const NSQL_LIST_UDFS_QUERY: &str = r#"
 SELECT name, source, kind, volatility, "from", description
