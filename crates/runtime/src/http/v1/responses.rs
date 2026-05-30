@@ -56,13 +56,16 @@ fn responses_support_gate(model_id: &str, support: &ResponsesApiSupport) -> Opti
                 code: Some("invalid_request_error".to_string()),
             })))
         }
-        ResponsesApiSupport::Unavailable => Some(
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("model '{model_id}' is unavailable via /v1/responses"),
-            )
-                .into_response(),
-        ),
+        ResponsesApiSupport::Unavailable => {
+            let error_response = serde_json::json!({
+                "message": format!("model '{model_id}' is unavailable via /v1/responses"),
+                "type": "service_unavailable_error",
+                "param": "model",
+                "code": "service_unavailable",
+            });
+
+            Some((StatusCode::SERVICE_UNAVAILABLE, Json(error_response)).into_response())
+        },
         ResponsesApiSupport::Supported => None,
     }
 }
@@ -141,7 +144,15 @@ fn responses_support_gate(model_id: &str, support: &ResponsesApiSupport) -> Opti
         ))),
         (status = 400, description = "The specified model provider does not support the Responses API or the request is invalid"),
         (status = 404, description = "The specified model was not found"),
-        (status = 503, description = "The specified model is unavailable via the Responses API"),
+        (status = 503, description = "The specified model is unavailable via the Responses API", content((
+            serde_json::Value = "application/json",
+            example = json!({
+                "message": "model 'my_model' is unavailable via /v1/responses",
+                "type": "service_unavailable_error",
+                "param": "model",
+                "code": "service_unavailable"
+            })
+        ))),
         (status = 500, description = "An internal server error occurred while processing the response", content((
             serde_json::Value = "application/json",
             example = json!({
@@ -498,8 +509,18 @@ mod tests {
             .await
             .expect("body should be readable")
             .to_bytes();
-        let body_text = String::from_utf8(body.to_vec()).expect("body should be valid utf-8");
-        assert!(body_text.contains("temporary_model"));
-        assert!(body_text.contains("unavailable via /v1/responses"));
+        let body_json: serde_json::Value =
+            serde_json::from_slice(&body).expect("body should be valid json");
+
+        assert_eq!(
+            body_json["message"].as_str(),
+            Some("model 'temporary_model' is unavailable via /v1/responses")
+        );
+        assert_eq!(
+            body_json["type"].as_str(),
+            Some("service_unavailable_error")
+        );
+        assert_eq!(body_json["param"].as_str(), Some("model"));
+        assert_eq!(body_json["code"].as_str(), Some("service_unavailable"));
     }
 }
