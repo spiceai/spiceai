@@ -19,9 +19,9 @@ limitations under the License.
 //! These exercise the cloud-connect client driver end-to-end against an
 //! in-process tonic mock server. They cover:
 //!
-//! - A RunQuery → CommandResult round-trip whose `payload_json`
-//!   deserializes into the documented `{columns, rows, row_count,
-//!   truncated}` envelope.
+//! - A RunQuery → CommandResult round-trip whose `payload_json` carries
+//!   only the `{row_count, truncated}` metadata, with the tabular rows
+//!   delivered out-of-band as an Arrow IPC stream in `result_arrow_ipc`.
 //! - The accompanying `EventLog{kind: "audit"}` carrying the SQL hash,
 //!   row count, truncation flag, and command id.
 //! - Truncation handling when the mock runtime reports more rows than

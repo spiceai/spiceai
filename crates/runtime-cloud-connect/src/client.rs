@@ -29,11 +29,14 @@ limitations under the License.
 //! - Otherwise, send the (pending) adoption code as `Hello.credential`
 //!   and identifier empty.
 //!
-//! If a Forget arrives, we clear the local identity and exit the
-//! cloud-connect task — spiced itself stays up and keeps serving local
-//! spicepod traffic as before. This matches the adoption semantics where
-//! "Forget" releases management but doesn't destroy the device. To
-//! re-adopt, the user runs `spice connect <code>` and restarts spiced.
+//! If a Forget arrives, we clear the local identity from disk and, on
+//! success, exit the cloud-connect task — spiced itself stays up and keeps
+//! serving local spicepod traffic as before. This matches the adoption
+//! semantics where "Forget" releases management but doesn't destroy the
+//! device. To re-adopt, the user runs `spice connect <code>` and restarts
+//! spiced. If the on-disk identity cannot be cleared, the Forget is
+//! reported as failed and the driver stays connected with the still-valid
+//! identity rather than falsely exiting as forgotten.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -461,8 +464,12 @@ impl ClientDriver {
                 self.handle_adopt(tx, cmd, live_identifier).await;
             }
             proto::control_message::Body::Forget(cmd) => {
-                self.handle_forget(tx, cmd, live_identifier).await;
-                return Some(ExitReason::Forget);
+                // Only exit as forgotten if the identity was actually cleared;
+                // on a clear failure stay connected with the still-valid
+                // identity rather than falsely exiting as forgotten.
+                if self.handle_forget(tx, cmd, live_identifier).await {
+                    return Some(ExitReason::Forget);
+                }
             }
             // Operator-only commands: acknowledge with an error.
             proto::control_message::Body::ApplyManifest(cmd) => {
@@ -604,21 +611,49 @@ impl ClientDriver {
         .await;
     }
 
+    /// Handle a `Forget` command. Returns `true` only if the on-disk identity
+    /// was actually removed (or was already absent) — i.e. the instance is
+    /// genuinely forgotten and the caller may exit as such.
+    ///
+    /// If clearing `identity.json` fails, the file would still be loaded on the
+    /// next start and Cloud Connect would silently reconnect, so reporting
+    /// success here would lie to the control plane. In that case we keep the
+    /// in-memory identity, report the command as failed, and return `false`
+    /// so the driver stays connected with the still-valid identity instead of
+    /// exiting as forgotten.
     async fn handle_forget(
         &mut self,
         tx: &mpsc::Sender<proto::ClientMessage>,
         cmd: proto::Forget,
         live_identifier: &Arc<RwLock<String>>,
-    ) {
-        // Clear identity from disk and memory. Use the async clear so the
-        // remote `Forget` path does not block a Tokio worker on `std::fs` I/O
-        // while the Cloud Connect stream is active.
+    ) -> bool {
+        // Clear identity from disk first. Use the async clear so the remote
+        // `Forget` path does not block a Tokio worker on `std::fs` I/O while
+        // the Cloud Connect stream is active. `clear_async` treats a missing
+        // file as success, so reaching the error branch means the file exists
+        // but could not be removed.
         if let Err(err) = IdentityStore::clear_async(&self.config.identity_path).await {
             tracing::warn!(
-                "Cloud Connect: failed to clear identity at {}: {err}",
+                "Cloud Connect: failed to clear identity at {}: {err}; \
+                 reporting Forget as failed and staying connected (the unchanged \
+                 identity would otherwise reconnect on restart)",
                 self.config.identity_path.display()
             );
+            send_result(
+                tx,
+                &cmd.command_id,
+                false,
+                &format!(
+                    "failed to clear identity at {}: {err}",
+                    self.config.identity_path.display()
+                ),
+                serde_json::Value::Null,
+            )
+            .await;
+            return false;
         }
+
+        // Disk identity is gone — drop it from memory too and report success.
         self.identity = None;
         live_identifier.write().await.clear();
 
@@ -630,6 +665,7 @@ impl ClientDriver {
             serde_json::json!({ "status": "forgotten" }),
         )
         .await;
+        true
     }
 }
 

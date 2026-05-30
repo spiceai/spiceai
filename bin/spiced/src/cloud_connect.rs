@@ -268,16 +268,13 @@ impl RuntimeHandle for SpicedRuntimeHandle {
 
     /// Standalone `spiced` cannot self-restart: there is no supervisor to bring
     /// the process back up, so a self-initiated exit would just take the
-    /// runtime down. Report `unsupported` (rather than the trait's hard error)
-    /// so the control plane surfaces it cleanly — operators restart spiced via
-    /// their own process manager (systemd, Docker, Kubernetes). Configuration
-    /// changes apply in-process via [`RuntimeHandle::apply_spicepod`], so a
-    /// restart is rarely needed.
+    /// runtime down. Return an error (not `Ok`) so the control plane records
+    /// this as a failed command rather than mistaking an unexecuted restart for
+    /// success — operators restart spiced via their own process manager
+    /// (systemd, Docker, Kubernetes). Configuration changes apply in-process via
+    /// [`RuntimeHandle::apply_spicepod`], so a restart is rarely needed.
     async fn restart(&self, _graceful: bool) -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({
-            "status": "unsupported",
-            "note": "standalone spiced does not self-restart; restart it via your process manager (systemd/Docker/Kubernetes). Configuration changes apply in-process via ApplySpicepod.",
-        }))
+        Err("restart is unsupported on standalone spiced: it has no supervisor to bring the process back up. Restart it via your process manager (systemd/Docker/Kubernetes). Configuration changes apply in-process via ApplySpicepod and do not need a restart.".to_string())
     }
 }
 
@@ -310,13 +307,7 @@ async fn stage_cloud_managed_spicepod(
 
     match AppBuilder::build_from_path(incoming.clone()).await {
         Ok(app) => {
-            // `rename` replaces an existing destination on Unix but fails on
-            // Windows when the destination already exists, so remove any
-            // previous canonical file first for a cross-platform replace.
-            let _ = tokio::fs::remove_file(&path).await;
-            tokio::fs::rename(&incoming, &path)
-                .await
-                .map_err(|e| format!("persist spicepod: {e}"))?;
+            replace_canonical_spicepod(&incoming, &path).await?;
             Ok((app, path))
         }
         Err(e) => {
@@ -327,46 +318,114 @@ async fn stage_cloud_managed_spicepod(
     }
 }
 
+/// Promote the validated `incoming` file onto the canonical `path` without
+/// ever leaving the runtime with no known-good config.
+///
+/// On Unix `rename` atomically replaces an existing destination, so the swap
+/// is a single syscall and the canonical file is never absent. On Windows
+/// `rename` fails when the destination exists, so we fall back to a
+/// backup-and-rollback sequence: move the current canonical file aside to a
+/// `*.bak`, move the incoming file into place, then delete the backup on
+/// success. If the second move fails we restore the backup, so the previous
+/// known-good config survives a mid-swap failure (permissions, a transient
+/// file lock, etc.) instead of being deleted up front.
+async fn replace_canonical_spicepod(incoming: &Path, path: &Path) -> Result<(), String> {
+    match tokio::fs::rename(incoming, path).await {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            // A fresh install has no canonical file yet — nothing to preserve,
+            // so surface the error directly.
+            if !tokio::fs::try_exists(path).await.unwrap_or(false) {
+                return Err(format!("persist spicepod: {e}"));
+            }
+            // Destination exists (the Windows case): fall through to the
+            // backup-and-rollback swap below.
+        }
+    }
+
+    let backup = path.with_extension("yml.bak");
+    let _ = tokio::fs::remove_file(&backup).await;
+    tokio::fs::rename(path, &backup)
+        .await
+        .map_err(|e| format!("persist spicepod (backup current): {e}"))?;
+    match tokio::fs::rename(incoming, path).await {
+        Ok(()) => {
+            // New config is in place; the backup is no longer needed.
+            let _ = tokio::fs::remove_file(&backup).await;
+            Ok(())
+        }
+        Err(e) => {
+            // Roll the previous known-good file back into place so we never
+            // lose the only good copy.
+            let _ = tokio::fs::rename(&backup, path).await;
+            Err(format!("persist spicepod: {e}"))
+        }
+    }
+}
+
 /// Byte budget for an encoded `RunQuery` Arrow IPC stream. A coarse secondary
 /// guard on top of the row cap so a few very wide rows can't blow past the
-/// gRPC message size. The budget is checked *before* appending each batch, so
-/// only the first batch (bounded by the row cap) can be emitted while already
-/// near the limit; subsequent batches are dropped once the buffer reaches it.
+/// gRPC message size. The budget is enforced on the *encoded* size of every
+/// batch — including the first — so a single wide first batch can never produce
+/// a stream above the cap; the overflowing batch and everything after it are
+/// dropped and the result is flagged truncated.
 pub const RUN_QUERY_BYTE_BUDGET: usize = 5 * 1024 * 1024;
 
-/// Encode `batches` into an Arrow IPC stream (`schema` first), stopping once
-/// the buffer exceeds `budget`. Returns the bytes, the number of rows
-/// actually written, and whether the budget cut the stream short.
+/// Encode `batches` into an Arrow IPC stream (`schema` first) whose total
+/// encoded size never exceeds `budget`. Each batch is appended only if, after
+/// encoding, the stream still fits the budget; the first batch to overflow (and
+/// all subsequent batches) is dropped and `truncated` is set. Returns the
+/// bytes, the number of rows actually written, and whether the budget cut the
+/// stream short.
+///
+/// Because the check is applied *after* encoding each batch, even a single
+/// oversized first batch is rejected — the function then emits the largest
+/// prefix that fits (possibly schema-only) rather than an over-budget stream.
 fn encode_ipc_bounded(
     schema: &arrow::datatypes::Schema,
     batches: &[arrow::record_batch::RecordBatch],
     budget: usize,
 ) -> Result<(Vec<u8>, u64, bool), String> {
+    // Encode the accepted-prefix once at the end, but discover how many
+    // batches fit by trial-encoding the running prefix. The budget guards the
+    // *finished* stream, so the prospective length must include the IPC
+    // end-of-stream marker that `finish` appends.
+    let mut accepted = 0usize;
+    let mut rows: u64 = 0;
+    for batch in batches {
+        let candidate = encode_ipc(schema, &batches[..=accepted])?;
+        if candidate.len() > budget {
+            // This batch (and thus the rest) pushes the encoded stream past
+            // the cap — stop here and emit only the prefix that fit.
+            break;
+        }
+        accepted += 1;
+        rows += batch.num_rows() as u64;
+    }
+    let truncated = accepted < batches.len();
+    let buf = encode_ipc(schema, &batches[..accepted])?;
+    Ok((buf, rows, truncated))
+}
+
+/// Encode `schema` + `batches` into a complete (finished) Arrow IPC stream.
+fn encode_ipc(
+    schema: &arrow::datatypes::Schema,
+    batches: &[arrow::record_batch::RecordBatch],
+) -> Result<Vec<u8>, String> {
     use arrow::ipc::writer::StreamWriter;
     let mut buf: Vec<u8> = Vec::new();
     let mut writer = StreamWriter::try_new(&mut buf, schema)
         .map_err(|e| format!("arrow ipc init failed: {e}"))?;
-    let mut rows: u64 = 0;
-    let mut truncated = false;
     for batch in batches {
-        // Enforce the budget BEFORE appending each batch so a wide batch can't
-        // push the encoded stream well past the cap. The first batch always
-        // writes (the buffer holds only the schema here); its size is bounded
-        // by the upstream row cap.
-        if writer.get_ref().len() >= budget {
-            truncated = true;
-            break;
-        }
         writer
             .write(batch)
             .map_err(|e| format!("arrow ipc write failed: {e}"))?;
-        rows += batch.num_rows() as u64;
     }
     writer
         .finish()
         .map_err(|e| format!("arrow ipc finish failed: {e}"))?;
     drop(writer);
-    Ok((buf, rows, truncated))
+    Ok(buf)
 }
 
 /// Default row cap when the cloud control plane sets `max_rows = 0`.
@@ -478,5 +537,90 @@ mod tests {
         assert!(!dir.join("spicepod-cloud-managed.incoming.yml").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    /// Build a single-column single-row batch whose one string cell is
+    /// `width` bytes, so its encoded IPC size is dominated by that payload.
+    fn wide_row_batch(schema: &Arc<Schema>, width: usize) -> RecordBatch {
+        let cell = "x".repeat(width);
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![Arc::new(StringArray::from(vec![cell]))],
+        )
+        .expect("build wide-row batch")
+    }
+
+    #[test]
+    fn encode_ipc_bounded_caps_a_wide_first_batch() {
+        // A single first batch larger than the budget must NOT be emitted as an
+        // oversized stream — the result is truncated down to the schema-only
+        // prefix and the bytes stay within budget.
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+        let budget = 4 * 1024;
+        let big = wide_row_batch(&schema, 64 * 1024);
+
+        let (bytes, rows, truncated) =
+            encode_ipc_bounded(schema.as_ref(), std::slice::from_ref(&big), budget)
+                .expect("encode succeeds");
+
+        assert!(truncated, "an over-budget first batch must flag truncation");
+        assert_eq!(rows, 0, "the oversized batch is dropped, so no rows ship");
+        assert!(
+            bytes.len() <= budget,
+            "emitted stream {} bytes must stay within budget {budget}",
+            bytes.len()
+        );
+        // The schema-only prefix is still a valid, readable IPC stream.
+        let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+            .expect("schema-only stream is valid");
+        assert_eq!(reader.schema().fields().len(), 1);
+    }
+
+    #[test]
+    fn encode_ipc_bounded_stops_before_overflowing_batch() {
+        // Several batches that each fit individually but collectively exceed the
+        // budget: only the prefix that fits is emitted and truncation is set.
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+        let budget = 8 * 1024;
+        let batches: Vec<RecordBatch> = (0..8).map(|_| wide_row_batch(&schema, 2 * 1024)).collect();
+
+        let (bytes, rows, truncated) =
+            encode_ipc_bounded(schema.as_ref(), &batches, budget).expect("encode succeeds");
+
+        assert!(truncated, "exceeding the budget must flag truncation");
+        assert!(rows >= 1, "at least the first fitting batch is written");
+        assert!(
+            rows < batches.len() as u64,
+            "not all batches fit the budget"
+        );
+        assert!(
+            bytes.len() <= budget,
+            "emitted stream {} bytes must stay within budget {budget}",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn encode_ipc_bounded_keeps_all_batches_under_budget() {
+        // When everything fits, all rows are written and nothing is truncated.
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+        let batches: Vec<RecordBatch> = (0..4).map(|_| wide_row_batch(&schema, 16)).collect();
+
+        let (bytes, rows, truncated) =
+            encode_ipc_bounded(schema.as_ref(), &batches, RUN_QUERY_BYTE_BUDGET)
+                .expect("encode succeeds");
+
+        assert!(!truncated, "well-under-budget input must not truncate");
+        assert_eq!(rows, batches.len() as u64, "all rows written");
+        assert!(bytes.len() <= RUN_QUERY_BYTE_BUDGET);
+        // Round-trips back to the same row count.
+        let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+            .expect("stream is valid");
+        let total: usize = reader.map(|b| b.expect("batch").num_rows()).sum();
+        assert_eq!(total, batches.len());
     }
 }

@@ -22,12 +22,13 @@ limitations under the License.
 //!
 //! 1. Admin in Spice Cloud generates a single-use adoption code.
 //! 2. User runs `spice connect <code>` (or sets `SPICE_ADOPT_CODE`).
-//! 3. `spiced` opens an outbound TLS gRPC stream (server-authenticated)
-//!    and sends `Hello`. The client authenticates itself at the
-//!    application layer via `Hello.credential` — either the adoption
-//!    code (first contact) or the persisted identity cert PEM. Future
-//!    revisions may upgrade this to true mTLS by binding the identity
-//!    cert to the transport.
+//! 3. `spiced` opens an outbound TLS gRPC stream and sends `Hello`. The
+//!    client authenticates at the application layer via `Hello.credential`
+//!    — either the adoption code (first contact) or the persisted identity
+//!    cert PEM. Once an identity is held, that identity (cert + ed25519
+//!    key) is also presented as a TLS client certificate, so the transport
+//!    is mutually authenticated; before adoption the connection is
+//!    server-authenticated only and bootstraps with the adoption code.
 //! 4. Admin clicks "Adopt"; cloud sends an `Adopt` command.
 //! 5. `spiced` generates an ed25519 keypair, stores identity at
 //!    `$SPICE_CONFIG_DIR/identity.json`, and replies with `AdoptAck`.

@@ -63,9 +63,12 @@ pub struct CloudConnectConfig {
     /// and the client should reconnect with the stored identity.
     pub adoption_code: Option<String>,
 
-    /// Path to the pending adoption-code file, if applicable. When the
-    /// first Hello with this code is acknowledged by the server the file
-    /// is deleted so a restart doesn't accidentally re-send a consumed
+    /// Path to the pending adoption-code file, if applicable. The driver
+    /// intentionally retains this file across reconnects until adoption
+    /// fully succeeds — it is deleted only once `handle_adopt` has
+    /// persisted the issued identity to disk. Keeping it until then lets a
+    /// dropped or retried connection re-send the code, while the post-adopt
+    /// delete stops a restart from accidentally re-sending a consumed
     /// single-use code.
     pub pending_adopt_code_path: Option<PathBuf>,
 
