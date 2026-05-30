@@ -64,6 +64,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectStorePath;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::OwnedMutexGuard;
 
@@ -506,7 +507,16 @@ impl CayenneTableProvider {
         data: SendableRecordBatchStream,
         target_partitions: usize,
     ) -> Result<CayenneStagedAppend> {
+        let lock_wait_start = Instant::now();
         let write_guard = self.write_lock_arc().lock_owned().await;
+        let lock_wait_elapsed = lock_wait_start.elapsed();
+        if lock_wait_elapsed > Duration::from_millis(10) {
+            tracing::debug!(
+                table = self.table_name(),
+                duration_ms = lock_wait_elapsed.as_millis(),
+                "Cayenne write lock acquisition exceeded threshold in begin_staged_append"
+            );
+        }
 
         self.ensure_no_incomplete_write().await?;
 
