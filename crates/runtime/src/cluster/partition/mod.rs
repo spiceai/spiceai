@@ -126,11 +126,22 @@ pub fn get_partition_filter_exprs(
 /// the column names they're aligned to (so the coordinator can project column
 /// stats onto a possibly-projected leaf scan by name).
 ///
-/// Reports `num_rows` AND per-column min/max/null_count from the table
-/// provider's scan-plan statistics (metadata-only, no row scan) — the column
-/// stats are what let the coordinator's planner estimate join/aggregate output
-/// cardinalities and pick hash-join build sides (q18 swap). Falls back to a
-/// `COUNT(*)` (num_rows only) if the provider surfaces no scan statistics.
+/// Reports `num_rows` AND per-column min/max — the column stats are what let the
+/// coordinator's planner estimate join/aggregate output cardinalities and pick
+/// hash-join build sides (q18 swap). Stats are sourced, in order:
+///
+/// 1. **Scan-plan statistics** (metadata-only). In append-only ("events") ingest
+///    Cayenne collects per-column min/max from file footers, so the scan plan
+///    carries everything we need with zero extra cost.
+/// 2. **Cayenne metastore running-aggregate.** Under CDC ("changes") ingest
+///    Cayenne disables footer-stat collection on the scan path while
+///    position-based deletions are pending (the footer `num_rows` would
+///    overcount logically-deleted rows), so the scan plan yields no column
+///    bounds. The metastore aggregate — merged from footers on every write and
+///    exposed via [`CayenneTableProvider::distributed_join_statistics`] — still
+///    carries valid superset min/max (with an inexact row count), and reading it
+///    is metadata-only (cached blob, no row scan).
+/// 3. **`COUNT(*)`** (num_rows only) as a last resort when neither yields stats.
 ///
 /// Note: in clustered mode an executor's accelerated table is registered
 /// *non-partitioned* (`partition_by` is cleared once the executor has partition
@@ -144,8 +155,6 @@ pub(crate) async fn local_executor_table_statistics(
     df: &crate::datafusion::DataFusion,
     table: &datafusion::sql::TableReference,
 ) -> Option<(Vec<u8>, Vec<String>)> {
-    use datafusion::common::stats::Precision;
-
     let provider = df.get_table(table).await?;
     let schema = provider.schema();
     let column_names: Vec<String> = schema
@@ -154,39 +163,67 @@ pub(crate) async fn local_executor_table_statistics(
         .map(|f| f.name().clone())
         .collect();
 
-    // Primary: full scan-plan statistics (num_rows + per-column min/max).
-    // No projection so column stats cover every column.
+    // Primary: scan-plan statistics (num_rows + per-column min/max). No
+    // projection so column stats cover every column.
     let state = df.ctx.state();
     let scan_stats = match provider.scan(&state, None, &[], None).await {
         Ok(plan) => plan.partition_statistics(None).ok(),
         Err(_) => None,
     };
 
-    let stats = match scan_stats {
-        Some(s) if s.num_rows.get_value().is_some() => s,
-        _ => {
-            // Fallback: COUNT(*) → num_rows only, no column stats.
-            let sql = format!("SELECT COUNT(*) AS n FROM {}", table.to_quoted_string());
-            let n = async {
-                let batches = df.ctx.sql(&sql).await.ok()?.collect().await.ok()?;
-                let batch = batches.into_iter().find(|b| b.num_rows() > 0)?;
-                let col = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<datafusion::arrow::array::Int64Array>()?;
-                usize::try_from(col.value(0)).ok()
-            }
-            .await;
-            match n {
-                Some(n) => datafusion::common::Statistics::new_unknown(&schema)
-                    .with_num_rows(Precision::Inexact(n)),
-                None => {
-                    tracing::debug!(table = %table, "No local statistics available for executor table");
-                    return None;
-                }
+    // Use scan-plan stats directly only when complete enough for join sizing:
+    // num_rows present AND at least one column carries a min/max bound.
+    if let Some(stats) = &scan_stats {
+        if stats.num_rows.get_value().is_some() && has_any_column_bounds(stats) {
+            return Some((runtime_cluster::encode_statistics(stats), column_names));
+        }
+    }
+
+    // Secondary (CDC / no footer stats on the scan path): the Cayenne metastore
+    // running-aggregate min/max, which survives pending deletions. Metadata-only.
+    #[cfg(not(windows))]
+    if let Some(cayenne) = provider
+        .as_any()
+        .downcast_ref::<cayenne::CayenneTableProvider>()
+    {
+        if let Some(stats) = cayenne.distributed_join_statistics() {
+            if stats.num_rows.get_value().is_some() && has_any_column_bounds(&stats) {
+                return Some((runtime_cluster::encode_statistics(&stats), column_names));
             }
         }
-    };
+    }
 
+    // Last resort: COUNT(*) → num_rows only, no column bounds.
+    let stats = count_only_statistics(df, table, &schema).await.or_else(|| {
+        tracing::debug!(table = %table, "No local statistics available for executor table");
+        None
+    })?;
     Some((runtime_cluster::encode_statistics(&stats), column_names))
+}
+
+/// True if any column in `stats` carries a usable min or max bound.
+fn has_any_column_bounds(stats: &datafusion::common::Statistics) -> bool {
+    use datafusion::common::stats::Precision;
+    stats.column_statistics.iter().any(|c| {
+        !matches!(c.min_value, Precision::Absent) || !matches!(c.max_value, Precision::Absent)
+    })
+}
+
+/// `COUNT(*)` → num_rows-only statistics (no column bounds).
+async fn count_only_statistics(
+    df: &crate::datafusion::DataFusion,
+    table: &datafusion::sql::TableReference,
+    schema: &datafusion::arrow::datatypes::SchemaRef,
+) -> Option<datafusion::common::Statistics> {
+    use datafusion::common::stats::Precision;
+
+    let sql = format!("SELECT COUNT(*) AS n FROM {}", table.to_quoted_string());
+    let batches = df.ctx.sql(&sql).await.ok()?.collect().await.ok()?;
+    let batch = batches.into_iter().find(|b| b.num_rows() > 0)?;
+    let n = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .and_then(|a| usize::try_from(a.value(0)).ok())?;
+    Some(datafusion::common::Statistics::new_unknown(schema).with_num_rows(Precision::Inexact(n)))
 }

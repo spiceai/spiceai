@@ -3682,6 +3682,23 @@ impl CayenneTableProvider {
         None
     }
 
+    /// Optimizer statistics (num_rows + per-column min/max) for distributing
+    /// this table's slice to a cluster coordinator's `JoinSelection`.
+    ///
+    /// Unlike [`TableProvider::statistics`], this does **not** suppress stats
+    /// while position-based deletions are pending. It returns the metastore
+    /// running-aggregate (merged from Vortex file footers on every write) via
+    /// [`Self::cached_table_statistics_for_optimizer`], which already downgrades
+    /// `num_rows` to `Inexact` under pending visibility changes. The per-column
+    /// min/max are a valid superset under deletes (deletes only remove rows), so
+    /// they're sound for cardinality estimation, and the inexact row count is a
+    /// safe optimization hint. Metadata-only (cached blob, no row scan), so it's
+    /// cheap to poll periodically from the cluster statistics reporter.
+    #[must_use]
+    pub fn distributed_join_statistics(&self) -> Option<Statistics> {
+        self.cached_table_statistics_for_optimizer()
+    }
+
     fn top_level_statistics_only(stats: &Statistics, inexact: bool) -> Statistics {
         let num_rows = if inexact {
             stats.num_rows.to_inexact()
