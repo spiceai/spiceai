@@ -229,6 +229,12 @@ pub(crate) struct NsqlColumnContext {
 #[serde(transparent)]
 pub(crate) struct NsqlColumnFlag(bool);
 
+impl From<bool> for NsqlColumnFlag {
+    fn from(value: bool) -> Self {
+        Self(value)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct NsqlForeignKeyContext {

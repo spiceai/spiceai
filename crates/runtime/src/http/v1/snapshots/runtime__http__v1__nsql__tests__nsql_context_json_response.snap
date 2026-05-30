@@ -281,6 +281,14 @@ expression: response
     ],
     "spice_specific": [
       {
+        "name": "ai",
+        "syntax": "ai(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "ai(...)"
+        ]
+      },
+      {
         "name": "bucket",
         "syntax": "bucket(...)",
         "function_type": "SCALAR",
@@ -310,6 +318,14 @@ expression: response
         "function_type": "SCALAR",
         "signatures": [
           "digest_many(...)"
+        ]
+      },
+      {
+        "name": "embed",
+        "syntax": "embed(...)",
+        "function_type": "SCALAR",
+        "signatures": [
+          "embed(...)"
         ]
       },
       {
