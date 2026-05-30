@@ -454,8 +454,9 @@ impl CayenneDeletionSink {
     /// Expects a single filter expr and recognizes the following filter shapes:
     ///
     /// - **Single PK**: `pk_col IN (v1, v2, ...)` — a flat `Expr::InList`.
-    /// - **Composite PK**: A balanced OR tree of AND-equality conjunctions, e.g.
-    ///   `(pk1 = a AND pk2 = b) OR (pk1 = c AND pk2 = d)`.
+    /// - **Composite PK (OR-of-AND)**: A balanced OR tree of AND-equality
+    ///   conjunctions, e.g. `(pk1 = a AND pk2 = b) OR (pk1 = c AND pk2 = d)`.
+    /// - **Composite PK (tuple-IN)**: `(pk1, pk2, ...) IN ((a, b, ...), (c, d, ...))`.
     fn try_extract_pks_from_filters(&self, filters: &[Expr]) -> Option<ExtractedPkDeletes> {
         if filters.len() != 1 {
             return None;
@@ -486,13 +487,21 @@ impl CayenneDeletionSink {
                         return Some(ExtractedPkDeletes::RowKeys(keys));
                     }
                 }
-                // Composite PK — balanced OR-of-AND equality tree.
+                // Composite PK — balanced OR-of-AND equality tree or tuple-IN of struct literals.
                 let pk_target_types: Vec<&arrow_schema::DataType> = self
                     .pk_column_indices
                     .iter()
                     .map(|&idx| self.schema.field(idx).data_type())
                     .collect();
-                pk_filter_extract::try_extract_composite_pk_keys(
+                if let Some(keys) = pk_filter_extract::try_extract_tuple_in_pk_keys(
+                    filter,
+                    pk_columns,
+                    &pk_target_types,
+                    row_converter,
+                ) {
+                    return Some(ExtractedPkDeletes::RowKeys(keys));
+                }
+                pk_filter_extract::try_extract_or_of_and_pk_keys(
                     filter,
                     pk_columns,
                     &pk_target_types,
