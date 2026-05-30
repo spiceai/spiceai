@@ -93,6 +93,17 @@ impl PositionDeletionVector {
     pub(crate) fn access_plan(&self) -> Arc<VortexAccessPlan> {
         Arc::clone(&self.access_plan)
     }
+
+    #[must_use]
+    pub(crate) fn approx_bytes(&self) -> usize {
+        // The resident state keeps both the original u32 bitmap and the u64
+        // access-plan treemap built from it. Serialized size is a compact,
+        // container-aware estimate that tracks bitmap growth without walking
+        // every row id.
+        std::mem::size_of::<Self>()
+            .saturating_add(self.row_ids.serialized_size())
+            .saturating_add(self.row_ids.serialized_size())
+    }
 }
 
 impl fmt::Debug for PositionDeletionVector {
@@ -114,6 +125,17 @@ impl fmt::Debug for PositionDeletionVector {
 /// lets readers and writers share unchanged entries for free; only entries that
 /// the writer actually updates allocate a new `Arc`.
 pub(crate) type PositionBitmap = HashMap<String, Arc<PositionDeletionVector>>;
+
+fn approx_position_bitmap_bytes(bitmap: &PositionBitmap) -> usize {
+    const POSITION_BITMAP_ENTRY_OVERHEAD_BYTES: usize = 64;
+
+    bitmap.iter().fold(0, |total, (file_path, deletions)| {
+        total
+            .saturating_add(file_path.len())
+            .saturating_add(POSITION_BITMAP_ENTRY_OVERHEAD_BYTES)
+            .saturating_add(deletions.approx_bytes())
+    })
+}
 
 /// Atomically-published deletion state for single-column `Int64` primary keys.
 #[derive(Debug, Clone)]
@@ -355,6 +377,44 @@ impl PkDeletionStrategyWithCache {
                 position_deletions: position_cache,
                 ..
             } => position_cache,
+        }
+    }
+
+    /// Approximate resident bytes held by deletion and insert-record caches.
+    /// Includes key-based delete/insert indexes and per-file position deletes.
+    #[must_use]
+    pub(crate) fn approx_resident_bytes(&self) -> usize {
+        match self {
+            Self::PositionBased {
+                cached_deleted_row_ids,
+            } => {
+                let position_snapshot = cached_deleted_row_ids.load_full();
+                approx_position_bitmap_bytes(&position_snapshot)
+            }
+            Self::Int64Pk {
+                deletion_snapshot,
+                position_deletions,
+            } => {
+                let snapshot = deletion_snapshot.load();
+                let position_snapshot = position_deletions.load_full();
+                snapshot
+                    .deleted_pk
+                    .approx_bytes()
+                    .saturating_add(snapshot.insert_records.approx_bytes())
+                    .saturating_add(approx_position_bitmap_bytes(&position_snapshot))
+            }
+            Self::RowConverterBased {
+                deletion_snapshot,
+                position_deletions,
+            } => {
+                let snapshot = deletion_snapshot.load();
+                let position_snapshot = position_deletions.load_full();
+                snapshot
+                    .deleted_row_keys
+                    .approx_bytes()
+                    .saturating_add(snapshot.insert_records.approx_bytes())
+                    .saturating_add(approx_position_bitmap_bytes(&position_snapshot))
+            }
         }
     }
 

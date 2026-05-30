@@ -21,7 +21,7 @@ use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReser
 use parking_lot::Mutex as ParkingMutex;
 
 /// Per-table accounting of Cayenne's off-pool resident state: the PK keyset and
-/// the key-based deletion indexes, against the `DataFusion` [`MemoryPool`] that
+/// deletion indexes, against the `DataFusion` [`MemoryPool`] that
 /// `runtime.query.memory_limit` controls. Before this reservation, that state
 /// was invisible to the pool, so queries planned against the full budget while
 /// the process drifted toward OOM. With the state registered, the pool reflects
@@ -69,8 +69,9 @@ impl CayenneMemoryAccount {
         self.resize_to_total();
     }
 
-    /// Account the resident bytes of the key-based deletion + insert-record
-    /// indexes (deleted keys + insert records). Reset to 0 at compaction.
+    /// Account the resident bytes of deletion + insert-record indexes (deleted
+    /// keys, insert records, and position deletion vectors). Reset to 0 at
+    /// compaction.
     pub(crate) fn set_deletion_bytes(&self, bytes: usize) {
         self.deletion_bytes.store(bytes, Ordering::Relaxed);
         self.resize_to_total();

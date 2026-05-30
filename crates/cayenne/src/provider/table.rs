@@ -1189,7 +1189,7 @@ pub struct CayenneTableProvider {
     /// Delete paths invalidate this cache because arbitrary predicates can
     /// remove keys without telling us which keys were affected.
     pk_keyset_cache: Arc<ParkingMutex<Option<CachedPkIndex>>>,
-    /// Accounts the keyset + key-based deletion indexes against the query memory
+    /// Accounts the keyset + deletion indexes against the query memory
     /// pool. `Arc`-shared with provider clones so they update one reservation.
     table_memory: Arc<CayenneMemoryAccount>,
     /// Coalesces inline-memtable checkpoint checks spawned after inline writes.
@@ -3411,6 +3411,8 @@ impl CayenneTableProvider {
             background_compactor: Arc::new(std::sync::OnceLock::new()),
         };
 
+        provider.refresh_deletion_memory_accounting();
+
         // Fail construction if a staging WAL exists — the table may contain
         // partial data from an interrupted append and must be resolved first.
         provider.ensure_no_incomplete_write().await?;
@@ -4161,11 +4163,16 @@ impl CayenneTableProvider {
     }
 
     /// Bytes this table currently reserves against the query memory pool for its
-    /// off-pool resident state (PK keyset + key-based deletion indexes). Exposed
+    /// off-pool resident state (PK keyset + deletion indexes). Exposed
     /// for observability and for memory-accounting correctness tests.
     #[must_use]
     pub fn accounted_memory_bytes(&self) -> usize {
         self.table_memory.reserved_bytes()
+    }
+
+    fn refresh_deletion_memory_accounting(&self) {
+        self.table_memory
+            .set_deletion_bytes(self.pk_deletion_strategy.approx_resident_bytes());
     }
 
     /// Best-effort write-time read-back (`deletion_mode: position`): scan newly
@@ -4251,6 +4258,7 @@ impl CayenneTableProvider {
             Arc::clone(&self.table_metadata.schema),
             &[],
             self.pk_deletion_strategy.clone(),
+            Arc::clone(&self.table_memory),
             self.pk_row_converter.as_ref().map(Arc::clone),
             self.pk_column_indices.clone(),
             Vec::new(),
@@ -5400,6 +5408,7 @@ impl CayenneTableProvider {
                     Arc::new(updated_deleted),
                     Arc::clone(&current.insert_records),
                 )));
+                self.refresh_deletion_memory_accounting();
             }
             PkDeletionStrategyWithCache::RowConverterBased {
                 deletion_snapshot, ..
@@ -5417,6 +5426,7 @@ impl CayenneTableProvider {
                     Arc::new(updated_deleted),
                     Arc::clone(&current.insert_records),
                 )));
+                self.refresh_deletion_memory_accounting();
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
                 // Position-based tables don't support upserts.
@@ -5610,6 +5620,7 @@ impl CayenneTableProvider {
                 Arc::clone(&self.table_metadata.schema),
                 &[],
                 self.pk_deletion_strategy.clone(),
+                Arc::clone(&self.table_memory),
                 self.pk_row_converter.as_ref().map(Arc::clone),
                 self.pk_column_indices.clone(),
                 Vec::new(),
@@ -5687,13 +5698,11 @@ impl CayenneTableProvider {
                     .insert_records
                     .extend_max(deleted_pk_i64.iter().map(|&pk| (pk, insert_sequence)));
                 let insert_count = updated_inserts.len();
-                let deletion_bytes =
-                    updated_deleted.approx_bytes() + updated_inserts.approx_bytes();
                 deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_indices(
                     updated_deleted,
                     updated_inserts,
                 )));
-                self.table_memory.set_deletion_bytes(deletion_bytes);
+                self.refresh_deletion_memory_accounting();
 
                 tracing::debug!(
                     "Updated Int64 PK deletion cache with {} deleted keys (seq={}) and {} insert records (seq={}) for table {}",
@@ -5731,13 +5740,11 @@ impl CayenneTableProvider {
                     .insert_records
                     .extend_max(written_keys.into_iter().map(|key| (key, insert_sequence)));
                 let insert_count = updated_inserts.len();
-                let deletion_bytes =
-                    updated_deleted.approx_bytes() + updated_inserts.approx_bytes();
                 deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_indices(
                     updated_deleted,
                     updated_inserts,
                 )));
-                self.table_memory.set_deletion_bytes(deletion_bytes);
+                self.refresh_deletion_memory_accounting();
 
                 tracing::debug!(
                     "Updated RowConverter deletion cache with {} deleted keys (seq={}) and {} insert records (seq={}) for table {}",
@@ -6842,6 +6849,7 @@ impl CayenneTableProvider {
             Arc::clone(&self.table_metadata.schema),
             &filters,
             self.pk_deletion_strategy.clone(),
+            Arc::clone(&self.table_memory),
             self.pk_row_converter.as_ref().map(Arc::clone),
             self.pk_column_indices.clone(),
             Vec::new(), // Retention filters don't need to scan protected snapshots
@@ -6889,6 +6897,7 @@ impl CayenneTableProvider {
 
         self.pk_deletion_strategy
             .refresh_from(&fresh_strategy, &self.table_metadata.table_name)?;
+        self.refresh_deletion_memory_accounting();
         self.clear_cached_pk_keyset();
 
         tracing::debug!(
@@ -9934,6 +9943,7 @@ impl CayenneTableProvider {
             Arc::clone(&self.table_metadata.schema),
             filters,
             self.pk_deletion_strategy.clone(),
+            Arc::clone(&self.table_memory),
             self.pk_row_converter.as_ref().map(Arc::clone),
             self.pk_column_indices.clone(),
             snapshot_tables,
@@ -9981,6 +9991,7 @@ impl CayenneTableProvider {
             Arc::clone(&self.table_metadata.schema),
             &[], // no filters — positions are resolved by key probe
             self.pk_deletion_strategy.clone(),
+            Arc::clone(&self.table_memory),
             self.pk_row_converter.as_ref().map(Arc::clone),
             self.pk_column_indices.clone(),
             Vec::new(), // no protected snapshots for PositionBased
