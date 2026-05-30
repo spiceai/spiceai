@@ -86,6 +86,12 @@ impl PolyTableProvider {
     pub fn writer(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.write)
     }
+
+    /// Returns a borrow of the write-side table provider without cloning.
+    #[must_use]
+    pub fn writer_ref(&self) -> &Arc<dyn TableProvider> {
+        &self.write
+    }
 }
 
 impl FederationProvider for PolyTableProvider {

@@ -2195,7 +2195,17 @@ impl CayenneTableProvider {
             }),
         ));
 
+        let lock_wait_start = Instant::now();
         let write_guard = self.write_lock_arc().lock_owned().await;
+        let lock_wait_elapsed = lock_wait_start.elapsed();
+        if lock_wait_elapsed > Duration::from_millis(10) {
+            tracing::debug!(
+                table = self.table_name(),
+                duration_ms = lock_wait_elapsed.as_millis(),
+                "Cayenne write lock acquisition exceeded threshold in write_cdc_append_stream"
+            );
+        }
+
         AppendMutationWriter::new(self, &self.context, task_context)
             .write_cdc_pipelined(normalized, write_guard)
             .await
@@ -7213,11 +7223,11 @@ impl CayenneTableProvider {
         }
 
         tracing::debug!(
-            "Inlined {} rows for table {} after removing {} replaced inline row(s), file_pk_deletions={}",
-            total_rows,
-            self.table_metadata.table_name,
-            removed_rows,
-            file_deleted_pk_i64.len() + file_deleted_row_keys.len(),
+            table = self.table_metadata.table_name,
+            rows = total_rows,
+            inlined_rows_removed = removed_rows,
+            file_pk_deletions = file_deleted_pk_i64.len() + file_deleted_row_keys.len(),
+            "Inlined write"
         );
 
         Ok(true)

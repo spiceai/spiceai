@@ -1068,9 +1068,8 @@ impl RefreshTask {
 
     #[cfg(not(windows))]
     fn cayenne_accelerator(&self) -> Option<&CayenneTableProvider> {
-        self.accelerator
-            .as_any()
-            .downcast_ref::<CayenneTableProvider>()
+        None
+        //find_cayenne_provider(&self.accelerator)
     }
 
     async fn process_truncate(
@@ -1237,6 +1236,22 @@ fn select_rows(
 
     RecordBatch::try_new(data_batch.schema(), selected_columns)
         .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)
+}
+
+/// Recursively unwraps accelerator wrapper providers to locate the inner [`CayenneTableProvider`].
+fn find_cayenne_provider(provider: &Arc<dyn TableProvider>) -> Option<&CayenneTableProvider> {
+    if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneTableProvider>() {
+        return Some(cayenne);
+    }
+
+    if let Some(poly) = provider
+        .as_any()
+        .downcast_ref::<data_components::poly::PolyTableProvider>()
+    {
+        return find_cayenne_provider(poly.writer_ref());
+    }
+
+    None
 }
 
 async fn delete_matching_rows_from_arrow_provider(
@@ -2623,6 +2638,60 @@ mod tests {
             .expect("collect should succeed");
         let remaining_rows: usize = remaining.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(remaining_rows, 0);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_find_cayenne_provider_unwraps_wrappers() {
+        use cayenne::metadata::{CreateTableOptions, VortexConfig};
+        use cayenne::{CayenneCatalog, MetadataCatalog};
+
+        let data_dir = tempfile::TempDir::new().expect("data temp dir should be created");
+        let metadata_dir = tempfile::TempDir::new().expect("metadata temp dir should be created");
+
+        let catalog: Arc<dyn MetadataCatalog> = Arc::new(
+            CayenneCatalog::new(format!(
+                "sqlite://{}/test.db",
+                metadata_dir.path().display()
+            ))
+            .expect("catalog should be created"),
+        );
+        catalog.init().await.expect("catalog should initialize");
+
+        let schema = Arc::new(create_test_data_schema());
+        let ctx = SessionContext::new();
+        let table_options = CreateTableOptions {
+            table_name: "cdc_table".to_string(),
+            schema: Arc::clone(&schema) as arrow::datatypes::SchemaRef,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: data_dir.path().to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        };
+
+        let cayenne_table = Arc::new(
+            CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env())
+                .await
+                .expect("cayenne table should be created"),
+        );
+
+        // Bare provider: direct downcast must succeed.
+        let bare = Arc::clone(&cayenne_table) as Arc<dyn TableProvider>;
+        assert!(
+            find_cayenne_provider(&bare).is_some(),
+            "find_cayenne_provider should locate a bare CayenneTableProvider"
+        );
+
+        // PolyTableProvider wrapper (read/write split, always applied for Cayenne).
+        let poly = Arc::new(data_components::poly::PolyTableProvider::new(
+            Arc::clone(&cayenne_table) as Arc<dyn TableProvider>,
+            Arc::clone(&cayenne_table) as Arc<dyn TableProvider>,
+        )) as Arc<dyn TableProvider>;
+        assert!(
+            find_cayenne_provider(&poly).is_some(),
+            "find_cayenne_provider should peel a PolyTableProvider wrapper"
+        );
     }
 
     #[test]
