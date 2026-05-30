@@ -196,8 +196,8 @@ struct InlineFlushCaps {
 impl InlineFlushCaps {
     /// Historical flat small-write caps (2 MiB / 2048 rows / 16 segments). Used
     /// for non-inlining refresh profiles (where the caps are ignored) and as the
-    /// derivation floor, so hosts at or below the floor are byte-for-byte
-    /// unchanged from prior releases.
+    /// derivation floor (`inline_flush_caps_for` never returns less than this), so
+    /// no host regresses below the prior flat default.
     const FLOOR: Self = Self {
         max_bytes: SMALL_WRITE_INLINE_FLUSH_MAX_BYTES,
         max_rows: SMALL_WRITE_INLINE_FLUSH_MAX_ROWS,
@@ -213,16 +213,19 @@ impl InlineFlushCaps {
 /// Deliberately more conservative than the PK keyset cap (`default_pk_keyset_cache_mb`,
 /// `total_mem/32`, [256 MiB, 8 GiB]): the keyset is a pruning structure, whereas
 /// the memtable is raw, un-pruned data re-read on every scan. The byte budget is
-/// the primary knob; rows and segments are derived from it so bytes stays the
-/// binding flush trigger and the floor ratios (2 MiB → 2048 rows / 16 segments)
-/// are preserved exactly.
+/// the primary lever; rows and segments are derived from it, preserving the floor
+/// ratios (2 MiB → 2048 rows / 16 segments). `max_segments` is additionally capped
+/// at 256 to bound per-scan merge fan-in, so a workload that accumulates many
+/// small entries can hit the segment trigger before the byte budget.
 fn inline_flush_caps_for(
     total_mem_bytes: u64,
     storage: ResolvedAccelerationStorage,
 ) -> InlineFlushCaps {
     const MIB: u64 = 1024 * 1024;
-    // 2 MiB == SMALL_WRITE_INLINE_FLUSH_MAX_BYTES (coupling asserted in tests):
-    // hosts at/under the floor keep prior behavior exactly.
+    // 2 MiB == SMALL_WRITE_INLINE_FLUSH_MAX_BYTES (coupling asserted in tests).
+    // A hard minimum, so no host drops below the prior flat default; the memory at
+    // which scaling begins above the floor is storage-dependent (~128 MiB on
+    // LocalSsd, 256 MiB on Ebs/Unknown, 512 MiB on Tmpfs).
     const FLOOR_BYTES: u64 = 2 * MIB;
     // (divisor, ceiling) per metastore medium: faster re-read → larger memtable.
     // Tmpfs is RAM-backed, so the memtable double-counts against memory — keep it
@@ -634,7 +637,8 @@ impl CayenneAccelerator {
             // Inline-memtable flush caps scale with machine memory and the
             // metastore's storage medium (where the memtable BLOBs live and the
             // per-scan re-read cost is paid). Only the small-write/CDC profile
-            // inlines, so skip the (blocking) storage probe for other profiles.
+            // inlines, so skip the storage probe (a spawn_blocking /proc-/sys read
+            // under the Auto profile) for other profiles.
             let inline_flush_caps = if uses_small_write_refresh_profile(acceleration) {
                 let metadata_dir = CayenneAccelerator::resolve_metadata_dir(Some(acceleration));
                 let metastore_storage =
