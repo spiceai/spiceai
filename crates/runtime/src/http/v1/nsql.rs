@@ -947,9 +947,7 @@ mod tests {
     async fn nsql_context_response_negotiates_plain_text() {
         let accept = accept_header("text/plain");
         let response = nsql_context_response(
-            NsqlContextJsonResponse::minimal_for_test(
-                "# Spice.ai NSQL Context\n\nNo datasets are currently in scope.",
-            ),
+            NsqlContextJsonResponse::minimal_for_test(nsql_context_block_with_samples_for_test()),
             Some(&accept),
         );
 
@@ -971,6 +969,11 @@ mod tests {
             .expect("response body should collect")
             .to_bytes();
         let body = String::from_utf8(body.to_vec()).expect("response body should be UTF-8");
+
+        assert!(body.contains("## Datasets"));
+        assert!(body.contains("`sales.orders`: Customer orders"));
+        assert!(body.contains("## SQL Functions"));
+        assert!(body.contains("## Sample Data"));
 
         insta::assert_snapshot!("nsql_context_plain_text_response", body);
     }
@@ -1079,8 +1082,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nsql_context_block_snapshot() {
+    fn nsql_context_function_context_for_test() -> &'static str {
+        r"
+Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions:
+
+### Spice-specific functions
+- `text_search`: Runs full-text search over a configured searchable dataset. Syntax: `text_search(dataset, 'query text'[, column])`.
+- `vector_search`: Runs vector search over a configured embedding/vector index. Syntax: `vector_search(dataset, 'query text'[, column])`.
+
+### User-defined functions
+- `ticket_priority`: scalar function from `sql` with `stable` volatility. Syntax: `ticket_priority(sentiment utf8) -> int64`. Converts support-ticket sentiment into a priority score.
+    "
+    }
+
+    fn nsql_context_block_with_samples_for_test() -> String {
         let tables = vec![
             TableReference::parse_str("sales.orders"),
             TableReference::parse_str("support_tickets"),
@@ -1123,16 +1138,6 @@ mod tests {
 | support_tickets | ticket_id | Int64 | false | Support ticket identifier |
 | support_tickets | sentiment | Utf8 | true | Model-derived sentiment label |
     ";
-        let function_context = r"
-Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions:
-
-### Spice-specific functions
-- `text_search`: Runs full-text search over a configured searchable dataset. Syntax: `text_search(dataset, 'query text'[, column])`.
-- `vector_search`: Runs vector search over a configured embedding/vector index. Syntax: `vector_search(dataset, 'query text'[, column])`.
-
-### User-defined functions
-- `ticket_priority`: scalar function from `sql` with `stable` volatility. Syntax: `ticket_priority(sentiment utf8) -> int64`. Converts support-ticket sentiment into a priority score.
-    ";
         let relationship_context = r"
 ### `sales.orders`
 - Primary key: `order_id`
@@ -1155,17 +1160,44 @@ Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. Th
             },
         ];
 
+        render_nsql_context_block(
+            &tables,
+            &dataset_contexts,
+            schema_context,
+            relationship_context,
+            nsql_context_function_context_for_test(),
+            &sample_context_blocks,
+        )
+    }
+
+    fn nsql_context_block_no_datasets_for_test() -> String {
+        render_nsql_context_block(
+            &[],
+            &[],
+            "",
+            "",
+            nsql_context_function_context_for_test(),
+            &[],
+        )
+    }
+
+    #[test]
+    fn nsql_context_block_snapshot() {
         insta::assert_snapshot!(
             "nsql_context_block_with_samples",
-            render_nsql_context_block(
-                &tables,
-                &dataset_contexts,
-                schema_context,
-                relationship_context,
-                function_context,
-                &sample_context_blocks,
-            )
+            nsql_context_block_with_samples_for_test()
         );
+    }
+
+    #[test]
+    fn nsql_context_block_no_datasets_snapshot() {
+        let context = nsql_context_block_no_datasets_for_test();
+
+        assert!(context.contains("No datasets are currently in scope."));
+        assert!(context.contains("## SQL Functions"));
+        assert!(context.contains("Apache DataFusion version"));
+
+        insta::assert_snapshot!("nsql_context_block_no_datasets", context);
     }
 
     #[test]
