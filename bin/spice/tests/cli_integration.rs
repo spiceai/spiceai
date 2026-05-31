@@ -746,7 +746,7 @@ mod connect {
     /// `spice connect status` should report pending adoption.
     #[test]
     fn test_connect_stage_code_and_status() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().expect("create temp config dir");
         let config_dir = dir.path();
 
         // Stage the code.
@@ -760,7 +760,7 @@ mod connect {
 
         let pending = config_dir.join("pending-adopt-code");
         assert!(pending.exists(), "pending-adopt-code should be created");
-        let content = fs::read_to_string(&pending).unwrap();
+        let content = fs::read_to_string(&pending).expect("read pending-adopt-code");
         assert_eq!(content, "SPICE-ADOPT-AAAA-BBBB");
 
         // Status should report pending adoption.
@@ -777,7 +777,7 @@ mod connect {
     /// `spice connect forget` with no prior state should be a no-op.
     #[test]
     fn test_connect_forget_when_nothing_to_clear() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().expect("create temp config dir");
         let mut cmd = spice_cmd();
         cmd.env("SPICE_CONFIG_DIR", dir.path())
             .arg("connect")
@@ -791,7 +791,7 @@ mod connect {
     /// the pending file.
     #[test]
     fn test_connect_forget_clears_pending_code() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().expect("create temp config dir");
         let config_dir = dir.path();
         spice_cmd()
             .env("SPICE_CONFIG_DIR", config_dir)
