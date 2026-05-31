@@ -296,11 +296,6 @@ fn supports_ndv(dt: &datafusion::arrow::datatypes::DataType) -> bool {
     )
 }
 
-/// Quote an identifier for SQL (double-quoted, internal quotes doubled).
-fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
 /// Convert the single-row aggregate result at `array[0]` into a min/max bound,
 /// treating null (empty/all-null column) as `Absent`.
 fn scalar_bound(
@@ -389,11 +384,16 @@ async fn aggregate_table_statistics(
     schema: &datafusion::arrow::datatypes::SchemaRef,
 ) -> Option<datafusion::common::Statistics> {
     use datafusion::common::stats::Precision;
-    use datafusion::common::{ColumnStatistics, Statistics};
+    use datafusion::common::{Column, ColumnStatistics, Statistics};
+    use datafusion::functions_aggregate::expr_fn::{approx_distinct, count, max, min};
+    use datafusion::prelude::{Expr, lit};
 
-    // COUNT(*) at column 0, then per supported column: min, max, and (for integer
-    // columns) approx_distinct. `layout` records each column's result indices.
-    let mut select_exprs: Vec<String> = vec!["COUNT(*) AS __sr_count".to_string()];
+    // Build the aggregate directly as logical-plan expressions (no SQL string, so
+    // no identifier-quoting concerns). Positionally: COUNT(*) at column 0, then
+    // per supported column min, max, and (for integer columns) approx_distinct.
+    // With no GROUP BY the aggregate emits one row whose columns are in
+    // `aggr_exprs` order, so `layout` records each column's result indices.
+    let mut aggr_exprs: Vec<Expr> = vec![count(lit(1_i64))];
     // (schema field index, min idx, max idx, optional ndv idx) in the result batch.
     let mut layout: Vec<(usize, usize, usize, Option<usize>)> = Vec::new();
     let mut next = 1usize;
@@ -401,13 +401,13 @@ async fn aggregate_table_statistics(
         if !supports_minmax(field.data_type()) {
             continue;
         }
-        let col = quote_ident(field.name());
+        let col_expr = Expr::Column(Column::new_unqualified(field.name().clone()));
         let (min_idx, max_idx) = (next, next + 1);
-        select_exprs.push(format!("min({col}) AS __sr_min{idx}"));
-        select_exprs.push(format!("max({col}) AS __sr_max{idx}"));
+        aggr_exprs.push(min(col_expr.clone()));
+        aggr_exprs.push(max(col_expr.clone()));
         next += 2;
         let ndv_idx = if supports_ndv(field.data_type()) {
-            select_exprs.push(format!("approx_distinct({col}) AS __sr_ndv{idx}"));
+            aggr_exprs.push(approx_distinct(col_expr));
             let n = next;
             next += 1;
             Some(n)
@@ -417,12 +417,16 @@ async fn aggregate_table_statistics(
         layout.push((idx, min_idx, max_idx, ndv_idx));
     }
 
-    let sql = format!(
-        "SELECT {} FROM {}",
-        select_exprs.join(", "),
-        table.to_quoted_string()
-    );
-    let batches = df.ctx.sql(&sql).await.ok()?.collect().await.ok()?;
+    let batches = df
+        .ctx
+        .table(table.clone())
+        .await
+        .ok()?
+        .aggregate(vec![], aggr_exprs)
+        .ok()?
+        .collect()
+        .await
+        .ok()?;
     let batch = batches.into_iter().find(|b| b.num_rows() > 0)?;
 
     let num_rows = count_at(batch.column(0))?;
@@ -483,9 +487,19 @@ async fn count_only_statistics(
     schema: &datafusion::arrow::datatypes::SchemaRef,
 ) -> Option<datafusion::common::Statistics> {
     use datafusion::common::stats::Precision;
+    use datafusion::functions_aggregate::expr_fn::count;
+    use datafusion::prelude::lit;
 
-    let sql = format!("SELECT COUNT(*) AS n FROM {}", table.to_quoted_string());
-    let batches = df.ctx.sql(&sql).await.ok()?.collect().await.ok()?;
+    let batches = df
+        .ctx
+        .table(table.clone())
+        .await
+        .ok()?
+        .aggregate(vec![], vec![count(lit(1_i64))])
+        .ok()?
+        .collect()
+        .await
+        .ok()?;
     let batch = batches.into_iter().find(|b| b.num_rows() > 0)?;
     let n = count_at(batch.column(0))?;
     Some(datafusion::common::Statistics::new_unknown(schema).with_num_rows(Precision::Inexact(n)))
