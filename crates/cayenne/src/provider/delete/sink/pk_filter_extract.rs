@@ -20,11 +20,15 @@ limitations under the License.
 //! exact set of primary key values to delete. When that is the case the engine
 //! can skip scanning data files entirely and write deletion vectors directly.
 //!
-//! This module recognises two filter shapes:
+//! This module recognises the following filter shapes:
 //!
 //! - **Single PK**: `pk_col IN (v1, v2, ...)` — a flat `Expr::InList`.
-//! - **Composite PK**: A balanced OR tree of AND-equality conjunctions, e.g.
-//!   `(pk1 = a AND pk2 = b) OR (pk1 = c AND pk2 = d)`.
+//! - **Composite PK (OR-of-AND)**: A balanced OR tree of AND-equality
+//!   conjunctions, e.g. `(pk1 = a AND pk2 = b) OR (pk1 = c AND pk2 = d)`.
+//! - **Composite PK (tuple-IN)**: `(pk1, pk2, ...) IN ((a, b, ...), (c, d, ...))`
+//!   — an `Expr::InList` whose `expr` and list items are `struct(...)` scalar
+//!   functions. This is the form emitted by batched composite-key deletes
+//!   (e.g. `DELETE FROM t WHERE (k1, k2) IN ((v1, v2), ...)`).
 //!
 
 use arrow::array::ArrayRef;
@@ -140,7 +144,7 @@ pub(crate) fn try_extract_in_list_row_keys(
 /// - `pk_columns`: PK column names from the table schema, in declaration order.
 /// - `pk_target_types`: the corresponding Arrow data types from the table schema
 ///   (same length as `pk_columns`). Used to cast filter literals when needed.
-pub(crate) fn try_extract_composite_pk_keys(
+pub(crate) fn try_extract_or_of_and_pk_keys(
     expr: &Expr,
     pk_columns: &[String],
     pk_target_types: &[&DataType],
@@ -177,7 +181,88 @@ pub(crate) fn try_extract_composite_pk_keys(
         }
     }
 
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(pk_columns.len());
+    scalars_to_row_keys(pk_column_values, pk_target_types, row_converter)
+}
+
+// ---------------------------------------------------------------------------
+// Composite-PK extraction (tuple-IN of struct literals)
+// ---------------------------------------------------------------------------
+
+/// Try to extract composite PK row keys from a tuple-`IN` list expression.
+///
+/// Matches `(pk1, pk2, ...) IN ((a, b, ...), (c, d, ...))`, which `DataFusion`
+/// represents as an `Expr::InList` whose `expr` is a `struct(pk1, pk2, ...)`
+/// scalar function over the PK columns (in declaration order) and whose list
+/// items are `struct(a, b, ...)` scalar functions over literals.
+///
+/// - `pk_columns`: PK column names from the table schema, in declaration order.
+/// - `pk_target_types`: the corresponding Arrow data types from the table schema
+///   (same length as `pk_columns`). Used to cast filter literals when needed.
+pub(crate) fn try_extract_tuple_in_pk_keys(
+    expr: &Expr,
+    pk_columns: &[String],
+    pk_target_types: &[&DataType],
+    row_converter: &RowConverter,
+) -> Option<Vec<Box<[u8]>>> {
+    if pk_columns.len() != pk_target_types.len() || pk_columns.len() < 2 {
+        return None;
+    }
+
+    let Expr::InList(in_list) = expr else {
+        return None;
+    };
+    if in_list.negated {
+        return None;
+    }
+
+    // Left-hand side must be `struct(pk1, pk2, ...)` over the PK columns in order.
+    let lhs_args = struct_func_args(in_list.expr.as_ref())?;
+    if lhs_args.len() != pk_columns.len() {
+        return None;
+    }
+    for (arg, pk_name) in lhs_args.iter().zip(pk_columns) {
+        let Expr::Column(col) = arg else {
+            return None;
+        };
+        if &col.name != pk_name {
+            return None;
+        }
+    }
+
+    // Each list item must be `struct(lit, lit, ...)` with one literal per PK column.
+    let mut pk_column_values: Vec<Vec<ScalarValue>> = pk_columns
+        .iter()
+        .map(|_| Vec::with_capacity(in_list.list.len()))
+        .collect();
+    for item in &in_list.list {
+        let item_args = struct_func_args(item)?;
+        if item_args.len() != pk_columns.len() {
+            return None;
+        }
+        for (pk_idx, arg) in item_args.iter().enumerate() {
+            let Expr::Literal(scalar, _) = arg else {
+                return None;
+            };
+            pk_column_values[pk_idx].push(scalar.clone());
+        }
+    }
+
+    scalars_to_row_keys(pk_column_values, pk_target_types, row_converter)
+}
+
+/// Serialise per-column scalar values into composite row keys.
+///
+/// `pk_column_values[i]` holds the values for the column whose target type is
+/// `pk_target_types[i]`; every column must have the same number of values. Each
+/// column is converted to an Arrow array, cast to its target type when needed,
+/// and serialised via the `RowConverter`. Returns `None` on cast failure or if
+/// any value is NULL.
+fn scalars_to_row_keys(
+    pk_column_values: Vec<Vec<ScalarValue>>,
+    pk_target_types: &[&DataType],
+    row_converter: &RowConverter,
+) -> Option<Vec<Box<[u8]>>> {
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(pk_target_types.len());
     for (pk_idx, values) in pk_column_values.into_iter().enumerate() {
         let array = ScalarValue::iter_to_array(values.into_iter()).ok()?;
         let target_type = pk_target_types[pk_idx];
@@ -194,6 +279,21 @@ pub(crate) fn try_extract_composite_pk_keys(
 
     let rows = row_converter.convert_columns(&arrays).ok()?;
     Some(rows.iter().map(|row| row.as_ref().into()).collect())
+}
+
+/// If `expr` is a `struct(...)` (alias `row(...)`) scalar function call, return
+/// its arguments; otherwise `None`.
+fn struct_func_args(expr: &Expr) -> Option<&[Expr]> {
+    let Expr::ScalarFunction(func) = expr else {
+        return None;
+    };
+    let name = func.func.name();
+    if name == "struct" || name == "named_struct" || func.func.aliases().iter().any(|a| a == "row")
+    {
+        Some(&func.args)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -276,12 +376,13 @@ fn find_scalar_for_column<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{Int64Array, RecordBatch, StringArray};
     use arrow::datatypes::{Field, Schema};
     use arrow_row::SortField;
     use data_components::pk_filter_expr::{
         balanced_binary, build_pk_in_list_from_batch, get_delete_where_expr_from_batch,
     };
+    use datafusion::prelude::SessionContext;
     use datafusion_expr::col;
     use std::sync::Arc;
 
@@ -442,7 +543,7 @@ mod tests {
         ];
 
         let expr = make_and_conjunction(1, "hello");
-        let result = try_extract_composite_pk_keys(&expr, &pk_columns, &target_types, &converter);
+        let result = try_extract_or_of_and_pk_keys(&expr, &pk_columns, &target_types, &converter);
         assert!(result.is_some());
         assert_eq!(result.expect("keys").len(), 1);
     }
@@ -461,7 +562,7 @@ mod tests {
             .or(make_and_conjunction(2, "b"))
             .or(make_and_conjunction(3, "c"));
 
-        let result = try_extract_composite_pk_keys(&expr, &pk_columns, &target_types, &converter);
+        let result = try_extract_or_of_and_pk_keys(&expr, &pk_columns, &target_types, &converter);
         assert!(result.is_some());
         let keys = result.expect("keys");
         assert_eq!(keys.len(), 3);
@@ -482,7 +583,7 @@ mod tests {
         // Only one equality instead of two — should fail.
         let expr = col("pk").eq(Expr::Literal(ScalarValue::Int64(Some(1)), None));
         assert!(
-            try_extract_composite_pk_keys(&expr, &pk_columns, &target_types, &converter).is_none()
+            try_extract_or_of_and_pk_keys(&expr, &pk_columns, &target_types, &converter).is_none()
         );
     }
 
@@ -503,7 +604,7 @@ mod tests {
                 None,
             )));
         assert!(
-            try_extract_composite_pk_keys(&expr, &pk_columns, &target_types, &converter).is_none()
+            try_extract_or_of_and_pk_keys(&expr, &pk_columns, &target_types, &converter).is_none()
         );
     }
 
@@ -519,8 +620,62 @@ mod tests {
         let expr = make_and_conjunction(1, "x")
             .and(col("other").gt(Expr::Literal(ScalarValue::Int64(Some(0)), None)));
         assert!(
-            try_extract_composite_pk_keys(&expr, &pk_columns, &target_types, &converter).is_none()
+            try_extract_or_of_and_pk_keys(&expr, &pk_columns, &target_types, &converter).is_none()
         );
+    }
+
+    /// Recursively find the predicate of the first `Filter` node in a plan.
+    fn find_filter_predicate(plan: &datafusion_expr::LogicalPlan) -> Option<&Expr> {
+        if let datafusion_expr::LogicalPlan::Filter(filter) = plan {
+            return Some(&filter.predicate);
+        }
+        for input in plan.inputs() {
+            if let Some(predicate) = find_filter_predicate(input) {
+                return Some(predicate);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn test_tuple_in_composite_pk_roundtrip() {
+        // Build the `(pk, sk) IN ((1, 'a'), (2, 'b'))` filter
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int64, false),
+            Field::new("sk", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::new_empty(Arc::clone(&schema));
+        let ctx = SessionContext::new();
+        ctx.register_batch("t", batch).expect("register batch");
+        let df = ctx
+            .sql("SELECT * FROM t WHERE (pk, sk) IN ((1, 'a'), (2, 'b'))")
+            .await
+            .expect("plan sql");
+        let plan = df.into_unoptimized_plan();
+        let predicate = find_filter_predicate(&plan).expect("filter predicate");
+
+        let pk_columns = vec!["pk".to_string(), "sk".to_string()];
+        let int64_type = DataType::Int64;
+        let utf8_type = DataType::Utf8;
+        let target_types: Vec<&DataType> = vec![&int64_type, &utf8_type];
+        let converter = RowConverter::new(vec![
+            SortField::new(DataType::Int64),
+            SortField::new(DataType::Utf8),
+        ])
+        .expect("row converter");
+
+        let keys = try_extract_tuple_in_pk_keys(predicate, &pk_columns, &target_types, &converter)
+            .expect("should extract tuple-IN composite keys");
+
+        // Expected keys built directly from the composite (pk, sk) rows.
+        let pk_array = Arc::new(Int64Array::from(vec![1_i64, 2])) as ArrayRef;
+        let sk_array = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
+        let rows = converter
+            .convert_columns(&[pk_array, sk_array])
+            .expect("convert expected columns");
+        let expected: Vec<Box<[u8]>> = rows.iter().map(|row| row.as_ref().into()).collect();
+
+        assert_eq!(keys, expected);
     }
 
     // -----------------------------------------------------------------------
@@ -676,7 +831,7 @@ mod tests {
         ];
         let converter = RowConverter::new(sort_fields).expect("converter");
 
-        let keys = try_extract_composite_pk_keys(&expr, &pk_columns, &target_types, &converter)
+        let keys = try_extract_or_of_and_pk_keys(&expr, &pk_columns, &target_types, &converter)
             .expect("should extract");
         assert_eq!(keys.len(), 3);
 

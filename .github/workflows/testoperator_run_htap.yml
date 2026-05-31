@@ -25,7 +25,7 @@ on:
         description: 'Duration of the HTAP workload in seconds'
         required: false
         type: string
-        default: '300'
+        default: '600'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
@@ -34,10 +34,9 @@ on:
       runner_type:
         description: 'Runner type'
         required: true
-        default: 'spiceai-dev-runners'
+        default: 'spiceai-dev-large-runners'
         type: choice
         options:
-          - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
 jobs:
   run-htap:

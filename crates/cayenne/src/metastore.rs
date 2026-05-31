@@ -112,6 +112,10 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         columns: &["table_id", "statistics_blob", "num_rows"],
     },
     ExpectedTable {
+        name: "cayenne_pk_index",
+        columns: &["table_id", "snapshot_id", "index_blob"],
+    },
+    ExpectedTable {
         name: "cayenne_inlined_data",
         columns: &[
             "inlined_id",

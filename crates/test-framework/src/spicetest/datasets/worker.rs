@@ -243,7 +243,7 @@ impl SpiceTestQueryWorker {
         }
 
         // Fall back to TPCH validation (which handles TPCH, parameterized TPCH, etc.)
-        validation::validate_tpch_query(query, actual_batches)
+        validation::validate_tpch_query_at_scale(query, actual_batches, self.scale_factor)
     }
 
     pub fn start(self) -> JoinHandle<Result<SpiceTestQueryWorkerResult>> {
@@ -574,6 +574,8 @@ impl SpiceTestQueryWorker {
             && self.executor.supports_validation()
             && let Some(batches) = &result.batches
         {
+            let mut reference_validation_passed = false;
+
             // Execute reference query if reference_schema is provided
             if let Some(ref_schema) = &self.reference_schema
                 && let Some(spice_client) = self.executor.as_spice_client()
@@ -624,10 +626,15 @@ impl SpiceTestQueryWorker {
                         "Query reference validation failed: {validation_reason:?}"
                     ));
                 }
+
+                reference_validation_passed = true;
             }
 
             // Also validate using existing validation logic (TPCH or custom validation data)
-            let validation_result = self.validate_query_results(query, batches)?;
+            let validation_result = validation_result_after_reference_validation(
+                self.validate_query_results(query, batches)?,
+                reference_validation_passed,
+            );
 
             if let QueryValidationResult::Fail(validation_reason) = validation_result {
                 eprintln!(
@@ -648,6 +655,16 @@ impl SpiceTestQueryWorker {
                         Ok(pretty) => eprintln!("{pretty}"),
                         Err(e) => eprintln!("Failed to format expected batches: {e}"),
                     }
+                } else if matches!(
+                    &validation_reason,
+                    validation::QueryValidationFailReason::NoExpectedAnswerAtScaleFactor
+                ) {
+                    eprintln!(
+                        "\nNo static expected answer exists for query '{}' at scale factor {}. \
+                         Static TPCH answers are only available at scale factor 1.0; validating at \
+                         other scale factors requires a configured reference schema.",
+                        query.name, self.scale_factor
+                    );
                 } else {
                     eprintln!(
                         "\nExpected results: See TPCH specification for query {}",
@@ -754,6 +771,19 @@ impl SpiceTestQueryWorker {
     }
 }
 
+fn validation_result_after_reference_validation(
+    validation_result: QueryValidationResult,
+    reference_validation_passed: bool,
+) -> QueryValidationResult {
+    match validation_result {
+        QueryValidationResult::Fail(
+            validation::QueryValidationFailReason::NoExpectedAnswer
+            | validation::QueryValidationFailReason::NoExpectedAnswerAtScaleFactor,
+        ) if reference_validation_passed => QueryValidationResult::Pass,
+        validation_result => validation_result,
+    }
+}
+
 fn default_row_count_validation_skip_queries() -> HashSet<String> {
     [
         "tpcds_q8",
@@ -825,6 +855,59 @@ mod tests {
 
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn test_reference_validation_does_not_skip_static_validation_failures() {
+        let validation_result = validation_result_after_reference_validation(
+            QueryValidationResult::Fail(validation::QueryValidationFailReason::DataMismatch {
+                column: "order_count".to_string(),
+                row_number: 1,
+                expected: "42".to_string(),
+                actual: "41".to_string(),
+            }),
+            true,
+        );
+
+        assert!(matches!(
+            validation_result,
+            QueryValidationResult::Fail(validation::QueryValidationFailReason::DataMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_reference_validation_covers_missing_static_answer() {
+        assert_eq!(
+            validation_result_after_reference_validation(
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::NoExpectedAnswer
+                ),
+                true,
+            ),
+            QueryValidationResult::Pass
+        );
+        assert_eq!(
+            validation_result_after_reference_validation(
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::NoExpectedAnswerAtScaleFactor,
+                ),
+                true,
+            ),
+            QueryValidationResult::Pass
+        );
+    }
+
+    #[test]
+    fn test_missing_static_answer_fails_without_reference_validation() {
+        assert_eq!(
+            validation_result_after_reference_validation(
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::NoExpectedAnswer
+                ),
+                false,
+            ),
+            QueryValidationResult::Fail(validation::QueryValidationFailReason::NoExpectedAnswer)
+        );
+    }
 
     #[test]
     fn test_build_unique_query_sets_single_group() {
