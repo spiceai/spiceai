@@ -41,7 +41,7 @@ const ACCOUNT_IDENTIFIER_EXAMPLES: &str = "Use a Snowflake account identifier su
 ///
 /// See: <https://docs.snowflake.com/en/user-guide/admin-account-identifier>
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SnowflakeAccountIdentifier {
+enum SnowflakeAccountIdentifier {
     /// `orgname.account_name` - dot is replaced with dash for the API URL.
     OrgQualified {
         orgname: String,
@@ -56,7 +56,7 @@ pub enum SnowflakeAccountIdentifier {
 impl SnowflakeAccountIdentifier {
     /// Returns the account identifier formatted for the Snowflake API URL.
     #[must_use]
-    pub fn api_account(&self) -> String {
+    fn api_account(&self) -> String {
         match self {
             Self::OrgQualified {
                 orgname,
@@ -211,6 +211,40 @@ fn validate_legacy_segment(segment: &str) -> std::result::Result<(), String> {
     }
 
     Ok(())
+}
+
+fn validate_legacy_cloud_segment(segment: &str) -> std::result::Result<(), String> {
+    if segment.eq_ignore_ascii_case("aws")
+        || segment.eq_ignore_ascii_case("azure")
+        || segment.eq_ignore_ascii_case("gcp")
+    {
+        return Ok(());
+    }
+
+    Err(account_identifier_error(
+        "legacy account locators with a cloud segment must use `aws`, `azure`, or `gcp`",
+    ))
+}
+
+fn validate_legacy_compliance_segment(segment: &str) -> std::result::Result<(), String> {
+    if segment.eq_ignore_ascii_case("fhplus") || segment.eq_ignore_ascii_case("dod") {
+        return Ok(());
+    }
+
+    Err(account_identifier_error(
+        "legacy SnowGov account locators with four segments must use `fhplus` or `dod` as the compliance segment",
+    ))
+}
+
+fn validate_legacy_locator_segments(parts: &[&str]) -> std::result::Result<(), String> {
+    match parts {
+        [_, _, cloud] => validate_legacy_cloud_segment(cloud),
+        [_, compliance, _, cloud] => {
+            validate_legacy_compliance_segment(compliance)?;
+            validate_legacy_cloud_segment(cloud)
+        }
+        _ => Ok(()),
+    }
 }
 
 fn extract_account_identifier_from_host(host: &str) -> std::result::Result<String, String> {
@@ -368,6 +402,7 @@ impl FromStr for SnowflakeAccountIdentifier {
         for segment in &parts {
             validate_legacy_segment(segment)?;
         }
+        validate_legacy_locator_segments(&parts)?;
 
         if parts
             .iter()
@@ -933,6 +968,9 @@ mod tests {
             "myorg.my$account",
             "xy12345..aws",
             "xy12345.us-east-1.",
+            "xy12345.us-east-2.notcloud",
+            "xy12345.us-east-2.aws.extra",
+            "xy12345.invalid.us-gov-west-1.aws",
             "xy12345.us-east-2.aws.extra.segment",
             "myorganizationname.myaccountnamewithmorethanallowedidentifierchars",
             "https://xy12345.us-east-2.aws.snowflakecomputing.com/console",
