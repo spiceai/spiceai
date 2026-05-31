@@ -575,10 +575,12 @@ async fn get_metadata_from_kafka(
             connector_component: ConnectorComponent::from(dataset),
         })?;
 
-    // Fetch a sample event to infer schema and primary keys.
+    // Obtain a schema sample and ensure the real consumer has a partition assignment
+    // before `restart_topic` rewinds it.
     let (key, value) = if schema_evolution {
+        // Poll the real consumer once for partition assignment, and peek the latest
+        // message via a temp consumer for the schema sample.
         let (_, event) = tokio::try_join!(
-            // read first message to assign partition that `restart_topic` needs to rewind.
             fetch_first_event(dataset, topic, &kafka_consumer),
             fetch_latest_change_event(dataset, topic, kafka_config),
         )?;
