@@ -74,13 +74,14 @@ use snafu::ResultExt;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::{
     datafusion::DataFusion,
-    embedding_col,
     embeddings::table::{EmbeddingColumnConfig, EmbeddingTable},
     model::EmbeddingModelStore,
-    search::util::{find_concrete_table_provider, table_ref_from_column_expr},
+    search::util::find_concrete_table_provider,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
-use runtime_search::candidate::vector::ChunkedNonIndexVectorGeneration;
+use runtime_search::{
+    candidate::vector::ChunkedNonIndexVectorGeneration, udtf::table_ref_from_column_expr,
+};
 
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
 use {
@@ -814,7 +815,7 @@ impl TableProvider for VectorSearchUDTFProvider {
         // Keep the embedding column in the inner projection even when it is not requested
         // in the final output. This gives `_score` a stable slot that does not collide
         // with other projected columns (e.g. recency columns used by RRF rewrites).
-        let embedding_col_name = embedding_col!(embed_col);
+        let embedding_col_name = runtime_search::embedding_col!(embed_col);
         if !base_expr
             .iter()
             .any(|expr| expr.qualified_name().1 == embedding_col_name)

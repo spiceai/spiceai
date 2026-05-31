@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow::array::RecordBatch;
+use arrow_json::writer::JsonArray;
 use schemars::{JsonSchema, schema_for};
 use serde::Serialize;
 use serde_json::Value;
@@ -26,4 +28,17 @@ pub fn parameters<T: JsonSchema + Serialize>() -> Option<Value> {
             None
         }
     }
+}
+
+/// Serialize record batches to a JSON string.
+pub fn write_to_json_string(
+    data: &[RecordBatch],
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let buf = Vec::new();
+    let mut writer = arrow_json::WriterBuilder::new()
+        .with_explicit_nulls(true)
+        .build::<_, JsonArray>(buf);
+    writer.write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())?;
+    writer.finish()?;
+    Ok(String::from_utf8(writer.into_inner())?)
 }

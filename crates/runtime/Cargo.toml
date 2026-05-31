@@ -301,6 +301,7 @@ duckdb = [
     "datafusion-optimizer-rules/duckdb",
     "runtime-acceleration/duckdb",
     "search/duckdb",
+    "runtime-search/duckdb",
 ]
 dynamodb = [
     "dep:aws-sdk-dynamodb",
@@ -330,6 +331,7 @@ models = [
     "search/llms",
     "llms/local_llm",
     "llms/local_embed",
+    "runtime-search/models",
 ]
 mongodb = ["data_components/mongodb"]
 mssql = ["dep:tiberius", "data_components/mssql"]
@@ -341,6 +343,7 @@ openapi = [
     "dep:utoipa",
     "mcp",
     "runtime-api-types/openapi",
+    "runtime-search/openapi",
     "runtime-tools/openapi",
 ]
 oracle = ["data_components/oracle"]
@@ -356,6 +359,7 @@ s3_vectors = [
     "data_components/s3_vectors",
     "dep:s3_vectors",
     "search/s3_vectors",
+    "runtime-search/s3_vectors",
 ]
 scylladb = ["db_connection_pool/scylladb", "data_components/scylladb"]
 sftp = ["runtime-object-store/sftp"]

@@ -15,7 +15,4 @@ limitations under the License.
 */
 pub mod catalog;
 pub mod get_readiness;
-pub mod list_datasets;
 pub mod search;
-pub mod sql;
-pub mod table_schema;

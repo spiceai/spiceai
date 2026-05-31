@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,51 +15,28 @@ limitations under the License.
 */
 #![allow(clippy::implicit_hasher)]
 
-use std::collections::HashSet;
-use std::{collections::HashMap, sync::Arc};
-
-use app::App;
-use data_components::MetadataEnrichedTableProvider;
-use datafusion::common::Column;
-use datafusion::error::DataFusionError;
-use datafusion::{datasource::TableProvider, sql::TableReference};
-use datafusion_federation::FederatedTableProviderAdaptor;
-use runtime_datafusion_index::{Index, IndexedTableProvider};
-use search::generation::CandidateGeneration;
-use search::generation::text_search::index::FullTextDatabaseIndex;
-use search::generation::util::get_primary_keys;
-use search::index::SearchIndex;
-use search::index::chunking::ChunkedSearchIndex;
-use snafu::ResultExt;
-use tokio::sync::RwLock;
+use std::sync::Arc;
 
 use crate::accelerated_table::AcceleratedTable;
-use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
-use runtime_query_engine::query_engine::QueryEngine;
+use data_components::MetadataEnrichedTableProvider;
+use datafusion::datasource::TableProvider;
+use datafusion_federation::FederatedTableProviderAdaptor;
+use runtime_datafusion_index::{Index, IndexedTableProvider};
+use runtime_search::embeddings::table::EmbeddingTable;
+use runtime_search::table_provider_explorer::TableProviderExplorer;
 
-use crate::embeddings::table::EmbeddingTable;
-use crate::search::SearchGenerationSnafu;
-use crate::search::full_text::as_candidate_generations;
-#[cfg(feature = "elasticsearch")]
-use crate::search::full_text::as_es_text_candidate_generations;
-
-use super::{Error, Result};
-
-/// Attempt to return a concrete [`TableProvider`] type from a given [`impl TableProvider`]. This includes if the [`TableProvider`] is a base table for an [`AcceleratedTable`] or [`FederatedTableProviderAdaptor`] or other known [`TableProvider`] that wrap a table.
-pub(crate) fn find_concrete_table_provider<T: TableProvider + 'static>(
+/// Attempt to return a concrete [`TableProvider`] type from a given [`impl TableProvider`],
+/// unwrapping known wrapper layers including `AcceleratedTable`.
+pub fn find_concrete_table_provider<T: TableProvider + 'static>(
     tbl: &Arc<dyn TableProvider>,
 ) -> Option<&T> {
     let mut current_tbl = tbl;
 
-    // For the many possible wrapping [`TableProvider`], attempt to find the concrete `impl TableProvider`.
-    // Also avoids having to [`Box::pin`] for recursive `async fn`.
     loop {
-        // Attempt to downcast the current table to the desired type.
         if let Some(found_table) = current_tbl.as_any().downcast_ref::<T>() {
             return Some(found_table);
         }
 
-        // Handle specific table wrapping logic.
         if let Some(index_table) = current_tbl.as_any().downcast_ref::<IndexedTableProvider>() {
             current_tbl = index_table.get_underlying_ref();
             continue;
@@ -94,15 +71,13 @@ pub(crate) fn find_concrete_table_provider<T: TableProvider + 'static>(
             continue;
         }
 
-        // Exit if no further wrapping is found.
         return None;
     }
 }
 
-pub(crate) fn find_index_in_table_provider<T: Index + 'static>(
+pub fn find_index_in_table_provider<T: Index + 'static>(
     tbl: &Arc<dyn TableProvider>,
 ) -> Option<(Vec<&T>, Arc<dyn TableProvider>)> {
-    // `AcceleratedTable` is a concrete TableProvider underneath `FederatedTableProviderAdaptor`.
     if let Some(accelerated_table) = find_concrete_table_provider::<AcceleratedTable>(tbl)
         && let Some(indexes) =
             find_index_in_table_provider::<T>(accelerated_table.get_accelerator_ref())
@@ -122,305 +97,23 @@ pub(crate) fn find_index_in_table_provider<T: Index + 'static>(
     None
 }
 
-/// Compute the primary keys for each table in the app. Primary Keys can be explicitly defined in the Spicepod.yaml
-pub async fn parse_explicit_primary_keys(
-    app: Arc<RwLock<Option<Arc<App>>>>,
-) -> HashMap<TableReference, Vec<String>> {
-    app.read().await.as_ref().map_or(HashMap::new(), |app| {
-        let mut pks = app
-            .datasets
-            .iter()
-            .filter_map(|d| {
-                d.primary_key_override().map(|pks| {
-                    (
-                        TableReference::parse_str(&d.name)
-                            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-                            .into(),
-                        pks,
-                    )
-                })
-            })
-            .collect::<HashMap<TableReference, Vec<_>>>();
+/// Runtime's implementation of [`TableProviderExplorer`] that knows how to
+/// unwrap `AcceleratedTable` and other runtime-specific wrappers.
+#[derive(Debug, Clone)]
+pub struct RuntimeTableProviderExplorer;
 
-        pks.extend(app.views.iter().filter_map(|d| {
-            d.primary_key_override().map(|pks| {
-                (
-                    TableReference::parse_str(&d.name)
-                        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-                        .into(),
-                    pks,
-                )
-            })
-        }));
-        pks
-    })
-}
-
-pub(crate) async fn get_primary_keys_from_table(
-    df: &Arc<dyn QueryEngine>,
-    table: &TableReference,
-) -> Result<Vec<String>> {
-    let tbl_ref = df
-        .get_table(table)
-        .await
-        .ok_or_else(|| Error::DataSourcesNotFound {
-            data_source: vec![table.clone()],
-        })?;
-
-    get_primary_keys(&tbl_ref).map_err(|e| Error::DataFusionError {
-        source: DataFusionError::from(e),
-    })
-}
-
-/// For a set of tables, get their primary keys. Attempt to determine the primary key(s) of the
-/// table from the [`TableProvider`] constraints, and if not provided, use the explicit primary
-/// keys defined in the spicepod configuration.
-pub async fn get_primary_keys_with_overrides(
-    df: &Arc<dyn QueryEngine>,
-    tables: &[TableReference],
-    explicit_primary_keys: &HashMap<TableReference, Vec<String>>,
-) -> Result<HashMap<TableReference, Vec<String>>> {
-    let mut tbl_to_pks: HashMap<TableReference, Vec<String>> = HashMap::new();
-
-    for tbl in tables {
-        // `explicit_primary_keys` are [`ResolvedTableReference`], must resolve with spice defaults first.
-        // Equivalent to using [`TableReference::resolve_eq`] on `explicit_primary_keys` keys.
-        let resolved_tbl: TableReference = tbl
-            .clone()
-            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-            .into();
-        let pks = get_primary_keys_from_table(df, &resolved_tbl).await?;
-        if !pks.is_empty() {
-            tbl_to_pks.insert(tbl.clone(), pks);
-        } else if let Some(explicit_pks) = explicit_primary_keys.get(&resolved_tbl) {
-            tbl_to_pks.insert(tbl.clone(), explicit_pks.clone());
-        }
-    }
-    Ok(tbl_to_pks)
-}
-
-pub async fn user_tables_that_can_search(df: &Arc<dyn QueryEngine>) -> Result<Vec<TableReference>> {
-    let mut searchable_tables = Vec::new();
-
-    for t in df.get_user_table_names() {
-        if embedding_columns_from_table(df, &t)
-            .await
-            .is_some_and(|cols| !cols.is_empty())
-        {
-            searchable_tables.push(t);
-            continue;
-        }
-
-        if full_text_search_candidates(df, &t)
-            .await
-            .is_some_and(|fts_res| fts_res.is_ok_and(|c| !c.is_empty()))
-        {
-            searchable_tables.push(t);
-        }
+impl TableProviderExplorer for RuntimeTableProviderExplorer {
+    fn find_concrete<'a, T: TableProvider + 'static>(
+        &self,
+        tbl: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a T> {
+        find_concrete_table_provider::<T>(tbl)
     }
 
-    Ok(searchable_tables)
-}
-
-/// Returns the column names of a [`TableReference`] that have associated embedding column(s)
-///
-/// This includes per-row embeddings and chunked embeddings.
-pub async fn embedding_columns_from_table(
-    df: &Arc<dyn QueryEngine>,
-    tbl: &TableReference,
-) -> Option<Vec<String>> {
-    let table_provider = df.get_table(tbl).await?;
-
-    let mut embedding_columns: HashSet<String> = HashSet::default();
-
-    // embedding columns from [`EmbeddingTable`].
-    if let Some(embedding_table) = find_concrete_table_provider::<EmbeddingTable>(&table_provider) {
-        for c in embedding_table.get_embedding_columns() {
-            embedding_columns.insert(c);
-        }
-    }
-
-    // embedding columns from [`IndexedTableProvider`].
-    #[cfg(feature = "s3_vectors")]
-    {
-        use search::index::s3_vectors::S3Vector;
-        if let Some((indexes, _)) = find_index_in_table_provider::<S3Vector>(&table_provider) {
-            embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
-        }
-    }
-
-    if let Some((indexes, _)) = find_index_in_table_provider::<ChunkedSearchIndex>(&table_provider)
-    {
-        embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
-    }
-
-    #[cfg(feature = "elasticsearch")]
-    {
-        use search::index::elasticsearch::ElasticsearchIndex;
-        if let Some((indexes, _)) =
-            find_index_in_table_provider::<ElasticsearchIndex>(&table_provider)
-        {
-            embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
-        }
-    }
-
-    #[cfg(feature = "duckdb")]
-    {
-        use search::index::duckdb::DuckDBVectorIndex;
-        if let Some((indexes, _)) =
-            find_index_in_table_provider::<DuckDBVectorIndex>(&table_provider)
-        {
-            embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
-        }
-    }
-
-    Some(embedding_columns.into_iter().collect())
-}
-
-/// Returns a full text search [`CandidateGeneration`] if the [`TableReference`] has the appropriate index(es) defined in [`DataFusion`].
-///
-/// Returns:
-///   None:
-///     - `tbl` does not exist
-///     - `tbl` does not have relevant full text search support.
-pub async fn full_text_search_candidates(
-    df: &Arc<dyn QueryEngine>,
-    tbl: &TableReference,
-) -> Option<Result<Vec<Arc<dyn CandidateGeneration>>>> {
-    let base_table_provider = df.get_table(tbl).await?;
-
-    // If the table exists, but does not have full text search support, return no candidates.
-    let Some(indexed_table) =
-        find_concrete_table_provider::<IndexedTableProvider>(&base_table_provider)
-    else {
-        return Some(Ok(vec![]));
-    };
-
-    // Tantivy path.
-    if let Some(fts) = indexed_table.get_index::<FullTextDatabaseIndex>() {
-        return Some(
-            as_candidate_generations(
-                &fts.with_new_base(Arc::clone(&base_table_provider)),
-                Arc::clone(df),
-                tbl.clone(),
-            )
-            .await
-            .context(SearchGenerationSnafu),
-        );
-    }
-
-    // Elasticsearch BM25 path.
-    #[cfg(feature = "elasticsearch")]
-    {
-        use search::index::elasticsearch::ElasticsearchTextIndex;
-        let es_indexes = indexed_table.get_indexes::<ElasticsearchTextIndex>();
-        if !es_indexes.is_empty() {
-            return Some(
-                as_es_text_candidate_generations(es_indexes, Arc::clone(df), tbl.clone())
-                    .await
-                    .context(SearchGenerationSnafu),
-            );
-        }
-    }
-
-    Some(Ok(vec![]))
-}
-
-/// There is no [`Expr`] that can parse a fully qualified table name. For UDTFs that require
-/// tables as an input [`Expr`], it will be parsed as a [`Column`]. This function converts a
-///  [`Column`] to the [`TableReference`] intended.
-#[must_use]
-pub fn table_ref_from_column_expr(c: &Column) -> TableReference {
-    let table: Arc<str> = c.name.clone().into();
-    let schema: Option<&str> = c.relation.as_ref().map(TableReference::table);
-    let catalog: Option<&str> = c.relation.as_ref().and_then(TableReference::schema);
-    match (catalog, schema) {
-        // Catalog without schema is impossible.
-        (None | Some(_), None) => TableReference::Bare { table },
-        (None, Some(s)) => TableReference::Partial {
-            schema: s.into(),
-            table,
-        },
-        (Some(c), Some(s)) => TableReference::Full {
-            catalog: c.into(),
-            schema: s.into(),
-            table,
-        },
-    }
-}
-
-// Constructs the associated [`Column`] derived from [`table_ref_from_column_expr`].
-#[must_use]
-pub fn to_column_expr(tbl: &TableReference) -> Column {
-    match tbl {
-        TableReference::Bare { table } => Column::new_unqualified(table.to_string()),
-        TableReference::Partial { schema, table } => Column::new(
-            Some(TableReference::Bare {
-                table: Arc::clone(schema),
-            }),
-            table.to_string(),
-        ),
-        TableReference::Full {
-            catalog,
-            schema,
-            table,
-        } => Column::new(
-            Some(TableReference::Partial {
-                schema: Arc::clone(catalog),
-                table: Arc::clone(schema),
-            }),
-            table.to_string(),
-        ),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::FullTextDatabaseIndex;
-    use super::*;
-    use arrow_schema::{DataType, Field, Schema};
-    use data_components::arrow::write::MemTable;
-    use std::sync::Arc;
-
-    #[tokio::test]
-    async fn test_find_concrete_table_provider_direct_match() {
-        let base: Arc<dyn TableProvider> = Arc::new(
-            MemTable::try_new(Arc::new(Schema::empty()), vec![]).expect("failed to make table"),
-        );
-
-        assert!(find_concrete_table_provider::<EmbeddingTable>(&base).is_none());
-    }
-
-    #[test]
-    fn test_find_concrete_table_provider_wrapped_in_full_text() {
-        let base_table: Arc<dyn TableProvider> = Arc::new(
-            MemTable::try_new(
-                Arc::new(Schema::new(vec![Field::new(
-                    "search_field",
-                    DataType::Utf8,
-                    false,
-                )])),
-                vec![],
-            )
-            .expect("failed to make table"),
-        );
-
-        let index = Arc::new(
-            FullTextDatabaseIndex::try_new(
-                Arc::clone(&base_table),
-                vec!["search_field".to_string()],
-                Some(vec!["search_field".to_string()]),
-                None,
-                &[],
-            )
-            .expect("cannot make full text table"),
-        );
-
-        let wrapped_table = Arc::new(IndexedTableProvider::new(base_table).add_index(index))
-            as Arc<dyn TableProvider>;
-
-        assert!(find_concrete_table_provider::<IndexedTableProvider>(&wrapped_table).is_some());
-
-        assert!(find_concrete_table_provider::<EmbeddingTable>(&wrapped_table).is_none());
+    fn find_index<'a, T: Index + 'static>(
+        &self,
+        tbl: &'a Arc<dyn TableProvider>,
+    ) -> Option<(Vec<&'a T>, Arc<dyn TableProvider>)> {
+        find_index_in_table_provider::<T>(tbl)
     }
 }

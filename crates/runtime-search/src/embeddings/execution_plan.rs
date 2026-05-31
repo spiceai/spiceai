@@ -42,9 +42,20 @@ use snafu::ResultExt;
 use std::collections::HashMap;
 use std::{any::Any, sync::Arc, thread};
 
-use super::table::{EmbeddingColumnConfig, EmbeddingInputMode};
-use crate::model::EmbeddingModelStore;
-use crate::{embedding_col, offset_col};
+use super::EmbeddingModelStore;
+use crate::udtf::{EmbeddingColumnConfig, EmbeddingInputMode};
+
+macro_rules! embedding_col {
+    ($col:expr) => {
+        format!("{}_embedding", $col)
+    };
+}
+
+macro_rules! offset_col {
+    ($col:expr) => {
+        format!("{}_offset", $col)
+    };
+}
 use rayon::ThreadPool;
 use std::fmt;
 use tokio::sync::RwLock;
@@ -207,7 +218,7 @@ fn to_sendable_stream(
     }
 }
 
-pub(crate) fn construct_record_batch(
+pub fn construct_record_batch(
     batch: &RecordBatch,
     projected_schema: &SchemaRef,
     embedding_cols: &HashMap<String, ArrayRef>,
@@ -232,7 +243,7 @@ pub(crate) fn construct_record_batch(
 /// For columns that are in the base table, no additional columns are calculated.
 ///
 /// The additional columns returned here should match those specified in [`super::table::EmbeddingTable::embedding_fields`]
-pub(crate) async fn compute_additional_embedding_columns(
+pub async fn compute_additional_embedding_columns(
     rb: &RecordBatch,
     embedded_columns: &HashMap<String, EmbeddingColumnConfig>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,

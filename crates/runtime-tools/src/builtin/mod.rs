@@ -16,4 +16,7 @@ limitations under the License.
 
 pub mod function_tool;
 pub mod get_current_datetime;
+pub mod list_datasets;
 pub mod sample;
+pub mod sql;
+pub mod table_schema;

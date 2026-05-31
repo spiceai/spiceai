@@ -22,22 +22,19 @@ use tracing_futures::Instrument;
 
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 
-use crate::search::search_engine::SearchEngine;
-use crate::tools::builtin::list_datasets::get_dataset_elements;
-use crate::{
-    search::{
-        request::{SearchRequest, SearchRequestBaseJson},
-        types::to_pretty,
-        util::parse_explicit_primary_keys,
-    },
-    tools::{SpiceModelTool, utils::parameters},
-};
+use crate::search::util::RuntimeTableProviderExplorer;
 use app::App;
 use cache::TabledCacheProvider;
 use cache::result::search::CachedSearchResult;
 use runtime_query_engine::query_engine::QueryEngine;
 use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_search::search_engine::{SearchEngine, parse_explicit_primary_keys};
+use runtime_search::request::{SearchRequest, SearchRequestBaseJson};
+use runtime_search::types::to_pretty;
+use runtime_tools::builtin::list_datasets::get_dataset_elements;
+use runtime_tools::utils::parameters;
 use tokio::sync::RwLock;
+use tools::SpiceModelTool;
 
 pub struct SearchTool {
     name: String,
@@ -46,6 +43,7 @@ pub struct SearchTool {
     app: Arc<RwLock<Option<Arc<App>>>>,
     search_cache: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
     table_allowlist: Option<ResolvedTableAwareAllowlist>,
+    explorer: RuntimeTableProviderExplorer,
 }
 impl SearchTool {
     #[must_use]
@@ -65,6 +63,7 @@ impl SearchTool {
             app,
             search_cache,
             table_allowlist: None,
+            explorer: RuntimeTableProviderExplorer,
         }
     }
     #[must_use]
@@ -98,6 +97,7 @@ impl SpiceModelTool for SearchTool {
             let vs = SearchEngine::new(
                 Arc::clone(&self.df),
                 parse_explicit_primary_keys(Arc::clone(&self.app)).await,
+                self.explorer.clone(),
             );
 
             let mut search_request = SearchRequest::try_from(req)?;

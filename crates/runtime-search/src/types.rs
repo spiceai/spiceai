@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::ResultExt;
 
-use super::{Result, SearchAggregationSnafu};
+use crate::error::{Result, SearchAggregationSnafu};
 
 pub type ModelKey = String;
 pub type VectorSearchResult = HashMap<TableReference, AggregationResult>;

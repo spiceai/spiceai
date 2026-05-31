@@ -17,36 +17,14 @@ limitations under the License.
 use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc};
 
-use super::request::SearchRequest;
-use super::util::user_tables_that_can_search;
-use super::{Error, Result};
+use crate::candidate::vector::ChunkedNonIndexVectorGeneration;
+use crate::candidate::vector_udtf::VectorUDTFGeneration;
 use crate::embeddings::table::EmbeddingTable;
-use crate::search::{DataFusionSnafu, FormattingSnafu};
-use datafusion::common::{Column, DFSchema, SchemaError};
-use datafusion::error::DataFusionError;
-use datafusion_expr::Expr;
-use datafusion_expr::sqlparser::ast;
-#[cfg(feature = "models")]
-use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
-use runtime_search::candidate::vector_udtf::VectorUDTFGeneration;
-#[cfg(not(feature = "models"))]
-const EMBED_UDF_NAME: &str = "embed";
-use runtime_datafusion::SPICE_DEFAULT_CATALOG;
-use runtime_datafusion::SPICE_DEFAULT_SCHEMA;
-use runtime_query_engine::query_engine::QueryEngine;
-use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
-#[cfg(feature = "duckdb")]
-use search::index::duckdb::DuckDBVectorIndex;
-#[cfg(feature = "s3_vectors")]
-use search::index::s3_vectors::S3Vector;
+use crate::error::{DataFusionSnafu, Error, FormattingSnafu, Result, SearchPipelineSnafu};
+use crate::table_provider_explorer::TableProviderExplorer;
 
-use crate::search::{
-    SearchPipelineSnafu,
-    util::{
-        embedding_columns_from_table, find_concrete_table_provider, find_index_in_table_provider,
-        full_text_search_candidates, get_primary_keys_with_overrides,
-    },
-};
+pub const SPICE_DEFAULT_CATALOG: &str = "spice";
+pub const SPICE_DEFAULT_SCHEMA: &str = "public";
 use arrow::array::RecordBatch;
 use async_stream::stream;
 use cache::key::{CacheKey, RawCacheKey, SearchKey};
@@ -55,11 +33,24 @@ use cache::result::query::CachedStream;
 use cache::result::search::{CachedAggregationResult, CachedSearchResult};
 use cache::{Sizeable, TabledCacheProvider};
 use datafusion::catalog::TableProvider;
+use datafusion::common::{Column, DFSchema, SchemaError};
+use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
+use datafusion_expr::Expr;
+use datafusion_expr::sqlparser::ast;
 use futures::StreamExt;
 use itertools::Itertools;
-use runtime_search::candidate::vector::ChunkedNonIndexVectorGeneration;
+#[cfg(feature = "models")]
+use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
+#[cfg(not(feature = "models"))]
+const EMBED_UDF_NAME: &str = "embed";
+use runtime_query_engine::query_engine::QueryEngine;
+use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
+#[cfg(feature = "duckdb")]
+use search::index::duckdb::DuckDBVectorIndex;
+#[cfg(feature = "s3_vectors")]
+use search::index::s3_vectors::S3Vector;
 use search::index::SearchIndex;
 use search::index::chunking::ChunkedSearchIndex;
 use search::index::native_vector::NativeVectorIndex;
@@ -71,29 +62,31 @@ use search::{
 use snafu::ResultExt;
 use tracing::{Instrument, Span};
 
-use super::types::VectorSearchResult;
+use crate::request::SearchRequest;
+use crate::types::VectorSearchResult;
 
 /// A Component that can perform search operations.
-pub struct SearchEngine {
+pub struct SearchEngine<E: TableProviderExplorer> {
     pub df: Arc<dyn QueryEngine>,
 
-    // For tables, explicitly defined primary keys for datasets.
-    // Are in [`ResolvedTableReference`] format.
-    // Before use, must be resolved with spice defaults, `.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)`.
     explicit_primary_keys: HashMap<TableReference, Vec<String>>,
 
     search_cache: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
+
+    explorer: E,
 }
 
-impl SearchEngine {
+impl<E: TableProviderExplorer> SearchEngine<E> {
     pub fn new(
         df: Arc<dyn QueryEngine>,
         explicit_primary_keys: HashMap<TableReference, Vec<String>>,
+        explorer: E,
     ) -> Self {
         SearchEngine {
             df,
             explicit_primary_keys,
             search_cache: None,
+            explorer,
         }
     }
 
@@ -113,11 +106,111 @@ impl SearchEngine {
         self.search_cache.clone()
     }
 
+    async fn user_tables_that_can_search(&self) -> Result<Vec<TableReference>> {
+        let mut searchable_tables = Vec::new();
+        for t in self.df.get_user_table_names() {
+            if self.embedding_columns_from_table(&t).await.is_some_and(|cols| !cols.is_empty()) {
+                searchable_tables.push(t);
+                continue;
+            }
+            if self.full_text_search_candidates(&t).await.is_some_and(|fts_res| fts_res.is_ok_and(|c| !c.is_empty())) {
+                searchable_tables.push(t);
+            }
+        }
+        Ok(searchable_tables)
+    }
+
+    async fn embedding_columns_from_table(&self, tbl: &TableReference) -> Option<Vec<String>> {
+        let table_provider = self.df.get_table(tbl).await?;
+        let mut embedding_columns: HashSet<String> = HashSet::default();
+
+        if let Some(embedding_table) = self.explorer.find_concrete::<EmbeddingTable>(&table_provider) {
+            for c in embedding_table.get_embedding_columns() {
+                embedding_columns.insert(c);
+            }
+        }
+
+        #[cfg(feature = "s3_vectors")]
+        {
+            use search::index::s3_vectors::S3Vector;
+            if let Some((indexes, _)) = self.explorer.find_index::<S3Vector>(&table_provider) {
+                embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
+            }
+        }
+
+        if let Some((indexes, _)) = self.explorer.find_index::<ChunkedSearchIndex>(&table_provider) {
+            embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
+        }
+
+        #[cfg(feature = "elasticsearch")]
+        {
+            use search::index::elasticsearch::ElasticsearchIndex;
+            if let Some((indexes, _)) = self.explorer.find_index::<ElasticsearchIndex>(&table_provider) {
+                embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
+            }
+        }
+
+        #[cfg(feature = "duckdb")]
+        {
+            use search::index::duckdb::DuckDBVectorIndex;
+            if let Some((indexes, _)) = self.explorer.find_index::<DuckDBVectorIndex>(&table_provider) {
+                embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
+            }
+        }
+
+        Some(embedding_columns.into_iter().collect())
+    }
+
+    async fn full_text_search_candidates(
+        &self,
+        tbl: &TableReference,
+    ) -> Option<Result<Vec<Arc<dyn CandidateGeneration>>>> {
+        use crate::full_text::as_candidate_generations;
+        #[cfg(feature = "elasticsearch")]
+        use crate::full_text::as_es_text_candidate_generations;
+        use runtime_datafusion_index::IndexedTableProvider;
+        use search::generation::text_search::index::FullTextDatabaseIndex;
+
+        let base_table_provider = self.df.get_table(tbl).await?;
+
+        let Some(indexed_table) = self.explorer.find_concrete::<IndexedTableProvider>(&base_table_provider) else {
+            return Some(Ok(vec![]));
+        };
+
+        if let Some(fts) = indexed_table.get_index::<FullTextDatabaseIndex>() {
+            return Some(
+                as_candidate_generations(
+                    &fts.with_new_base(Arc::clone(&base_table_provider)),
+                    Arc::clone(&self.df),
+                    tbl.clone(),
+                )
+                .await
+                .map_err(|source| Error::SearchGenerationError { source }),
+            );
+        }
+
+        #[cfg(feature = "elasticsearch")]
+        {
+            use search::index::elasticsearch::ElasticsearchTextIndex;
+            let es_indexes = indexed_table.get_indexes::<ElasticsearchTextIndex>();
+            if !es_indexes.is_empty() {
+                return Some(
+                    as_es_text_candidate_generations(es_indexes, Arc::clone(&self.df), tbl.clone())
+                        .await
+                        .map_err(|source| Error::SearchGenerationError { source }),
+                );
+            }
+        }
+
+        Some(Ok(vec![]))
+    }
+
     fn get_vector_index(
+        &self,
         tbl: &Arc<dyn TableProvider>,
         embedding_column: &str,
     ) -> Option<Arc<dyn SearchIndex>> {
-        if let Some((indexes, _)) = find_index_in_table_provider::<ChunkedSearchIndex>(tbl)
+        if let Some((indexes, _)) = self.explorer.find_index::<ChunkedSearchIndex>(tbl)
             && let Some(index) = indexes
                 .into_iter()
                 .find(|idx| idx.search_column() == embedding_column)
@@ -126,7 +219,7 @@ impl SearchEngine {
         }
 
         #[cfg(feature = "s3_vectors")]
-        if let Some((indexes, _)) = find_index_in_table_provider::<S3Vector>(tbl)
+        if let Some((indexes, _)) = self.explorer.find_index::<S3Vector>(tbl)
             && let Some(index) = indexes
                 .into_iter()
                 .find(|idx| idx.search_column() == embedding_column)
@@ -135,7 +228,7 @@ impl SearchEngine {
         }
 
         #[cfg(feature = "duckdb")]
-        if let Some((indexes, _)) = find_index_in_table_provider::<DuckDBVectorIndex>(tbl)
+        if let Some((indexes, _)) = self.explorer.find_index::<DuckDBVectorIndex>(tbl)
             && let Some(index) = indexes
                 .into_iter()
                 .find(|idx| idx.search_column() == embedding_column)
@@ -143,7 +236,7 @@ impl SearchEngine {
             return Some(Arc::new(index.clone()) as Arc<dyn SearchIndex>);
         }
 
-        if let Some((indexes, _)) = find_index_in_table_provider::<NativeVectorIndex>(tbl)
+        if let Some((indexes, _)) = self.explorer.find_index::<NativeVectorIndex>(tbl)
             && let Some(index) = indexes
                 .into_iter()
                 .find(|idx| idx.search_column() == embedding_column)
@@ -169,7 +262,7 @@ impl SearchEngine {
                 data_source: vec![tbl.clone()],
             })?;
 
-        if let Some(vector_index) = Self::get_vector_index(&table_provider, embedding_column) {
+        if let Some(vector_index) = self.get_vector_index(&table_provider, embedding_column) {
             let is_chunked = vector_index
                 .as_any()
                 .downcast_ref::<ChunkedSearchIndex>()
@@ -183,7 +276,7 @@ impl SearchEngine {
             )))
         } else {
             let Some(embedding_table) =
-                find_concrete_table_provider::<EmbeddingTable>(&table_provider)
+                self.explorer.find_concrete::<EmbeddingTable>(&table_provider)
             else {
                 return Err(Error::CannotVectorSearchDataset {
                     data_source: tbl.clone(),
@@ -344,7 +437,7 @@ impl SearchEngine {
 
         let tables = match data_source_opt {
             Some(ts) => ts.iter().map(TableReference::from).collect(),
-            None => user_tables_that_can_search(&self.df).await?,
+            None => self.user_tables_that_can_search().await?,
         };
 
         if tables.is_empty() {
@@ -372,7 +465,7 @@ impl SearchEngine {
 
                 async move {
                     let request_context = RequestContext::current(AsyncMarker::new().await);
-                    let embedding_columns = embedding_columns_from_table(&self.df, &tbl).await.unwrap_or_default();
+                    let embedding_columns = self.embedding_columns_from_table(&tbl).await.unwrap_or_default();
                     let mut generators: Vec<Arc<dyn CandidateGeneration>> = Vec::with_capacity(embedding_columns.len());
                     for (i, col) in embedding_columns.iter().enumerate() {
                         generators.insert(i, self.vector_search_generator(
@@ -384,7 +477,7 @@ impl SearchEngine {
                     };
 
                     // If the dataset is configured with full text search capabilities, add as generator.
-                    if let Some(mut fts) = full_text_search_candidates(&self.df, &tbl).await.transpose()? {
+                    if let Some(mut fts) = self.full_text_search_candidates(&tbl).await.transpose()? {
                         telemetry::track_text_search(&request_context.to_dimensions());
                         generators.append(&mut fts);
                     }
@@ -446,7 +539,7 @@ async fn get_filter_for_table(
     df: &Arc<dyn QueryEngine>,
     tbl: &TableReference,
     filter_opt: Option<&ast::Expr>,
-) -> Result<Option<Expr>, super::Error> {
+) -> Result<Option<Expr>, Error> {
     let Some(filter) = filter_opt else {
         return Ok(None);
     };
@@ -470,7 +563,7 @@ async fn get_filter_for_table(
             );
             Ok(None)
         }
-        Err(e) => Err(super::Error::DataFusionError { source: e }),
+        Err(e) => Err(Error::DataFusionError { source: e }),
     }
 }
 
@@ -608,4 +701,76 @@ fn wrap_cache_to_result(
     });
 
     wrapped_results
+}
+
+async fn get_primary_keys_from_table(
+    df: &Arc<dyn QueryEngine>,
+    table: &TableReference,
+) -> Result<Vec<String>> {
+    let tbl_ref = df
+        .get_table(table)
+        .await
+        .ok_or_else(|| Error::DataSourcesNotFound {
+            data_source: vec![table.clone()],
+        })?;
+
+    search::generation::util::get_primary_keys(&tbl_ref).map_err(|e| Error::DataFusionError {
+        source: DataFusionError::from(e),
+    })
+}
+
+async fn get_primary_keys_with_overrides(
+    df: &Arc<dyn QueryEngine>,
+    tables: &[TableReference],
+    explicit_primary_keys: &HashMap<TableReference, Vec<String>>,
+) -> Result<HashMap<TableReference, Vec<String>>> {
+    let mut tbl_to_pks: HashMap<TableReference, Vec<String>> = HashMap::new();
+
+    for tbl in tables {
+        let resolved_tbl: TableReference = tbl
+            .clone()
+            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+            .into();
+        let pks = get_primary_keys_from_table(df, &resolved_tbl).await?;
+        if !pks.is_empty() {
+            tbl_to_pks.insert(tbl.clone(), pks);
+        } else if let Some(explicit_pks) = explicit_primary_keys.get(&resolved_tbl) {
+            tbl_to_pks.insert(tbl.clone(), explicit_pks.clone());
+        }
+    }
+    Ok(tbl_to_pks)
+}
+
+/// Compute the primary keys for each table in the app.
+pub async fn parse_explicit_primary_keys(
+    app: Arc<tokio::sync::RwLock<Option<Arc<app::App>>>>,
+) -> HashMap<TableReference, Vec<String>> {
+    app.read().await.as_ref().map_or(HashMap::new(), |app| {
+        let mut pks = app
+            .datasets
+            .iter()
+            .filter_map(|d| {
+                d.primary_key_override().map(|pks| {
+                    (
+                        TableReference::parse_str(&d.name)
+                            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                            .into(),
+                        pks,
+                    )
+                })
+            })
+            .collect::<HashMap<TableReference, Vec<_>>>();
+
+        pks.extend(app.views.iter().filter_map(|d| {
+            d.primary_key_override().map(|pks| {
+                (
+                    TableReference::parse_str(&d.name)
+                        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                        .into(),
+                    pks,
+                )
+            })
+        }));
+        pks
+    })
 }

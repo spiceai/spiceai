@@ -21,11 +21,9 @@ use crate::{
     },
     http::v1::{ResponseMetadata, ResponseMimeType, to_http_response},
     model::LLMChatCompletionsModelStore,
-    tools::{
-        builtin::table_schema::{TableSchemaTool, TableSchemaToolParams},
-        utils::create_tool_use_messages,
-    },
+    tools::utils::create_tool_use_messages,
 };
+use runtime_tools::builtin::table_schema::{TableSchemaTool, TableSchemaToolParams};
 use async_openai::types::chat::ChatCompletionRequestMessage;
 use axum::{
     Extension, Json,

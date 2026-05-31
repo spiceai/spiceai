@@ -13,7 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::tools::{SpiceModelTool, utils::parameters};
+use crate::utils::parameters;
+use tools::SpiceModelTool;
 use app::App;
 use arrow_schema::{Field, Schema};
 use arrow_tools::format::table_schemas_to_markdown_table;
@@ -134,9 +135,7 @@ impl TableSchemaTool {
                     if self.table_allowlist.as_ref().is_some_and(|list| {
                         !list.table_is_allowed(&TableReference::parse_str(t.as_str()))
                     }) {
-                        return Err(crate::datafusion::Error::UnableToGetTable {
-                            source: DataFusionError::Plan(format!("No table named {t}")),
-                        })
+                        return Err(DataFusionError::Plan(format!("No table named {t}")))
                         .boxed();
                     }
                     let base_schema = self

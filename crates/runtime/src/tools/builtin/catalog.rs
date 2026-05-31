@@ -36,10 +36,11 @@ use runtime_tools::builtin::get_current_datetime::GetCurrentDateTimeTool;
 use runtime_tools::builtin::sample::{SampleTableMethod, tool::SampleDataTool};
 use tools::SpiceModelTool;
 
-use super::{
-    get_readiness::GetReadinessTool, list_datasets::ListDatasetsTool, search::SearchTool,
-    sql::SqlTool, table_schema::TableSchemaTool,
-};
+use runtime_tools::builtin::list_datasets::ListDatasetsTool;
+use runtime_tools::builtin::sql::SqlTool;
+use runtime_tools::builtin::table_schema::TableSchemaTool;
+
+use super::{get_readiness::GetReadinessTool, search::SearchTool};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -141,8 +142,6 @@ impl BuiltinToolCatalog {
             } else {
                 self.model_table_allowlist.clone()
             };
-
-        let query_engine: Arc<dyn QueryEngine> = self.rt.datafusion();
 
         match id {
             "get_readiness" => Ok(Arc::new(GetReadinessTool::new(

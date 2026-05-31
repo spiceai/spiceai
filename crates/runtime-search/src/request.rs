@@ -25,7 +25,7 @@ use schemars::JsonSchema;
 use search::pipeline::valid_keywords;
 use serde::{Deserialize, Serialize};
 
-use super::{Error, Result};
+use crate::error::{Error, Result};
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -202,7 +202,7 @@ impl SearchRequest {
         Ok(expr)
     }
 
-    pub fn parse_additional_columns(additional_columns: &[String]) -> super::Result<Vec<Column>> {
+    pub fn parse_additional_columns(additional_columns: &[String]) -> crate::error::Result<Vec<Column>> {
         additional_columns
             .iter()
             .map(|c| {
@@ -255,21 +255,21 @@ impl SearchRequest {
 
                 let Some(TableWithJoins { relation, .. }) = expr.from.first() else {
                     tracing::trace!("parsing 'additional_columns' for search failed. Expected a table, but got {expr:?}");
-                    return Err(super::Error::InvalidAdditionalColumns{
+                    return Err(crate::error::Error::InvalidAdditionalColumns{
                         additional_column: c.clone(),
                     });
                 };
 
                 let TableFactor::Table { name, .. } = relation else {
                     tracing::trace!("parsing 'additional_columns' for search failed. Expected a table, but got {relation:?}");
-                    return Err(super::Error::InvalidAdditionalColumns{
+                    return Err(crate::error::Error::InvalidAdditionalColumns{
                         additional_column: c.clone(),
                     });
                 };
 
                 if name.to_string() != "testing" {
                     tracing::trace!("parsing 'additional_columns' for search failed. Expected 'testing', but got {name}");
-                    return Err(super::Error::InvalidAdditionalColumns{
+                    return Err(crate::error::Error::InvalidAdditionalColumns{
                         additional_column: c.clone(),
                     });
                 }
@@ -277,7 +277,7 @@ impl SearchRequest {
                 let next_token = parser.next_token();
                 if next_token != Token::EOF {
                     tracing::trace!("parsing 'additional_columns' for search failed. Expected EOF, but got {next_token:?}");
-                    return Err(super::Error::InvalidAdditionalColumns{
+                    return Err(crate::error::Error::InvalidAdditionalColumns{
                         additional_column: c.clone(),
                     });
                 }

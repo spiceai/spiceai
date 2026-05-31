@@ -13,12 +13,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::tools::SpiceModelTool;
 use app::App;
 use async_trait::async_trait;
 use datafusion::sql::TableReference;
 use itertools::Itertools;
-use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use tools::SpiceModelTool;
+
+pub const SPICE_DEFAULT_CATALOG: &str = "spice";
+pub const SPICE_DEFAULT_SCHEMA: &str = "public";
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use runtime_query_engine::query_engine::QueryEngine;
 use serde::{Deserialize, Serialize};

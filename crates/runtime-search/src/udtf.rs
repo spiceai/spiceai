@@ -295,6 +295,26 @@ pub fn closest_column(target: &str, candidates: &[String]) -> Option<String> {
     }
 }
 
+/// Parse a scalar value as a u64 limit parameter.
+pub fn parse_limit_scalar(scalar: &ScalarValue) -> DataFusionResult<u64> {
+    match scalar {
+        ScalarValue::Int64(Some(limit)) => u64::try_from(*limit).map_err(|_| {
+            DataFusionError::Plan(format!(
+                "Limit argument must be a non-negative integer, but got {limit}."
+            ))
+        }),
+        ScalarValue::UInt64(Some(limit)) => Ok(*limit),
+        ScalarValue::Utf8(Some(limit_str)) => limit_str.parse::<u64>().map_err(|_| {
+            DataFusionError::Plan(format!(
+                "Limit argument must be a non-negative integer, but got '{limit_str}'."
+            ))
+        }),
+        _ => Err(DataFusionError::Plan(format!(
+            "Limit argument must be a non-negative integer, but got {scalar}."
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Text search
 // ---------------------------------------------------------------------------

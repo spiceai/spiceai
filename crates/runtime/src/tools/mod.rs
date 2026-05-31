@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 pub use runtime_tools::tooling::Tooling;
-use std::sync::Arc;
 pub use tools::SpiceModelTool;
 
 pub mod builtin;

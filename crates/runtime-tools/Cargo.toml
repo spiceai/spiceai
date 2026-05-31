@@ -10,6 +10,7 @@ version.workspace = true
 
 [dependencies]
 arrow.workspace = true
+arrow-json.workspace = true
 arrow-schema.workspace = true
 arrow_tools = { path = "../arrow_tools" }
 app = { path = "../app" }
@@ -25,6 +26,7 @@ http.workspace = true
 rmcp = { workspace = true, optional = true }
 runtime-auth = { path = "../runtime-auth" }
 runtime-query-engine = { path = "../runtime-query-engine" }
+runtime-search = { path = "../runtime-search" }
 runtime-request-context = { path = "../runtime-request-context" }
 schemars.workspace = true
 serde.workspace = true

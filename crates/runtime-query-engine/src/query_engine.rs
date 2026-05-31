@@ -42,6 +42,7 @@ use crate::allowlist::ResolvedTableAwareAllowlist;
 
 /// Errors returned by [`QueryEngine`] methods.
 #[derive(Snafu, Debug)]
+#[snafu(visibility(pub))]
 pub enum Error {
     #[snafu(display("Failed to retrieve schema for table '{table_ref}': {source}"))]
     GetSchema {

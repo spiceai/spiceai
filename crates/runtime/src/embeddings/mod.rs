@@ -13,9 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-pub mod common;
+pub use runtime_search::embeddings::common;
 pub mod connector;
-pub mod execution_plan;
+pub use runtime_search::embeddings::execution_plan;
 
 pub mod index;
 pub mod metrics;
@@ -23,28 +23,7 @@ pub mod table;
 pub mod task;
 pub mod udtf;
 
-use std::sync::Arc;
-
-use chunking::{Chunker, ChunkingConfig};
-use llms::embeddings::Error as EmbedError;
-
-use crate::model::EmbeddingModelStore;
-use tokio::sync::RwLock;
-
-/// Makes a [`Chunker`] from [`ChunkingConfig`] and a column's embedding model in [`EmbeddingModelStore`].
-async fn construct_chunker(
-    model_name: &str,
-    chunk_config: &ChunkingConfig<'_>,
-    embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
-) -> Result<Arc<dyn Chunker>, EmbedError> {
-    let embedding_models_guard = embedding_models.read().await;
-    let Some(embed_model) = embedding_models_guard.get(model_name) else {
-        return Err(EmbedError::ModelDoesNotExist {
-            model_name: model_name.to_string(),
-        });
-    };
-    embed_model.chunker(chunk_config)
-}
+pub use runtime_search::embeddings::{EmbeddingModelStore, construct_chunker};
 
 #[cfg(test)]
 pub(crate) mod tests {

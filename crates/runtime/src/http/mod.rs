@@ -29,9 +29,10 @@ use tokio::sync::watch::{self, Receiver};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
-use crate::search::search_engine::SearchEngine;
+use runtime_search::search_engine::SearchEngine;
+use runtime_search::search_engine::parse_explicit_primary_keys;
 use crate::{
-    Runtime, config, metrics as runtime_metrics, search::util::parse_explicit_primary_keys,
+    Runtime, config, metrics as runtime_metrics,
     tls::TlsConfig,
 };
 
@@ -129,6 +130,7 @@ where
         SearchEngine::new(
             Arc::clone(&rt.df) as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
             parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
+            crate::search::util::RuntimeTableProviderExplorer,
         )
         .with_search_cache(rt.df.search_cache_provider()),
     );

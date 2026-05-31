@@ -20,7 +20,7 @@ use crate::datafusion::DataFusion;
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 use crate::model::ModelContextLayer;
 use crate::request::DatabricksAuthExtension;
-use crate::{search::search_engine, status::RuntimeStatus};
+use crate::status::RuntimeStatus;
 
 use crate::Runtime;
 use crate::cluster::ExecutorRegistry;
@@ -314,7 +314,11 @@ const HEALTH_REQUEST_BODY_LIMIT: usize = 128 * 1024; // 128 KiB
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
     config: Arc<config::Config>,
-    search: Arc<search_engine::SearchEngine>,
+    search: Arc<
+        runtime_search::search_engine::SearchEngine<
+            crate::search::util::RuntimeTableProviderExplorer,
+        >,
+    >,
     auth_layer: Option<AuthLayer>,
     cors_config: &CorsConfig,
     #[cfg(feature = "mcp")] mcp_config: Option<&McpConfig>,

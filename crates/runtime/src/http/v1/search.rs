@@ -13,12 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::search::{
-    Error as VectorSearchError,
-    request::{SearchRequest, SearchRequestHTTPJson},
-    search_engine::SearchEngine,
-    types::{Match, to_matches_sorted},
-};
+use runtime_search::error::Error as VectorSearchError;
+use runtime_search::request::{SearchRequest, SearchRequestHTTPJson};
+use runtime_search::search_engine::SearchEngine;
+use runtime_search::types::{Match, to_matches_sorted};
 use axum::{
     Extension, Json,
     http::StatusCode,
@@ -119,7 +117,7 @@ struct SearchResponse {
     )
 ))]
 pub(crate) async fn post(
-    Extension(vs): Extension<Arc<SearchEngine>>,
+    Extension(vs): Extension<Arc<SearchEngine<crate::search::util::RuntimeTableProviderExplorer>>>,
     Json(payload): Json<SearchRequestHTTPJson>,
 ) -> Response {
     let start_time = Instant::now();

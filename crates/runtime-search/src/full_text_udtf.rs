@@ -39,7 +39,7 @@ use datafusion::{
 };
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 
-use moka::future::FutureExt;
+use futures::FutureExt;
 #[cfg(feature = "elasticsearch")]
 use search::index::elasticsearch::ElasticsearchTextIndex;
 use search::{
@@ -51,15 +51,13 @@ use std::any::Any;
 use std::sync::LazyLock;
 use std::sync::{Arc, Weak};
 
-use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
-use crate::{
-    datafusion::DataFusion,
-    embeddings::udtf::parse_limit_scalar,
-    search::util::{find_index_in_table_provider, table_ref_from_column_expr},
-};
+use crate::table_provider_explorer::TableProviderExplorer;
+use crate::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFuncArgs, table_ref_from_column_expr, parse_limit_scalar};
+use runtime_query_engine::query_engine::QueryEngine;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
-use runtime_search::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFuncArgs};
+pub const SPICE_DEFAULT_CATALOG: &str = "spice";
+pub const SPICE_DEFAULT_SCHEMA: &str = "public";
 
 /// Creates a `UserDefined` signature that allows named parameters (like `rank_weight => X`)
 /// to pass through for RRF (Reciprocal Rank Fusion) operations.
@@ -101,37 +99,36 @@ fn all_indexed_fields(fts_indexes: &[&FullTextDatabaseIndex]) -> Vec<String> {
 /// Suggest the closest indexed column for a misspelled column name using
 /// case-insensitive Levenshtein distance. Returns `None` if no column is reasonably close.
 fn suggest_column(target: &str, candidates: &[String]) -> Option<String> {
-    runtime_search::udtf::closest_column(target, candidates)
+    crate::udtf::closest_column(target, candidates)
 }
 
 #[derive(Debug)]
-pub struct TextSearchTableFunc {
-    // This needs to be a weak reference because the DataFusion instance contains the SessionContext which contains this UDTF.
-    df: Weak<DataFusion>,
-    // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `DataFusion` implement them.
+pub struct TextSearchTableFunc<E: TableProviderExplorer> {
+    df: Weak<dyn QueryEngine>,
     df_ptr: u64,
+    explorer: E,
 }
 
-impl PartialEq for TextSearchTableFunc {
+impl<E: TableProviderExplorer> PartialEq for TextSearchTableFunc<E> {
     fn eq(&self, other: &Self) -> bool {
         self.df_ptr == other.df_ptr
     }
 }
 
-impl Eq for TextSearchTableFunc {}
+impl<E: TableProviderExplorer> Eq for TextSearchTableFunc<E> {}
 
-impl std::hash::Hash for TextSearchTableFunc {
+impl<E: TableProviderExplorer> std::hash::Hash for TextSearchTableFunc<E> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.df_ptr.hash(state);
     }
 }
 
-impl TextSearchTableFunc {
+impl<E: TableProviderExplorer> TextSearchTableFunc<E> {
     #[must_use]
-    pub fn new(df: Weak<DataFusion>) -> Self {
+    pub fn new(df: Weak<dyn QueryEngine>, explorer: E) -> Self {
         let ptr = df.as_ptr().addr() as u64;
 
-        Self { df, df_ptr: ptr }
+        Self { df, df_ptr: ptr, explorer }
     }
 
     fn scalar_invocation_error<T>() -> Result<T, DataFusionError> {
@@ -224,7 +221,7 @@ impl TextSearchTableFunc {
     }
 }
 
-impl TextSearchTableFunc {
+impl<E: TableProviderExplorer> TextSearchTableFunc<E> {
     pub(crate) fn to_expr(args: &TextSearchTableFuncArgs) -> Vec<Expr> {
         args.to_expr()
     }
@@ -386,7 +383,7 @@ impl TextSearchTableFunc {
     }
 }
 
-impl TableFunctionImpl for TextSearchTableFunc {
+impl<E: TableProviderExplorer + 'static> TableFunctionImpl for TextSearchTableFunc<E> {
     fn call(&self, args: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
         let args = Self::parse_args(args)?;
 
@@ -401,13 +398,13 @@ impl TableFunctionImpl for TextSearchTableFunc {
             )));
         };
 
-        let fts_indexes = find_index_in_table_provider::<FullTextDatabaseIndex>(&table_provider);
+        let fts_indexes = self.explorer.find_index::<FullTextDatabaseIndex>(&table_provider);
 
         // Phase 2: try Elasticsearch-backed text indexes if Tantivy found nothing.
         #[cfg(feature = "elasticsearch")]
         if fts_indexes.is_none()
             && let Some((es_indexes, _)) =
-                find_index_in_table_provider::<ElasticsearchTextIndex>(&table_provider)
+                self.explorer.find_index::<ElasticsearchTextIndex>(&table_provider)
             && !es_indexes.is_empty()
         {
             return Self::call_with_es_indexes(&es_indexes, &args, Arc::clone(&table_provider));
@@ -502,7 +499,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
     }
 }
 
-impl ScalarUDFImpl for TextSearchTableFunc {
+impl<E: TableProviderExplorer + 'static> ScalarUDFImpl for TextSearchTableFunc<E> {
     fn as_any(&self) -> &dyn Any {
         self
     }

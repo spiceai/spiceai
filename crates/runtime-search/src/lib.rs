@@ -15,6 +15,14 @@ limitations under the License.
 */
 
 pub mod candidate;
+pub mod embeddings;
+pub mod error;
+pub mod full_text;
+pub mod full_text_udtf;
 pub mod rerank;
+pub mod request;
 pub mod rrf;
+pub mod search_engine;
+pub mod table_provider_explorer;
+pub mod types;
 pub mod udtf;
