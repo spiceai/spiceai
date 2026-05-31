@@ -17,6 +17,7 @@ limitations under the License.
 //! HTAP test command — runs concurrent TPC-C OLTP workload against the source
 //! Postgres database while executing CH-benCH analytical queries through spiced.
 
+mod correctness;
 mod staleness;
 
 use std::sync::Arc;
@@ -242,17 +243,45 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         }
     }
 
+    // 10. Data-correctness gate: OLTP has stopped, so wait for replication to
+    //     fully drain (bounded by the test duration) and then assert that
+    //     source and Spice row counts match for every replicated table.
+    let probe_tables: Vec<String> = driver
+        .probe_tables()
+        .iter()
+        .map(|t| (*t).to_string())
+        .collect();
+    let correctness_result = {
+        let spice_client = spiced_instance.spice_client(None, true).await?;
+        correctness::verify_after_drain(Arc::clone(&driver), &spice_client, &probe_tables, duration)
+            .await
+    };
+
     let health_report = health_monitor.stop().await;
 
     if let Some(ref metrics) = spiced_metrics {
         emit_replication_metrics(metrics);
     }
 
+    let mut error_messages = Vec::new();
+
+    // Record correctness results (including OpenTelemetry metrics) before flushing telemetry below.
+    match correctness_result {
+        Ok(report) => {
+            report.emit();
+            if let Some(message) = report.failure_message() {
+                error_messages.push(message);
+            }
+        }
+        Err(e) => {
+            error_messages.push(format!("HTAP data-correctness error: {e}"));
+        }
+    }
+
     telemetry.emit().await?;
     spiced_instance.stop()?;
 
     let health_report = health_report?;
-    let mut error_messages = Vec::new();
 
     if !test_succeeded {
         error_messages.push(format!(
