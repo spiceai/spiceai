@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/src/http/v1/nsql.rs
-expression: body
+expression: context
 ---
 # Spice.ai NSQL Context
 - Write SQL for the Spice runtime, which uses Apache DataFusion with the SQL parser configured for the PostgreSQL dialect.
@@ -12,27 +12,10 @@ expression: body
 - Schema metadata includes table and column comments/descriptions when supplied by the connector or Spicepod.
 
 ## Datasets
-- `sales.orders`: Customer orders
-- `support_tickets`: Customer support tickets
+No datasets are currently in scope.
 
 ## Schemas
-| table_reference | column_name | data_type | nullable | description |
-| --- | --- | --- | --- | --- |
-| sales.orders | order_id | Int64 | false | Unique order identifier |
-| sales.orders | customer_id | Utf8 | false | Customer account identifier |
-| support_tickets | ticket_id | Int64 | false | Support ticket identifier |
-| support_tickets | sentiment | Utf8 | true | Model-derived sentiment label |
-
-## Dataset Relationships
-### `sales.orders`
-- Primary key: `order_id`
-- Foreign keys:
-    - (`customer_id`) references `spice.sales.customers` (`id`)
-- Indexes:
-    - `customer_id`: `customer_id` (enabled, spicepod.acceleration.indexes)
-- Search indexes:
-    - vector search on `customer_id` using `embed_model`. Syntax: `vector_search(sales.orders, 'query text', customer_id)`. Engine/index: `duckdb_vector_index`. Row id: `order_id`.
-    - full-text search on `customer_id` using `tantivy`. Syntax: `text_search(sales.orders, 'query text', customer_id)`. Row id: `order_id`.
+No schema information is available.
 
 ## SQL Functions
 Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions:
@@ -43,16 +26,3 @@ Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. Th
 
 ### User-defined functions
 - `ticket_priority`: scalar function from `sql` with `stable` volatility. Syntax: `ticket_priority(sentiment utf8) -> int64`. Converts support-ticket sentiment into a priority score.
-
-## Sample Data
-
-### Distinct value samples for `support_tickets`
-| sentiment |
-| --- |
-| positive |
-| negative |
-
-### Example rows for `sales.orders`
-| order_id | customer_id |
-| --- | --- |
-| 42 | CUST-1 |
