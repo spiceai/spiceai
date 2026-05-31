@@ -37,10 +37,11 @@ use runtime_tools::builtin::sample::{SampleTableMethod, tool::SampleDataTool};
 use tools::SpiceModelTool;
 
 use runtime_tools::builtin::list_datasets::ListDatasetsTool;
+use runtime_tools::builtin::search::SearchTool;
 use runtime_tools::builtin::sql::SqlTool;
 use runtime_tools::builtin::table_schema::TableSchemaTool;
 
-use super::{get_readiness::GetReadinessTool, search::SearchTool};
+use super::get_readiness::GetReadinessTool;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -158,6 +159,7 @@ impl BuiltinToolCatalog {
                     Arc::clone(&self.df),
                     Arc::clone(&self.app),
                     self.search_cache.clone(),
+                    crate::search::util::RuntimeTableProviderExplorer,
                     Some(name),
                     description,
                 )

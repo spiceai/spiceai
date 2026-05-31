@@ -19,7 +19,6 @@ pub use runtime_search::embeddings::execution_plan;
 
 pub mod index;
 pub mod metrics;
-pub mod table;
 pub mod task;
 pub mod udtf;
 

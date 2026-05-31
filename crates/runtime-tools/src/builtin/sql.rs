@@ -19,13 +19,13 @@ use std::{borrow::Cow, sync::Arc};
 
 use crate::builtin::function_tool::current_principal_requires_read_only;
 use crate::utils::{parameters, write_to_json_string};
-use tools::SpiceModelTool;
 use futures::TryStreamExt;
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tools::SpiceModelTool;
 use tracing::Span;
 use tracing_futures::Instrument;
 
@@ -129,4 +129,3 @@ impl SpiceModelTool for SqlTool {
         }
     }
 }
-

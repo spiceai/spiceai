@@ -17,9 +17,9 @@ limitations under the License.
 use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc};
 
+use super::embeddings::table::EmbeddingTable;
 use crate::candidate::vector::ChunkedNonIndexVectorGeneration;
 use crate::candidate::vector_udtf::VectorUDTFGeneration;
-use crate::embeddings::table::EmbeddingTable;
 use crate::error::{DataFusionSnafu, Error, FormattingSnafu, Result, SearchPipelineSnafu};
 use crate::table_provider_explorer::TableProviderExplorer;
 
@@ -47,13 +47,13 @@ use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
 const EMBED_UDF_NAME: &str = "embed";
 use runtime_query_engine::query_engine::QueryEngine;
 use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
-#[cfg(feature = "duckdb")]
-use search::index::duckdb::DuckDBVectorIndex;
-#[cfg(feature = "s3_vectors")]
-use search::index::s3_vectors::S3Vector;
 use search::index::SearchIndex;
 use search::index::chunking::ChunkedSearchIndex;
+#[cfg(feature = "duckdb")]
+use search::index::duckdb::DuckDBVectorIndex;
 use search::index::native_vector::NativeVectorIndex;
+#[cfg(feature = "s3_vectors")]
+use search::index::s3_vectors::S3Vector;
 use search::{
     aggregation::{AggregationResult, reciprocal_rank::ReciprocalRankFusion},
     generation::CandidateGeneration,
@@ -109,11 +109,19 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
     async fn user_tables_that_can_search(&self) -> Result<Vec<TableReference>> {
         let mut searchable_tables = Vec::new();
         for t in self.df.get_user_table_names() {
-            if self.embedding_columns_from_table(&t).await.is_some_and(|cols| !cols.is_empty()) {
+            if self
+                .embedding_columns_from_table(&t)
+                .await
+                .is_some_and(|cols| !cols.is_empty())
+            {
                 searchable_tables.push(t);
                 continue;
             }
-            if self.full_text_search_candidates(&t).await.is_some_and(|fts_res| fts_res.is_ok_and(|c| !c.is_empty())) {
+            if self
+                .full_text_search_candidates(&t)
+                .await
+                .is_some_and(|fts_res| fts_res.is_ok_and(|c| !c.is_empty()))
+            {
                 searchable_tables.push(t);
             }
         }
@@ -124,7 +132,10 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         let table_provider = self.df.get_table(tbl).await?;
         let mut embedding_columns: HashSet<String> = HashSet::default();
 
-        if let Some(embedding_table) = self.explorer.find_concrete::<EmbeddingTable>(&table_provider) {
+        if let Some(embedding_table) = self
+            .explorer
+            .find_concrete::<EmbeddingTable>(&table_provider)
+        {
             for c in embedding_table.get_embedding_columns() {
                 embedding_columns.insert(c);
             }
@@ -138,14 +149,20 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
             }
         }
 
-        if let Some((indexes, _)) = self.explorer.find_index::<ChunkedSearchIndex>(&table_provider) {
+        if let Some((indexes, _)) = self
+            .explorer
+            .find_index::<ChunkedSearchIndex>(&table_provider)
+        {
             embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
         }
 
         #[cfg(feature = "elasticsearch")]
         {
             use search::index::elasticsearch::ElasticsearchIndex;
-            if let Some((indexes, _)) = self.explorer.find_index::<ElasticsearchIndex>(&table_provider) {
+            if let Some((indexes, _)) = self
+                .explorer
+                .find_index::<ElasticsearchIndex>(&table_provider)
+            {
                 embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
             }
         }
@@ -153,7 +170,10 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         #[cfg(feature = "duckdb")]
         {
             use search::index::duckdb::DuckDBVectorIndex;
-            if let Some((indexes, _)) = self.explorer.find_index::<DuckDBVectorIndex>(&table_provider) {
+            if let Some((indexes, _)) = self
+                .explorer
+                .find_index::<DuckDBVectorIndex>(&table_provider)
+            {
                 embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
             }
         }
@@ -173,7 +193,10 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 
         let base_table_provider = self.df.get_table(tbl).await?;
 
-        let Some(indexed_table) = self.explorer.find_concrete::<IndexedTableProvider>(&base_table_provider) else {
+        let Some(indexed_table) = self
+            .explorer
+            .find_concrete::<IndexedTableProvider>(&base_table_provider)
+        else {
             return Some(Ok(vec![]));
         };
 
@@ -275,8 +298,9 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                 is_chunked,
             )))
         } else {
-            let Some(embedding_table) =
-                self.explorer.find_concrete::<EmbeddingTable>(&table_provider)
+            let Some(embedding_table) = self
+                .explorer
+                .find_concrete::<EmbeddingTable>(&table_provider)
             else {
                 return Err(Error::CannotVectorSearchDataset {
                     data_source: tbl.clone(),

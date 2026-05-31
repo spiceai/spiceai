@@ -23,7 +23,6 @@ use crate::{
     model::LLMChatCompletionsModelStore,
     tools::utils::create_tool_use_messages,
 };
-use runtime_tools::builtin::table_schema::{TableSchemaTool, TableSchemaToolParams};
 use async_openai::types::chat::ChatCompletionRequestMessage;
 use axum::{
     Extension, Json,
@@ -40,6 +39,7 @@ use headers_accept::Accept;
 use http::HeaderMap;
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_tools::builtin::table_schema::{TableSchemaTool, TableSchemaToolParams};
 
 use arrow::array::RecordBatch;
 use itertools::Itertools;

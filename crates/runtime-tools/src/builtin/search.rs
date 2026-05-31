@@ -22,35 +22,36 @@ use tracing_futures::Instrument;
 
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 
-use crate::search::util::RuntimeTableProviderExplorer;
+use crate::builtin::list_datasets::get_dataset_elements;
+use crate::utils::parameters;
 use app::App;
 use cache::TabledCacheProvider;
 use cache::result::search::CachedSearchResult;
 use runtime_query_engine::query_engine::QueryEngine;
 use runtime_request_context::{AsyncMarker, RequestContext};
-use runtime_search::search_engine::{SearchEngine, parse_explicit_primary_keys};
 use runtime_search::request::{SearchRequest, SearchRequestBaseJson};
+use runtime_search::search_engine::{SearchEngine, parse_explicit_primary_keys};
+use runtime_search::table_provider_explorer::TableProviderExplorer;
 use runtime_search::types::to_pretty;
-use runtime_tools::builtin::list_datasets::get_dataset_elements;
-use runtime_tools::utils::parameters;
 use tokio::sync::RwLock;
 use tools::SpiceModelTool;
 
-pub struct SearchTool {
+pub struct SearchTool<E: TableProviderExplorer + Clone> {
     name: String,
     description: String,
     df: Arc<dyn QueryEngine>,
     app: Arc<RwLock<Option<Arc<App>>>>,
     search_cache: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
     table_allowlist: Option<ResolvedTableAwareAllowlist>,
-    explorer: RuntimeTableProviderExplorer,
+    explorer: E,
 }
-impl SearchTool {
+impl<E: TableProviderExplorer + Clone> SearchTool<E> {
     #[must_use]
     pub fn new(
         df: Arc<dyn QueryEngine>,
         app: Arc<RwLock<Option<Arc<App>>>>,
         search_cache: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
+        explorer: E,
         name: Option<&str>,
         description: Option<&str>,
     ) -> Self {
@@ -63,7 +64,7 @@ impl SearchTool {
             app,
             search_cache,
             table_allowlist: None,
-            explorer: RuntimeTableProviderExplorer,
+            explorer,
         }
     }
     #[must_use]
@@ -74,7 +75,7 @@ impl SearchTool {
 }
 
 #[async_trait]
-impl SpiceModelTool for SearchTool {
+impl<E: TableProviderExplorer + Clone + 'static> SpiceModelTool for SearchTool<E> {
     fn name(&self) -> Cow<'_, str> {
         self.name.clone().into()
     }

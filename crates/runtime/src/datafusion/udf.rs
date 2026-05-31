@@ -28,8 +28,6 @@ use crate::datafusion::udtf::json_properties::{
 };
 use crate::datafusion::udtf::json_tree::{JSON_TREE_UDTF_NAME, JsonTreeScalar, JsonTreeTableFunc};
 use crate::embeddings::udtf::VectorSearchTableFunc;
-use runtime_search::full_text_udtf::TextSearchTableFunc;
-use runtime_search::search_engine::parse_explicit_primary_keys;
 use datafusion::execution::FunctionRegistry;
 use datafusion::functions::math::random::RandomFunc;
 use datafusion::logical_expr::ScalarUDF;
@@ -42,9 +40,11 @@ use runtime_datafusion_udfs::{
     embed::{self, EMBED_UDF_NAME},
 };
 use runtime_query_engine::query_engine::QueryEngine;
+use runtime_search::full_text_udtf::TextSearchTableFunc;
 use runtime_search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
 use runtime_search::rrf;
 use runtime_search::rrf::RRF_UDF_NAME;
+use runtime_search::search_engine::parse_explicit_primary_keys;
 use runtime_search::udtf::{TEXT_SEARCH_UDTF_NAME, VECTOR_SEARCH_UDTF_NAME};
 use runtime_secrets::{ExposeSecret, get_params_with_secrets};
 #[cfg(not(feature = "models"))]
@@ -86,10 +86,19 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     let ctx = &runtime.df.ctx;
     register_core_scalar_udfs(ctx);
 
-    ctx.register_udf(TextSearchTableFunc::new(Arc::downgrade(&runtime.df) as _, crate::search::util::RuntimeTableProviderExplorer).into());
+    ctx.register_udf(
+        TextSearchTableFunc::new(
+            Arc::downgrade(&runtime.df) as _,
+            crate::search::util::RuntimeTableProviderExplorer,
+        )
+        .into(),
+    );
     ctx.register_udtf(
         TEXT_SEARCH_UDTF_NAME,
-        Arc::new(TextSearchTableFunc::new(Arc::downgrade(&runtime.df) as _, crate::search::util::RuntimeTableProviderExplorer)),
+        Arc::new(TextSearchTableFunc::new(
+            Arc::downgrade(&runtime.df) as _,
+            crate::search::util::RuntimeTableProviderExplorer,
+        )),
     );
 
     let explicit_pks = parse_explicit_primary_keys(runtime.app()).await;

@@ -29,12 +29,9 @@ use tokio::sync::watch::{self, Receiver};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
+use crate::{Runtime, config, metrics as runtime_metrics, tls::TlsConfig};
 use runtime_search::search_engine::SearchEngine;
 use runtime_search::search_engine::parse_explicit_primary_keys;
-use crate::{
-    Runtime, config, metrics as runtime_metrics,
-    tls::TlsConfig,
-};
 
 #[cfg(feature = "openapi")]
 pub use routes::get_api_doc;

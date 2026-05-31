@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::utils::parameters;
-use tools::SpiceModelTool;
 use app::App;
 use arrow_schema::{Field, Schema};
 use arrow_tools::format::table_schemas_to_markdown_table;
@@ -40,6 +39,7 @@ use spicepod::semantic::Column;
 use std::collections::HashMap;
 use std::{borrow::Cow, sync::Arc};
 use tokio::sync::RwLock;
+use tools::SpiceModelTool;
 use tracing_futures::Instrument;
 
 /// A tool to retrieve the schema of one or more available SQL tables.
@@ -135,8 +135,7 @@ impl TableSchemaTool {
                     if self.table_allowlist.as_ref().is_some_and(|list| {
                         !list.table_is_allowed(&TableReference::parse_str(t.as_str()))
                     }) {
-                        return Err(DataFusionError::Plan(format!("No table named {t}")))
-                        .boxed();
+                        return Err(DataFusionError::Plan(format!("No table named {t}"))).boxed();
                     }
                     let base_schema = self
                         .df

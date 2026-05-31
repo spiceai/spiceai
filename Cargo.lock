@@ -16381,6 +16381,7 @@ dependencies = [
  "arrow_tools",
  "async-openai",
  "async-trait",
+ "cache",
  "chrono",
  "datafusion",
  "fundu",

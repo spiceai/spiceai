@@ -19,14 +19,12 @@ use std::sync::Arc;
 use datafusion::datasource::TableProvider;
 use runtime_datafusion_index::Index;
 
-/// Trait for unwrapping nested `TableProvider` layers to find concrete types.
+/// Handles finding specific [`TableProvider`] and [`Index`] for a given [`TableProvider`].
 ///
-/// Implementations peel through runtime-specific wrappers (e.g. `AcceleratedTable`,
-/// `FederatedTableProviderAdaptor`, `EmbeddingTable`, etc.) to find a requested
-/// concrete type via `as_any().downcast_ref::<T>()`.
-///
-/// `SearchEngine` is generic over this trait so it can find embedding tables
-/// and search indexes without depending on the concrete wrapper types.
+/// Various implementations of [`TableProvider`] are middleware atop other [`TableProvider`]s,
+///  sometimes to support [`Index`], or for other reasons. This trait provide a mechanism for
+/// finding or checking that a given specific [`TableProvider`] has/is a [`TableProvider`]
+///  or [`Index`].
 pub trait TableProviderExplorer: Send + Sync + std::fmt::Debug {
     /// Find a concrete `TableProvider` type inside a (possibly wrapped) provider.
     fn find_concrete<'a, T: TableProvider + 'static>(

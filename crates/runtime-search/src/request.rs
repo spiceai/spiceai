@@ -202,7 +202,9 @@ impl SearchRequest {
         Ok(expr)
     }
 
-    pub fn parse_additional_columns(additional_columns: &[String]) -> crate::error::Result<Vec<Column>> {
+    pub fn parse_additional_columns(
+        additional_columns: &[String],
+    ) -> crate::error::Result<Vec<Column>> {
         additional_columns
             .iter()
             .map(|c| {

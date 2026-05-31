@@ -16,6 +16,7 @@ arrow_tools = { path = "../arrow_tools" }
 app = { path = "../app" }
 async-openai.workspace = true
 async-trait.workspace = true
+cache = { path = "../cache" }
 chrono.workspace = true
 datafusion.workspace = true
 fundu.workspace = true

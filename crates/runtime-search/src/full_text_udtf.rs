@@ -52,7 +52,9 @@ use std::sync::LazyLock;
 use std::sync::{Arc, Weak};
 
 use crate::table_provider_explorer::TableProviderExplorer;
-use crate::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFuncArgs, table_ref_from_column_expr, parse_limit_scalar};
+use crate::udtf::{
+    TEXT_SEARCH_UDTF_NAME, TextSearchTableFuncArgs, parse_limit_scalar, table_ref_from_column_expr,
+};
 use runtime_query_engine::query_engine::QueryEngine;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
@@ -128,7 +130,11 @@ impl<E: TableProviderExplorer> TextSearchTableFunc<E> {
     pub fn new(df: Weak<dyn QueryEngine>, explorer: E) -> Self {
         let ptr = df.as_ptr().addr() as u64;
 
-        Self { df, df_ptr: ptr, explorer }
+        Self {
+            df,
+            df_ptr: ptr,
+            explorer,
+        }
     }
 
     fn scalar_invocation_error<T>() -> Result<T, DataFusionError> {
@@ -222,10 +228,6 @@ impl<E: TableProviderExplorer> TextSearchTableFunc<E> {
 }
 
 impl<E: TableProviderExplorer> TextSearchTableFunc<E> {
-    pub(crate) fn to_expr(args: &TextSearchTableFuncArgs) -> Vec<Expr> {
-        args.to_expr()
-    }
-
     fn parse_args(args: &[Expr]) -> DataFusionResult<TextSearchTableFuncArgs> {
         // Split args into positional and named. Named args carry a
         // `spice.parameter_name` metadata key (set by the Spice DataFusion
@@ -398,13 +400,16 @@ impl<E: TableProviderExplorer + 'static> TableFunctionImpl for TextSearchTableFu
             )));
         };
 
-        let fts_indexes = self.explorer.find_index::<FullTextDatabaseIndex>(&table_provider);
+        let fts_indexes = self
+            .explorer
+            .find_index::<FullTextDatabaseIndex>(&table_provider);
 
         // Phase 2: try Elasticsearch-backed text indexes if Tantivy found nothing.
         #[cfg(feature = "elasticsearch")]
         if fts_indexes.is_none()
-            && let Some((es_indexes, _)) =
-                self.explorer.find_index::<ElasticsearchTextIndex>(&table_provider)
+            && let Some((es_indexes, _)) = self
+                .explorer
+                .find_index::<ElasticsearchTextIndex>(&table_provider)
             && !es_indexes.is_empty()
         {
             return Self::call_with_es_indexes(&es_indexes, &args, Arc::clone(&table_provider));

@@ -14,40 +14,45 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fmt::Debug, sync::Arc};
+//! A simple [`QueryEngine`] implementation backed by a bare [`SessionContext`].
+//!
+//! Useful for unit tests and lightweight scenarios that don't need the full
+//! runtime `DataFusion` wrapper.
+
+use std::fmt::Debug;
+use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use datafusion::{
-    catalog::TableProvider,
-    common::DataFusionError,
-    execution::{SendableRecordBatchStream, context::SQLOptions},
-    logical_expr::LogicalPlan,
-    physical_plan::{ExecutionPlan, collect},
-    prelude::SessionContext,
-    sql::TableReference,
-};
-use snafu::ResultExt;
+use datafusion::datasource::TableProvider;
+use datafusion::error::DataFusionError;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::logical_expr::LogicalPlan;
+use datafusion::prelude::SessionContext;
+use datafusion::sql::TableReference;
 
-use crate::query_engine::{
-    Error, GetSchemaSnafu, QueryEngine, QueryExecutionSnafu, QueryRequest, Result, UpdateType,
-    WriteDataSnafu,
-};
+use crate::query_engine::{Error, QueryEngine, QueryRequest, Result, UpdateType};
 
+/// A [`QueryEngine`] backed directly by a [`SessionContext`].
+#[derive(Debug)]
 pub struct QuerySession {
     ctx: Arc<SessionContext>,
 }
 
-impl Debug for QuerySession {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QuerySession").finish_non_exhaustive()
-    }
-}
-
 impl QuerySession {
+    /// Create a new `QuerySession` wrapping the given context.
+    #[must_use]
     pub fn new(ctx: Arc<SessionContext>) -> Self {
         Self { ctx }
+    }
+
+    /// Create a new `QuerySession` with a default `SessionContext`.
+    #[must_use]
+    pub fn default_session() -> Self {
+        Self {
+            ctx: Arc::new(SessionContext::new()),
+        }
     }
 }
 
@@ -62,7 +67,7 @@ impl QueryEngine for QuerySession {
     }
 
     fn get_table_sync(&self, _table_ref: &TableReference) -> Option<Arc<dyn TableProvider>> {
-        None
+        None // sync lookup not supported for bare SessionContext
     }
 
     fn table_exists(&self, table_ref: &TableReference) -> bool {
@@ -70,41 +75,38 @@ impl QueryEngine for QuerySession {
     }
 
     async fn get_arrow_schema(&self, table_ref: TableReference) -> Result<Schema> {
-        let tbl = self
-            .ctx
-            .table_provider(table_ref.clone())
+        let provider = self
+            .get_table(&table_ref)
             .await
-            .context(GetSchemaSnafu {
+            .ok_or_else(|| Error::GetSchema {
                 table_ref: table_ref.to_string(),
+                source: DataFusionError::Plan(format!("Table '{table_ref}' not found")),
             })?;
-        Ok(Arc::unwrap_or_clone(tbl.schema()))
+        Ok(provider.schema().as_ref().clone())
     }
 
     fn get_user_table_names(&self) -> Vec<TableReference> {
         self.ctx
             .catalog_names()
-            .iter()
+            .into_iter()
             .flat_map(|catalog| {
-                let Some(cat) = self.ctx.catalog(catalog) else {
+                let Some(cat) = self.ctx.catalog(&catalog) else {
                     return vec![];
                 };
                 cat.schema_names()
-                    .iter()
+                    .into_iter()
                     .flat_map(|schema| {
-                        cat.schema(schema)
-                            .map(|s| {
-                                s.table_names()
-                                    .into_iter()
-                                    .map(|t| {
-                                        TableReference::full(
-                                            Arc::from(catalog.clone()),
-                                            Arc::from(schema.clone()),
-                                            Arc::from(t),
-                                        )
-                                    })
-                                    .collect::<Vec<_>>()
+                        let Some(sch) = cat.schema(&schema) else {
+                            return vec![];
+                        };
+                        sch.table_names()
+                            .into_iter()
+                            .map(|table| TableReference::Full {
+                                catalog: catalog.as_str().into(),
+                                schema: schema.as_str().into(),
+                                table: table.into(),
                             })
-                            .unwrap_or_default()
+                            .collect::<Vec<_>>()
                     })
                     .collect::<Vec<_>>()
             })
@@ -112,38 +114,11 @@ impl QueryEngine for QuerySession {
     }
 
     fn get_public_table_names(&self) -> Result<Vec<String>> {
-        let default_catalog =
-            self.ctx
-                .catalog_names()
-                .into_iter()
-                .next()
-                .ok_or(Error::GetTableNames {
-                    source: DataFusionError::Internal("No catalogs registered".to_string()),
-                })?;
-        let catalog = self
-            .ctx
-            .catalog(&default_catalog)
-            .ok_or(Error::GetTableNames {
-                source: DataFusionError::Internal(format!("Catalog '{default_catalog}' not found")),
-            })?;
-        let default_schema =
-            catalog
-                .schema_names()
-                .into_iter()
-                .next()
-                .ok_or(Error::GetTableNames {
-                    source: DataFusionError::Internal(format!(
-                        "No schemas in catalog '{default_catalog}'"
-                    )),
-                })?;
-        let schema = catalog
-            .schema(&default_schema)
-            .ok_or_else(|| Error::GetTableNames {
-                source: DataFusionError::Internal(format!(
-                    "Schema '{default_schema}' not found in catalog '{default_catalog}'"
-                )),
-            })?;
-        Ok(schema.table_names())
+        Ok(self
+            .get_user_table_names()
+            .into_iter()
+            .map(|t| t.to_string())
+            .collect())
     }
 
     fn is_writable(&self, _table_ref: &TableReference) -> bool {
@@ -155,97 +130,37 @@ impl QueryEngine for QuerySession {
     }
 
     async fn execute_query(&self, request: QueryRequest) -> Result<SendableRecordBatchStream> {
-        let options = if request.read_only {
-            SQLOptions::new()
-                .with_allow_ddl(false)
-                .with_allow_dml(false)
-                .with_allow_statements(false)
-        } else {
-            SQLOptions::new()
-        };
-
-        let plan = self
+        let df = self
             .ctx
-            .state()
-            .create_logical_plan(&request.sql)
+            .sql(&request.sql)
             .await
-            .context(QueryExecutionSnafu)?;
-
-        options.verify_plan(&plan).context(QueryExecutionSnafu)?;
-
-        let plan = if let Some(params) = request.parameters {
-            plan.with_param_values(params)
-                .context(QueryExecutionSnafu)?
-        } else {
-            plan
-        };
-
-        self.ctx
-            .execute_logical_plan(plan)
+            .map_err(|source| Error::QueryExecution { source })?;
+        df.execute_stream()
             .await
-            .context(QueryExecutionSnafu)?
-            .execute_stream()
-            .await
-            .context(QueryExecutionSnafu)
+            .map_err(|source| Error::QueryExecution { source })
     }
 
     async fn execute_plan(&self, plan: LogicalPlan) -> Result<SendableRecordBatchStream> {
-        self.ctx
+        let df = self
+            .ctx
             .execute_logical_plan(plan)
             .await
-            .context(QueryExecutionSnafu)?
-            .execute_stream()
+            .map_err(|source| Error::QueryExecution { source })?;
+        df.execute_stream()
             .await
-            .context(QueryExecutionSnafu)
+            .map_err(|source| Error::QueryExecution { source })
     }
 
     async fn write_data(
         &self,
         table_ref: &TableReference,
-        schema: Arc<Schema>,
-        data: Vec<RecordBatch>,
-        update_type: UpdateType,
+        _schema: Arc<Schema>,
+        _data: Vec<RecordBatch>,
+        _update_type: UpdateType,
     ) -> Result<()> {
-        let provider =
-            self.ctx
-                .table_provider(table_ref.clone())
-                .await
-                .context(WriteDataSnafu {
-                    table_ref: table_ref.to_string(),
-                })?;
-
-        let insert_op = match update_type {
-            UpdateType::Append => datafusion::logical_expr::dml::InsertOp::Append,
-            UpdateType::Overwrite => datafusion::logical_expr::dml::InsertOp::Overwrite,
-            UpdateType::Changes => datafusion::logical_expr::dml::InsertOp::Replace,
-        };
-
-        let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![data]).context(
-            WriteDataSnafu {
-                table_ref: table_ref.to_string(),
-            },
-        )?;
-
-        let scan = mem_table
-            .scan(&self.ctx.state(), None, &[], None)
-            .await
-            .context(WriteDataSnafu {
-                table_ref: table_ref.to_string(),
-            })?;
-
-        let insert_plan = provider
-            .insert_into(&self.ctx.state(), scan, insert_op)
-            .await
-            .context(WriteDataSnafu {
-                table_ref: table_ref.to_string(),
-            })?;
-
-        collect(insert_plan, self.ctx.task_ctx())
-            .await
-            .context(WriteDataSnafu {
-                table_ref: table_ref.to_string(),
-            })?;
-
-        Ok(())
+        Err(Error::WriteData {
+            table_ref: table_ref.to_string(),
+            source: DataFusionError::Plan("QuerySession does not support writes".to_string()),
+        })
     }
 }

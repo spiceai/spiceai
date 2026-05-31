@@ -1179,3 +1179,500 @@ fn sort_by_rerank_score_desc(
     RecordBatch::try_new(batch.schema(), sorted_columns)
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rrf;
+    use arrow::array::{Float32Array, StringArray};
+    use arrow::util::pretty::pretty_format_batches;
+    use async_trait::async_trait;
+    use datafusion::logical_expr::expr::FieldMetadata;
+    use datafusion::logical_expr::{Volatility, create_udf};
+    use futures::TryStreamExt;
+    use runtime_request_context::{Protocol, RequestContext};
+    use std::collections::BTreeMap;
+
+    fn lit_utf8(s: &str) -> Expr {
+        Expr::Literal(ScalarValue::Utf8(Some(s.to_string())), None)
+    }
+
+    fn named_lit_utf8(name: &str, value: &str) -> Expr {
+        let meta = FieldMetadata::new(BTreeMap::from([(
+            "spice.parameter_name".to_string(),
+            name.to_string(),
+        )]));
+        Expr::Literal(ScalarValue::Utf8(Some(value.to_string())), Some(meta))
+    }
+
+    fn stub_udf(name: &str) -> Arc<datafusion::logical_expr::ScalarUDF> {
+        Arc::new(create_udf(
+            name,
+            vec![],
+            DataType::Utf8,
+            Volatility::Stable,
+            Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some("x".into()))))),
+        ))
+    }
+
+    fn vector_search_call(query: &str) -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(
+            stub_udf(VECTOR_SEARCH_UDTF_NAME),
+            vec![
+                Expr::Column(Column::new_unqualified("docs")),
+                lit_utf8(query),
+            ],
+        ))
+    }
+
+    fn text_search_call(query: &str) -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(
+            stub_udf(TEXT_SEARCH_UDTF_NAME),
+            vec![
+                Expr::Column(Column::new_unqualified("docs")),
+                lit_utf8(query),
+            ],
+        ))
+    }
+
+    fn rrf_call(children: Vec<Expr>) -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(stub_udf(RRF_UDF_NAME), children))
+    }
+
+    #[test]
+    fn extract_query_from_vector_search() {
+        let q = extract_query_literal(&vector_search_call("ocelots"));
+        assert_eq!(q.as_deref(), Some("ocelots"));
+    }
+
+    #[test]
+    fn extract_query_from_text_search() {
+        let q = extract_query_literal(&text_search_call("ferrets"));
+        assert_eq!(q.as_deref(), Some("ferrets"));
+    }
+
+    #[test]
+    fn extract_query_from_rrf_uses_first_child() {
+        let q = extract_query_literal(&rrf_call(vec![
+            vector_search_call("badgers"),
+            text_search_call("badgers"),
+        ]));
+        assert_eq!(q.as_deref(), Some("badgers"));
+    }
+
+    #[test]
+    fn extract_query_skips_named_args_in_vector_search() {
+        // vector_search(docs, distance_metric => 'l2', 'pangolins')
+        // — named arg lands at index 1 in the raw arg list, but the query
+        // is still the Utf8 literal at the 2nd positional slot.
+        let named = named_lit_utf8("distance_metric", "l2");
+        let expr = Expr::ScalarFunction(ScalarFunction::new_udf(
+            stub_udf(VECTOR_SEARCH_UDTF_NAME),
+            vec![
+                Expr::Column(Column::new_unqualified("docs")),
+                named,
+                lit_utf8("pangolins"),
+            ],
+        ));
+        assert_eq!(extract_query_literal(&expr).as_deref(), Some("pangolins"));
+    }
+
+    #[test]
+    fn extract_query_returns_none_for_non_search_call() {
+        let unknown = Expr::ScalarFunction(ScalarFunction::new_udf(
+            stub_udf("some_other_fn"),
+            vec![lit_utf8("x")],
+        ));
+        assert_eq!(extract_query_literal(&unknown), None);
+    }
+
+    #[test]
+    fn extract_query_returns_none_for_column_ref() {
+        let col = Expr::Column(Column::new_unqualified("docs"));
+        assert_eq!(extract_query_literal(&col), None);
+    }
+
+    #[test]
+    fn parse_args_requires_document() {
+        let args = vec![vector_search_call("q"), named_lit_utf8("model", "my_model")];
+        let err =
+            RerankTableFuncArgs::from_udtf_args(&args).expect_err("must require document column");
+        assert!(err.to_string().contains("'document =>"));
+    }
+
+    #[test]
+    fn parse_args_auto_propagates_query() {
+        let args = vec![
+            vector_search_call("llamas"),
+            named_lit_utf8("document", "content"),
+            named_lit_utf8("model", "my_model"),
+        ];
+        let parsed = RerankTableFuncArgs::from_udtf_args(&args).expect("parse ok");
+        assert_eq!(parsed.query.as_deref(), Some("llamas"));
+        assert_eq!(parsed.model.as_deref(), Some("my_model"));
+        assert_eq!(parsed.document, "content");
+    }
+
+    #[test]
+    fn parse_args_explicit_query_overrides_auto() {
+        let args = vec![
+            vector_search_call("auto_query"),
+            named_lit_utf8("document", "content"),
+            named_lit_utf8("query", "explicit_query"),
+        ];
+        let parsed = RerankTableFuncArgs::from_udtf_args(&args).expect("parse ok");
+        assert_eq!(parsed.query.as_deref(), Some("explicit_query"));
+    }
+
+    #[test]
+    fn parse_args_bare_table_needs_explicit_query_at_scan() {
+        // A bare Column is a valid input, but `query` stays None until
+        // explicitly provided. Scan-time enforcement is where the error
+        // surfaces; parse-time just records what we have.
+        let args = vec![
+            Expr::Column(Column::new_unqualified("tickets")),
+            named_lit_utf8("document", "body"),
+        ];
+        let parsed = RerankTableFuncArgs::from_udtf_args(&args).expect("parse ok");
+        assert!(matches!(parsed.input, RerankInput::Table(_)));
+        assert_eq!(parsed.query, None);
+    }
+
+    #[test]
+    fn parse_args_parses_strategy() {
+        let args = vec![
+            vector_search_call("q"),
+            named_lit_utf8("document", "content"),
+            named_lit_utf8("strategy", "pointwise"),
+        ];
+        let parsed = RerankTableFuncArgs::from_udtf_args(&args).expect("parse ok");
+        assert_eq!(parsed.strategy, Some(LlmStrategy::Pointwise));
+    }
+
+    #[test]
+    fn parse_args_parses_limit() {
+        let meta = FieldMetadata::new(BTreeMap::from([(
+            "spice.parameter_name".to_string(),
+            "limit".to_string(),
+        )]));
+        let args = vec![
+            vector_search_call("q"),
+            named_lit_utf8("document", "content"),
+            Expr::Literal(ScalarValue::UInt64(Some(10)), Some(meta)),
+        ];
+        let parsed = RerankTableFuncArgs::from_udtf_args(&args).expect("parse ok");
+        assert_eq!(parsed.limit, Some(10));
+    }
+
+    #[test]
+    fn output_schema_drops_score_columns_and_adds_rerank_score() {
+        let input_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("content", DataType::Utf8, false),
+            Field::new("_score", DataType::Float32, true),
+            // RRF emits its fused score as `_fused_score` (see
+            // `RRF_FUSED_SCORE_COLUMN_NAME`); the UDTF must drop it alongside
+            // `_score` so downstream rows only see `rerank_score`.
+            Field::new(RRF_FUSED_SCORE_COLUMN_NAME, DataType::Float64, true),
+        ]));
+        let out = RerankUDTFProvider::output_schema(&input_schema);
+        let names: Vec<&str> = out.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["id", "content", RERANK_SCORE_COLUMN]);
+    }
+
+    #[test]
+    fn sort_by_rerank_score_orders_desc_and_applies_limit() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(RERANK_SCORE_COLUMN, DataType::Float32, false),
+        ]));
+        let ids = Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef;
+        let scores = Arc::new(Float32Array::from(vec![0.1, 0.9, 0.5])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![ids, scores]).expect("batch");
+
+        let sorted = sort_by_rerank_score_desc(&batch, Some(2)).expect("sort");
+        assert_eq!(sorted.num_rows(), 2);
+        let id_col = sorted
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("strings");
+        assert_eq!(id_col.value(0), "b");
+        assert_eq!(id_col.value(1), "c");
+    }
+
+    #[test]
+    fn parse_args_rejects_extra_positional_args() {
+        // `rerank(vs, 'not_named', document => 'content')` — the second
+        // positional looks like a typoed/forgotten `=>`; silently dropping it
+        // would produce misleading output. Fail fast.
+        let args = vec![
+            vector_search_call("q"),
+            lit_utf8("not_named"),
+            named_lit_utf8("document", "content"),
+        ];
+        let err = RerankTableFuncArgs::from_udtf_args(&args)
+            .expect_err("extra positional arg should be rejected");
+        assert!(
+            err.to_string()
+                .contains("only accepts one positional argument"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_query_handles_make_array() {
+        // `vector_search(docs, make_array('a', 'b'))` — multi-query path;
+        // auto-propagation should pick the first string.
+        use datafusion::functions_nested::make_array::make_array_udf;
+        let make_array = make_array_udf();
+        let multi_query = Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::clone(&make_array),
+            vec![lit_utf8("red"), lit_utf8("round")],
+        ));
+        let expr = Expr::ScalarFunction(ScalarFunction::new_udf(
+            stub_udf(VECTOR_SEARCH_UDTF_NAME),
+            vec![Expr::Column(Column::new_unqualified("docs")), multi_query],
+        ));
+        assert_eq!(extract_query_literal(&expr).as_deref(), Some("red"));
+    }
+
+    #[test]
+    fn extract_query_handles_list_literal() {
+        // SQL `ARRAY['a', 'b']` parses as ScalarValue::List.
+        use arrow::datatypes::DataType as ArrowDataType;
+        let scalars = vec![
+            ScalarValue::Utf8(Some("climate".to_string())),
+            ScalarValue::Utf8(Some("economy".to_string())),
+        ];
+        let arr = ScalarValue::new_list_nullable(&scalars, &ArrowDataType::Utf8);
+        let multi_query = Expr::Literal(ScalarValue::List(arr), None);
+        let expr = Expr::ScalarFunction(ScalarFunction::new_udf(
+            stub_udf(VECTOR_SEARCH_UDTF_NAME),
+            vec![Expr::Column(Column::new_unqualified("docs")), multi_query],
+        ));
+        assert_eq!(extract_query_literal(&expr).as_deref(), Some("climate"));
+    }
+
+    #[test]
+    fn extract_documents_preserves_nulls() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "content",
+            DataType::Utf8,
+            true,
+        )]));
+        let col = Arc::new(StringArray::from(vec![Some("hello"), None, Some("world")])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![col]).expect("batch");
+        let docs = RerankUDTFProvider::extract_documents(&batch, "content").expect("extract");
+        assert_eq!(docs.len(), 3);
+        assert_eq!(docs[0].as_deref(), Some("hello"));
+        assert!(
+            docs[1].is_none(),
+            "NULL row must stay None, not become an empty string"
+        );
+        assert_eq!(docs[2].as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn truncate_batches_caps_at_limit() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, false)]));
+        let batch = |vals: &[&str]| -> RecordBatch {
+            let col = Arc::new(StringArray::from(vals.to_vec())) as ArrayRef;
+            RecordBatch::try_new(Arc::clone(&schema), vec![col]).expect("batch")
+        };
+
+        // Two 3-row batches, cap at 4 rows → first batch fully, second sliced
+        // to one row, total 4.
+        let out = truncate_batches(vec![batch(&["a", "b", "c"]), batch(&["d", "e", "f"])], 4);
+        let total: usize = out.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, 4);
+        assert_eq!(out[0].num_rows(), 3);
+        assert_eq!(out[1].num_rows(), 1);
+
+        // Cap at 0 → no batches returned.
+        let none = truncate_batches(vec![batch(&["a"])], 0);
+        assert!(none.is_empty());
+
+        // Cap ≥ total → all batches returned unchanged.
+        let all = truncate_batches(vec![batch(&["a"]), batch(&["b"])], 10);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].num_rows(), 1);
+        assert_eq!(all[1].num_rows(), 1);
+    }
+
+    #[test]
+    fn null_rows_sort_below_negative_scores() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(RERANK_SCORE_COLUMN, DataType::Float32, false),
+        ]));
+        let ids = Arc::new(StringArray::from(vec![
+            "valid_neg",
+            "null_row",
+            "valid_pos",
+        ])) as ArrayRef;
+        let scores = Arc::new(Float32Array::from(vec![-0.5, f32::NEG_INFINITY, 0.3])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![ids, scores]).expect("batch");
+
+        let sorted = sort_by_rerank_score_desc(&batch, None).expect("sort");
+        let id_col = sorted
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("strings");
+        assert_eq!(id_col.value(0), "valid_pos");
+        assert_eq!(id_col.value(1), "valid_neg");
+        assert_eq!(
+            id_col.value(2),
+            "null_row",
+            "NULL rows must sort last even with negative reranker scores"
+        );
+    }
+
+    /// Deterministic reranker for tests. Returns pre-configured scores in order, sliced to `documents.len()`.
+    #[derive(Debug)]
+    struct MockRerank {
+        scores: Vec<f32>,
+    }
+
+    #[async_trait]
+    impl llms::rerank::Rerank for MockRerank {
+        async fn rerank(
+            &self,
+            _query: &str,
+            documents: &[String],
+        ) -> llms::rerank::Result<Vec<f32>> {
+            Ok(self.scores[..documents.len()].to_vec())
+        }
+
+        fn model_name(&self) -> Option<&str> {
+            Some("mock_reranker")
+        }
+    }
+
+    async fn make_rerank_session() -> DataFusionResult<(
+        Arc<SessionContext>,
+        Arc<RwLock<llms::rerank::RerankerModelStore>>,
+        Arc<RwLock<ChatModelStore>>,
+    )> {
+        let ctx = Arc::new(SessionContext::new());
+        ctx.state().config_mut().set_extension(Arc::new(
+            RequestContext::builder(Protocol::Internal).build(),
+        ));
+
+        // Register RRF
+        ctx.register_udf(rrf::ReciprocalRankFusion::from_ctx(&ctx).into());
+        ctx.register_udtf(
+            rrf::RRF_UDF_NAME,
+            Arc::new(rrf::ReciprocalRankFusion::from_ctx(&ctx)),
+        );
+
+        let rerankers: Arc<RwLock<llms::rerank::RerankerModelStore>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let chat_models: Arc<RwLock<ChatModelStore>> = Arc::new(RwLock::new(HashMap::new()));
+
+        // Register rerank UDTF
+        let weak_ctx: std::sync::Weak<dyn runtime_query_engine::query_engine::QueryEngine> =
+            Arc::downgrade(
+                &(Arc::new(runtime_query_engine::session::QuerySession::new(
+                    Arc::clone(&ctx),
+                )) as Arc<dyn runtime_query_engine::query_engine::QueryEngine>),
+            );
+        ctx.register_udf(
+            RerankTableFunc::new(
+                weak_ctx.clone(),
+                Arc::clone(&rerankers),
+                Arc::clone(&chat_models),
+            )
+            .into(),
+        );
+        ctx.register_udtf(
+            RERANK_UDTF_NAME,
+            Arc::new(RerankTableFunc::new(
+                weak_ctx,
+                Arc::clone(&rerankers),
+                Arc::clone(&chat_models),
+            )),
+        );
+
+        Ok((ctx, rerankers, chat_models))
+    }
+
+    /// Register a small test table and insert a mock reranker.
+    async fn setup_test_table(
+        ctx: &SessionContext,
+        rerankers: &Arc<RwLock<llms::rerank::RerankerModelStore>>,
+        scores: Vec<f32>,
+    ) -> DataFusionResult<()> {
+        ctx.sql(
+            "CREATE TABLE test_docs AS SELECT * FROM (VALUES
+                (1, 'great battery life and performance', 'electronics'),
+                (2, 'terrible battery drains fast', 'electronics'),
+                (3, 'amazing screen quality', 'displays'),
+                (4, 'average product nothing special', 'general'),
+                (5, 'best purchase ever made', 'general')
+            ) AS t(id, content, category)",
+        )
+        .await?;
+
+        let mock: Arc<dyn llms::rerank::Rerank> = Arc::new(MockRerank { scores });
+        rerankers
+            .write()
+            .await
+            .insert("mock_reranker".to_string(), mock);
+
+        Ok(())
+    }
+
+    macro_rules! execute_query {
+        ($ctx:expr, $sql:expr) => {{
+            let df = $ctx.sql($sql).await.expect("query must parse");
+            df.collect().await
+        }};
+    }
+
+    async fn query_snapshot(ctx: &SessionContext, sql: &str) -> String {
+        let batches = execute_query!(ctx, sql).expect("query must succeed");
+        pretty_format_batches(&batches)
+            .expect("format query result")
+            .to_string()
+    }
+
+    async fn explain_query_snapshot(ctx: &SessionContext, sql: &str) -> String {
+        query_snapshot(ctx, &format!("EXPLAIN {sql}")).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rerank_bare_table_ordering_and_limit() -> DataFusionResult<()> {
+        let (ctx, rerankers, _chat_models) = make_rerank_session().await?;
+        setup_test_table(&ctx, &rerankers, vec![0.1, 0.9, 0.5, 0.3, 0.7]).await?;
+
+        let sql = "SELECT id, rerank_score FROM rerank(test_docs, document => 'content', query => 'battery', model => 'mock_reranker', limit => 3)";
+
+        insta::assert_snapshot!(
+            "bare_table_explain",
+            explain_query_snapshot(&ctx, sql).await
+        );
+        insta::assert_snapshot!("bare_table_result", query_snapshot(&ctx, sql).await);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rerank_filter_pushdown_reduces_candidates() -> DataFusionResult<()> {
+        let (ctx, rerankers, _chat_models) = make_rerank_session().await?;
+        // 5 scores but only 2 rows match category='electronics' (ids 1,2).
+        // MockRerank returns scores in positional order of the filtered input.
+        setup_test_table(&ctx, &rerankers, vec![0.4, 0.8, 0.0, 0.0, 0.0]).await?;
+
+        let sql = "SELECT id, rerank_score FROM rerank(test_docs, document => 'content', query => 'battery', model => 'mock_reranker') WHERE category = 'electronics'";
+
+        insta::assert_snapshot!(
+            "filter_pushdown_explain",
+            explain_query_snapshot(&ctx, sql).await
+        );
+        insta::assert_snapshot!("filter_pushdown_result", query_snapshot(&ctx, sql).await);
+
+        Ok(())
+    }
+}

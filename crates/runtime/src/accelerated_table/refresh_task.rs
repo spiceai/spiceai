@@ -198,8 +198,8 @@ struct RefreshStat {
 fn collect_indexes_from_provider(
     root: Arc<dyn datafusion::catalog::TableProvider>,
 ) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
-    use crate::embeddings::table::EmbeddingTable;
     use runtime_datafusion_index::IndexedTableProvider;
+    use runtime_search::embeddings::table::EmbeddingTable;
 
     let mut indexes: Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> = Vec::new();
     let mut seen = std::collections::HashSet::new();

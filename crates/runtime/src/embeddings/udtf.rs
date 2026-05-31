@@ -73,14 +73,14 @@ use snafu::ResultExt;
 
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::{
-    datafusion::DataFusion,
-    embeddings::table::{EmbeddingColumnConfig, EmbeddingTable},
-    model::EmbeddingModelStore,
-    search::util::find_concrete_table_provider,
+    datafusion::DataFusion, model::EmbeddingModelStore, search::util::find_concrete_table_provider,
 };
+
 use runtime_request_context::{AsyncMarker, RequestContext};
 use runtime_search::{
-    candidate::vector::ChunkedNonIndexVectorGeneration, udtf::table_ref_from_column_expr,
+    candidate::vector::ChunkedNonIndexVectorGeneration,
+    embeddings::table::EmbeddingTable,
+    udtf::{EmbeddingColumnConfig, table_ref_from_column_expr},
 };
 
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]

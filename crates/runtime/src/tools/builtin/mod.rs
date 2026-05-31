@@ -15,4 +15,3 @@ limitations under the License.
 */
 pub mod catalog;
 pub mod get_readiness;
-pub mod search;

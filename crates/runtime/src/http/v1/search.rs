@@ -13,10 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use runtime_search::error::Error as VectorSearchError;
-use runtime_search::request::{SearchRequest, SearchRequestHTTPJson};
-use runtime_search::search_engine::SearchEngine;
-use runtime_search::types::{Match, to_matches_sorted};
 use axum::{
     Extension, Json,
     http::StatusCode,
@@ -24,6 +20,10 @@ use axum::{
 };
 use http::{HeaderMap, HeaderValue};
 use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
+use runtime_search::error::Error as VectorSearchError;
+use runtime_search::request::{SearchRequest, SearchRequestHTTPJson};
+use runtime_search::search_engine::SearchEngine;
+use runtime_search::types::{Match, to_matches_sorted};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Instant};
 use tracing::Instrument;
