@@ -660,8 +660,7 @@ async fn fetch_latest_change_event(
         Ok(None) => Err(super::DataConnectorError::UnableToGetReadProvider {
             dataconnector: "debezium".to_string(),
             source: format!(
-                "No messages available on Kafka topic '{topic}' for dataset '{dataset_name}' within {timeout:?} while inferring schema (schema_evolution=true). Verify the topic exists and the Debezium connector is producing messages. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
-                timeout = SCHEMA_INFERENCE_TIMEOUT,
+                "No messages available on Kafka topic '{topic}' for dataset '{dataset_name}' within {SCHEMA_INFERENCE_TIMEOUT:?} while inferring schema (schema_evolution=true). Verify the topic exists and the Debezium connector is producing messages. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
             )
             .into(),
             connector_component: ConnectorComponent::from(dataset),
@@ -689,8 +688,7 @@ async fn fetch_first_event(
     .map_err(|_elapsed| super::DataConnectorError::UnableToGetReadProvider {
         dataconnector: "debezium".to_string(),
         source: format!(
-            "Timed out after {timeout:?} waiting for a message on Kafka topic '{topic}' for dataset '{dataset_name}' while inferring schema. Verify the Debezium connector is producing messages. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
-            timeout = SCHEMA_INFERENCE_TIMEOUT,
+            "Timed out after {SCHEMA_INFERENCE_TIMEOUT:?} waiting for a message on Kafka topic '{topic}' for dataset '{dataset_name}' while inferring schema. Verify the Debezium connector is producing messages. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
         )
         .into(),
         connector_component: ConnectorComponent::from(dataset),
