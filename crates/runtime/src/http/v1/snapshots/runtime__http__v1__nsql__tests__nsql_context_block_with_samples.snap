@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/src/http/v1/nsql.rs
-expression: "render_nsql_context_block(&tables, schema_context, relationship_context,\nfunction_context, &sample_context_blocks,)"
+expression: "render_nsql_context_block(&tables, &dataset_contexts, schema_context,\nrelationship_context, function_context, &sample_context_blocks,)"
 ---
 # Spice.ai NSQL Context
 - Write SQL for the Spice runtime, which uses Apache DataFusion with the SQL parser configured for the PostgreSQL dialect.
@@ -12,8 +12,8 @@ expression: "render_nsql_context_block(&tables, schema_context, relationship_con
 - Schema metadata includes table and column comments/descriptions when supplied by the connector or Spicepod.
 
 ## Datasets
-- `sales.orders`
-- `support_tickets`
+- `sales.orders`: Customer orders
+- `support_tickets`: Customer support tickets
 
 ## Schemas
 | table_reference | column_name | data_type | nullable | description |

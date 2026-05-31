@@ -1085,6 +1085,36 @@ mod tests {
             TableReference::parse_str("sales.orders"),
             TableReference::parse_str("support_tickets"),
         ];
+        let dataset_contexts = vec![
+            NsqlDatasetContext {
+                name: "sales.orders".to_string(),
+                catalog: None,
+                schema: Some("sales".to_string()),
+                table: "orders".to_string(),
+                description: Some("Customer orders".to_string()),
+                metadata: BTreeMap::new(),
+                columns: vec![],
+                primary_key: vec![],
+                unique_constraints: vec![],
+                foreign_keys: vec![],
+                indexes: vec![],
+                search: NsqlDatasetSearchContext::default(),
+            },
+            NsqlDatasetContext {
+                name: "support_tickets".to_string(),
+                catalog: None,
+                schema: None,
+                table: "support_tickets".to_string(),
+                description: Some("Customer support tickets".to_string()),
+                metadata: BTreeMap::new(),
+                columns: vec![],
+                primary_key: vec![],
+                unique_constraints: vec![],
+                foreign_keys: vec![],
+                indexes: vec![],
+                search: NsqlDatasetSearchContext::default(),
+            },
+        ];
         let schema_context = r"
 | table_reference | column_name | data_type | nullable | description |
 | --- | --- | --- | --- | --- |
@@ -1129,6 +1159,7 @@ Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. Th
             "nsql_context_block_with_samples",
             render_nsql_context_block(
                 &tables,
+                &dataset_contexts,
                 schema_context,
                 relationship_context,
                 function_context,

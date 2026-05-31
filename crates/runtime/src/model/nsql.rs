@@ -1941,6 +1941,191 @@ fn nsql_function_context(
     }
 }
 
+fn dataset_context_for_table<'a>(
+    datasets: &'a [NsqlDatasetContext],
+    table: &TableReference,
+) -> Option<&'a NsqlDatasetContext> {
+    datasets
+        .iter()
+        .find(|dataset| TableReference::parse_str(&dataset.name).resolved_eq(table))
+}
+
+fn dataset_context_for_foreign_table<'a>(
+    datasets: &'a [NsqlDatasetContext],
+    foreign_table: &str,
+) -> Option<&'a NsqlDatasetContext> {
+    let table = TableReference::parse_str(foreign_table);
+
+    if let Some(dataset) = datasets
+        .iter()
+        .find(|dataset| TableReference::parse_str(&dataset.name) == table)
+    {
+        return Some(dataset);
+    }
+
+    let mut relaxed_matches = datasets.iter().filter(|dataset| {
+        table_reference_matches_foreign_target(&TableReference::parse_str(&dataset.name), &table)
+    });
+    let dataset = relaxed_matches.next()?;
+    if relaxed_matches.next().is_some() {
+        return None;
+    }
+
+    Some(dataset)
+}
+
+fn table_reference_matches_foreign_target(
+    dataset: &TableReference,
+    foreign_target: &TableReference,
+) -> bool {
+    if dataset.table() != foreign_target.table() {
+        return false;
+    }
+    if let Some(schema) = foreign_target.schema()
+        && dataset.schema() != Some(schema)
+    {
+        return false;
+    }
+    if let Some(catalog) = foreign_target.catalog()
+        && dataset.catalog() != Some(catalog)
+    {
+        return false;
+    }
+
+    true
+}
+
+fn compact_column_context(column: &NsqlColumnContext) -> String {
+    let mut context = format!("`{}` {}", column.name, column.data_type);
+    if let Some(description) = &column.description
+        && !description.is_empty()
+    {
+        let _ = write!(context, " ({description})");
+    }
+    context
+}
+
+const FOREIGN_KEY_TARGET_CONTEXT_COLUMN_LIMIT: usize = 4;
+
+fn push_compact_foreign_key_target_column(
+    column_names: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    column_name: &str,
+) {
+    let column_name = column_name.to_string();
+    if seen.insert(column_name.clone()) {
+        column_names.push(column_name);
+    }
+}
+
+fn compact_foreign_key_target_columns(
+    target: &NsqlDatasetContext,
+    foreign_columns: &[String],
+) -> Vec<String> {
+    let mut selected_columns = Vec::new();
+    let mut seen_columns = BTreeSet::new();
+
+    for column_name in foreign_columns.iter().chain(target.primary_key.iter()) {
+        push_compact_foreign_key_target_column(
+            &mut selected_columns,
+            &mut seen_columns,
+            column_name,
+        );
+    }
+    for column_name in target.unique_constraints.iter().flatten() {
+        push_compact_foreign_key_target_column(
+            &mut selected_columns,
+            &mut seen_columns,
+            column_name,
+        );
+    }
+
+    let mut columns = selected_columns
+        .iter()
+        .filter_map(|column_name| {
+            target
+                .columns
+                .iter()
+                .find(|column| column.name == *column_name)
+        })
+        .take(FOREIGN_KEY_TARGET_CONTEXT_COLUMN_LIMIT)
+        .map(compact_column_context)
+        .collect_vec();
+
+    let remaining_columns = FOREIGN_KEY_TARGET_CONTEXT_COLUMN_LIMIT.saturating_sub(columns.len());
+    if remaining_columns > 0 {
+        columns.extend(
+            target
+                .columns
+                .iter()
+                .filter(|column| !seen_columns.contains(&column.name))
+                .filter(|column| column.description.is_some())
+                .take(remaining_columns)
+                .map(compact_column_context),
+        );
+    }
+
+    columns
+}
+
+fn write_foreign_key_target_context(
+    output: &mut String,
+    datasets: &[NsqlDatasetContext],
+    foreign_key: &NsqlForeignKeyContext,
+) {
+    let Some(target) = dataset_context_for_foreign_table(datasets, &foreign_key.foreign_table)
+    else {
+        return;
+    };
+
+    let mut parts = Vec::new();
+    if let Some(description) = &target.description
+        && !description.is_empty()
+    {
+        parts.push(description.clone());
+    }
+
+    let columns = compact_foreign_key_target_columns(target, &foreign_key.foreign_columns);
+    if !columns.is_empty() {
+        parts.push(format!("target columns: {}", columns.join(", ")));
+    }
+
+    if !parts.is_empty() {
+        let _ = writeln!(
+            output,
+            "    Target context for `{}`: {}.",
+            target.name,
+            parts.join("; ")
+        );
+    }
+}
+
+fn write_dataset_context_list(
+    output: &mut String,
+    tables: &[TableReference],
+    datasets: &[NsqlDatasetContext],
+) {
+    if tables.is_empty() {
+        let _ = writeln!(output, "No datasets are currently in scope.");
+        return;
+    }
+
+    for table in tables {
+        let Some(dataset) = dataset_context_for_table(datasets, table) else {
+            let _ = writeln!(output, "- `{table}`");
+            continue;
+        };
+
+        if let Some(description) = &dataset.description
+            && !description.is_empty()
+        {
+            let _ = writeln!(output, "- `{table}`: {description}");
+        } else {
+            let _ = writeln!(output, "- `{table}`");
+        }
+    }
+}
+
 pub(crate) fn render_nsql_dataset_relationship_context(datasets: &[NsqlDatasetContext]) -> String {
     let mut context = String::new();
 
@@ -1995,6 +2180,7 @@ pub(crate) fn render_nsql_dataset_relationship_context(datasets: &[NsqlDatasetCo
                     "  - ({columns}) references `{}` ({foreign_columns})",
                     foreign_key.foreign_table
                 );
+                write_foreign_key_target_context(&mut context, datasets, foreign_key);
             }
         }
 
@@ -2063,6 +2249,7 @@ pub(crate) fn render_nsql_dataset_relationship_context(datasets: &[NsqlDatasetCo
 
 pub(crate) fn render_nsql_context_block(
     tables: &[TableReference],
+    datasets: &[NsqlDatasetContext],
     schema_context: &str,
     relationship_context: &str,
     function_context: &str,
@@ -2082,13 +2269,7 @@ pub(crate) fn render_nsql_context_block(
     );
 
     let _ = writeln!(context, "\n## Datasets");
-    if tables.is_empty() {
-        let _ = writeln!(context, "No datasets are currently in scope.");
-    } else {
-        for table in tables {
-            let _ = writeln!(context, "- `{table}`");
-        }
-    }
+    write_dataset_context_list(&mut context, tables, datasets);
 
     let _ = writeln!(context, "\n## Schemas");
     if schema_context.trim().is_empty() {
@@ -2254,6 +2435,7 @@ pub(crate) async fn build_nsql_context(
 
     let context_block = render_nsql_context_block(
         &tables,
+        &dataset_contexts,
         &schema_context,
         &relationship_context,
         &function_context_block,
@@ -2286,6 +2468,209 @@ mod tests {
             .iter()
             .map(|entry| entry.name.to_ascii_lowercase())
             .collect()
+    }
+
+    fn relationship_test_dataset(
+        name: &str,
+        description: Option<&str>,
+        columns: Vec<NsqlColumnContext>,
+    ) -> NsqlDatasetContext {
+        NsqlDatasetContext {
+            name: name.to_string(),
+            catalog: None,
+            schema: None,
+            table: name.rsplit('.').next().unwrap_or(name).to_string(),
+            description: description.map(ToString::to_string),
+            metadata: BTreeMap::new(),
+            columns,
+            primary_key: vec![],
+            unique_constraints: vec![],
+            foreign_keys: vec![],
+            indexes: vec![],
+            search: NsqlDatasetSearchContext::default(),
+        }
+    }
+
+    fn relationship_test_column(
+        name: &str,
+        data_type: &str,
+        description: &str,
+    ) -> NsqlColumnContext {
+        NsqlColumnContext {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            nullable: false,
+            description: Some(description.to_string()),
+            source_type: None,
+            metadata: BTreeMap::new(),
+            primary_key: false.into(),
+            unique: false.into(),
+            indexed: false.into(),
+            vector_search: false.into(),
+            full_text_search: false.into(),
+        }
+    }
+
+    fn relationship_test_orders_customer_fk(foreign_table: &str) -> NsqlDatasetContext {
+        let mut orders = relationship_test_dataset("sales.orders", None, vec![]);
+        orders.foreign_keys = vec![NsqlForeignKeyContext {
+            columns: vec!["customer_id".to_string()],
+            foreign_table: foreign_table.to_string(),
+            foreign_columns: vec!["id".to_string()],
+        }];
+        orders
+    }
+
+    fn relationship_test_customer_dataset(name: &str, description: &str) -> NsqlDatasetContext {
+        relationship_test_dataset(
+            name,
+            Some(description),
+            vec![relationship_test_column("id", "Int64", "Customer id")],
+        )
+    }
+
+    #[test]
+    fn nsql_relationship_context_includes_compact_foreign_key_target_context() {
+        let mut orders = relationship_test_dataset("sales.orders", None, vec![]);
+        orders.foreign_keys = vec![NsqlForeignKeyContext {
+            columns: vec!["customer_id".to_string()],
+            foreign_table: "sales.customers".to_string(),
+            foreign_columns: vec!["id".to_string()],
+        }];
+
+        let mut customers = relationship_test_dataset(
+            "sales.customers",
+            Some("Customer accounts"),
+            vec![
+                relationship_test_column("id", "Int64", "Unique customer identifier"),
+                relationship_test_column("account_name", "Utf8", "Customer account name"),
+            ],
+        );
+        customers.primary_key = vec!["id".to_string()];
+
+        let context = render_nsql_dataset_relationship_context(&[orders, customers]);
+
+        assert!(context.contains(
+            "Target context for `sales.customers`: Customer accounts; target columns: `id` Int64 (Unique customer identifier), `account_name` Utf8 (Customer account name)."
+        ));
+    }
+
+    #[test]
+    fn nsql_relationship_context_limits_compact_foreign_key_target_columns() {
+        let mut orders = relationship_test_dataset("sales.orders", None, vec![]);
+        orders.foreign_keys = vec![NsqlForeignKeyContext {
+            columns: vec![
+                "customer_id".to_string(),
+                "tenant_id".to_string(),
+                "account_name".to_string(),
+                "owner_email".to_string(),
+                "segment".to_string(),
+            ],
+            foreign_table: "sales.customers".to_string(),
+            foreign_columns: vec![
+                "id".to_string(),
+                "tenant_id".to_string(),
+                "account_name".to_string(),
+                "owner_email".to_string(),
+                "segment".to_string(),
+            ],
+        }];
+
+        let mut customers = relationship_test_dataset(
+            "sales.customers",
+            Some("Customer accounts"),
+            vec![
+                relationship_test_column("id", "Int64", "Unique customer identifier"),
+                relationship_test_column("tenant_id", "Int64", "Tenant identifier"),
+                relationship_test_column("account_name", "Utf8", "Customer account name"),
+                relationship_test_column("owner_email", "Utf8", "Customer owner email"),
+                relationship_test_column("segment", "Utf8", "Customer segment"),
+            ],
+        );
+        customers.primary_key = vec!["id".to_string()];
+
+        let context = render_nsql_dataset_relationship_context(&[orders, customers]);
+        let target_context_line = context
+            .lines()
+            .find(|line| line.contains("Target context for `sales.customers`"))
+            .expect("relationship context should include target context for sales.customers");
+
+        assert_eq!(
+            target_context_line.trim(),
+            "Target context for `sales.customers`: Customer accounts; target columns: `id` Int64 (Unique customer identifier), `tenant_id` Int64 (Tenant identifier), `account_name` Utf8 (Customer account name), `owner_email` Utf8 (Customer owner email)."
+        );
+    }
+
+    #[test]
+    fn nsql_relationship_context_includes_unique_under_qualified_foreign_key_target_context() {
+        let orders = relationship_test_orders_customer_fk("customers");
+        let customers = relationship_test_customer_dataset("sales.customers", "Sales customers");
+
+        let context = render_nsql_dataset_relationship_context(&[orders, customers]);
+
+        assert!(context.contains(
+            "Target context for `sales.customers`: Sales customers; target columns: `id` Int64 (Customer id)."
+        ));
+    }
+
+    #[test]
+    fn nsql_relationship_context_does_not_match_less_qualified_dataset_context() {
+        let orders = relationship_test_orders_customer_fk("sales.customers");
+        let customers = relationship_test_customer_dataset("customers", "Bare customers");
+
+        let context = render_nsql_dataset_relationship_context(&[orders, customers]);
+
+        assert!(context.contains("references `sales.customers`"));
+        assert!(!context.contains("Target context for"));
+    }
+
+    #[test]
+    fn nsql_relationship_context_prefers_exact_foreign_key_target_context() {
+        let orders = relationship_test_orders_customer_fk("customers");
+        let sales_customers =
+            relationship_test_customer_dataset("sales.customers", "Sales customers");
+        let customers = relationship_test_customer_dataset("customers", "Bare customers");
+
+        let context =
+            render_nsql_dataset_relationship_context(&[orders, sales_customers, customers]);
+
+        assert!(context.contains(
+            "Target context for `customers`: Bare customers; target columns: `id` Int64 (Customer id)."
+        ));
+        assert!(!context.contains("Sales customers"));
+    }
+
+    #[test]
+    fn nsql_relationship_context_skips_ambiguous_compact_foreign_key_target_context() {
+        let mut orders = relationship_test_dataset("sales.orders", None, vec![]);
+        orders.foreign_keys = vec![NsqlForeignKeyContext {
+            columns: vec!["customer_id".to_string()],
+            foreign_table: "customers".to_string(),
+            foreign_columns: vec!["id".to_string()],
+        }];
+
+        let sales_customers = relationship_test_dataset(
+            "sales.customers",
+            Some("Sales customers"),
+            vec![relationship_test_column("id", "Int64", "Sales customer id")],
+        );
+        let marketing_customers = relationship_test_dataset(
+            "marketing.customers",
+            Some("Marketing customers"),
+            vec![relationship_test_column(
+                "id",
+                "Int64",
+                "Marketing customer id",
+            )],
+        );
+
+        let context = render_nsql_dataset_relationship_context(&[
+            orders,
+            sales_customers,
+            marketing_customers,
+        ]);
+
+        assert!(!context.contains("Target context for"));
     }
 
     #[test]
