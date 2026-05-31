@@ -133,7 +133,27 @@ message ExecutorControlMessage {
         // Acknowledgement for a scheduler command (correlated by request_id).
         Ack ack = 5;
         PartitionsLoaded partitions_loaded = 6;
+        ExecutorStatistics executor_statistics = 7;
     }
+}
+
+// Periodic per-table statistics report from an executor, decoupled from the
+// PartitionsLoaded readiness ack. The executor sends this for each table it
+// serves locally (including cayenne catalog tables) so the coordinator's
+// in-memory per-executor statistics stay fresh as streaming ETL grows the data.
+message ExecutorStatistics {
+    // Table name (as a TableReference string, e.g. "spicebench.bench.lineitem").
+    string table_name = 1;
+    // Prost-serialized `datafusion_proto_common.Statistics` for the executor's
+    // local slice of the table: num_rows plus per-column min/max/null_count
+    // (column_statistics is positional, aligned to `column_names`). The
+    // coordinator stamps these onto this executor's federated scan, projecting
+    // column stats by name, so the query planner can size joins (q18 swap).
+    bytes statistics = 2;
+    // Column names aligned positionally with the decoded Statistics'
+    // column_statistics, so the coordinator can project them onto a leaf scan's
+    // (possibly projected) schema by name.
+    repeated string column_names = 3;
 }
 
 // Sent by an executor after it has finished accelerating one or more
@@ -145,6 +165,12 @@ message PartitionsLoaded {
     string table_name = 1;
     // Partition expression bytes for partitions that are now loaded.
     BytesArray partition_expr_bytes = 2;
+    // Field 3 was a per-table `statistics` blob piggybacked on this readiness
+    // ack. Statistics now flow via the dedicated `ExecutorStatistics` message
+    // (with per-column min/max), and `PartitionsLoaded` is readiness-only, so the
+    // field is removed.
+    reserved 3;
+    reserved "statistics";
 }
 
 // Message sent from scheduler to executor on the control stream.
