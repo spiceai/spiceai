@@ -26,7 +26,8 @@ use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::stats::Precision;
+use datafusion::common::{DataFusionError, Result, Statistics};
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
@@ -160,6 +161,9 @@ pub struct PartialAggregationFlightSqlExec {
     /// outgoing call so executor-side spans chain back to the originating
     /// request.
     trace_parent: Option<String>,
+    /// Output statistics, derived from the source scan's statistics at
+    /// construction time (see [`PartialAggregationFlightSqlExec::new`]).
+    statistics: Statistics,
 }
 
 impl PartialAggregationFlightSqlExec {
@@ -178,6 +182,7 @@ impl PartialAggregationFlightSqlExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
+        let statistics = Self::derive_statistics(source, &output_schema);
         Self {
             table_reference: source.table_reference().clone(),
             source_filters: source.filters().to_vec(),
@@ -189,6 +194,29 @@ impl PartialAggregationFlightSqlExec {
             cookie_store: Arc::clone(source.cookie_store()),
             properties,
             trace_parent: source.trace_parent().map(str::to_string),
+            statistics,
+        }
+    }
+
+    /// Derive the output statistics of the pushed-down partial aggregate from
+    /// the source scan's statistics.
+    ///
+    /// This mirrors `DataFusion`'s own grouped-`AggregateExec` estimate: a
+    /// `GROUP BY` emits at most one row per input row, so the output row count
+    /// is the input row count as an inexact upper bound. Column-level
+    /// statistics are not carried through (the output columns are group keys
+    /// and partial aggregate states, not the source columns). Without this, the
+    /// pushed-down aggregate would be a statistics-less leaf and the planner
+    /// could not compare it against a join's other side.
+    fn derive_statistics(source: &FlightSqlExec, output_schema: &SchemaRef) -> Statistics {
+        let stats = Statistics::new_unknown(output_schema);
+        match source
+            .partition_statistics(None)
+            .ok()
+            .and_then(|s| s.num_rows.get_value().copied())
+        {
+            Some(num_rows) => stats.with_num_rows(Precision::Inexact(num_rows)),
+            None => stats,
         }
     }
 
@@ -246,6 +274,17 @@ impl ExecutionPlan for PartialAggregationFlightSqlExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn statistics(&self) -> Result<Statistics> {
+        Ok(self.statistics.clone())
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        match partition {
+            None | Some(0) => Ok(self.statistics.clone()),
+            Some(_) => Ok(Statistics::new_unknown(&self.output_schema)),
+        }
     }
 
     fn with_new_children(
