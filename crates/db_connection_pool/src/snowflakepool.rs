@@ -26,29 +26,31 @@ use std::{collections::HashMap, fmt::Write, fs, str::FromStr, sync::Arc, time::I
 
 use crate::dbconnection::snowflakeconn::SnowflakeConnection;
 
-/// Snowflake account identifier formats.
+const SNOWFLAKE_ACCOUNT_IDENTIFIER_DOCS: &str =
+    "https://docs.snowflake.com/en/user-guide/admin-account-identifier";
+const SNOWFLAKE_COMPUTING_COM_SUFFIX: &str = ".snowflakecomputing.com";
+const SNOWFLAKE_COMPUTING_CN_SUFFIX: &str = ".snowflakecomputing.cn";
+const ACCOUNT_IDENTIFIER_EXAMPLES: &str = "Use a Snowflake account identifier such as `myorg-myaccount`, `myorg.myaccount`, `https://myorg-myaccount.snowflakecomputing.com`, `xy12345`, `xy12345.us-east-2.aws`, or `xy12345.fhplus.us-gov-west-1.aws`.";
+
+/// Snowflake account identifier formats accepted by the connector.
 ///
-/// The org-based format (`orgname.account_name`) uses a dot separator that must
-/// become a dash in the API URL: `orgname-account_name.snowflakecomputing.com`.
-///
-/// The legacy format (`account_locator` with optional `.region.cloud` suffix)
-/// uses dots as subdomain separators and must be preserved as-is:
-/// `account_locator.region.cloud.snowflakecomputing.com`.
+/// The preferred client/driver format (`orgname-account_name`) and legacy
+/// locator formats are already API URL host labels. The SQL/data sharing format
+/// (`orgname.account_name`) uses a dot separator that must become a dash for the
+/// API URL: `orgname-account_name.snowflakecomputing.com`.
 ///
 /// See: <https://docs.snowflake.com/en/user-guide/admin-account-identifier>
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnowflakeAccountIdentifier {
-    /// `orgname.account_name` — dot is replaced with dash for the API URL.
-    OrgBased {
+    /// `orgname.account_name` - dot is replaced with dash for the API URL.
+    OrgQualified {
         orgname: String,
         account_name: String,
     },
-    /// `account_locator[.region[.cloud]]` — used as-is in the API URL.
-    Legacy {
-        account_locator: String,
-        region: Option<String>,
-        cloud: Option<String>,
-    },
+    /// `orgname-account_name`, a bare locator, or a Snowflake account URL host stripped to its account identifier.
+    AccountName { account_identifier: String },
+    /// `account_locator[.region[.cloud]]` or `account_locator.gov_compliance.region.cloud`.
+    Legacy { segments: Vec<String> },
 }
 
 impl SnowflakeAccountIdentifier {
@@ -56,35 +58,268 @@ impl SnowflakeAccountIdentifier {
     #[must_use]
     pub fn api_account(&self) -> String {
         match self {
-            Self::OrgBased {
+            Self::OrgQualified {
                 orgname,
                 account_name,
             } => format!("{orgname}-{account_name}"),
-            Self::Legacy {
-                account_locator,
-                region: Some(r),
-                cloud: Some(c),
-            } => format!("{account_locator}.{r}.{c}"),
-            Self::Legacy {
-                account_locator,
-                region: Some(r),
-                cloud: None,
-            } => format!("{account_locator}.{r}"),
-
-            Self::Legacy {
-                account_locator,
-                region: _,
-                cloud: _,
-            } => account_locator.clone(),
+            Self::AccountName { account_identifier } => account_identifier.clone(),
+            Self::Legacy { segments } => segments.join("."),
         }
     }
 }
 
-fn is_valid_org_identifier_segment(segment: &str) -> bool {
-    !segment.is_empty()
-        && segment
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+fn account_identifier_error(reason: &str) -> String {
+    format!("{reason}. {ACCOUNT_IDENTIFIER_EXAMPLES} See: {SNOWFLAKE_ACCOUNT_IDENTIFIER_DOCS}")
+}
+
+fn starts_with_ascii_letter(value: &str) -> bool {
+    value
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+}
+
+fn validate_org_name(orgname: &str) -> std::result::Result<(), String> {
+    if orgname.is_empty() {
+        return Err(account_identifier_error(
+            "the organization name before `.` cannot be empty",
+        ));
+    }
+
+    if !starts_with_ascii_letter(orgname) {
+        return Err(account_identifier_error(
+            "the organization name before `.` must start with a letter",
+        ));
+    }
+
+    if !orgname.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        return Err(account_identifier_error(
+            "the organization name before `.` can contain only letters and digits",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_account_name(account_name: &str) -> std::result::Result<(), String> {
+    if account_name.is_empty() {
+        return Err(account_identifier_error(
+            "the account name after `.` cannot be empty",
+        ));
+    }
+
+    if !starts_with_ascii_letter(account_name) {
+        return Err(account_identifier_error(
+            "the account name after `.` must start with a letter",
+        ));
+    }
+
+    if account_name.ends_with('_') {
+        return Err(account_identifier_error(
+            "the account name after `.` cannot end with `_`",
+        ));
+    }
+
+    if !account_name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err(account_identifier_error(
+            "the account name after `.` can contain only letters, digits, and underscores",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_org_qualified_identifier_length(
+    orgname: &str,
+    account_name: &str,
+) -> std::result::Result<(), String> {
+    if orgname.len() + 1 + account_name.len() > 63 {
+        return Err(account_identifier_error(
+            "the preferred account identifier must be 63 characters or fewer, including the organization name, account name, and separator",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_account_host_label(account_identifier: &str) -> std::result::Result<(), String> {
+    if account_identifier.is_empty() {
+        return Err(account_identifier_error(
+            "the account identifier cannot be empty",
+        ));
+    }
+
+    if account_identifier.len() > 63 {
+        return Err(account_identifier_error(
+            "the preferred account identifier must be 63 characters or fewer",
+        ));
+    }
+
+    if !starts_with_ascii_letter(account_identifier) {
+        return Err(account_identifier_error(
+            "the account identifier must start with a letter",
+        ));
+    }
+
+    if account_identifier.ends_with('_') || account_identifier.ends_with('-') {
+        return Err(account_identifier_error(
+            "the account identifier cannot end with `_` or `-`",
+        ));
+    }
+
+    if !account_identifier
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err(account_identifier_error(
+            "the account identifier can contain only letters, digits, underscores, and hyphens",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_legacy_segment(segment: &str) -> std::result::Result<(), String> {
+    if segment.is_empty() {
+        return Err(account_identifier_error(
+            "legacy account locators cannot contain empty segments; remove extra dots",
+        ));
+    }
+
+    if !starts_with_ascii_letter(segment) {
+        return Err(account_identifier_error(
+            "each legacy account locator segment must start with a letter",
+        ));
+    }
+
+    if segment.ends_with('-') {
+        return Err(account_identifier_error(
+            "legacy account locator segments cannot end with `-`",
+        ));
+    }
+
+    if !segment
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        return Err(account_identifier_error(
+            "legacy account locator segments can contain only letters, digits, and hyphens",
+        ));
+    }
+
+    Ok(())
+}
+
+fn extract_account_identifier_from_host(host: &str) -> std::result::Result<String, String> {
+    if host.is_empty() {
+        return Err(account_identifier_error(
+            "Snowflake account URL is missing a host",
+        ));
+    }
+
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let host_lowercase = host.to_ascii_lowercase();
+    if host_lowercase.contains(".privatelink.") {
+        return Err(account_identifier_error(
+            "Snowflake PrivateLink account URLs are not supported by this connector because the Snowflake client connects to the public snowflakecomputing.com endpoint",
+        ));
+    }
+
+    if host_lowercase.ends_with(SNOWFLAKE_COMPUTING_COM_SUFFIX) {
+        let account_identifier = &host[..host.len() - SNOWFLAKE_COMPUTING_COM_SUFFIX.len()];
+        if account_identifier.is_empty() {
+            return Err(account_identifier_error(
+                "Snowflake account URL is missing the account identifier before snowflakecomputing.com",
+            ));
+        }
+        return Ok(account_identifier.to_string());
+    }
+
+    if host_lowercase.ends_with(SNOWFLAKE_COMPUTING_CN_SUFFIX) {
+        return Err(account_identifier_error(
+            "Snowflake account URLs on snowflakecomputing.cn are not supported by this connector because the Snowflake client connects to snowflakecomputing.com",
+        ));
+    }
+
+    Err(account_identifier_error(
+        "Snowflake account URLs must end with snowflakecomputing.com",
+    ))
+}
+
+fn split_url_authority(input: &str) -> (&str, Option<&str>) {
+    input.find(['/', '?', '#']).map_or((input, None), |index| {
+        (&input[..index], Some(&input[index..]))
+    })
+}
+
+fn normalize_account_identifier_input(input: &str) -> std::result::Result<String, String> {
+    if input.is_empty() {
+        return Err(account_identifier_error(
+            "account identifier cannot be empty",
+        ));
+    }
+
+    if input.trim() != input {
+        return Err(account_identifier_error(
+            "account identifier must not include leading or trailing whitespace",
+        ));
+    }
+
+    if input.chars().any(char::is_whitespace) {
+        return Err(account_identifier_error(
+            "account identifier cannot contain whitespace",
+        ));
+    }
+
+    if input.contains("://") {
+        let Some((scheme, without_scheme)) = input.split_once("://") else {
+            return Err(account_identifier_error("invalid Snowflake account URL"));
+        };
+
+        if !scheme.eq_ignore_ascii_case("https") {
+            return Err(account_identifier_error(
+                "Snowflake account URLs must use the https:// scheme",
+            ));
+        }
+
+        let (authority, tail) = split_url_authority(without_scheme);
+        if let Some(tail) = tail
+            && tail != "/"
+        {
+            return Err(account_identifier_error(
+                "Snowflake account URLs in `snowflake_account` must not include a path, query, or fragment",
+            ));
+        }
+
+        if authority.contains('@') {
+            return Err(account_identifier_error(
+                "Snowflake account URLs in `snowflake_account` must not include credentials",
+            ));
+        }
+
+        if authority.contains(':') {
+            return Err(account_identifier_error(
+                "Snowflake account URLs in `snowflake_account` must not include a port",
+            ));
+        }
+
+        return extract_account_identifier_from_host(authority);
+    }
+
+    if input.contains(['/', '?', '#', '@', ':']) {
+        return Err(account_identifier_error(
+            "account identifier must not include URL paths, query strings, fragments, credentials, or ports",
+        ));
+    }
+
+    if input.to_ascii_lowercase().contains("snowflakecomputing.") {
+        return extract_account_identifier_from_host(input);
+    }
+
+    Ok(input.to_string())
 }
 
 impl FromStr for SnowflakeAccountIdentifier {
@@ -92,79 +327,72 @@ impl FromStr for SnowflakeAccountIdentifier {
 
     /// Parses a Snowflake account identifier string.
     ///
-    /// Org-based identifiers (`orgname.account_name`) have exactly one dot and
-    /// no dashes — both org and account names are alphanumeric + underscores.
+    /// Org-qualified identifiers for SQL/data sharing (`orgname.account_name`)
+    /// have exactly one dot and no dashes. They are converted to the
+    /// client/driver form (`orgname-account_name`) before creating the
+    /// Snowflake API client.
     ///
-    /// Legacy identifiers contain dashes (from region names like `eu-central-1`)
-    /// or multiple dots (`locator.region.cloud`), or no dots at all (bare locator).
+    /// Client/driver identifiers (`orgname-account_name`), account URLs, and
+    /// legacy locators (`locator[.region[.cloud]]`) are preserved as-is after
+    /// URL normalization.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.is_empty() {
-            return Err("account identifier cannot be empty".to_string());
+        let normalized = normalize_account_identifier_input(s)?;
+        let parts: Vec<&str> = normalized.split('.').collect();
+
+        if parts.len() > 4 {
+            return Err(account_identifier_error(
+                "legacy account locators can contain at most four dot-separated segments",
+            ));
         }
 
-        let dot_count = s.matches('.').count();
+        if parts.len() == 1 {
+            let account_identifier = parts[0];
+            validate_account_host_label(account_identifier)?;
+            return Ok(Self::AccountName {
+                account_identifier: account_identifier.to_string(),
+            });
+        }
 
-        // Exactly one dot and no dashes → org-based format.
-        // Org names and account names are alphanumeric + underscores only.
-        if dot_count == 1 && !s.contains('-') {
-            let (orgname, account_name) = s
-                .split_once('.')
-                .ok_or_else(|| format!("invalid org-based account identifier: {s}"))?;
-            if !is_valid_org_identifier_segment(orgname)
-                || !is_valid_org_identifier_segment(account_name)
-            {
-                return Err(format!("invalid org-based account identifier: {s}"));
-            }
-            return Ok(Self::OrgBased {
+        if parts.len() == 2 && !normalized.contains('-') {
+            let orgname = parts[0];
+            let account_name = parts[1];
+            validate_org_name(orgname)?;
+            validate_account_name(account_name)?;
+            validate_org_qualified_identifier_length(orgname, account_name)?;
+            return Ok(Self::OrgQualified {
                 orgname: orgname.to_string(),
                 account_name: account_name.to_string(),
             });
         }
 
-        // Legacy format: account_locator[.region[.cloud]]
-        let parts: Vec<&str> = s.splitn(3, '.').collect();
-        let has_empty_segment = parts.iter().any(|segment| segment.is_empty());
-        if has_empty_segment {
-            return Err(format!("invalid account identifier: {s}"));
+        for segment in &parts {
+            validate_legacy_segment(segment)?;
         }
 
-        match parts.as_slice() {
-            [locator] => Ok(Self::Legacy {
-                account_locator: (*locator).to_string(),
-                region: None,
-                cloud: None,
-            }),
-            [locator, region] => Ok(Self::Legacy {
-                account_locator: (*locator).to_string(),
-                region: Some((*region).to_string()),
-                cloud: None,
-            }),
-            [locator, region, cloud] => Ok(Self::Legacy {
-                account_locator: (*locator).to_string(),
-                region: Some((*region).to_string()),
-                cloud: Some((*cloud).to_string()),
-            }),
-            _ => Err(format!("invalid account identifier: {s}")),
+        if parts
+            .iter()
+            .any(|segment| segment.eq_ignore_ascii_case("cn-northwest-1"))
+        {
+            return Err(account_identifier_error(
+                "Snowflake China region locators use snowflakecomputing.cn, which is not supported by this connector",
+            ));
         }
+
+        Ok(Self::Legacy {
+            segments: parts.into_iter().map(ToString::to_string).collect(),
+        })
     }
 }
 
 impl std::fmt::Display for SnowflakeAccountIdentifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::OrgBased {
+            Self::OrgQualified {
                 orgname,
                 account_name,
             } => write!(f, "{orgname}.{account_name}"),
-            Self::Legacy {
-                account_locator,
-                region,
-                cloud,
-            } => match (region, cloud) {
-                (Some(r), Some(c)) => write!(f, "{account_locator}.{r}.{c}"),
-                (Some(r), None) => write!(f, "{account_locator}.{r}"),
-                _ => write!(f, "{account_locator}"),
-            },
+            Self::AccountName { account_identifier } => write!(f, "{account_identifier}"),
+            Self::Legacy { segments } => write!(f, "{}", segments.join(".")),
         }
     }
 }
@@ -172,7 +400,7 @@ impl std::fmt::Display for SnowflakeAccountIdentifier {
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required secret: {name}. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/snowflake#auth"
+        "Missing required parameter `{name}`. Add `{name}` to the Snowflake connector params or configure a secret named `{name}`. For details, visit: https://spiceai.org/docs/components/data-connectors/snowflake#auth"
     ))]
     MissingRequiredSecret { name: String },
 
@@ -204,15 +432,12 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Invalid value for parameter '{param_key}': {param_value}. For details, visit: https://spiceai.org/docs/components/data-connectors/snowflake#parameters"
+        "Invalid value for parameter `{parameter}`: {reason}. For details, visit: https://spiceai.org/docs/components/data-connectors/snowflake#parameters"
     ))]
-    InvalidParameterValue {
-        param_key: String,
-        param_value: String,
-    },
+    InvalidParameterValue { parameter: String, reason: String },
 
     #[snafu(display(
-        "Failed to parse private key file. Verify the file is a private key file, and try again. {source}"
+        "Failed to parse private key. Verify the key file or `snowflake_private_key` content is a valid PEM private key, and try again. {source}"
     ))]
     UnableToParsePrivateKey { source: pkcs8::der::Error },
 
@@ -227,9 +452,143 @@ pub enum Error {
     FailedToCreatePem { source: pkcs8::der::Error },
 
     #[snafu(display(
-        "Both 'snowflake_private_key' and 'snowflake_private_key_path' are specified. Only one of these options can be specified for a given dataset. For details, visit: https://spiceai.org/docs/components/data-connectors/snowflake#auth"
+        "Both `snowflake_private_key` and `snowflake_private_key_path` are specified. Only one of these options can be specified for a given dataset. For details, visit: https://spiceai.org/docs/components/data-connectors/snowflake#auth"
     ))]
     MutuallyExclusivePrivateKeyParams,
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+fn prefixed_parameter(parameter: &str) -> String {
+    if parameter.starts_with("snowflake_") {
+        parameter.to_string()
+    } else {
+        format!("snowflake_{parameter}")
+    }
+}
+
+fn invalid_parameter(parameter: &str, reason: impl Into<String>) -> Error {
+    Error::InvalidParameterValue {
+        parameter: prefixed_parameter(parameter),
+        reason: reason.into(),
+    }
+}
+
+fn validate_non_empty_parameter(parameter: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(invalid_parameter(parameter, "value must not be empty"));
+    }
+
+    Ok(())
+}
+
+fn validate_text_parameter(parameter: &str, value: &str) -> Result<()> {
+    validate_non_empty_parameter(parameter, value)?;
+
+    if value.trim() != value {
+        return Err(invalid_parameter(
+            parameter,
+            "value must not include leading or trailing whitespace",
+        ));
+    }
+
+    Ok(())
+}
+
+fn required_parameter<'a>(
+    params: &'a HashMap<String, SecretString>,
+    parameter: &str,
+) -> Result<&'a str> {
+    let value = params
+        .get(parameter)
+        .map(SecretBox::expose_secret)
+        .context(MissingRequiredSecretSnafu {
+            name: prefixed_parameter(parameter),
+        })?;
+
+    Ok(value)
+}
+
+fn required_text_parameter<'a>(
+    params: &'a HashMap<String, SecretString>,
+    parameter: &str,
+) -> Result<&'a str> {
+    let value = required_parameter(params, parameter)?;
+    validate_text_parameter(parameter, value)?;
+    Ok(value)
+}
+
+fn optional_text_parameter(
+    params: &HashMap<String, SecretString>,
+    parameter: &str,
+) -> Result<Option<String>> {
+    let Some(value) = params.get(parameter).map(SecretBox::expose_secret) else {
+        return Ok(None);
+    };
+
+    validate_text_parameter(parameter, value)?;
+
+    Ok(Some(value.to_string()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnowflakeAuthType {
+    Password,
+    KeyPair,
+}
+
+impl SnowflakeAuthType {
+    fn from_params(params: &HashMap<String, SecretString>) -> Result<Self> {
+        let Some(auth_type) = params.get("auth_type").map(SecretBox::expose_secret) else {
+            if !params.contains_key("password")
+                && (params.contains_key("private_key") || params.contains_key("private_key_path"))
+            {
+                return Ok(Self::KeyPair);
+            }
+
+            return Ok(Self::Password);
+        };
+
+        validate_text_parameter("auth_type", auth_type)?;
+
+        match auth_type.to_ascii_lowercase().as_str() {
+            "snowflake" | "password" => Ok(Self::Password),
+            "keypair" | "snowflake_jwt" => Ok(Self::KeyPair),
+            _ => Err(invalid_parameter(
+                "auth_type",
+                "supported values are `password` (or `snowflake`) and `keypair` (or `snowflake_jwt`)",
+            )),
+        }
+    }
+}
+
+fn validate_authentication_parameters(
+    params: &HashMap<String, SecretString>,
+    auth_type: SnowflakeAuthType,
+) -> Result<()> {
+    match auth_type {
+        SnowflakeAuthType::Password => {
+            if params.contains_key("private_key")
+                || params.contains_key("private_key_path")
+                || params.contains_key("private_key_passphrase")
+            {
+                return Err(invalid_parameter(
+                    "auth_type",
+                    "keypair parameters were provided but password authentication is selected; remove `snowflake_private_key`, `snowflake_private_key_path`, and `snowflake_private_key_passphrase`, or set `snowflake_auth_type: keypair`",
+                ));
+            }
+        }
+        SnowflakeAuthType::KeyPair => {
+            if params.contains_key("password") {
+                return Err(invalid_parameter(
+                    "auth_type",
+                    "`snowflake_password` was provided but keypair authentication is selected; remove `snowflake_password` or set `snowflake_auth_type: password`",
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub struct SnowflakeConnectionPool {
@@ -243,61 +602,41 @@ impl SnowflakeConnectionPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    pub async fn new(params: &HashMap<String, SecretString>) -> Result<Self, Error> {
+    pub async fn new(params: &HashMap<String, SecretString>) -> Result<Self> {
         let pool_start = Instant::now();
 
-        let username = params
-            .get("username")
-            .map(SecretBox::expose_secret)
-            .context(MissingRequiredSecretSnafu { name: "username" })?;
+        let username = required_text_parameter(params, "username")?;
 
-        let account_raw = params
-            .get("account")
-            .map(SecretBox::expose_secret)
-            .context(MissingRequiredSecretSnafu { name: "account" })?;
-        let account_id = SnowflakeAccountIdentifier::from_str(account_raw).map_err(|e| {
+        let account_raw = required_parameter(params, "account")?;
+        let account_id = SnowflakeAccountIdentifier::from_str(account_raw).map_err(|reason| {
             Error::InvalidParameterValue {
-                param_key: "account".to_string(),
-                param_value: e,
+                parameter: prefixed_parameter("account"),
+                reason,
             }
         })?;
         let account = account_id.api_account();
 
-        let warehouse = params
-            .get("warehouse")
-            .map(SecretBox::expose_secret)
-            .map(ToString::to_string);
-        let role = params
-            .get("role")
-            .map(SecretBox::expose_secret)
-            .map(ToString::to_string);
+        let warehouse = optional_text_parameter(params, "warehouse")?;
+        let role = optional_text_parameter(params, "role")?;
 
-        let auth_type = params
-            .get("auth_type")
-            .map(SecretBox::expose_secret)
-            .map_or_else(|| "snowflake".to_string(), ToString::to_string)
-            .to_lowercase();
+        let auth_type = SnowflakeAuthType::from_params(params)?;
+        validate_authentication_parameters(params, auth_type)?;
 
-        let api = match auth_type.as_str() {
-            "snowflake" => init_snowflake_api_with_password_auth(
+        let api = match auth_type {
+            SnowflakeAuthType::Password => init_snowflake_api_with_password_auth(
                 &account,
                 username,
-                warehouse.as_ref(),
-                role.as_ref(),
+                warehouse.as_deref(),
+                role.as_deref(),
                 params,
             )?,
-            "keypair" => init_snowflake_api_with_keypair_auth(
+            SnowflakeAuthType::KeyPair => init_snowflake_api_with_keypair_auth(
                 &account,
                 username,
-                warehouse.as_ref(),
-                role.as_ref(),
+                warehouse.as_deref(),
+                role.as_deref(),
                 params,
             )?,
-            _ => InvalidParameterValueSnafu {
-                param_key: "snowflake_auth_type",
-                param_value: auth_type,
-            }
-            .fail()?,
         };
 
         tracing::debug!("Snowflake API client created, validating connectivity...");
@@ -306,8 +645,8 @@ impl SnowflakeConnectionPool {
             tracing::warn!(duration_ms = validation_start.elapsed().as_millis(), error = %err, "Snowflake connectivity validation failed");
             match err {
                 snowflake_api::SnowflakeApiError::AuthError(auth_err) => {
-                    // for incorrect werehouse or account param the library fails
-                    // with response decoding message that confuses, so we return a generic error
+                    // For incorrect warehouse or account params the library fails
+                    // with a response decoding message that confuses, so return a generic error.
                     if auth_err
                         .to_string()
                         .contains("error decoding response body")
@@ -353,24 +692,16 @@ impl SnowflakeConnectionPool {
 fn init_snowflake_api_with_password_auth(
     account: &str,
     username: &str,
-    warehouse: Option<&String>,
-    role: Option<&String>,
+    warehouse: Option<&str>,
+    role: Option<&str>,
     params: &HashMap<String, SecretString>,
-) -> Result<SnowflakeApi, Error> {
-    let password = params
-        .get("password")
-        .map(SecretBox::expose_secret)
-        .context(MissingRequiredSecretSnafu { name: "password" })?;
-    let api = SnowflakeApi::with_password_auth(
-        account,
-        warehouse.map(String::as_str),
-        None,
-        None,
-        username,
-        role.map(String::as_str),
-        password,
-    )
-    .context(UnableToConnectSnafu)?;
+) -> Result<SnowflakeApi> {
+    let password = required_parameter(params, "password")?;
+    validate_non_empty_parameter("password", password)?;
+
+    let api =
+        SnowflakeApi::with_password_auth(account, warehouse, None, None, username, role, password)
+            .context(UnableToConnectSnafu)?;
 
     Ok(api)
 }
@@ -378,10 +709,10 @@ fn init_snowflake_api_with_password_auth(
 fn init_snowflake_api_with_keypair_auth(
     account: &str,
     username: &str,
-    warehouse: Option<&String>,
-    role: Option<&String>,
+    warehouse: Option<&str>,
+    role: Option<&str>,
     params: &HashMap<String, SecretString>,
-) -> Result<SnowflakeApi, Error> {
+) -> Result<SnowflakeApi> {
     let private_key_content = params.get("private_key").map(SecretBox::expose_secret);
     let private_key_path = params.get("private_key_path").map(SecretBox::expose_secret);
 
@@ -389,8 +720,12 @@ fn init_snowflake_api_with_keypair_auth(
         (Some(_), Some(_)) => {
             return MutuallyExclusivePrivateKeyParamsSnafu.fail();
         }
-        (Some(content), None) => content.to_string(),
+        (Some(content), None) => {
+            validate_non_empty_parameter("private_key", content)?;
+            content.to_string()
+        }
         (None, Some(path)) => {
+            validate_text_parameter("private_key_path", path)?;
             fs::read_to_string(path).context(ErrorReadingPrivateKeyFileSnafu { file_path: path })?
         }
         (None, None) => {
@@ -409,7 +744,7 @@ fn init_snowflake_api_with_keypair_auth(
             .get("private_key_passphrase")
             .map(SecretBox::expose_secret)
             .context(MissingRequiredSecretSnafu {
-                name: "snowflake_private_key_passphrase",
+                name: "snowflake_private_key_passphrase".to_string(),
             })?;
 
         private_key_pem = decode_pkcs8_encrypted_data(&data, passphrase)?;
@@ -417,11 +752,11 @@ fn init_snowflake_api_with_keypair_auth(
 
     let api = SnowflakeApi::with_certificate_auth(
         account,
-        warehouse.map(String::as_str),
+        warehouse,
         None,
         None,
         username,
-        role.map(String::as_str),
+        role,
         &private_key_pem,
     )
     .context(UnableToConnectSnafu)?;
@@ -433,7 +768,7 @@ fn init_snowflake_api_with_keypair_auth(
 impl DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> for SnowflakeConnectionPool {
     async fn connect(
         &self,
-    ) -> Result<
+    ) -> std::result::Result<
         Box<dyn DbConnection<Arc<SnowflakeApi>, &'static dyn Sync>>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
@@ -449,7 +784,7 @@ impl DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> for SnowflakeConnect
     }
 }
 
-fn decode_pkcs8_encrypted_data(data: &SecretDocument, password: &str) -> Result<String, Error> {
+fn decode_pkcs8_encrypted_data(data: &SecretDocument, password: &str) -> Result<String> {
     let encrypted_key_info = data
         .decode_msg::<pkcs8::EncryptedPrivateKeyInfo>()
         .context(UnableToParsePrivateKeySnafu)?;
@@ -467,20 +802,27 @@ fn decode_pkcs8_encrypted_data(data: &SecretDocument, password: &str) -> Result<
 mod tests {
     use super::*;
 
-    fn assert_invalid_account_identifier(account_identifier: &str) {
-        let _error = account_identifier
+    fn assert_invalid_account_identifier(account_identifier: &str) -> String {
+        account_identifier
             .parse::<SnowflakeAccountIdentifier>()
-            .expect_err("reject invalid Snowflake account identifier");
+            .expect_err("reject invalid Snowflake account identifier")
+    }
+
+    fn secret_params(params: &[(&str, &str)]) -> HashMap<String, SecretString> {
+        params
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), SecretString::from(*value)))
+            .collect()
     }
 
     #[test]
-    fn test_org_based_format() {
+    fn org_qualified_format_uses_dash_for_api_account() {
         let id: SnowflakeAccountIdentifier = "myorg.myaccount"
             .parse()
-            .expect("parse org-based Snowflake account identifier");
+            .expect("parse org-qualified Snowflake account identifier");
         assert_eq!(
             id,
-            SnowflakeAccountIdentifier::OrgBased {
+            SnowflakeAccountIdentifier::OrgQualified {
                 orgname: "myorg".to_string(),
                 account_name: "myaccount".to_string(),
             }
@@ -490,104 +832,194 @@ mod tests {
     }
 
     #[test]
-    fn test_org_based_with_underscores() {
-        let id: SnowflakeAccountIdentifier = "my_org.my_account"
+    fn org_qualified_format_supports_account_name_underscores() {
+        let id: SnowflakeAccountIdentifier = "myorg.my_account"
             .parse()
-            .expect("parse org-based Snowflake account identifier with underscores");
-        assert_eq!(id.api_account(), "my_org-my_account");
+            .expect("parse account name with underscores");
+        assert_eq!(id.api_account(), "myorg-my_account");
     }
 
     #[test]
-    fn test_legacy_locator_with_region() {
-        let id: SnowflakeAccountIdentifier = "sb70577.eu-central-1"
-            .parse()
-            .expect("parse legacy Snowflake account identifier with region");
-        assert_eq!(
-            id,
-            SnowflakeAccountIdentifier::Legacy {
-                account_locator: "sb70577".to_string(),
-                region: Some("eu-central-1".to_string()),
-                cloud: None,
-            }
-        );
-        assert_eq!(id.api_account(), "sb70577.eu-central-1");
-    }
-
-    #[test]
-    fn test_legacy_locator_with_region_and_cloud() {
-        let id: SnowflakeAccountIdentifier = "xy12345.us-east-2.aws"
-            .parse()
-            .expect("parse legacy Snowflake account identifier with region and cloud");
-        assert_eq!(
-            id,
-            SnowflakeAccountIdentifier::Legacy {
-                account_locator: "xy12345".to_string(),
-                region: Some("us-east-2".to_string()),
-                cloud: Some("aws".to_string()),
-            }
-        );
-        assert_eq!(id.api_account(), "xy12345.us-east-2.aws");
-    }
-
-    #[test]
-    fn test_legacy_bare_locator() {
-        let id: SnowflakeAccountIdentifier = "xy12345"
-            .parse()
-            .expect("parse legacy Snowflake account locator");
-        assert_eq!(
-            id,
-            SnowflakeAccountIdentifier::Legacy {
-                account_locator: "xy12345".to_string(),
-                region: None,
-                cloud: None,
-            }
-        );
-        assert_eq!(id.api_account(), "xy12345");
-    }
-
-    #[test]
-    fn test_already_dashed_org_format() {
+    fn preferred_client_driver_format_is_preserved() {
         let id: SnowflakeAccountIdentifier = "myorg-myaccount"
             .parse()
-            .expect("parse dashed Snowflake account identifier as legacy locator");
+            .expect("parse preferred client-driver account identifier");
         assert_eq!(
             id,
-            SnowflakeAccountIdentifier::Legacy {
-                account_locator: "myorg-myaccount".to_string(),
-                region: None,
-                cloud: None,
+            SnowflakeAccountIdentifier::AccountName {
+                account_identifier: "myorg-myaccount".to_string(),
             }
         );
         assert_eq!(id.api_account(), "myorg-myaccount");
     }
 
     #[test]
-    fn test_empty_is_err() {
-        assert_invalid_account_identifier("");
+    fn account_urls_are_normalized_to_api_account() {
+        let id: SnowflakeAccountIdentifier = "https://myorg-myaccount.snowflakecomputing.com"
+            .parse()
+            .expect("parse Snowflake account URL");
+        assert_eq!(id.api_account(), "myorg-myaccount");
+
+        let id: SnowflakeAccountIdentifier = "xy12345.us-east-2.aws.snowflakecomputing.com"
+            .parse()
+            .expect("parse Snowflake account host");
+        assert_eq!(id.api_account(), "xy12345.us-east-2.aws");
     }
 
     #[test]
-    fn test_leading_dot_is_err() {
-        assert_invalid_account_identifier(".myaccount");
+    fn legacy_locator_with_region_is_preserved() {
+        let id: SnowflakeAccountIdentifier = "sb70577.eu-central-1"
+            .parse()
+            .expect("parse legacy Snowflake account identifier with region");
+        assert_eq!(
+            id,
+            SnowflakeAccountIdentifier::Legacy {
+                segments: vec!["sb70577".to_string(), "eu-central-1".to_string()],
+            }
+        );
+        assert_eq!(id.api_account(), "sb70577.eu-central-1");
     }
 
     #[test]
-    fn test_trailing_dot_is_err() {
-        assert_invalid_account_identifier("myorg.");
+    fn legacy_locator_with_region_and_cloud_is_preserved() {
+        let id: SnowflakeAccountIdentifier = "xy12345.us-east-2.aws"
+            .parse()
+            .expect("parse legacy Snowflake account identifier with region and cloud");
+        assert_eq!(
+            id,
+            SnowflakeAccountIdentifier::Legacy {
+                segments: vec![
+                    "xy12345".to_string(),
+                    "us-east-2".to_string(),
+                    "aws".to_string(),
+                ],
+            }
+        );
+        assert_eq!(id.api_account(), "xy12345.us-east-2.aws");
     }
 
     #[test]
-    fn test_org_based_with_invalid_character_is_err() {
-        assert_invalid_account_identifier("myorg.my$account");
+    fn legacy_snowgov_locator_with_compliance_segment_is_preserved() {
+        let id: SnowflakeAccountIdentifier = "xy12345.fhplus.us-gov-west-1.aws"
+            .parse()
+            .expect("parse legacy SnowGov Snowflake account identifier");
+        assert_eq!(id.api_account(), "xy12345.fhplus.us-gov-west-1.aws");
     }
 
     #[test]
-    fn test_legacy_with_empty_region_segment_is_err() {
-        assert_invalid_account_identifier("xy12345..aws");
+    fn legacy_bare_locator_is_preserved() {
+        let id: SnowflakeAccountIdentifier = "xy12345"
+            .parse()
+            .expect("parse legacy Snowflake account locator");
+        assert_eq!(
+            id,
+            SnowflakeAccountIdentifier::AccountName {
+                account_identifier: "xy12345".to_string(),
+            }
+        );
+        assert_eq!(id.api_account(), "xy12345");
     }
 
     #[test]
-    fn test_legacy_with_empty_cloud_segment_is_err() {
-        assert_invalid_account_identifier("xy12345.us-east-1.");
+    fn invalid_account_identifiers_are_rejected_with_actionable_message() {
+        for account_identifier in [
+            "",
+            " myorg-myaccount",
+            "my org-myaccount",
+            ".myaccount",
+            "myorg.",
+            "my_org.myaccount",
+            "myorg.my_account_",
+            "myorg.my$account",
+            "xy12345..aws",
+            "xy12345.us-east-1.",
+            "xy12345.us-east-2.aws.extra.segment",
+            "myorganizationname.myaccountnamewithmorethanallowedidentifierchars",
+            "https://xy12345.us-east-2.aws.snowflakecomputing.com/console",
+            "https://xy12345.us-east-2.aws.privatelink.snowflakecomputing.com",
+            "https://xy12345.cn-northwest-1.aws.snowflakecomputing.cn",
+            "xy12345.cn-northwest-1.aws",
+        ] {
+            let error = assert_invalid_account_identifier(account_identifier);
+            assert!(
+                error.contains("account identifier") || error.contains("Snowflake account URL"),
+                "error should describe the invalid account identifier: {error}"
+            );
+            assert!(
+                error.contains(SNOWFLAKE_ACCOUNT_IDENTIFIER_DOCS),
+                "error should link to Snowflake account identifier docs: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_type_accepts_documented_and_legacy_aliases() {
+        let params = secret_params(&[]);
+        assert_eq!(
+            SnowflakeAuthType::from_params(&params).expect("default auth type"),
+            SnowflakeAuthType::Password
+        );
+
+        let params = secret_params(&[("auth_type", "password")]);
+        assert_eq!(
+            SnowflakeAuthType::from_params(&params).expect("password auth type"),
+            SnowflakeAuthType::Password
+        );
+
+        let params = secret_params(&[("auth_type", "snowflake")]);
+        assert_eq!(
+            SnowflakeAuthType::from_params(&params).expect("legacy password auth type"),
+            SnowflakeAuthType::Password
+        );
+
+        let params = secret_params(&[("auth_type", "keypair")]);
+        assert_eq!(
+            SnowflakeAuthType::from_params(&params).expect("keypair auth type"),
+            SnowflakeAuthType::KeyPair
+        );
+
+        let params = secret_params(&[("auth_type", "snowflake_jwt")]);
+        assert_eq!(
+            SnowflakeAuthType::from_params(&params).expect("Snowflake JWT auth type"),
+            SnowflakeAuthType::KeyPair
+        );
+    }
+
+    #[test]
+    fn auth_type_defaults_to_keypair_when_only_keypair_credentials_are_present() {
+        let params = secret_params(&[("private_key_path", "/path/to/key.pem")]);
+        assert_eq!(
+            SnowflakeAuthType::from_params(&params).expect("infer keypair auth type"),
+            SnowflakeAuthType::KeyPair
+        );
+    }
+
+    #[test]
+    fn invalid_auth_type_is_rejected_with_user_facing_parameter_name() {
+        let params = secret_params(&[("auth_type", "oauth")]);
+        let error = SnowflakeAuthType::from_params(&params)
+            .expect_err("reject unsupported auth type")
+            .to_string();
+
+        assert!(error.contains("snowflake_auth_type"));
+        assert!(error.contains("password"));
+        assert!(error.contains("keypair"));
+    }
+
+    #[test]
+    fn conflicting_authentication_parameters_are_rejected() {
+        let params = secret_params(&[("auth_type", "password"), ("private_key_path", "key.pem")]);
+        let error = validate_authentication_parameters(&params, SnowflakeAuthType::Password)
+            .expect_err("reject keypair params with password auth")
+            .to_string();
+        assert!(error.contains("snowflake_auth_type"));
+        assert!(error.contains("snowflake_private_key_path"));
+
+        let params = secret_params(&[("auth_type", "keypair"), ("password", "secret")]);
+        let error = validate_authentication_parameters(&params, SnowflakeAuthType::KeyPair)
+            .expect_err("reject password with keypair auth")
+            .to_string();
+        assert!(error.contains("snowflake_auth_type"));
+        assert!(error.contains("snowflake_password"));
     }
 }
