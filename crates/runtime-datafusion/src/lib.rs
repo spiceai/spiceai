@@ -26,6 +26,8 @@ pub mod join_accumulator;
 pub mod managed_runtime;
 pub mod optimizer_rule;
 pub mod param_utils;
+pub mod query_cancel_registry;
+pub mod query_engine;
 pub mod schema_provider;
 pub mod sort_columns;
 pub mod url_table;

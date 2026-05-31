@@ -30,6 +30,7 @@ use std::time::Duration;
 use ballista_core::utils::{GrpcClientConfig, create_grpc_client_endpoint};
 use ballista_executor::executor::Executor;
 use futures::StreamExt;
+use runtime_cluster::ExecutorOutboundBroadcaster;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
 use runtime_proto::scheduler_control_message::Message as SchedulerMessage;
 use runtime_proto::{
@@ -80,6 +81,23 @@ struct ControlStreamHandle {
     outbound_tx: Arc<RwLock<Option<mpsc::Sender<ExecutorControlMessage>>>>,
 }
 
+/// Tear down per-connection state when a control stream exits (cancellation,
+/// stream error, or scheduler-side close). Bundled so the four exit paths
+/// share a single cleanup sequence — if a new piece of per-connection state
+/// is added, this is the only place to update.
+async fn teardown_scheduler_stream(
+    heartbeat_task: &tokio::task::JoinHandle<()>,
+    outbound_tx_state: &Arc<RwLock<Option<mpsc::Sender<ExecutorControlMessage>>>>,
+    broadcaster: Option<&ExecutorOutboundBroadcaster>,
+    scheduler_address: &str,
+) {
+    heartbeat_task.abort();
+    *outbound_tx_state.write().await = None;
+    if let Some(b) = broadcaster {
+        b.unregister(scheduler_address).await;
+    }
+}
+
 /// Spawns a control stream connection to a single scheduler.
 ///
 /// The stream will:
@@ -99,6 +117,7 @@ fn spawn_control_stream(
     outbound_tx_state: Arc<RwLock<Option<mpsc::Sender<ExecutorControlMessage>>>>,
     partition_update_handler: Option<&PartitionUpdateHandler>,
     refresh_dataset_handler: Option<&RefreshDatasetHandler>,
+    broadcaster: Option<ExecutorOutboundBroadcaster>,
 ) -> ControlStreamHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
@@ -184,6 +203,10 @@ fn spawn_control_stream(
                 let mut outbound_guard = outbound_tx_state_for_task.write().await;
                 *outbound_guard = Some(outbound_tx.clone());
             }
+            if let Some(b) = broadcaster.as_ref() {
+                b.register(scheduler_address.clone(), outbound_tx.clone())
+                    .await;
+            }
 
             // Spawn heartbeat sender
             let heartbeat_executor_id = executor_id.clone();
@@ -226,9 +249,13 @@ fn spawn_control_stream(
                 })),
             };
             if outbound_tx.send(init_msg).await.is_err() {
-                heartbeat_task.abort();
-                let mut outbound_guard = outbound_tx_state_for_task.write().await;
-                *outbound_guard = None;
+                teardown_scheduler_stream(
+                    &heartbeat_task,
+                    &outbound_tx_state_for_task,
+                    broadcaster.as_ref(),
+                    &scheduler_address,
+                )
+                .await;
                 continue;
             }
 
@@ -242,9 +269,13 @@ fn spawn_control_stream(
                     tracing::warn!(
                         "Failed to establish control stream to {scheduler_address}: {e}"
                     );
-                    heartbeat_task.abort();
-                    let mut outbound_guard = outbound_tx_state_for_task.write().await;
-                    *outbound_guard = None;
+                    teardown_scheduler_stream(
+                        &heartbeat_task,
+                        &outbound_tx_state_for_task,
+                        broadcaster.as_ref(),
+                        &scheduler_address,
+                    )
+                    .await;
                     if let Some(delay) = backoff.next_duration() {
                         tokio::select! {
                             () = token.cancelled() => break,
@@ -268,11 +299,13 @@ fn spawn_control_stream(
             loop {
                 tokio::select! {
                     () = token.cancelled() => {
-                        heartbeat_task.abort();
-                        {
-                            let mut outbound_guard = outbound_tx_state_for_task.write().await;
-                            *outbound_guard = None;
-                        }
+                        teardown_scheduler_stream(
+                            &heartbeat_task,
+                            &outbound_tx_state_for_task,
+                            broadcaster.as_ref(),
+                            &scheduler_address,
+                        )
+                        .await;
                         tracing::debug!(
                             "Control stream to {scheduler_address} cancelled"
                         );
@@ -318,11 +351,13 @@ fn spawn_control_stream(
                 }
             }
 
-            heartbeat_task.abort();
-            {
-                let mut outbound_guard = outbound_tx_state_for_task.write().await;
-                *outbound_guard = None;
-            }
+            teardown_scheduler_stream(
+                &heartbeat_task,
+                &outbound_tx_state_for_task,
+                broadcaster.as_ref(),
+                &scheduler_address,
+            )
+            .await;
             tracing::debug!("Control stream to {scheduler_address} disconnected, will reconnect");
 
             runtime_cluster::metrics::set_executor_scheduler_active_connection(
@@ -533,11 +568,15 @@ pub struct ControlStreamManager {
     partition_update_handler: Option<PartitionUpdateHandler>,
     /// Callback handler for dataset refresh commands.
     refresh_dataset_handler: Option<RefreshDatasetHandler>,
+    /// Shared per-scheduler sender map used by the runtime to broadcast
+    /// unsolicited messages (e.g. `PartitionsLoaded`).
+    broadcaster: Option<ExecutorOutboundBroadcaster>,
 }
 
 impl ControlStreamManager {
     /// Creates a new control stream manager.
     #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         executor_id: String,
         ballista_executor_id: String,
@@ -546,6 +585,7 @@ impl ControlStreamManager {
         partition_update_handler: Option<PartitionUpdateHandler>,
         executor: Option<Arc<Executor>>,
         refresh_dataset_handler: Option<RefreshDatasetHandler>,
+        broadcaster: Option<ExecutorOutboundBroadcaster>,
     ) -> Self {
         Self {
             executor_id,
@@ -558,6 +598,7 @@ impl ControlStreamManager {
             poll_now_notify: Arc::new(Notify::new()),
             partition_update_handler,
             refresh_dataset_handler,
+            broadcaster,
         }
     }
 
@@ -641,6 +682,7 @@ impl ControlStreamManager {
                 Arc::clone(&outbound_tx_state),
                 self.partition_update_handler.as_ref(),
                 self.refresh_dataset_handler.as_ref(),
+                self.broadcaster.clone(),
             );
             self.streams.insert(address, handle);
         }
@@ -724,6 +766,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(manager.known_schedulers.is_empty());
         assert!(manager.streams.is_empty());
@@ -741,6 +784,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(manager.metrics_reader.is_some());
     }
@@ -750,6 +794,7 @@ mod tests {
         let mut manager = ControlStreamManager::new(
             "executor-1".to_string(),
             "executor-1".to_string(),
+            None,
             None,
             None,
             None,
@@ -766,6 +811,7 @@ mod tests {
         let mut manager = ControlStreamManager::new(
             "executor-1".to_string(),
             "executor-1".to_string(),
+            None,
             None,
             None,
             None,

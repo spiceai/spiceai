@@ -195,6 +195,11 @@ pub enum Error {
 
     #[snafu(display("No primary keys defined for dataset {dataset_name}"))]
     NoPrimaryKeysDefined { dataset_name: String },
+
+    #[snafu(transparent)]
+    PkFilterExpr {
+        source: data_components::pk_filter_expr::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -853,13 +858,24 @@ impl Builder {
 
         let (refresh_handle, refresh_trigger) =
             if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
-                // Accelerated tables aren't accelerated on scheduler. Immediately ready.
-                // Set refresh_trigger to None because the receiver will be dropped
-                // (refresher.start() is not called), making the channel dead.
-                self.runtime_status
-                    .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
-                // Notify immediately so schedule creation doesn't block waiting for
-                // a refresh that will never happen locally on the scheduler.
+                // Accelerated tables aren't loaded locally on the scheduler —
+                // executors do. Don't start a refresh task, and leave the
+                // dataset status as `Refreshing` (set by the caller before
+                // this point). The scheduler flips the dataset to `Ready`
+                // only after executors confirm via `PartitionsLoaded` acks
+                // that every assigned partition is loaded; see
+                // `runtime_cluster::PartitionLoadTracker` and the
+                // `PartitionsLoaded` handler in `cluster::service`.
+                // Previously this branch flipped the dataset to `Ready`
+                // immediately, which made `/v1/ready` claim the cluster was
+                // queryable before any data had been loaded on executors.
+                //
+                // `refresh_trigger` is None because the receiver will be
+                // dropped (refresher.start() is not called).
+                //
+                // Notify completion waiters so the schedule-creation path
+                // doesn't block waiting on a refresh that won't run here —
+                // dataset readiness is a separate concern handled above.
                 on_complete_notification.notify_waiters();
                 (None, None)
             } else {
