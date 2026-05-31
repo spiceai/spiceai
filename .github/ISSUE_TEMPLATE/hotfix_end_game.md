@@ -31,7 +31,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
 
 1. **Unit/Integration Tests**
    - [ ] Confirm local and CI tests pass without major failures.
-     - [ ] Verify [integration](https://github.com/spiceai/spiceai/actions/workflows/integration.yml) tests (which include the `run_all_tests` flag) is green on the release branch.
+     - [ ] Verify [integration](https://github.com/spiceai/spiceai/actions/workflows/integration-tests.yml) tests (which include the `run_all_tests` flag) is green on the release branch.
 
 ## Final Updates
 

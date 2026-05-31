@@ -1,0 +1,28 @@
+name: 'pr - helm lint'
+run-name: 'pr - helm lint - ${{ github.ref_name }}'
+
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - 'deploy/chart/**'
+
+jobs:
+  lint-helm:
+    name: Helm Lint
+    runs-on: spiceai-macos
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 1
+
+      - name: Set up Helm
+        uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5
+
+      - name: Lint Helm chart
+        run: helm lint deploy/chart/

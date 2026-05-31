@@ -1,0 +1,68 @@
+name: 'bench-spice postgres tpch docker'
+run-name: 'bench-spice postgres tpch docker - ${{ github.ref_name }}'
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Login to Docker Hub
+        # Authenticate to Docker Hub before pulling so we use the authenticated
+        # rate limits instead of anonymous (per-IP) limits.
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull Postgres Docker image
+        run: docker pull postgres:latest
+
+      - name: Start temporary Postgres server
+        run: |
+          docker run --name spice-postgres-bench-temp -e POSTGRES_PASSWORD=postgres -p 5432:5432 -d postgres:latest
+          sleep 10
+
+      - name: Install necessary tools
+        run: sudo apt-get update && sudo apt-get install -y git make gcc
+
+      - name: Initialize TPCH data
+        working-directory: ./test/tpch
+        run: |
+          make tpch-init
+          export PGPASSWORD='postgres'
+          for sf in 0.01 0.05 1; do
+            DB_NAME=tpch_sf${sf//./_}
+            DBGEN_SCALE=$sf make tpch-gen
+            DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-init
+            DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-load
+            DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-create-index
+            docker exec spice-postgres-bench-temp sh -c "exec pg_dump -U postgres ${DB_NAME}" >> postgres-bench/backup_$DB_NAME.sql
+          done
+
+      - name: Login to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: ./test/tpch/postgres-bench
+          file: ./test/tpch/postgres-bench/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/spiceai/spice-postgres-bench:latest
+            ghcr.io/spiceai/spice-postgres-bench:${{ github.sha }}

@@ -1,4 +1,5 @@
-name: Enforce Pulls with Spice
+name: 'Enforce Pulls with Spice'
+run-name: 'Enforce Pulls with Spice - ${{ github.ref_name }}'
 
 on:
   merge_group:

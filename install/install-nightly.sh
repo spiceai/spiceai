@@ -37,7 +37,7 @@ SPICE_BIN=".spice/bin"
 # GitHub Organization and repo name
 GITHUB_ORG=spiceai
 GITHUB_REPO=spiceai
-WORKFLOW_NAME="build_nightly.yml"
+WORKFLOW_NAME="build-nightly.yml"
 
 # Filenames
 SPICE_CLI_FILENAME=spice

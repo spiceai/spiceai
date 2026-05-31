@@ -1,0 +1,539 @@
+name: 'bench-testoperator e2e tests'
+run-name: 'bench-testoperator e2e tests - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}'
+
+on:
+  workflow_dispatch:
+    inputs:
+      spiced_commit:
+        description: 'spiced build commit'
+        required: false
+        type: string
+      spicepod_path:
+        description: 'The spicepod file to test with'
+        required: true
+        type: string
+      query_set:
+        description: 'Query set'
+        required: true
+        default: 'tpch'
+        type: choice
+        options:
+          - 'tpch'
+          - 'tpch[parameterized]'
+          - 'tpcds'
+          - 'clickbench'
+          - 'chbench'
+          - 'scenario'
+      scenario_query_file:
+        description: 'Path to scenario query file (required when query_set is scenario)'
+        required: false
+        type: string
+        default: ''
+      query_overrides:
+        description: 'Query overrides'
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - 'sqlite'
+          - 'postgresql'
+          - 'mysql'
+          - 'dremio'
+          - 'odbc-athena'
+          - 'odbc-databricks'
+          - 'oracle'
+          - 'duckdb'
+          - 'duckdb-zero-results'
+          - 'duckdb-partitioned'
+          - 'snowflake'
+          - 'snowflake-catalog'
+          - 'spark'
+          - 'iceberg-sf1'
+          - 'spicecloud-catalog'
+          - 'glue-catalog'
+          - 'databricks-catalog'
+          - 'spicecloud'
+          - 'iceberg-hadoop'
+          - 'dynamodb'
+          - 'arrow'
+          - 'cayenne'
+          - 'postgres-catalog'
+          - 'mysql-catalog'
+          - 'mssql-catalog'
+          - 'oracle-catalog'
+          - 'ducklake-catalog'
+          - 'turso'
+          - 'bigquery'
+          - 'scylladb'
+      ready_wait:
+        description: 'How long (in seconds) to wait for spiced to start'
+        required: true
+        default: '30'
+        type: string
+      runner_type:
+        description: 'Runner type'
+        required: true
+        default: 'spiceai-dev-runners'
+        type: choice
+        options:
+          - 'spiceai-dev-runners'
+          - 'spiceai-dev-large-runners'
+      scale_factor:
+        description: 'Scale factor for the benchmark'
+        required: false
+        type: string
+        default: '1'
+      update_snapshots:
+        description: 'Update the snapshots?'
+        required: false
+        default: 'default'
+        type: choice
+        options:
+          - 'default'
+          - 'always'
+          - 'no'
+      validate_results:
+        description: 'Validate the results?'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  run-bench:
+    name: Run bench-testoperator e2e tests
+    runs-on: ${{ github.event.inputs.runner_type }}
+    timeout-minutes: 600
+    services:
+      mssql_tpch:
+        image: ${{ contains(github.event.inputs.spicepod_path, 'mssql') && 'ghcr.io/spiceai/spice-mssql-bench:latest' || '' }}
+        ports:
+          - 1433:1433
+        env:
+          MSSQL_SA_PASSWORD: S3cretP@ssw0rd
+          DB_NAME: tpch_sf1
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Rust toolchain
+        uses: ./.github/actions/setup-rust
+
+      - name: Determine snapshot update mode
+        id: determine_update_snapshots
+        run: |
+          update_mode="${{ github.event.inputs.update_snapshots }}"
+          if [ "${update_mode}" = "default" ] || [ -z "${update_mode}" ]; then
+            branch_name="${{ github.ref_name }}"
+            if [[ "${branch_name}" == "release/"* ]]; then
+              update_mode="no"
+            else
+              update_mode="always"
+            fi
+          fi
+
+          echo "Using update_snapshots=${update_mode}" >&2
+          echo "update_snapshots=${update_mode}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set spicepod path
+        id: set_spicepod_path
+        run: |
+          query_set="${{ github.event.inputs.query_set }}"
+          query_set="${query_set%%\[*\]*}"
+          SPICEPOD_PATH="./test/spicepods/${query_set}/sf${{ github.event.inputs.scale_factor }}/${{ github.event.inputs.spicepod_path }}"
+          echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
+
+      - name: Validate spicepod file exists
+        run: |
+          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
+            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+            exit 1
+          fi
+          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Build spicepod validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Validate spicepod
+        run: |
+          spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        id: setup-spiced
+        with:
+          spiced_commit: ${{ github.event.inputs.spiced_commit }}
+          with_odbc: ${{ contains(github.event.inputs.spicepod_path, 'odbc') }}
+
+      - name: Display spiced commit
+        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Setup Testoperator
+        uses: ./.github/actions/setup-testoperator-data
+        with:
+          query_set: ${{ github.event.inputs.query_set }}
+
+      - name: Setup MySQL
+        run: |
+          if [[ ${{ github.event.inputs.query_set }} == "tpcds" ]]; then
+            echo "MYSQL_DB=tpcds_sf1" >> $GITHUB_ENV
+          elif [[ ${{ github.event.inputs.query_set }} == "tpch" ]]; then
+            echo "MYSQL_DB=tpch_sf1" >> $GITHUB_ENV
+            echo "MYSQL_DB_SF100=tpch_sf100" >> $GITHUB_ENV
+          fi
+
+      - name: Setup ODBC
+        if: ${{ contains(github.event.inputs.spicepod_path, 'odbc') }}
+        uses: ./.github/actions/setup-odbc
+
+      - name: Install Oracle ODPI-C
+        if: ${{ contains(github.event.inputs.spicepod_path, 'oracle') }}
+        uses: ./.github/actions/setup-oracle-odpi
+
+      - name: Install ADBC BigQuery Driver
+        if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
+        uses: ./.github/actions/setup-adbc-bigquery
+
+      - name: Set up Python
+        if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') || contains(github.event.inputs.spicepod_path, 'ducklake') }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Setup ScyllaDB
+        if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') }}
+        uses: ./.github/actions/setup-scylladb
+        with:
+          keyspace: tpch_sf1
+
+      - name: Install PostgreSQL for DuckLake
+        if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
+        uses: ./.github/actions/install-postgres
+        with:
+          pg-db: ducklake_catalog
+
+      - name: Setup CH-benCH PostgreSQL
+        if: ${{ github.event.inputs.query_set == 'chbench' }}
+        uses: ./.github/actions/setup-chbench-postgres
+
+      - name: Start local MinIO for DuckLake
+        if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            quay.io/minio/minio server /data --console-address ':9001'
+
+      - name: Wait for local MinIO
+        if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
+        run: |
+          for _ in {1..30}; do
+            if curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo 'MinIO did not become ready in time.'
+          docker logs minio
+          exit 1
+
+      - name: Bootstrap DuckLake TPCH SF1 catalog
+        if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
+        run: |
+          python -m pip install --upgrade duckdb minio
+
+          python <<'PY'
+          import duckdb
+          from minio import Minio
+
+          bucket_name = "ducklake"
+          minio = Minio(
+              "127.0.0.1:9000",
+              access_key="minioadmin",
+              secret_key="minioadmin",
+              secure=False,
+          )
+          if not minio.bucket_exists(bucket_name):
+              minio.make_bucket(bucket_name)
+
+          tables = [
+              "customer",
+              "lineitem",
+              "nation",
+              "orders",
+              "part",
+              "partsupp",
+              "region",
+              "supplier",
+          ]
+
+          connection = duckdb.connect()
+          connection.execute("INSTALL ducklake; LOAD ducklake;")
+          connection.execute("INSTALL postgres; LOAD postgres;")
+          connection.execute("INSTALL httpfs; LOAD httpfs;")
+          connection.execute("INSTALL tpch; LOAD tpch;")
+
+          connection.execute(
+              """
+              CREATE OR REPLACE SECRET minio_secret (
+                TYPE s3,
+                PROVIDER config,
+                KEY_ID 'minioadmin',
+                SECRET 'minioadmin',
+                REGION 'us-east-1',
+                ENDPOINT '127.0.0.1:9000',
+                URL_STYLE 'path',
+                USE_SSL false
+              );
+              """
+          )
+
+          connection.execute(
+              """
+              ATTACH 'ducklake:postgres:dbname=ducklake_catalog host=localhost user=postgres password=postgres' AS ducklake
+                (DATA_PATH 's3://ducklake/tpch_sf1/');
+              """
+          )
+
+          connection.execute("CALL dbgen(sf=1);")
+
+          for table in tables:
+              connection.execute(
+                  f"CREATE TABLE ducklake.main.{table} AS SELECT * FROM memory.main.{table};"
+              )
+
+          connection.close()
+          PY
+
+      - name: Run the benchmark test - ${{ github.event.inputs.spicepod_path }}
+        if: ${{ github.event.inputs.query_overrides == '' }}
+        run: |
+          [ -z "$AWS_ENDPOINT_URL" ] && unset AWS_ENDPOINT_URL
+
+          rm -rf .spice/data
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
+            -s /usr/local/bin/spiced \
+            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
+            -d /opt/spiced/data \
+            --query-set ${{ github.event.inputs.query_set }} \
+            ${{ github.event.inputs.scenario_query_file != '' && format('--scenario-query-file ./test/scenario/{0}', github.event.inputs.scenario_query_file) || '' }} \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --disable-progress-bars \
+            --validate=${{ github.event.inputs.validate_results }} \
+            --metrics \
+            --scale-factor ${{ github.event.inputs.scale_factor }}
+        env:
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+          DATABRICKS_ODBC_PATH: ${{ vars.DATABRICKS_ODBC_PATH }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_ENDPOINT: ${{ vars.DATABRICKS_ENDPOINT }}
+          DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
+          DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.DATABRICKS_SQL_WAREHOUSE_ID }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'minioadmin' || secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'minioadmin' || secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          AWS_DYNAMODB_ACCESS_KEY_ID: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
+          AWS_DYNAMODB_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'http://127.0.0.1:9000' || '' }}
+          AWS_ALLOW_HTTP: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'true' || '' }}
+          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
+          DUCKLAKE_CONNECTION_STRING: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'postgres:dbname=ducklake_catalog host=localhost user=postgres password=postgres' || '' }}
+          GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
+          GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          MYSQL_HOST: ${{ vars.TEST_MYSQL_HOST }}
+          MYSQL_TCP_PORT: 3306
+          MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
+          MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
+          MONGODB_HOST: ${{ vars.TEST_MONGODB_HOST }}
+          MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
+          POSTGRES_HOST: ${{ vars.TEST_POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ vars.TEST_POSTGRES_HOST }}
+          POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+          SPICEAI_TEST_ENDPOINT: ${{ vars.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
+          SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
+          SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
+          SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
+          SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
+          SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
+          SQL_WAREHOUSE_DATABRICKS_HOST: ${{ vars.SQL_WAREHOUSE_DATABRICKS_HOST }}
+          SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
+          DREMIO_ENDPOINT: ${{ vars.TEST_DREMIO_ENDPOINT}}
+          DREMIO_USERNAME: ${{ secrets.TEST_DREMIO_USERNAME}}
+          DREMIO_PASSWORD: ${{ secrets.TEST_DREMIO_PASSWORD}}
+          INSTA_UPDATE: ${{ steps.determine_update_snapshots.outputs.update_snapshots}}
+          MSSQL_HOST: localhost
+          MSSQL_USER: sa
+          MSSQL_PASSWORD: S3cretP@ssw0rd
+          MSSQL_TPCH_DB: tpch_sf1
+          ORACLE_CLOUD_CONNECTION_STRING: ${{ secrets.ORACLE_CLOUD_CONNECTION_STRING }}
+          ORACLE_CLOUD_USERNAME: ${{ secrets.ORACLE_CLOUD_USERNAME }}
+          ORACLE_CLOUD_PASSWORD: ${{ secrets.ORACLE_CLOUD_PASSWORD }}
+          ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          SCYLLADB_HOST: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '127.0.0.1' || '' }}
+          SCYLLADB_PORT: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '9042' || '' }}
+          SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}
+
+      - name: Run the benchmark test (with overrides) - ${{ github.event.inputs.spicepod_path }}
+        if: ${{ github.event.inputs.query_overrides != '' }}
+        run: |
+          [ -z "$AWS_ENDPOINT_URL" ] && unset AWS_ENDPOINT_URL
+
+          rm -rf .spice/data
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
+            -s /usr/local/bin/spiced \
+            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
+            -d /opt/spiced/data \
+            --query-set ${{ github.event.inputs.query_set }} \
+            ${{ github.event.inputs.scenario_query_file != '' && format('--scenario-query-file ./test/scenario/{0}', github.event.inputs.scenario_query_file) || '' }} \
+            --query-overrides ${{ github.event.inputs.query_overrides }} \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --disable-progress-bars \
+            --validate=${{ github.event.inputs.validate_results }} \
+            --metrics \
+            --scale-factor ${{ github.event.inputs.scale_factor }}
+        env:
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+          DATABRICKS_ODBC_PATH: ${{ vars.DATABRICKS_ODBC_PATH }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_ENDPOINT: ${{ vars.DATABRICKS_ENDPOINT }}
+          DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
+          DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.DATABRICKS_SQL_WAREHOUSE_ID }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'minioadmin' || secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'minioadmin' || secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          AWS_DYNAMODB_ACCESS_KEY_ID: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
+          AWS_DYNAMODB_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'http://127.0.0.1:9000' || '' }}
+          AWS_ALLOW_HTTP: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'true' || '' }}
+          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
+          DUCKLAKE_CONNECTION_STRING: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'postgres:dbname=ducklake_catalog host=localhost user=postgres password=postgres' || '' }}
+          GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
+          GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          MYSQL_HOST: ${{ vars.TEST_MYSQL_HOST }}
+          MYSQL_TCP_PORT: 3306
+          MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
+          MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
+          MONGODB_HOST: ${{ vars.TEST_MONGODB_HOST }}
+          MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
+          POSTGRES_HOST: ${{ vars.TEST_POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ vars.TEST_POSTGRES_HOST }}
+          POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+          SPICEAI_TEST_ENDPOINT: ${{ vars.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
+          SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
+          SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
+          SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
+          SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
+          SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
+          SQL_WAREHOUSE_DATABRICKS_HOST: ${{ vars.SQL_WAREHOUSE_DATABRICKS_HOST }}
+          SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
+          DREMIO_ENDPOINT: ${{ vars.TEST_DREMIO_ENDPOINT}}
+          DREMIO_USERNAME: ${{ secrets.TEST_DREMIO_USERNAME}}
+          DREMIO_PASSWORD: ${{ secrets.TEST_DREMIO_PASSWORD}}
+          INSTA_UPDATE: ${{ steps.determine_update_snapshots.outputs.update_snapshots}}
+          MSSQL_HOST: localhost
+          MSSQL_USER: sa
+          MSSQL_PASSWORD: S3cretP@ssw0rd
+          MSSQL_TPCH_DB: tpch_sf1
+          ORACLE_CLOUD_CONNECTION_STRING: ${{ secrets.ORACLE_CLOUD_CONNECTION_STRING }}
+          ORACLE_CLOUD_USERNAME: ${{ secrets.ORACLE_CLOUD_USERNAME }}
+          ORACLE_CLOUD_PASSWORD: ${{ secrets.ORACLE_CLOUD_PASSWORD }}
+          ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          SCYLLADB_HOST: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '127.0.0.1' || '' }}
+          SCYLLADB_PORT: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '9042' || '' }}
+          SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}
+
+      - name: Install GH CLI
+        if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
+        run: |
+          (type -p wget >/dev/null || (sudo apt update && sudo apt-get install wget -y)) \
+          && sudo mkdir -p -m 755 /etc/apt/keyrings \
+          && out=$(mktemp) && wget -nv -O$out https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+          && cat $out | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+          && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+          && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+          && sudo apt update \
+          && sudo apt install gh -y
+
+      - name: Upload benchmark snapshots to branch
+        if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
+        run: |
+          git fetch --unshallow || true
+
+          # if the spiced commit is set, use that as the branch ID
+          if [ -n "${{ github.event.inputs.spiced_commit || '' }}" ]; then
+            BRANCH_ID=${{ github.event.inputs.spiced_commit }}
+          else
+            BRANCH_ID=${{ github.run_id }}
+          fi
+
+          BRANCH_NAME="testoperator-snapshot-update/${BRANCH_ID}"
+
+          git config --global user.name 'Spice Benchmark Snapshot Update Bot'
+          git config --global user.email 'spiceaibot@spice.ai'
+          git checkout -b ${BRANCH_NAME}
+          git add '*.snap'
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}"
+            if git ls-remote --exit-code --heads origin ${BRANCH_NAME}; then
+              git pull --rebase origin ${BRANCH_NAME}
+            fi
+            git push origin ${BRANCH_NAME}
+
+            PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
+            if [[ -n "${PR_URL}" ]]; then
+              echo "PR already exists -> ${PR_URL}"
+              exit 0
+            else
+              BODY=$(cat <<EOF
+          Automated benchmark snapshot update from workflow run [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+
+          **Query set:** \`${{ github.event.inputs.query_set }}\`
+          **Spicepod:** \`${{ github.event.inputs.spicepod_path }}\`
+          **Profile:** \`${{ github.event.inputs.profile_option || 'release' }}\`
+          EOF
+          )
+              gh pr create --title "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}" --body "${BODY}" --base trunk --head ${BRANCH_NAME} --label kind/bug
+              gh pr merge --squash --auto ${BRANCH_NAME}
+            fi
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

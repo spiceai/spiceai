@@ -52,19 +52,19 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
 
 1. **Unit/Integration Tests**
    - [ ] Confirm local and CI tests pass without major failures.
-     - [ ] Verify [integration](https://github.com/spiceai/spiceai/actions/workflows/integration.yml) tests (which include the `run_all_tests` flag) is green on the release branch.
+     - [ ] Verify [integration tests](https://github.com/spiceai/spiceai/actions/workflows/integration-tests.yml) tests (which include the `run_all_tests` flag) is green on the release branch.
 
 1. **E2E Tests**
-   - [ ] Verify [E2E Test CI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on `trunk` and the release branch.
-   - [ ] Verify [Test Operator Benchmarks](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_bench.yml) is green on `trunk` and the release branch.
-     - Use the [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new benchmark run. Specify `trunk` as the branch source, with the following parameters:
+   - [ ] Verify [E2E Test CI](https://github.com/spiceai/spiceai/actions/workflows/e2e-test-ci.yml) is green on `trunk` and the release branch.
+   - [ ] Verify [bench-testoperator e2e tests](https://github.com/spiceai/spiceai/actions/workflows/bench-testoperator-e2e-tests.yml) is green on `trunk` and the release branch.
+     - Use the [testoperator dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator-dispatch.yml) workflow to execute a new benchmark run. Specify `trunk` as the branch source, with the following parameters:
        - Workflow to execute: `bench`
        - All other values left empty.
-   - [ ] Verify [E2E Test CLI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_spice_cli.yml) is green on `trunk` and the release branch.
+   - [ ] Verify [E2E Test CLI behavior](https://github.com/spiceai/spiceai/actions/workflows/e2e-test-cli-behavior.yml) is green on `trunk` and the release branch.
      - Parameters: Branch: `trunk`
      - Build CLI: `true`
-   - [ ] Verify [Throughput Tests](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_throughput.yml) is green on `trunk` and the release branch.
-     - Use the [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new throughput run. Specify `trunk` as the branch source, with the following parameters:
+   - [ ] Verify [bench-testoperator throughput tests](https://github.com/spiceai/spiceai/actions/workflows/bench-testoperator-throughput-tests.yml) is green on `trunk` and the release branch.
+     - Use the [testoperator dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator-dispatch.yml) workflow to execute a new throughput run. Specify `trunk` as the branch source, with the following parameters:
        - Workflow to execute: `throughput`
        - All other values left empty.
 
@@ -180,7 +180,7 @@ Testing focus DRIs are responsible for:
   - [ ] Acknowledge external and new contributors.
   - [ ] List notable dependency updates (e.g. `datafusion`, `datafusion-table-providers`) under `## Dependencies`.
   - [ ] Summarize any cookbook changes under `## Cookbook`.
-  - [ ] Run [Generate Changelog](https://github.com/spiceai/spiceai/actions/workflows/generate_changelog.yml) to update the release notes.
+  - [ ] Run [Generate Changelog](https://github.com/spiceai/spiceai/actions/workflows/generate-changelog.yml) to update the release notes.
     - Use parameters:
       - Previous Release Tag: the previous release tag (e.g. `v1.4.0`). This is the tag of the previous release we want to compare against.
       - Release Branch: the release branch (e.g. `release/1.5`). This is the branch that contains the new changes that are based on the release branch. If this is a prep branch, use that branch here.
@@ -194,9 +194,9 @@ Testing focus DRIs are responsible for:
   - [ ] [spice-dotnet](https://github.com/spiceai/spice-dotnet/releases)
   - [ ] [gospice](https://github.com/spiceai/gospice/releases)
 
-- [ ] [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate_json_schema.yml) and cherry-pick schema update PR onto the release branch.
+- [ ] [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate-spicepod-json-schema.yml) and cherry-pick schema update PR onto the release branch.
 
-- [ ] Run [Generate Acknowledgements](https://github.com/spiceai/spiceai/actions/workflows/generate_acknowledgements.yml) **on the release branch** to update acknowledgements in [docs](https://github.com/spiceai/docs/blob/trunk/website/docs/acknowledgements/index.md).
+- [ ] Run [Generate Acknowledgements](https://github.com/spiceai/spiceai/actions/workflows/generate-acknowledgements.yml) **on the release branch** to update acknowledgements in [docs](https://github.com/spiceai/docs/blob/trunk/website/docs/acknowledgements/index.md).
 
 - [ ] Verify `version.txt` and version in `Cargo.toml` using [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update).
 
@@ -206,20 +206,20 @@ Testing focus DRIs are responsible for:
 
 - [ ] Cherry-pick release notes onto the release branch.
 - [ ] Create a **pre-release** [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with a tag (e.g. `v1.0.0-rc.1`). Leave the body empty so automation can populate it from the checked-in notes.
-- [ ] Tag and release docs (e.g. `v1.0.0`) **after** the [build_and_release workflow](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml) completes.
+- [ ] Tag and release docs (e.g. `v1.0.0`) **after** the [build and release workflow](https://github.com/spiceai/spiceai/actions/workflows/build-and-release.yml) completes.
   - [ ] (Docs DRI) Create and merge PR from `release/X.Y.Z` into `trunk`.
   - [ ] (Docs DRI) Tag the merged `trunk` commit `vX.Y.Z`.
-- [ ] When binaries are built for the release, edit the GitHub release and select **“Set as latest release”** to trigger the [spiced_docker workflow](https://github.com/spiceai/spiceai/actions/workflows/spiced_docker.yml) so Docker images are built from the published artifacts.
-  - [ ] Monitor the spiced_docker workflow (and re-run with **workflow_dispatch** using `release_tag` and optional `target` overrides if a rebuild or partial rebuild is required).
+- [ ] When binaries are built for the release, edit the GitHub release and select **“Set as latest release”** to trigger the [spiced docker workflow](https://github.com/spiceai/spiceai/actions/workflows/spiced-docker.yml) so Docker images are built from the published artifacts.
+  - [ ] Monitor the spiced docker workflow (and re-run with **workflow_dispatch** using `release_tag` and optional `target` overrides if a rebuild or partial rebuild is required).
 - [ ] Ensure all newly released SDKs (mentioned in release notes) are published
 - [ ] Update the [Helm chart](https://github.com/spiceai/spiceai/blob/trunk/deploy/chart) (chart version e.g. `1.8.3` & image.tag e.g. `1.8.3-models`) in the release branch (not in trunk).
   - [ ] If this is a **minor** release, replace the `ghcr.io/spiceai/spiceai-nightly` repository in `values.yaml` with `spiceai/spiceai` and change the tag to the release version (e.g. `1.0.0`).
   - [ ] [Release Chart workflow](https://github.com/spiceai/helm-charts/actions/workflows/release.yml) is triggered using the release branch.
 - [ ] Perform a final test pass on the released binaries and Docker images.
 - [ ] Run the following workflows to confirm installation health after the release is marked as official:
-  - [ ] [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
-  - [ ] [E2E Test Release Installation (Helm)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install_helm.yml)
-  - [ ] [E2E Test CLI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_spice_cli.yml)
+  - [ ] [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e-test-release-installation.yml)
+  - [ ] [E2E Test Release Installation (Helm)](https://github.com/spiceai/spiceai/actions/workflows/e2e-test-release-installation-helm.yml)
+  - [ ] [E2E Test CLI behavior](https://github.com/spiceai/spiceai/actions/workflows/e2e-test-cli-behavior.yml)
     - Use parameters:
       - Branch: `trunk`
       - Build the CLI: `false`
@@ -229,7 +229,7 @@ Testing focus DRIs are responsible for:
 ## Post-Release Housekeeping
 
 - [ ] Bump `version.txt` and `Cargo.toml` in `trunk` to the next planned **minor** release (if required).
-- [ ] If this is a **minor** release, update the scheduled benchmark job `dispatch-scheduled` in [`testoperator_dispatch.yml`](https://github.com/spiceai/spiceai/blob/trunk/.github/workflows/testoperator_dispatch.yml) to use the new release branch.
+- [ ] If this is a **minor** release, update the scheduled benchmark job `dispatch-scheduled` in [`testoperator-dispatch.yml`](https://github.com/spiceai/spiceai/blob/trunk/.github/workflows/testoperator-dispatch.yml) to use the new release branch.
 - [ ] Update [brew taps](https://github.com/spiceai/homebrew-spiceai/actions/workflows/update-formula.yml) after the final build completes.
 - [ ] Remove or mark the released version in the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md).
 - [ ] Update the supported version in `SECURITY.md` if necessary.

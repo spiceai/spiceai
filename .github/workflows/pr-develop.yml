@@ -1,5 +1,6 @@
 ---
-name: pr-develop
+name: 'pr-develop'
+run-name: 'pr-develop - ${{ github.ref_name }}'
 
 on:
   pull_request:

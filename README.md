@@ -3,7 +3,7 @@
 </p>
 <div align="center">
 
-[![CodeQL](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml?query=branch%3Atrunk+event%3Apush)
+[![CodeQL](https://github.com/spiceai/spiceai/actions/workflows/codeql.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/codeql.yml?query=branch%3Atrunk+event%3Apush)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Slack](https://img.shields.io/badge/Slack-Join%20Us-4A154B?logo=slack)](https://spice.ai/slack)
 [![Follow on X](https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=x)](https://x.com/intent/follow?screen_name=spice_ai)
@@ -13,12 +13,12 @@
 
 <div align="center">
 
-[![GitHub Actions Workflow Status - build](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build_nightly.yml?branch=trunk&label=build)](https://github.com/spiceai/spiceai/actions/workflows/build_nightly.yml?query=branch%3Atrunk)
-[![GitHub Actions Workflow Status - docker build](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/spiced_docker_dev.yml?branch=trunk&label=docker%20build)](https://github.com/spiceai/spiceai/actions/workflows/spiced_docker_dev.yml?query=branch%3Atrunk)
-[![GitHub Actions Workflow Status - unit tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build_and_release.yml?branch=trunk&label=unit%20tests)](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml?query=branch%3Atrunk)
-[![GitHub Actions Workflow Status - integration tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration.yml?branch=trunk&label=integration%20tests)](https://github.com/spiceai/spiceai/actions/workflows/integration.yml?query=branch%3Atrunk)
-[![GitHub Actions Workflow Status - integration tests (models)](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration_models.yml?branch=trunk&label=integration%20tests%20%28models%29)](https://github.com/spiceai/spiceai/actions/workflows/integration_models.yml?query=branch%3Atrunk)
-[![GitHub Actions Workflow Status - benchmark tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/testoperator_run_bench.yml?branch=trunk&label=benchmark%20tests)](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_bench.yml?query=branch%3Atrunk)
+[![GitHub Actions Workflow Status - build](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build-nightly.yml?branch=trunk&label=build)](https://github.com/spiceai/spiceai/actions/workflows/build-nightly.yml?query=branch%3Atrunk)
+[![GitHub Actions Workflow Status - docker build](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/spiced-docker-dev.yml?branch=trunk&label=docker%20build)](https://github.com/spiceai/spiceai/actions/workflows/spiced-docker-dev.yml?query=branch%3Atrunk)
+[![GitHub Actions Workflow Status - unit tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build-and-release.yml?branch=trunk&label=unit%20tests)](https://github.com/spiceai/spiceai/actions/workflows/build-and-release.yml?query=branch%3Atrunk)
+[![GitHub Actions Workflow Status - integration tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration-tests.yml?branch=trunk&label=integration%20tests)](https://github.com/spiceai/spiceai/actions/workflows/integration-tests.yml?query=branch%3Atrunk)
+[![GitHub Actions Workflow Status - integration tests (models)](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration-tests-models.yml?branch=trunk&label=integration%20tests%20%28models%29)](https://github.com/spiceai/spiceai/actions/workflows/integration-tests-models.yml?query=branch%3Atrunk)
+[![GitHub Actions Workflow Status - benchmark tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/bench-testoperator-e2e-tests.yml?branch=trunk&label=benchmark%20tests)](https://github.com/spiceai/spiceai/actions/workflows/bench-testoperator-e2e-tests.yml?query=branch%3Atrunk)
 
 </div>
 

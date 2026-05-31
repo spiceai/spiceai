@@ -30,7 +30,7 @@ cargo run --manifest-path tools/spicepodschema/Cargo.toml -- .schema/spicepod.sc
 
 ### CI Workflow
 
-The schema is automatically generated via `.github/workflows/generate_json_schema.yml`:
+The schema is automatically generated via `.github/workflows/generate-spicepod-json-schema.yml`:
 
 **Triggers:**
 - Push to `trunk` with changes in `crates/spicepod/**`

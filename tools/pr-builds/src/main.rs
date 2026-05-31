@@ -278,7 +278,7 @@ fn trigger_build(
             "run",
             "list",
             "--workflow",
-            "build_and_release.yml",
+            "build-and-release.yml",
             "--branch",
             &branch,
             "--limit",
@@ -361,7 +361,7 @@ fn trigger_build(
         let mut cmd_args: Vec<String> = vec![
             "workflow".to_string(),
             "run".to_string(),
-            "build_and_release.yml".to_string(),
+            "build-and-release.yml".to_string(),
             "--ref".to_string(),
             branch.clone(),
             "-f".to_string(),
@@ -397,7 +397,7 @@ fn trigger_build(
 
         if !wait {
             println!("You can check the status with:");
-            println!("  gh run list --workflow build_and_release.yml --branch \"{branch}\"",);
+            println!("  gh run list --workflow build-and-release.yml --branch \"{branch}\"",);
             return Ok(());
         }
 
@@ -414,7 +414,7 @@ fn trigger_build(
                     "run",
                     "list",
                     "--workflow",
-                    "build_and_release.yml",
+                    "build-and-release.yml",
                     "--branch",
                     &branch,
                     "--limit",
@@ -521,7 +521,7 @@ fn install_build(branch: Option<&str>, pr: Option<u64>) -> Result<()> {
             "run",
             "list",
             "--workflow",
-            "build_and_release.yml",
+            "build-and-release.yml",
             "--branch",
             &branch,
             "--status",

@@ -306,7 +306,7 @@ pub enum RunnerType {
     DevLarge,
 }
 
-/// Payload sent to the GitHub Actions workflow request. Should match inputs in `.github/workflows/testoperator_run_texttosql.yml`.
+/// Payload sent to the GitHub Actions workflow request. Should match inputs in `.github/workflows/testoperator-text-to-sql-tests.yml`.
 /// `spiced_commit` is not an eligible argument in the test files, as it is controlled by the environment.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TextToSqlArgs {
@@ -421,7 +421,7 @@ pub struct StreamingCorrectnessDispatchArgs {
 
 /// HTAP workflow arguments.
 ///
-/// Mirrors the inputs of `testoperator_run_htap.yml`.
+/// Mirrors the inputs of `bench-testoperator-htap-tests.yml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HtapDispatchArgs {
     pub spicepod_path: PathBuf,

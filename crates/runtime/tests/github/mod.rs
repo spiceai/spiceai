@@ -1610,7 +1610,7 @@ async fn test_github_workflow_runs() -> Result<(), String> {
                 &GithubDatasetType::RepoSpecific {
                     owner: "spiceai".to_string(),
                     repo: "spiceai".to_string(),
-                    query_type: "workflows/testoperator_run_bench.yml/runs".to_string(),
+                    query_type: "workflows/bench-testoperator-e2e-tests.yml/runs".to_string(),
                 },
                 "auto",
                 None,

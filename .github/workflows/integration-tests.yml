@@ -1,0 +1,776 @@
+---
+name: 'integration tests'
+run-name: 'integration tests - ${{ github.ref_name }}'
+
+on:
+  push:
+    branches:
+      - trunk
+      - release/*
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+
+  workflow_dispatch:
+    inputs:
+      update_snapshots:
+        description: 'Update the snapshots?'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'always'
+          - 'no'
+      run_all_tests:
+        description: 'Run all tests'
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  # Allow only one workflow per any non-trunk branch.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
+env:
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
+  INTEGRATION_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-test-archive/integration.tar.zst
+  INTEGRATION_RETENTION_OOM_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-retention-oom-test-archive/retention_oom.tar.zst
+  INTEGRATION_AWS_SDK_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-aws-sdk-test-archive/integration_aws_sdk.tar.zst
+  INTEGRATION_SNAPSHOT_REFRESH_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-snapshot-refresh-test-archive/integration_snapshot_refresh.tar.zst
+  INTEGRATION_AWS_SDK_CREDENTIAL_BRIDGE_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-aws-sdk-credential-bridge-test-archive/integration_aws_sdk_credential_bridge.tar.zst
+  INTEGRATION_PARTITION_TABLE_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-partition-table-test-archive/partition_table_test.tar.zst
+  INTEGRATION_DATA_COMPONENTS_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-data-components-test-archive/data_components_hadoop.tar.zst
+
+jobs:
+  # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via
+  # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
+  # a success when skipped).
+  check_changes:
+    runs-on: spiceai-dev-runners
+    outputs:
+      relevant_changes: ${{ steps.check.outputs.relevant_changes }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+          # Use fetch-depth 2 for PR change detection (dorny/paths-filter only needs base + head)
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+
+      - name: Check for code changes
+        id: check
+        uses: ./.github/actions/check-code-changes
+
+  build:
+    name: Build Test Binary
+    needs: check_changes
+    runs-on: spiceai-dev-runners
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      # Cache Cargo dependencies
+      - name: Cache Cargo registry
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Set up Rust
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up make
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-cc
+
+      - name: Install protoc
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/install-protoc
+
+      - name: Set up sccache
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+
+      - name: Set up Nextest
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-nextest
+
+      # Build the test binaries without running tests
+      - name: Build integration test archives
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          CARGO_INCREMENTAL: 0
+          RUSTC_WRAPPER: sccache
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+
+          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,iceberg-write,snapshots,mongodb"
+          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
+            FEATURES="${FEATURES},extended_tests"
+            echo "Including extended_tests"
+          else
+            echo "Excluding extended_tests"
+          fi
+
+          cargo nextest archive -p runtime --test integration --features ${FEATURES} --archive-file integration.tar.zst
+          cargo nextest archive -p runtime --test retention_oom --features ${FEATURES} --archive-file retention_oom.tar.zst
+          cargo nextest archive -p runtime --test integration_aws_sdk --features databricks,delta_lake --archive-file integration_aws_sdk.tar.zst
+          cargo nextest archive -p runtime --test integration_snapshot_refresh --features duckdb,sqlite,turso,snapshots --archive-file integration_snapshot_refresh.tar.zst
+          cargo nextest archive -p aws-sdk-credential-bridge --test credential_provider --archive-file integration_aws_sdk_credential_bridge.tar.zst
+          cargo nextest archive -p runtime-table-partition --test partition_table_provider --archive-file partition_table_test.tar.zst
+          cargo nextest archive -p data_components --test hadoop_catalog_test --archive-file data_components_hadoop.tar.zst
+
+      - name: Set up MinIO client
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Upload test archives to local MinIO
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to upload integration test archives}"
+          mc mb --ignore-existing spice-minio/build
+          mc cp ./integration.tar.zst "spice-minio/${INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}"
+          mc cp ./retention_oom.tar.zst "spice-minio/${INTEGRATION_RETENTION_OOM_TEST_ARCHIVE_S3_URI#s3://}"
+          mc cp ./integration_aws_sdk.tar.zst "spice-minio/${INTEGRATION_AWS_SDK_TEST_ARCHIVE_S3_URI#s3://}"
+          mc cp ./integration_snapshot_refresh.tar.zst "spice-minio/${INTEGRATION_SNAPSHOT_REFRESH_TEST_ARCHIVE_S3_URI#s3://}"
+          mc cp ./integration_aws_sdk_credential_bridge.tar.zst "spice-minio/${INTEGRATION_AWS_SDK_CREDENTIAL_BRIDGE_TEST_ARCHIVE_S3_URI#s3://}"
+          mc cp ./partition_table_test.tar.zst "spice-minio/${INTEGRATION_PARTITION_TABLE_TEST_ARCHIVE_S3_URI#s3://}"
+          mc cp ./data_components_hadoop.tar.zst "spice-minio/${INTEGRATION_DATA_COMPONENTS_TEST_ARCHIVE_S3_URI#s3://}"
+
+      - name: Upload test archive
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: integration-test-archive
+          path: ./integration.tar.zst
+          retention-days: 3
+          compression-level: 1
+
+      - name: Upload retention OOM test archive
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: integration-retention-oom-test-archive
+          path: ./retention_oom.tar.zst
+          retention-days: 3
+          compression-level: 1
+
+      - name: Upload AWS SDK test archive
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: integration-aws-sdk-test-archive
+          path: ./integration_aws_sdk.tar.zst
+          retention-days: 3
+          compression-level: 1
+
+      - name: Upload snapshot refresh test archive
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: integration-snapshot-refresh-test-archive
+          path: ./integration_snapshot_refresh.tar.zst
+          retention-days: 3
+          compression-level: 1
+
+      - name: Upload AWS SDK credential bridge test archive
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: integration-aws-sdk-credential-bridge-test-archive
+          path: ./integration_aws_sdk_credential_bridge.tar.zst
+          retention-days: 3
+          compression-level: 1
+
+      - name: Upload partition table test archive
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: integration-partition-table-test-archive
+          path: ./partition_table_test.tar.zst
+          retention-days: 3
+          compression-level: 1
+
+      - name: Upload data components test archive
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: integration-data-components-test-archive
+          path: ./data_components_hadoop.tar.zst
+          retention-days: 3
+          compression-level: 1
+
+  test:
+    name: Integration Tests (part ${{ matrix.label }})
+    needs: [build, check_changes]
+    permissions:
+      contents: write
+    runs-on: spiceai-dev-runners
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: 1
+            partition: 'count:1/3'
+          - label: 2
+            partition: 'count:2/3'
+          - label: 3
+            partition: 'count:3/3'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        with:
+          persist-credentials: false
+          fetch-depth: 1 # Shallow clone for faster checkout
+
+      - name: Set up Rust
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-rust
+
+      - name: Install Oracle ODPI-C
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-oracle-odpi
+
+      - name: Set up MinIO client
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Download test archive from local MinIO
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download integration test archive}"
+          mkdir -p ./integration_test
+          mc cp "spice-minio/${INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}" ./integration_test/integration.tar.zst
+
+      - name: Download test archive
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: integration-test-archive
+          path: ./integration_test
+
+      - name: Download retention OOM test archive from local MinIO
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3' && env.HAS_TEST_MINIO_SECRET == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download retention OOM test archive}"
+          mkdir -p ./retention_oom_test
+          mc cp "spice-minio/${INTEGRATION_RETENTION_OOM_TEST_ARCHIVE_S3_URI#s3://}" ./retention_oom_test/retention_oom.tar.zst
+
+      - name: Download retention OOM test archive
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3' && env.HAS_TEST_MINIO_SECRET != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: integration-retention-oom-test-archive
+          path: ./retention_oom_test
+
+      - name: Set up Nextest
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-nextest
+
+      - name: Login to DockerHub
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull database images
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          docker pull docker.io/library/postgres:latest
+          docker pull docker.io/library/mysql:latest
+          docker pull docker.io/library/mongo:latest
+          docker pull docker.io/gvenzl/oracle-free:latest
+
+      - name: Set up Spice.ai API Key
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_KEY }}"' > .env
+
+      - name: Set up Github Token
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v2
+        id: github-app-token
+        with:
+          app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
+          private-key: ${{ secrets.ORG_MEMBERS_GITHUB_PRIVATE_KEY }}
+          owner: spiceai
+          repositories: |
+            spiceai
+
+      - name: Run integration test
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          AWS_EC2_METADATA_DISABLED: true
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
+          GITHUB_ORG_TOKEN: ${{ steps.github-app-token.outputs.token }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # MinIO/S3-compatible storage for TPC-DS and other S3 tests
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          MINIO_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          # old dbc instance
+          TEST_DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+          TEST_DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          TEST_DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          # new dbc instance
+          NEW_DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
+          NEW_DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
+          NEW_DATABRICKS_SP_CLIENT_ID: ${{ secrets.NEW_DATABRICKS_SP_CLIENT_ID }}
+          NEW_DATABRICKS_SP_CLIENT_SECRET: ${{ secrets.NEW_DATABRICKS_SP_CLIENT_SECRET }}
+          NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
+          NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
+          AWS_ICEBERG_ACCESS_KEY_ID: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
+          AWS_ICEBERG_SECRET_ACCESS_KEY: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+          AWS_ICEBERG_REGION: ${{ secrets.AWS_ICEBERG_REGION }}
+          AWS_ICEBERG_ACCOUNT_ID: ${{ secrets.AWS_ICEBERG_ACCOUNT_ID }}
+          AWS_GLUE_KEY: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
+          AWS_GLUE_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+          AWS_DYNAMODB_KEY: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
+          AWS_DYNAMODB_SECRET: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
+          ORACLE_CLOUD_CONNECTION_STRING: ${{ secrets.ORACLE_CLOUD_CONNECTION_STRING }}
+          ORACLE_CLOUD_USERNAME: ${{ secrets.ORACLE_CLOUD_USERNAME }}
+          ORACLE_CLOUD_PASSWORD: ${{ secrets.ORACLE_CLOUD_PASSWORD }}
+          ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
+          AWS_SNAPSHOT_KEY: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
+          AWS_SNAPSHOT_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
+          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
+        run: |
+          if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_test/integration.tar.zst
+          else
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_test/integration.tar.zst --skip spiceai_integration_test
+          fi
+
+      - name: Run retention OOM regression test
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
+        run: |
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./retention_oom_test/retention_oom.tar.zst
+
+      - name: Upload integration snapshots artifact
+        id: create_snapshot_archive
+        if: github.event.inputs.update_snapshots == 'always' && needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          git diff --name-only -- '*.snap' > snapshot-files
+          git ls-files -o --exclude-standard -- '*.snap' >> snapshot-files
+          if [ -s snapshot-files ]; then
+            tr '\n' '\0' < snapshot-files > snapshot-files-0
+            tar --null -czf integration-snapshots-part-${{ matrix.label }}.tar.gz --files-from snapshot-files-0
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No snapshot files found"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          fi
+          rm -f snapshot-files snapshot-files-0
+        shell: bash
+      - name: Store integration snapshots artifact
+        if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true' && needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: integration-snapshots-part-${{ matrix.label }}
+          path: integration-snapshots-part-${{ matrix.label }}.tar.gz
+          retention-days: 1
+
+  upload-integration-snapshots:
+    name: Upload Integration Snapshots
+    if: github.event.inputs.update_snapshots == 'always'
+    needs:
+      - test
+    permissions:
+      contents: write
+      pull-requests: write
+    runs-on: spiceai-dev-runners
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Download integration snapshots artifacts
+        id: download_snapshots
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: integration-snapshots-part-*
+          merge-multiple: true
+          path: integration-snapshots
+
+      - name: Extract snapshots
+        if: steps.download_snapshots.outcome == 'success'
+        run: |
+          shopt -s nullglob
+          for archive in integration-snapshots/*.tar.gz; do
+            tar -xzf "$archive" -C .
+          done
+        shell: bash
+
+      - name: Configure Git
+        if: steps.download_snapshots.outcome == 'success'
+        run: |
+          git config --global user.name 'Spice Snapshot Update Bot'
+          git config --global user.email 'spiceaibot@spice.ai'
+
+      - name: Push snapshots to branch
+        if: steps.download_snapshots.outcome == 'success'
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: No snapshot changes detected
+        if: steps.download_snapshots.outcome != 'success'
+        run: echo "No snapshot artifacts were uploaded; skipping snapshot update."
+
+  test-aws-sdk:
+    name: AWS SDK Integration Tests
+    needs: [build, check_changes]
+    if: needs.check_changes.outputs.relevant_changes == 'true'
+    permissions: read-all
+    runs-on: spiceai-dev-runners
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up MinIO client
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Download AWS SDK test archive from local MinIO
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK test archive}"
+          mkdir -p ./integration_aws_sdk_test
+          mc cp "spice-minio/${INTEGRATION_AWS_SDK_TEST_ARCHIVE_S3_URI#s3://}" ./integration_aws_sdk_test/integration_aws_sdk.tar.zst
+
+      - name: Download AWS SDK test archive
+        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: integration-aws-sdk-test-archive
+          path: ./integration_aws_sdk_test
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
+
+      - name: Login to ACR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        if: github.repository == 'spiceai/spiceai'
+        with:
+          registry: spiceaitestimages.azurecr.io
+          username: spiceai-repo-pull
+          password: ${{ secrets.AZCR_PASSWORD }}
+
+      - name: Run AWS SDK integration test
+        env:
+          AWS_EC2_METADATA_DISABLED: true
+          TEST_DATABRICKS_TOKEN: ${{ secrets.NEW_DATABRICKS_TOKEN }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+        run: |
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_aws_sdk_test/integration_aws_sdk.tar.zst
+
+  test-aws-sdk-credential-bridge:
+    name: AWS SDK Credential Bridge Integration Tests
+    needs: [build, check_changes]
+    if: needs.check_changes.outputs.relevant_changes == 'true'
+    permissions: read-all
+    runs-on: spiceai-dev-runners
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up MinIO client
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Download AWS SDK credential bridge test archive from local MinIO
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK credential bridge test archive}"
+          mkdir -p ./integration_aws_sdk_credential_bridge_test
+          mc cp "spice-minio/${INTEGRATION_AWS_SDK_CREDENTIAL_BRIDGE_TEST_ARCHIVE_S3_URI#s3://}" ./integration_aws_sdk_credential_bridge_test/integration_aws_sdk_credential_bridge.tar.zst
+
+      - name: Download AWS SDK credential bridge test archive
+        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: integration-aws-sdk-credential-bridge-test-archive
+          path: ./integration_aws_sdk_credential_bridge_test
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
+
+      - name: Login to ACR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        if: github.repository == 'spiceai/spiceai'
+        with:
+          registry: spiceaitestimages.azurecr.io
+          username: spiceai-repo-pull
+          password: ${{ secrets.AZCR_PASSWORD }}
+
+      - name: Run AWS SDK credential bridge integration test
+        env:
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_S3_CLIENT_ID: ${{ secrets.AWS_S3_CLIENT_ID }}
+          AWS_S3_IDENTITY_POOL_ID: ${{ secrets.AWS_S3_IDENTITY_POOL_ID }}
+          AWS_S3_USERNAME: ${{ secrets.AWS_S3_USERNAME }}
+          AWS_S3_PASSWORD: ${{ secrets.AWS_S3_PASSWORD }}
+          AWS_COGNITO_IDP_URI: ${{ vars.AWS_COGNITO_IDP_URI }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_aws_sdk_credential_bridge_test/integration_aws_sdk_credential_bridge.tar.zst
+
+  test-snapshot-refresh:
+    name: Snapshot Refresh Mode Integration Tests
+    needs: [build, check_changes]
+    if: needs.check_changes.outputs.relevant_changes == 'true'
+    permissions: read-all
+    runs-on: spiceai-dev-runners
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up MinIO client
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Download snapshot refresh test archive from local MinIO
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download snapshot refresh test archive}"
+          mkdir -p ./integration_snapshot_refresh_test
+          mc cp "spice-minio/${INTEGRATION_SNAPSHOT_REFRESH_TEST_ARCHIVE_S3_URI#s3://}" ./integration_snapshot_refresh_test/integration_snapshot_refresh.tar.zst
+
+      - name: Download snapshot refresh test archive
+        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: integration-snapshot-refresh-test-archive
+          path: ./integration_snapshot_refresh_test
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
+
+      - name: Login to ACR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        if: github.repository == 'spiceai/spiceai'
+        with:
+          registry: spiceaitestimages.azurecr.io
+          username: spiceai-repo-pull
+          password: ${{ secrets.AZCR_PASSWORD }}
+
+      - name: Run snapshot refresh integration tests
+        env:
+          AWS_EC2_METADATA_DISABLED: true
+          AWS_SNAPSHOT_KEY: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
+          AWS_SNAPSHOT_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+        run: |
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_snapshot_refresh_test/integration_snapshot_refresh.tar.zst
+
+  test-data-components:
+    name: Data Components Integration Tests
+    needs: [build, check_changes]
+    if: needs.check_changes.outputs.relevant_changes == 'true'
+    permissions: read-all
+    runs-on: spiceai-dev-runners
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up MinIO client
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Download data components test archive from local MinIO
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download data components test archive}"
+          mkdir -p ./data_components_test
+          mc cp "spice-minio/${INTEGRATION_DATA_COMPONENTS_TEST_ARCHIVE_S3_URI#s3://}" ./data_components_test/data_components_hadoop.tar.zst
+
+      - name: Download data components test archive
+        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: integration-data-components-test-archive
+          path: ./data_components_test
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
+
+      - name: Run data components integration test
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          MINIO_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+        run: |
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./data_components_test/data_components_hadoop.tar.zst
+
+  test-runtime-partition:
+    name: Partition Table Integration Tests
+    needs: [build, check_changes]
+    if: needs.check_changes.outputs.relevant_changes == 'true'
+    runs-on: spiceai-dev-runners
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up MinIO client
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Download partition table test archive from local MinIO
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download partition table test archive}"
+          mkdir -p ./partition_table_test
+          mc cp "spice-minio/${INTEGRATION_PARTITION_TABLE_TEST_ARCHIVE_S3_URI#s3://}" ./partition_table_test/partition_table_test.tar.zst
+
+      - name: Download partition table test archive
+        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: integration-partition-table-test-archive
+          path: ./partition_table_test
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
+
+      - name: Login to ACR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        if: github.repository == 'spiceai/spiceai'
+        with:
+          registry: spiceaitestimages.azurecr.io
+          username: spiceai-repo-pull
+          password: ${{ secrets.AZCR_PASSWORD }}
+
+      - name: Run partition table integration test
+        env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+        run: |
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./partition_table_test/partition_table_test.tar.zst
+
+      - name: Configure Git
+        if: github.event.inputs.update_snapshots == 'always'
+        run: |
+          git config --global user.name 'Spice Snapshot Update Bot'
+          git config --global user.email 'spiceaibot@spice.ai'
+
+      - name: Push snapshots to branch
+        if: github.event.inputs.update_snapshots == 'always'
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

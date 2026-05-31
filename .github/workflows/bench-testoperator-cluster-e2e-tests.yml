@@ -1,0 +1,267 @@
+name: 'bench-testoperator cluster e2e tests'
+run-name: 'bench-testoperator cluster e2e tests - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}'
+
+# Cluster-mode counterpart to `bench-testoperator-e2e-tests.yml`. Instead of spawning a
+# local `spiced` process, testoperator drives the benchmark against a SUT
+# acquired via the system-adapter JSON-RPC protocol — here, the `spidapter`
+# docker image deploying a Spice Cloud clustered app. Mirrors the
+# `run_spicebench.yml` plumbing in the spicebench repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      spicepod_path:
+        description: 'The spicepod file to test with (relative to test/spicepods/{query_set}/sf{scale_factor}/)'
+        required: true
+        type: string
+      query_set:
+        description: 'Query set'
+        required: true
+        default: 'tpch'
+        type: choice
+        options:
+          - 'tpch'
+          - 'tpch[parameterized]'
+          - 'tpcds'
+          - 'clickbench'
+          - 'scenario'
+      scenario_query_file:
+        description: 'Path to scenario query file (required when query_set is scenario)'
+        required: false
+        type: string
+        default: ''
+      query_transport:
+        description: 'Which distributed path inside the cluster to exercise'
+        required: true
+        default: 'flightsql'
+        type: choice
+        options:
+          - 'flightsql'   # Distributed accelerations (Flight SQL gRPC)
+          - 'v1-queries'  # Ballista distributed query (HTTP /v1/queries) — sets --distributed
+      executor_replicas:
+        description: 'Number of spidapter executor replicas'
+        required: true
+        default: '4'
+        type: string
+      channel:
+        description: 'Spice runtime image channel passed to spidapter'
+        required: true
+        default: 'nightly'
+        type: choice
+        options:
+          - 'nightly'
+          - 'preview'
+          - 'stable'
+          - 'internal'
+      scale_factor:
+        description: 'Scale factor for the benchmark'
+        required: false
+        type: string
+        default: '1'
+      validate_results:
+        description: 'Validate query results against expected (where supported)'
+        required: false
+        type: boolean
+        default: false
+      update_snapshots:
+        description: |
+          How to handle insta snapshot mismatches. `default` decides based on
+          the branch (release/* → no, anything else → always). `always` creates
+          new baselines on mismatch (use this on a brand-new spicepod that
+          has no snapshots yet). `no` fails on any drift, matching production
+          benchmark behavior. Mirrors `bench-testoperator-e2e-tests.yml`.
+        required: false
+        default: 'default'
+        type: choice
+        options:
+          - 'default'
+          - 'always'
+          - 'no'
+      ready_wait:
+        description: 'Seconds to wait for the cluster to become ready'
+        required: true
+        default: '600'
+        type: string
+      runner_type:
+        description: 'Runner type'
+        required: true
+        default: 'spiceai-dev-runners'
+        type: choice
+        options:
+          - 'spiceai-dev-runners'
+          - 'spiceai-dev-large-runners'
+
+permissions:
+  contents: read
+  packages: read
+
+# Centralized defaults so push-triggered runs (where github.event.inputs.* is
+# empty) and workflow_dispatch runs share the same fallback chain. Configured
+# for a Ballista distributed-query smoke test against the public-S3 TPC-H
+# spicepod by default.
+env:
+  CB_SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path || 'federated/s3-public[parquet].yaml' }}
+  CB_QUERY_SET: ${{ github.event.inputs.query_set || 'tpch' }}
+  CB_SCENARIO_QUERY_FILE: ${{ github.event.inputs.scenario_query_file || '' }}
+  CB_QUERY_TRANSPORT: ${{ github.event.inputs.query_transport || 'v1-queries' }}
+  CB_EXECUTOR_REPLICAS: ${{ github.event.inputs.executor_replicas || '3' }}
+  CB_CHANNEL: ${{ github.event.inputs.channel || 'nightly' }}
+  CB_SCALE_FACTOR: ${{ github.event.inputs.scale_factor || '1' }}
+  CB_VALIDATE_RESULTS: ${{ github.event.inputs.validate_results || 'false' }}
+  CB_UPDATE_SNAPSHOTS: ${{ github.event.inputs.update_snapshots || 'default' }}
+  CB_READY_WAIT: ${{ github.event.inputs.ready_wait || '600' }}
+  CB_RUNNER_TYPE: ${{ github.event.inputs.runner_type || 'spiceai-dev-runners' }}
+
+jobs:
+  run-cluster-bench:
+    name: Run cluster benchmark
+    runs-on: ${{ github.event.inputs.runner_type || 'spiceai-dev-runners' }}
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Rust toolchain
+        uses: ./.github/actions/setup-rust
+
+      - name: Determine snapshot update mode
+        id: determine_update_snapshots
+        run: |
+          # `default` → branch-based: release/* never updates, anything else
+          # always updates. Mirrors bench-testoperator-e2e-tests.yml so cluster-bench
+          # snapshot policy is consistent with the single-node bench.
+          update_mode="${CB_UPDATE_SNAPSHOTS}"
+          if [ "${update_mode}" = "default" ] || [ -z "${update_mode}" ]; then
+            branch_name="${{ github.ref_name }}"
+            if [[ "${branch_name}" == "release/"* ]]; then
+              update_mode="no"
+            else
+              update_mode="always"
+            fi
+          fi
+
+          echo "Using update_snapshots=${update_mode}" >&2
+          echo "update_snapshots=${update_mode}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set spicepod path
+        id: set_spicepod_path
+        run: |
+          query_set="${CB_QUERY_SET}"
+          query_set="${query_set%%\[*\]*}"
+          SPICEPOD_PATH="./test/spicepods/${query_set}/sf${CB_SCALE_FACTOR}/${CB_SPICEPOD_PATH}"
+          echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
+
+      - name: Validate spicepod file exists
+        run: |
+          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
+            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+            exit 1
+          fi
+          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Build spicepod validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Validate spicepod
+        run: |
+          spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Setup Testoperator
+        uses: ./.github/actions/setup-testoperator-data
+        with:
+          query_set: ${{ env.CB_QUERY_SET }}
+
+      - name: Build Spidapter
+        uses: ./.github/actions/build-spidapter
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Management login (prod)
+        uses: ./.github/actions/management-login
+        with:
+          token-url: https://spice.ai/api/oauth/token
+          client-id: ${{ secrets.SPICE_MANAGEMENT_CLIENT_ID_PROD }}
+          client-secret: ${{ secrets.SPICE_MANAGEMENT_CLIENT_SECRET_PROD }}
+          # Exports SPICEAI_API_KEY for subsequent steps. Same prod creds
+          # spicebench's run_spicebench.yml uses.
+
+      - name: Run the cluster benchmark - ${{ env.CB_SPICEPOD_PATH }}
+        env:
+          SPICEAI_API_KEY: ${{ env.SPICEAI_API_KEY }}
+          SPICE_CLOUD_API_URL: https://api.spice.ai
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+          SCHEDULER_STATE_LOCATION: 's3://spiceai-testing-cluster-state/testoperator-cluster-bench-${{ github.run_id }}/'
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          EXECUTOR_REPLICAS: ${{ env.CB_EXECUTOR_REPLICAS }}
+          CHANNEL: ${{ env.CB_CHANNEL }}
+          QUERY_SET: ${{ env.CB_QUERY_SET }}
+          QUERY_TRANSPORT: ${{ env.CB_QUERY_TRANSPORT }}
+          SCALE_FACTOR: ${{ env.CB_SCALE_FACTOR }}
+          VALIDATE_RESULTS: ${{ env.CB_VALIDATE_RESULTS }}
+          READY_WAIT: ${{ env.CB_READY_WAIT }}
+          INSTA_UPDATE: ${{ steps.determine_update_snapshots.outputs.update_snapshots }}
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+          SCENARIO_QUERY_FILE: ${{ env.CB_SCENARIO_QUERY_FILE }}
+        run: |
+          set -euo pipefail
+
+          # Translate the abstract transport name into the concrete testoperator
+          # flag. `--distributed` selects the existing DistributedExecutor that
+          # POSTs to /v1/queries; the default (no flag) keeps the Flight SQL
+          # path that exercises distributed accelerations.
+          TRANSPORT_FLAG=""
+          if [ "${QUERY_TRANSPORT}" = "v1-queries" ]; then
+            TRANSPORT_FLAG="--distributed"
+          fi
+
+          # Optional scenario query file (only used when --query-set scenario).
+          SCENARIO_ARG=""
+          if [ -n "${SCENARIO_QUERY_FILE}" ]; then
+            SCENARIO_ARG="--scenario-query-file ./test/scenario/${SCENARIO_QUERY_FILE}"
+          fi
+
+          # Run the freshly-built spidapter binary as the JSON-RPC adapter.
+          # spidapter reads its config from SPIDAPTER_*/SPICEAI_*/AWS_*/SCHEDULER_*
+          # env vars, which testoperator's child process inherits from this step's
+          # env block.
+          export SPIDAPTER_EXECUTOR_REPLICAS="${EXECUTOR_REPLICAS}"
+
+          rm -rf .spice/data
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
+            -p "${SPICEPOD_PATH}" \
+            --query-set "${QUERY_SET}" \
+            --scale-factor "${SCALE_FACTOR}" \
+            --ready-wait "${READY_WAIT}" \
+            --disable-progress-bars \
+            --validate="${VALIDATE_RESULTS}" \
+            --metrics \
+            ${TRANSPORT_FLAG} \
+            ${SCENARIO_ARG} \
+            --system-adapter-stdio-cmd spidapter \
+            --system-adapter-stdio-args "stdio --verbose --channel ${CHANNEL}" \
+            --system-adapter-param channel="${CHANNEL}" \
+            --system-adapter-param executor_replicas="${EXECUTOR_REPLICAS}" \
+            --system-adapter-param query_transport="${QUERY_TRANSPORT}"

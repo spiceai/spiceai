@@ -1,5 +1,6 @@
 ---
-name: pr
+name: 'pr'
+run-name: 'pr - ${{ github.event.inputs.profile_option || github.ref_name }}'
 
 on:
   pull_request:

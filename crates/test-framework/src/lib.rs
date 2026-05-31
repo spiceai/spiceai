@@ -71,17 +71,17 @@ impl TestType {
     #[must_use]
     pub fn workflow(&self) -> &str {
         match self {
-            TestType::Throughput => "testoperator_run_throughput.yml",
-            TestType::Load => "testoperator_run_load.yml",
-            TestType::Benchmark => "testoperator_run_bench.yml",
-            TestType::Append => "testoperator_run_append.yml",
-            TestType::DataConsistency => "testoperator_run_data_consistency.yml",
-            TestType::Search => "testoperator_run_search.yml",
-            TestType::TextToSql => "testoperator_run_texttosql.yml",
-            TestType::Streaming => "testoperator_run_streaming_bench.yml",
-            TestType::StreamingCorrectness => "testoperator_run_streaming_correctness.yml",
-            TestType::Schema => "testoperator_run_schema.yml",
-            TestType::Htap => "testoperator_run_htap.yml",
+            TestType::Throughput => "bench-testoperator-throughput-tests.yml",
+            TestType::Load => "bench-testoperator-load-tests.yml",
+            TestType::Benchmark => "bench-testoperator-e2e-tests.yml",
+            TestType::Append => "bench-testoperator-append-tests.yml",
+            TestType::DataConsistency => "data-consistency-tests.yml",
+            TestType::Search => "bench-testoperator-search-tests.yml",
+            TestType::TextToSql => "testoperator-text-to-sql-tests.yml",
+            TestType::Streaming => "bench-testoperator-streaming-dynamodb.yml",
+            TestType::StreamingCorrectness => "testoperator-streaming-dynamodb-correctness.yml",
+            TestType::Schema => "testoperator-schema-tests.yml",
+            TestType::Htap => "bench-testoperator-htap-tests.yml",
         }
     }
 }
