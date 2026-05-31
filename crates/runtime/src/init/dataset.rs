@@ -1266,6 +1266,8 @@ impl Runtime {
                             Vec::new()
                         };
                     let table_name = resolved_name.to_string();
+                    // Statistics flow via the periodic ExecutorStatistics reporter,
+                    // not this readiness ack.
                     let sent = b
                         .broadcast_partitions_loaded(table_name.clone(), bytes)
                         .await;
