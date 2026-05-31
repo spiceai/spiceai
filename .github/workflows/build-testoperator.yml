@@ -9,7 +9,7 @@ on:
       - 'tools/testoperator/**'
       - 'crates/test-framework/**'
       - 'Cargo.lock'
-      - '.github/workflows/testoperator_build-and-release.yml'
+      - '.github/workflows/build-testoperator.yml'
       - '.github/actions/build-testoperator/**'
 
   workflow_dispatch:

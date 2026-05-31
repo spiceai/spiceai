@@ -9,7 +9,7 @@ on:
       - 'tools/spidapter/**'
       - 'crates/test-framework/**'
       - 'Cargo.lock'
-      - '.github/workflows/spidapter_build-and-release.yml'
+      - '.github/workflows/build-spidapter.yml'
       - '.github/actions/build-spidapter/**'
 
   workflow_dispatch:
