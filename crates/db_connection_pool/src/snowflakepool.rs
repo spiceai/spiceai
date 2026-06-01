@@ -31,6 +31,7 @@ const SNOWFLAKE_ACCOUNT_IDENTIFIER_DOCS: &str =
 const SNOWFLAKE_COMPUTING_COM_SUFFIX: &str = ".snowflakecomputing.com";
 const SNOWFLAKE_COMPUTING_CN_SUFFIX: &str = ".snowflakecomputing.cn";
 const ACCOUNT_IDENTIFIER_EXAMPLES: &str = "Use a Snowflake account identifier such as `myorg-myaccount`, `myorg.myaccount`, `https://myorg-myaccount.snowflakecomputing.com`, `xy12345`, `xy12345.us-east-2.aws`, or `xy12345.fhplus.us-gov-west-1.aws`.";
+const MISSING_KEYPAIR_CREDENTIALS_REASON: &str = "keypair authentication requires either `snowflake_private_key` or `snowflake_private_key_path`";
 
 /// Snowflake account identifier formats accepted by the connector.
 ///
@@ -620,6 +621,13 @@ fn validate_authentication_parameters(
                     "`snowflake_password` was provided but keypair authentication is selected; remove `snowflake_password` or set `snowflake_auth_type: password`",
                 ));
             }
+
+            if !params.contains_key("private_key") && !params.contains_key("private_key_path") {
+                return Err(invalid_parameter(
+                    "auth_type",
+                    MISSING_KEYPAIR_CREDENTIALS_REASON,
+                ));
+            }
         }
     }
 
@@ -766,10 +774,10 @@ fn init_snowflake_api_with_keypair_auth(
             })?
         }
         (None, None) => {
-            return MissingRequiredSecretSnafu {
-                name: "snowflake_private_key or snowflake_private_key_path".to_string(),
-            }
-            .fail();
+            return Err(invalid_parameter(
+                "auth_type",
+                MISSING_KEYPAIR_CREDENTIALS_REASON,
+            ));
         }
     };
 
@@ -1061,5 +1069,20 @@ mod tests {
             .to_string();
         assert!(error.contains("snowflake_auth_type"));
         assert!(error.contains("snowflake_password"));
+    }
+
+    #[test]
+    fn keypair_auth_requires_private_key_or_path() {
+        let params = secret_params(&[("auth_type", "keypair")]);
+        let error = validate_authentication_parameters(&params, SnowflakeAuthType::KeyPair)
+            .expect_err("reject missing keypair credentials")
+            .to_string();
+
+        assert!(error.contains("snowflake_auth_type"));
+        assert!(error.contains("snowflake_private_key"));
+        assert!(error.contains("snowflake_private_key_path"));
+        assert!(
+            !error.contains("secret named `snowflake_private_key or snowflake_private_key_path`")
+        );
     }
 }
