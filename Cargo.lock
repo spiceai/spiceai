@@ -1451,10 +1451,11 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-bedrockruntime"
-version = "1.131.0"
+version = "1.132.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e494025b4c578bfefd025aada69c51ab1db6b7589f61cb78ae681f3115269209"
+checksum = "41a2940faeb61f4f579a434bc3a546e9ab49a89596e94527d329281ef55fd44d"
 dependencies = [
+ "arc-swap",
  "aws-credential-types",
  "aws-runtime",
  "aws-sigv4",
@@ -1478,9 +1479,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-cognitoidentity"
-version = "1.100.0"
+version = "1.101.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4ef8e3458e0d093592c3cfca19932440a1993e2b3390ad93a387548d47ce59c"
+checksum = "8702155e9fa02846d04eb9593d0d08a0a0c21db6ece91dc36ee7c675a0c910c9"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1502,9 +1503,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-cognitoidentityprovider"
-version = "1.117.0"
+version = "1.118.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d5496e16c14cd3d3bdfdc118238ef8626770a733ddeeb4d0496f7849cd23064"
+checksum = "5d5d3a004dad95923091544845f1a6bd7a7ca92bdc60ccf1290c4c2be643edd4"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1554,9 +1555,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-dynamodb"
-version = "1.112.0"
+version = "1.113.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d2b44e71eda015705fe8a2d3f8061003432ad722d4e321ac38b3e2680fbe49"
+checksum = "e5537e9d39ac4fcb96e5a36a480dec1223f0f17748c36cca0ca831e23b87fbf3"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1578,9 +1579,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-dynamodbstreams"
-version = "1.100.0"
+version = "1.101.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5c0d79c923c61841ed33ef398192df702c59cc26b71870a2f20d74bbdc2d497"
+checksum = "b3c7fa3b9e8613035354653870fc0a6b8cb4d2f2374419cabe3c28a4d03d166c"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1602,9 +1603,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-glue"
-version = "1.146.0"
+version = "1.147.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9472b63bdbb5b9a49a2220a0f1321c209fd4587039caa2aa2f77dbfc6284842a"
+checksum = "74d4762686c2b321ebedf1f72152b5b82b67d4495d521d9c010d9995aae74cc1"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1626,9 +1627,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3"
-version = "1.133.0"
+version = "1.134.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "237aba2985e3c0a83e199cc7aa9a64a16c599875bc98170f00932f6199f19922"
+checksum = "be06bdfdf00371318253d74776567512d1229d1f3cd5546d27d333c89e013b84"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1661,10 +1662,11 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3vectors"
-version = "1.25.0"
+version = "1.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "427cecd78a9547d377a4cb53e08043d97c7e045359c6bc6f7ec1980a87c32005"
+checksum = "030f0038825c3d245a8337b9abf5b35f4c94e98a04079f6c7561c212c43b121e"
 dependencies = [
+ "arc-swap",
  "aws-credential-types",
  "aws-runtime",
  "aws-smithy-async",
@@ -1685,9 +1687,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-secretsmanager"
-version = "1.105.0"
+version = "1.106.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c4e56ac810211dc33810c7aa3612eda29a8b1e8c7e2db6e960c8657e3d95e42"
+checksum = "8b6fa2aa029a7298bc3d863c253fe6745dac677620f20c337b6ca7cc208f7201"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1757,9 +1759,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-sts"
-version = "1.104.0"
+version = "1.105.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6aa6622798e19e6a76b690562085dd4771c736cd48343464a53ab4ae2f2c9f84"
+checksum = "59f4f8065fe615dbed9096458ba98dda6d641553ffd5aedd27e37e65211aca9f"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
