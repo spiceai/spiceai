@@ -131,6 +131,14 @@ impl DeletionIndex {
         self.entries.is_empty()
     }
 
+    /// Approximate resident bytes for memory accounting: each `i64 -> i64` entry
+    /// is 16 bytes of key+value plus hash-table control/load-factor overhead.
+    #[must_use]
+    pub fn approx_bytes(&self) -> usize {
+        const APPROX_I64_ENTRY_BYTES: usize = 48;
+        self.entries.len().saturating_mul(APPROX_I64_ENTRY_BYTES)
+    }
+
     /// Highest delete sequence number in this index, if any.
     #[must_use]
     pub fn max_sequence_number(&self) -> Option<i64> {
@@ -335,6 +343,16 @@ impl KeyDeletionIndex {
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Approximate resident bytes for memory accounting. Uses a per-entry
+    /// estimate (a typical row-encoded composite key plus the `Box`, value, and
+    /// hash-table control overhead) rather than summing every key length, so the
+    /// call stays O(1) on the hot CDC path instead of O(total deletions).
+    #[must_use]
+    pub fn approx_bytes(&self) -> usize {
+        const APPROX_KEY_ENTRY_BYTES: usize = 80;
+        self.entries.len().saturating_mul(APPROX_KEY_ENTRY_BYTES)
     }
 
     /// Whether the index has any deletions.

@@ -16,11 +16,6 @@ limitations under the License.
 
 //! Constants used throughout the Cayenne provider module.
 
-/// Default data file ID used for non-partitioned tables.
-///
-/// In Cayenne, this represents the single data file in a non-partitioned table.
-pub const DEFAULT_DATA_FILE_ID: i64 = 0;
-
 /// Reserved directory name for staged append writes.
 ///
 /// Append writes are first written to `{table_path}/{table_id}/_staging/`,

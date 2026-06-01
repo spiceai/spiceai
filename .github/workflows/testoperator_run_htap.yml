@@ -25,7 +25,7 @@ on:
         description: 'Duration of the HTAP workload in seconds'
         required: false
         type: string
-        default: '300'
+        default: '600'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
@@ -34,16 +34,15 @@ on:
       runner_type:
         description: 'Runner type'
         required: true
-        default: 'spiceai-dev-runners'
+        default: 'spiceai-dev-large-runners'
         type: choice
         options:
-          - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
 jobs:
   run-htap:
     name: Run CH-BenCHmark
     runs-on: ${{ github.event.inputs.runner_type }}
-    timeout-minutes: 600
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
