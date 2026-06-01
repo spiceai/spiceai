@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod federation;
 pub mod provider;
 mod write;
 
@@ -34,14 +35,15 @@ use datafusion::{
 use datafusion_table_providers::sql::{
     db_connection_pool::DbConnectionPool, sql_provider_datafusion::SqlTable,
 };
+use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use snowflake_api::SnowflakeApi;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
 use crate::schema_discovery::{NoPermissionsCheck, SchemaProbeResult, discover_schema};
 use crate::{
-    CLUSTERING_KEY_METADATA_KEY, CLUSTERING_METADATA_KEY, COMMENT_METADATA_KEY, Read, ReadWrite,
-    SOURCE_TYPE_METADATA_KEY,
+    CLUSTERING_KEY_METADATA_KEY, CLUSTERING_METADATA_KEY, DESCRIPTION_METADATA_KEY, Read,
+    ReadWrite, SOURCE_TYPE_METADATA_KEY,
 };
 
 pub type SnowflakeConnectionPool =
@@ -50,6 +52,7 @@ pub type SnowflakeConnectionPool =
 pub struct SnowflakeTableFactory {
     pool: Arc<SnowflakeConnectionPool>,
     write_lock: Arc<Mutex<()>>,
+    function_support: Option<FunctionSupport>,
 }
 
 impl std::fmt::Debug for SnowflakeTableFactory {
@@ -65,7 +68,26 @@ impl SnowflakeTableFactory {
         Self {
             pool,
             write_lock: Arc::new(Mutex::new(())),
+            function_support: None,
         }
+    }
+
+    /// Install a function deny-list so federation pushdown skips remote
+    /// execution for any plan touching one of the denied functions. Plans that
+    /// would otherwise be unparsed into Snowflake SQL with Spice-only UDFs
+    /// (e.g. `json_get_str`) fall back to local `DataFusion` evaluation instead.
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
+        self.function_support = Some(function_support);
+        self
+    }
+
+    /// Returns the currently configured [`FunctionSupport`], if any. Used by
+    /// connector tests to confirm the Spice deny-list is wired through to the
+    /// federation layer.
+    #[must_use]
+    pub fn function_support(&self) -> Option<&FunctionSupport> {
+        self.function_support.as_ref()
     }
 }
 
@@ -136,11 +158,11 @@ async fn probe_snowflake_information_schema(
     let table = table_reference.table().replace('\'', "''");
     let schema_filter = table_reference
         .schema()
-        .map(|s| format!(" AND table_schema = '{}'", s.replace('\'', "''")))
+        .map(|s| format!(" AND c.table_schema = '{}'", s.replace('\'', "''")))
         .unwrap_or_default();
     let catalog_filter = table_reference
         .catalog()
-        .map(|c| format!(" AND table_catalog = '{}'", c.replace('\'', "''")))
+        .map(|c| format!(" AND c.table_catalog = '{}'", c.replace('\'', "''")))
         .unwrap_or_default();
 
     // When a catalog (database) is specified, qualify `information_schema` with it so
@@ -304,7 +326,7 @@ fn parse_information_schema_json(
 
         if let Some(table_comment) = optional_json_string(row.get(6)) {
             schema_metadata
-                .entry(COMMENT_METADATA_KEY.to_string())
+                .entry(DESCRIPTION_METADATA_KEY.to_string())
                 .or_insert_with(|| table_comment.to_string());
         }
         if let Some(clustering_key) = optional_json_string(row.get(7)) {
@@ -400,7 +422,7 @@ fn parse_information_schema_arrow(
             let source_type = snowflake_source_type(data_type_str, precision, scale);
             if let Some(table_comment) = optional_arrow_string(table_comments, i) {
                 schema_metadata
-                    .entry(COMMENT_METADATA_KEY.to_string())
+                    .entry(DESCRIPTION_METADATA_KEY.to_string())
                     .or_insert_with(|| table_comment.to_string());
             }
             if let Some(clustering_key) = optional_arrow_string(clustering_keys, i) {
@@ -454,7 +476,7 @@ fn field_with_optional_metadata(
 ) -> Field {
     let mut metadata = HashMap::new();
     if let Some(comment) = comment {
-        metadata.insert(COMMENT_METADATA_KEY.to_string(), comment.to_string());
+        metadata.insert(DESCRIPTION_METADATA_KEY.to_string(), comment.to_string());
     }
     if let Some(source_type) = source_type.map(str::trim).filter(|value| !value.is_empty()) {
         metadata.insert(
@@ -703,22 +725,23 @@ impl SnowflakeTableFactory {
         let schema = Arc::clone(&result.schema);
         let table_reference_for_provider = table_reference.clone();
 
-        let table_provider = Arc::new(
+        let sql_table = Arc::new(
             SqlTable::new_with_schema(
                 "snowflake",
                 &pool,
                 Arc::clone(&schema),
-                table_reference_for_provider,
+                table_reference_for_provider.clone(),
                 None,
             )
             .with_dialect(Arc::clone(&dialect)),
         );
 
-        let table_provider = Arc::new(
-            table_provider
-                .create_federated_table_provider()
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
-        );
+        let table_provider = Arc::new(federation::create_spice_federated_table_provider(
+            sql_table,
+            Arc::clone(&schema),
+            table_reference_for_provider,
+            self.function_support.clone(),
+        ));
 
         if writable {
             let table_provider: Arc<dyn TableProvider> = table_provider;
@@ -781,7 +804,7 @@ mod tests {
         assert_eq!(
             schema
                 .metadata()
-                .get(COMMENT_METADATA_KEY)
+                .get(DESCRIPTION_METADATA_KEY)
                 .map(String::as_str),
             Some("customer dimension")
         );
@@ -796,7 +819,7 @@ mod tests {
             schema
                 .field(0)
                 .metadata()
-                .get(COMMENT_METADATA_KEY)
+                .get(DESCRIPTION_METADATA_KEY)
                 .map(String::as_str),
             Some("stable identifier")
         );
@@ -820,7 +843,7 @@ mod tests {
             schema
                 .field(1)
                 .metadata()
-                .get(COMMENT_METADATA_KEY)
+                .get(DESCRIPTION_METADATA_KEY)
                 .map(String::as_str),
             Some("display name")
         );
@@ -844,7 +867,7 @@ mod tests {
             schema
                 .field(2)
                 .metadata()
-                .get(COMMENT_METADATA_KEY)
+                .get(DESCRIPTION_METADATA_KEY)
                 .is_none()
         );
         assert_eq!(

@@ -34,27 +34,28 @@ pub fn calculate_physical_schema(
         .iter()
         .zip(struct_dtype.fields())
         .map(|(name, field_dtype)| {
-            let arrow_type = match reference_logical_schema.field_with_name(name.as_ref()).ok() {
-                Some(logical_field) => {
-                    calculate_physical_field_type(&field_dtype, logical_field.data_type())?
-                }
-                None => {
-                    // Field not in logical schema, use default conversion
-                    field_dtype.to_arrow_dtype().map_err(|e| {
-                        exec_datafusion_err!("Failed to convert dtype to arrow: {e}")
-                    })?
-                }
+            let logical_field = reference_logical_schema.field_with_name(name.as_ref()).ok();
+            let arrow_type = match &logical_field {
+                Some(lf) => calculate_physical_field_type(&field_dtype, lf.data_type())?,
+                None => field_dtype
+                    .to_arrow_dtype()
+                    .map_err(|e| exec_datafusion_err!("Failed to convert dtype to arrow: {e}"))?,
             };
 
-            Ok(Field::new(
-                name.to_string(),
-                arrow_type,
-                field_dtype.is_nullable(),
-            ))
+            Ok(match logical_field {
+                Some(lf) => lf
+                    .clone()
+                    .with_data_type(arrow_type)
+                    .with_nullable(field_dtype.is_nullable()),
+                None => Field::new(name.to_string(), arrow_type, field_dtype.is_nullable()),
+            })
         })
         .collect::<DFResult<Vec<_>>>()?;
 
-    Ok(Schema::new(fields))
+    Ok(Schema::new_with_metadata(
+        fields,
+        reference_logical_schema.metadata().clone(),
+    ))
 }
 
 /// Calculate the physical Arrow type for a field, preferring the logical type when the
@@ -84,22 +85,27 @@ fn calculate_physical_field_type(dtype: &DType, logical_type: &DataType) -> DFRe
                     .iter()
                     .zip(struct_dtype.fields())
                     .map(|(name, field_dtype)| {
-                        let arrow_type =
-                            match logical_fields.iter().find(|f| f.name() == name.as_ref()) {
-                                Some(logical_field) => calculate_physical_field_type(
-                                    &field_dtype,
-                                    logical_field.data_type(),
-                                )?,
-                                None => field_dtype.to_arrow_dtype().map_err(|e| {
-                                    exec_datafusion_err!("Failed to convert dtype to arrow: {e}")
-                                })?,
-                            };
+                        let logical_field =
+                            logical_fields.iter().find(|f| f.name() == name.as_ref());
+                        let arrow_type = match &logical_field {
+                            Some(lf) => {
+                                calculate_physical_field_type(&field_dtype, lf.data_type())?
+                            }
+                            None => field_dtype.to_arrow_dtype().map_err(|e| {
+                                exec_datafusion_err!("Failed to convert dtype to arrow: {e}")
+                            })?,
+                        };
 
-                        Ok(Field::new(
-                            name.to_string(),
-                            arrow_type,
-                            field_dtype.is_nullable(),
-                        ))
+                        Ok(match logical_field {
+                            Some(lf) => lf
+                                .as_ref()
+                                .clone()
+                                .with_data_type(arrow_type)
+                                .with_nullable(field_dtype.is_nullable()),
+                            None => {
+                                Field::new(name.to_string(), arrow_type, field_dtype.is_nullable())
+                            }
+                        })
                     })
                     .collect::<DFResult<Vec<_>>>()?;
 
@@ -116,11 +122,10 @@ fn calculate_physical_field_type(dtype: &DType, logical_type: &DataType) -> DFRe
             if let DType::List(elem_dtype, _) = dtype {
                 let physical_elem_type =
                     calculate_physical_field_type(elem_dtype, logical_elem.data_type())?;
-                let physical_field = Field::new(
-                    logical_elem.name(),
-                    physical_elem_type,
-                    logical_elem.is_nullable(),
-                );
+                let physical_field = logical_elem
+                    .as_ref()
+                    .clone()
+                    .with_data_type(physical_elem_type);
                 match logical_type {
                     DataType::List(_) => DataType::List(physical_field.into()),
                     DataType::LargeList(_) => DataType::LargeList(physical_field.into()),
@@ -138,11 +143,10 @@ fn calculate_physical_field_type(dtype: &DType, logical_type: &DataType) -> DFRe
             if let DType::FixedSizeList(elem_dtype, ..) = dtype {
                 let physical_elem_type =
                     calculate_physical_field_type(elem_dtype, logical_elem.data_type())?;
-                let physical_field = Field::new(
-                    logical_elem.name(),
-                    physical_elem_type,
-                    logical_elem.is_nullable(),
-                );
+                let physical_field = logical_elem
+                    .as_ref()
+                    .clone()
+                    .with_data_type(physical_elem_type);
                 DataType::FixedSizeList(physical_field.into(), *size)
             } else {
                 return Err(exec_datafusion_err!(
@@ -156,11 +160,10 @@ fn calculate_physical_field_type(dtype: &DType, logical_type: &DataType) -> DFRe
             if let DType::List(elem_dtype, _) = dtype {
                 let physical_elem_type =
                     calculate_physical_field_type(elem_dtype, logical_elem.data_type())?;
-                let physical_field = Field::new(
-                    logical_elem.name(),
-                    physical_elem_type,
-                    logical_elem.is_nullable(),
-                );
+                let physical_field = logical_elem
+                    .as_ref()
+                    .clone()
+                    .with_data_type(physical_elem_type);
                 match logical_type {
                     DataType::ListView(_) => DataType::ListView(physical_field.into()),
                     DataType::LargeListView(_) => DataType::LargeListView(physical_field.into()),
@@ -390,5 +393,75 @@ mod tests {
                 .to_string()
                 .contains("Expected struct dtype")
         );
+    }
+
+    #[test]
+    fn test_field_and_schema_metadata_preserved() {
+        use std::collections::HashMap;
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert("logicalType".to_string(), "TIMESTAMP_LTZ".to_string());
+        let field_with_metadata =
+            Field::new("ts_col", DataType::Utf8, true).with_metadata(field_metadata.clone());
+
+        let mut schema_metadata = HashMap::new();
+        schema_metadata.insert("parquet.avro.schema".to_string(), "...".to_string());
+        let logical_schema = Schema::new_with_metadata(
+            vec![
+                field_with_metadata,
+                Field::new("plain_col", DataType::Int64, false),
+            ],
+            schema_metadata.clone(),
+        );
+
+        let dtype = DType::Struct(
+            StructFields::from_iter([
+                ("ts_col", DType::Utf8(Nullability::Nullable)),
+                (
+                    "plain_col",
+                    DType::Primitive(PType::I64, Nullability::NonNullable),
+                ),
+            ]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema = calculate_physical_schema(&dtype, &logical_schema).unwrap();
+
+        assert_eq!(physical_schema.metadata(), &schema_metadata);
+        assert_eq!(physical_schema.field(0).metadata(), &field_metadata);
+    }
+
+    #[test]
+    fn test_nested_list_element_metadata_preserved() {
+        use std::collections::HashMap;
+
+        let mut elem_metadata = HashMap::new();
+        elem_metadata.insert("extension:type".to_string(), "json".to_string());
+        let inner_field =
+            Field::new("item", DataType::Utf8, true).with_metadata(elem_metadata.clone());
+        let logical_schema = Schema::new(vec![Field::new(
+            "list_col",
+            DataType::List(Arc::new(inner_field)),
+            true,
+        )]);
+
+        let dtype = DType::Struct(
+            StructFields::from_iter([(
+                "list_col",
+                DType::List(
+                    Arc::new(DType::Utf8(Nullability::Nullable)),
+                    Nullability::Nullable,
+                ),
+            )]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema = calculate_physical_schema(&dtype, &logical_schema).unwrap();
+
+        if let DataType::List(elem_field) = physical_schema.field(0).data_type() {
+            assert_eq!(elem_field.metadata(), &elem_metadata);
+        } else {
+            panic!("Expected list type");
+        }
     }
 }

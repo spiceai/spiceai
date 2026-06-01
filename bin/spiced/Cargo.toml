@@ -50,6 +50,7 @@ reqwest.workspace = true
 runtime = { path = "../../crates/runtime" }
 runtime-auth = { path = "../../crates/runtime-auth" }
 runtime-async = { path = "../../crates/runtime-async" }
+runtime-datafusion = { path = "../../crates/runtime-datafusion" }
 rustls.workspace = true
 yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
@@ -114,6 +115,9 @@ default = [
     "pingora",
     "scylladb",
     "models",
+    "aws-secrets-manager",
+    "azure-keyvault",
+    "keyring-secret-store",
 ]
 delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
 dev = ["runtime/dev"]

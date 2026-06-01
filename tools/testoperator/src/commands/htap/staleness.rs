@@ -158,7 +158,7 @@ async fn run_staleness_probe(
 }
 
 /// Query `MAX(_bench_ts)` from Spice via Flight SQL, returning microseconds since epoch.
-async fn query_max_bench_ts_spice(
+pub(super) async fn query_max_bench_ts_spice(
     client: &spiceai::Client,
     table: &str,
 ) -> anyhow::Result<Option<i64>> {

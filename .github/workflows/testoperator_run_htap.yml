@@ -25,7 +25,7 @@ on:
         description: 'Duration of the HTAP workload in seconds'
         required: false
         type: string
-        default: '300'
+        default: '600'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
@@ -34,10 +34,9 @@ on:
       runner_type:
         description: 'Runner type'
         required: true
-        default: 'spiceai-dev-runners'
+        default: 'spiceai-dev-large-runners'
         type: choice
         options:
-          - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
 jobs:
   run-htap:
@@ -86,6 +85,24 @@ jobs:
       - name: Setup CH-benCH PostgreSQL
         uses: ./.github/actions/setup-chbench-postgres
 
+      - name: Start resource monitor
+        run: |
+          echo -e "timestamp\tpg_cpu_pct\tpg_mem\tpg_block_io\tspiced_cpu_pct\tspiced_rss_kb\ttestop_cpu_pct\ttestop_rss_kb" > /tmp/resource-monitor.tsv
+          (while true; do
+            ts=$(date -u +%H:%M:%S)
+            pg=$(docker stats chbench-pg --no-stream --format "{{.CPUPerc}}\t{{.MemUsage}}\t{{.BlockIO}}" 2>/dev/null || echo "0%\t0\t0")
+            spiced_line=$(ps -eo pcpu,rss,comm | grep '[s]piced' | head -1 || true)
+            testop_line=$(ps -eo pcpu,rss,comm | grep '[t]estoperator' | head -1 || true)
+            spiced_cpu=$(echo "$spiced_line" | awk '{print $1+0}')
+            spiced_rss=$(echo "$spiced_line" | awk '{print $2+0}')
+            testop_cpu=$(echo "$testop_line" | awk '{print $1+0}')
+            testop_rss=$(echo "$testop_line" | awk '{print $2+0}')
+            echo -e "${ts}\t${pg}\t${spiced_cpu}\t${spiced_rss}\t${testop_cpu}\t${testop_rss}" >> /tmp/resource-monitor.tsv
+            sleep 10
+          done) &
+          echo $! > /tmp/monitor-pid.txt
+          echo "Resource monitor started (PID: $(cat /tmp/monitor-pid.txt))"
+
       - name: Run CH-benCHmark - ${{ github.event.inputs.spicepod_path }}
         run: |
           testoperator run htap \
@@ -101,3 +118,19 @@ jobs:
         env:
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          CHBENCH_PG_HOST: 127.0.0.1
+
+      - name: Stop resource monitor
+        if: always()
+        run: |
+          if [ -f /tmp/monitor-pid.txt ]; then
+            kill "$(cat /tmp/monitor-pid.txt)" 2>/dev/null || true
+          fi
+
+      - name: Upload resource monitor
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: resource-monitor
+          path: /tmp/resource-monitor.tsv
+          retention-days: 7

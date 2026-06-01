@@ -75,6 +75,7 @@ pub(crate) mod context;
 pub(crate) mod delete;
 pub mod deletion_index;
 pub(crate) mod deletion_strategy;
+pub(crate) mod memory_account;
 pub(crate) mod mutation_writer;
 pub(crate) mod overwrite;
 pub mod partitioned_wal;
@@ -1072,16 +1073,6 @@ mod tests {
         .expect("to create upsert batch");
         insert_batch(&provider, batch2).await;
 
-        let table_id = provider.table_id().to_string();
-        let pre_restart_insert_records = catalog
-            .get_insert_records(&table_id)
-            .await
-            .expect("Failed to read insert records before restart");
-        assert!(
-            !pre_restart_insert_records.is_empty(),
-            "Upsert should persist insert records in catalog"
-        );
-
         // Restart by creating fresh catalog/provider instances.
         drop(provider);
         drop(catalog);
@@ -1097,22 +1088,14 @@ mod tests {
         let catalog_trait2: Arc<dyn MetadataCatalog> =
             Arc::clone(&catalog2) as Arc<dyn MetadataCatalog>;
 
-        let persisted_insert_records = catalog2
-            .get_insert_records(&table_id)
-            .await
-            .expect("Failed to read insert records after restart");
-        assert!(
-            !persisted_insert_records.is_empty(),
-            "Insert records should survive restart"
-        );
-
         let ctx2 = SessionContext::new();
         let provider2 = CayenneTableProviderBuilder::new(catalog_trait2, ctx2.runtime_env())
             .open("users")
             .await
             .expect("Failed to reopen table after restart");
 
-        ctx2.register_table("users", Arc::new(provider2) as Arc<dyn TableProvider>)
+        let provider2 = Arc::new(provider2);
+        ctx2.register_table("users", Arc::clone(&provider2) as Arc<dyn TableProvider>)
             .expect("Failed to register reopened table");
 
         let df = ctx2

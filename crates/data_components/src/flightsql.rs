@@ -41,6 +41,7 @@ use arrow_flight::{
 use datafusion::{
     arrow::datatypes::SchemaRef,
     catalog::Session,
+    common::Statistics,
     common::utils::quote_identifier,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
@@ -177,6 +178,8 @@ pub struct FlightSQLTable {
     table_reference: TableReference,
     schema: SchemaRef,
     cookie_store: Arc<CookieStore>,
+    /// Optional statistics to attach to the scan this provider produces.
+    statistics: Option<Statistics>,
 }
 
 #[expect(clippy::needless_pass_by_value)]
@@ -197,6 +200,7 @@ impl FlightSQLTable {
             schema,
             join_push_down_context: format!("endpoint={endpoint}"),
             cookie_store,
+            statistics: None,
         })
     }
 
@@ -216,7 +220,15 @@ impl FlightSQLTable {
             schema,
             join_push_down_context: format!("endpoint={endpoint}"),
             cookie_store,
+            statistics: None,
         }
+    }
+
+    /// Attach statistics to be reported by the scans this provider creates.
+    #[must_use]
+    pub fn with_statistics(mut self, statistics: Option<Statistics>) -> Self {
+        self.statistics = statistics;
+        self
     }
 
     pub async fn from_static(
@@ -379,7 +391,7 @@ impl FlightSQLTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(FlightSqlExec::new(
+        let exec = FlightSqlExec::new(
             projections,
             schema,
             &self.table_reference,
@@ -387,7 +399,14 @@ impl FlightSQLTable {
             filters,
             limit,
             Arc::clone(&self.cookie_store),
-        )?))
+        )?;
+        // Project the table-level statistics onto the scan's (projected) output
+        // schema so the column-statistics list lines up with the output columns.
+        let exec = match &self.statistics {
+            Some(stats) => exec.with_statistics(stats.clone().project(projections)),
+            None => exec,
+        };
+        Ok(Arc::new(exec))
     }
 }
 
@@ -450,6 +469,12 @@ pub struct FlightSqlExec {
     /// the typed `Arc<RequestContext>` extension from the `TaskContext`
     /// session config and constructs a header from its `trace_parent()`.
     trace_parent: Option<String>,
+    /// Statistics for the rows this scan produces. Defaults to unknown; the
+    /// planner that builds the scan can supply real statistics (e.g. row
+    /// counts sourced from cluster partition metadata) via
+    /// [`FlightSqlExec::with_statistics`] so downstream optimizer rules such as
+    /// hash-join build-side selection can use them.
+    statistics: Statistics,
 }
 
 impl FlightSqlExec {
@@ -463,6 +488,7 @@ impl FlightSqlExec {
         cookie_store: Arc<CookieStore>,
     ) -> DataFusionResult<Self> {
         let projected_schema = project_schema(schema, projections)?;
+        let statistics = Statistics::new_unknown(&projected_schema);
         Ok(Self {
             projected_schema: Arc::clone(&projected_schema),
             table_reference: table_reference.clone(),
@@ -479,7 +505,18 @@ impl FlightSqlExec {
             cookie_store,
             metrics: ExecutionPlanMetricsSet::new(),
             trace_parent: None,
+            statistics,
         })
+    }
+
+    /// Attach statistics describing the rows this scan produces. The schema of
+    /// the statistics' column list is expected to match the (projected) output
+    /// schema; callers that only know the row count can use
+    /// `Statistics::new_unknown(schema).with_num_rows(...)`.
+    #[must_use]
+    pub fn with_statistics(mut self, statistics: Statistics) -> Self {
+        self.statistics = statistics;
+        self
     }
 
     /// Set an explicit W3C `traceparent` header value to forward on each
@@ -692,6 +729,7 @@ impl ExecutionPlan for FlightSqlExec {
             cookie_store: Arc::clone(&self.cookie_store),
             metrics: ExecutionPlanMetricsSet::new(),
             trace_parent: self.trace_parent.clone(),
+            statistics: self.statistics.clone(),
         };
 
         Ok(SortOrderPushdownResult::Exact {
@@ -752,6 +790,19 @@ impl ExecutionPlan for FlightSqlExec {
         Some(self.metrics.clone_inner())
     }
 
+    fn statistics(&self) -> DataFusionResult<Statistics> {
+        Ok(self.statistics.clone())
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
+        // Single output partition (`UnknownPartitioning(1)`), so per-partition
+        // statistics for partition 0 are the whole scan's statistics.
+        match partition {
+            None | Some(0) => Ok(self.statistics.clone()),
+            Some(_) => Ok(Statistics::new_unknown(&self.projected_schema)),
+        }
+    }
+
     fn supports_limit_pushdown(&self) -> bool {
         true
     }
@@ -775,6 +826,7 @@ impl ExecutionPlan for FlightSqlExec {
             cookie_store: Arc::clone(&self.cookie_store),
             metrics: ExecutionPlanMetricsSet::new(),
             trace_parent: self.trace_parent.clone(),
+            statistics: self.statistics.clone(),
         };
 
         Some(Arc::new(new_plan))

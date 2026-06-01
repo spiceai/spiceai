@@ -25,7 +25,11 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
-use datafusion::{catalog::TableProvider, sql::TableReference};
+use datafusion::{
+    catalog::TableProvider,
+    common::{Statistics, stats::Precision},
+    sql::TableReference,
+};
 use datafusion_expr::{Expr, TableScan};
 use flight_client::cookie::CookieStore;
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;
@@ -34,7 +38,7 @@ use snafu::prelude::*;
 use tokio::sync::{RwLock, mpsc};
 
 use crate::correlated::{CorrelatedResponses, CorrelationError, send_correlated};
-use crate::{PartitionStore, PartitionValue, executor_selection};
+use crate::{PartitionStore, PartitionValue, executor_selection, metrics};
 
 /// Error type for executor registry operations.
 #[derive(Debug, Snafu)]
@@ -189,6 +193,49 @@ impl DdlLog {
     }
 }
 
+/// Statistics an executor reported for its local slice of a table, retaining the
+/// column names so per-column stats can be projected onto a (possibly projected)
+/// leaf scan schema by name.
+#[derive(Debug, Clone)]
+pub struct ExecutorTableStatistics {
+    /// `num_rows` + positional per-column `min`/`max`/`null_count` for the executor's slice.
+    pub statistics: Statistics,
+    /// Column names aligned positionally with `statistics.column_statistics`.
+    pub column_names: Vec<String>,
+}
+
+impl ExecutorTableStatistics {
+    /// Builds a [`Statistics`] aligned to `leaf_schema`: carries the reported
+    /// `num_rows` and, for each leaf column, the reported per-column stats matched
+    /// by name (`Absent`/unknown when the executor reported none for that column).
+    /// This lets the coordinator's planner estimate join/aggregate cardinalities
+    /// from the executor's column min/max even when the leaf scan is projected.
+    #[must_use]
+    pub fn projected_onto(&self, leaf_schema: &SchemaRef) -> Statistics {
+        use datafusion::common::ColumnStatistics;
+        let by_name: HashMap<&str, &ColumnStatistics> = self
+            .column_names
+            .iter()
+            .map(String::as_str)
+            .zip(self.statistics.column_statistics.iter())
+            .collect();
+        let column_statistics = leaf_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                by_name
+                    .get(f.name().as_str())
+                    .map_or_else(ColumnStatistics::new_unknown, |c| (*c).clone())
+            })
+            .collect();
+        Statistics {
+            num_rows: self.statistics.num_rows,
+            total_byte_size: Precision::Absent,
+            column_statistics,
+        }
+    }
+}
+
 /// Registry for tracking executor control stream connections.
 ///
 /// Schedulers use this registry to:
@@ -214,16 +261,52 @@ pub struct ExecutorRegistry {
 
     federated_partition_store: Arc<PartitionStore>,
 
+    /// Per-(table, executor) statistics reported by executors on their
+    /// `PartitionsLoaded` acks (today: `num_rows` summed from each executor's
+    /// local accelerated partition record counts). Held in memory rather than in
+    /// `cluster.json` because it is ack-derived, ephemeral optimizer-hint state
+    /// (mirroring [`crate::PartitionLoadTracker`]): persisting it per ack would
+    /// hammer the shared cluster document and starve the ingest path's own
+    /// partition-assignment writes. Each scheduler receives every executor's
+    /// broadcast, so its in-memory view is complete; it is re-populated by the
+    /// executors' next refresh after a scheduler restart. Read at query-planning
+    /// time to size the coordinator's per-executor federated scans.
+    executor_statistics:
+        Arc<parking_lot::RwLock<HashMap<TableReference, HashMap<String, ExecutorTableStatistics>>>>,
+
     /// Append-only log of DDL SQL statements applied to the cluster.
     ddl_log: Arc<RwLock<DdlLog>>,
+
+    /// Scheduler's `<host>:<port>` identity, used as the `node_id` attribute on
+    /// cluster metrics recorded from this registry. `None` when metrics
+    /// shouldn't be emitted (e.g. tests, runtime hasn't propagated identity).
+    node_id: Option<Arc<str>>,
 }
 
 impl ExecutorRegistry {
-    /// Creates a new executor registry.
+    /// Creates a new executor registry without a `node_id`. Metrics recorded
+    /// via this registry will be skipped. Use [`Self::with_node_id`] in
+    /// production to attach the scheduler's `<host>:<port>` identity.
     #[must_use]
     pub fn new(
         accelerations_partition_store: Arc<PartitionStore>,
         federated_partition_store: Arc<PartitionStore>,
+    ) -> Self {
+        Self::with_node_id(
+            accelerations_partition_store,
+            federated_partition_store,
+            None,
+        )
+    }
+
+    /// Creates a new executor registry with an explicit `node_id`. The
+    /// `<host>:<port>` string is attached to every cluster metric recorded
+    /// through this registry.
+    #[must_use]
+    pub fn with_node_id(
+        accelerations_partition_store: Arc<PartitionStore>,
+        federated_partition_store: Arc<PartitionStore>,
+        node_id: Option<Arc<str>>,
     ) -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
@@ -231,8 +314,57 @@ impl ExecutorRegistry {
             partitions: Arc::new(RwLock::new(HashMap::new())),
             accelerations_partition_store,
             federated_partition_store,
+            executor_statistics: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             ddl_log: Arc::new(RwLock::new(DdlLog::default())),
+            node_id,
         }
+    }
+
+    /// Records the statistics an executor reported for the slice of `table` it
+    /// serves, overwriting any previous report. In-memory only — cheap enough to
+    /// call on every report. `column_names` is positionally aligned with
+    /// `statistics.column_statistics` so the coordinator can project column stats
+    /// onto a (possibly projected) leaf scan by name.
+    pub fn record_executor_statistics(
+        &self,
+        table: TableReference,
+        executor_id: String,
+        statistics: Statistics,
+        column_names: Vec<String>,
+    ) {
+        self.executor_statistics
+            .write()
+            .entry(table)
+            .or_default()
+            .insert(
+                executor_id,
+                ExecutorTableStatistics {
+                    statistics,
+                    column_names,
+                },
+            );
+    }
+
+    /// Returns a snapshot of the per-executor statistics for `table` (keyed by
+    /// executor id), or an empty map if none have been reported. Used at
+    /// query-planning time; the small clone avoids holding the lock across
+    /// planning.
+    #[must_use]
+    pub fn executor_statistics_snapshot(
+        &self,
+        table: &TableReference,
+    ) -> HashMap<String, ExecutorTableStatistics> {
+        self.executor_statistics
+            .read()
+            .get(table)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Returns the scheduler's `node_id` if one was provided at construction.
+    #[must_use]
+    pub fn node_id(&self) -> Option<&str> {
+        self.node_id.as_deref()
     }
 
     #[must_use]
@@ -286,12 +418,21 @@ impl ExecutorRegistry {
         };
 
         let mut connections = self.connections.write().await;
-        if connections.contains_key(&executor_id) {
+        let is_reconnect = connections.contains_key(&executor_id);
+        if is_reconnect {
             tracing::debug!("Executor {executor_id} reconnected, replacing existing connection");
         } else {
             tracing::debug!("Executor {executor_id} connected");
         }
-        connections.insert(executor_id, connection);
+        connections.insert(executor_id.clone(), connection);
+        drop(connections);
+
+        if let Some(node_id) = self.node_id.as_deref() {
+            metrics::set_scheduler_executor_active_connection(node_id, &executor_id, true);
+            if is_reconnect {
+                metrics::record_scheduler_executor_connection_retry(node_id, &executor_id);
+            }
+        }
 
         handles
     }
@@ -303,6 +444,20 @@ impl ExecutorRegistry {
         }
         self.flight_sql_clients.write().await.remove(executor_id);
         self.partitions.write().await.remove(executor_id);
+
+        // Drop the disconnected executor's reported statistics across all tables
+        // so a departed executor's stale row counts don't linger in planning.
+        {
+            let mut stats = self.executor_statistics.write();
+            for table_stats in stats.values_mut() {
+                table_stats.remove(executor_id);
+            }
+            stats.retain(|_, table_stats| !table_stats.is_empty());
+        }
+
+        if let Some(node_id) = self.node_id.as_deref() {
+            metrics::set_scheduler_executor_active_connection(node_id, executor_id, false);
+        }
     }
 
     /// Returns `true` if at least one executor has an active `FlightSqlClient`.
@@ -521,28 +676,45 @@ impl ExecutorRegistry {
     /// one `FlightSQL` table provider per selected executor. The caller decides whether the
     /// table should actually be partitioned (e.g. `AcceleratedPartitionProvider` checks
     /// `AcceleratedTable` downcast in the runtime crate).
+    #[must_use]
     pub fn resolve_accelerated_partitions(
         &self,
         table: &TableReference,
         schema: &SchemaRef,
     ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
-        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
-            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
-            return Vec::new();
-        };
         let Ok(connections) = self.connections.try_read() else {
             tracing::warn!("Failed to acquire read lock on connections");
             return Vec::new();
         };
-
+        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
+            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
+            return Vec::new();
+        };
+        let executors = ready_executors(&connections, &flight_sql_clients);
+        let executor_statistics = self.executor_statistics_snapshot(table);
         get_partitions_from_store(
             &self.accelerations_partition_store,
-            &connections,
-            &flight_sql_clients,
+            &executors,
             table,
             schema,
+            &executor_statistics,
+            self.node_id.as_deref(),
         )
     }
+}
+
+/// Returns executors that have both an active connection and a `FlightSQL` client.
+fn ready_executors<'a>(
+    connections: &'a HashMap<String, ExecutorConnection>,
+    flight_sql_clients: &'a HashMap<String, FlightSqlClient>,
+) -> HashMap<String, (&'a ExecutorConnection, &'a FlightSqlClient)> {
+    connections
+        .iter()
+        .filter_map(|(id, conn)| {
+            let client = flight_sql_clients.get(id)?;
+            Some((id.clone(), (conn, client)))
+        })
+        .collect()
 }
 
 pub(crate) fn flight_sql_table_provider(
@@ -550,43 +722,61 @@ pub(crate) fn flight_sql_table_provider(
     client: FlightSqlClient,
     table: &TableReference,
     schema: SchemaRef,
+    statistics: Option<Statistics>,
 ) -> Arc<dyn TableProvider> {
-    Arc::new(FlightSQLTable::create_with_schema(
-        "flightsql",
-        executor_id,
-        client,
-        table.clone(),
-        schema,
-        Arc::new(CookieStore::new()),
-    )) as Arc<dyn TableProvider>
+    Arc::new(
+        FlightSQLTable::create_with_schema(
+            "flightsql",
+            executor_id,
+            client,
+            table.clone(),
+            schema,
+            Arc::new(CookieStore::new()),
+        )
+        .with_statistics(statistics),
+    ) as Arc<dyn TableProvider>
 }
 
 /// Shared logic for `get_partitions` across accelerated and federated partition providers.
 ///
-/// Uses the given [`PartitionStore`] to look up partition metadata, validates liveness against
-/// `connections`, selects a minimal executor set, and returns `(FlightSQL provider, partition values)` pairs.
+/// Uses the given [`PartitionStore`] to look up partition metadata, checks readiness (both an
+/// active connection and a `FlightSQL` client) via the `executors` map, selects a minimal
+/// executor set, and returns `(FlightSQL provider, partition values)` pairs.
 pub(crate) fn get_partitions_from_store(
     partition_store: &PartitionStore,
-    connections: &HashMap<String, ExecutorConnection>,
-    flight_sql_clients: &HashMap<String, FlightSqlClient>,
+    executors: &HashMap<String, (&ExecutorConnection, &FlightSqlClient)>,
     table: &TableReference,
     schema: &SchemaRef,
+    executor_statistics: &HashMap<String, ExecutorTableStatistics>,
+    node_id: Option<&str>,
 ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
     let Some(table_metadata) = partition_store.get_cached_table_metadata(table) else {
         // No partition metadata — route to a single live executor to avoid duplicate results.
-        let Some((executor_id, client)) = flight_sql_clients
-            .iter()
-            .filter(|(eid, _)| connections.contains_key(*eid))
-            .min_by(|(a, _), (b, _)| a.cmp(b))
+        let Some((executor_id, (_, client))) = executors.iter().min_by_key(|(id, _)| id.as_str())
         else {
             tracing::warn!(
                 "No partition assignments for table {table:?} and no connected executors with FlightSQL clients"
             );
+            if let Some(node_id) = node_id {
+                metrics::record_query_planning_failure(
+                    node_id,
+                    metrics::PlanningFailure::NoExecutors,
+                );
+            }
             return Vec::new();
         };
 
+        if let Some(node_id) = node_id {
+            metrics::record_query_executor_count(node_id, 1);
+        }
         return vec![(
-            flight_sql_table_provider(executor_id, client.clone(), table, Arc::clone(schema)),
+            flight_sql_table_provider(
+                executor_id,
+                (*client).clone(),
+                table,
+                Arc::clone(schema),
+                None,
+            ),
             Vec::new(),
         )];
     };
@@ -603,11 +793,14 @@ pub(crate) fn get_partitions_from_store(
         return Vec::new();
     }
 
-    // Build executor -> partitions map, excluding dead executors
+    // Build executor -> partitions map, excluding dead executors. Per-executor
+    // row-count statistics (used below to size the coordinator's joins) come
+    // from `table_metadata.executor_statistics`, which each executor reports
+    // for the slice of the table it serves (see `handle_partitions_loaded`).
     let mut executor_partition_map: HashMap<String, Vec<PartitionValue>> = HashMap::new();
     for partition_meta in &table_metadata.partitions {
         for executor_id in &partition_meta.assigned_executors {
-            if !connections.contains_key(executor_id) {
+            if !executors.contains_key(executor_id) {
                 tracing::debug!(
                     "Executor '{}' has partition assignment but is no longer alive; excluding from selection",
                     executor_id
@@ -634,9 +827,19 @@ pub(crate) fn get_partitions_from_store(
                 missing.len(),
                 missing.iter().take(5).collect::<Vec<_>>()
             );
+            if let Some(node_id) = node_id {
+                metrics::record_query_planning_failure(
+                    node_id,
+                    metrics::PlanningFailure::MissingPartitions,
+                );
+            }
             return Vec::new();
         }
     };
+
+    if let Some(node_id) = node_id {
+        metrics::record_query_executor_count(node_id, selected_executors.len() as u64);
+    }
 
     tracing::debug!(
         "Selected {} executor(s) from {} available for table {} (covering {} partition(s))",
@@ -649,10 +852,22 @@ pub(crate) fn get_partitions_from_store(
     selected_executors
         .into_iter()
         .filter_map(|executor_id| {
-            let client = flight_sql_clients.get(&executor_id)?;
+            let (_, client) = executors.get(&executor_id)?;
             let partition_values = executor_partition_map.remove(&executor_id)?;
-            let provider =
-                flight_sql_table_provider(&executor_id, client.clone(), table, Arc::clone(schema));
+            // Stamp the executor-reported statistics onto this leaf scan so the
+            // coordinator's planner can size joins. Project the reported per-column
+            // stats onto the leaf's (possibly projected) schema by name, carrying
+            // num_rows and per-column min/max.
+            let statistics = executor_statistics
+                .get(&executor_id)
+                .map(|ets| ets.projected_onto(schema));
+            let provider = flight_sql_table_provider(
+                &executor_id,
+                (*client).clone(),
+                table,
+                Arc::clone(schema),
+                statistics,
+            );
             Some((provider, partition_values))
         })
         .collect()
@@ -667,6 +882,9 @@ pub struct FederatedPartitionProvider {
     connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
     flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
     partition_store: Arc<PartitionStore>,
+    executor_statistics:
+        Arc<parking_lot::RwLock<HashMap<TableReference, HashMap<String, ExecutorTableStatistics>>>>,
+    node_id: Option<Arc<str>>,
 }
 
 impl FederatedPartitionProvider {
@@ -677,6 +895,8 @@ impl FederatedPartitionProvider {
             connections: Arc::clone(&registry.connections),
             flight_sql_clients: Arc::clone(&registry.flight_sql_clients),
             partition_store: Arc::clone(&registry.federated_partition_store),
+            executor_statistics: Arc::clone(&registry.executor_statistics),
+            node_id: registry.node_id.clone(),
         }
     }
 }
@@ -693,24 +913,33 @@ impl TablePartitionProvider for FederatedPartitionProvider {
         table: &TableReference,
         schema: &SchemaRef,
     ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
-        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
-            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
-            return Vec::new();
-        };
         let Ok(connections) = self.connections.try_read() else {
             tracing::warn!("Failed to acquire read lock on connections");
             return Vec::new();
         };
+        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
+            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
+            return Vec::new();
+        };
+
+        let executors = ready_executors(&connections, &flight_sql_clients);
+        let executor_statistics = self
+            .executor_statistics
+            .read()
+            .get(table)
+            .cloned()
+            .unwrap_or_default();
 
         get_partitions_from_store(
             &self.partition_store,
-            &connections,
-            &flight_sql_clients,
+            &executors,
             table,
             schema,
+            &executor_statistics,
+            self.node_id.as_deref(),
         )
         .into_iter()
-        .map(|(provider, _)| (provider, vec![])) // For now, do not need partition values. Executors only have required data.
+        .map(|(provider, _)| (provider, vec![]))
         .collect()
     }
 }
@@ -863,6 +1092,63 @@ mod tests {
         // Original executor should still be registered
         let executors = registry.connected_executors().await;
         assert_eq!(executors, vec!["executor-1"]);
+    }
+
+    /// Regression test: an executor that is in `connections` but not yet in
+    /// `flight_sql_clients` (e.g. reconnected but hasn't sent
+    /// `AllocateInitialPartitions` yet) must NOT appear in `ready_executors`.
+    #[test]
+    fn ready_executors_excludes_missing_flight_client() {
+        let (tx, _rx) = mpsc::channel(1);
+        let conn = ExecutorConnection::new(tx);
+
+        let mut connections: HashMap<String, ExecutorConnection> = HashMap::new();
+        connections.insert("exec-1".to_string(), conn);
+
+        let flight_sql_clients: HashMap<String, FlightSqlClient> = HashMap::new();
+
+        let ready = ready_executors(&connections, &flight_sql_clients);
+        assert!(
+            ready.is_empty(),
+            "executor without FlightSQL client should not be ready"
+        );
+    }
+
+    /// Verify `ready_executors` includes executors present in both maps.
+    #[tokio::test]
+    async fn ready_executors_includes_fully_registered() {
+        let (tx, _rx) = mpsc::channel(1);
+        let conn = ExecutorConnection::new(tx);
+
+        let mut connections: HashMap<String, ExecutorConnection> = HashMap::new();
+        connections.insert("exec-1".to_string(), conn);
+
+        let mut flight_sql_clients: HashMap<String, FlightSqlClient> = HashMap::new();
+        flight_sql_clients.insert("exec-1".to_string(), dummy_flight_sql_client());
+
+        let ready = ready_executors(&connections, &flight_sql_clients);
+        assert_eq!(ready.len(), 1);
+        assert!(ready.contains_key("exec-1"));
+    }
+
+    /// Verify only the intersection is returned when maps partially overlap.
+    #[tokio::test]
+    async fn ready_executors_returns_intersection() {
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+
+        let mut connections: HashMap<String, ExecutorConnection> = HashMap::new();
+        connections.insert("exec-1".to_string(), ExecutorConnection::new(tx1));
+        connections.insert("exec-2".to_string(), ExecutorConnection::new(tx2));
+
+        // Only exec-2 has a FlightSQL client (exec-1 just reconnected).
+        let mut flight_sql_clients: HashMap<String, FlightSqlClient> = HashMap::new();
+        flight_sql_clients.insert("exec-2".to_string(), dummy_flight_sql_client());
+
+        let ready = ready_executors(&connections, &flight_sql_clients);
+        assert_eq!(ready.len(), 1);
+        assert!(ready.contains_key("exec-2"));
+        assert!(!ready.contains_key("exec-1"));
     }
 
     #[tokio::test]

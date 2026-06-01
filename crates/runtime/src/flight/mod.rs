@@ -242,54 +242,35 @@ impl Service {
         Ok(schema_bytes)
     }
 
+    /// Construct a stream of [`FlightData`] for a given sql statement.
+    ///
+    /// This function does not perform any read-only validation itself. Callers
+    /// are responsible for gating access:
+    /// - For read-only principals, callers must pre-validate the SQL via
+    ///   [`check_read_only_sql`] and pass the resulting plan as `read_only_plan`.
+    ///   The original `sql` is then used only for caching, tracing, and
+    ///   observability.
+    /// - When `read_only_plan` is `None`, `sql` is executed directly and may be a
+    ///   DDL/DML statement. Only callers that have already determined the
+    ///   request is allowed to execute write statements should use this path.
     async fn sql_to_flight_stream(
         datafusion: Arc<DataFusion>,
         sql: &str,
         parameters: Option<ParamValues>,
-        pre_parsed_plan: Option<LogicalPlan>,
+        read_only_plan: Option<LogicalPlan>,
     ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, CacheStatus), Status> {
-        let read_only = crate::http::v1::current_principal_requires_read_only().await;
-        let query_result = if let Some(plan) = pre_parsed_plan {
+        let query_builder = if let Some(plan) = read_only_plan {
             QueryBuilder::from_plan(plan, sql, Arc::clone(&datafusion))
-                .parameters(parameters)
-                .read_only(read_only)
-                .build()
-                .run()
-                .await
-                .map_err(handle_query_error)?
         } else {
             QueryBuilder::new(sql, Arc::clone(&datafusion))
-                .parameters(parameters)
-                .read_only(read_only)
-                .build()
-                .run()
-                .await
-                .map_err(handle_query_error)?
         };
 
-        Ok(Self::query_result_to_flight_stream(query_result))
-    }
-
-    /// Run a pre-built [`LogicalPlan`] and stream results as Flight data.
-    ///
-    /// Used by surfaces that produce a logical plan outside the SQL parser
-    /// (e.g. `FlightSQL` `CommandStatementSubstraitPlan`). The `cache_key`
-    /// identifies the plan in the results cache; callers should derive it
-    /// from the plan source so that semantically identical inputs hit the
-    /// same cache entry.
-    pub(crate) async fn plan_to_flight_stream(
-        datafusion: Arc<DataFusion>,
-        plan: LogicalPlan,
-        cache_key: impl Into<Arc<str>>,
-    ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, CacheStatus), Status> {
-        let read_only = crate::http::v1::current_principal_requires_read_only().await;
-        let query_result = QueryBuilder::from_plan(plan, cache_key, Arc::clone(&datafusion))
-            .read_only(read_only)
+        let query_result = query_builder
+            .parameters(parameters)
             .build()
             .run()
             .await
             .map_err(handle_query_error)?;
-
         Ok(Self::query_result_to_flight_stream(query_result))
     }
 
@@ -658,7 +639,8 @@ pub async fn start(
         .into_inner();
 
     // Create the OpenTelemetry MetricsService
-    let otel_service = create_metrics_service(rt.datafusion());
+    let query_engine: Arc<dyn runtime_datafusion::query_engine::QueryEngine> = rt.datafusion();
+    let otel_service = create_metrics_service(query_engine);
 
     // Get job executor if available (cluster mode)
     let job_executor = rt.job_executor();

@@ -417,7 +417,8 @@ impl CayenneCatalog {
     /// 4. `DELETE FROM cayenne_inlined_data      WHERE table_id = ?`
     /// 5. `DELETE FROM cayenne_inlined_delete    WHERE table_id = ?`
     /// 6. `DELETE FROM cayenne_table_statistics  WHERE table_id = ?`
-    /// 7. `UPDATE cayenne_table SET current_snapshot_id = ? WHERE table_id = ?`
+    /// 7. `DELETE FROM cayenne_pk_index           WHERE table_id = ?`
+    /// 8. `UPDATE cayenne_table SET current_snapshot_id = ? WHERE table_id = ?`
     ///
     /// Without (4)-(6) in the same transaction, a crash between the pointer
     /// flip and the (separate, post-commit) clears in `PreparedOverwrite::finish`
@@ -455,6 +456,7 @@ impl CayenneCatalog {
              DELETE FROM cayenne_inlined_data WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_inlined_delete WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_table_statistics WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_pk_index WHERE table_id = {table_id_literal}; \
              UPDATE cayenne_table SET current_snapshot_id = {new_snapshot_id_literal} WHERE table_id = {table_id_literal};"
         );
 
@@ -1841,6 +1843,53 @@ impl MetadataCatalog for CayenneCatalog {
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "DELETE FROM cayenne_table_statistics WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+    }
+
+    async fn upsert_pk_index(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        index_blob: &[u8],
+    ) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "INSERT OR REPLACE INTO cayenne_pk_index \
+                      (table_id, snapshot_id, index_blob) \
+                      VALUES (?1, ?2, ?3)",
+                params: vec![
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Text(snapshot_id.to_string()),
+                    MetastoreValue::Blob(index_blob.to_vec()),
+                ],
+            })
+            .await
+    }
+
+    async fn get_pk_index(&self, table_id: &str) -> CatalogResult<Option<(String, Vec<u8>)>> {
+        let results = self
+            .metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT snapshot_id, index_blob
+                    FROM cayenne_pk_index
+                    WHERE table_id = ?1
+                    ",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                |row| Ok((row.get_string(0)?, row.get_blob(1)?)),
+            )
+            .await?;
+        Ok(results.into_iter().next())
+    }
+
+    async fn clear_pk_index(&self, table_id: &str) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_pk_index WHERE table_id = ?1",
                 params: vec![MetastoreValue::Text(table_id.to_string())],
             })
             .await

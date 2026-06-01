@@ -19,10 +19,10 @@ use std::{
     sync::Arc,
 };
 
-use crate::datafusion::DataFusion;
 use arrow::array::RecordBatch;
 use distinct::DistinctColumnsParams;
 use random::RandomSampleParams;
+use runtime_datafusion::query_engine::QueryEngine;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use top_samples::TopSamplesParams;
@@ -36,7 +36,7 @@ pub trait SampleFrom: Send + Sync {
     /// Given the parameters for sampling data, return a [`RecordBatch`] with the sampled data.
     fn sample(
         &self,
-        df: Arc<DataFusion>,
+        df: Arc<dyn QueryEngine>,
     ) -> impl std::future::Future<
         Output = Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>>,
     > + Send;
@@ -139,7 +139,7 @@ impl Display for SampleTableParams {
 impl SampleFrom for SampleTableParams {
     async fn sample(
         &self,
-        df: Arc<DataFusion>,
+        df: Arc<dyn QueryEngine>,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
         match self {
             SampleTableParams::DistinctColumns(params) => params.sample(df).await,

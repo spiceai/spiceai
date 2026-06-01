@@ -115,6 +115,17 @@ pub enum DistributedNode {
 
         /// Partition service for discovery, assignment, and executor notification.
         partition_service: Arc<PartitionService>,
+
+        /// Tracks which (table, partition) pairs each executor has reported
+        /// as loaded; used to drive accelerated-dataset readiness on the
+        /// scheduler.
+        ///
+        /// Starts empty when the scheduler boots. A scheduler that joins
+        /// after executors are already running won't have ack state until
+        /// the next refresh-driven broadcast, so `/v1/ready` stays at 503
+        /// on that scheduler until then. Acceptable simplification: this
+        /// path is multi-scheduler HA, not the steady-state.
+        partition_load_tracker: Arc<runtime_cluster::PartitionLoadTracker>,
     },
     Executor {
         /// Partition assignments for this runtime (executor) for each table.
@@ -122,6 +133,11 @@ pub enum DistributedNode {
         /// This is populated during startup when the executor registers with the scheduler.
         /// It contains the list of partition filters (expressions) that this executor is responsible for.
         partition_assignments: Arc<RwLock<HashMap<ResolvedTableReference, Vec<Expr>>>>,
+
+        /// Shared map of per-scheduler outbound senders. Lets the runtime
+        /// broadcast unsolicited messages (e.g. `PartitionsLoaded`) without
+        /// owning the [`ControlStreamManager`] directly.
+        outbound_broadcaster: ExecutorOutboundBroadcaster,
     },
 }
 
@@ -435,11 +451,14 @@ pub use control_stream_client::ControlStreamManager;
 pub use heartbeat::{CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeat, SchedulerHeartbeatStore};
 pub use partition::{PartitionMetadata, PartitionStore, TablePartitionMetadata};
 pub use reaper::{Reaper, ReaperOutcome};
+pub use runtime_cluster::ExecutorOutboundBroadcaster;
 use runtime_cluster::store::{AccelerationsPartitions, CatalogPartitions};
 pub use runtime_cluster::{ExecutorRegistry, FederatedPartitionProvider, TablePartitions};
 pub use scheduler_registry::SchedulerPeers;
 pub use scheduler_registry::start_scheduler_registry;
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
+#[cfg(not(windows))]
+pub(crate) use service::discover_cayenne_tables;
 pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 
 /// mTLS configuration for cluster communications.
@@ -873,6 +892,24 @@ impl ResolvedClusterConfig {
         self.scheduler_url_string()
             .or_else(|| self.node_advertise_address())
             .map_or_else(|| self.node_bind_address().to_string(), str::to_string)
+    }
+
+    /// Returns the canonical `<host>:<port>` form used as the `node_id`
+    /// attribute on cluster metrics. Strips any URL scheme from the
+    /// configured advertise value and pairs the advertise host with the
+    /// configured bind port, so series line up with the executor identity
+    /// registered in the cluster control plane.
+    ///
+    /// Note: if an executor fell back to a dynamic port at flight-server
+    /// bind time, the configured port here may diverge from the actually
+    /// bound port. That edge case is not corrected by this helper.
+    #[must_use]
+    pub fn metrics_node_id(&self) -> String {
+        let port = self.node_bind_address().port();
+        if let Some(host) = self.node_advertise_address() {
+            return format!("{host}:{port}");
+        }
+        self.node_bind_address().to_string()
     }
 }
 
@@ -1361,6 +1398,14 @@ pub async fn initialize_cluster_executor(
     let control_stream_metrics_reader = rt.metrics_reader().cloned();
     let shutdown_token_for_manager = shutdown_token.clone();
 
+    // Stamp the executor id onto the broadcaster that was created at builder
+    // time (when executor_id wasn't yet known) so outbound messages carry the
+    // right identifier.
+    let outbound_broadcaster = rt.executor_outbound_broadcaster();
+    if let Some(b) = outbound_broadcaster.as_ref() {
+        b.set_executor_id(executor_id.clone()).await;
+    }
+
     let partition_update_handler_rt = Arc::clone(&rt);
     let partition_update_handler: Option<
         crate::cluster::control_stream_client::PartitionUpdateHandler,
@@ -1419,6 +1464,7 @@ pub async fn initialize_cluster_executor(
             partition_update_handler,
             Some(Arc::clone(&executor_for_manager)),
             refresh_dataset_handler,
+            outbound_broadcaster,
         );
 
         // Get the shared poll_now notify handle from the control stream manager.

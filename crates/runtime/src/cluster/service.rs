@@ -79,7 +79,9 @@ use crate::cluster::{
     ExecutorRegistry, TablePartitions,
     {SchedulerPeers, partition::partition_value_to_bytes},
 };
-use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
+use crate::datafusion::{
+    DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_RUNTIME_SCHEMA,
+};
 use crate::metrics_reader::MetricsReader;
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
 
@@ -617,6 +619,13 @@ impl ClusterService for ClusterServiceImpl {
             // Unregister the executor stream.
             executor_streams.unregister(&executor_id);
 
+            // Drop any partition-load acks the executor had; until it
+            // reconnects (or another executor takes over and acks), the
+            // affected datasets should no longer be considered loaded.
+            if let Some(tracker) = datafusion.partition_load_tracker.as_ref() {
+                tracker.drop_executor(&executor_id).await;
+            }
+
             tracing::debug!("Executor control stream ended: {executor_id}");
         });
 
@@ -860,6 +869,12 @@ async fn handle_executor_message(
             // This shouldn't be reached, but log if it is.
             tracing::warn!("Unexpected ack in handle_executor_message for {executor_id}");
         }
+        ExecutorMessage::PartitionsLoaded(loaded) => {
+            handle_partitions_loaded(executor_id, loaded, datafusion).await;
+        }
+        ExecutorMessage::ExecutorStatistics(stats_msg) => {
+            handle_executor_statistics(executor_id, stats_msg, datafusion);
+        }
         ExecutorMessage::Shutdown(shutdown) => {
             let reason = if shutdown.reason.is_empty() {
                 "executor shutdown".to_string()
@@ -910,6 +925,140 @@ async fn notify_scheduler_executor_shutdown(
 
     Ok(())
 }
+
+/// Records a per-table [`ExecutorStatistics`] report into the scheduler's
+/// in-memory `ExecutorRegistry`, where it's read at query-planning time to size
+/// the coordinator's per-executor federated scans. Decoupled from readiness.
+fn handle_executor_statistics(
+    executor_id: &str,
+    msg: &runtime_proto::ExecutorStatistics,
+    datafusion: &DataFusion,
+) {
+    let resolved = TableReference::parse_str(&msg.table_name)
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+    let table = TableReference::full(
+        Arc::<str>::clone(&resolved.catalog),
+        Arc::<str>::clone(&resolved.schema),
+        Arc::<str>::clone(&resolved.table),
+    );
+    let stats = runtime_cluster::decode_statistics(&msg.statistics);
+    if let (Some(stats), Some(registry)) = (stats, datafusion.executor_registry()) {
+        registry.record_executor_statistics(
+            table,
+            executor_id.to_string(),
+            stats,
+            msg.column_names.clone(),
+        );
+    }
+}
+
+/// Records a `PartitionsLoaded` ack from an executor and, if all assigned
+/// partitions for the table are now covered by an executor ack, flips the
+/// dataset's status to `Ready`. This is the only path that marks an
+/// accelerated dataset ready on the scheduler — the dataset starts
+/// `Refreshing` at registration time and stays there until the cluster
+/// actually has data.
+async fn handle_partitions_loaded(
+    executor_id: &str,
+    loaded: &runtime_proto::PartitionsLoaded,
+    datafusion: &DataFusion,
+) {
+    let Some(tracker) = datafusion.partition_load_tracker.as_ref() else {
+        return;
+    };
+    let Some(partition_store) = datafusion
+        .partition_service
+        .as_ref()
+        .map(|s| Arc::clone(&s.partition_store))
+    else {
+        // No partition store available — nothing to evaluate against.
+        return;
+    };
+
+    // Canonicalize the executor-sent table name. Executors can legitimately
+    // emit different textual forms across paths (bare `foo`, partial
+    // `public.foo`, full `spice.public.foo`); resolving against Spice defaults
+    // produces a single key so a `replace(...)` on one form doesn't shadow an
+    // ack on another, and metadata lookup hits the same entry the scheduler
+    // populated.
+    let resolved = TableReference::parse_str(&loaded.table_name)
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+    let table = TableReference::full(
+        Arc::<str>::clone(&resolved.catalog),
+        Arc::<str>::clone(&resolved.schema),
+        Arc::<str>::clone(&resolved.table),
+    );
+
+    let partition_expr_bytes: std::collections::HashSet<bytes::Bytes> = loaded
+        .partition_expr_bytes
+        .as_ref()
+        .map(|arr| {
+            arr.items
+                .iter()
+                .map(|v| bytes::Bytes::copy_from_slice(v))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    tracing::debug!(
+        executor_id,
+        table = %loaded.table_name,
+        partitions = partition_expr_bytes.len(),
+        "Received PartitionsLoaded ack"
+    );
+
+    // Statistics now flow via the dedicated ExecutorStatistics message
+    // (handle_executor_statistics); PartitionsLoaded is readiness-only.
+    tracker
+        .replace(table.clone(), executor_id.to_string(), partition_expr_bytes)
+        .await;
+
+    // Refresh in-memory partition metadata snapshot before evaluating
+    // readiness — the tracker compares against the latest assigned set.
+    // Fail closed: if we can't refresh we may be looking at a stale
+    // assignment, which could flip a dataset to `Ready` based on outdated
+    // executor membership. Skip this evaluation and let the next ack or
+    // reconcile cycle retry.
+    if let Err(err) = partition_store.refresh().await {
+        tracing::warn!(
+            table = %loaded.table_name,
+            "Skipping readiness evaluation: partition store refresh failed: {err}"
+        );
+        return;
+    }
+    let Some(metadata) = partition_store.get_cached_table_metadata(&table) else {
+        // No partition metadata yet — likely raced with first discovery
+        // cycle; the next reconcile will re-evaluate.
+        return;
+    };
+
+    if tracker.is_table_loaded(&table, &metadata, datafusion).await {
+        // Find the dataset key that was registered as `Refreshing` at init
+        // time. The original key may be bare/partial (`foo`) while the
+        // canonical form is full (`spice.public.foo`); calling
+        // `update_dataset(&canonical)` would create a *new* status entry and
+        // leave the original stuck in `Refreshing`, keeping `/v1/ready` at
+        // 503. Match by resolve-equality to update the existing entry.
+        let target = datafusion
+            .runtime_status
+            .get_dataset_statuses()
+            .into_keys()
+            .find(|key| {
+                key.clone()
+                    .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                    == resolved
+            })
+            .unwrap_or_else(|| table.clone());
+        tracing::info!(
+            table = %loaded.table_name,
+            "All assigned partitions loaded; marking dataset Ready"
+        );
+        datafusion
+            .runtime_status
+            .update_dataset(&target, crate::status::ComponentStatus::Ready);
+    }
+}
+
 /// Discovers all Cayenne table references registered in the `DataFusion` catalog.
 ///
 /// Iterates through all catalogs, identifies Cayenne-backed catalogs, and returns
@@ -917,7 +1066,7 @@ async fn notify_scheduler_executor_shutdown(
 /// register unpartitioned entries in the executor's partition map so that queries
 /// for Cayenne tables are forwarded to the executor.
 #[cfg(not(windows))]
-async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
+pub(crate) async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
     use crate::datafusion::cayenne_ddl::is_cayenne_catalog;
     use cayenne::CayenneSchemaProvider;
 
