@@ -61,6 +61,7 @@ pub mod catalog_provider;
 pub mod cayenne_catalog;
 #[cfg(feature = "partition-table-provider")]
 pub mod ddl;
+pub mod hll;
 #[cfg(feature = "partition-table-provider")]
 pub use ddl::CayenneDdlHandler;
 pub mod logical_optimizer;
