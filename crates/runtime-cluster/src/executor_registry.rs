@@ -25,7 +25,11 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
-use datafusion::{catalog::TableProvider, sql::TableReference};
+use datafusion::{
+    catalog::TableProvider,
+    common::{Statistics, stats::Precision},
+    sql::TableReference,
+};
 use datafusion_expr::{Expr, TableScan};
 use flight_client::cookie::CookieStore;
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;
@@ -189,6 +193,49 @@ impl DdlLog {
     }
 }
 
+/// Statistics an executor reported for its local slice of a table, retaining the
+/// column names so per-column stats can be projected onto a (possibly projected)
+/// leaf scan schema by name.
+#[derive(Debug, Clone)]
+pub struct ExecutorTableStatistics {
+    /// `num_rows` + positional per-column `min`/`max`/`null_count` for the executor's slice.
+    pub statistics: Statistics,
+    /// Column names aligned positionally with `statistics.column_statistics`.
+    pub column_names: Vec<String>,
+}
+
+impl ExecutorTableStatistics {
+    /// Builds a [`Statistics`] aligned to `leaf_schema`: carries the reported
+    /// `num_rows` and, for each leaf column, the reported per-column stats matched
+    /// by name (`Absent`/unknown when the executor reported none for that column).
+    /// This lets the coordinator's planner estimate join/aggregate cardinalities
+    /// from the executor's column min/max even when the leaf scan is projected.
+    #[must_use]
+    pub fn projected_onto(&self, leaf_schema: &SchemaRef) -> Statistics {
+        use datafusion::common::ColumnStatistics;
+        let by_name: HashMap<&str, &ColumnStatistics> = self
+            .column_names
+            .iter()
+            .map(String::as_str)
+            .zip(self.statistics.column_statistics.iter())
+            .collect();
+        let column_statistics = leaf_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                by_name
+                    .get(f.name().as_str())
+                    .map_or_else(ColumnStatistics::new_unknown, |c| (*c).clone())
+            })
+            .collect();
+        Statistics {
+            num_rows: self.statistics.num_rows,
+            total_byte_size: Precision::Absent,
+            column_statistics,
+        }
+    }
+}
+
 /// Registry for tracking executor control stream connections.
 ///
 /// Schedulers use this registry to:
@@ -213,6 +260,19 @@ pub struct ExecutorRegistry {
     accelerations_partition_store: Arc<PartitionStore>,
 
     federated_partition_store: Arc<PartitionStore>,
+
+    /// Per-(table, executor) statistics reported by executors on their
+    /// `PartitionsLoaded` acks (today: `num_rows` summed from each executor's
+    /// local accelerated partition record counts). Held in memory rather than in
+    /// `cluster.json` because it is ack-derived, ephemeral optimizer-hint state
+    /// (mirroring [`crate::PartitionLoadTracker`]): persisting it per ack would
+    /// hammer the shared cluster document and starve the ingest path's own
+    /// partition-assignment writes. Each scheduler receives every executor's
+    /// broadcast, so its in-memory view is complete; it is re-populated by the
+    /// executors' next refresh after a scheduler restart. Read at query-planning
+    /// time to size the coordinator's per-executor federated scans.
+    executor_statistics:
+        Arc<parking_lot::RwLock<HashMap<TableReference, HashMap<String, ExecutorTableStatistics>>>>,
 
     /// Append-only log of DDL SQL statements applied to the cluster.
     ddl_log: Arc<RwLock<DdlLog>>,
@@ -254,9 +314,51 @@ impl ExecutorRegistry {
             partitions: Arc::new(RwLock::new(HashMap::new())),
             accelerations_partition_store,
             federated_partition_store,
+            executor_statistics: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             ddl_log: Arc::new(RwLock::new(DdlLog::default())),
             node_id,
         }
+    }
+
+    /// Records the statistics an executor reported for the slice of `table` it
+    /// serves, overwriting any previous report. In-memory only — cheap enough to
+    /// call on every report. `column_names` is positionally aligned with
+    /// `statistics.column_statistics` so the coordinator can project column stats
+    /// onto a (possibly projected) leaf scan by name.
+    pub fn record_executor_statistics(
+        &self,
+        table: TableReference,
+        executor_id: String,
+        statistics: Statistics,
+        column_names: Vec<String>,
+    ) {
+        self.executor_statistics
+            .write()
+            .entry(table)
+            .or_default()
+            .insert(
+                executor_id,
+                ExecutorTableStatistics {
+                    statistics,
+                    column_names,
+                },
+            );
+    }
+
+    /// Returns a snapshot of the per-executor statistics for `table` (keyed by
+    /// executor id), or an empty map if none have been reported. Used at
+    /// query-planning time; the small clone avoids holding the lock across
+    /// planning.
+    #[must_use]
+    pub fn executor_statistics_snapshot(
+        &self,
+        table: &TableReference,
+    ) -> HashMap<String, ExecutorTableStatistics> {
+        self.executor_statistics
+            .read()
+            .get(table)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Returns the scheduler's `node_id` if one was provided at construction.
@@ -342,6 +444,16 @@ impl ExecutorRegistry {
         }
         self.flight_sql_clients.write().await.remove(executor_id);
         self.partitions.write().await.remove(executor_id);
+
+        // Drop the disconnected executor's reported statistics across all tables
+        // so a departed executor's stale row counts don't linger in planning.
+        {
+            let mut stats = self.executor_statistics.write();
+            for table_stats in stats.values_mut() {
+                table_stats.remove(executor_id);
+            }
+            stats.retain(|_, table_stats| !table_stats.is_empty());
+        }
 
         if let Some(node_id) = self.node_id.as_deref() {
             metrics::set_scheduler_executor_active_connection(node_id, executor_id, false);
@@ -579,11 +691,13 @@ impl ExecutorRegistry {
             return Vec::new();
         };
         let executors = ready_executors(&connections, &flight_sql_clients);
+        let executor_statistics = self.executor_statistics_snapshot(table);
         get_partitions_from_store(
             &self.accelerations_partition_store,
             &executors,
             table,
             schema,
+            &executor_statistics,
             self.node_id.as_deref(),
         )
     }
@@ -608,15 +722,19 @@ pub(crate) fn flight_sql_table_provider(
     client: FlightSqlClient,
     table: &TableReference,
     schema: SchemaRef,
+    statistics: Option<Statistics>,
 ) -> Arc<dyn TableProvider> {
-    Arc::new(FlightSQLTable::create_with_schema(
-        "flightsql",
-        executor_id,
-        client,
-        table.clone(),
-        schema,
-        Arc::new(CookieStore::new()),
-    )) as Arc<dyn TableProvider>
+    Arc::new(
+        FlightSQLTable::create_with_schema(
+            "flightsql",
+            executor_id,
+            client,
+            table.clone(),
+            schema,
+            Arc::new(CookieStore::new()),
+        )
+        .with_statistics(statistics),
+    ) as Arc<dyn TableProvider>
 }
 
 /// Shared logic for `get_partitions` across accelerated and federated partition providers.
@@ -629,6 +747,7 @@ pub(crate) fn get_partitions_from_store(
     executors: &HashMap<String, (&ExecutorConnection, &FlightSqlClient)>,
     table: &TableReference,
     schema: &SchemaRef,
+    executor_statistics: &HashMap<String, ExecutorTableStatistics>,
     node_id: Option<&str>,
 ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
     let Some(table_metadata) = partition_store.get_cached_table_metadata(table) else {
@@ -651,7 +770,13 @@ pub(crate) fn get_partitions_from_store(
             metrics::record_query_executor_count(node_id, 1);
         }
         return vec![(
-            flight_sql_table_provider(executor_id, (*client).clone(), table, Arc::clone(schema)),
+            flight_sql_table_provider(
+                executor_id,
+                (*client).clone(),
+                table,
+                Arc::clone(schema),
+                None,
+            ),
             Vec::new(),
         )];
     };
@@ -668,7 +793,10 @@ pub(crate) fn get_partitions_from_store(
         return Vec::new();
     }
 
-    // Build executor -> partitions map, excluding dead executors
+    // Build executor -> partitions map, excluding dead executors. Per-executor
+    // row-count statistics (used below to size the coordinator's joins) come
+    // from `table_metadata.executor_statistics`, which each executor reports
+    // for the slice of the table it serves (see `handle_partitions_loaded`).
     let mut executor_partition_map: HashMap<String, Vec<PartitionValue>> = HashMap::new();
     for partition_meta in &table_metadata.partitions {
         for executor_id in &partition_meta.assigned_executors {
@@ -726,11 +854,19 @@ pub(crate) fn get_partitions_from_store(
         .filter_map(|executor_id| {
             let (_, client) = executors.get(&executor_id)?;
             let partition_values = executor_partition_map.remove(&executor_id)?;
+            // Stamp the executor-reported statistics onto this leaf scan so the
+            // coordinator's planner can size joins. Project the reported per-column
+            // stats onto the leaf's (possibly projected) schema by name, carrying
+            // num_rows and per-column min/max.
+            let statistics = executor_statistics
+                .get(&executor_id)
+                .map(|ets| ets.projected_onto(schema));
             let provider = flight_sql_table_provider(
                 &executor_id,
                 (*client).clone(),
                 table,
                 Arc::clone(schema),
+                statistics,
             );
             Some((provider, partition_values))
         })
@@ -746,6 +882,8 @@ pub struct FederatedPartitionProvider {
     connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
     flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
     partition_store: Arc<PartitionStore>,
+    executor_statistics:
+        Arc<parking_lot::RwLock<HashMap<TableReference, HashMap<String, ExecutorTableStatistics>>>>,
     node_id: Option<Arc<str>>,
 }
 
@@ -757,6 +895,7 @@ impl FederatedPartitionProvider {
             connections: Arc::clone(&registry.connections),
             flight_sql_clients: Arc::clone(&registry.flight_sql_clients),
             partition_store: Arc::clone(&registry.federated_partition_store),
+            executor_statistics: Arc::clone(&registry.executor_statistics),
             node_id: registry.node_id.clone(),
         }
     }
@@ -784,12 +923,19 @@ impl TablePartitionProvider for FederatedPartitionProvider {
         };
 
         let executors = ready_executors(&connections, &flight_sql_clients);
+        let executor_statistics = self
+            .executor_statistics
+            .read()
+            .get(table)
+            .cloned()
+            .unwrap_or_default();
 
         get_partitions_from_store(
             &self.partition_store,
             &executors,
             table,
             schema,
+            &executor_statistics,
             self.node_id.as_deref(),
         )
         .into_iter()
