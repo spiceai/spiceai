@@ -448,10 +448,23 @@ impl CayenneCdcWrite {
     pub async fn finish(self) -> Result<u64> {
         if let Some(prepared_append) = self.prepared_append {
             let publish_start = Instant::now();
-            prepared_append.apply_under_barrier().await?;
             if let Some(prepared_on_conflict) = self.prepared_on_conflict {
+                // Publish the staged file move AND the deletion / protected-snapshot
+                // caches under a SINGLE listing-fence write. A concurrent `scan()`
+                // captures its deletion snapshot and `protected_snapshots` under
+                // `listing_fence.read()`, so holding the write fence across both
+                // makes the upsert atomic to readers: a scan observes either the
+                // pre-publish state (old rows, no new snapshot) or the full
+                // post-publish state (new snapshot + its deletes) — never the new
+                // snapshot's rows without the deletes that hide the old versions.
+                // (visibility lock then fence — same order as `apply_under_barrier`.)
+                let _visibility = self.table.visibility_lock_arc().lock_owned().await;
+                let _fence = self.table.lock_listing_fence_write_owned().await;
+                prepared_append.apply_under_held_barrier().await?;
                 self.table
                     .publish_prepared_on_conflict_deletions(prepared_on_conflict)?;
+            } else {
+                prepared_append.apply_under_barrier().await?;
             }
             let rows = prepared_append.finish().await?;
             record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
@@ -9997,10 +10010,25 @@ impl TableProvider for CayenneTableProvider {
             self.register_object_store_for_runtime(state.runtime_env(), config);
         }
 
+        // Hold listing_fence.read() for the remainder of this scan's plan-build
+        // so the deletion snapshot, the protected_snapshots set, and the current
+        // snapshot's file listing are all captured atomically against a
+        // concurrent writer barrier. A staged CDC upsert publishes its file move,
+        // its deletion caches, and protected_snapshots under listing_fence.write()
+        // (CayenneCdcWrite::finish), so holding the read fence across all three
+        // captures here guarantees this scan observes that publish either fully
+        // or not at all — never the new snapshot's rows without the deletes that
+        // hide the old versions. Concurrent scans share the read fence; only a
+        // writer barrier holding the write fence blocks them, and vice versa.
+        let listing_fence_wait_start = Instant::now();
+        let _fence = self.listing_fence.read().await;
+        self.record_listing_fence_wait_duration(listing_fence_wait_start.elapsed());
+
         // Capture one immutable deletion snapshot for this scan and use it for
-        // both projection planning and filter construction. This avoids racing a
-        // later cache publish between the decision to include PK columns and the
-        // decision to wrap the plan with a PK deletion filter.
+        // both projection planning and filter construction. Captured under the
+        // fence above so it stays consistent with the protected_snapshots load
+        // later in this function (otherwise a concurrent upsert publish could be
+        // observed as new rows without their deletes).
         let deletion_snapshot = self.pk_deletion_snapshot();
         let need_pk_deletion = deletion_snapshot.has_deletions();
 
@@ -10105,19 +10133,11 @@ impl TableProvider for CayenneTableProvider {
             state.config()
         };
 
-        // Hold listing_fence.read() across direct snapshot file listing and
-        // FileScanConfig creation so concurrent writer barriers (#10125 §6.4)
-        // cannot interleave file moves with this scan's listing operation.
-        // Multiple concurrent scans
-        // share the read fence and do not block each other; only a writer-side
-        // barrier holding the write fence blocks scans, and vice versa.
-        //
-        // The plan is built from the live current_snapshot_id so it can apply
-        // per-scan DataFusion config (target_partitions, etc.). The fence still matters because
-        // append-mode coordinators move files into the CURRENT snapshot dir.
-        let listing_fence_wait_start = Instant::now();
-        let _fence = self.listing_fence.read().await;
-        self.record_listing_fence_wait_duration(listing_fence_wait_start.elapsed());
+        // `listing_fence.read()` is already held (acquired at the top of this
+        // scan so the deletion snapshot, protected_snapshots, and the file
+        // listing are captured atomically against a concurrent writer barrier —
+        // #10125 §6.4). The plan is built from the live current_snapshot_id so it
+        // can apply per-scan DataFusion config (target_partitions, etc.).
         let current_snapshot_id = self.get_current_snapshot_id();
         let listing_scan_start = Instant::now();
         let main_plan_result = self

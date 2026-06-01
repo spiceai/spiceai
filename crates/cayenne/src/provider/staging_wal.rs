@@ -549,17 +549,12 @@ pub(crate) struct StagingWal {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StagingWalTargetKind {
+    #[default]
     CurrentSnapshot,
     ProtectedSnapshot,
-}
-
-impl Default for StagingWalTargetKind {
-    fn default() -> Self {
-        Self::CurrentSnapshot
-    }
 }
 
 #[derive(Debug)]

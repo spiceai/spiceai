@@ -204,20 +204,17 @@ impl DeletionIndex {
         // iterator's hint to skip Vec growth reallocations.
         let mut new_keys: Vec<i64> = Vec::with_capacity(additions.size_hint().0);
         for (pk, seq) in additions {
-            let stored_sequence = match entries.get(&pk).copied() {
-                Some(existing) => {
-                    if seq > existing {
-                        entries.insert(pk, seq);
-                        seq
-                    } else {
-                        existing
-                    }
-                }
-                None => {
+            let stored_sequence = if let Some(existing) = entries.get(&pk).copied() {
+                if seq > existing {
                     entries.insert(pk, seq);
-                    new_keys.push(pk);
                     seq
+                } else {
+                    existing
                 }
+            } else {
+                entries.insert(pk, seq);
+                new_keys.push(pk);
+                seq
             };
             if max_sequence_number.is_none_or(|max| stored_sequence > max) {
                 max_sequence_number = Some(stored_sequence);
@@ -408,20 +405,17 @@ impl KeyDeletionIndex {
         // iterator's hint to skip Vec growth reallocations.
         let mut new_hashes: Vec<u64> = Vec::with_capacity(additions.size_hint().0);
         for (key, seq) in additions {
-            let stored_sequence = match entries.get(key.as_ref()).copied() {
-                Some(existing) => {
-                    if seq > existing {
-                        entries.insert(key, seq);
-                        seq
-                    } else {
-                        existing
-                    }
-                }
-                None => {
-                    new_hashes.push(hash_key(&key.as_ref()));
+            let stored_sequence = if let Some(existing) = entries.get(key.as_ref()).copied() {
+                if seq > existing {
                     entries.insert(key, seq);
                     seq
+                } else {
+                    existing
                 }
+            } else {
+                new_hashes.push(hash_key(&key.as_ref()));
+                entries.insert(key, seq);
+                seq
             };
             if max_sequence_number.is_none_or(|max| stored_sequence > max) {
                 max_sequence_number = Some(stored_sequence);

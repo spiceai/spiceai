@@ -2396,8 +2396,8 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             }
 
-            if let Some(snapshot_sequence) = &snapshot_sequence {
-                if let Err(e) = tx
+            if let Some(snapshot_sequence) = &snapshot_sequence
+                && let Err(e) = tx
                     .execute(ExecuteParams {
                         sql: "INSERT OR REPLACE INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3)",
                         params: vec![
@@ -2407,25 +2407,23 @@ impl MetadataCatalog for CayenneCatalog {
                         ],
                     })
                     .await
-                {
-                    if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
-                        drop(tx);
-                        sleep_before_metastore_write_retry(
-                            attempt,
-                            max_attempts,
-                            "insert snapshot sequence inside on-conflict transaction",
-                        )
-                        .await;
-                        continue 'attempts;
-                    }
+            {
+                if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
                     drop(tx);
-                    return Err(CatalogError::InvalidOperation {
-                        message:
-                            "Failed to insert snapshot sequence inside on-conflict transaction"
-                                .to_string(),
-                        source: Box::new(e),
-                    });
+                    sleep_before_metastore_write_retry(
+                        attempt,
+                        max_attempts,
+                        "insert snapshot sequence inside on-conflict transaction",
+                    )
+                    .await;
+                    continue 'attempts;
                 }
+                drop(tx);
+                return Err(CatalogError::InvalidOperation {
+                    message: "Failed to insert snapshot sequence inside on-conflict transaction"
+                        .to_string(),
+                    source: Box::new(e),
+                });
             }
 
             match tx.commit().await {
