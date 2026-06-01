@@ -295,6 +295,13 @@ pub fn parse_partition_value(
                 ScalarValue::Utf8(Some(value_str.to_string()))
             }
         }
+        DataType::LargeUtf8 => {
+            if value_str == "none" || value_str == "NULL" {
+                ScalarValue::LargeUtf8(None)
+            } else {
+                ScalarValue::LargeUtf8(Some(value_str.to_string()))
+            }
+        }
         DataType::Utf8View => {
             if value_str == "none" || value_str == "NULL" {
                 ScalarValue::Utf8View(None)
@@ -436,6 +443,38 @@ mod tests {
 
         let result = parse_partition_value(&df_schema, &partition_by_bool, "true")?;
         assert_eq!(result, ScalarValue::Boolean(Some(true)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_partition_value_large_utf8() -> Result<(), Box<dyn std::error::Error>> {
+        // Cayenne represents strings as LargeUtf8, so inferring existing partitions
+        // reads the partition value back as LargeUtf8. partition_key_to_string already
+        // handles all three string types; this is the matching string -> scalar
+        // direction.
+        let schema = Schema::new(vec![Field::new("str_col", DataType::LargeUtf8, true)]);
+        let df_schema = DFSchema::try_from(schema)?;
+        let partition_by = PartitionedBy {
+            name: "str_col".to_string(),
+            expression: col("str_col"),
+        };
+
+        // NULL sentinels
+        assert_eq!(
+            parse_partition_value(&df_schema, &partition_by, "none")?,
+            ScalarValue::LargeUtf8(None)
+        );
+        assert_eq!(
+            parse_partition_value(&df_schema, &partition_by, "NULL")?,
+            ScalarValue::LargeUtf8(None)
+        );
+
+        // Actual value
+        assert_eq!(
+            parse_partition_value(&df_schema, &partition_by, "MONTH")?,
+            ScalarValue::LargeUtf8(Some("MONTH".to_string()))
+        );
 
         Ok(())
     }
