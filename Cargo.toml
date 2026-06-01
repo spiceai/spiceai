@@ -428,7 +428,7 @@ datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.g
 datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "06e4b624c6073c40c7b2127ce620e281ec1979ae" }                    # spiceai-52.5
 datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "06e4b624c6073c40c7b2127ce620e281ec1979ae" }                # spiceai-52.5
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "5f8236f0b93db58e5de5c86d89ad413824b2c31b" } # spiceai-52
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "4fbd5d7041d54df04d04cc9707941ece03e30f4f" } # spiceai-52
 
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "07be66a8efff7e20c2abadaaba6ef62b02fc1ffc" }      # spiceai-52.5
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "07be66a8efff7e20c2abadaaba6ef62b02fc1ffc" } # spiceai-52.5
@@ -437,7 +437,7 @@ ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "47034733a0477f72e4f6abbbf6a27d0da069860a" } # spiceai-0.18.2
 
 # Patch duckdb for direct dependencies and spiceai_duckdb_fork for datafusion-table-providers
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "91d0c71f02fb591ac75cf1415285855863a5d827" } # spiceai-1.5.3
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "b80672e038d1abe3d710f092a130661ea482940f" } # spiceai-1.5.3
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6d062676210d095df45eafa6e19fd8" }
 
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
