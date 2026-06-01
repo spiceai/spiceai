@@ -109,7 +109,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_table_statistics",
-        columns: &["table_id", "statistics_blob", "num_rows"],
+        columns: &["table_id", "statistics_blob", "num_rows", "ndv_sketches"],
     },
     ExpectedTable {
         name: "cayenne_pk_index",
@@ -339,6 +339,14 @@ pub trait MetastoreRow: Send {
     ///
     /// Returns an error if the column index is out of bounds.
     fn get_optional_string(&self, index: usize) -> CatalogResult<Option<String>>;
+
+    /// Get an optional blob (binary) value from the row by column index.
+    /// Returns `None` for SQL `NULL`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column index is out of bounds.
+    fn get_optional_blob(&self, index: usize) -> CatalogResult<Option<Vec<u8>>>;
 }
 
 /// Trait for types that can be extracted from a metastore row.

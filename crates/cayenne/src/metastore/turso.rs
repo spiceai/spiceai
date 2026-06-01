@@ -291,6 +291,7 @@ impl TursoMetastore {
             table_id TEXT NOT NULL PRIMARY KEY,
             statistics_blob BLOB NOT NULL,
             num_rows BIGINT NOT NULL DEFAULT 0,
+            ndv_sketches BLOB,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
@@ -420,6 +421,16 @@ impl MetastoreRow for TursoRow<'_> {
             }),
         }
     }
+
+    fn get_optional_blob(&self, index: usize) -> CatalogResult<Option<Vec<u8>>> {
+        match self.raw_value(index)? {
+            TursoValue::Blob(b) => Ok(Some(b)),
+            TursoValue::Null | TursoValue::Real(_) => Ok(None),
+            other => Err(CatalogError::Database {
+                message: format!("Expected blob or null at index {index}, found {other:?}"),
+            }),
+        }
+    }
 }
 
 /// Convert Turso Value to `MetastoreValue`, consuming the source so the
@@ -510,6 +521,12 @@ impl MetastoreBackend for TursoMetastore {
         let _ = conn
             .execute(
                 "ALTER TABLE cayenne_table ADD COLUMN on_conflict_json TEXT",
+                (),
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "ALTER TABLE cayenne_table_statistics ADD COLUMN ndv_sketches BLOB",
                 (),
             )
             .await;
