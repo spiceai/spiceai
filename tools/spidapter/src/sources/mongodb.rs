@@ -50,10 +50,11 @@ pub(crate) fn generate_mongodb_spicepod(
     };
 
     for (dataset_name, config) in datasets {
-        // The MongoDB connector uses `connection_string` (not mongodb_*-prefixed).
-        // Database and collection are derived from the `from:` URI; no separate params needed.
+        // `connection_string` is the correct connector param (not mongodb_*-prefixed).
+        // `sslmode: disabled` prevents the driver from attempting TLS on plain connections.
         let mut param_map = HashMap::from([
-            ("connection_string".to_string(), uri.to_string()),
+            ("mongodb_connection_string".to_string(), uri.to_string()),
+            ("mongodb_sslmode".to_string(), "disabled".to_string()),
         ]);
 
         if auto_load_complete {
