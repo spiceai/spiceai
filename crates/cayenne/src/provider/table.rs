@@ -448,24 +448,31 @@ impl CayenneCdcWrite {
     pub async fn finish(self) -> Result<u64> {
         if let Some(prepared_append) = self.prepared_append {
             let publish_start = Instant::now();
-            if let Some(prepared_on_conflict) = self.prepared_on_conflict {
+            let superseded_rows = if let Some(prepared_on_conflict) = self.prepared_on_conflict {
+                // Each staged on-conflict deletion is represented once in the
+                // key-delete lists; positioned delete vectors are a subset.
+                let superseded = prepared_on_conflict.deleted_pk_i64.len()
+                    + prepared_on_conflict.deleted_row_keys.len();
+
                 // Publish the staged file move AND the deletion / protected-snapshot
                 // caches under a SINGLE listing-fence write. A concurrent `scan()`
                 // captures its deletion snapshot and `protected_snapshots` under
                 // `listing_fence.read()`, so holding the write fence across both
                 // makes the upsert atomic to readers: a scan observes either the
                 // pre-publish state (old rows, no new snapshot) or the full
-                // post-publish state (new snapshot + its deletes) — never the new
+                // post-publish state (new snapshot + its deletes), never the new
                 // snapshot's rows without the deletes that hide the old versions.
-                // (visibility lock then fence — same order as `apply_under_barrier`.)
+                // (visibility lock then fence: same order as `apply_under_barrier`.)
                 let _visibility = self.table.visibility_lock_arc().lock_owned().await;
                 let _fence = self.table.lock_listing_fence_write_owned().await;
                 prepared_append.apply_under_held_barrier().await?;
                 self.table
                     .publish_prepared_on_conflict_deletions(prepared_on_conflict)?;
+                superseded
             } else {
                 prepared_append.apply_under_barrier().await?;
-            }
+                0
+            };
             let rows = prepared_append.finish().await?;
             record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
             let retention_requested = self.table.has_retention_delete_filters();
@@ -477,10 +484,12 @@ impl CayenneCdcWrite {
             } else {
                 self.table.record_file_pk_keys(&self.validated_file_keys);
             }
-            // This staged-append path only runs when `can_stage_for_pipeline`
-            // (no pending or on-conflict deletions — see `write_cdc_pipelined`),
-            // so it is a pure append: every written row is a new live row.
-            let live_rows_delta = i64::try_from(rows).unwrap_or(i64::MAX);
+            // Live `num_rows` delta is inserted rows minus upsert replacements.
+            // The staged path has no standalone deletes, so this remains a pure
+            // append delta when `superseded_rows` is 0.
+            let live_rows_delta = i64::try_from(rows)
+                .unwrap_or(i64::MAX)
+                .saturating_sub(i64::try_from(superseded_rows).unwrap_or(i64::MAX));
             self.table.schedule_post_write_maintenance(
                 self.stats,
                 false,
