@@ -761,11 +761,13 @@ fn init_snowflake_api_with_keypair_auth(
         }
         (None, Some(path)) => {
             validate_text_parameter("private_key_path", path)?;
-            fs::read_to_string(path).context(ErrorReadingPrivateKeyFileSnafu { file_path: path })?
+            fs::read_to_string(path).context(ErrorReadingPrivateKeyFileSnafu {
+                file_path: path.to_string(),
+            })?
         }
         (None, None) => {
             return MissingRequiredSecretSnafu {
-                name: "snowflake_private_key or snowflake_private_key_path",
+                name: "snowflake_private_key or snowflake_private_key_path".to_string(),
             }
             .fail();
         }
