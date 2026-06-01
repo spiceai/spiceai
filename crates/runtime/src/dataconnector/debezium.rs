@@ -33,8 +33,8 @@ use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
 use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset};
-use data_components::schema::merge_inferred_with_declared;
 use datafusion::datasource::TableProvider;
+use datafusion_table_providers::util::schema::merge_inferred_and_declared_schemas;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -397,8 +397,10 @@ impl DataConnector for Debezium {
                         dataconnector: "debezium",
                         connector_component: ConnectorComponent::from(dataset),
                     })?;
-                    let schema =
-                        merge_inferred_with_declared(Arc::new(inferred), declared_schema.as_ref());
+                    let schema = merge_inferred_and_declared_schemas(
+                        Arc::new(inferred),
+                        declared_schema.as_ref(),
+                    );
                     (metadata, schema)
                 };
 
@@ -639,7 +641,7 @@ async fn get_metadata_from_kafka(
             dataconnector: "debezium",
             connector_component: ConnectorComponent::from(dataset),
         })?;
-    let schema = merge_inferred_with_declared(Arc::new(inferred), declared_schema);
+    let schema = merge_inferred_and_declared_schemas(Arc::new(inferred), declared_schema);
 
     let metadata = DebeziumKafkaMetadata {
         consumer_group_id: kafka_consumer.group_id().to_string(),
@@ -709,7 +711,7 @@ async fn refresh_schema_if_evolved(
             );
             return Ok((
                 metadata,
-                merge_inferred_with_declared(Arc::new(cached_schema), declared_schema),
+                merge_inferred_and_declared_schemas(Arc::new(cached_schema), declared_schema),
             ));
         }
         Err(e) => {
@@ -718,7 +720,7 @@ async fn refresh_schema_if_evolved(
             );
             return Ok((
                 metadata,
-                merge_inferred_with_declared(Arc::new(cached_schema), declared_schema),
+                merge_inferred_and_declared_schemas(Arc::new(cached_schema), declared_schema),
             ));
         }
     };
@@ -726,7 +728,7 @@ async fn refresh_schema_if_evolved(
     let Some(fresh_fields) = value.get_schema_fields() else {
         return Ok((
             metadata,
-            merge_inferred_with_declared(Arc::new(cached_schema), declared_schema),
+            merge_inferred_and_declared_schemas(Arc::new(cached_schema), declared_schema),
         ));
     };
 
@@ -738,7 +740,7 @@ async fn refresh_schema_if_evolved(
             );
             return Ok((
                 metadata,
-                merge_inferred_with_declared(Arc::new(cached_schema), declared_schema),
+                merge_inferred_and_declared_schemas(Arc::new(cached_schema), declared_schema),
             ));
         }
     };
@@ -746,7 +748,7 @@ async fn refresh_schema_if_evolved(
     if fresh_schema == cached_schema {
         return Ok((
             metadata,
-            merge_inferred_with_declared(Arc::new(cached_schema), declared_schema),
+            merge_inferred_and_declared_schemas(Arc::new(cached_schema), declared_schema),
         ));
     }
 
@@ -770,7 +772,7 @@ async fn refresh_schema_if_evolved(
 
     Ok((
         updated_metadata,
-        merge_inferred_with_declared(Arc::new(fresh_schema), declared_schema),
+        merge_inferred_and_declared_schemas(Arc::new(fresh_schema), declared_schema),
     ))
 }
 
