@@ -252,6 +252,17 @@ impl<'a> AppendMutationWriter<'a> {
                 inlined = false,
                 "CDC pipelined append completed on synchronous path"
             );
+            // End-to-end Cayenne-write wall-clock for the synchronous (non-pipelined)
+            // path, labeled by path. For this path publish runs inline, so this IS
+            // the full slot-apply→publish-complete latency. The gap between this
+            // `total` and the sum of the named sub-phases (apply_on_conflict_deletions
+            // + vortex_write + publish) is the currently-unmeasured prepare/validation
+            // + lock-wait + fsync cost.
+            record_cayenne_write_phase(
+                self.table.table_name(),
+                "cdc_path_synchronous",
+                write_start,
+            );
             return Ok(CayenneCdcWrite::completed(
                 self.table.clone_for_write_operations(),
                 rows,
@@ -273,6 +284,11 @@ impl<'a> AppendMutationWriter<'a> {
                     rows,
                     inlined = true,
                     "CDC pipelined append completed as inlined write"
+                );
+                record_cayenne_write_phase(
+                    self.table.table_name(),
+                    "cdc_path_inlined",
+                    write_start,
                 );
                 Ok(CayenneCdcWrite::completed(
                     self.table.clone_for_write_operations(),
@@ -303,6 +319,11 @@ impl<'a> AppendMutationWriter<'a> {
                     inlined = false,
                     "CDC pipelined append staged; WAL is durable, publish/finalize is pending"
                 );
+                // Time to durable WAL + return on the staged (pipelined) path.
+                // NOTE: publish/finalize is backgrounded here, so unlike
+                // `cdc_path_synchronous` this does NOT include publish — it is
+                // the staged-prepare latency, not full end-to-end.
+                record_cayenne_write_phase(self.table.table_name(), "cdc_path_staged", write_start);
 
                 Ok(CayenneCdcWrite::prepared_append(
                     self.table.clone_for_write_operations(),

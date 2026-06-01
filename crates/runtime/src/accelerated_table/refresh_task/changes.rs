@@ -483,10 +483,25 @@ impl RefreshTask {
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
 
-        while let Some(first) = match carried_item.take() {
-            Some(item) => Some(item),
-            None => rx.recv().await,
-        } {
+        loop {
+            // Time how long the apply loop blocks waiting for the next batch
+            // from the source-reader channel. Large => source-bound (slot read /
+            // WAL decode can't keep up); near-zero => apply-bound (the
+            // accelerator write is the bottleneck). Carried-item iterations
+            // record ~0, which is correct — no wait occurred. Pairs with
+            // CDC_APPLY_BURST_DURATION_MS for full per-batch attribution.
+            let recv_start = Instant::now();
+            let next_item = match carried_item.take() {
+                Some(item) => Some(item),
+                None => rx.recv().await,
+            };
+            metrics::CDC_SOURCE_RECV_WAIT_MS.record(
+                elapsed_ms(recv_start),
+                &[KeyValue::new("dataset", dataset_name.to_string())],
+            );
+            let Some(first) = next_item else {
+                break;
+            };
             // Drain whatever is already buffered in the prefetch channel
             // (no `await` between try_recv calls). Under low load the buffer
             // is empty after the initial recv and `burst.len() == 1` — that
