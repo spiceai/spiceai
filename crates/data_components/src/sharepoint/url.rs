@@ -205,20 +205,20 @@ impl DriveRef {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "tests use unwrap to assert happy paths")]
 mod tests {
     use super::*;
 
     #[test]
     fn parse_me_root() {
-        let url = SharepointUrl::parse("sharepoint://me/").unwrap();
+        let url = SharepointUrl::parse("sharepoint://me/").expect("sharepoint://me/ should parse");
         assert_eq!(url.drive, DriveRef::Me);
         assert_eq!(url.item_path.as_ref(), "");
     }
 
     #[test]
     fn parse_me_with_path() {
-        let url = SharepointUrl::parse("sharepoint://me/Documents/report.csv").unwrap();
+        let url = SharepointUrl::parse("sharepoint://me/Documents/report.csv")
+            .expect("sharepoint://me/ with path should parse");
         assert_eq!(url.drive, DriveRef::Me);
         assert_eq!(url.item_path.as_ref(), "Documents/report.csv");
     }
@@ -228,7 +228,7 @@ mod tests {
         let url = SharepointUrl::parse(
             "sharepoint://drives/b!abc-def_XYZ/Shared%20Documents/file.parquet",
         )
-        .unwrap();
+        .expect("sharepoint://drives/<id>/... should parse");
         assert_eq!(url.drive, DriveRef::Drive("b!abc-def_XYZ".to_string()));
         assert_eq!(url.item_path.as_ref(), "Shared Documents/file.parquet");
     }
@@ -239,7 +239,7 @@ mod tests {
         let url = SharepointUrl::parse(
             "sharepoint://sites/contoso.sharepoint.com,11111111-2222-3333-4444-555555555555,66666666-7777-8888-9999-aaaaaaaaaaaa/Shared/data.json",
         )
-        .unwrap();
+        .expect("sharepoint://sites/<comma-id>/... should parse");
         match url.drive {
             DriveRef::Site(id) => {
                 assert!(id.starts_with("contoso.sharepoint.com,"));
@@ -254,31 +254,35 @@ mod tests {
     fn parse_user_and_group() {
         let u =
             SharepointUrl::parse("sharepoint://users/48d31887-5fad-4d73-a9f5-3c356e68a038/dir/f")
-                .unwrap();
+                .expect("sharepoint://users/<id>/... should parse");
         assert_eq!(
             u.drive,
             DriveRef::User("48d31887-5fad-4d73-a9f5-3c356e68a038".to_string())
         );
 
-        let g = SharepointUrl::parse("sharepoint://groups/gid-abc/dir/f").unwrap();
+        let g = SharepointUrl::parse("sharepoint://groups/gid-abc/dir/f")
+            .expect("sharepoint://groups/<id>/... should parse");
         assert_eq!(g.drive, DriveRef::Group("gid-abc".to_string()));
     }
 
     #[test]
     fn reject_wrong_scheme() {
-        let err = SharepointUrl::parse("https://example.com/foo").unwrap_err();
+        let err = SharepointUrl::parse("https://example.com/foo")
+            .expect_err("non-sharepoint scheme should be rejected");
         assert!(matches!(err, Error::WrongScheme { .. }));
     }
 
     #[test]
     fn reject_missing_id() {
-        let err = SharepointUrl::parse("sharepoint://drives/").unwrap_err();
+        let err = SharepointUrl::parse("sharepoint://drives/")
+            .expect_err("missing drive id should be rejected");
         assert!(matches!(err, Error::Malformed { .. }));
     }
 
     #[test]
     fn reject_unknown_kind() {
-        let err = SharepointUrl::parse("sharepoint://bogus/id/path").unwrap_err();
+        let err = SharepointUrl::parse("sharepoint://bogus/id/path")
+            .expect_err("unknown drive kind should be rejected");
         assert!(matches!(err, Error::Malformed { .. }));
     }
 }
