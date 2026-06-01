@@ -35,9 +35,14 @@ use datafusion::sql::TableReference;
 use crate::query_engine::{Error, QueryEngine, QueryRequest, Result, UpdateType};
 
 /// A [`QueryEngine`] backed directly by a [`SessionContext`].
-#[derive(Debug)]
 pub struct QuerySession {
     ctx: Arc<SessionContext>,
+}
+
+impl Debug for QuerySession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuerySession").finish_non_exhaustive()
+    }
 }
 
 impl QuerySession {
