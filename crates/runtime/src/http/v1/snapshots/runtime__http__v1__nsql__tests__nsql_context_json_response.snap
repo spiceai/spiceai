@@ -17,9 +17,10 @@ expression: response
     "dialect": "PostgreSQL",
     "parser": "DataFusion SQL parser configured with PostgreSQL dialect",
     "notes": [
-      "Spice supports standard DataFusion SQL plus Spice-specific, JSON, Spark compatibility, and registered user-defined functions listed in this context.",
+      "Spice supports standard DataFusion SQL plus relevant Spice-specific, JSON, Spark compatibility, and registered user-defined functions listed in this context.",
       "Not every PostgreSQL extension is implemented; prefer the functions listed in this response when generating SQL for Spice.",
       "Table functions such as text_search, vector_search, json_tree, and list_udfs are used in the FROM clause.",
+      "Run SELECT * FROM list_udfs() to inspect all functions registered in the current DataFusion context.",
       "Use LIMIT for exploratory or broad-result queries unless the user explicitly asks for all rows."
     ]
   },
@@ -65,6 +66,22 @@ expression: response
           "indexed": true,
           "vector_search": true,
           "full_text_search": true
+        },
+        {
+          "name": "order_payload",
+          "data_type": "Utf8",
+          "nullable": true,
+          "description": "Order details stored as JSON",
+          "source_type": "jsonb",
+          "metadata": {
+            "description": "Order details stored as JSON",
+            "source_type": "jsonb"
+          },
+          "primary_key": false,
+          "unique": false,
+          "indexed": false,
+          "vector_search": false,
+          "full_text_search": false
         }
       ],
       "primary_key": [
@@ -156,7 +173,7 @@ expression: response
     }
   ],
   "functions": {
-    "summary": "Spice SQL runs on Apache DataFusion with the SQL parser configured for the PostgreSQL dialect. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions. Function references are filtered to functions registered in the current DataFusion context",
+    "summary": "Spice SQL runs on Apache DataFusion with the SQL parser configured for the PostgreSQL dialect. Standard DataFusion SQL functions are available. The context lists registered functions that are relevant to the current spicepod, including search functions only when in-scope datasets expose the required search indexes. Run SELECT * FROM list_udfs() to inspect the full registered function inventory",
     "json": [
       {
         "name": "flatten_json",

@@ -35,7 +35,7 @@ expression: body
     - full-text search on `customer_id` using `tantivy`. Syntax: `text_search(sales.orders, 'query text', customer_id)`. Row id: `order_id`.
 
 ## SQL Functions
-Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions:
+Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. This context lists registered functions relevant to the current spicepod. Search functions appear only when in-scope datasets expose the required search indexes. Run SELECT * FROM list_udfs() to inspect the full registered function inventory:
 
 ### Spice-specific functions
 - `rerank`: Re-ranks search results or table rows using a configured reranker model. Syntax: `rerank(input, model => 'model_name', document => 'column_name'[, query => 'query text'])`.

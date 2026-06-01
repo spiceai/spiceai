@@ -18,7 +18,7 @@ No datasets are currently in scope.
 No schema information is available.
 
 ## SQL Functions
-Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions:
+Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. This context lists registered functions relevant to the current spicepod. Search functions appear only when in-scope datasets expose the required search indexes. Run SELECT * FROM list_udfs() to inspect the full registered function inventory:
 
 ### User-defined functions
 - `ticket_priority`: scalar function from `sql` with `stable` volatility. Syntax: `ticket_priority(sentiment utf8) -> int64`. Converts support-ticket sentiment into a priority score.

@@ -266,7 +266,7 @@ fn nsql_context_error_response(error: &NsqlContextError) -> (StatusCode, String)
 /// Return the same context block that `/v1/nsql` injects into the configured NSQL model.
 ///
 /// The response is a markdown/plain-text block or JSON object containing the in-scope datasets, schemas,
-/// Spice-specific SQL functions, registered user-defined functions, JSON/Spark compatibility functions,
+/// Spice-specific SQL functions, registered user-defined functions, relevant JSON/Spark compatibility functions,
 /// and optional sample data.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
@@ -294,7 +294,7 @@ fn nsql_context_error_response(error: &NsqlContextError) -> (StatusCode, String)
                     "version": "52.5.0",
                     "dialect": "PostgreSQL",
                     "parser": "DataFusion SQL parser configured with PostgreSQL dialect",
-                    "notes": ["Spice supports standard DataFusion SQL plus Spice-specific functions."]
+                    "notes": ["Spice supports standard DataFusion SQL plus registered Spice-specific functions."]
                 },
                 "datasets": [{
                     "name": "sales.orders",
@@ -1085,7 +1085,7 @@ mod tests {
     fn nsql_context_function_context_for_test(include_search_functions: bool) -> String {
         let mut context = String::from(concat!(
             "\n",
-            "Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions:\n"
+            "Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. Search and JSON function references are included only when relevant to the current spicepod. Search functions appear only when in-scope datasets expose the required search indexes. Run SELECT * FROM list_udfs() to inspect the full registered function inventory:\n"
         ));
 
         if include_search_functions {
@@ -1261,6 +1261,25 @@ mod tests {
                     vector_search: true.into(),
                     full_text_search: true.into(),
                 },
+                NsqlColumnContext {
+                    name: "order_payload".to_string(),
+                    data_type: "Utf8".to_string(),
+                    nullable: true,
+                    description: Some("Order details stored as JSON".to_string()),
+                    source_type: Some("jsonb".to_string()),
+                    metadata: BTreeMap::from([
+                        (
+                            "description".to_string(),
+                            "Order details stored as JSON".to_string(),
+                        ),
+                        ("source_type".to_string(), "jsonb".to_string()),
+                    ]),
+                    primary_key: false.into(),
+                    unique: false.into(),
+                    indexed: false.into(),
+                    vector_search: false.into(),
+                    full_text_search: false.into(),
+                },
             ],
             primary_key: vec!["order_id".to_string()],
             unique_constraints: vec![vec!["order_id".to_string()]],
@@ -1317,6 +1336,7 @@ mod tests {
         response.functions = nsql_function_context_for_test(
             &app,
             &all_context_function_names_for_test(),
+            true,
             true,
             true,
         );

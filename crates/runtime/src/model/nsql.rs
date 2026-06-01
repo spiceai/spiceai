@@ -115,7 +115,7 @@ const NSQL_CONTEXT_INSTRUCTIONS: [&str; 5] = [
     "Use table and column descriptions, primary keys, foreign keys, unique constraints, and indexes when choosing joins and filters.",
 ];
 
-const NSQL_FUNCTION_CONTEXT_SUMMARY: &str = "Spice SQL runs on Apache DataFusion with the SQL parser configured for the PostgreSQL dialect. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions. Function references are filtered to functions registered in the current DataFusion context";
+const NSQL_FUNCTION_CONTEXT_SUMMARY: &str = "Spice SQL runs on Apache DataFusion with the SQL parser configured for the PostgreSQL dialect. Standard DataFusion SQL functions are available. Search and JSON function references are included only when relevant to the current spicepod; search functions require in-scope datasets with the required search indexes. Run SELECT * FROM list_udfs() to inspect the full registered function inventory";
 
 #[derive(Debug, Snafu)]
 pub(crate) enum NsqlContextError {
@@ -483,9 +483,11 @@ fn nsql_sql_context() -> NsqlSqlContext {
         dialect: "PostgreSQL".to_string(),
         parser: "DataFusion SQL parser configured with PostgreSQL dialect".to_string(),
         notes: vec![
-            "Spice supports standard DataFusion SQL plus Spice-specific, JSON, Spark compatibility, and registered user-defined functions listed in this context.".to_string(),
+            "Spice supports standard DataFusion SQL plus registered Spice-specific, JSON, Spark compatibility, and user-defined functions listed in this context.".to_string(),
             "Not every PostgreSQL extension is implemented; prefer the functions listed in this response when generating SQL for Spice.".to_string(),
+            "Search and JSON function references are included only when relevant to the current spicepod.".to_string(),
             "Table functions such as text_search, vector_search, json_tree, and list_udfs are used in the FROM clause.".to_string(),
+            "Run SELECT * FROM list_udfs() to inspect all functions registered in the current DataFusion context.".to_string(),
             "Use LIMIT for exploratory or broad-result queries unless the user explicitly asks for all rows.".to_string(),
         ],
     }
@@ -1593,6 +1595,22 @@ fn is_json_context_function(name: &str) -> bool {
     name.starts_with("json") || name.contains("_json")
 }
 
+fn is_json_context_type(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("json")
+}
+
+fn dataset_json_function_availability(datasets: &[NsqlDatasetContext]) -> bool {
+    datasets.iter().any(|dataset| {
+        dataset.columns.iter().any(|column| {
+            is_json_context_type(&column.data_type)
+                || column
+                    .source_type
+                    .as_deref()
+                    .is_some_and(is_json_context_type)
+        })
+    })
+}
+
 fn spark_function_names(inventory: &FunctionInventory) -> BTreeSet<String> {
     datafusion_spark::all_default_scalar_functions()
         .into_iter()
@@ -1718,6 +1736,7 @@ pub(crate) fn nsql_function_context_for_test(
     available_names: &HashSet<String>,
     vector_search: bool,
     text_search: bool,
+    json_functions: bool,
 ) -> NsqlFunctionContext {
     let inventory = function_inventory_for_test(available_names);
     nsql_function_context(
@@ -1727,6 +1746,7 @@ pub(crate) fn nsql_function_context_for_test(
             vector_search,
             text_search,
         },
+        json_functions,
     )
 }
 
@@ -1893,7 +1913,6 @@ fn user_function_context(
 impl NsqlFunctionContext {
     fn render_markdown(&self) -> String {
         let mut context = format!("{}:\n", self.summary);
-
         write_function_entries(&mut context, "JSON functions", &self.json);
         write_function_entries(
             &mut context,
@@ -1919,9 +1938,14 @@ fn nsql_function_context(
     app: &app::App,
     inventory: &FunctionInventory,
     search_functions: SearchFunctionAvailability,
+    include_json_functions: bool,
 ) -> NsqlFunctionContext {
     let user_function_names = user_function_names(app);
-    let json = inventory_entries(inventory, &user_function_names, is_json_context_function);
+    let json = if include_json_functions {
+        inventory_entries(inventory, &user_function_names, is_json_context_function)
+    } else {
+        vec![]
+    };
     let spark_function_names = spark_function_names(inventory);
     let spice_specific = inventory_entries(inventory, &user_function_names, |name| {
         !is_json_context_function(name)
@@ -2431,8 +2455,12 @@ pub(crate) async fn build_nsql_context(
 
     let dataset_search_functions =
         dataset_search_function_availability(configured_search_functions, &dataset_contexts);
-    let function_context =
-        nsql_function_context(&app, &function_inventory, dataset_search_functions);
+    let function_context = nsql_function_context(
+        &app,
+        &function_inventory,
+        dataset_search_functions,
+        dataset_json_function_availability(&dataset_contexts),
+    );
     let function_context_block = function_context.render_markdown();
     let relationship_context = render_nsql_dataset_relationship_context(&dataset_contexts);
 
@@ -2763,11 +2791,32 @@ mod tests {
     }
 
     #[test]
-    fn function_context_includes_registered_json_and_spark_functions() {
+    fn dataset_json_function_availability_requires_json_column_context() {
+        let dataset = relationship_test_dataset(
+            "events",
+            None,
+            vec![relationship_test_column("payload", "Utf8", "Event payload")],
+        );
+
+        assert!(!dataset_json_function_availability(std::slice::from_ref(
+            &dataset,
+        )));
+
+        let mut data_type_dataset = dataset.clone();
+        data_type_dataset.columns[0].data_type = "Json".to_string();
+        assert!(dataset_json_function_availability(&[data_type_dataset]));
+
+        let mut source_type_dataset = dataset;
+        source_type_dataset.columns[0].source_type = Some("jsonb".to_string());
+        assert!(dataset_json_function_availability(&[source_type_dataset]));
+    }
+
+    #[test]
+    fn function_context_includes_registered_json_when_relevant_and_spark_functions() {
         let app = app::AppBuilder::new("test").build();
         let available_names = all_context_function_names_for_test();
 
-        let context = nsql_function_context_for_test(&app, &available_names, true, true);
+        let context = nsql_function_context_for_test(&app, &available_names, true, true, true);
 
         let json_names = entry_names(&context.json);
         let expected_json_names = available_names
@@ -2804,11 +2853,21 @@ mod tests {
     }
 
     #[test]
+    fn function_context_omits_registered_json_when_not_relevant() {
+        let app = app::AppBuilder::new("test").build();
+        let available_names = all_context_function_names_for_test();
+
+        let context = nsql_function_context_for_test(&app, &available_names, true, true, false);
+
+        assert!(context.json.is_empty());
+    }
+
+    #[test]
     fn function_context_spice_specific_only_includes_search_functions() {
         let app = app::AppBuilder::new("test").build();
         let available_names = all_context_function_names_for_test();
 
-        let context = nsql_function_context_for_test(&app, &available_names, true, true);
+        let context = nsql_function_context_for_test(&app, &available_names, true, true, false);
 
         assert_eq!(
             entry_names(&context.spice_specific),
@@ -2831,21 +2890,22 @@ mod tests {
             RERANK_UDTF_NAME.to_string(),
         ]);
 
-        let text_only = nsql_function_context_for_test(&app, &available_names, false, true);
+        let text_only = nsql_function_context_for_test(&app, &available_names, false, true, false);
         let text_only_names = entry_names(&text_only.spice_specific);
         assert!(text_only_names.contains(TEXT_SEARCH_UDTF_NAME));
         assert!(!text_only_names.contains(VECTOR_SEARCH_UDTF_NAME));
         assert!(!text_only_names.contains(RRF_UDF_NAME));
         assert!(!text_only_names.contains(RERANK_UDTF_NAME));
 
-        let vector_only = nsql_function_context_for_test(&app, &available_names, true, false);
+        let vector_only =
+            nsql_function_context_for_test(&app, &available_names, true, false, false);
         let vector_only_names = entry_names(&vector_only.spice_specific);
         assert!(!vector_only_names.contains(TEXT_SEARCH_UDTF_NAME));
         assert!(vector_only_names.contains(VECTOR_SEARCH_UDTF_NAME));
         assert!(!vector_only_names.contains(RRF_UDF_NAME));
         assert!(!vector_only_names.contains(RERANK_UDTF_NAME));
 
-        let hybrid = nsql_function_context_for_test(&app, &available_names, true, true);
+        let hybrid = nsql_function_context_for_test(&app, &available_names, true, true, false);
         let hybrid_names = entry_names(&hybrid.spice_specific);
         assert!(hybrid_names.contains(TEXT_SEARCH_UDTF_NAME));
         assert!(hybrid_names.contains(VECTOR_SEARCH_UDTF_NAME));
