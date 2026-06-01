@@ -65,7 +65,7 @@ fn responses_support_gate(model_id: &str, support: &ResponsesApiSupport) -> Opti
             });
 
             Some((StatusCode::SERVICE_UNAVAILABLE, Json(error_response)).into_response())
-        },
+        }
         ResponsesApiSupport::Supported => None,
     }
 }
