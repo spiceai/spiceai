@@ -363,16 +363,31 @@ impl SqliteMetastore {
     /// Schema for the `cayenne_table_statistics` table.
     ///
     /// Stores a single row per table holding a serialized Vortex `FileStatistics`
-    /// flatbuffer blob. The row is upserted on every write and currently reflects
-    /// the accumulator from the most recent write (min, max, null count) — a
-    /// last-write-wins snapshot, not an aggregate across every file. Consumers
-    /// must treat these values as optimization hints until cross-write merging
-    /// lands.
+    /// flatbuffer blob (min, max, null count), a live `num_rows` count, and an
+    /// optional `ndv_sketches` blob of per-column `HyperLogLog` sketches. The row is
+    /// upserted on every write and merged into the running per-table aggregate.
+    /// Consumers must treat these values as optimization hints.
     const TABLE_STATISTICS_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table_statistics (
             table_id TEXT NOT NULL PRIMARY KEY,
             statistics_blob BLOB NOT NULL,
             num_rows BIGINT NOT NULL DEFAULT 0,
+            ndv_sketches BLOB,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+        )
+    ";
+
+    /// Schema for the `cayenne_pk_index` table.
+    ///
+    /// One row per table holding the serialized primary-key existence bloom
+    /// checkpoint (see `provider::table`), tagged with the snapshot id it covers.
+    /// Lets restart / snapshot-bootstrap skip the full-table keyset rebuild;
+    /// captured in metastore snapshots via `EXPECTED_TABLES`.
+    const PK_INDEX_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_pk_index (
+            table_id TEXT NOT NULL PRIMARY KEY,
+            snapshot_id TEXT NOT NULL,
+            index_blob BLOB NOT NULL,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
@@ -490,6 +505,16 @@ impl MetastoreRow for SqliteRow {
             })?;
         Option::<String>::from_value(value)
     }
+
+    fn get_optional_blob(&self, index: usize) -> CatalogResult<Option<Vec<u8>>> {
+        let value = self
+            .values
+            .get(index)
+            .ok_or_else(|| CatalogError::Database {
+                message: format!("Column index {index} out of bounds"),
+            })?;
+        Option::<Vec<u8>>::from_value(value)
+    }
 }
 
 /// Convert `rusqlite::Value` to `MetastoreValue`.
@@ -531,7 +556,7 @@ impl MetastoreBackend for SqliteMetastore {
             .call(|conn| {
                 // Create tables in a transaction
                 conn.execute_batch(&format!(
-                    "{}; {}; {}; {}; {}; {}; {}; {}; {};",
+                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
                     Self::TABLE_TABLE_DDL,
                     Self::TABLE_NAME_UNIQUE_INDEX_DDL,
                     Self::DELETE_FILE_TABLE_DDL,
@@ -540,13 +565,18 @@ impl MetastoreBackend for SqliteMetastore {
                     Self::SNAPSHOT_SEQUENCE_TABLE_DDL,
                     Self::TABLE_STATISTICS_DDL,
                     Self::INLINED_DATA_TABLE_DDL,
-                    Self::INLINED_DELETE_TABLE_DDL
+                    Self::INLINED_DELETE_TABLE_DDL,
+                    Self::PK_INDEX_TABLE_DDL
                 ))?;
 
                 // Backfill new columns for existing deployments (SQLite doesn't support IF NOT EXISTS for ALTER TABLE until v3.35)
                 // Ignore errors when the column already exists to keep init idempotent.
                 let _ = conn.execute(
                     "ALTER TABLE cayenne_table ADD COLUMN on_conflict_json TEXT",
+                    [],
+                );
+                let _ = conn.execute(
+                    "ALTER TABLE cayenne_table_statistics ADD COLUMN ndv_sketches BLOB",
                     [],
                 );
 

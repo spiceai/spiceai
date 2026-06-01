@@ -216,6 +216,7 @@ impl<'a> AppendMutationWriter<'a> {
         write_guard: OwnedMutexGuard<()>,
     ) -> Result<CayenneCdcWrite> {
         self.table.ensure_no_incomplete_write().await?;
+        let write_start = Instant::now();
 
         let pending_pk_deletions = !self.table.pk_deletion_strategy().is_position_based()
             && self.table.has_pending_deletions();
@@ -244,6 +245,13 @@ impl<'a> AppendMutationWriter<'a> {
                     may_have_on_conflict_deletions,
                 )
                 .await?;
+            tracing::debug!(
+                table = self.table.table_name(),
+                rows,
+                duration_ms = write_start.elapsed().as_millis(),
+                inlined = false,
+                "CDC pipelined append completed on synchronous path"
+            );
             return Ok(CayenneCdcWrite::completed(
                 self.table.clone_for_write_operations(),
                 rows,
@@ -260,6 +268,12 @@ impl<'a> AppendMutationWriter<'a> {
             } => {
                 self.table
                     .record_inlined_pk_keys(&post_validation.validated_keys);
+                tracing::debug!(
+                    table = self.table.table_name(),
+                    rows,
+                    inlined = true,
+                    "CDC pipelined append completed as inlined write"
+                );
                 Ok(CayenneCdcWrite::completed(
                     self.table.clone_for_write_operations(),
                     rows,
@@ -282,9 +296,12 @@ impl<'a> AppendMutationWriter<'a> {
                     .await?;
 
                 tracing::debug!(
-                    "CDC append staged, wrote {} rows to Vortex in {} writer operation(s); WAL is durable",
+                    table = self.table.table_name(),
                     rows,
-                    writer_ops
+                    writer_ops,
+                    duration_ms = write_start.elapsed().as_millis(),
+                    inlined = false,
+                    "CDC pipelined append staged; WAL is durable, publish/finalize is pending"
                 );
 
                 Ok(CayenneCdcWrite::prepared_append(
@@ -368,19 +385,36 @@ impl<'a> AppendMutationWriter<'a> {
 
         let needs_new_snapshot = pending_pk_deletions || may_have_on_conflict_deletions;
 
-        let (total_rows, write_stats_acc, validated_keys) = if needs_new_snapshot {
-            self.write_new_snapshot_after_validation(prepared_stream, &post_validation)
-                .await?
+        // `superseded` = existing rows replaced by this upsert (deleted as part
+        // of the conflict resolution). The live-row delta is `inserted -
+        // superseded`, which keeps the metastore `num_rows` tracking COUNT(*)
+        // under CDC upsert instead of summing every insert.
+        let (total_rows, write_stats_acc, validated_keys, superseded) = if needs_new_snapshot {
+            let new_snapshot_start = Instant::now();
+            let (rows, stats_acc, validated_keys, superseded) = self
+                .write_new_snapshot_after_validation(prepared_stream, &post_validation)
+                .await?;
+            tracing::debug!(
+                table = self.table.table_name(),
+                rows,
+                superseded,
+                duration_ms = new_snapshot_start.elapsed().as_millis(),
+                "New snapshot write and publish completed"
+            );
+            (rows, stats_acc, validated_keys, superseded)
         } else {
             let target_size_bytes = self.context.target_file_size_bytes();
+            let write_start = Instant::now();
             let (rows, writer_ops, stats_acc) = self
                 .write_staged_append(prepared_stream, target_size_bytes)
                 .await?;
 
             tracing::debug!(
-                "Insert completed, wrote {} rows to Vortex in {} writer operation(s)",
+                table = self.table.table_name(),
                 rows,
-                writer_ops
+                writer_ops,
+                duration_ms = write_start.elapsed().as_millis(),
+                "Insert completed"
             );
 
             let PostValidationState {
@@ -388,19 +422,24 @@ impl<'a> AppendMutationWriter<'a> {
                 validated_keys,
             } = take_post_validation(&post_validation);
 
+            let superseded = on_conflict_deletions.total_superseded();
             self.table
                 .apply_on_conflict_deletions(on_conflict_deletions)
                 .await?;
 
-            (rows, stats_acc, validated_keys)
+            (rows, stats_acc, validated_keys, superseded)
         };
 
         let retention_requested = self.table.has_retention_delete_filters();
 
+        let live_rows_delta = i64::try_from(total_rows)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(i64::try_from(superseded).unwrap_or(i64::MAX));
         self.table.schedule_post_write_maintenance(
             Some(write_stats_acc),
             needs_new_snapshot,
             retention_requested,
+            live_rows_delta,
         );
 
         if retention_requested {
@@ -425,6 +464,7 @@ impl<'a> AppendMutationWriter<'a> {
         u64,
         Arc<ColumnStatsAccumulator>,
         std::collections::HashSet<arrow_row::OwnedRow>,
+        usize,
     )> {
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let target_size_bytes = self.context.target_file_size_bytes();
@@ -439,12 +479,13 @@ impl<'a> AppendMutationWriter<'a> {
             )
             .await?;
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
-
-        tracing::debug!(
-            "Insert to deferred-validation snapshot {} completed, wrote {} rows to Vortex in {} writer operation(s)",
+        tracing::trace!(
+            table = self.table.table_name(),
             new_snapshot_id,
             rows,
-            writer_ops
+            writer_ops,
+            duration_ms = write_start.elapsed().as_millis(),
+            "Write to new snapshot completed"
         );
 
         let PostValidationState {
@@ -452,6 +493,7 @@ impl<'a> AppendMutationWriter<'a> {
             validated_keys,
         } = take_post_validation(post_validation);
 
+        let superseded = on_conflict_deletions.total_superseded();
         let deletion_start = Instant::now();
         self.table
             .apply_on_conflict_deletions(on_conflict_deletions)
@@ -474,7 +516,7 @@ impl<'a> AppendMutationWriter<'a> {
             .await?;
         record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
 
-        Ok((rows, stats_acc, validated_keys))
+        Ok((rows, stats_acc, validated_keys, superseded))
     }
 
     async fn try_inline_or_restream(
@@ -522,8 +564,18 @@ impl<'a> AppendMutationWriter<'a> {
                     stats_acc.update(batch);
                 }
 
-                self.table
-                    .schedule_post_write_maintenance(Some(Arc::new(stats_acc)), false, false);
+                // Net live-row delta: inlined inserts minus rows superseded by
+                // this inline upsert (across inlined + file-backed deletes).
+                let superseded = state.on_conflict_deletions.total_superseded();
+                let live_rows_delta = i64::try_from(buffer.total_rows())
+                    .unwrap_or(i64::MAX)
+                    .saturating_sub(i64::try_from(superseded).unwrap_or(i64::MAX));
+                self.table.schedule_post_write_maintenance(
+                    Some(Arc::new(stats_acc)),
+                    false,
+                    false,
+                    live_rows_delta,
+                );
 
                 self.table
                     .schedule_inline_checkpoint_if_memtable_pressure_exceeded();

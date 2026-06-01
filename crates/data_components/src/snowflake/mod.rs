@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod federation;
 pub mod provider;
 mod write;
 
@@ -34,6 +35,7 @@ use datafusion::{
 use datafusion_table_providers::sql::{
     db_connection_pool::DbConnectionPool, sql_provider_datafusion::SqlTable,
 };
+use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use snowflake_api::SnowflakeApi;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
@@ -50,6 +52,7 @@ pub type SnowflakeConnectionPool =
 pub struct SnowflakeTableFactory {
     pool: Arc<SnowflakeConnectionPool>,
     write_lock: Arc<Mutex<()>>,
+    function_support: Option<FunctionSupport>,
 }
 
 impl std::fmt::Debug for SnowflakeTableFactory {
@@ -65,7 +68,26 @@ impl SnowflakeTableFactory {
         Self {
             pool,
             write_lock: Arc::new(Mutex::new(())),
+            function_support: None,
         }
+    }
+
+    /// Install a function deny-list so federation pushdown skips remote
+    /// execution for any plan touching one of the denied functions. Plans that
+    /// would otherwise be unparsed into Snowflake SQL with Spice-only UDFs
+    /// (e.g. `json_get_str`) fall back to local `DataFusion` evaluation instead.
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
+        self.function_support = Some(function_support);
+        self
+    }
+
+    /// Returns the currently configured [`FunctionSupport`], if any. Used by
+    /// connector tests to confirm the Spice deny-list is wired through to the
+    /// federation layer.
+    #[must_use]
+    pub fn function_support(&self) -> Option<&FunctionSupport> {
+        self.function_support.as_ref()
     }
 }
 
@@ -703,22 +725,23 @@ impl SnowflakeTableFactory {
         let schema = Arc::clone(&result.schema);
         let table_reference_for_provider = table_reference.clone();
 
-        let table_provider = Arc::new(
+        let sql_table = Arc::new(
             SqlTable::new_with_schema(
                 "snowflake",
                 &pool,
                 Arc::clone(&schema),
-                table_reference_for_provider,
+                table_reference_for_provider.clone(),
                 None,
             )
             .with_dialect(Arc::clone(&dialect)),
         );
 
-        let table_provider = Arc::new(
-            table_provider
-                .create_federated_table_provider()
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
-        );
+        let table_provider = Arc::new(federation::create_spice_federated_table_provider(
+            sql_table,
+            Arc::clone(&schema),
+            table_reference_for_provider,
+            self.function_support.clone(),
+        ));
 
         if writable {
             let table_provider: Arc<dyn TableProvider> = table_provider;

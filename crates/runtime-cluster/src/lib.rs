@@ -29,6 +29,8 @@ pub mod executor_selection;
 pub mod flight_config;
 pub mod metadata;
 pub mod metrics;
+pub mod outbound_broadcaster;
+pub mod partition_load_tracker;
 pub mod scheduler_task_config;
 pub mod service;
 pub mod store;
@@ -42,8 +44,10 @@ pub use executor_registry::{
     ExecutorRegistry, FederatedPartitionProvider, RegisteredHandles, TablePartitions,
 };
 pub use metadata::{
-    PartitionMetadata, PartitionValue, TablePartitionMetadata, normalized_table_name,
-    partition_value_to_bytes,
+    PartitionMetadata, PartitionValue, TablePartitionMetadata, decode_statistics,
+    encode_partition_exprs, encode_statistics, normalized_table_name, partition_value_to_bytes,
 };
+pub use outbound_broadcaster::ExecutorOutboundBroadcaster;
+pub use partition_load_tracker::PartitionLoadTracker;
 pub use service::{AssignmentConfig, PartitionService};
 pub use store::{AllocationResult, AssignmentRequest, CopyAssignmentsResult, PartitionStore};

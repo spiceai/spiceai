@@ -181,6 +181,28 @@ impl MetricsScraper {
         }
     }
 
+    /// Perform a single one-shot scrape of the spiced `/metrics` endpoint.
+    ///
+    /// Unlike the background scraper, this fetches the current metrics exactly
+    /// once and returns them aggregated as `SpicedMetrics`.
+    pub async fn scrape_once() -> anyhow::Result<SpicedMetrics> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .context("Failed to create metrics scraper HTTP client")?;
+
+        let mut all_samples: HashMap<String, Vec<MetricSample>> = HashMap::new();
+        for sample in Self::scrape_metrics(&client).await? {
+            all_samples
+                .entry(sample.name.clone())
+                .or_default()
+                .push(sample);
+        }
+        Ok(SpicedMetrics {
+            samples: all_samples,
+        })
+    }
+
     /// Scrape metrics from the spiced /metrics endpoint
     async fn scrape_metrics(client: &reqwest::Client) -> anyhow::Result<Vec<MetricSample>> {
         let response = client

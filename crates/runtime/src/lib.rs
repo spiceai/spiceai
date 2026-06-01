@@ -693,7 +693,24 @@ impl Runtime {
         match self.distributed.as_ref() {
             Some(DistributedNode::Executor {
                 partition_assignments,
+                ..
             }) => Some(Arc::clone(partition_assignments)),
+            _ => None,
+        }
+    }
+
+    /// Returns the executor outbound broadcaster used to send
+    /// `PartitionsLoaded` and other unsolicited messages back to schedulers.
+    /// Only available when this runtime is running as a cluster executor.
+    #[must_use]
+    pub fn executor_outbound_broadcaster(
+        &self,
+    ) -> Option<crate::cluster::ExecutorOutboundBroadcaster> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Executor {
+                outbound_broadcaster,
+                ..
+            }) => Some(outbound_broadcaster.clone()),
             _ => None,
         }
     }
@@ -701,6 +718,7 @@ impl Runtime {
     pub async fn set_partition_assignments(&self, assignments: PartitionAssignments) {
         if let Some(DistributedNode::Executor {
             partition_assignments,
+            ..
         }) = self.distributed.as_ref()
         {
             let mut guard = partition_assignments.write().await;
@@ -751,6 +769,7 @@ impl Runtime {
     ) -> Result<()> {
         let Some(DistributedNode::Executor {
             partition_assignments,
+            ..
         }) = self.distributed.as_ref()
         else {
             tracing::warn!(
@@ -857,14 +876,118 @@ impl Runtime {
             })?;
 
         tracing::info!("Updated partition assignments for {table}");
-        // Trigger a refresh to load the data for the new partitions. Refresh
-        // failures are non-fatal — the assignment is still valid; data just
-        // hasn't been pulled yet.
-        if let Err(e) = self.datafusion().refresh_table(&table_ref, None).await {
-            tracing::warn!("Failed to trigger refresh for {table} after updating partitions: {e}");
+
+        // Trigger a refresh to load the data for the new partitions, capturing
+        // the completion notifier so we can ack the scheduler with a
+        // `PartitionsLoaded` once the accelerated table has actually finished
+        // loading. Refresh failures are non-fatal — the assignment is still
+        // valid; data just hasn't been pulled yet, so we skip the ack.
+        let notifier = match self.datafusion().refresh_table(&table_ref, None).await {
+            Ok(notifier) => notifier,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to trigger refresh for {table} after updating partitions: {e}"
+                );
+                return Ok(());
+            }
+        };
+
+        // Snapshot the partition exprs assigned to us for this table, encoded
+        // the same way the scheduler encodes them when sending UpdatePartitions
+        // (`Expr::to_bytes()`). `partition_value_to_bytes` sorts entries by
+        // key so the encoding is deterministic across re-serialization.
+        let table_str = table.to_string();
+        let partition_expr_bytes: Vec<Vec<u8>> = assignments
+            .get(&table)
+            .map(|exprs| runtime_cluster::encode_partition_exprs(exprs, &table_str))
+            .unwrap_or_default();
+
+        if let Some(broadcaster) = self.executor_outbound_broadcaster() {
+            // Send the ack even when `partition_expr_bytes` is empty — a
+            // legitimately empty assignment (e.g. zero-partition source, or
+            // partitions that all failed to serialize) still needs to flip
+            // the scheduler-side readiness gate via the
+            // `is_table_loaded`/`updated_at` shortcut. Suppressing the empty
+            // case here would leave the dataset stuck in `Refreshing`.
+            let table_name = table.to_string();
+            tokio::spawn(async move {
+                if let Some(n) = notifier {
+                    n.notified().await;
+                }
+                // Statistics flow via the periodic ExecutorStatistics reporter, not
+                // this readiness ack.
+                let sent = broadcaster
+                    .broadcast_partitions_loaded(table_name.clone(), partition_expr_bytes)
+                    .await;
+                tracing::debug!(
+                    "Broadcast PartitionsLoaded for {table_name} to {sent} scheduler(s)"
+                );
+            });
         }
 
         Ok(())
+    }
+
+    /// Periodically recompute and rebroadcast this executor's per-table row-count
+    /// statistics to all schedulers. `PartitionsLoaded` is otherwise only sent on
+    /// initial load / assignment change, so during streaming ETL the coordinator's
+    /// in-memory stats would reflect only the first snapshot (or nothing if the
+    /// table had no data at initial-load time). A periodic rebroadcast keeps the
+    /// coordinator's join-sizing statistics fresh as the executor's local data grows.
+    pub(crate) async fn run_executor_statistics_reporter(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(45));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The statistics source (`local_executor_table_statistics`) reads the
+        // Cayenne metastore aggregate, which is maintained incrementally on the
+        // write path: always-fresh, O(1), and never degrades to a row-count-only
+        // result mid-ingest. So there is no non-degrading cache here — each tick
+        // simply broadcasts the current aggregate.
+        loop {
+            interval.tick().await;
+            let Some(broadcaster) = self.executor_outbound_broadcaster() else {
+                continue;
+            };
+            let df = self.datafusion();
+
+            // Enumerate the tables this executor serves locally. The q18 tables
+            // are cayenne *catalog* tables (not spice.public datasets), so the
+            // dataset partition-assignment map doesn't cover them; enumerate the
+            // cayenne catalog directly. Also include any dataset assignments.
+            let mut tables: Vec<TableReference> = Vec::new();
+            #[cfg(not(windows))]
+            {
+                tables.extend(crate::cluster::discover_cayenne_tables(&df).await);
+            }
+            if let Some(assignments_lock) = self.partition_assignments() {
+                for resolved in assignments_lock.read().await.keys() {
+                    tables.push(TableReference::full(
+                        Arc::<str>::clone(&resolved.catalog),
+                        Arc::<str>::clone(&resolved.schema),
+                        Arc::<str>::clone(&resolved.table),
+                    ));
+                }
+            }
+            tables.sort_by_key(ToString::to_string);
+            tables.dedup_by_key(|t| t.to_string());
+            if tables.is_empty() {
+                continue;
+            }
+            tracing::debug!(
+                count = tables.len(),
+                "Reporting per-executor table statistics to schedulers"
+            );
+            for table in tables {
+                let table_key = table.to_string();
+                if let Some((stats, column_names)) =
+                    crate::cluster::partition::local_executor_table_statistics(&df, &table).await
+                {
+                    let encoded = runtime_cluster::encode_statistics(&stats);
+                    broadcaster
+                        .broadcast_executor_statistics(table_key, encoded, column_names)
+                        .await;
+                }
+            }
+        }
     }
 
     /// Returns the partition store for accelerated table partition metadata (scheduler only).
@@ -875,6 +998,19 @@ impl Runtime {
                 accelerations_partitions_store,
                 ..
             }) => Some(Arc::clone(accelerations_partitions_store)),
+            _ => None,
+        }
+    }
+
+    /// Returns the partition load tracker used to aggregate executor
+    /// `PartitionsLoaded` acks (scheduler only).
+    #[must_use]
+    pub fn partition_load_tracker(&self) -> Option<Arc<runtime_cluster::PartitionLoadTracker>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler {
+                partition_load_tracker,
+                ..
+            }) => Some(Arc::clone(partition_load_tracker)),
             _ => None,
         }
     }
@@ -1114,6 +1250,17 @@ impl Runtime {
         };
 
         // Start Flight server
+        // On executors, periodically rebroadcast per-table row-count statistics so
+        // the coordinator's join-sizing stats stay fresh as streaming ETL grows
+        // local data (PartitionsLoaded is otherwise sent only on initial load /
+        // assignment change).
+        if self.df.cluster_config.effective_role() == Some(ClusterRole::Executor) {
+            let reporter_self = Arc::clone(&self);
+            tokio::spawn(async move {
+                reporter_self.run_executor_statistics_reporter().await;
+            });
+        }
+
         let flight_shutdown = CancellationToken::new();
         let self_ref = Arc::clone(&self);
         let cloned_tls_config = tls_config.clone();

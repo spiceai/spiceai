@@ -49,6 +49,7 @@ use super::super::Error;
 use super::super::deletion_strategy::{
     Int64PkDeletionSnapshot, PkDeletionStrategyWithCache, RowConverterDeletionSnapshot,
 };
+use super::super::memory_account::CayenneMemoryAccount;
 use super::super::utils::convert_to_u64_box;
 use super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use crate::catalog::MetadataCatalog;
@@ -81,6 +82,11 @@ mod position_based;
 // File-based deletion for time-based retention (deletes entire expired files)
 pub(crate) mod file_based;
 
+mod pk_filter_extract;
+use pk_filter_extract::ExtractedPkDeletes;
+
+const PK_DELETE_FLUSH_BATCH_SIZE: usize = 50_000;
+
 /// Deletion sink for Cayenne tables.
 ///
 /// This sink handles the process of marking rows as deleted by writing
@@ -96,6 +102,8 @@ pub struct CayenneDeletionSink {
     filters: Vec<Expr>,
     /// Deletion strategy for this table, with embedded caches.
     pk_deletion_strategy: PkDeletionStrategyWithCache,
+    /// Shared table memory account updated when this sink publishes deletion cache snapshots.
+    table_memory: Arc<CayenneMemoryAccount>,
     /// `RowConverter` for converting primary key columns to byte representation.
     /// Only set for tables with composite or non-integer primary keys.
     pk_row_converter: Option<Arc<RowConverter>>,
@@ -121,6 +129,7 @@ impl CayenneDeletionSink {
         schema: SchemaRef,
         filters: &[Expr],
         pk_deletion_strategy: PkDeletionStrategyWithCache,
+        table_memory: Arc<CayenneMemoryAccount>,
         pk_row_converter: Option<Arc<RowConverter>>,
         pk_column_indices: Vec<usize>,
         protected_snapshot_tables: Vec<Arc<ListingTable>>,
@@ -134,12 +143,18 @@ impl CayenneDeletionSink {
             schema,
             filters: filters.to_vec(),
             pk_deletion_strategy,
+            table_memory,
             pk_row_converter,
             pk_column_indices,
             protected_snapshot_tables,
             runtime_env,
             write_lock,
         }
+    }
+
+    fn refresh_deletion_memory_accounting(&self) {
+        self.table_memory
+            .set_deletion_bytes(self.pk_deletion_strategy.approx_resident_bytes());
     }
 
     async fn delete_all_rows_from_tables(
@@ -269,8 +284,6 @@ impl CayenneDeletionSink {
         ctx: &SessionContext,
         tables: &[Arc<ListingTable>],
     ) -> super::super::Result<u64> {
-        const PK_DELETE_FLUSH_BATCH_SIZE: usize = 50_000;
-
         let table_name = &self.table_metadata.table_name;
 
         // For position-based deletion, use the streaming per-file approach directly.
@@ -280,6 +293,38 @@ impl CayenneDeletionSink {
         }
 
         let coerced_filters = self.coerce_filters_for_schema()?;
+
+        // If filters encode PK deletion values directly, extract them and write
+        // deletion vectors without performing full scan.
+        //
+        // The fast path always returns 0: the extracted key set is the filter's
+        // upper bound on deletions, not a verified per-row count, so we can't
+        // produce a meaningful "rows deleted" number without a scan. Callers
+        // (CDC, `InlineAwareDeletionSink`) must not depend on this count — the
+        // authoritative count for user-visible DELETEs comes from the inline
+        // path in `InlineAwareDeletionSink`.
+        match self.try_extract_pks_from_filters(&coerced_filters) {
+            Some(ExtractedPkDeletes::Int64(pk_values)) => {
+                tracing::debug!(
+                    table = %table_name,
+                    count = pk_values.len(),
+                    "Fast-path delete: extracted Int64 PK values directly from filters, skipping table scan"
+                );
+                self.persist_int64_pk_deletions(pk_values).await?;
+                return Ok(0);
+            }
+            Some(ExtractedPkDeletes::RowKeys(row_keys)) => {
+                tracing::debug!(
+                    table = %table_name,
+                    count = row_keys.len(),
+                    "Fast-path delete: extracted row keys directly from filters, skipping table scan"
+                );
+                self.persist_key_based_deletions(row_keys).await?;
+                return Ok(0);
+            }
+            None => {}
+        }
+
         let physical_filters = self.build_physical_filters(&coerced_filters)?;
 
         match &self.pk_deletion_strategy {
@@ -413,6 +458,71 @@ impl CayenneDeletionSink {
         }
     }
 
+    /// Attempt to extract primary key values directly from the deletion filters,
+    /// without scanning any data files.
+    ///
+    /// Expects a single filter expr and recognizes the following filter shapes:
+    ///
+    /// - **Single PK**: `pk_col IN (v1, v2, ...)` — a flat `Expr::InList`.
+    /// - **Composite PK (OR-of-AND)**: A balanced OR tree of AND-equality
+    ///   conjunctions, e.g. `(pk1 = a AND pk2 = b) OR (pk1 = c AND pk2 = d)`.
+    /// - **Composite PK (tuple-IN)**: `(pk1, pk2, ...) IN ((a, b, ...), (c, d, ...))`.
+    fn try_extract_pks_from_filters(&self, filters: &[Expr]) -> Option<ExtractedPkDeletes> {
+        if filters.len() != 1 {
+            return None;
+        }
+        let filter = &filters[0];
+        let pk_columns = &self.table_metadata.primary_key;
+
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { .. } => {
+                if pk_columns.len() != 1 {
+                    return None;
+                }
+                pk_filter_extract::try_extract_int64_in_list(filter, &pk_columns[0])
+                    .map(ExtractedPkDeletes::Int64)
+            }
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
+                let row_converter = self.pk_row_converter.as_ref()?;
+                // Single non-Int64 PK - try InList first.
+                if pk_columns.len() == 1 {
+                    let pk_idx = *self.pk_column_indices.first()?;
+                    let target_type = self.schema.field(pk_idx).data_type();
+                    if let Some(keys) = pk_filter_extract::try_extract_in_list_row_keys(
+                        filter,
+                        &pk_columns[0],
+                        target_type,
+                        row_converter,
+                    ) {
+                        return Some(ExtractedPkDeletes::RowKeys(keys));
+                    }
+                }
+                // Composite PK — balanced OR-of-AND equality tree or tuple-IN of struct literals.
+                let pk_target_types: Vec<&arrow_schema::DataType> = self
+                    .pk_column_indices
+                    .iter()
+                    .map(|&idx| self.schema.field(idx).data_type())
+                    .collect();
+                if let Some(keys) = pk_filter_extract::try_extract_tuple_in_pk_keys(
+                    filter,
+                    pk_columns,
+                    &pk_target_types,
+                    row_converter,
+                ) {
+                    return Some(ExtractedPkDeletes::RowKeys(keys));
+                }
+                pk_filter_extract::try_extract_or_of_and_pk_keys(
+                    filter,
+                    pk_columns,
+                    &pk_target_types,
+                    row_converter,
+                )
+                .map(ExtractedPkDeletes::RowKeys)
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => None,
+        }
+    }
+
     fn coerce_filters_for_schema(&self) -> super::super::Result<Vec<Expr>> {
         let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
         let mut coerced_filters = Vec::with_capacity(self.filters.len());
@@ -529,13 +639,31 @@ impl CayenneDeletionSink {
             return Ok(0);
         }
 
-        let delete_sequence = self
-            .catalog
-            .increment_sequence_number(&self.table_metadata.table_id)
-            .await?;
+        let table_name = &self.table_metadata.table_name;
+        let mut delete_sequence: Option<i64> = None;
+        let mut deleted_rows: u64 = 0;
+        let mut row_keys_iter = filtered_row_keys.into_iter();
 
-        self.persist_key_based_deletions_with_sequence(filtered_row_keys, delete_sequence)
-            .await
+        loop {
+            let chunk_keys: Vec<Box<[u8]>> = row_keys_iter
+                .by_ref()
+                .take(PK_DELETE_FLUSH_BATCH_SIZE)
+                .collect();
+            if chunk_keys.is_empty() {
+                return Ok(deleted_rows);
+            }
+
+            let chunk_deleted = self
+                .persist_key_based_chunk_with_shared_sequence(chunk_keys, &mut delete_sequence)
+                .await?;
+            deleted_rows =
+                deleted_rows
+                    .checked_add(chunk_deleted)
+                    .ok_or_else(|| Error::Internal {
+                        table: table_name.clone(),
+                        message: "Deleted row count overflowed u64".to_string(),
+                    })?;
+        }
     }
 
     async fn persist_key_based_deletions_with_sequence(
@@ -606,6 +734,7 @@ impl CayenneDeletionSink {
             Arc::new(updated),
             Arc::clone(&current.insert_records),
         )));
+        self.refresh_deletion_memory_accounting();
 
         let deleted_count =
             convert_to_u64_box(new_deletion_count, "deleted row count").map_err(|e| {
@@ -632,13 +761,31 @@ impl CayenneDeletionSink {
             return Ok(0);
         }
 
-        let delete_sequence = self
-            .catalog
-            .increment_sequence_number(&self.table_metadata.table_id)
-            .await?;
+        let table_name = &self.table_metadata.table_name;
+        let mut delete_sequence: Option<i64> = None;
+        let mut deleted_rows: u64 = 0;
+        let mut pk_values_iter = filtered_pk_values.into_iter();
 
-        self.persist_int64_pk_deletions_with_sequence(filtered_pk_values, delete_sequence)
-            .await
+        loop {
+            let chunk_values: Vec<i64> = pk_values_iter
+                .by_ref()
+                .take(PK_DELETE_FLUSH_BATCH_SIZE)
+                .collect();
+            if chunk_values.is_empty() {
+                return Ok(deleted_rows);
+            }
+
+            let chunk_deleted = self
+                .persist_int64_pk_chunk_with_shared_sequence(chunk_values, &mut delete_sequence)
+                .await?;
+            deleted_rows =
+                deleted_rows
+                    .checked_add(chunk_deleted)
+                    .ok_or_else(|| Error::Internal {
+                        table: table_name.clone(),
+                        message: "Deleted row count overflowed u64".to_string(),
+                    })?;
+        }
     }
 
     async fn persist_int64_pk_deletions_with_sequence(
@@ -703,6 +850,7 @@ impl CayenneDeletionSink {
             Arc::new(updated),
             Arc::clone(&current.insert_records),
         )));
+        self.refresh_deletion_memory_accounting();
 
         let deleted_count =
             convert_to_u64_box(new_deletion_count, "deleted row count").map_err(|e| {

@@ -40,6 +40,7 @@ use data_components::kafka::{
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
+#[cfg(test)]
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
@@ -52,8 +53,10 @@ use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion_index::IndexedTableProvider;
 use runtime_table_partition::provider::PartitionTableProvider;
-use snafu::{OptionExt, ResultExt};
-use std::collections::HashSet;
+#[cfg(test)]
+use snafu::OptionExt;
+use snafu::ResultExt;
+use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -140,6 +143,7 @@ impl WriteChangeOutcome {
 ///    println!("Primary key value as DataFusion expression: {}", expr_value);
 /// }
 /// ```
+#[cfg(test)]
 macro_rules! extract_primary_key {
     ($key_col:expr, $key:expr, $data_schema:expr, $array_type:ty, $data_type_str:expr, $row:expr) => {{
         let key_col = $key_col.as_any().downcast_ref::<$array_type>().context(
@@ -901,14 +905,30 @@ impl RefreshTask {
 
             match op_type {
                 ChangeOperationType::Delete => {
+                    let op_start = Instant::now();
                     self.process_delete_batch(&change_batch, &row_indices, ctx, session_state)
                         .await?;
+                    tracing::trace!(
+                        dataset = %dataset_name,
+                        op = "delete",
+                        rows = row_indices.len(),
+                        duration_ms = elapsed_ms(op_start),
+                        "Append/change stream sub-batch processed"
+                    );
                     had_change = true;
                 }
                 ChangeOperationType::Upsert => {
+                    let op_start = Instant::now();
                     pending_finalize = self
                         .process_upsert_batch(&change_batch, &row_indices, ctx, session_state)
                         .await?;
+                    tracing::trace!(
+                        dataset = %dataset_name,
+                        op = "upsert",
+                        rows = row_indices.len(),
+                        duration_ms = elapsed_ms(op_start),
+                        "Append/change stream batch sub-batch processed"
+                    );
                     had_change = true;
                 }
                 ChangeOperationType::Truncate => {
@@ -944,16 +964,7 @@ impl RefreshTask {
         ctx: &SessionContext,
         session_state: &SessionState,
     ) -> crate::accelerated_table::Result<Option<PendingApplyFinalize>> {
-        let dataset_name = &self.dataset_name;
-
         let data_batch = change_batch.data_batch();
-
-        if !row_indices.is_empty() {
-            tracing::trace!(
-                "Processing upsert batch for {dataset_name} with {} rows",
-                row_indices.len()
-            );
-        }
 
         let target_schema = self.accelerator.schema();
 
@@ -1100,11 +1111,6 @@ impl RefreshTask {
         session_state: &SessionState,
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = &self.dataset_name;
-
-        tracing::trace!(
-            "Processing delete batch for {dataset_name} with {} rows",
-            row_indices.len()
-        );
 
         let (keyless_rows, keyed_rows): (Vec<_>, Vec<_>) = row_indices
             .iter()
@@ -1474,6 +1480,7 @@ pub(crate) fn get_primary_key_value(
     get_primary_key_value_at_row(data, 0, key)
 }
 
+#[cfg(test)]
 pub(crate) fn get_primary_key_value_at_row(
     data: &RecordBatch,
     row: usize,
@@ -1507,18 +1514,45 @@ pub(crate) fn get_primary_key_value_at_row(
 }
 
 /// An active batch accumulating row indices for a single operation type.
-/// Tracks the set of primary keys it contains so that PK conflicts can be
-/// detected in O(1) per row.
+/// Tracks primary keys so that same-PK collisions within the bucket apply
+/// last-write-wins deduplication (the newer row replaces the older one)
 struct OpBatchAccumulator {
     rows: Vec<usize>,
-    pks: HashSet<Vec<u8>, BuildHasherDefault<twox_hash::XxHash3_64>>,
+    needs_sort: bool,
+    /// Maps encoded PK to index into `rows`, enabling replacement on same-bucket PK collision.
+    pk_to_pos: HashMap<Vec<u8>, usize, BuildHasherDefault<twox_hash::XxHash3_64>>,
 }
 
 impl OpBatchAccumulator {
     fn new() -> Self {
         Self {
             rows: Vec::new(),
-            pks: HashSet::default(),
+            needs_sort: false,
+            pk_to_pos: HashMap::default(),
+        }
+    }
+
+    /// Returns `true` if `pk` is already tracked in this bucket.
+    fn contains_pk(&self, pk: &[u8]) -> bool {
+        self.pk_to_pos.contains_key(pk)
+    }
+
+    /// Insert `row_id` under `pk`. If the PK already exists in this bucket,
+    /// the previous row index is replaced in-place (last-write-wins).
+    /// See [`group_into_sub_batches`] for the rationale.
+    fn insert_or_replace(&mut self, pk: Vec<u8>, row_id: usize) {
+        if let Some(&pos) = self.pk_to_pos.get(&pk) {
+            // Same-bucket collision: replace the earlier row with the newer
+            // one. The old row is superseded because CDC rows carry the
+            // full row state.
+            if pos + 1 < self.rows.len() {
+                self.needs_sort = true;
+            }
+            self.rows[pos] = row_id;
+        } else {
+            let pos = self.rows.len();
+            self.rows.push(row_id);
+            self.pk_to_pos.insert(pk, pos);
         }
     }
 
@@ -1530,8 +1564,12 @@ impl OpBatchAccumulator {
         out: &mut Vec<(ChangeOperationType, Vec<usize>)>,
     ) {
         if !self.rows.is_empty() {
+            if self.needs_sort {
+                self.rows.sort_unstable();
+                self.needs_sort = false;
+            }
             out.push((op, std::mem::take(&mut self.rows)));
-            self.pks.clear();
+            self.pk_to_pos.clear();
         }
     }
 }
@@ -1539,11 +1577,21 @@ impl OpBatchAccumulator {
 /// Groups rows into sub-batches based on operation type and primary key
 /// conflicts across active operation buckets.
 ///
-/// Uses a streaming conflict-window algorithm: two active buckets (upsert,
-/// delete) accumulate rows concurrently. When an incoming row's PK already
-/// exists in *either* bucket, only the conflicting bucket is flushed — the
-/// other keeps accumulating. Truncate and Unknown act as barriers that flush
-/// everything.
+/// Uses a streaming conflict-window algorithm with **last-write-wins
+/// deduplication**: two active buckets (upsert, delete) accumulate rows
+/// concurrently. When an incoming row's PK already exists in the *other*
+/// bucket, that bucket is flushed to preserve cross-operation ordering.
+/// When the PK collides within the *same* bucket the earlier row index is
+/// replaced in-place — CDC rows are full-state snapshots, so only the
+/// latest row per PK is required and intermediate states can be safely dropped.
+///
+/// For deletes a same-bucket PK collision is unexpected in practice (a
+/// source would have to emit two consecutive deletes for the same key
+/// without an intervening upsert), but is still safe — deleting the same
+/// PK twice is idempotent. We use the same replace path for both operation
+/// types to keep the logic simple.
+///
+/// Truncate and Unknown act as barriers that flush everything.
 #[must_use]
 fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationType, Vec<usize>)> {
     let num_rows = change_batch.record.num_rows();
@@ -1577,29 +1625,40 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
             continue;
         }
 
-        // When PKs are available, flush only the bucket(s) that already
-        // contain this PK so that per-PK ordering is preserved without
-        // unnecessarily breaking up non-conflicting batches.
+        // When PKs are available, use last-write-wins within the same
+        // bucket (CDC rows are full-state snapshots so only the latest
+        // row per PK matters) and flush only on *cross-bucket* conflicts
+        // to preserve inter-operation ordering.
         if has_pks {
             let primary_key = encode_primary_key(&data_batch, &pk_col_indices, row_id);
 
-            if upserts.pks.contains(&primary_key) {
-                upserts.flush_into(ChangeOperationType::Upsert, &mut out);
-            }
-            if deletes.pks.contains(&primary_key) {
-                deletes.flush_into(ChangeOperationType::Delete, &mut out);
+            // Cross-bucket conflict: the *other* bucket already has this
+            // PK, so flush it to preserve operation ordering.
+            match op_type {
+                ChangeOperationType::Upsert => {
+                    if deletes.contains_pk(&primary_key) {
+                        deletes.flush_into(ChangeOperationType::Delete, &mut out);
+                    }
+                }
+                ChangeOperationType::Delete => {
+                    if upserts.contains_pk(&primary_key) {
+                        upserts.flush_into(ChangeOperationType::Upsert, &mut out);
+                    }
+                }
+                ChangeOperationType::Truncate | ChangeOperationType::Unknown => {
+                    unreachable!("unexpected op type {op_type:?} after barrier check")
+                }
             }
 
+            // Same-bucket collision: replace the old row (last-write-wins).
             let batch = match op_type {
                 ChangeOperationType::Upsert => &mut upserts,
                 ChangeOperationType::Delete => &mut deletes,
                 ChangeOperationType::Truncate | ChangeOperationType::Unknown => {
-                    // Handled as barriers above; this is unreachable.
                     unreachable!("unexpected op type {op_type:?} after barrier check")
                 }
             };
-            batch.rows.push(row_id);
-            batch.pks.insert(primary_key);
+            batch.insert_or_replace(primary_key, row_id);
         } else {
             // No PKs — fall back to grouping consecutive same-op rows
             // (can't detect conflicts without keys).
@@ -2049,7 +2108,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_primary_key_causes_split() {
+    fn test_duplicate_primary_key_replaces_in_place() {
         let change_batch = create_test_change_batch(
             vec!["c", "c", "c"],
             &[vec!["id"], vec!["id"], vec!["id"]],
@@ -2059,18 +2118,16 @@ mod tests {
 
         let result = group_into_sub_batches(&change_batch);
 
-        // Should split when duplicate primary key is encountered within same operation type
+        // Last-write-wins: row 0 (pk1,v1) is replaced by row 1 (pk1,v2)
+        // within the same upsert bucket, so only one sub-batch remains.
         assert_eq!(
             result.len(),
-            2,
-            "Should split into two sub-batches when duplicate key is found"
+            1,
+            "Same-bucket PK collision should replace, not split"
         );
 
         assert_eq!(result[0].0, ChangeOperationType::Upsert);
-        assert_eq!(result[0].1, vec![0]);
-
-        assert_eq!(result[1].0, ChangeOperationType::Upsert);
-        assert_eq!(result[1].1, vec![1, 2]);
+        assert_eq!(result[0].1, vec![1, 2]);
     }
 
     #[test]
@@ -2132,19 +2189,14 @@ mod tests {
 
         let result = group_into_sub_batches(&change_batch);
 
-        // First batch: id=1 (row 0)
-        // Second batch: id=1 (row 1, duplicate), id=2 (row 2, new)
-        // Third batch: id=1 (row 3, duplicate again)
-        assert_eq!(result.len(), 3);
+        // Last-write-wins: pk1 appears at rows 0, 1, 3 — each successive
+        // occurrence replaces the previous in-place. pk2 at row 2 is kept.
+        // The final bucket is ordered by row index to preserve contiguous-slice fast paths.
+        assert_eq!(result.len(), 1);
 
         assert_eq!(result[0].0, ChangeOperationType::Upsert);
-        assert_eq!(result[0].1, vec![0]);
-
-        assert_eq!(result[1].0, ChangeOperationType::Upsert);
-        assert_eq!(result[1].1, vec![1, 2]);
-
-        assert_eq!(result[2].0, ChangeOperationType::Upsert);
-        assert_eq!(result[2].1, vec![3]);
+        assert_eq!(result[0].1, vec![2, 3]);
+        assert_eq!(contiguous_row_span(&result[0].1), Some((2, 2)));
     }
 
     #[test]
@@ -2158,16 +2210,16 @@ mod tests {
 
         let result = group_into_sub_batches(&change_batch);
 
-        // Composite keys are formatted differently, so these should be distinct
+        // Last-write-wins: composite key (1,"Alice") at row 0 is replaced
+        // by row 2. Key (2,"Bob") at row 1 is distinct and kept.
         assert_eq!(
             result.len(),
-            2,
-            "Different composite keys should not cause split"
+            1,
+            "Same composite key should replace, not split"
         );
         assert_eq!(result[0].0, ChangeOperationType::Upsert);
-        assert_eq!(result[0].1, vec![0, 1]);
-        assert_eq!(result[1].0, ChangeOperationType::Upsert);
-        assert_eq!(result[1].1, vec![2]);
+        assert_eq!(result[0].1, vec![1, 2]);
+        assert_eq!(contiguous_row_span(&result[0].1), Some((1, 2)));
     }
 
     #[test]
@@ -2282,6 +2334,115 @@ mod tests {
         assert_eq!(result[0].1, vec![0]);
         assert_eq!(result[1].0, ChangeOperationType::Delete);
         assert_eq!(result[1].1, vec![1]);
+    }
+
+    #[test]
+    fn test_last_write_wins_keeps_only_latest_row() {
+        // 5 upserts to the same PK — only the last row should survive.
+        let change_batch = create_test_change_batch(
+            vec!["c", "u", "u", "u", "u"],
+            &[vec!["id"], vec!["id"], vec!["id"], vec!["id"], vec!["id"]],
+            vec![1, 1, 1, 1, 1],
+            vec![Some("v1"), Some("v2"), Some("v3"), Some("v4"), Some("v5")],
+        );
+
+        let result = group_into_sub_batches(&change_batch);
+
+        assert_eq!(
+            result.len(),
+            1,
+            "All same-PK upserts should collapse to one batch"
+        );
+        assert_eq!(result[0].0, ChangeOperationType::Upsert);
+        assert_eq!(
+            result[0].1,
+            vec![4],
+            "Only the last row (index 4) should survive"
+        );
+    }
+
+    #[test]
+    fn test_last_write_wins_cross_bucket_still_flushes() {
+        // U(pk1), D(pk2), U(pk1) — the second U(pk1) replaces the first
+        // within the upsert bucket (no cross-bucket conflict for pk1 in
+        // deletes). D(pk2) stays in its own bucket.
+        let change_batch = create_test_change_batch(
+            vec!["c", "d", "u"],
+            &[vec!["id"], vec!["id"], vec!["id"]],
+            vec![1, 2, 1],
+            vec![Some("A"), Some("B"), Some("A_v2")],
+        );
+
+        let result = group_into_sub_batches(&change_batch);
+
+        // pk1 never appears in the delete bucket, so no cross-bucket flush.
+        // Same-bucket replace: row 0 replaced by row 2 for pk1.
+        assert_eq!(result.len(), 2, "Upsert bucket (deduped) + delete bucket");
+        assert_eq!(result[0].0, ChangeOperationType::Upsert);
+        assert_eq!(result[0].1, vec![2]);
+        assert_eq!(result[1].0, ChangeOperationType::Delete);
+        assert_eq!(result[1].1, vec![1]);
+    }
+
+    #[test]
+    fn test_full_pk_lifecycle_upsert_delete_upsert() {
+        // U(pk1) → D(pk1) → U(pk1) — row created, deleted, re-created.
+        // Two consecutive cross-bucket flushes for the same PK.
+        let change_batch = create_test_change_batch(
+            vec!["c", "d", "c"],
+            &[vec!["id"], vec!["id"], vec!["id"]],
+            vec![1, 1, 1],
+            vec![Some("v1"), Some("v1_del"), Some("v2")],
+        );
+
+        let result = group_into_sub_batches(&change_batch);
+
+        assert_eq!(
+            result.len(),
+            3,
+            "Full lifecycle needs 3 ordered sub-batches"
+        );
+        assert_eq!(result[0].0, ChangeOperationType::Upsert);
+        assert_eq!(result[0].1, vec![0]);
+        assert_eq!(result[1].0, ChangeOperationType::Delete);
+        assert_eq!(result[1].1, vec![1]);
+        assert_eq!(result[2].0, ChangeOperationType::Upsert);
+        assert_eq!(result[2].1, vec![2]);
+    }
+
+    #[test]
+    fn test_truncate_resets_dedup_state() {
+        // U(pk1,v1), U(pk1,v2), T, U(pk1,v3), U(pk1,v4) — dedup works
+        // independently on each side of the truncate barrier. The post-
+        // truncate pk1 must not collide with the pre-truncate pk1.
+        let change_batch = create_test_change_batch(
+            vec!["c", "u", "t", "c", "u"],
+            &[vec!["id"], vec!["id"], vec!["id"], vec!["id"], vec!["id"]],
+            vec![1, 1, 99, 1, 1],
+            vec![Some("v1"), Some("v2"), Some("T"), Some("v3"), Some("v4")],
+        );
+
+        let result = group_into_sub_batches(&change_batch);
+
+        assert_eq!(
+            result.len(),
+            3,
+            "Deduped upsert + truncate + deduped upsert"
+        );
+        assert_eq!(result[0].0, ChangeOperationType::Upsert);
+        assert_eq!(
+            result[0].1,
+            vec![1],
+            "Pre-truncate: only v2 survives (last-write-wins)"
+        );
+        assert_eq!(result[1].0, ChangeOperationType::Truncate);
+        assert_eq!(result[1].1, vec![2]);
+        assert_eq!(result[2].0, ChangeOperationType::Upsert);
+        assert_eq!(
+            result[2].1,
+            vec![4],
+            "Post-truncate: only v4 survives (last-write-wins)"
+        );
     }
 
     fn make_mem_table() -> Arc<MemTable> {
