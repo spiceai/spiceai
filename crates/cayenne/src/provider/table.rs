@@ -1860,6 +1860,26 @@ impl PkDeletionSnapshot {
             } => !deleted_row_keys.is_empty(),
         }
     }
+
+    /// The highest delete sequence reflected in THIS coherent snapshot.
+    ///
+    /// Because every deletion update does `extend_max(...)` followed by a single
+    /// atomic `deletion_snapshot.store(...)`, a snapshot obtained from one load
+    /// reflects all deletions up to this value. Deriving the compaction fence
+    /// from the same snapshot (rather than a second, independent
+    /// `get_max_delete_sequence()` load) is required for correctness — see
+    /// `compact_protected_snapshots_subset`.
+    fn max_sequence_number(&self) -> Option<i64> {
+        match self {
+            Self::PositionBased => None,
+            Self::Int64Pk {
+                deleted_pk_values, ..
+            } => deleted_pk_values.max_sequence_number(),
+            Self::RowConverterBased {
+                deleted_row_keys, ..
+            } => deleted_row_keys.max_sequence_number(),
+        }
+    }
 }
 
 fn pk_deletion_snapshot_for_strategy(strategy: &PkDeletionStrategyWithCache) -> PkDeletionSnapshot {
@@ -1884,6 +1904,100 @@ fn pk_deletion_snapshot_for_strategy(strategy: &PkDeletionStrategyWithCache) -> 
             }
         }
     }
+}
+
+/// Tier-0 size ceiling for protected-snapshot leveling, in bytes (8 MiB).
+///
+/// Runs at or below this size are tier 0; each subsequent tier is
+/// [`PROTECTED_TIER_GROWTH`]× larger. Function-scoped constant for now —
+/// promote to a `CayenneContext` config knob when the policy stabilizes.
+const PROTECTED_TIER_BASE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Geometric growth factor between protected-snapshot size tiers.
+const PROTECTED_TIER_GROWTH: u64 = 8;
+
+/// Hard cap on the number of runs consolidated in a single fast merge pass,
+/// bounding the per-pass read/write amplification regardless of how many
+/// same-tier runs have accumulated.
+const PROTECTED_MERGE_MAX_WIDTH: usize = 32;
+
+/// Classify a protected snapshot's on-disk byte size into an LSM-style size
+/// tier. Tier 0 covers everything up to `base_bytes`; each higher tier covers
+/// up to `growth`× the previous tier's ceiling.
+///
+/// Pure and total: returns 0 for `bytes <= base_bytes` or a degenerate
+/// `growth <= 1`, and saturates (stops climbing) on multiplication overflow so
+/// arbitrarily large inputs map to the top representable tier rather than
+/// panicking.
+fn protected_snapshot_size_tier(bytes: u64, base_bytes: u64, growth: u64) -> u32 {
+    if bytes <= base_bytes || growth <= 1 {
+        return 0;
+    }
+    let mut ceiling = base_bytes;
+    let mut tier: u32 = 0;
+    loop {
+        match ceiling.checked_mul(growth) {
+            Some(next) => ceiling = next,
+            // Overflow: this is the largest tier we can represent; stop here.
+            None => return tier,
+        }
+        tier += 1;
+        if bytes <= ceiling {
+            return tier;
+        }
+    }
+}
+
+/// Select which same-size protected snapshots to consolidate this pass.
+///
+/// LSM-style leveling: assign every input to a size tier, then pick the
+/// **lowest** tier that has accumulated at least `min_runs` runs and merge
+/// those (oldest-first, capped at `max_width`). Merging only within a tier
+/// bounds write amplification to O(log N) per byte (a run is rewritten only
+/// when it levels up), while the `min_runs` threshold bounds read amplification
+/// by keeping at most `min_runs - 1` un-merged runs per tier. The large
+/// carried-forward run sits alone in a high tier and is rewritten rarely
+/// instead of on every pass.
+///
+/// `inputs` is `(snapshot_id, deletion_threshold, bytes)`. Returns the selected
+/// `(snapshot_id, deletion_threshold)` pairs oldest-first (input order is
+/// assumed oldest-first, i.e. UUIDv7 lexical order), or empty if no tier has
+/// `>= min_runs` runs.
+fn select_protected_snapshot_merge_tier(
+    inputs: &[(String, i64, u64)],
+    min_runs: usize,
+    max_width: usize,
+    base_bytes: u64,
+    growth: u64,
+) -> Vec<(String, i64)> {
+    if inputs.len() < 2 || min_runs < 2 {
+        // A merge needs at least two runs, and a floor below 2 is meaningless.
+        return Vec::new();
+    }
+
+    // Group input indices by tier, preserving oldest-first order within a tier.
+    let mut tiers: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
+    for (idx, (_, _, bytes)) in inputs.iter().enumerate() {
+        let tier = protected_snapshot_size_tier(*bytes, base_bytes, growth);
+        tiers.entry(tier).or_default().push(idx);
+    }
+
+    // BTreeMap iterates tiers in ascending order, so the first qualifying tier
+    // is the lowest one.
+    for (_tier, indices) in tiers {
+        if indices.len() >= min_runs {
+            return indices
+                .into_iter()
+                .take(max_width.max(2))
+                .map(|i| {
+                    let (id, threshold, _) = &inputs[i];
+                    (id.clone(), *threshold)
+                })
+                .collect();
+        }
+    }
+
+    Vec::new()
 }
 
 #[derive(Default)]
@@ -2568,7 +2682,7 @@ impl CayenneTableProvider {
                     || protected_snapshot_ids.contains(snapshot_id_str)
                     || snapshot_id_str == STAGING_DIR_NAME
                 {
-                    tracing::debug!(
+                    tracing::trace!(
                         "Keeping snapshot: {snapshot_id_str} (current, protected, or staging)"
                     );
                     continue;
@@ -3148,7 +3262,7 @@ impl CayenneTableProvider {
                 || protected_snapshot_ids.contains(snapshot_id)
                 || snapshot_id == STAGING_DIR_NAME
             {
-                tracing::debug!(
+                tracing::trace!(
                     "Keeping snapshot: {} (current, protected, or staging)",
                     snapshot_id
                 );
@@ -3165,7 +3279,7 @@ impl CayenneTableProvider {
 
                 match dir_unix {
                     Some(ts) if ts >= current_unix => {
-                        tracing::debug!("Keeping snapshot: {snapshot_id} (newer than current)");
+                        tracing::trace!("Keeping snapshot: {snapshot_id} (newer than current)");
                         continue;
                     }
                     None => {
@@ -6770,6 +6884,341 @@ impl CayenneTableProvider {
         Ok(stream)
     }
 
+    /// Fast, write-lock-free consolidation of a size-tiered subset of the
+    /// immutable protected snapshots into a single new protected snapshot.
+    ///
+    /// Unlike current-snapshot small-file compaction, this rewrites only
+    /// protected snapshots (data written after deletions) — it never touches
+    /// the current snapshot `S0`, its pointer, or its delete files `D1..Dn`.
+    /// Those delete files still apply to `S0` and are intentionally preserved.
+    ///
+    /// Algorithm (fenced immutable-input protocol):
+    /// 1. Short fence read: snapshot the protected set + the live deletion
+    ///    snapshot + its `max_delete_seq` as one coherent `(inputs, fence_seq)`
+    ///    pair, so the rewrite applies exactly the deletions visible at the
+    ///    fence and the merged snapshot can be tagged consistently.
+    /// 2. Size-tier selection (outside the fence): assign inputs to LSM-style
+    ///    size tiers and merge only the lowest tier that has accumulated enough
+    ///    same-size runs, bounding write amplification. See
+    ///    [`select_protected_snapshot_merge_tier`].
+    /// 3. Rewrite outside the lock: union-scan each selected input applying its
+    ///    own partial deletion filter (`delete_seq > threshold_at_creation`),
+    ///    exactly as a read would, streaming the result into a fresh snapshot.
+    /// 4. CAS commit: [`MetadataCatalog::swap_protected_snapshots`] atomically
+    ///    deactivates the input snapshots and activates the merged one — only
+    ///    if every input is still active. On a lost race the rewritten output
+    ///    is discarded and a later trigger retries.
+    ///
+    /// ## Why the merged snapshot's threshold is the fence `max_delete_seq`
+    ///
+    /// Each input's rows have all deletions with `seq > threshold_at_creation`
+    /// physically applied during the rewrite (deletions with `seq <= threshold`
+    /// correctly do NOT apply — those rows are newer than the deletion). After
+    /// the merge every input has therefore resolved all deletions up to the
+    /// fence's `max_delete_seq`, so the new snapshot is tagged with that value
+    /// and the read path only applies strictly-newer deletions (`seq > fence`)
+    /// to it going forward. This preserves the sequence-ordering invariant with
+    /// no resurrection and no over-deletion.
+    ///
+    /// `max_inputs` bounds how many of the oldest protected snapshots are
+    /// considered as merge candidates before size-tiering; pass `usize::MAX` to
+    /// consider the whole set.
+    ///
+    /// Returns `Ok(true)` if a merge was committed, `Ok(false)` if there was
+    /// nothing to do (fewer than two protected snapshots, no qualifying tier,
+    /// or the CAS lost a race).
+    #[doc(hidden)]
+    pub async fn compact_protected_snapshots_subset(&self, max_inputs: usize) -> Result<bool> {
+        let Ok(_guard) = self.compaction_lock.try_lock() else {
+            tracing::trace!(
+                table = self.table_metadata.table_name.as_str(),
+                "Skipping protected-snapshot subset compaction: another pass already running",
+            );
+            return Ok(false);
+        };
+
+        let compaction_start = std::time::Instant::now();
+
+        // --- Phase 1: short fence read — choose a coherent input set. ---
+        // Capture the protected set, each input's deletion threshold, the live
+        // deletion snapshot, and the current max delete sequence together under
+        // the read fence so the rewrite applies exactly the deletions visible at
+        // the fence and the merged snapshot can be tagged consistently.
+        let (candidates, fence_max_delete_seq, deletion_snapshot) = {
+            let _fence = self.listing_fence.read().await;
+            let protected = self.protected_snapshots.load_full();
+            if protected.len() < 2 {
+                return Ok(false);
+            }
+
+            // Protected snapshot ids are UUIDv7, so lexical order == creation
+            // order. Consider the oldest `max_inputs` (at least 2) snapshots.
+            let mut ids: Vec<String> = protected.keys().cloned().collect();
+            ids.sort();
+            let take = ids.len().min(max_inputs.max(2));
+            ids.truncate(take);
+
+            let candidates: Vec<(String, i64)> = ids
+                .into_iter()
+                .map(|id| {
+                    let threshold = protected.get(&id).copied().unwrap_or(0);
+                    (id, threshold)
+                })
+                .collect();
+
+            let deletion_snapshot = self.pk_deletion_snapshot();
+            // Derive the fence from the SAME loaded deletion snapshot used for
+            // the Phase 2 rewrite. A separate `get_max_delete_sequence()` load
+            // here can observe a NEWER ArcSwap version than `deletion_snapshot`:
+            // any deletion that lands between the two loads would then be tagged
+            // as already-applied (`seq <= fence`) without ever being applied
+            // during the rewrite, permanently masking it and resurrecting the
+            // rows it deletes. Both values must come from one coherent load.
+            let fence_max_delete_seq = deletion_snapshot.max_sequence_number().unwrap_or(0);
+            (candidates, fence_max_delete_seq, deletion_snapshot)
+        };
+        let phase1_fence_ms = compaction_start.elapsed().as_millis();
+
+        // Per-input sizing: list each candidate snapshot's on-disk Vortex bytes
+        // + file count. Sizes drive the size-tier selection and reveal the size
+        // distribution (e.g. one carried-forward merged snapshot dwarfing the
+        // small new deltas). This is diagnostic I/O outside the fence.
+        let sizing_start = std::time::Instant::now();
+        let mut sized_candidates: Vec<(String, i64, u64)> = Vec::with_capacity(candidates.len());
+        for (snapshot_id, threshold) in &candidates {
+            let bytes = match self.list_snapshot_files_with_sizes(snapshot_id).await {
+                Ok(files) => files.iter().map(|(_, sz)| *sz).sum(),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        snapshot_id = snapshot_id.as_str(),
+                        "Failed to size protected-snapshot merge input for tiering: {e}"
+                    );
+                    // Treat as tier 0 (unknown/small) so it stays a merge
+                    // candidate rather than being skipped as "large".
+                    0
+                }
+            };
+            sized_candidates.push((snapshot_id.clone(), *threshold, bytes));
+        }
+        let sizing_ms = sizing_start.elapsed().as_millis();
+
+        // --- Size-tier selection (replaces the single-threshold PoC skip). ---
+        // Consolidate only the lowest size tier that has accumulated at least
+        // `min_runs` same-size runs, capped at `PROTECTED_MERGE_MAX_WIDTH`. This
+        // bounds write amplification to O(log N) per byte (a run is rewritten
+        // only when its tier fills up and it levels up) and read amplification
+        // to at most `min_runs - 1` un-merged runs per tier — instead of folding
+        // the large carried-forward blob back in on every pass.
+        let min_runs = self
+            .context
+            .compaction_trigger_protected_snapshots()
+            .max(2);
+        let inputs = select_protected_snapshot_merge_tier(
+            &sized_candidates,
+            min_runs,
+            PROTECTED_MERGE_MAX_WIDTH,
+            PROTECTED_TIER_BASE_BYTES,
+            PROTECTED_TIER_GROWTH,
+        );
+
+        if inputs.len() < 2 {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                candidates = sized_candidates.len(),
+                min_runs,
+                tier_base_bytes = PROTECTED_TIER_BASE_BYTES,
+                "Skipping fast protected-snapshot compaction: no size tier has enough runs to merge"
+            );
+            return Ok(false);
+        }
+
+        // Diagnostics over the SELECTED (single-tier) input set.
+        let selected_ids: std::collections::HashSet<&str> =
+            inputs.iter().map(|(id, _)| id.as_str()).collect();
+        let selected_sizes: Vec<&(String, i64, u64)> = sized_candidates
+            .iter()
+            .filter(|(id, _, _)| selected_ids.contains(id.as_str()))
+            .collect();
+        let total_input_bytes: u64 = selected_sizes.iter().map(|(_, _, b)| *b).sum();
+        let largest_input_bytes = selected_sizes
+            .iter()
+            .map(|(_, _, b)| *b)
+            .max()
+            .unwrap_or(0);
+        // Percent of selected bytes contributed by the single largest run,
+        // computed with integer (u128) math to avoid any float cast. With
+        // size-tiering this should stay low (runs are same-tier), in contrast to
+        // the ~99% dominance of the old fold-everything pass.
+        let dominance_pct: u64 = if total_input_bytes > 0 {
+            u64::try_from(u128::from(largest_input_bytes) * 100 / u128::from(total_input_bytes))
+                .unwrap_or(100)
+        } else {
+            0
+        };
+        let selected_tier =
+            protected_snapshot_size_tier(largest_input_bytes, PROTECTED_TIER_BASE_BYTES, PROTECTED_TIER_GROWTH);
+
+        tracing::info!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            input_count = inputs.len(),
+            candidate_count = sized_candidates.len(),
+            selected_tier,
+            min_runs,
+            fence_max_delete_seq,
+            total_input_bytes,
+            largest_input_bytes,
+            dominance_pct,
+            phase1_fence_ms,
+            sizing_ms,
+            "Running fast protected-snapshot subset compaction"
+        );
+
+        // --- Phase 2: rewrite outside the lock. ---
+        // Build a UNION over the selected inputs, applying each input's own
+        // partial deletion filter exactly as the read path does, then stream
+        // the merged rows into a fresh snapshot dir.
+        let phase2_start = std::time::Instant::now();
+        let ctx = self.create_session_context();
+        let state = ctx.state();
+        let pk_indices = self.pk_column_indices.clone();
+
+        let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(inputs.len());
+        for (snapshot_id, threshold) in &inputs {
+            let plan = self
+                .create_snapshot_scan_plan(&state, snapshot_id, None, &[], None)
+                .await?;
+            let filtered =
+                self.apply_partial_deletion_filter(plan, &pk_indices, *threshold, &deletion_snapshot)?;
+            plans.push(filtered);
+        }
+
+        let merged_plan: Arc<dyn ExecutionPlan> = if plans.len() == 1 {
+            plans.remove(0)
+        } else {
+            UnionExec::try_new(plans)?
+        };
+        let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
+        let plan_build_ms = phase2_start.elapsed().as_millis();
+
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let is_s3 = self.table_metadata.path.starts_with("s3://");
+
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
+        }
+
+        let target_size_bytes = self.context.target_file_size_bytes();
+        let target_partitions = state.config().target_partitions();
+        let write_start = std::time::Instant::now();
+        let write_result = self
+            .write_to_snapshot(stream, target_size_bytes, &new_snapshot_id, target_partitions)
+            .await;
+
+        let (total_rows, _writer_ops, _stats_acc) = match write_result {
+            Ok(result) => result,
+            Err(e) => {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(e);
+            }
+        };
+        let write_ms = write_start.elapsed().as_millis();
+
+        // Sync the new snapshot dir for durability before the catalog commit.
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            if let Err(e) = Self::sync_snapshot_dir(&snapshot_dir).await {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(Error::Catalog { source: e });
+            }
+        }
+
+        // --- Phase 3: CAS commit. ---
+        let phase2_rewrite_ms = phase2_start.elapsed().as_millis();
+        let phase3_start = std::time::Instant::now();
+        let old_ids: Vec<String> = inputs.iter().map(|(id, _)| id.clone()).collect();
+        let swapped = match self
+            .catalog
+            .swap_protected_snapshots(
+                &self.table_metadata.table_id,
+                &old_ids,
+                &new_snapshot_id,
+                fence_max_delete_seq,
+            )
+            .await
+        {
+            Ok(swapped) => swapped,
+            Err(e) => {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(Error::Catalog { source: e });
+            }
+        };
+
+        if !swapped {
+            // An input snapshot was concurrently consumed by another compaction.
+            // The catalog is unchanged; discard the rewritten output and let a
+            // later trigger retry against the new protected set.
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Protected-snapshot subset swap aborted (inputs no longer active); discarding output"
+            );
+            self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                .await;
+            return Ok(false);
+        }
+
+        // Catalog committed — bring the in-memory protected set into agreement:
+        // drop the merged inputs and add the new merged snapshot with its
+        // fence-aligned deletion threshold. Other protected snapshots created
+        // after the fence (post-fence CDC writes) are preserved untouched.
+        self.protected_snapshots.rcu(|current| {
+            let mut new_map = (**current).clone();
+            for (id, _) in &inputs {
+                new_map.remove(id);
+            }
+            new_map.insert(new_snapshot_id.clone(), fence_max_delete_seq);
+            Arc::new(new_map)
+        });
+
+        // Reap the replaced protected-snapshot dirs in the background after the
+        // grace period. The current snapshot is preserved (passed as the
+        // "current" arg); cleanup reads the LIVE protected set after the grace
+        // sleep, which now excludes the merged inputs and includes the new
+        // snapshot, so only the merged-away dirs are removed.
+        let current_snapshot_id = self.get_current_snapshot_id();
+        self.trigger_old_snapshot_cleanup(&current_snapshot_id).await;
+
+        tracing::info!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            merged_inputs = inputs.len(),
+            rows = total_rows,
+            new_snapshot_id = new_snapshot_id.as_str(),
+            fence_max_delete_seq,
+            total_input_bytes,
+            largest_input_bytes,
+            dominance_pct,
+            phase1_fence_ms,
+            sizing_ms,
+            plan_build_ms,
+            write_ms,
+            phase2_rewrite_ms,
+            phase3_commit_ms = phase3_start.elapsed().as_millis(),
+            duration_ms = compaction_start.elapsed().as_millis(),
+            "Fast protected-snapshot subset compaction completed"
+        );
+
+        Ok(true)
+    }
+
     async fn cleanup_failed_compaction_snapshot(&self, new_snapshot_id: &str, is_s3: bool) {
         if is_s3 {
             match self.snapshot_object_store_prefix(new_snapshot_id) {
@@ -10152,26 +10601,41 @@ fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
 #[async_trait::async_trait]
 impl super::compaction::CompactionRunner for CayenneTableProvider {
     async fn run_compaction_trigger(&self) -> std::result::Result<bool, String> {
-        // Background scheduler path: serialize with the per-table `write_lock`
-        // so concurrent appends (which write to the current snapshot dir under
-        // `write_lock`) cannot land between this pass reading the current
-        // snapshot and the snapshot-rewrite commit advancing the pointer.
+        // Routes to the fast protected-snapshot subset compaction, which only
+        // rewrites immutable protected snapshots and CAS-swaps them in the
+        // catalog. It never touches the current snapshot `S0`, its pointer, or
+        // its delete files, so — unlike the current-snapshot small-file path
+        // (`maybe_compact_small_files` / `run_one_compaction_pass`) — it does
+        // NOT need the per-table `write_lock` and therefore cannot block
+        // concurrent appends/CDC applies. Serialization against other compaction
+        // passes is provided by the internal `compaction_lock` (`try_lock`
+        // inside `compact_protected_snapshots_subset`); cross-process safety by
+        // the CAS in `MetadataCatalog::swap_protected_snapshots`.
         //
-        // Using `try_lock` keeps the background loop non-blocking from a
-        // writer's perspective — if a writer is active we skip this tick and
-        // re-evaluate on the next interval. The inline trigger paths in
-        // `mutation_writer.rs` call `maybe_compact_small_files` directly while
-        // the caller already holds `write_lock`, so they bypass this guard
-        // (tokio mutexes are not re-entrant, so we must not re-acquire there).
-        let Ok(_write_guard) = self.write_lock.try_lock() else {
+        // Cheap lock-free early-out first: skip acquiring `compaction_lock` /
+        // `listing_fence` and building a session context unless the protected
+        // set already has enough runs to be worth merging. `protected_snapshots`
+        // is an `ArcSwap`, so `load()` is a cheap atomic read. The authoritative
+        // re-check (and size-tiering) still happens under the fence inside
+        // `compact_protected_snapshots_subset`; this guard only avoids wasted
+        // work on the common path where nothing has accumulated yet.
+        let min_inputs = self
+            .context
+            .compaction_trigger_protected_snapshots()
+            .max(2);
+        let protected_len = self.protected_snapshots.load().len();
+        if protected_len < min_inputs {
             tracing::trace!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
-                "Skipping background compaction: write_lock held by another writer",
+                protected_len,
+                min_inputs,
+                "Skipping fast protected-snapshot compaction: protected set below trigger floor",
             );
             return Ok(false);
-        };
-        self.maybe_compact_small_files()
+        }
+
+        self.compact_protected_snapshots_subset(usize::MAX)
             .await
             .map_err(|e| e.to_string())
     }
@@ -10243,6 +10707,105 @@ mod tests {
 
     fn protected_snapshot_id_at_unix_time(seconds: u64) -> String {
         uuid::Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, seconds, 0)).to_string()
+    }
+
+    #[test]
+    fn protected_snapshot_size_tier_classifies_by_geometric_ceilings() {
+        let base = 8 * 1024 * 1024; // 8 MiB
+        let growth = 8;
+
+        // Tier 0: everything at or below the base ceiling.
+        assert_eq!(protected_snapshot_size_tier(0, base, growth), 0);
+        assert_eq!(protected_snapshot_size_tier(1, base, growth), 0);
+        assert_eq!(protected_snapshot_size_tier(base, base, growth), 0);
+
+        // Just over the base ceiling rolls into tier 1.
+        assert_eq!(protected_snapshot_size_tier(base + 1, base, growth), 1);
+        assert_eq!(protected_snapshot_size_tier(base * growth, base, growth), 1);
+
+        // Just over tier 1's ceiling rolls into tier 2.
+        assert_eq!(
+            protected_snapshot_size_tier(base * growth + 1, base, growth),
+            2
+        );
+        assert_eq!(
+            protected_snapshot_size_tier(base * growth * growth, base, growth),
+            2
+        );
+    }
+
+    #[test]
+    fn protected_snapshot_size_tier_handles_degenerate_growth() {
+        let base = 8 * 1024 * 1024;
+        // growth <= 1 cannot form ceilings: everything collapses to tier 0.
+        assert_eq!(protected_snapshot_size_tier(base * 100, base, 1), 0);
+        assert_eq!(protected_snapshot_size_tier(base * 100, base, 0), 0);
+    }
+
+    #[test]
+    fn protected_snapshot_size_tier_saturates_on_overflow() {
+        // A near-u64::MAX input must not panic; it maps to the top tier.
+        let tier = protected_snapshot_size_tier(u64::MAX, 1, 2);
+        assert!(tier >= 63, "expected a high tier, got {tier}");
+    }
+
+    fn sized(id: &str, bytes: u64) -> (String, i64, u64) {
+        (id.to_string(), 0, bytes)
+    }
+
+    #[test]
+    fn select_merge_tier_picks_lowest_tier_with_enough_runs() {
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        // Two tier-0 runs (small) and two tier-1 runs (large). With min_runs=2
+        // the LOWEST qualifying tier (tier 0) is selected.
+        let inputs = vec![
+            sized("a", 1024),          // tier 0
+            sized("b", 2048),          // tier 0
+            sized("c", base * 4),      // tier 1
+            sized("d", base * 5),      // tier 1
+        ];
+        let selected = select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth);
+        let ids: Vec<&str> = selected.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn select_merge_tier_returns_empty_when_no_tier_qualifies() {
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        // One run per tier — no tier reaches min_runs = 2.
+        let inputs = vec![sized("a", 1024), sized("b", base * 4)];
+        let selected = select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn select_merge_tier_respects_max_width_and_keeps_oldest_first() {
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        // Four tier-0 runs; max_width = 2 caps the merge to the two oldest.
+        let inputs = vec![
+            sized("a", 100),
+            sized("b", 200),
+            sized("c", 300),
+            sized("d", 400),
+        ];
+        let selected = select_protected_snapshot_merge_tier(&inputs, 2, 2, base, growth);
+        let ids: Vec<&str> = selected.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn select_merge_tier_rejects_degenerate_inputs() {
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        // Fewer than two inputs, or a sub-2 floor, can never merge.
+        assert!(select_protected_snapshot_merge_tier(&[sized("a", 1)], 2, 32, base, growth).is_empty());
+        assert!(
+            select_protected_snapshot_merge_tier(&[sized("a", 1), sized("b", 2)], 1, 32, base, growth)
+                .is_empty()
+        );
     }
 
     #[test]

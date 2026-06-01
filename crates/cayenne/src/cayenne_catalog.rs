@@ -400,6 +400,86 @@ impl CayenneCatalog {
             })
     }
 
+    /// CAS-validate and swap a subset of protected-snapshot sequence rows
+    /// inside the caller's `MetastoreTransaction`, without opening a new one.
+    ///
+    /// Returns `Ok(false)` (and makes no mutation) if any input snapshot is no
+    /// longer present in `cayenne_snapshot_sequence` — the caller should roll
+    /// back / discard the rewritten output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::InvalidOperationNoSource`] if any UUID is
+    /// malformed, or propagates the metastore error if a statement fails.
+    pub async fn swap_protected_snapshots_in_txn(
+        &self,
+        txn: &mut dyn MetastoreTransaction,
+        table_id: &str,
+        old_snapshot_ids: &[String],
+        new_snapshot_id: &str,
+        new_sequence_number: i64,
+    ) -> CatalogResult<bool> {
+        // Validate UUIDs to keep the interpolated batch SQL injection-free.
+        // All ids are generated internally via `uuid::Uuid::now_v7()`, but we
+        // enforce the invariant here since they are interpolated as SQL literals.
+        if uuid::Uuid::parse_str(table_id).is_err() {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!("table_id is not a valid UUID: {table_id}"),
+            });
+        }
+        if uuid::Uuid::parse_str(new_snapshot_id).is_err() {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!("new_snapshot_id is not a valid UUID: {new_snapshot_id}"),
+            });
+        }
+        for id in old_snapshot_ids {
+            if uuid::Uuid::parse_str(id).is_err() {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!("old_snapshot_id is not a valid UUID: {id}"),
+                });
+            }
+        }
+
+        if old_snapshot_ids.is_empty() {
+            return Ok(false);
+        }
+
+        let table_id_literal = sql_text_literal(table_id);
+        let id_list = old_snapshot_ids
+            .iter()
+            .map(|id| sql_text_literal(id))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // CAS guard: every input snapshot must still be active. If a concurrent
+        // compaction already consumed one of them, abort without mutating.
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM cayenne_snapshot_sequence \
+             WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list})"
+        );
+        let count_values = txn
+            .query_row_values(QueryRowParams {
+                sql: &count_sql,
+                params: vec![],
+            })
+            .await?;
+        let existing = i64::from_value(metastore_value_at(&count_values, 0)?)?;
+        if existing != i64::try_from(old_snapshot_ids.len()).unwrap_or(i64::MAX) {
+            return Ok(false);
+        }
+
+        let new_snapshot_id_literal = sql_text_literal(new_snapshot_id);
+        let batch_sql = format!(
+            "DELETE FROM cayenne_snapshot_sequence \
+                WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); \
+             INSERT OR REPLACE INTO cayenne_snapshot_sequence \
+                (table_id, snapshot_id, sequence_number) \
+                VALUES ({table_id_literal}, {new_snapshot_id_literal}, {new_sequence_number});"
+        );
+        txn.execute_batch(&batch_sql).await?;
+        Ok(true)
+    }
+
     /// Apply an overwrite commit's catalog mutations inside the caller's
     /// `MetastoreTransaction`, without opening a new transaction.
     ///
@@ -1586,6 +1666,72 @@ impl MetadataCatalog for CayenneCatalog {
         Err(CatalogError::InvalidOperationNoSource {
             message: format!(
                 "commit_compaction exhausted {max_attempts} attempts without success or a terminal error"
+            ),
+        })
+    }
+
+    async fn swap_protected_snapshots(
+        &self,
+        table_id: &str,
+        old_snapshot_ids: &[String],
+        new_snapshot_id: &str,
+        new_sequence_number: i64,
+    ) -> CatalogResult<bool> {
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+        if max_attempts == 0 {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "swap_protected_snapshots requires at least one attempt".to_string(),
+            });
+        }
+
+        for attempt in 1..=max_attempts {
+            let mut tx = self.begin_transaction().await.map_err(|e| {
+                CatalogError::FailedToSetCurrentSnapshot {
+                    source: Box::new(e),
+                }
+            })?;
+
+            match self
+                .swap_protected_snapshots_in_txn(
+                    &mut *tx,
+                    table_id,
+                    old_snapshot_ids,
+                    new_snapshot_id,
+                    new_sequence_number,
+                )
+                .await
+            {
+                // CAS guard failed — an input snapshot is no longer active.
+                // The transaction made no changes; nothing to commit.
+                Ok(false) => return Ok(false),
+                Ok(true) => match tx.commit().await {
+                    Ok(()) => return Ok(true),
+                    Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
+                        let delay = retry_backoff_delay(attempt);
+                        tracing::debug!(
+                            attempt,
+                            max_attempts,
+                            ?delay,
+                            "Retrying protected-snapshot swap after commit conflict"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(e) => {
+                        return Err(CatalogError::FailedToSetCurrentSnapshot {
+                            source: Box::new(e),
+                        });
+                    }
+                },
+                Err(e) => {
+                    // Transaction auto-rolls-back on drop.
+                    return Err(e);
+                }
+            }
+        }
+
+        Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "swap_protected_snapshots exhausted {max_attempts} attempts without success or a terminal error"
             ),
         })
     }
