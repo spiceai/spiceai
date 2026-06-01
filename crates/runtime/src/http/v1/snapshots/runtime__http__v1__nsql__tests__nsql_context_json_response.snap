@@ -281,102 +281,6 @@ expression: response
     ],
     "spice_specific": [
       {
-        "name": "ai",
-        "syntax": "ai(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "ai(...)"
-        ]
-      },
-      {
-        "name": "bucket",
-        "syntax": "bucket(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "bucket(...)"
-        ]
-      },
-      {
-        "name": "col_description",
-        "syntax": "col_description(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "col_description(...)"
-        ]
-      },
-      {
-        "name": "cosine_distance",
-        "syntax": "cosine_distance(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "cosine_distance(...)"
-        ]
-      },
-      {
-        "name": "digest_many",
-        "syntax": "digest_many(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "digest_many(...)"
-        ]
-      },
-      {
-        "name": "embed",
-        "syntax": "embed(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "embed(...)"
-        ]
-      },
-      {
-        "name": "inner_product",
-        "syntax": "inner_product(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "inner_product(...)"
-        ]
-      },
-      {
-        "name": "l2_distance",
-        "syntax": "l2_distance(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "l2_distance(...)"
-        ]
-      },
-      {
-        "name": "l2_norm",
-        "syntax": "l2_norm(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "l2_norm(...)"
-        ]
-      },
-      {
-        "name": "l2_squared_distance",
-        "syntax": "l2_squared_distance(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "l2_squared_distance(...)"
-        ]
-      },
-      {
-        "name": "list_udfs",
-        "syntax": "list_udfs(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "list_udfs(...)"
-        ]
-      },
-      {
-        "name": "obj_description",
-        "syntax": "obj_description(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "obj_description(...)"
-        ]
-      },
-      {
         "name": "rerank",
         "syntax": "rerank(...)",
         "function_type": "SCALAR",
@@ -398,14 +302,6 @@ expression: response
         "function_type": "SCALAR",
         "signatures": [
           "text_search(...)"
-        ]
-      },
-      {
-        "name": "truncate",
-        "syntax": "truncate(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "truncate(...)"
         ]
       },
       {

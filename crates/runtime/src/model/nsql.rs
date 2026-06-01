@@ -42,6 +42,7 @@ use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use runtime_datafusion_index::IndexedTableProvider;
+#[cfg(test)]
 use runtime_datafusion_udfs::{
     bucket::BUCKET_SCALAR_UDF_NAME,
     cosine_distance::COSINE_DISTANCE_UDF_NAME,
@@ -59,7 +60,7 @@ use spicepod::{component::function::Function, semantic::Column};
 use tracing::Span;
 use tracing_futures::Instrument;
 
-#[cfg(feature = "models")]
+#[cfg(all(test, feature = "models"))]
 use runtime_datafusion_udfs::{ai::AI_UDF_NAME, embed::EMBED_UDF_NAME};
 
 use crate::{
@@ -67,7 +68,6 @@ use crate::{
     component::column::full_text_search_config,
     datafusion::{
         SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA,
-        pg_catalog::{COL_DESCRIPTION_UDF_NAME, OBJ_DESCRIPTION_UDF_NAME},
         request_context_extension::get_current_datafusion,
         udf::{UserFunctionInfo, effective_user_function_volatility, user_function_infos},
     },
@@ -88,8 +88,13 @@ use crate::{
         },
         utils::tool_call_error_response,
     },
-    udtfs::LIST_UDFS_UDTF_NAME,
 };
+
+#[cfg(test)]
+use crate::datafusion::pg_catalog::{COL_DESCRIPTION_UDF_NAME, OBJ_DESCRIPTION_UDF_NAME};
+
+#[cfg(test)]
+use crate::udtfs::LIST_UDFS_UDTF_NAME;
 
 #[cfg(test)]
 use crate::datafusion::udtf::{
@@ -458,7 +463,7 @@ struct ConfiguredFullTextSearchColumn {
     row_id_columns: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SearchFunctionAvailability {
     vector_search: bool,
     text_search: bool,
@@ -659,6 +664,22 @@ fn search_function_availability(available_names: &HashSet<String>) -> SearchFunc
     SearchFunctionAvailability {
         vector_search: available_names.contains(VECTOR_SEARCH_UDTF_NAME),
         text_search: available_names.contains(TEXT_SEARCH_UDTF_NAME),
+    }
+}
+
+fn dataset_search_function_availability(
+    registered: SearchFunctionAvailability,
+    datasets: &[NsqlDatasetContext],
+) -> SearchFunctionAvailability {
+    SearchFunctionAvailability {
+        vector_search: registered.vector_search
+            && datasets
+                .iter()
+                .any(|dataset| !dataset.search.vector.is_empty()),
+        text_search: registered.text_search
+            && datasets
+                .iter()
+                .any(|dataset| !dataset.search.full_text.is_empty()),
     }
 }
 
@@ -1597,27 +1618,7 @@ fn is_search_context_function_visible(
 }
 
 fn is_spice_context_function(name: &str, search_functions: SearchFunctionAvailability) -> bool {
-    #[cfg(feature = "models")]
-    let is_model_function = name == EMBED_UDF_NAME || name == AI_UDF_NAME;
-    #[cfg(not(feature = "models"))]
-    let is_model_function = false;
-
     is_search_context_function_visible(name, search_functions)
-        || is_model_function
-        || [
-            COSINE_DISTANCE_UDF_NAME,
-            INNER_PRODUCT_UDF_NAME,
-            L2_DISTANCE_UDF_NAME,
-            L2_SQUARED_DISTANCE_UDF_NAME,
-            L2_NORM_UDF_NAME,
-            BUCKET_SCALAR_UDF_NAME,
-            TRUNCATE_SCALAR_UDF_NAME,
-            DIGEST_UDF_NAME,
-            OBJ_DESCRIPTION_UDF_NAME,
-            COL_DESCRIPTION_UDF_NAME,
-            LIST_UDFS_UDTF_NAME,
-        ]
-        .contains(&name)
 }
 
 fn user_function_names(app: &app::App) -> HashSet<String> {
@@ -2428,8 +2429,10 @@ pub(crate) async fn build_nsql_context(
                 NsqlContextError::SchemaContext { source }
             })?;
 
+    let dataset_search_functions =
+        dataset_search_function_availability(configured_search_functions, &dataset_contexts);
     let function_context =
-        nsql_function_context(&app, &function_inventory, configured_search_functions);
+        nsql_function_context(&app, &function_inventory, dataset_search_functions);
     let function_context_block = function_context.render_markdown();
     let relationship_context = render_nsql_dataset_relationship_context(&dataset_contexts);
 
@@ -2527,6 +2530,92 @@ mod tests {
             Some(description),
             vec![relationship_test_column("id", "Int64", "Customer id")],
         )
+    }
+
+    fn vector_search_test_context(column: &str) -> NsqlVectorSearchContext {
+        NsqlVectorSearchContext {
+            column: column.to_string(),
+            function: VECTOR_SEARCH_UDTF_NAME.to_string(),
+            syntax: format!("{VECTOR_SEARCH_UDTF_NAME}(docs, 'query text', {column})"),
+            model: "embed_model".to_string(),
+            engine: Some("duckdb_vector_index".to_string()),
+            row_id_columns: vec!["id".to_string()],
+            vector_size: Some(384),
+            chunked: false,
+            input_mode: None,
+            index: None,
+            required_columns: vec![column.to_string(), "id".to_string()],
+            notes: vec![],
+        }
+    }
+
+    fn full_text_search_test_context(column: &str) -> NsqlFullTextSearchContext {
+        NsqlFullTextSearchContext {
+            column: column.to_string(),
+            function: TEXT_SEARCH_UDTF_NAME.to_string(),
+            syntax: format!("{TEXT_SEARCH_UDTF_NAME}(docs, 'query text', {column})"),
+            engine: "tantivy".to_string(),
+            index_store: "memory".to_string(),
+            row_id_columns: vec!["id".to_string()],
+            index: None,
+            required_columns: vec![column.to_string(), "id".to_string()],
+            notes: vec![],
+        }
+    }
+
+    #[test]
+    fn dataset_search_function_availability_requires_registered_functions_and_search_context() {
+        let registered = SearchFunctionAvailability {
+            vector_search: true,
+            text_search: true,
+        };
+        let no_search = relationship_test_dataset("docs", None, vec![]);
+        assert_eq!(
+            dataset_search_function_availability(registered, &[no_search]),
+            SearchFunctionAvailability {
+                vector_search: false,
+                text_search: false,
+            }
+        );
+
+        let mut vector_dataset = relationship_test_dataset("docs", None, vec![]);
+        vector_dataset
+            .search
+            .vector
+            .push(vector_search_test_context("body"));
+        assert_eq!(
+            dataset_search_function_availability(registered, &[vector_dataset.clone()]),
+            SearchFunctionAvailability {
+                vector_search: true,
+                text_search: false,
+            }
+        );
+        assert_eq!(
+            dataset_search_function_availability(
+                SearchFunctionAvailability {
+                    vector_search: false,
+                    text_search: true,
+                },
+                &[vector_dataset]
+            ),
+            SearchFunctionAvailability {
+                vector_search: false,
+                text_search: false,
+            }
+        );
+
+        let mut full_text_dataset = relationship_test_dataset("docs", None, vec![]);
+        full_text_dataset
+            .search
+            .full_text
+            .push(full_text_search_test_context("body"));
+        assert_eq!(
+            dataset_search_function_availability(registered, &[full_text_dataset]),
+            SearchFunctionAvailability {
+                vector_search: false,
+                text_search: true,
+            }
+        );
     }
 
     #[test]
@@ -2712,6 +2801,24 @@ mod tests {
             "expected DataFusion Spark compatibility to expose many functions"
         );
         assert_eq!(actual_spark_names, expected_spark_names);
+    }
+
+    #[test]
+    fn function_context_spice_specific_only_includes_search_functions() {
+        let app = app::AppBuilder::new("test").build();
+        let available_names = all_context_function_names_for_test();
+
+        let context = nsql_function_context_for_test(&app, &available_names, true, true);
+
+        assert_eq!(
+            entry_names(&context.spice_specific),
+            BTreeSet::from([
+                RERANK_UDTF_NAME.to_string(),
+                RRF_UDF_NAME.to_string(),
+                TEXT_SEARCH_UDTF_NAME.to_string(),
+                VECTOR_SEARCH_UDTF_NAME.to_string(),
+            ])
+        );
     }
 
     #[test]

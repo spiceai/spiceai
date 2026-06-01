@@ -38,6 +38,8 @@ expression: body
 Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions:
 
 ### Spice-specific functions
+- `rerank`: Re-ranks search results or table rows using a configured reranker model. Syntax: `rerank(input, model => 'model_name', document => 'column_name'[, query => 'query text'])`.
+- `rrf`: Combines multiple search result sets using reciprocal rank fusion. Syntax: `rrf(text_search(...), vector_search(...)[, limit => n])`.
 - `text_search`: Runs full-text search over a configured searchable dataset. Syntax: `text_search(dataset, 'query text'[, column])`.
 - `vector_search`: Runs vector search over a configured embedding/vector index. Syntax: `vector_search(dataset, 'query text'[, column])`.
 

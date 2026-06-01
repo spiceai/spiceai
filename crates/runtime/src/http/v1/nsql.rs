@@ -1082,17 +1082,29 @@ mod tests {
         );
     }
 
-    fn nsql_context_function_context_for_test() -> &'static str {
-        r"
-Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions:
+    fn nsql_context_function_context_for_test(include_search_functions: bool) -> String {
+        let mut context = String::from(concat!(
+            "\n",
+            "Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. The Spice runtime also exposes these functions when useful for Text-to-SQL, including registered user-defined functions:\n"
+        ));
 
-### Spice-specific functions
-- `text_search`: Runs full-text search over a configured searchable dataset. Syntax: `text_search(dataset, 'query text'[, column])`.
-- `vector_search`: Runs vector search over a configured embedding/vector index. Syntax: `vector_search(dataset, 'query text'[, column])`.
+        if include_search_functions {
+            context.push_str(concat!(
+                "\n",
+                "### Spice-specific functions\n",
+                "- `rerank`: Re-ranks search results or table rows using a configured reranker model. Syntax: `rerank(input, model => 'model_name', document => 'column_name'[, query => 'query text'])`.\n",
+                "- `rrf`: Combines multiple search result sets using reciprocal rank fusion. Syntax: `rrf(text_search(...), vector_search(...)[, limit => n])`.\n",
+                "- `text_search`: Runs full-text search over a configured searchable dataset. Syntax: `text_search(dataset, 'query text'[, column])`.\n",
+                "- `vector_search`: Runs vector search over a configured embedding/vector index. Syntax: `vector_search(dataset, 'query text'[, column])`.\n"
+            ));
+        }
 
-### User-defined functions
-- `ticket_priority`: scalar function from `sql` with `stable` volatility. Syntax: `ticket_priority(sentiment utf8) -> int64`. Converts support-ticket sentiment into a priority score.
-    "
+        context.push_str(concat!(
+            "\n",
+            "### User-defined functions\n",
+            "- `ticket_priority`: scalar function from `sql` with `stable` volatility. Syntax: `ticket_priority(sentiment utf8) -> int64`. Converts support-ticket sentiment into a priority score.\n"
+        ));
+        context
     }
 
     fn nsql_context_block_with_samples_for_test() -> String {
@@ -1165,7 +1177,7 @@ Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. Th
             &dataset_contexts,
             schema_context,
             relationship_context,
-            nsql_context_function_context_for_test(),
+            &nsql_context_function_context_for_test(true),
             &sample_context_blocks,
         )
     }
@@ -1176,7 +1188,7 @@ Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. Th
             &[],
             "",
             "",
-            nsql_context_function_context_for_test(),
+            &nsql_context_function_context_for_test(false),
             &[],
         )
     }
