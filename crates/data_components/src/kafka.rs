@@ -548,13 +548,11 @@ impl KafkaConsumer {
     /// # Errors
     /// Returns an error if topic metadata or watermarks cannot be fetched within `timeout`.
     pub fn topic_has_messages(&self, topic: &str, timeout: Duration) -> Result<bool> {
-        eprintln!("[kafka] topic_has_messages: fetching metadata for {topic}");
         let metadata = self.consumer.fetch_metadata(Some(topic), timeout).context(
             UnableToRestartTopicSnafu {
                 message: "Failed to fetch topic metadata".to_string(),
             },
         )?;
-        eprintln!("[kafka] topic_has_messages: metadata fetched for {topic}");
 
         let topic_metadata = metadata
             .topics()
@@ -565,7 +563,6 @@ impl KafkaConsumer {
             })?;
 
         for partition in topic_metadata.partitions() {
-            eprintln!("[kafka] topic_has_messages: fetching watermarks for {topic} partition {}", partition.id());
             let (low, high) = self
                 .consumer
                 .fetch_watermarks(topic, partition.id(), timeout)
@@ -575,7 +572,6 @@ impl KafkaConsumer {
                         partition.id()
                     ),
                 })?;
-            eprintln!("[kafka] topic_has_messages: watermarks for {topic} partition {} low={low} high={high}", partition.id());
             if high > low {
                 return Ok(true);
             }
@@ -677,9 +673,7 @@ impl KafkaConsumer {
         let temp_group_id = format!("spice-schema-peek-{}", uuid::Uuid::new_v4());
         let mut peek_config = kafka_config.clone();
         peek_config.metrics_store = None; // Avoid skewing real consumer metrics
-        eprintln!("[kafka] fetch_latest_message: creating temp consumer for {topic}");
         let temp_consumer = Self::create(temp_group_id, &peek_config, None)?;
-        eprintln!("[kafka] fetch_latest_message: temp consumer created, fetching metadata for {topic}");
 
         // Fetch topic metadata to discover partitions
         let metadata = temp_consumer
@@ -688,7 +682,6 @@ impl KafkaConsumer {
             .context(UnableToRestartTopicSnafu {
                 message: "Failed to fetch topic metadata".to_string(),
             })?;
-        eprintln!("[kafka] fetch_latest_message: metadata fetched for {topic}");
 
         let topic_metadata = metadata
             .topics()
@@ -701,7 +694,6 @@ impl KafkaConsumer {
         // Find the partition with the highest watermark (most recent data)
         let mut best_partition: Option<(i32, i64)> = None;
         for partition in topic_metadata.partitions() {
-            eprintln!("[kafka] fetch_latest_message: fetching watermarks for {topic} partition {}", partition.id());
             let (low, high) = temp_consumer
                 .consumer
                 .fetch_watermarks(topic, partition.id(), timeout)
@@ -711,7 +703,6 @@ impl KafkaConsumer {
                         partition.id()
                     ),
                 })?;
-            eprintln!("[kafka] fetch_latest_message: watermarks for {topic} partition {} low={low} high={high}", partition.id());
 
             if high > low {
                 match &best_partition {
@@ -722,7 +713,6 @@ impl KafkaConsumer {
         }
 
         let Some((partition_id, high_watermark)) = best_partition else {
-            eprintln!("[kafka] fetch_latest_message: topic {topic} is empty, returning Ok(None)");
             return Ok(None); // No messages available
         };
 

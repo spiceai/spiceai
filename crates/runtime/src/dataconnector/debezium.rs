@@ -560,7 +560,6 @@ async fn get_metadata_from_kafka(
     declared_schema: Option<&SchemaRef>,
 ) -> super::DataConnectorResult<(KafkaConsumer, DebeziumKafkaMetadata, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
-    eprintln!("[debezium] {dataset_name}: creating Kafka consumer for topic {topic}");
     let kafka_consumer = KafkaConsumer::create_for_dataset(
         &dataset_name,
         kafka_config.consumer_group_id.clone(),
@@ -571,7 +570,6 @@ async fn get_metadata_from_kafka(
         dataconnector: "debezium",
         connector_component: ConnectorComponent::from(dataset),
     })?;
-    eprintln!("[debezium] {dataset_name}: consumer created, subscribing to {topic}");
 
     kafka_consumer
         .subscribe(topic)
@@ -580,7 +578,6 @@ async fn get_metadata_from_kafka(
             dataconnector: "debezium",
             connector_component: ConnectorComponent::from(dataset),
         })?;
-    eprintln!("[debezium] {dataset_name}: subscribed, calling fetch_latest_message");
 
     let fetch_result = KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
         topic,
@@ -588,11 +585,6 @@ async fn get_metadata_from_kafka(
         Duration::from_secs(30),
     )
     .await;
-    eprintln!("[debezium] {dataset_name}: fetch_latest_message returned: {}", match &fetch_result {
-        Ok(Some(_)) => "Ok(Some(msg))".to_string(),
-        Ok(None) => "Ok(None)".to_string(),
-        Err(e) => format!("Err({e})"),
-    });
 
     let (key, value) = match fetch_result {
         Ok(Some((key, value))) => (key, value),

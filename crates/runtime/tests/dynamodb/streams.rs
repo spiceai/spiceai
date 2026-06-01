@@ -106,7 +106,7 @@ async fn wait_for_dynamodb_host_port(port: u16) -> Result<(), anyhow::Error> {
     ))
 }
 
-async fn wait_for_dynamodb_source_rows(
+pub(super) async fn wait_for_dynamodb_source_rows(
     client: &Client,
     table_name: &str,
     expected_rows: usize,
@@ -138,7 +138,7 @@ async fn wait_for_dynamodb_source_rows(
     ))
 }
 
-async fn ensure_dataset_rows(
+pub(super) async fn ensure_dataset_rows(
     rt: &Runtime,
     table_name: &str,
     expected_rows: usize,
@@ -199,7 +199,7 @@ pub fn make_dynamodb_dataset(
     dataset
 }
 
-async fn create_table(client: &Client, table_name: &str) {
+pub(super) async fn create_table(client: &Client, table_name: &str) {
     client
         .create_table()
         .attribute_definitions(
@@ -230,7 +230,7 @@ async fn create_table(client: &Client, table_name: &str) {
         .expect("Table created");
 }
 
-fn get_client(port: u16, access_key: &str, secret_key: &str) -> Client {
+pub(super) fn get_client(port: u16, access_key: &str, secret_key: &str) -> Client {
     let config = SdkConfig::builder()
         .endpoint_url(format!("http://localhost:{port}"))
         .credentials_provider(SharedCredentialsProvider::new(Credentials::from_keys(
@@ -243,7 +243,7 @@ fn get_client(port: u16, access_key: &str, secret_key: &str) -> Client {
     Client::new(&config)
 }
 
-async fn insert_rows(client: &Client, table_name: &str, range: Range<usize>) {
+pub(super) async fn insert_rows(client: &Client, table_name: &str, range: Range<usize>) {
     for i in range {
         client
             .put_item()
@@ -442,7 +442,7 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
         .await
 }
 
-async fn run_and_snapshot_query(
+pub(super) async fn run_and_snapshot_query(
     rt: &Runtime,
     query: &str,
     test_name: &str,
@@ -695,7 +695,7 @@ async fn wait_for_dataset_error(rt: &Runtime, dataset_name: &str, timeout_secs: 
     }
 }
 
-async fn wait_for_dataset_rows(
+pub(super) async fn wait_for_dataset_rows(
     rt: &Runtime,
     table_name: &str,
     expected_rows: usize,
