@@ -14,9 +14,7 @@
 
 use std::collections::HashMap;
 
-use spicepod::acceleration::{
-    Acceleration, Mode, RefreshMode, RefreshOnStartup, ZeroResultsAction,
-};
+use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use spicepod::component::ComponentOrReference;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{Runtime, TelemetryConfig};
@@ -49,7 +47,7 @@ pub(crate) fn generate_mongodb_spicepod(
         ..Runtime::default()
     };
 
-    for (dataset_name, config) in datasets {
+    for (dataset_name, dataset_config) in datasets {
         // `connection_string` is the correct connector param (not mongodb_*-prefixed).
         // `sslmode: disabled` prevents the driver from attempting TLS on plain connections.
         let mut param_map = HashMap::from([
@@ -57,16 +55,23 @@ pub(crate) fn generate_mongodb_spicepod(
             ("mongodb_sslmode".to_string(), "disabled".to_string()),
         ]);
 
-        if auto_load_complete {
-            param_map.insert("auto_load_complete".to_string(), "true".to_string());
-        }
+        let pks = &dataset_config.primary_key_columns;
+        let primary_key = match pks.len() {
+            0 => None,
+            1 => Some(pks[0].clone()),
+            _ => Some(format!("({})", pks.join(", "))),
+        };
+        let on_conflict = match &primary_key {
+            None => HashMap::new(),
+            Some(pk) => HashMap::from([(pk.clone(), OnConflictBehavior::Upsert)]),
+        };
 
         let mut dataset = Dataset::new(
             format!("mongodb:{MONGODB_DATABASE}.{dataset_name}"),
             dataset_name.as_str(),
         );
         dataset.params = Some(spicepod::param::Params::from_string_map(param_map));
-        dataset.columns = config
+        dataset.columns = dataset_config
             .schema
             .fields()
             .iter()
@@ -80,10 +85,9 @@ pub(crate) fn generate_mongodb_spicepod(
             enabled: true,
             engine: Some(acceleration_engine.to_string()),
             mode: Mode::File,
-            refresh_mode: Some(RefreshMode::Full),
-            refresh_on_startup: RefreshOnStartup::Auto,
-            refresh_retry_enabled: true,
-            on_zero_results: ZeroResultsAction::ReturnEmpty,
+            refresh_mode: Some(RefreshMode::Changes),
+            primary_key,
+            on_conflict,
             ..Acceleration::default()
         });
 
