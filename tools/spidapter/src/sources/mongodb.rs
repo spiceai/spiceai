@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use super::arrow_type_to_spicepod_str;
 
-/// Database name used for all MongoDB benchmark collections.
+/// Database name used for all `MongoDB` benchmark collections.
 const MONGODB_DATABASE: &str = "spicebench";
 
 pub(crate) fn generate_mongodb_spicepod(
@@ -51,18 +51,9 @@ pub(crate) fn generate_mongodb_spicepod(
 
     for (dataset_name, config) in datasets {
         let mut param_map = HashMap::from([
-            (
-                "mongodb_connection_string".to_string(),
-                uri.to_string(),
-            ),
-            (
-                "mongodb_collection".to_string(),
-                dataset_name.clone(),
-            ),
-            (
-                "mongodb_database".to_string(),
-                MONGODB_DATABASE.to_string(),
-            ),
+            ("mongodb_connection_string".to_string(), uri.to_string()),
+            ("mongodb_collection".to_string(), dataset_name.clone()),
+            ("mongodb_database".to_string(), MONGODB_DATABASE.to_string()),
         ]);
 
         if auto_load_complete {

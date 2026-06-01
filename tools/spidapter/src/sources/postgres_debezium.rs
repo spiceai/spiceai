@@ -19,7 +19,6 @@ use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode
 use spicepod::component::ComponentOrReference;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{Runtime, TelemetryConfig};
-use spicepod::metric::{Metric, Metrics};
 use spicepod::param::Params;
 use spicepod::semantic::Column;
 use spicepod::spec::SpicepodDefinition;
@@ -173,7 +172,9 @@ async fn register_single_connector(
         eprintln!("[stdio] Debezium: connector '{connector_name}' registered (status={status})");
     } else if status.as_u16() == 409 {
         // Connector already exists — delete and recreate for a fresh snapshot.
-        eprintln!("[stdio] Debezium: connector '{connector_name}' exists — deleting and recreating...");
+        eprintln!(
+            "[stdio] Debezium: connector '{connector_name}' exists — deleting and recreating..."
+        );
         let del = client
             .delete(format!("{connect_url}/connectors/{connector_name}"))
             .send()
@@ -195,7 +196,9 @@ async fn register_single_connector(
         let s = recreate.status();
         let b = recreate.text().await.unwrap_or_default();
         if !s.is_success() {
-            return Err(anyhow::anyhow!("Recreation of '{connector_name}' failed: {s} {b}"));
+            return Err(anyhow::anyhow!(
+                "Recreation of '{connector_name}' failed: {s} {b}"
+            ));
         }
         eprintln!("[stdio] Debezium: connector '{connector_name}' recreated (status={s})");
     } else {
@@ -216,7 +219,9 @@ async fn wait_for_connector_running(
     let timeout = Duration::from_secs(120);
     let started = tokio::time::Instant::now();
 
-    eprintln!("[stdio] Debezium: waiting for connector '{connector_name}' to reach RUNNING state...");
+    eprintln!(
+        "[stdio] Debezium: waiting for connector '{connector_name}' to reach RUNNING state..."
+    );
 
     loop {
         if started.elapsed() > timeout {
@@ -228,8 +233,7 @@ async fn wait_for_connector_running(
 
         match client.get(&status_url).send().await {
             Ok(resp) if resp.status().is_success() => {
-                let body: serde_json::Value =
-                    resp.json().await.unwrap_or(serde_json::Value::Null);
+                let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
 
                 let connector_state = body
                     .get("connector")
@@ -248,15 +252,13 @@ async fn wait_for_connector_running(
                     })
                     .unwrap_or_default();
 
-                eprintln!(
-                    "[stdio] Debezium: connector={connector_state} tasks={task_states:?}"
-                );
+                eprintln!("[stdio] Debezium: connector={connector_state} tasks={task_states:?}");
 
                 // Tasks RUNNING is sufficient — connector-level UNASSIGNED is a known
                 // Kafka Connect quirk in single-node deployments where the coordinator
                 // hasn't fully claimed the connector object but tasks are active.
-                let tasks_running = !task_states.is_empty()
-                    && task_states.iter().all(|&s| s == "RUNNING");
+                let tasks_running =
+                    !task_states.is_empty() && task_states.iter().all(|&s| s == "RUNNING");
 
                 if tasks_running {
                     eprintln!(
@@ -265,8 +267,10 @@ async fn wait_for_connector_running(
                     return Ok(());
                 }
 
-                if connector_state == "FAILED" || task_states.iter().any(|&s| s == "FAILED") {
-                    anyhow::bail!("Debezium connector '{connector_name}' entered FAILED state: {body}");
+                if connector_state == "FAILED" || task_states.contains(&"FAILED") {
+                    anyhow::bail!(
+                        "Debezium connector '{connector_name}' entered FAILED state: {body}"
+                    );
                 }
             }
             Ok(resp) => {
@@ -312,8 +316,14 @@ pub(crate) fn generate_postgres_debezium_spicepod(
         let topic = format!("spicebench.{}.{dataset_name}", pg.schema);
         let mut dataset = Dataset::new(format!("debezium:{topic}"), dataset_name.as_str());
         let mut param_map = HashMap::from([
-            ("kafka_bootstrap_servers".to_string(), kafka_brokers.to_string()),
-            ("kafka_security_protocol".to_string(), "PLAINTEXT".to_string()),
+            (
+                "kafka_bootstrap_servers".to_string(),
+                kafka_brokers.to_string(),
+            ),
+            (
+                "kafka_security_protocol".to_string(),
+                "PLAINTEXT".to_string(),
+            ),
             ("batch_max_size".to_string(), "50000".to_string()),
             ("batch_max_duration".to_string(), "1s".to_string()),
             ("kafka_session_timeout_ms".to_string(), "300000".to_string()),

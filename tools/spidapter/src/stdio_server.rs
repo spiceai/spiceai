@@ -43,9 +43,9 @@ mod sources;
 mod provision;
 
 use provision::{
-    Ec2PostgresInstance, is_ec2_mode, launch_ec2_debezium, launch_mongodb_ec2,
-    launch_postgres_ec2, provision_local_single_node, provision_local_spiced_cluster,
-    provision_scp_app, teardown_local_run, terminate_ec2_instance,
+    Ec2PostgresInstance, is_ec2_mode, launch_ec2_debezium, launch_mongodb_ec2, launch_postgres_ec2,
+    provision_local_single_node, provision_local_spiced_cluster, provision_scp_app,
+    teardown_local_run, terminate_ec2_instance,
 };
 use sources::cayenne::generate_cayenne_sink_spicepod;
 use sources::dynamodb::{
@@ -471,60 +471,51 @@ impl Handler for SpidapterHandler {
 
                 // In EC2 mode: launch Postgres + Debezium EC2 instances concurrently.
                 // In local mode: read KAFKA_BROKERS and DEBEZIUM_CONNECT_URL from env.
-                let (ec2_pg_instance, kafka_brokers, debezium_connect_url) =
-                    if is_ec2_mode(&self.args) {
-                        let (pg_res, deb_res) = tokio::join!(
-                            launch_postgres_ec2(&self.args, short_id),
-                            launch_ec2_debezium(&self.args, short_id)
-                        );
+                let (ec2_pg_instance, kafka_brokers, debezium_connect_url) = if is_ec2_mode(
+                    &self.args,
+                ) {
+                    let (pg_res, deb_res) = tokio::join!(
+                        launch_postgres_ec2(&self.args, short_id),
+                        launch_ec2_debezium(&self.args, short_id)
+                    );
 
-                        let ec2_pg = match pg_res {
-                            Ok(inst) => {
-                                ec2_guards.push(Ec2Guard::new(
-                                    inst.instance_id.clone(),
-                                    inst.region.clone(),
-                                ));
-                                Some(inst)
-                            }
-                            Err(e) => {
-                                return Err(format!(
-                                    "Failed to provision EC2 PostgreSQL instance: {e}"
-                                ));
-                            }
-                        };
+                    let ec2_pg = match pg_res {
+                        Ok(inst) => {
+                            ec2_guards
+                                .push(Ec2Guard::new(inst.instance_id.clone(), inst.region.clone()));
+                            Some(inst)
+                        }
+                        Err(e) => {
+                            return Err(format!(
+                                "Failed to provision EC2 PostgreSQL instance: {e}"
+                            ));
+                        }
+                    };
 
-                        let ec2_deb = match deb_res {
-                            Ok(inst) => {
-                                ec2_guards.push(Ec2Guard::new(
-                                    inst.instance_id.clone(),
-                                    inst.region.clone(),
-                                ));
-                                inst
-                            }
-                            Err(e) => {
-                                return Err(format!(
-                                    "Failed to provision EC2 Debezium instance: {e}"
-                                ));
-                            }
-                        };
+                    let ec2_deb = match deb_res {
+                        Ok(inst) => {
+                            ec2_guards
+                                .push(Ec2Guard::new(inst.instance_id.clone(), inst.region.clone()));
+                            inst
+                        }
+                        Err(e) => {
+                            return Err(format!("Failed to provision EC2 Debezium instance: {e}"));
+                        }
+                    };
 
-                        (
-                            ec2_pg,
-                            ec2_deb.kafka_brokers,
-                            ec2_deb.connect_url,
-                        )
-                    } else {
-                        let kafka_brokers = std::env::var("KAFKA_BROKERS").map_err(|_| {
-                            "KAFKA_BROKERS env var is required for local postgres-debezium mode"
-                                .to_string()
-                        })?;
-                        let debezium_connect_url =
+                    (ec2_pg, ec2_deb.kafka_brokers, ec2_deb.connect_url)
+                } else {
+                    let kafka_brokers = std::env::var("KAFKA_BROKERS").map_err(|_| {
+                        "KAFKA_BROKERS env var is required for local postgres-debezium mode"
+                            .to_string()
+                    })?;
+                    let debezium_connect_url =
                             std::env::var("DEBEZIUM_CONNECT_URL").map_err(|_| {
                                 "DEBEZIUM_CONNECT_URL env var is required for local postgres-debezium mode"
                                     .to_string()
                             })?;
-                        (None, kafka_brokers, debezium_connect_url)
-                    };
+                    (None, kafka_brokers, debezium_connect_url)
+                };
 
                 let pg = if let Some(ref ec2) = ec2_pg_instance {
                     Some(PgConfig {
@@ -638,11 +629,16 @@ impl Handler for SpidapterHandler {
         } = setup_config.storage
         {
             let table_names: Vec<&str> = datasets.keys().map(String::as_str).collect();
-            let debezium_pg_host = std::env::var("PG_DEBEZIUM_HOST")
-                .unwrap_or_else(|_| pg.host.clone());
-            register_debezium_postgres_connector(debezium_connect_url, pg, &debezium_pg_host, &table_names)
-                .await
-                .map_err(|e| format!("Failed to register Debezium PostgreSQL connector: {e}"))?;
+            let debezium_pg_host =
+                std::env::var("PG_DEBEZIUM_HOST").unwrap_or_else(|_| pg.host.clone());
+            register_debezium_postgres_connector(
+                debezium_connect_url,
+                pg,
+                &debezium_pg_host,
+                &table_names,
+            )
+            .await
+            .map_err(|e| format!("Failed to register Debezium PostgreSQL connector: {e}"))?;
         }
 
         // For Cayenne: provision spiced first (Flight URL needed to build SinkConfig).
@@ -995,19 +991,18 @@ impl Handler for SpidapterHandler {
             }
         }
         if let Some(mut guard) = dynamodb_guard
-            && let Some(info) = guard.disarm() {
-                cleanup.spawn(async move {
-                    eprintln!(
-                        "[stdio] teardown: deleting {} DynamoDB table(s)",
-                        info.table_names.len()
-                    );
-                    if let Err(e) = delete_dynamodb_tables(&info).await {
-                        eprintln!(
-                            "[stdio] teardown: warning: failed to delete DynamoDB tables: {e}"
-                        );
-                    }
-                });
-            }
+            && let Some(info) = guard.disarm()
+        {
+            cleanup.spawn(async move {
+                eprintln!(
+                    "[stdio] teardown: deleting {} DynamoDB table(s)",
+                    info.table_names.len()
+                );
+                if let Err(e) = delete_dynamodb_tables(&info).await {
+                    eprintln!("[stdio] teardown: warning: failed to delete DynamoDB tables: {e}");
+                }
+            });
+        }
         while cleanup.join_next().await.is_some() {}
 
         Ok(TeardownResponse { ok: true })
@@ -1398,15 +1393,13 @@ async fn generate_initial_spicepod(
                 datasets,
                 args.auto_load_complete,
             ),
-            FederatedStorageConfig::MongoDB { uri, acceleration } => {
-                generate_mongodb_spicepod(
-                    run_id,
-                    uri,
-                    datasets,
-                    acceleration_engine_str(*acceleration),
-                    args.auto_load_complete,
-                )
-            }
+            FederatedStorageConfig::MongoDB { uri, acceleration } => generate_mongodb_spicepod(
+                run_id,
+                uri,
+                datasets,
+                acceleration_engine_str(*acceleration),
+                args.auto_load_complete,
+            ),
         }
     };
 

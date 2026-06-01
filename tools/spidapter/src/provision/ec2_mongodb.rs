@@ -29,16 +29,16 @@ const MONGO_PORT: u16 = 27017;
 const DEFAULT_MONGO_USER: &str = "spicebench";
 const DEFAULT_MONGO_DATABASE: &str = "spicebench";
 
-/// A provisioned EC2 instance running MongoDB.
+/// A provisioned EC2 instance running `MongoDB`.
 pub(crate) struct Ec2MongoInstance {
     pub(crate) instance_id: String,
     pub(crate) host: String,
-    /// Full MongoDB connection URI: `mongodb://user:password@host:27017/spicebench`
+    /// Full `MongoDB` connection URI: `mongodb://user:password@host:27017/spicebench`
     pub(crate) uri: String,
     pub(crate) region: String,
 }
 
-/// Launch an EC2 instance, install MongoDB, and wait until it accepts connections.
+/// Launch an EC2 instance, install `MongoDB`, and wait until it accepts connections.
 pub(crate) async fn launch_mongodb_ec2(
     args: &StdioArgs,
     run_id_short: &str,
@@ -179,7 +179,7 @@ pub(crate) async fn launch_mongodb_ec2(
     })
 }
 
-/// Build the cloud-init user-data script that installs and configures MongoDB.
+/// Build the cloud-init user-data script that installs and configures `MongoDB`.
 fn mongodb_user_data(user: &str, password: &str, database: &str) -> String {
     format!(
         r#"#!/bin/bash
@@ -254,21 +254,32 @@ async fn wait_for_instance_running(ec2: &Ec2Client, instance_id: &str) -> anyhow
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     loop {
         if tokio::time::Instant::now() > deadline {
-            anyhow::bail!("Timed out waiting for EC2 instance {instance_id} to reach running state");
+            anyhow::bail!(
+                "Timed out waiting for EC2 instance {instance_id} to reach running state"
+            );
         }
-        let result = ec2.describe_instances().instance_ids(instance_id).send().await;
+        let result = ec2
+            .describe_instances()
+            .instance_ids(instance_id)
+            .send()
+            .await;
         match result {
             Err(e) => {
                 let is_not_found = e.as_service_error().and_then(|se| se.meta().code())
                     == Some("InvalidInstanceID.NotFound");
                 if !is_not_found {
-                    return Err(anyhow::anyhow!("Failed to describe EC2 instance {instance_id}: {e:#?}"));
+                    return Err(anyhow::anyhow!(
+                        "Failed to describe EC2 instance {instance_id}: {e:#?}"
+                    ));
                 }
-                eprintln!("[stdio] EC2 MongoDB: instance {instance_id} not yet visible, retrying...");
+                eprintln!(
+                    "[stdio] EC2 MongoDB: instance {instance_id} not yet visible, retrying..."
+                );
             }
             Ok(desc) => {
                 let state = desc
-                    .reservations().first()
+                    .reservations()
+                    .first()
                     .and_then(|r| r.instances().first())
                     .and_then(|i| i.state())
                     .and_then(|s| s.name())
@@ -276,7 +287,9 @@ async fn wait_for_instance_running(ec2: &Ec2Client, instance_id: &str) -> anyhow
                 match state.as_deref() {
                     Some("running") => return Ok(()),
                     Some("terminated" | "shutting-down") => {
-                        anyhow::bail!("EC2 instance {instance_id} reached terminal state unexpectedly");
+                        anyhow::bail!(
+                            "EC2 instance {instance_id} reached terminal state unexpectedly"
+                        );
                     }
                     _ => {}
                 }
@@ -287,9 +300,14 @@ async fn wait_for_instance_running(ec2: &Ec2Client, instance_id: &str) -> anyhow
 }
 
 async fn get_instance_public_ip(ec2: &Ec2Client, instance_id: &str) -> anyhow::Result<String> {
-    let desc = ec2.describe_instances().instance_ids(instance_id).send().await
+    let desc = ec2
+        .describe_instances()
+        .instance_ids(instance_id)
+        .send()
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to describe EC2 instance {instance_id}: {e:#?}"))?;
-    desc.reservations().first()
+    desc.reservations()
+        .first()
         .and_then(|r| r.instances().first())
         .and_then(|i| i.public_ip_address())
         .map(str::to_string)
@@ -297,9 +315,14 @@ async fn get_instance_public_ip(ec2: &Ec2Client, instance_id: &str) -> anyhow::R
 }
 
 async fn get_instance_private_ip(ec2: &Ec2Client, instance_id: &str) -> anyhow::Result<String> {
-    let desc = ec2.describe_instances().instance_ids(instance_id).send().await
+    let desc = ec2
+        .describe_instances()
+        .instance_ids(instance_id)
+        .send()
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to describe EC2 instance {instance_id}: {e:#?}"))?;
-    desc.reservations().first()
+    desc.reservations()
+        .first()
         .and_then(|r| r.instances().first())
         .and_then(|i| i.private_ip_address())
         .map(str::to_string)
