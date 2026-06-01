@@ -1115,3 +1115,140 @@ async fn test_duckdb_connection_pool_concurrent_queries() -> Result<(), String> 
         })
         .await
 }
+
+/// A Parquet file written with an all-null column has `DataType::Null` in its Arrow schema
+/// metadata (logical type Unknown). `DuckDB` doesn't have a Null type and silently coerces
+/// it to INT32 when creating the acceleration table. Without the fix this produces a schema
+/// mismatch at query time; with the fix the accelerator normalises the column to INT32 before
+/// creating the table so both sides agree.
+#[tokio::test]
+async fn duckdb_acceleration_null_typed_parquet_column() -> Result<(), String> {
+    use arrow::array::{Int64Array, NullArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::parquet::arrow::ArrowWriter;
+
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            // Build a parquet file whose `untyped` column carries DataType::Null — the same
+            // situation as a pyarrow file where every value in a column is null and the
+            // column was never given an explicit type.
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("untyped", DataType::Null, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 2, 3])),
+                    Arc::new(NullArray::new(3)),
+                ],
+            )
+            .map_err(|e| format!("failed to create batch: {e}"))?;
+
+            let temp_dir =
+                tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
+            let parquet_path = temp_dir.path().join("null_col.parquet");
+            {
+                let file = std::fs::File::create(&parquet_path)
+                    .map_err(|e| format!("failed to create parquet file: {e}"))?;
+                let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)
+                    .map_err(|e| format!("failed to create ArrowWriter: {e}"))?;
+                writer
+                    .write(&batch)
+                    .map_err(|e| format!("failed to write batch: {e}"))?;
+                writer
+                    .close()
+                    .map_err(|e| format!("failed to close writer: {e}"))?;
+            }
+
+            let mut dataset = Dataset::new(
+                format!("duckdb:read_parquet('{}')", parquet_path.display()),
+                "null_col_parquet".to_string(),
+            );
+            dataset.name = "null_col_parquet".to_string();
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("duckdb".to_string()),
+                mode: Mode::Memory,
+                refresh_mode: Some(RefreshMode::Full),
+                ..Acceleration::default()
+            });
+
+            let app = AppBuilder::new("duckdb_null_col_test")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err("Timed out waiting for dataset to load".to_string());
+                }
+                () = Arc::clone(&cloned_rt).load_components() => {}
+            }
+
+            runtime_ready_check(&cloned_rt).await;
+
+            let result = cloned_rt
+                .datafusion()
+                .query_builder("SELECT id, untyped FROM null_col_parquet ORDER BY id")
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("query failed: {e}"))?;
+
+            let batches: Vec<RecordBatch> = result
+                .data
+                .try_collect()
+                .await
+                .map_err(|e| format!("failed to collect results: {e}"))?;
+
+            assert_batches_eq!(
+                [
+                    "+----+---------+",
+                    "| id | untyped |",
+                    "+----+---------+",
+                    "| 1  |         |",
+                    "| 2  |         |",
+                    "| 3  |         |",
+                    "+----+---------+",
+                ],
+                &batches
+            );
+
+            let result = cloned_rt
+                .datafusion()
+                .query_builder("describe null_col_parquet")
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("query failed: {e}"))?;
+
+            let batches: Vec<RecordBatch> = result
+                .data
+                .try_collect()
+                .await
+                .map_err(|e| format!("failed to collect results: {e}"))?;
+
+            assert_batches_eq!(
+                [
+                    "+-------------+-----------+-------------+",
+                    "| column_name | data_type | is_nullable |",
+                    "+-------------+-----------+-------------+",
+                    "| id          | Int64     | YES         |",
+                    "| untyped     | Int32     | YES         |",
+                    "+-------------+-----------+-------------+",
+                ],
+                &batches
+            );
+
+            Ok(())
+        })
+        .await
+}
