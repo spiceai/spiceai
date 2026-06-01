@@ -481,8 +481,6 @@ fn standalone_spiced_args(bind_host: &str, ports: LocalPorts, spicepod_path: &Pa
         format!("{bind_host}:{}", ports.http),
         "--flight".to_string(),
         format!("{bind_host}:{}", ports.flight),
-        "--metrics".to_string(),
-        format!("{bind_host}:9090"),
         spicepod_path.display().to_string(),
     ]
 }

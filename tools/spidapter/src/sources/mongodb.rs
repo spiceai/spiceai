@@ -50,10 +50,10 @@ pub(crate) fn generate_mongodb_spicepod(
     };
 
     for (dataset_name, config) in datasets {
+        // The MongoDB connector uses `connection_string` (not mongodb_*-prefixed).
+        // Database and collection are derived from the `from:` URI; no separate params needed.
         let mut param_map = HashMap::from([
-            ("mongodb_connection_string".to_string(), uri.to_string()),
-            ("mongodb_collection".to_string(), dataset_name.clone()),
-            ("mongodb_database".to_string(), MONGODB_DATABASE.to_string()),
+            ("connection_string".to_string(), uri.to_string()),
         ]);
 
         if auto_load_complete {
