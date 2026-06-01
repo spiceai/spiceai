@@ -178,6 +178,7 @@ datafusion-physical-expr-adapter = "52.0.0"
 datafusion-physical-expr-common = "52.0.0"
 datafusion-physical-plan = "52.0.0"
 datafusion-proto = { version = "52.0.0", features = ["json"] }
+datafusion-proto-common = { version = "52.0.0" }
 datafusion-pruning = "52.0.0"
 datafusion-spark = "52.0.0"
 datafusion-substrait = "52.0.0"

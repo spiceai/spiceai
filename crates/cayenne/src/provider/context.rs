@@ -24,7 +24,7 @@ use vortex::VortexSessionDefault;
 use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions};
 use vortex_session::VortexSession;
 
-use crate::metadata::{PkConflictDetection, VortexConfig};
+use crate::metadata::{DeletionMode, PkConflictDetection, VortexConfig};
 
 /// Shared context for Cayenne table operations.
 ///
@@ -54,6 +54,19 @@ pub struct CayenneContext {
     /// are shared with the main query engine.
     runtime_env: Arc<RuntimeEnv>,
 }
+
+/// Default byte budget for the in-memory PK keyset cache when
+/// `cayenne_pk_keyset_cache_mb` is unset. 256 MiB preserves historical behavior;
+/// raise the param on memory-rich hosts so high-cardinality tables keep their
+/// keyset resident instead of rebuilding it from a full-table scan every CDC
+/// batch.
+pub(crate) const DEFAULT_PK_KEYSET_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Hard ceiling on the configurable PK keyset cache budget. The budget doubles as
+/// the bloom allocation size (`PkBloom::with_byte_budget`), so an out-of-range or
+/// typo'd `cayenne_pk_keyset_cache_mb` must not be able to request a
+/// near-`usize::MAX` allocation. Matches the auto-default's 8 GiB ceiling.
+pub(crate) const PK_KEYSET_CACHE_MAX_CONFIGURABLE_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 impl CayenneContext {
     /// Create a new Cayenne context from configuration.
@@ -168,6 +181,29 @@ impl CayenneContext {
     #[must_use]
     pub(crate) fn pk_conflict_detection(&self) -> PkConflictDetection {
         self.config.pk_conflict_detection
+    }
+
+    /// How primary-key deletions are recorded and applied for PK tables.
+    /// The default `auto` resolves to `position` (merge-on-read position-delete
+    /// vectors); `key` is the opt-out that keeps the above-scan key-based filter.
+    #[must_use]
+    pub(crate) fn deletion_mode(&self) -> DeletionMode {
+        self.config.deletion_mode
+    }
+
+    /// Byte budget for the in-memory PK keyset cache used during upsert conflict
+    /// detection. See [`DEFAULT_PK_KEYSET_CACHE_MAX_BYTES`].
+    #[must_use]
+    pub(crate) fn pk_keyset_cache_max_bytes(&self) -> usize {
+        self.config
+            .pk_keyset_cache_mb
+            .map_or(DEFAULT_PK_KEYSET_CACHE_MAX_BYTES, |mb| {
+                // Cap the configured budget: it doubles as the bloom allocation
+                // size, so a huge/typo'd value would otherwise saturate and try
+                // to allocate ~`usize::MAX`. `0` is preserved (forces the bloom).
+                mb.saturating_mul(1024 * 1024)
+                    .min(PK_KEYSET_CACHE_MAX_CONFIGURABLE_BYTES)
+            })
     }
 
     /// Build the compaction picker config from the underlying `VortexConfig`.

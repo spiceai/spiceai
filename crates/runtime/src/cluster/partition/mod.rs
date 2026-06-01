@@ -120,3 +120,373 @@ pub fn get_partition_filter_exprs(
         .unwrap_or_else(|| unreachable!("partitions is not empty"));
     vec![combined]
 }
+
+/// Computes the per-executor [`Statistics`] for the slice of `table` this
+/// executor has accelerated locally, returning the encoded statistics bytes and
+/// the column names they're aligned to (so the coordinator can project column
+/// stats onto a possibly-projected leaf scan by name).
+///
+/// Reports `num_rows` AND per-column min/max (and, for integer columns, an
+/// approximate `distinct_count`) — these are what let the coordinator's planner
+/// estimate join/aggregate output cardinalities and pick hash-join build sides
+/// (q18 swap). Stats are sourced, in order:
+///
+/// 1. **Scan-plan statistics** (metadata-only). In append-only ("events") ingest
+///    Cayenne collects per-column min/max from file footers, so the scan plan
+///    carries `num_rows` + bounds with zero extra cost.
+/// 2. **Aggregate query** fallback. Under CDC ("changes") ingest Cayenne disables
+///    footer-stat collection while position-based deletions are pending, so the
+///    scan plan yields no column bounds. Derive `num_rows` + per-column min/max
+///    (+ `approx_distinct` for integer columns) with a single aggregate. Running
+///    through the scan applies the deletion filter, so the values are exact for
+///    the executor's live slice.
+///
+/// Why the integer `distinct_count` matters: a join key whose values are *sparse*
+/// over a wide domain (e.g. CDC `o_custkey` ranging to ~1e9 with only ~1M
+/// distinct) has a min/max range far larger than its true NDV. Without a distinct
+/// count, the planner's `max_distinct_count` falls back to the range / row count
+/// and badly over-estimates the key's cardinality, which under-estimates the join
+/// and prevents the build-side swap. Reporting an approximate NDV lets the
+/// planner size the join correctly. (The append-only case doesn't need this — its
+/// keys are dense, so the min/max range already approximates the NDV.)
+///
+/// Note: in clustered mode an executor's accelerated table is registered
+/// *non-partitioned* (`partition_by` is cleared once the executor has partition
+/// assignments — see `init::dataset`), so this goes through the generic table
+/// provider rather than a `PartitionTableProvider`.
+///
+/// Best-effort: returns `None` when the row count can't be determined. Returns the
+/// decoded [`Statistics`] (the reporter decides how rich they are and handles
+/// encoding/caching — see [`StatsRichness`]).
+///
+/// [`Statistics`]: datafusion::common::Statistics
+pub(crate) async fn local_executor_table_statistics(
+    df: &crate::datafusion::DataFusion,
+    table: &datafusion::sql::TableReference,
+) -> Option<(datafusion::common::Statistics, Vec<String>)> {
+    let provider = df.get_table(table).await?;
+    let schema = provider.schema();
+    let column_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+
+    // Primary: scan-plan statistics (num_rows + per-column min/max). No
+    // projection so column stats cover every column.
+    let session_state = df.ctx.state();
+    let scan_stats = match provider.scan(&session_state, None, &[], None).await {
+        Ok(plan) => plan.partition_statistics(None).ok(),
+        Err(_) => None,
+    };
+
+    // Use scan-plan stats directly only when complete enough for join sizing:
+    // num_rows present AND at least one column carries a min/max bound.
+    if let Some(stats) = scan_stats
+        && stats.num_rows.get_value().is_some()
+        && has_any_column_bounds(&stats)
+    {
+        return Some((stats, column_names));
+    }
+
+    // Fallback (CDC / no footer stats): aggregate query for num_rows + min/max
+    // (+ integer NDV), degrading to a num_rows-only COUNT(*) if it fails. The
+    // reporter is responsible for not clobbering richer cached stats with a
+    // degraded result (see `run_executor_statistics_reporter`).
+    let stats = match aggregate_table_statistics(df, table, &schema).await {
+        Some(stats) => stats,
+        None => count_only_statistics(df, table, &schema)
+            .await
+            .or_else(|| {
+                tracing::debug!(table = %table, "No local statistics available for executor table");
+                None
+            })?,
+    };
+
+    Some((stats, column_names))
+}
+
+/// How useful a [`Statistics`] is for distributed join sizing. The reporter uses
+/// this to avoid broadcasting a degraded stat over a previously-cached richer one
+/// (which would make the coordinator's join-build-side choice flap — the q18
+/// swap fires only while the coordinator holds the column stats).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum StatsRichness {
+    /// `num_rows` only — no per-column bounds (e.g. the `COUNT(*)` fallback).
+    RowCountOnly,
+    /// Per-column min/max present, but no distinct counts.
+    Bounds,
+    /// Per-column min/max AND at least one distinct count (best for sizing joins
+    /// on sparse keys — see [`local_executor_table_statistics`]).
+    BoundsAndDistinct,
+}
+
+/// Classify a [`Statistics`] for the reporter's non-degrading cache.
+pub(crate) fn classify_stats_richness(stats: &datafusion::common::Statistics) -> StatsRichness {
+    use datafusion::common::stats::Precision;
+    let mut has_bounds = false;
+    let mut has_distinct = false;
+    for c in &stats.column_statistics {
+        if !matches!(c.min_value, Precision::Absent) || !matches!(c.max_value, Precision::Absent) {
+            has_bounds = true;
+        }
+        if !matches!(c.distinct_count, Precision::Absent) {
+            has_distinct = true;
+        }
+    }
+    match (has_bounds, has_distinct) {
+        (_, true) => StatsRichness::BoundsAndDistinct,
+        (true, false) => StatsRichness::Bounds,
+        (false, false) => StatsRichness::RowCountOnly,
+    }
+}
+
+/// True if any column in `stats` carries a usable min or max bound.
+fn has_any_column_bounds(stats: &datafusion::common::Statistics) -> bool {
+    use datafusion::common::stats::Precision;
+    stats.column_statistics.iter().any(|c| {
+        !matches!(c.min_value, Precision::Absent) || !matches!(c.max_value, Precision::Absent)
+    })
+}
+
+/// Whether `min`/`max` aggregates are supported for `dt` (scalar types only, so
+/// the synthesized aggregate query can't fail on a nested/unsupported column).
+fn supports_minmax(dt: &datafusion::arrow::datatypes::DataType) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    matches!(
+        dt,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+    )
+}
+
+/// Whether to collect an approximate `distinct_count` for `dt`. Restricted to
+/// integer types: these are the join-key candidates (e.g. `*_custkey`,
+/// `*_orderkey`) whose NDV can diverge sharply from their min/max range under
+/// sparse-key CDC data, and `approx_distinct` (`HyperLogLog`) over one integer
+/// column is cheap to fold into the existing aggregate scan.
+fn supports_ndv(dt: &datafusion::arrow::datatypes::DataType) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    matches!(
+        dt,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    )
+}
+
+/// Quote an identifier for SQL (double-quoted, internal quotes doubled).
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Convert the single-row aggregate result at `array[0]` into a min/max bound,
+/// treating null (empty/all-null column) as `Absent`.
+fn scalar_bound(
+    array: &datafusion::arrow::array::ArrayRef,
+) -> datafusion::common::stats::Precision<datafusion::common::ScalarValue> {
+    use datafusion::common::ScalarValue;
+    use datafusion::common::stats::Precision;
+    match ScalarValue::try_from_array(array, 0) {
+        Ok(sv) if !sv.is_null() => Precision::Exact(sv),
+        _ => Precision::Absent,
+    }
+}
+
+/// Effective max for a column given its approximate distinct count: the tighter
+/// of the true max and `min + ndv`, marked inexact. Returns `true_max` unchanged
+/// when there's no ndv, no usable min, the column isn't an integer type, or the
+/// synthetic value isn't tighter (dense keys). See the call site for why this
+/// matters for sparse-key join sizing.
+fn effective_max_for_ndv(
+    min: &datafusion::common::stats::Precision<datafusion::common::ScalarValue>,
+    ndv: Option<usize>,
+    true_max: datafusion::common::stats::Precision<datafusion::common::ScalarValue>,
+) -> datafusion::common::stats::Precision<datafusion::common::ScalarValue> {
+    use datafusion::common::ScalarValue as SV;
+    use datafusion::common::stats::Precision;
+
+    let (Some(ndv), Some(min_sv)) = (ndv, min.get_value()) else {
+        return true_max;
+    };
+    let ndv = i128::try_from(ndv).unwrap_or(i128::MAX);
+    let add = |m: i128| -> i128 { m.saturating_add(ndv) };
+    // Synthetic max = min + ndv, in the column's own integer type.
+    let synthetic = match min_sv {
+        SV::Int8(Some(m)) => i8::try_from(add(i128::from(*m)))
+            .ok()
+            .map(|v| SV::Int8(Some(v))),
+        SV::Int16(Some(m)) => i16::try_from(add(i128::from(*m)))
+            .ok()
+            .map(|v| SV::Int16(Some(v))),
+        SV::Int32(Some(m)) => i32::try_from(add(i128::from(*m)))
+            .ok()
+            .map(|v| SV::Int32(Some(v))),
+        SV::Int64(Some(m)) => i64::try_from(add(i128::from(*m)))
+            .ok()
+            .map(|v| SV::Int64(Some(v))),
+        SV::UInt8(Some(m)) => u8::try_from(add(i128::from(*m)))
+            .ok()
+            .map(|v| SV::UInt8(Some(v))),
+        SV::UInt16(Some(m)) => u16::try_from(add(i128::from(*m)))
+            .ok()
+            .map(|v| SV::UInt16(Some(v))),
+        SV::UInt32(Some(m)) => u32::try_from(add(i128::from(*m)))
+            .ok()
+            .map(|v| SV::UInt32(Some(v))),
+        SV::UInt64(Some(m)) => u64::try_from(add(i128::from(*m)))
+            .ok()
+            .map(|v| SV::UInt64(Some(v))),
+        _ => None,
+    };
+    match (synthetic, true_max.get_value()) {
+        // Only tighten — never widen past the real max.
+        (Some(syn), Some(tmax)) if &syn < tmax => Precision::Inexact(syn),
+        _ => true_max,
+    }
+}
+
+/// Read a non-negative count from the single-row aggregate result at `array[0]`,
+/// accepting either `Int64` (`COUNT`) or `UInt64` (`approx_distinct`).
+fn count_at(array: &datafusion::arrow::array::ArrayRef) -> Option<usize> {
+    use datafusion::arrow::array::{Int64Array, UInt64Array};
+    if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
+        return usize::try_from(a.value(0)).ok();
+    }
+    if let Some(a) = array.as_any().downcast_ref::<UInt64Array>() {
+        return usize::try_from(a.value(0)).ok();
+    }
+    None
+}
+
+/// Derive `num_rows` + per-column min/max (+ integer `approx_distinct`) for the
+/// executor's local slice of `table` via a single aggregate query. Returns `None`
+/// if the query fails or yields no row.
+async fn aggregate_table_statistics(
+    df: &crate::datafusion::DataFusion,
+    table: &datafusion::sql::TableReference,
+    schema: &datafusion::arrow::datatypes::SchemaRef,
+) -> Option<datafusion::common::Statistics> {
+    use datafusion::common::stats::Precision;
+    use datafusion::common::{ColumnStatistics, Statistics};
+
+    // COUNT(*) at column 0, then per supported column: min, max, and (for integer
+    // columns) approx_distinct. `layout` records each column's result indices.
+    let mut select_exprs: Vec<String> = vec!["COUNT(*) AS __sr_count".to_string()];
+    // (schema field index, min idx, max idx, optional ndv idx) in the result batch.
+    let mut layout: Vec<(usize, usize, usize, Option<usize>)> = Vec::new();
+    let mut next = 1usize;
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if !supports_minmax(field.data_type()) {
+            continue;
+        }
+        let col = quote_ident(field.name());
+        let (min_idx, max_idx) = (next, next + 1);
+        select_exprs.push(format!("min({col}) AS __sr_min{idx}"));
+        select_exprs.push(format!("max({col}) AS __sr_max{idx}"));
+        next += 2;
+        let ndv_idx = if supports_ndv(field.data_type()) {
+            select_exprs.push(format!("approx_distinct({col}) AS __sr_ndv{idx}"));
+            let n = next;
+            next += 1;
+            Some(n)
+        } else {
+            None
+        };
+        layout.push((idx, min_idx, max_idx, ndv_idx));
+    }
+
+    let sql = format!(
+        "SELECT {} FROM {}",
+        select_exprs.join(", "),
+        table.to_quoted_string()
+    );
+    let batches = df.ctx.sql(&sql).await.ok()?.collect().await.ok()?;
+    let batch = batches.into_iter().find(|b| b.num_rows() > 0)?;
+
+    let num_rows = count_at(batch.column(0))?;
+
+    // Per-column bounds for supported columns, keyed by schema field index.
+    let mut bounds: HashMap<usize, ColumnStatistics> = HashMap::new();
+    for (field_idx, min_idx, max_idx, ndv_idx) in layout {
+        let min_value = scalar_bound(batch.column(min_idx));
+        let true_max = scalar_bound(batch.column(max_idx));
+        let ndv = ndv_idx.and_then(|i| count_at(batch.column(i)));
+        let distinct_count = ndv.map_or(Precision::Absent, Precision::Inexact);
+        // Report an *effective* max for integer columns: min(true_max, min + ndv),
+        // marked inexact. The planner estimates a key's distinct count from the
+        // min/max range when no distinct count is available (and `UnionExec` drops
+        // distinct counts when merging the per-executor scans of one table). For a
+        // sparse key — e.g. CDC `o_custkey` spanning ~1e9 with only ~1M distinct —
+        // the raw range hugely over-estimates the NDV, which under-estimates joins
+        // and prevents the q18 build-side swap. Tightening the reported range to
+        // the NDV makes the range-based estimate accurate. min/max survive the
+        // union natively, so this needs no change to `UnionExec`. Dense keys are
+        // unaffected (min + ndv ≈ true_max). Inexact bounds can't trip
+        // empty-relation pruning (that requires Exact(0)), and these federated leaf
+        // stats are planning estimates only (executors re-run the real query).
+        let max_value = effective_max_for_ndv(&min_value, ndv, true_max);
+        bounds.insert(
+            field_idx,
+            ColumnStatistics {
+                null_count: Precision::Absent,
+                min_value,
+                max_value,
+                sum_value: Precision::Absent,
+                distinct_count,
+                byte_size: Precision::Absent,
+            },
+        );
+    }
+
+    // Align column_statistics positionally with the full schema (= column_names).
+    let column_statistics = (0..schema.fields().len())
+        .map(|i| {
+            bounds
+                .remove(&i)
+                .unwrap_or_else(ColumnStatistics::new_unknown)
+        })
+        .collect();
+
+    Some(Statistics {
+        num_rows: Precision::Inexact(num_rows),
+        total_byte_size: Precision::Absent,
+        column_statistics,
+    })
+}
+
+/// Last-resort fallback: `COUNT(*)` → `num_rows` only, no column bounds.
+async fn count_only_statistics(
+    df: &crate::datafusion::DataFusion,
+    table: &datafusion::sql::TableReference,
+    schema: &datafusion::arrow::datatypes::SchemaRef,
+) -> Option<datafusion::common::Statistics> {
+    use datafusion::common::stats::Precision;
+
+    let sql = format!("SELECT COUNT(*) AS n FROM {}", table.to_quoted_string());
+    let batches = df.ctx.sql(&sql).await.ok()?.collect().await.ok()?;
+    let batch = batches.into_iter().find(|b| b.num_rows() > 0)?;
+    let n = count_at(batch.column(0))?;
+    Some(datafusion::common::Statistics::new_unknown(schema).with_num_rows(Precision::Inexact(n)))
+}

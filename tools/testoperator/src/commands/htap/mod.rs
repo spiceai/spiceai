@@ -17,6 +17,7 @@ limitations under the License.
 //! HTAP test command — runs concurrent TPC-C OLTP workload against the source
 //! Postgres database while executing CH-benCH analytical queries through spiced.
 
+mod correctness;
 mod staleness;
 
 use std::sync::Arc;
@@ -137,6 +138,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     let (_, test_builder) = super::build_test_with_validation(
         test_args,
+        &app,
         NotStarted::new()
             .with_parallel_count(1)
             .with_end_condition(EndCondition::Duration(Duration::from_secs(
@@ -241,17 +243,58 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         }
     }
 
+    if let Some(metrics) = spiced_metrics {
+        emit_replication_metrics(&metrics, "under load", true);
+    }
+
+    // 10. Data-correctness gate: OLTP has stopped, so wait for replication to
+    //     fully drain (bounded by the test duration) and then assert that
+    //     source and Spice row counts match for every replicated table.
+    let probe_tables: Vec<String> = driver
+        .probe_tables()
+        .iter()
+        .map(|t| (*t).to_string())
+        .collect();
+    let correctness_result = {
+        let spice_client = spiced_instance.spice_client(None, true).await?;
+        correctness::verify_after_drain(Arc::clone(&driver), &spice_client, &probe_tables, duration)
+            .await
+    };
+
     let health_report = health_monitor.stop().await;
 
-    if let Some(ref metrics) = spiced_metrics {
-        emit_replication_metrics(metrics);
+    let mut error_messages = Vec::new();
+
+    // Record correctness results (including OpenTelemetry metrics) before flushing telemetry below.
+    match correctness_result {
+        Ok(report) => {
+            report.emit();
+            // If replication failed to converge, re-scrape the live lag one more time for diagnostics
+            if report.converged_at.is_none() {
+                match crate::spiced_metrics::MetricsScraper::scrape_once().await {
+                    Ok(metrics) => {
+                        emit_replication_metrics(&metrics, "post-drain re-scrape", false);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Failed to re-scrape replication metrics after non-convergence: {e}"
+                        );
+                    }
+                }
+            }
+            if let Some(message) = report.failure_message() {
+                error_messages.push(message);
+            }
+        }
+        Err(e) => {
+            error_messages.push(format!("HTAP data-correctness error: {e}"));
+        }
     }
 
     telemetry.emit().await?;
     spiced_instance.stop()?;
 
     let health_report = health_report?;
-    let mut error_messages = Vec::new();
 
     if !test_succeeded {
         error_messages.push(format!(
@@ -272,7 +315,16 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 }
 
 /// Emits replication metrics scraped from spiced's `/metrics` endpoint.
-fn emit_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
+///
+/// `phase` labels the scrape context (e.g. "under load", "post-drain re-scrape").
+/// `record_telemetry` controls whether the values are recorded to OpenTelemetry —
+/// only the primary under-load scrape should be recorded so diagnostic re-scrapes
+/// don't overwrite the headline lag metric.
+fn emit_replication_metrics(
+    metrics: &crate::spiced_metrics::SpicedMetrics,
+    phase: &str,
+    record_telemetry: bool,
+) {
     use std::collections::{BTreeMap, BTreeSet};
 
     // Collect replication metrics per dataset from scraped samples.
@@ -350,7 +402,7 @@ fn emit_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
         return;
     }
 
-    println!("\nReplication Metrics (last scrape from spiced)");
+    println!("\nReplication Metrics ({phase})");
     // Header
     println!(
         "  {:<14} {:>10} {:>12} {:>10} {:>10} {:>10} {:>10} {:>10}",
@@ -387,8 +439,10 @@ fn emit_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
             "  {dataset:<14} {l_ms:>10.0} {l_bytes:>12.0} {ins:>10.0} {upd:>10.0} {del:>10.0} {recv:>10.0} {reconn:>10.0}",
         );
 
-        crate::metrics::REPLICATION_LAG_MS
-            .record(l_ms, &[KeyValue::new("dataset", (*dataset).clone())]);
+        if record_telemetry {
+            crate::metrics::REPLICATION_LAG_MS
+                .record(l_ms, &[KeyValue::new("dataset", (*dataset).clone())]);
+        }
         if l_ms > worst_lag_ms {
             worst_lag_ms = l_ms;
         }
@@ -396,5 +450,7 @@ fn emit_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
     println!();
 
     // Headline: worst replication lag across all datasets.
-    crate::metrics::REPLICATION_LAG_MS.record(worst_lag_ms, &[]);
+    if record_telemetry {
+        crate::metrics::REPLICATION_LAG_MS.record(worst_lag_ms, &[]);
+    }
 }

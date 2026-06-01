@@ -49,6 +49,7 @@ use super::super::Error;
 use super::super::deletion_strategy::{
     Int64PkDeletionSnapshot, PkDeletionStrategyWithCache, RowConverterDeletionSnapshot,
 };
+use super::super::memory_account::CayenneMemoryAccount;
 use super::super::utils::convert_to_u64_box;
 use super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use crate::catalog::MetadataCatalog;
@@ -101,6 +102,8 @@ pub struct CayenneDeletionSink {
     filters: Vec<Expr>,
     /// Deletion strategy for this table, with embedded caches.
     pk_deletion_strategy: PkDeletionStrategyWithCache,
+    /// Shared table memory account updated when this sink publishes deletion cache snapshots.
+    table_memory: Arc<CayenneMemoryAccount>,
     /// `RowConverter` for converting primary key columns to byte representation.
     /// Only set for tables with composite or non-integer primary keys.
     pk_row_converter: Option<Arc<RowConverter>>,
@@ -126,6 +129,7 @@ impl CayenneDeletionSink {
         schema: SchemaRef,
         filters: &[Expr],
         pk_deletion_strategy: PkDeletionStrategyWithCache,
+        table_memory: Arc<CayenneMemoryAccount>,
         pk_row_converter: Option<Arc<RowConverter>>,
         pk_column_indices: Vec<usize>,
         protected_snapshot_tables: Vec<Arc<ListingTable>>,
@@ -139,12 +143,18 @@ impl CayenneDeletionSink {
             schema,
             filters: filters.to_vec(),
             pk_deletion_strategy,
+            table_memory,
             pk_row_converter,
             pk_column_indices,
             protected_snapshot_tables,
             runtime_env,
             write_lock,
         }
+    }
+
+    fn refresh_deletion_memory_accounting(&self) {
+        self.table_memory
+            .set_deletion_bytes(self.pk_deletion_strategy.approx_resident_bytes());
     }
 
     async fn delete_all_rows_from_tables(
@@ -454,8 +464,9 @@ impl CayenneDeletionSink {
     /// Expects a single filter expr and recognizes the following filter shapes:
     ///
     /// - **Single PK**: `pk_col IN (v1, v2, ...)` — a flat `Expr::InList`.
-    /// - **Composite PK**: A balanced OR tree of AND-equality conjunctions, e.g.
-    ///   `(pk1 = a AND pk2 = b) OR (pk1 = c AND pk2 = d)`.
+    /// - **Composite PK (OR-of-AND)**: A balanced OR tree of AND-equality
+    ///   conjunctions, e.g. `(pk1 = a AND pk2 = b) OR (pk1 = c AND pk2 = d)`.
+    /// - **Composite PK (tuple-IN)**: `(pk1, pk2, ...) IN ((a, b, ...), (c, d, ...))`.
     fn try_extract_pks_from_filters(&self, filters: &[Expr]) -> Option<ExtractedPkDeletes> {
         if filters.len() != 1 {
             return None;
@@ -486,13 +497,21 @@ impl CayenneDeletionSink {
                         return Some(ExtractedPkDeletes::RowKeys(keys));
                     }
                 }
-                // Composite PK — balanced OR-of-AND equality tree.
+                // Composite PK — balanced OR-of-AND equality tree or tuple-IN of struct literals.
                 let pk_target_types: Vec<&arrow_schema::DataType> = self
                     .pk_column_indices
                     .iter()
                     .map(|&idx| self.schema.field(idx).data_type())
                     .collect();
-                pk_filter_extract::try_extract_composite_pk_keys(
+                if let Some(keys) = pk_filter_extract::try_extract_tuple_in_pk_keys(
+                    filter,
+                    pk_columns,
+                    &pk_target_types,
+                    row_converter,
+                ) {
+                    return Some(ExtractedPkDeletes::RowKeys(keys));
+                }
+                pk_filter_extract::try_extract_or_of_and_pk_keys(
                     filter,
                     pk_columns,
                     &pk_target_types,
@@ -715,6 +734,7 @@ impl CayenneDeletionSink {
             Arc::new(updated),
             Arc::clone(&current.insert_records),
         )));
+        self.refresh_deletion_memory_accounting();
 
         let deleted_count =
             convert_to_u64_box(new_deletion_count, "deleted row count").map_err(|e| {
@@ -830,6 +850,7 @@ impl CayenneDeletionSink {
             Arc::new(updated),
             Arc::clone(&current.insert_records),
         )));
+        self.refresh_deletion_memory_accounting();
 
         let deleted_count =
             convert_to_u64_box(new_deletion_count, "deleted row count").map_err(|e| {

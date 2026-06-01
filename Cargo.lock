@@ -16056,6 +16056,7 @@ dependencies = [
  "datafusion",
  "datafusion-expr",
  "datafusion-proto",
+ "datafusion-proto-common",
  "flight_client",
  "fundu",
  "futures",
@@ -16063,6 +16064,7 @@ dependencies = [
  "object_store_occ",
  "opentelemetry",
  "parking_lot 0.12.5",
+ "prost 0.14.3",
  "runtime-datafusion",
  "runtime-proto",
  "runtime-request-context",
@@ -16114,10 +16116,12 @@ dependencies = [
  "snafu",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tracing",
  "tracing-futures",
  "url",
  "util",
+ "uuid 1.21.0",
 ]
 
 [[package]]
@@ -18029,6 +18033,7 @@ dependencies = [
  "runtime",
  "runtime-async",
  "runtime-auth",
+ "runtime-datafusion",
  "rustls 0.23.36",
  "snafu",
  "snmalloc-rs",

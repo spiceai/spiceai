@@ -93,6 +93,17 @@ impl PositionDeletionVector {
     pub(crate) fn access_plan(&self) -> Arc<VortexAccessPlan> {
         Arc::clone(&self.access_plan)
     }
+
+    #[must_use]
+    pub(crate) fn approx_bytes(&self) -> usize {
+        // The resident state keeps both the original u32 bitmap and the u64
+        // access-plan treemap built from it. Serialized size is a compact,
+        // container-aware estimate that tracks bitmap growth without walking
+        // every row id.
+        std::mem::size_of::<Self>()
+            .saturating_add(self.row_ids.serialized_size())
+            .saturating_add(self.row_ids.serialized_size())
+    }
 }
 
 impl fmt::Debug for PositionDeletionVector {
@@ -114,6 +125,17 @@ impl fmt::Debug for PositionDeletionVector {
 /// lets readers and writers share unchanged entries for free; only entries that
 /// the writer actually updates allocate a new `Arc`.
 pub(crate) type PositionBitmap = HashMap<String, Arc<PositionDeletionVector>>;
+
+fn approx_position_bitmap_bytes(bitmap: &PositionBitmap) -> usize {
+    const POSITION_BITMAP_ENTRY_OVERHEAD_BYTES: usize = 64;
+
+    bitmap.iter().fold(0, |total, (file_path, deletions)| {
+        total
+            .saturating_add(file_path.len())
+            .saturating_add(POSITION_BITMAP_ENTRY_OVERHEAD_BYTES)
+            .saturating_add(deletions.approx_bytes())
+    })
+}
 
 /// Atomically-published deletion state for single-column `Int64` primary keys.
 #[derive(Debug, Clone)]
@@ -227,11 +249,19 @@ pub(crate) enum PkDeletionStrategyWithCache {
     Int64Pk {
         /// Atomically-published deleted PK and insert-record indexes.
         deletion_snapshot: Arc<ArcSwap<Int64PkDeletionSnapshot>>,
+        /// Per-file position deletes for rows whose `(file, position)` is known
+        /// (`deletion_mode: position`). Pushed into the Vortex scan alongside the
+        /// above-scan key filter for the remaining (unlocated) rows. Empty and
+        /// unused under `deletion_mode: key`.
+        position_deletions: Arc<ArcSwap<PositionBitmap>>,
     },
     /// Composite/non-integer primary key deletion tracking using serialized row keys.
     RowConverterBased {
         /// Atomically-published deleted row-key and insert-record indexes.
         deletion_snapshot: Arc<ArcSwap<RowConverterDeletionSnapshot>>,
+        /// Per-file position deletes for located rows (`deletion_mode: position`).
+        /// See [`Self::Int64Pk`]'s `position_deletions`.
+        position_deletions: Arc<ArcSwap<PositionBitmap>>,
     },
 }
 
@@ -249,6 +279,7 @@ impl PkDeletionStrategyWithCache {
     pub fn empty_int64_pk() -> Self {
         Self::Int64Pk {
             deletion_snapshot: Arc::new(ArcSwap::from_pointee(Int64PkDeletionSnapshot::empty())),
+            position_deletions: Arc::new(ArcSwap::from_pointee(PositionBitmap::new())),
         }
     }
 
@@ -259,6 +290,7 @@ impl PkDeletionStrategyWithCache {
             deletion_snapshot: Arc::new(ArcSwap::from_pointee(
                 RowConverterDeletionSnapshot::empty(),
             )),
+            position_deletions: Arc::new(ArcSwap::from_pointee(PositionBitmap::new())),
         }
     }
 
@@ -309,7 +341,9 @@ impl PkDeletionStrategyWithCache {
     #[must_use]
     pub fn int64_pk_snapshot(&self) -> Option<&Arc<ArcSwap<Int64PkDeletionSnapshot>>> {
         match self {
-            Self::Int64Pk { deletion_snapshot } => Some(deletion_snapshot),
+            Self::Int64Pk {
+                deletion_snapshot, ..
+            } => Some(deletion_snapshot),
             _ => None,
         }
     }
@@ -318,8 +352,69 @@ impl PkDeletionStrategyWithCache {
     #[must_use]
     pub fn row_keys_snapshot(&self) -> Option<&Arc<ArcSwap<RowConverterDeletionSnapshot>>> {
         match self {
-            Self::RowConverterBased { deletion_snapshot } => Some(deletion_snapshot),
+            Self::RowConverterBased {
+                deletion_snapshot, ..
+            } => Some(deletion_snapshot),
             _ => None,
+        }
+    }
+
+    /// Returns the per-file position-delete cache for **any** strategy: the
+    /// `PositionBased` cache for PK-less tables, or the `position_deletions`
+    /// cache for PK tables (`deletion_mode: position`). This is the unified
+    /// handle the position-vector write/read paths key by file path.
+    #[must_use]
+    pub(crate) fn position_cache(&self) -> &Arc<ArcSwap<PositionBitmap>> {
+        match self {
+            Self::PositionBased {
+                cached_deleted_row_ids: position_cache,
+            }
+            | Self::Int64Pk {
+                position_deletions: position_cache,
+                ..
+            }
+            | Self::RowConverterBased {
+                position_deletions: position_cache,
+                ..
+            } => position_cache,
+        }
+    }
+
+    /// Approximate resident bytes held by deletion and insert-record caches.
+    /// Includes key-based delete/insert indexes and per-file position deletes.
+    #[must_use]
+    pub(crate) fn approx_resident_bytes(&self) -> usize {
+        match self {
+            Self::PositionBased {
+                cached_deleted_row_ids,
+            } => {
+                let position_snapshot = cached_deleted_row_ids.load_full();
+                approx_position_bitmap_bytes(&position_snapshot)
+            }
+            Self::Int64Pk {
+                deletion_snapshot,
+                position_deletions,
+            } => {
+                let snapshot = deletion_snapshot.load();
+                let position_snapshot = position_deletions.load_full();
+                snapshot
+                    .deleted_pk
+                    .approx_bytes()
+                    .saturating_add(snapshot.insert_records.approx_bytes())
+                    .saturating_add(approx_position_bitmap_bytes(&position_snapshot))
+            }
+            Self::RowConverterBased {
+                deletion_snapshot,
+                position_deletions,
+            } => {
+                let snapshot = deletion_snapshot.load();
+                let position_snapshot = position_deletions.load_full();
+                snapshot
+                    .deleted_row_keys
+                    .approx_bytes()
+                    .saturating_add(snapshot.insert_records.approx_bytes())
+                    .saturating_add(approx_position_bitmap_bytes(&position_snapshot))
+            }
         }
     }
 
@@ -347,23 +442,29 @@ impl PkDeletionStrategyWithCache {
             (
                 Self::Int64Pk {
                     deletion_snapshot: existing,
+                    position_deletions: existing_positions,
                 },
                 Self::Int64Pk {
                     deletion_snapshot: fresh,
+                    position_deletions: fresh_positions,
                 },
             ) => {
                 existing.store(fresh.load_full());
+                existing_positions.store(fresh_positions.load_full());
                 Ok(())
             }
             (
                 Self::RowConverterBased {
                     deletion_snapshot: existing,
+                    position_deletions: existing_positions,
                 },
                 Self::RowConverterBased {
                     deletion_snapshot: fresh,
+                    position_deletions: fresh_positions,
                 },
             ) => {
                 existing.store(fresh.load_full());
+                existing_positions.store(fresh_positions.load_full());
                 Ok(())
             }
             _ => Err(Error::Internal {
