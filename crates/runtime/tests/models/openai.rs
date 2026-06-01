@@ -48,6 +48,7 @@ use llms::chat::Chat;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use runtime::tools::utils::get_tools;
 use runtime::{Runtime, auth::EndpointAuth, model::try_to_chat_model};
+use runtime_tools::options::SpiceToolsOptions;
 use serde_json::Value;
 use serde_json::json;
 use spicepod::component::runtime::TaskHistoryCapturedContext;
@@ -1051,11 +1052,7 @@ async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
                     return Err(anyhow::anyhow!("Timed out waiting for OpenAI response"));
                 }
             };
-            let tools = get_tools(
-                Arc::clone(&rt),
-                &runtime::tools::options::SpiceToolsOptions::Auto,
-            )
-            .await;
+            let tools = get_tools(Arc::clone(&rt), &SpiceToolsOptions::Auto).await;
 
             let mut desired_tools = tools.iter().map(|t| t.name()).collect::<HashSet<_>>();
             desired_tools.insert(std::borrow::Cow::Borrowed("web_search"));
