@@ -153,9 +153,9 @@ pub struct ContextRequest {
     #[serde(default = "default_nsql_context_sample_limit")]
     pub sampling_limit: usize,
 
-    /// Whether example rows are included in the context block. Default: false.
-    #[serde(default)]
-    pub include_examples: bool,
+    /// Whether example rows are included in the context block. Defaults to `include_sampling` when omitted, matching `/v1/nsql` `sample_data_enabled` behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_examples: Option<bool>,
 
     /// Maximum number of example rows per dataset. Default: 3, maximum: 100.
     #[serde(default = "default_nsql_context_sample_limit")]
@@ -168,13 +168,14 @@ pub struct ContextRequest {
 
 impl ContextRequest {
     fn context_options(&self) -> Result<NsqlContextOptions, (StatusCode, String)> {
+        let include_examples = self.include_examples.unwrap_or(self.include_sampling);
         validate_context_limit("sampling_limit", self.include_sampling, self.sampling_limit)?;
-        validate_context_limit("examples_limit", self.include_examples, self.examples_limit)?;
+        validate_context_limit("examples_limit", include_examples, self.examples_limit)?;
 
         Ok(NsqlContextOptions::new(
             self.include_sampling,
             self.sampling_limit,
-            self.include_examples,
+            include_examples,
             self.examples_limit,
         ))
     }
@@ -1055,6 +1056,34 @@ mod tests {
         assert!(!options.include_examples);
         assert_eq!(options.examples_limit, DEFAULT_NSQL_CONTEXT_SAMPLE_LIMIT);
         assert!(request.datasets.is_empty());
+    }
+
+    #[test]
+    fn context_request_sample_data_enabled_defaults_examples_to_sampling() {
+        let request: ContextRequest = serde_json::from_value(json!({
+            "sample_data_enabled": true
+        }))
+        .expect("context request should accept sample_data_enabled alias");
+
+        let options = request
+            .context_options()
+            .expect("sample_data_enabled context options should be valid");
+
+        assert!(options.include_sampling);
+        assert!(options.include_examples);
+
+        let request: ContextRequest = serde_json::from_value(json!({
+            "sample_data_enabled": true,
+            "include_examples": false
+        }))
+        .expect("context request should allow include_examples override");
+
+        let options = request
+            .context_options()
+            .expect("explicit include_examples override should be valid");
+
+        assert!(options.include_sampling);
+        assert!(!options.include_examples);
     }
 
     #[test]

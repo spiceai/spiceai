@@ -417,10 +417,19 @@ async fn tool_context_text(
     let arg = serde_json::to_string(params)?;
     let response = match tool.call(arg.as_str()).await {
         Ok(response) => response,
-        Err(error) => tool_call_error_response(tool.name().as_ref(), error),
+        Err(error) => {
+            let tool_name = tool.name();
+            let tool_name: &str = tool_name.as_ref();
+            tracing::warn!(tool = %tool_name, error = %error, "Failed to build NSQL tool context; returning error context");
+            tool_call_error_response(tool_name, error)
+        }
     };
 
     Ok(value_to_context_text(&response))
+}
+
+fn sort_table_references(tables: &mut [TableReference]) {
+    tables.sort_by_cached_key(ToString::to_string);
 }
 
 async fn table_schema_context(
@@ -2592,14 +2601,17 @@ pub(crate) async fn build_nsql_context(
 
     let tables = datasets.map_or_else(
         || {
-            df.get_user_table_names()
+            let mut tables = df
+                .get_user_table_names()
                 .into_iter()
                 .filter(|table| {
                     table_allowlist_opt
                         .as_ref()
                         .is_none_or(|allowlist| allowlist.table_is_allowed(table))
                 })
-                .collect()
+                .collect_vec();
+            sort_table_references(&mut tables);
+            tables
         },
         |datasets| datasets.iter().map(TableReference::from).collect_vec(),
     );
@@ -2782,6 +2794,26 @@ mod tests {
             required_columns: vec![column.to_string(), "id".to_string()],
             notes: vec![],
         }
+    }
+
+    #[test]
+    fn sort_table_references_orders_by_rendered_name() {
+        let mut tables = vec![
+            TableReference::parse_str("support_tickets"),
+            TableReference::parse_str("sales.orders"),
+            TableReference::parse_str("spice.marketing.accounts"),
+        ];
+
+        sort_table_references(&mut tables);
+
+        assert_eq!(
+            tables.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                "sales.orders".to_string(),
+                "spice.marketing.accounts".to_string(),
+                "support_tickets".to_string(),
+            ]
+        );
     }
 
     #[test]
