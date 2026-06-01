@@ -17,7 +17,7 @@ expression: response
     "dialect": "PostgreSQL",
     "parser": "DataFusion SQL parser configured with PostgreSQL dialect",
     "notes": [
-      "Spice supports standard DataFusion SQL plus relevant Spice-specific, JSON, Spark compatibility, and registered user-defined functions listed in this context.",
+      "Spice supports standard DataFusion SQL plus additional Spice-specific and registered user-defined functions listed in this context.",
       "Not every PostgreSQL extension is implemented; prefer the functions listed in this response when generating SQL for Spice.",
       "Table functions such as text_search, vector_search, json_tree, and list_udfs are used in the FROM clause.",
       "Run SELECT * FROM list_udfs() to inspect all functions registered in the current DataFusion context.",
@@ -66,22 +66,6 @@ expression: response
           "indexed": true,
           "vector_search": true,
           "full_text_search": true
-        },
-        {
-          "name": "order_payload",
-          "data_type": "Utf8",
-          "nullable": true,
-          "description": "Order details stored as JSON",
-          "source_type": "jsonb",
-          "metadata": {
-            "description": "Order details stored as JSON",
-            "source_type": "jsonb"
-          },
-          "primary_key": false,
-          "unique": false,
-          "indexed": false,
-          "vector_search": false,
-          "full_text_search": false
         }
       ],
       "primary_key": [
@@ -173,161 +157,195 @@ expression: response
     }
   ],
   "functions": {
-    "summary": "Spice SQL runs on Apache DataFusion with the SQL parser configured for the PostgreSQL dialect. Standard DataFusion SQL functions are available. The context lists registered functions that are relevant to the current spicepod, including search functions only when in-scope datasets expose the required search indexes. Run SELECT * FROM list_udfs() to inspect the full registered function inventory",
+    "summary": "Spice SQL runs on Apache DataFusion with the SQL parser configured for the PostgreSQL dialect. Standard DataFusion SQL functions are available. Additional Spice-specific and registered user-defined functions are listed below. Run SELECT * FROM list_udfs() to inspect the full registered function inventory",
     "json": [
       {
         "name": "flatten_json",
-        "syntax": "flatten_json(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "flatten_json(...)"
-        ]
+        "syntax": "flatten_json(json)",
+        "description": "Flattens JSON objects into key-value rows or structures."
       },
       {
         "name": "flatten_json_properties",
-        "syntax": "flatten_json_properties(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "flatten_json_properties(...)"
-        ]
+        "syntax": "flatten_json_properties(json_schema)",
+        "description": "Flattens JSON-schema properties into key-value rows or structures."
       },
       {
         "name": "json_as_text",
-        "syntax": "json_as_text(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "json_as_text(...)"
-        ]
+        "syntax": "json_as_text(json)",
+        "description": "Converts a JSON value to text.",
+        "function_type": "SCALAR"
       },
       {
         "name": "json_contains",
-        "syntax": "json_contains(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "json_contains(...)"
-        ]
+        "syntax": "json_contains(json, value)",
+        "description": "Returns whether one JSON value contains another.",
+        "function_type": "SCALAR"
       },
       {
         "name": "json_from_scalar",
-        "syntax": "json_from_scalar(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "json_from_scalar(...)"
-        ]
+        "syntax": "json_from_scalar(value)",
+        "description": "Converts a scalar value to JSON.",
+        "function_type": "SCALAR"
       },
       {
         "name": "json_get",
-        "syntax": "json_get(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "json_get(...)"
-        ]
+        "syntax": "json_get(json, path)",
+        "description": "Extracts a JSON value by path.",
+        "function_type": "SCALAR"
       },
       {
         "name": "json_get_array",
-        "syntax": "json_get_array(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "json_get_array(...)"
-        ]
+        "syntax": "json_get_array(json, path)",
+        "description": "Extracts a JSON array by path.",
+        "function_type": "SCALAR"
       },
       {
         "name": "json_get_bool",
-        "syntax": "json_get_bool(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "json_get_bool(...)"
-        ]
+        "syntax": "json_get_bool(json, path)",
+        "description": "Extracts a boolean value from JSON by path.",
+        "function_type": "SCALAR"
       },
       {
         "name": "json_get_float",
-        "syntax": "json_get_float(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "json_get_float(...)"
-        ]
+        "syntax": "json_get_float(json, path)",
+        "description": "Extracts a floating-point value from JSON by path.",
+        "function_type": "SCALAR"
       },
       {
         "name": "json_get_int",
-        "syntax": "json_get_int(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "json_get_int(...)"
-        ]
+        "syntax": "json_get_int(json, path)",
+        "description": "Extracts an integer value from JSON by path.",
+        "function_type": "SCALAR"
       },
       {
         "name": "json_get_json",
-        "syntax": "json_get_json(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "json_get_json(...)"
-        ]
+        "syntax": "json_get_json(json, path)",
+        "description": "Extracts a nested JSON value by path.",
+        "function_type": "SCALAR"
       },
       {
         "name": "json_get_str",
-        "syntax": "json_get_str(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "json_get_str(...)"
-        ]
+        "syntax": "json_get_str(json, path)",
+        "description": "Extracts a string value from JSON by path.",
+        "function_type": "SCALAR"
       },
       {
         "name": "json_length",
-        "syntax": "json_length(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "json_length(...)"
-        ]
+        "syntax": "json_length(json)",
+        "description": "Returns the length of a JSON array or object.",
+        "function_type": "SCALAR"
       },
       {
         "name": "json_object_keys",
-        "syntax": "json_object_keys(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "json_object_keys(...)"
-        ]
+        "syntax": "json_object_keys(json)",
+        "description": "Returns the keys of a JSON object.",
+        "function_type": "SCALAR"
       },
       {
         "name": "json_tree",
-        "syntax": "json_tree(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "json_tree(...)"
-        ]
+        "syntax": "json_tree(json)",
+        "description": "Expands JSON into a tree of path, key, and value rows or structures."
       }
     ],
-    "spice_specific": [
+    "search": [
       {
         "name": "rerank",
-        "syntax": "rerank(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "rerank(...)"
-        ]
+        "syntax": "rerank(input, model => 'model_name', document => 'column_name'[, query => 'query text'])",
+        "description": "Re-ranks search results or table rows using a configured reranker model."
       },
       {
         "name": "rrf",
-        "syntax": "rrf(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "rrf(...)"
-        ]
+        "syntax": "rrf(text_search(...), vector_search(...)[, limit => n])",
+        "description": "Combines multiple search result sets using reciprocal rank fusion."
       },
       {
         "name": "text_search",
-        "syntax": "text_search(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "text_search(...)"
-        ]
+        "syntax": "text_search(dataset, 'query text'[, column])",
+        "description": "Runs full-text search over a configured searchable dataset."
       },
       {
         "name": "vector_search",
-        "syntax": "vector_search(...)",
-        "function_type": "SCALAR",
-        "signatures": [
-          "vector_search(...)"
-        ]
+        "syntax": "vector_search(dataset, 'query text'[, column])",
+        "description": "Runs vector search over a configured embedding/vector index."
+      }
+    ],
+    "additional": [
+      {
+        "name": "ai",
+        "syntax": "ai(prompt[, model => 'model_name'])",
+        "description": "Runs a prompt against a configured language model.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "bucket",
+        "syntax": "bucket(value, buckets)",
+        "description": "Assigns a numeric expression to a bucket boundary.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "col_description",
+        "syntax": "col_description(table_catalog, table_schema, table_name, column_name)",
+        "description": "Returns the configured description for a table column.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "cosine_distance",
+        "syntax": "cosine_distance(vector_a, vector_b)",
+        "description": "Computes cosine distance between two vectors.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "digest_many",
+        "syntax": "digest_many(value[, ...])",
+        "description": "Computes a digest for one or more input expressions.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "embed",
+        "syntax": "embed(input[, model => 'model_name'])",
+        "description": "Generates an embedding with a configured embedding model.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "inner_product",
+        "syntax": "inner_product(vector_a, vector_b)",
+        "description": "Computes the inner product of two vectors.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "l2_distance",
+        "syntax": "l2_distance(vector_a, vector_b)",
+        "description": "Computes Euclidean distance between two vectors.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "l2_norm",
+        "syntax": "l2_norm(vector)",
+        "description": "Computes the L2 norm of a vector.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "l2_squared_distance",
+        "syntax": "l2_squared_distance(vector_a, vector_b)",
+        "description": "Computes squared Euclidean distance between two vectors.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "list_udfs",
+        "syntax": "list_udfs()",
+        "description": "Lists functions registered in the current DataFusion context."
+      },
+      {
+        "name": "obj_description",
+        "syntax": "obj_description(table_catalog, table_schema, table_name)",
+        "description": "Returns the configured description for a table or object.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "truncate",
+        "syntax": "truncate(value, precision)",
+        "description": "Truncates values to the requested precision.",
+        "function_type": "SCALAR"
       }
     ],
     "spark_compatibility": {

@@ -115,7 +115,7 @@ const NSQL_CONTEXT_INSTRUCTIONS: [&str; 5] = [
     "Use table and column descriptions, primary keys, foreign keys, unique constraints, and indexes when choosing joins and filters.",
 ];
 
-const NSQL_FUNCTION_CONTEXT_SUMMARY: &str = "Spice SQL runs on Apache DataFusion with the SQL parser configured for the PostgreSQL dialect. Standard DataFusion SQL functions are available. Search and JSON function references are included only when relevant to the current spicepod; search functions require in-scope datasets with the required search indexes. Run SELECT * FROM list_udfs() to inspect the full registered function inventory";
+const NSQL_FUNCTION_CONTEXT_SUMMARY: &str = "Spice SQL runs on Apache DataFusion with the SQL parser configured for the PostgreSQL dialect. Standard DataFusion SQL functions are available. Additional Spice-specific and registered user-defined functions are listed below. Run SELECT * FROM list_udfs() to inspect the full registered function inventory";
 
 #[derive(Debug, Snafu)]
 pub(crate) enum NsqlContextError {
@@ -306,7 +306,8 @@ pub(crate) struct NsqlFullTextSearchContext {
 pub(crate) struct NsqlFunctionContext {
     pub(crate) summary: String,
     pub(crate) json: Vec<NsqlFunctionContextEntry>,
-    pub(crate) spice_specific: Vec<NsqlFunctionContextEntry>,
+    pub(crate) search: Vec<NsqlFunctionContextEntry>,
+    pub(crate) additional: Vec<NsqlFunctionContextEntry>,
     pub(crate) spark_compatibility: NsqlSparkFunctionContext,
     pub(crate) user_defined: Vec<UserFunctionContextEntry>,
 }
@@ -345,7 +346,8 @@ impl NsqlContextJsonResponse {
             functions: NsqlFunctionContext {
                 summary: NSQL_FUNCTION_CONTEXT_SUMMARY.to_string(),
                 json: vec![],
-                spice_specific: vec![],
+                search: vec![],
+                additional: vec![],
                 spark_compatibility: NsqlSparkFunctionContext {
                     description: "Spark-compatible scalar functions are available for arrays, maps, structs, dates, strings, hashes, URLs, XML, and other common Spark SQL expressions.".to_string(),
                     functions: vec![],
@@ -483,9 +485,8 @@ fn nsql_sql_context() -> NsqlSqlContext {
         dialect: "PostgreSQL".to_string(),
         parser: "DataFusion SQL parser configured with PostgreSQL dialect".to_string(),
         notes: vec![
-            "Spice supports standard DataFusion SQL plus registered Spice-specific, JSON, Spark compatibility, and user-defined functions listed in this context.".to_string(),
+            "Spice supports standard DataFusion SQL plus additional Spice-specific and registered user-defined functions listed in this context.".to_string(),
             "Not every PostgreSQL extension is implemented; prefer the functions listed in this response when generating SQL for Spice.".to_string(),
-            "Search and JSON function references are included only when relevant to the current spicepod.".to_string(),
             "Table functions such as text_search, vector_search, json_tree, and list_udfs are used in the FROM clause.".to_string(),
             "Run SELECT * FROM list_udfs() to inspect all functions registered in the current DataFusion context.".to_string(),
             "Use LIMIT for exploratory or broad-result queries unless the user explicitly asks for all rows.".to_string(),
@@ -1287,6 +1288,7 @@ struct RegisteredFunction {
     function_type: Option<String>,
     description: Option<String>,
     syntax_example: Option<String>,
+    registered_builtin: bool,
     return_types: BTreeSet<String>,
     signatures: BTreeMap<u8, RegisteredFunctionSignature>,
 }
@@ -1559,6 +1561,7 @@ fn add_list_udf_batches(
             }
 
             let function = inventory.function_mut(&name);
+            function.registered_builtin = true;
             if function.function_type.is_none() {
                 function.function_type = non_empty_string(string_value(batch, "kind", row)?);
             }
@@ -1595,22 +1598,6 @@ fn is_json_context_function(name: &str) -> bool {
     name.starts_with("json") || name.contains("_json")
 }
 
-fn is_json_context_type(value: &str) -> bool {
-    value.to_ascii_lowercase().contains("json")
-}
-
-fn dataset_json_function_availability(datasets: &[NsqlDatasetContext]) -> bool {
-    datasets.iter().any(|dataset| {
-        dataset.columns.iter().any(|column| {
-            is_json_context_type(&column.data_type)
-                || column
-                    .source_type
-                    .as_deref()
-                    .is_some_and(is_json_context_type)
-        })
-    })
-}
-
 fn spark_function_names(inventory: &FunctionInventory) -> BTreeSet<String> {
     datafusion_spark::all_default_scalar_functions()
         .into_iter()
@@ -1635,6 +1622,13 @@ fn is_search_context_function_visible(
     false
 }
 
+fn is_search_context_function(name: &str) -> bool {
+    name == TEXT_SEARCH_UDTF_NAME
+        || name == VECTOR_SEARCH_UDTF_NAME
+        || name == RRF_UDF_NAME
+        || name == RERANK_UDTF_NAME
+}
+
 fn is_spice_context_function(name: &str, search_functions: SearchFunctionAvailability) -> bool {
     is_search_context_function_visible(name, search_functions)
 }
@@ -1649,13 +1643,13 @@ fn user_function_names(app: &app::App) -> HashSet<String> {
 fn inventory_entries(
     inventory: &FunctionInventory,
     user_function_names: &HashSet<String>,
-    include: impl Fn(&str) -> bool,
+    include: impl Fn(&str, &RegisteredFunction) -> bool,
 ) -> Vec<NsqlFunctionContextEntry> {
     inventory
         .functions
         .iter()
         .filter(|(name, _)| !user_function_names.contains(*name))
-        .filter(|(name, _)| include(name))
+        .filter(|(name, function)| include(name, function))
         .map(|(_, function)| function.to_context_entry())
         .collect_vec()
 }
@@ -1713,19 +1707,207 @@ pub(crate) fn all_context_function_names_for_test() -> HashSet<String> {
 }
 
 #[cfg(test)]
+struct TestBuiltinFunctionDefinition {
+    function_type: Option<&'static str>,
+    description: &'static str,
+    syntax: &'static str,
+}
+
+#[cfg(test)]
+fn test_builtin_function_definition(name: &str) -> Option<TestBuiltinFunctionDefinition> {
+    let lower_name = name.to_ascii_lowercase();
+    let (function_type, description, syntax) = match lower_name.as_str() {
+        "ai" => (
+            Some("SCALAR"),
+            "Runs a prompt against a configured language model.",
+            "ai(prompt[, model => 'model_name'])",
+        ),
+        "bucket" => (
+            Some("SCALAR"),
+            "Assigns a numeric expression to a bucket boundary.",
+            "bucket(value, buckets)",
+        ),
+        "col_description" => (
+            Some("SCALAR"),
+            "Returns the configured description for a table column.",
+            "col_description(table_catalog, table_schema, table_name, column_name)",
+        ),
+        "cosine_distance" => (
+            Some("SCALAR"),
+            "Computes cosine distance between two vectors.",
+            "cosine_distance(vector_a, vector_b)",
+        ),
+        "digest" | "digest_many" => (
+            Some("SCALAR"),
+            "Computes a digest for one or more input expressions.",
+            "digest_many(value[, ...])",
+        ),
+        "embed" => (
+            Some("SCALAR"),
+            "Generates an embedding with a configured embedding model.",
+            "embed(input[, model => 'model_name'])",
+        ),
+        "flatten_json" => (
+            None,
+            "Flattens JSON objects into key-value rows or structures.",
+            "flatten_json(json)",
+        ),
+        "flatten_json_properties" => (
+            None,
+            "Flattens JSON-schema properties into key-value rows or structures.",
+            "flatten_json_properties(json_schema)",
+        ),
+        "inner_product" => (
+            Some("SCALAR"),
+            "Computes the inner product of two vectors.",
+            "inner_product(vector_a, vector_b)",
+        ),
+        "json_as_text" => (
+            Some("SCALAR"),
+            "Converts a JSON value to text.",
+            "json_as_text(json)",
+        ),
+        "json_contains" => (
+            Some("SCALAR"),
+            "Returns whether one JSON value contains another.",
+            "json_contains(json, value)",
+        ),
+        "json_from_scalar" => (
+            Some("SCALAR"),
+            "Converts a scalar value to JSON.",
+            "json_from_scalar(value)",
+        ),
+        "json_get" => (
+            Some("SCALAR"),
+            "Extracts a JSON value by path.",
+            "json_get(json, path)",
+        ),
+        "json_get_array" => (
+            Some("SCALAR"),
+            "Extracts a JSON array by path.",
+            "json_get_array(json, path)",
+        ),
+        "json_get_bool" => (
+            Some("SCALAR"),
+            "Extracts a boolean value from JSON by path.",
+            "json_get_bool(json, path)",
+        ),
+        "json_get_float" => (
+            Some("SCALAR"),
+            "Extracts a floating-point value from JSON by path.",
+            "json_get_float(json, path)",
+        ),
+        "json_get_int" => (
+            Some("SCALAR"),
+            "Extracts an integer value from JSON by path.",
+            "json_get_int(json, path)",
+        ),
+        "json_get_json" => (
+            Some("SCALAR"),
+            "Extracts a nested JSON value by path.",
+            "json_get_json(json, path)",
+        ),
+        "json_get_str" => (
+            Some("SCALAR"),
+            "Extracts a string value from JSON by path.",
+            "json_get_str(json, path)",
+        ),
+        "json_length" => (
+            Some("SCALAR"),
+            "Returns the length of a JSON array or object.",
+            "json_length(json)",
+        ),
+        "json_object_keys" => (
+            Some("SCALAR"),
+            "Returns the keys of a JSON object.",
+            "json_object_keys(json)",
+        ),
+        "json_tree" => (
+            None,
+            "Expands JSON into a tree of path, key, and value rows or structures.",
+            "json_tree(json)",
+        ),
+        "l2_distance" => (
+            Some("SCALAR"),
+            "Computes Euclidean distance between two vectors.",
+            "l2_distance(vector_a, vector_b)",
+        ),
+        "l2_norm" => (
+            Some("SCALAR"),
+            "Computes the L2 norm of a vector.",
+            "l2_norm(vector)",
+        ),
+        "l2_squared_distance" => (
+            Some("SCALAR"),
+            "Computes squared Euclidean distance between two vectors.",
+            "l2_squared_distance(vector_a, vector_b)",
+        ),
+        "list_udfs" => (
+            None,
+            "Lists functions registered in the current DataFusion context.",
+            "list_udfs()",
+        ),
+        "obj_description" => (
+            Some("SCALAR"),
+            "Returns the configured description for a table or object.",
+            "obj_description(table_catalog, table_schema, table_name)",
+        ),
+        "rerank" => (
+            None,
+            "Re-ranks search results or table rows using a configured reranker model.",
+            "rerank(input, model => 'model_name', document => 'column_name'[, query => 'query text'])",
+        ),
+        "rrf" => (
+            None,
+            "Combines multiple search result sets using reciprocal rank fusion.",
+            "rrf(text_search(...), vector_search(...)[, limit => n])",
+        ),
+        "text_search" => (
+            None,
+            "Runs full-text search over a configured searchable dataset.",
+            "text_search(dataset, 'query text'[, column])",
+        ),
+        "truncate" => (
+            Some("SCALAR"),
+            "Truncates values to the requested precision.",
+            "truncate(value, precision)",
+        ),
+        "vector_search" => (
+            None,
+            "Runs vector search over a configured embedding/vector index.",
+            "vector_search(dataset, 'query text'[, column])",
+        ),
+        _ => return None,
+    };
+
+    Some(TestBuiltinFunctionDefinition {
+        function_type,
+        description,
+        syntax,
+    })
+}
+
+#[cfg(test)]
 fn function_inventory_for_test(available_names: &HashSet<String>) -> FunctionInventory {
     let mut inventory = FunctionInventory::default();
     for name in available_names {
         let function = inventory.function_mut(name);
-        function.function_type = Some("SCALAR".to_string());
-        function.signatures.insert(
-            0,
-            RegisteredFunctionSignature {
-                parameters: vec![],
-                return_type: None,
-                variadic: true,
-            },
-        );
+        function.registered_builtin = true;
+        if let Some(definition) = test_builtin_function_definition(name) {
+            function.function_type = definition.function_type.map(ToString::to_string);
+            function.description = Some(definition.description.to_string());
+            function.syntax_example = Some(definition.syntax.to_string());
+        } else {
+            function.function_type = Some("SCALAR".to_string());
+            function.signatures.insert(
+                0,
+                RegisteredFunctionSignature {
+                    parameters: vec![],
+                    return_type: None,
+                    variadic: true,
+                },
+            );
+        }
     }
     inventory
 }
@@ -1736,7 +1918,6 @@ pub(crate) fn nsql_function_context_for_test(
     available_names: &HashSet<String>,
     vector_search: bool,
     text_search: bool,
-    json_functions: bool,
 ) -> NsqlFunctionContext {
     let inventory = function_inventory_for_test(available_names);
     nsql_function_context(
@@ -1746,7 +1927,6 @@ pub(crate) fn nsql_function_context_for_test(
             vector_search,
             text_search,
         },
-        json_functions,
     )
 }
 
@@ -1763,16 +1943,28 @@ fn write_function_entries(
     for entry in entries {
         let _ = write!(output, "- `{}`", entry.name);
         if let Some(description) = &entry.description {
+            let description = description.trim().trim_end_matches('.');
             let _ = write!(output, ": {description}");
         }
         if let Some(function_type) = &entry.function_type {
             let _ = write!(output, " ({function_type})");
         }
         if let Some(syntax) = &entry.syntax {
-            let _ = write!(output, ". Syntax: `{syntax}`");
+            if entry.description.is_some() || entry.function_type.is_some() {
+                let _ = write!(output, ". Syntax: `{syntax}`");
+            } else {
+                let _ = write!(output, ": Syntax: `{syntax}`");
+            }
         }
         if let Some(example) = &entry.example {
-            let _ = write!(output, ". Example: `{example}`");
+            if entry.description.is_some()
+                || entry.function_type.is_some()
+                || entry.syntax.is_some()
+            {
+                let _ = write!(output, ". Example: `{example}`");
+            } else {
+                let _ = write!(output, ": Example: `{example}`");
+            }
         }
         let _ = writeln!(output, ".");
     }
@@ -1911,13 +2103,14 @@ fn user_function_context(
 }
 
 impl NsqlFunctionContext {
-    fn render_markdown(&self) -> String {
+    pub(crate) fn render_markdown(&self) -> String {
         let mut context = format!("{}:\n", self.summary);
         write_function_entries(&mut context, "JSON functions", &self.json);
+        write_function_entries(&mut context, "Search functions", &self.search);
         write_function_entries(
             &mut context,
-            "Spice-specific functions",
-            &self.spice_specific,
+            "Additional registered functions",
+            &self.additional,
         );
 
         if !self.spark_compatibility.functions.is_empty() {
@@ -1938,26 +2131,30 @@ fn nsql_function_context(
     app: &app::App,
     inventory: &FunctionInventory,
     search_functions: SearchFunctionAvailability,
-    include_json_functions: bool,
 ) -> NsqlFunctionContext {
     let user_function_names = user_function_names(app);
-    let json = if include_json_functions {
-        inventory_entries(inventory, &user_function_names, is_json_context_function)
-    } else {
-        vec![]
-    };
+    let json = inventory_entries(inventory, &user_function_names, |name, function| {
+        function.registered_builtin && is_json_context_function(name)
+    });
     let spark_function_names = spark_function_names(inventory);
-    let spice_specific = inventory_entries(inventory, &user_function_names, |name| {
+    let search = inventory_entries(inventory, &user_function_names, |name, _| {
         !is_json_context_function(name)
             && !spark_function_names.contains(name)
             && is_spice_context_function(name, search_functions)
+    });
+    let additional = inventory_entries(inventory, &user_function_names, |name, function| {
+        function.registered_builtin
+            && !is_json_context_function(name)
+            && !is_search_context_function(name)
+            && !spark_function_names.contains(name)
     });
     let spark_function_names = spark_function_names.into_iter().collect_vec();
 
     NsqlFunctionContext {
         summary: NSQL_FUNCTION_CONTEXT_SUMMARY.to_string(),
         json,
-        spice_specific,
+        search,
+        additional,
         spark_compatibility: NsqlSparkFunctionContext {
             description: "Spark-compatible scalar functions are available for arrays, maps, structs, dates, strings, hashes, URLs, XML, and other common Spark SQL expressions.".to_string(),
             functions: spark_function_names,
@@ -2455,12 +2652,8 @@ pub(crate) async fn build_nsql_context(
 
     let dataset_search_functions =
         dataset_search_function_availability(configured_search_functions, &dataset_contexts);
-    let function_context = nsql_function_context(
-        &app,
-        &function_inventory,
-        dataset_search_functions,
-        dataset_json_function_availability(&dataset_contexts),
-    );
+    let function_context =
+        nsql_function_context(&app, &function_inventory, dataset_search_functions);
     let function_context_block = function_context.render_markdown();
     let relationship_context = render_nsql_dataset_relationship_context(&dataset_contexts);
 
@@ -2791,32 +2984,11 @@ mod tests {
     }
 
     #[test]
-    fn dataset_json_function_availability_requires_json_column_context() {
-        let dataset = relationship_test_dataset(
-            "events",
-            None,
-            vec![relationship_test_column("payload", "Utf8", "Event payload")],
-        );
-
-        assert!(!dataset_json_function_availability(std::slice::from_ref(
-            &dataset,
-        )));
-
-        let mut data_type_dataset = dataset.clone();
-        data_type_dataset.columns[0].data_type = "Json".to_string();
-        assert!(dataset_json_function_availability(&[data_type_dataset]));
-
-        let mut source_type_dataset = dataset;
-        source_type_dataset.columns[0].source_type = Some("jsonb".to_string());
-        assert!(dataset_json_function_availability(&[source_type_dataset]));
-    }
-
-    #[test]
-    fn function_context_includes_registered_json_when_relevant_and_spark_functions() {
+    fn function_context_includes_registered_json_and_spark_functions() {
         let app = app::AppBuilder::new("test").build();
         let available_names = all_context_function_names_for_test();
 
-        let context = nsql_function_context_for_test(&app, &available_names, true, true, true);
+        let context = nsql_function_context_for_test(&app, &available_names, true, true);
 
         let json_names = entry_names(&context.json);
         let expected_json_names = available_names
@@ -2853,24 +3025,14 @@ mod tests {
     }
 
     #[test]
-    fn function_context_omits_registered_json_when_not_relevant() {
+    fn function_context_search_only_includes_search_functions() {
         let app = app::AppBuilder::new("test").build();
         let available_names = all_context_function_names_for_test();
 
-        let context = nsql_function_context_for_test(&app, &available_names, true, true, false);
-
-        assert!(context.json.is_empty());
-    }
-
-    #[test]
-    fn function_context_spice_specific_only_includes_search_functions() {
-        let app = app::AppBuilder::new("test").build();
-        let available_names = all_context_function_names_for_test();
-
-        let context = nsql_function_context_for_test(&app, &available_names, true, true, false);
+        let context = nsql_function_context_for_test(&app, &available_names, true, true);
 
         assert_eq!(
-            entry_names(&context.spice_specific),
+            entry_names(&context.search),
             BTreeSet::from([
                 RERANK_UDTF_NAME.to_string(),
                 RRF_UDF_NAME.to_string(),
@@ -2878,6 +3040,21 @@ mod tests {
                 VECTOR_SEARCH_UDTF_NAME.to_string(),
             ])
         );
+    }
+
+    #[test]
+    fn function_context_includes_additional_registered_functions() {
+        let app = app::AppBuilder::new("test").build();
+        let available_names = all_context_function_names_for_test();
+
+        let context = nsql_function_context_for_test(&app, &available_names, true, true);
+        let additional_names = entry_names(&context.additional);
+
+        assert!(additional_names.contains(COSINE_DISTANCE_UDF_NAME));
+        assert!(additional_names.contains(DIGEST_UDF_NAME));
+        assert!(additional_names.contains(LIST_UDFS_UDTF_NAME));
+        assert!(!additional_names.contains(TEXT_SEARCH_UDTF_NAME));
+        assert!(!additional_names.contains("json_get"));
     }
 
     #[test]
@@ -2890,23 +3067,22 @@ mod tests {
             RERANK_UDTF_NAME.to_string(),
         ]);
 
-        let text_only = nsql_function_context_for_test(&app, &available_names, false, true, false);
-        let text_only_names = entry_names(&text_only.spice_specific);
+        let text_only = nsql_function_context_for_test(&app, &available_names, false, true);
+        let text_only_names = entry_names(&text_only.search);
         assert!(text_only_names.contains(TEXT_SEARCH_UDTF_NAME));
         assert!(!text_only_names.contains(VECTOR_SEARCH_UDTF_NAME));
         assert!(!text_only_names.contains(RRF_UDF_NAME));
         assert!(!text_only_names.contains(RERANK_UDTF_NAME));
 
-        let vector_only =
-            nsql_function_context_for_test(&app, &available_names, true, false, false);
-        let vector_only_names = entry_names(&vector_only.spice_specific);
+        let vector_only = nsql_function_context_for_test(&app, &available_names, true, false);
+        let vector_only_names = entry_names(&vector_only.search);
         assert!(!vector_only_names.contains(TEXT_SEARCH_UDTF_NAME));
         assert!(vector_only_names.contains(VECTOR_SEARCH_UDTF_NAME));
         assert!(!vector_only_names.contains(RRF_UDF_NAME));
         assert!(!vector_only_names.contains(RERANK_UDTF_NAME));
 
-        let hybrid = nsql_function_context_for_test(&app, &available_names, true, true, false);
-        let hybrid_names = entry_names(&hybrid.spice_specific);
+        let hybrid = nsql_function_context_for_test(&app, &available_names, true, true);
+        let hybrid_names = entry_names(&hybrid.search);
         assert!(hybrid_names.contains(TEXT_SEARCH_UDTF_NAME));
         assert!(hybrid_names.contains(VECTOR_SEARCH_UDTF_NAME));
         assert!(hybrid_names.contains(RRF_UDF_NAME));

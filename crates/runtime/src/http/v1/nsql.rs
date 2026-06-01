@@ -294,7 +294,7 @@ fn nsql_context_error_response(error: &NsqlContextError) -> (StatusCode, String)
                     "version": "52.5.0",
                     "dialect": "PostgreSQL",
                     "parser": "DataFusion SQL parser configured with PostgreSQL dialect",
-                    "notes": ["Spice supports standard DataFusion SQL plus registered Spice-specific functions."]
+                    "notes": ["Spice supports standard DataFusion SQL plus additional Spice-specific and registered user-defined functions listed in this context."]
                 },
                 "datasets": [{
                     "name": "sales.orders",
@@ -357,7 +357,8 @@ fn nsql_context_error_response(error: &NsqlContextError) -> (StatusCode, String)
                 "functions": {
                     "summary": "Spice SQL runs on Apache DataFusion with the SQL parser configured for the PostgreSQL dialect.",
                     "json": [],
-                    "spice_specific": [],
+                    "search": [],
+                    "additional": [],
                     "spark_compatibility": {"description": "Spark-compatible scalar functions are available.", "functions": []},
                     "user_defined": []
                 },
@@ -888,6 +889,18 @@ mod tests {
         function
     }
 
+    fn ticket_priority_function() -> Function {
+        let mut function = test_function("ticket_priority", true);
+        function.description =
+            Some("Converts support-ticket sentiment into a priority score.".to_string());
+        function.signature.args = vec![FunctionArg {
+            name: "sentiment".to_string(),
+            arrow_type: "utf8".to_string(),
+        }];
+        function.signature.returns = Some(FunctionReturns::Scalar("int64".to_string()));
+        function
+    }
+
     fn test_user_function_info(name: &str) -> UserFunctionInfo {
         UserFunctionInfo {
             name: name.to_string(),
@@ -1083,28 +1096,17 @@ mod tests {
     }
 
     fn nsql_context_function_context_for_test(include_search_functions: bool) -> String {
-        let mut context = String::from(concat!(
-            "\n",
-            "Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. Search and JSON function references are included only when relevant to the current spicepod. Search functions appear only when in-scope datasets expose the required search indexes. Run SELECT * FROM list_udfs() to inspect the full registered function inventory:\n"
-        ));
+        let app = app_with_functions(true, vec![ticket_priority_function()]);
+        let mut available_names = all_context_function_names_for_test();
+        available_names.insert("ticket_priority".to_string());
 
-        if include_search_functions {
-            context.push_str(concat!(
-                "\n",
-                "### Spice-specific functions\n",
-                "- `rerank`: Re-ranks search results or table rows using a configured reranker model. Syntax: `rerank(input, model => 'model_name', document => 'column_name'[, query => 'query text'])`.\n",
-                "- `rrf`: Combines multiple search result sets using reciprocal rank fusion. Syntax: `rrf(text_search(...), vector_search(...)[, limit => n])`.\n",
-                "- `text_search`: Runs full-text search over a configured searchable dataset. Syntax: `text_search(dataset, 'query text'[, column])`.\n",
-                "- `vector_search`: Runs vector search over a configured embedding/vector index. Syntax: `vector_search(dataset, 'query text'[, column])`.\n"
-            ));
-        }
-
-        context.push_str(concat!(
-            "\n",
-            "### User-defined functions\n",
-            "- `ticket_priority`: scalar function from `sql` with `stable` volatility. Syntax: `ticket_priority(sentiment utf8) -> int64`. Converts support-ticket sentiment into a priority score.\n"
-        ));
-        context
+        nsql_function_context_for_test(
+            &app,
+            &available_names,
+            include_search_functions,
+            include_search_functions,
+        )
+        .render_markdown()
     }
 
     fn nsql_context_block_with_samples_for_test() -> String {
@@ -1261,25 +1263,6 @@ mod tests {
                     vector_search: true.into(),
                     full_text_search: true.into(),
                 },
-                NsqlColumnContext {
-                    name: "order_payload".to_string(),
-                    data_type: "Utf8".to_string(),
-                    nullable: true,
-                    description: Some("Order details stored as JSON".to_string()),
-                    source_type: Some("jsonb".to_string()),
-                    metadata: BTreeMap::from([
-                        (
-                            "description".to_string(),
-                            "Order details stored as JSON".to_string(),
-                        ),
-                        ("source_type".to_string(), "jsonb".to_string()),
-                    ]),
-                    primary_key: false.into(),
-                    unique: false.into(),
-                    indexed: false.into(),
-                    vector_search: false.into(),
-                    full_text_search: false.into(),
-                },
             ],
             primary_key: vec!["order_id".to_string()],
             unique_constraints: vec![vec!["order_id".to_string()]],
@@ -1336,7 +1319,6 @@ mod tests {
         response.functions = nsql_function_context_for_test(
             &app,
             &all_context_function_names_for_test(),
-            true,
             true,
             true,
         );

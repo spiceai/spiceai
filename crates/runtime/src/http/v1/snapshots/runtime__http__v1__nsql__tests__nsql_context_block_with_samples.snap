@@ -35,16 +35,55 @@ expression: nsql_context_block_with_samples_for_test()
     - full-text search on `customer_id` using `tantivy`. Syntax: `text_search(sales.orders, 'query text', customer_id)`. Row id: `order_id`.
 
 ## SQL Functions
-Use Spice.ai/DataFusion SQL. Standard DataFusion SQL functions are available. This context lists registered functions relevant to the current spicepod. Search functions appear only when in-scope datasets expose the required search indexes. Run SELECT * FROM list_udfs() to inspect the full registered function inventory:
+Spice SQL runs on Apache DataFusion with the SQL parser configured for the PostgreSQL dialect. Standard DataFusion SQL functions are available. Additional Spice-specific and registered user-defined functions are listed below. Run SELECT * FROM list_udfs() to inspect the full registered function inventory:
 
-### Spice-specific functions
+### JSON functions
+- `flatten_json`: Flattens JSON objects into key-value rows or structures. Syntax: `flatten_json(json)`.
+- `flatten_json_properties`: Flattens JSON-schema properties into key-value rows or structures. Syntax: `flatten_json_properties(json_schema)`.
+- `json_as_text`: Converts a JSON value to text (SCALAR). Syntax: `json_as_text(json)`.
+- `json_contains`: Returns whether one JSON value contains another (SCALAR). Syntax: `json_contains(json, value)`.
+- `json_from_scalar`: Converts a scalar value to JSON (SCALAR). Syntax: `json_from_scalar(value)`.
+- `json_get`: Extracts a JSON value by path (SCALAR). Syntax: `json_get(json, path)`.
+- `json_get_array`: Extracts a JSON array by path (SCALAR). Syntax: `json_get_array(json, path)`.
+- `json_get_bool`: Extracts a boolean value from JSON by path (SCALAR). Syntax: `json_get_bool(json, path)`.
+- `json_get_float`: Extracts a floating-point value from JSON by path (SCALAR). Syntax: `json_get_float(json, path)`.
+- `json_get_int`: Extracts an integer value from JSON by path (SCALAR). Syntax: `json_get_int(json, path)`.
+- `json_get_json`: Extracts a nested JSON value by path (SCALAR). Syntax: `json_get_json(json, path)`.
+- `json_get_str`: Extracts a string value from JSON by path (SCALAR). Syntax: `json_get_str(json, path)`.
+- `json_length`: Returns the length of a JSON array or object (SCALAR). Syntax: `json_length(json)`.
+- `json_object_keys`: Returns the keys of a JSON object (SCALAR). Syntax: `json_object_keys(json)`.
+- `json_tree`: Expands JSON into a tree of path, key, and value rows or structures. Syntax: `json_tree(json)`.
+
+### Search functions
 - `rerank`: Re-ranks search results or table rows using a configured reranker model. Syntax: `rerank(input, model => 'model_name', document => 'column_name'[, query => 'query text'])`.
 - `rrf`: Combines multiple search result sets using reciprocal rank fusion. Syntax: `rrf(text_search(...), vector_search(...)[, limit => n])`.
 - `text_search`: Runs full-text search over a configured searchable dataset. Syntax: `text_search(dataset, 'query text'[, column])`.
 - `vector_search`: Runs vector search over a configured embedding/vector index. Syntax: `vector_search(dataset, 'query text'[, column])`.
 
-### User-defined functions
-- `ticket_priority`: scalar function from `sql` with `stable` volatility. Syntax: `ticket_priority(sentiment utf8) -> int64`. Converts support-ticket sentiment into a priority score.
+### Additional registered functions
+- `ai`: Runs a prompt against a configured language model (SCALAR). Syntax: `ai(prompt[, model => 'model_name'])`.
+- `bucket`: Assigns a numeric expression to a bucket boundary (SCALAR). Syntax: `bucket(value, buckets)`.
+- `col_description`: Returns the configured description for a table column (SCALAR). Syntax: `col_description(table_catalog, table_schema, table_name, column_name)`.
+- `cosine_distance`: Computes cosine distance between two vectors (SCALAR). Syntax: `cosine_distance(vector_a, vector_b)`.
+- `digest_many`: Computes a digest for one or more input expressions (SCALAR). Syntax: `digest_many(value[, ...])`.
+- `embed`: Generates an embedding with a configured embedding model (SCALAR). Syntax: `embed(input[, model => 'model_name'])`.
+- `inner_product`: Computes the inner product of two vectors (SCALAR). Syntax: `inner_product(vector_a, vector_b)`.
+- `l2_distance`: Computes Euclidean distance between two vectors (SCALAR). Syntax: `l2_distance(vector_a, vector_b)`.
+- `l2_norm`: Computes the L2 norm of a vector (SCALAR). Syntax: `l2_norm(vector)`.
+- `l2_squared_distance`: Computes squared Euclidean distance between two vectors (SCALAR). Syntax: `l2_squared_distance(vector_a, vector_b)`.
+- `list_udfs`: Lists functions registered in the current DataFusion context. Syntax: `list_udfs()`.
+- `obj_description`: Returns the configured description for a table or object (SCALAR). Syntax: `obj_description(table_catalog, table_schema, table_name)`.
+- `truncate`: Truncates values to the requested precision (SCALAR). Syntax: `truncate(value, precision)`.
+
+### Spark compatibility scalar functions
+Spark-compatible scalar functions are available for arrays, maps, structs, dates, strings, hashes, URLs, XML, and other common Spark SQL expressions.
+- `abs`, `array`, `ascii`, `bit_count`, `bit_get`, `bitmap_count`, `bitwise_not`, `char`
+- `concat`, `crc32`, `csc`, `date_add`, `date_sub`, `elt`, `expm1`, `factorial`
+- `format_string`, `hex`, `hour`, `if`, `ilike`, `last_day`, `length`, `like`
+- `luhn_check`, `make_dt_interval`, `make_interval`, `map_from_arrays`, `map_from_entries`, `minute`, `mod`, `next_day`
+- `parse_url`, `pmod`, `rint`, `sec`, `second`, `sha1`, `sha2`, `shiftleft`
+- `shiftright`, `shiftrightunsigned`, `shuffle`, `space`, `try_parse_url`, `try_url_decode`, `url_decode`, `url_encode`
+- `width_bucket`
 
 ## Sample Data
 
