@@ -62,12 +62,14 @@ async fn test_table_statistics_crud(
     let stats = catalog.get_table_statistics(&table_id).await?;
     assert!(stats.is_none(), "Expected no stats initially");
 
-    // Upsert stats with a dummy blob
+    // Upsert stats with a dummy blob and NDV sketch blob
     let dummy_blob = vec![1, 2, 3, 4];
+    let dummy_ndv = vec![9, 8, 7, 6, 5];
     let table_stats = TableStatistics {
         table_id: table_id.clone(),
         statistics_blob: dummy_blob.clone(),
         num_rows: 100,
+        ndv_sketches: Some(dummy_ndv.clone()),
     };
     catalog.upsert_table_statistics(&table_stats).await?;
 
@@ -78,12 +80,14 @@ async fn test_table_statistics_crud(
         .expect("stats should exist");
     assert_eq!(stats.statistics_blob, dummy_blob);
     assert_eq!(stats.num_rows, 100);
+    assert_eq!(stats.ndv_sketches, Some(dummy_ndv));
 
-    // Upsert updates existing stats
+    // Upsert updates existing stats, including clearing the NDV sketches to NULL.
     let updated = TableStatistics {
         table_id: table_id.clone(),
         statistics_blob: vec![5, 6, 7, 8],
         num_rows: 200,
+        ndv_sketches: None,
     };
     catalog.upsert_table_statistics(&updated).await?;
 
@@ -93,6 +97,7 @@ async fn test_table_statistics_crud(
         .expect("stats should exist");
     assert_eq!(stats.statistics_blob, vec![5, 6, 7, 8]);
     assert_eq!(stats.num_rows, 200);
+    assert_eq!(stats.ndv_sketches, None);
 
     // Clear
     catalog.clear_table_statistics(&table_id).await?;
@@ -128,6 +133,7 @@ async fn test_stats_cleared_on_drop_table(
             table_id: table_id.clone(),
             statistics_blob: vec![1, 2, 3],
             num_rows: 100,
+            ndv_sketches: None,
         })
         .await?;
 
