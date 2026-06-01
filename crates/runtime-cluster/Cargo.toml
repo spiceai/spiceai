@@ -24,6 +24,7 @@ data_components = { path = "../data_components" }
 datafusion.workspace = true
 datafusion-expr = { workspace = true }
 datafusion-proto = { workspace = true }
+datafusion-proto-common = { workspace = true }
 flight_client = { path = "../flight_client" }
 fundu.workspace = true
 futures.workspace = true
@@ -31,6 +32,7 @@ object_store.workspace = true
 object_store_occ = { path = "../object_store_occ" }
 opentelemetry = { workspace = true }
 parking_lot.workspace = true
+prost = { workspace = true }
 serde_json.workspace = true
 runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-proto = { path = "../runtime-proto" }

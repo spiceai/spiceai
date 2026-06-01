@@ -926,6 +926,8 @@ impl Runtime {
                 if let Some(n) = notifier {
                     n.notified().await;
                 }
+                // Statistics flow via the periodic ExecutorStatistics reporter, not
+                // this readiness ack.
                 let sent = broadcaster
                     .broadcast_partitions_loaded(table_name.clone(), partition_expr_bytes)
                     .await;
@@ -936,6 +938,106 @@ impl Runtime {
         }
 
         Ok(())
+    }
+
+    /// Periodically recompute and rebroadcast this executor's per-table row-count
+    /// statistics to all schedulers. `PartitionsLoaded` is otherwise only sent on
+    /// initial load / assignment change, so during streaming ETL the coordinator's
+    /// in-memory stats would reflect only the first snapshot (or nothing if the
+    /// table had no data at initial-load time). A periodic rebroadcast keeps the
+    /// coordinator's join-sizing statistics fresh as the executor's local data grows.
+    pub(crate) async fn run_executor_statistics_reporter(self: Arc<Self>) {
+        use crate::cluster::partition::{StatsRichness, classify_stats_richness};
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(45));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Per-table cache of the last *rich* stats we broadcast, so a tick whose
+        // stats computation degrades (e.g. the aggregate query fails under ingest
+        // load and falls back to COUNT(*)) does not clobber the coordinator's
+        // richer stats. Distributed JoinSelection (q18 swap) only picks the small
+        // build side while the coordinator holds the column/distinct stats, so
+        // flapping between rich and degraded would intermittently OOM.
+        let mut last_rich: HashMap<String, (StatsRichness, Vec<u8>, Vec<String>)> = HashMap::new();
+        loop {
+            interval.tick().await;
+            let Some(broadcaster) = self.executor_outbound_broadcaster() else {
+                continue;
+            };
+            let df = self.datafusion();
+
+            // Enumerate the tables this executor serves locally. The q18 tables
+            // are cayenne *catalog* tables (not spice.public datasets), so the
+            // dataset partition-assignment map doesn't cover them; enumerate the
+            // cayenne catalog directly. Also include any dataset assignments.
+            let mut tables: Vec<TableReference> = Vec::new();
+            #[cfg(not(windows))]
+            {
+                tables.extend(crate::cluster::discover_cayenne_tables(&df).await);
+            }
+            if let Some(assignments_lock) = self.partition_assignments() {
+                for resolved in assignments_lock.read().await.keys() {
+                    tables.push(TableReference::full(
+                        Arc::<str>::clone(&resolved.catalog),
+                        Arc::<str>::clone(&resolved.schema),
+                        Arc::<str>::clone(&resolved.table),
+                    ));
+                }
+            }
+            tables.sort_by_key(ToString::to_string);
+            tables.dedup_by_key(|t| t.to_string());
+            if tables.is_empty() {
+                continue;
+            }
+            tracing::debug!(
+                count = tables.len(),
+                "Reporting per-executor table statistics to schedulers"
+            );
+            for table in tables {
+                let table_key = table.to_string();
+                match crate::cluster::partition::local_executor_table_statistics(&df, &table).await
+                {
+                    Some((stats, column_names)) => {
+                        let richness = classify_stats_richness(&stats);
+                        // Adopt the fresh stats when they're at least as rich as
+                        // what we last broadcast (so growing num_rows/min/max stay
+                        // current); otherwise re-broadcast the cached richer stats.
+                        let adopt = last_rich
+                            .get(&table_key)
+                            .is_none_or(|(cached, _, _)| richness >= *cached);
+                        if adopt {
+                            let encoded = runtime_cluster::encode_statistics(&stats);
+                            last_rich.insert(
+                                table_key.clone(),
+                                (richness, encoded.clone(), column_names.clone()),
+                            );
+                            broadcaster
+                                .broadcast_executor_statistics(table_key, encoded, column_names)
+                                .await;
+                        } else if let Some((_, encoded, names)) = last_rich.get(&table_key) {
+                            broadcaster
+                                .broadcast_executor_statistics(
+                                    table_key,
+                                    encoded.clone(),
+                                    names.clone(),
+                                )
+                                .await;
+                        }
+                    }
+                    // Computation failed entirely — keep the coordinator warm with
+                    // the last rich stats rather than going dark for this table.
+                    None => {
+                        if let Some((_, encoded, names)) = last_rich.get(&table_key) {
+                            broadcaster
+                                .broadcast_executor_statistics(
+                                    table_key,
+                                    encoded.clone(),
+                                    names.clone(),
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Returns the partition store for accelerated table partition metadata (scheduler only).
@@ -1198,6 +1300,17 @@ impl Runtime {
         };
 
         // Start Flight server
+        // On executors, periodically rebroadcast per-table row-count statistics so
+        // the coordinator's join-sizing stats stay fresh as streaming ETL grows
+        // local data (PartitionsLoaded is otherwise sent only on initial load /
+        // assignment change).
+        if self.df.cluster_config.effective_role() == Some(ClusterRole::Executor) {
+            let reporter_self = Arc::clone(&self);
+            tokio::spawn(async move {
+                reporter_self.run_executor_statistics_reporter().await;
+            });
+        }
+
         let flight_shutdown = CancellationToken::new();
         let self_ref = Arc::clone(&self);
         let cloned_tls_config = tls_config.clone();
