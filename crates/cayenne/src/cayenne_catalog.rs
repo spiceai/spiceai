@@ -1804,12 +1804,16 @@ impl MetadataCatalog for CayenneCatalog {
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "INSERT OR REPLACE INTO cayenne_table_statistics \
-                      (table_id, statistics_blob, num_rows) \
-                      VALUES (?1, ?2, ?3)",
+                      (table_id, statistics_blob, num_rows, ndv_sketches) \
+                      VALUES (?1, ?2, ?3, ?4)",
                 params: vec![
                     MetastoreValue::Text(stats.table_id.clone()),
                     MetastoreValue::Blob(stats.statistics_blob.clone()),
                     MetastoreValue::Integer(stats.num_rows),
+                    stats
+                        .ndv_sketches
+                        .clone()
+                        .map_or(MetastoreValue::Null, MetastoreValue::Blob),
                 ],
             })
             .await
@@ -1821,7 +1825,7 @@ impl MetadataCatalog for CayenneCatalog {
             .query_helper(
                 QueryParams {
                     sql: r"
-                    SELECT table_id, statistics_blob, num_rows
+                    SELECT table_id, statistics_blob, num_rows, ndv_sketches
                     FROM cayenne_table_statistics
                     WHERE table_id = ?1
                     ",
@@ -1832,6 +1836,7 @@ impl MetadataCatalog for CayenneCatalog {
                         table_id: row.get_string(0)?,
                         statistics_blob: row.get_blob(1)?,
                         num_rows: row.get_i64(2)?,
+                        ndv_sketches: row.get_optional_blob(3)?,
                     })
                 },
             )

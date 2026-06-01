@@ -295,11 +295,18 @@ struct PostWriteMaintenanceState {
     /// Set when the writer wants retention filters applied. Coalesces — multiple
     /// writes scheduling retention collapse to one scan per debounce window.
     retention_requested: bool,
+    /// Net change to the live row count across the coalesced writes
+    /// (`inserted - superseded - deleted`). Accumulated alongside `stats` and
+    /// applied as a [`RowCountUpdate::Delta`] when the stats are persisted.
+    live_rows_delta: i64,
 }
 
 impl PostWriteMaintenanceState {
     fn is_empty(&self) -> bool {
-        self.stats.is_none() && !self.refresh_listing && !self.retention_requested
+        self.stats.is_none()
+            && !self.refresh_listing
+            && !self.retention_requested
+            && self.live_rows_delta == 0
     }
 }
 
@@ -457,8 +464,16 @@ impl CayenneCdcWrite {
             } else {
                 self.table.record_file_pk_keys(&self.validated_file_keys);
             }
-            self.table
-                .schedule_post_write_maintenance(self.stats, false, retention_requested);
+            // This staged-append path only runs when `can_stage_for_pipeline`
+            // (no pending or on-conflict deletions — see `write_cdc_pipelined`),
+            // so it is a pure append: every written row is a new live row.
+            let live_rows_delta = i64::try_from(rows).unwrap_or(i64::MAX);
+            self.table.schedule_post_write_maintenance(
+                self.stats,
+                false,
+                retention_requested,
+                live_rows_delta,
+            );
             Ok(rows)
         } else {
             Ok(self.rows)
@@ -476,6 +491,26 @@ impl CayenneCdcWrite {
 struct ColumnStatsState {
     columns: Vec<vortex::array::stats::StatsSet>,
     seeded: Vec<bool>,
+    /// Per-column NDV (distinct-count) `HyperLogLog` sketch, `Some` only for
+    /// integer columns (join-key candidates). Parallel to `columns` for O(1)
+    /// access on the write hot path. See [`crate::hll`].
+    ndv: Vec<Option<crate::hll::HyperLogLog>>,
+}
+
+/// How a stats persist updates the live `num_rows` count, keeping it tracking
+/// `SELECT COUNT(*)` rather than the sum of every insert ever made.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RowCountUpdate {
+    /// Add a signed net delta for this commit (`inserted - superseded - deleted`).
+    /// Used by the normal write/CDC-upsert path.
+    Delta(i64),
+    /// Replace with an authoritative live count. Used by compaction and overwrite
+    /// rewrites, which materialize exactly the live rows and so bound any drift
+    /// the incremental deltas might accumulate.
+    Set(i64),
+    /// Leave the count unchanged — rows moved, not added (e.g. the inline-data
+    /// checkpoint flush, whose rows were already counted on insert).
+    Unchanged,
 }
 
 /// Accumulates per-column statistics across multiple `RecordBatch`es during a write.
@@ -516,15 +551,65 @@ impl ColumnStatsAccumulator {
                 ))
             })
             .collect();
+        // NDV sketches only for integer columns (join-key candidates); other
+        // columns get `None` so the write path skips them.
+        let ndv: Vec<Option<crate::hll::HyperLogLog>> = schema
+            .fields()
+            .iter()
+            .map(|f| Self::supports_ndv(f.data_type()).then(crate::hll::HyperLogLog::new))
+            .collect();
         Self {
             state: std::sync::Mutex::new(ColumnStatsState {
                 columns: vec![vortex::array::stats::StatsSet::default(); num_cols],
                 seeded: vec![false; num_cols],
+                ndv,
             }),
             dtypes,
             row_count: std::sync::atomic::AtomicI64::new(0),
             schema: schema.clone(),
         }
+    }
+
+    /// Whether to maintain an NDV sketch for `dt`. Restricted to integer types:
+    /// these are the join-key candidates (e.g. `*_custkey`, `*_orderkey`) whose
+    /// distinct count can diverge sharply from their min/max range under sparse
+    /// CDC keys. Mirrors the consumer-side `supports_ndv` in the cluster reporter.
+    fn supports_ndv(dt: &DataType) -> bool {
+        matches!(
+            dt,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+        )
+    }
+
+    /// Fold every non-null value of an integer Arrow column into `hll`. Iterates
+    /// the typed array directly (no `ScalarValue` boxing) to keep the write hot
+    /// path cheap, sign-extending to `i128` so all widths share one hash path.
+    fn add_int_column_to_hll(col: &dyn arrow::array::Array, hll: &mut crate::hll::HyperLogLog) {
+        macro_rules! fold {
+            ($array_ty:ty) => {{
+                if let Some(a) = col.as_any().downcast_ref::<$array_ty>() {
+                    for v in a.iter().flatten() {
+                        hll.add_i128(i128::from(v));
+                    }
+                    return;
+                }
+            }};
+        }
+        fold!(Int8Array);
+        fold!(Int16Array);
+        fold!(Int32Array);
+        fold!(Int64Array);
+        fold!(UInt8Array);
+        fold!(UInt16Array);
+        fold!(UInt32Array);
+        fold!(UInt64Array);
     }
 
     /// Update accumulated stats from a `RecordBatch`.
@@ -566,6 +651,11 @@ impl ColumnStatsAccumulator {
             } else {
                 state.columns[i] = batch_stats;
                 state.seeded[i] = true;
+            }
+
+            // Maintain the per-column NDV sketch for integer columns.
+            if let Some(Some(hll)) = state.ndv.get_mut(i) {
+                Self::add_int_column_to_hll(col.as_ref(), hll);
             }
         }
     }
@@ -855,12 +945,16 @@ impl ColumnStatsAccumulator {
             return;
         }
 
-        let (other_columns, other_seeded) = {
+        let (other_columns, other_seeded, other_ndv) = {
             let Ok(other_state) = other.state.lock() else {
                 tracing::warn!("ColumnStatsAccumulator: mutex poisoned in merge_from(), skipping");
                 return;
             };
-            (other_state.columns.clone(), other_state.seeded.clone())
+            (
+                other_state.columns.clone(),
+                other_state.seeded.clone(),
+                other_state.ndv.clone(),
+            )
         };
 
         let Ok(mut state) = self.state.lock() else {
@@ -891,6 +985,37 @@ impl ColumnStatsAccumulator {
                 state.seeded[idx] = true;
             }
         }
+
+        // Merge per-column NDV sketches (register-wise max).
+        for (idx, other_hll) in other_ndv.into_iter().enumerate() {
+            let (Some(other_hll), Some(slot)) = (other_hll, state.ndv.get_mut(idx)) else {
+                continue;
+            };
+            match slot {
+                Some(hll) => hll.merge(&other_hll),
+                None => *slot = Some(other_hll),
+            }
+        }
+    }
+
+    /// Snapshot the accumulated per-column NDV sketches as an [`NdvSketches`]
+    /// container (column index -> sketch), for serialization/merge on persist.
+    fn to_ndv_sketches(&self) -> crate::hll::NdvSketches {
+        let mut sketches = crate::hll::NdvSketches::new();
+        let Ok(state) = self.state.lock() else {
+            tracing::warn!(
+                "ColumnStatsAccumulator: mutex poisoned in to_ndv_sketches(), returning empty"
+            );
+            return sketches;
+        };
+        for (idx, slot) in state.ndv.iter().enumerate() {
+            if let Some(hll) = slot
+                && let Ok(col_idx) = u32::try_from(idx)
+            {
+                *sketches.entry(col_idx) = hll.clone();
+            }
+        }
+        sketches
     }
 
     pub(crate) fn to_file_statistics_blob_with_row_count(&self) -> Option<(Vec<u8>, i64)> {
@@ -1868,6 +1993,20 @@ pub(crate) struct OnConflictDeletions {
     pub(crate) deleted_inlined_pk_i64: Vec<i64>,
     /// Deleted inlined row keys.
     pub(crate) deleted_inlined_row_keys: Vec<Box<[u8]>>,
+}
+
+impl OnConflictDeletions {
+    /// Total number of existing rows superseded (deleted) by this upsert across
+    /// all strategies (position deletes + file-backed + inlined). Used to net the
+    /// live row count: an upsert that replaces N existing rows adds
+    /// `inserted - N` live rows, not `inserted`.
+    pub(crate) fn total_superseded(&self) -> usize {
+        self.delete_specs.values().map(Vec::len).sum::<usize>()
+            + self.deleted_pk_i64.len()
+            + self.deleted_row_keys.len()
+            + self.deleted_inlined_pk_i64.len()
+            + self.deleted_inlined_row_keys.len()
+    }
 }
 
 #[derive(Clone)]
@@ -3957,10 +4096,39 @@ impl CayenneTableProvider {
             })
             .ok()?;
 
-        Some(crate::stats::file_statistics_to_df(
-            &file_stats,
-            stats.num_rows,
-        ))
+        let mut df_stats = crate::stats::file_statistics_to_df(&file_stats, stats.num_rows);
+
+        // Overlay per-column NDV estimates from the HyperLogLog sketches as
+        // `distinct_count`. The cluster reporter uses this to encode an
+        // effective max (`min(true_max, min + ndv)`) that survives `UnionExec`,
+        // letting distributed JoinSelection size joins on sparse integer keys.
+        if let Some(blob) = stats.ndv_sketches.as_deref()
+            && let Some(sketches) = crate::hll::NdvSketches::deserialize(blob)
+        {
+            for (idx, col) in df_stats.column_statistics.iter_mut().enumerate() {
+                if let Ok(col_idx) = u32::try_from(idx)
+                    && let Some(ndv) = sketches.estimate(col_idx)
+                    && let Ok(ndv) = usize::try_from(ndv)
+                {
+                    col.distinct_count = datafusion_common::stats::Precision::Inexact(ndv);
+                }
+            }
+        }
+
+        Some(df_stats)
+    }
+
+    /// The incrementally-maintained metastore statistics aggregate (live
+    /// `num_rows` + per-column min/max + integer NDV via `distinct_count`), for
+    /// distributed-join sizing by the cluster executor-statistics reporter.
+    ///
+    /// Unlike [`TableProvider::statistics`], this is **not** gated off while
+    /// position-based deletions are pending — under CDC the aggregate is exactly
+    /// what the coordinator needs, and it is always-fresh (kept warm at
+    /// construction and on every write commit) and O(1) to read.
+    #[must_use]
+    pub fn optimizer_table_statistics(&self) -> Option<Statistics> {
+        self.cached_table_statistics_for_optimizer()
     }
 
     fn cached_table_statistics_for_optimizer(&self) -> Option<Statistics> {
@@ -6528,8 +6696,9 @@ impl CayenneTableProvider {
         stats: Option<Arc<ColumnStatsAccumulator>>,
         refresh_listing: bool,
         retention_requested: bool,
+        live_rows_delta: i64,
     ) {
-        if stats.is_none() && !refresh_listing && !retention_requested {
+        if stats.is_none() && !refresh_listing && !retention_requested && live_rows_delta == 0 {
             return;
         }
 
@@ -6544,6 +6713,9 @@ impl CayenneTableProvider {
             }
             maintenance_state.refresh_listing |= refresh_listing;
             maintenance_state.retention_requested |= retention_requested;
+            maintenance_state.live_rows_delta = maintenance_state
+                .live_rows_delta
+                .saturating_add(live_rows_delta);
         }
 
         if self
@@ -6620,7 +6792,12 @@ impl CayenneTableProvider {
     ) -> CatalogResult<()> {
         let had_stats = state.stats.is_some();
         if let Some(stats) = state.stats {
-            self.persist_table_stats(&stats).await;
+            // The net live-row delta (inserts minus supersedes/deletes) was
+            // accumulated alongside the coalesced stats. Retention deletes below
+            // are not yet netted here (TPC-H has none); compaction's `Set` reset
+            // bounds any resulting drift.
+            self.persist_table_stats(&stats, RowCountUpdate::Delta(state.live_rows_delta))
+                .await;
         }
 
         let mut retention_deleted = 0_u64;
@@ -7076,8 +7253,11 @@ impl CayenneTableProvider {
             self.clear_all_deletion_caches();
 
             // Persist accumulated stats from the rewrite — keeps DataFusion's
-            // synchronous statistics path consistent with the new snapshot.
-            self.persist_table_stats(&stats_acc).await;
+            // synchronous statistics path consistent with the new snapshot. The
+            // rewrite materializes exactly the live rows, so its min/max + NDV +
+            // count are authoritative: replace the aggregate, correcting any
+            // drift the incremental merges/deltas accumulated.
+            self.replace_table_stats_after_rewrite(&stats_acc).await;
         }
 
         // Checkpoint the PK existence index for fast restart (best-effort). The
@@ -7709,78 +7889,136 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Persist table-level statistics by merging the current write with the
-    /// existing metastore aggregate when possible.
+    /// Persist table-level statistics by merging the current write's accumulator
+    /// (min/max/null + NDV sketches) into the existing metastore aggregate and
+    /// applying `num_rows_update` to the live row count.
     ///
     /// Best-effort: logs a warning and continues if stats persistence fails,
     /// since stats are an optimization and not critical for correctness.
-    pub(crate) async fn persist_table_stats(&self, accumulator: &ColumnStatsAccumulator) {
+    pub(crate) async fn persist_table_stats(
+        &self,
+        accumulator: &ColumnStatsAccumulator,
+        num_rows_update: RowCountUpdate,
+    ) {
         let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
-        self.persist_table_stats_locked(accumulator).await;
+        self.persist_table_stats_locked(accumulator, num_rows_update, false)
+            .await;
     }
 
+    /// Replace the aggregate entirely with the overwrite's accumulator and reset
+    /// the live count to the rewritten row count (the prior data is gone, so the
+    /// old min/max/NDV must not survive — see [`RowCountUpdate`]).
     pub(crate) async fn reset_table_stats_after_overwrite(
         &self,
         accumulator: &ColumnStatsAccumulator,
     ) {
         let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
         self.clear_cached_table_statistics_unlocked();
-        self.persist_table_stats_locked(accumulator).await;
+        let new_rows = accumulator.row_count();
+        self.persist_table_stats_locked(accumulator, RowCountUpdate::Set(new_rows), true)
+            .await;
     }
 
-    async fn persist_table_stats_locked(&self, accumulator: &ColumnStatsAccumulator) {
-        let Some((new_blob, new_rows)) = accumulator.to_file_statistics_blob_with_row_count()
+    /// Replace the aggregate with a full live-row rewrite (compaction).
+    ///
+    /// Compaction materializes exactly the live rows, so its accumulator's
+    /// min/max + NDV are the authoritative *live* aggregate. Replacing (rather
+    /// than merging) resets any superset drift accumulated incrementally — e.g.
+    /// min/max widened by since-deleted rows, or an NDV sketch inflated by
+    /// superseded keys — back to the live set, and `Set`s the live count.
+    pub(crate) async fn replace_table_stats_after_rewrite(
+        &self,
+        accumulator: &ColumnStatsAccumulator,
+    ) {
+        let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
+        let new_rows = accumulator.row_count();
+        self.persist_table_stats_locked(accumulator, RowCountUpdate::Set(new_rows), true)
+            .await;
+    }
+
+    /// Persist merged/replaced stats.
+    ///
+    /// `replace_aggregate` true ignores any existing aggregate (overwrite); false
+    /// merges this write into it. `num_rows_update` sets the live count relative
+    /// to the previous aggregate (`Delta`), to an authoritative value (`Set`), or
+    /// leaves it (`Unchanged`).
+    async fn persist_table_stats_locked(
+        &self,
+        accumulator: &ColumnStatsAccumulator,
+        num_rows_update: RowCountUpdate,
+        replace_aggregate: bool,
+    ) {
+        let Some((new_blob, _new_rows)) = accumulator.to_file_statistics_blob_with_row_count()
         else {
             return;
         };
+        let new_ndv = accumulator.to_ndv_sketches();
 
         // Prefer an in-memory cached raw blob (populated by previous persist or load)
         // to avoid a catalog round-trip on every write. Only hit the catalog when
-        // the cache is cold.
-        let cached_raw = {
-            let guard = self.table_statistics.read();
-            guard.raw.clone()
-        };
-
-        let existing_stats = if let Some(raw) = cached_raw {
-            Some(raw)
+        // the cache is cold. Skipped entirely when replacing the aggregate.
+        let existing_stats = if replace_aggregate {
+            None
         } else {
-            match self
-                .catalog
-                .get_table_statistics(&self.table_metadata.table_id)
-                .await
-            {
-                Ok(stats) => stats,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to load existing table stats for {} before merge: {e}",
-                        self.table_metadata.table_name
-                    );
-                    None
+            let cached_raw = {
+                let guard = self.table_statistics.read();
+                guard.raw.clone()
+            };
+            if let Some(raw) = cached_raw {
+                Some(raw)
+            } else {
+                match self
+                    .catalog
+                    .get_table_statistics(&self.table_metadata.table_id)
+                    .await
+                {
+                    Ok(stats) => stats,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to load existing table stats for {} before merge: {e}",
+                            self.table_metadata.table_name
+                        );
+                        None
+                    }
                 }
             }
         };
 
-        let (statistics_blob, num_rows) = if let Some(existing) = existing_stats {
-            if let Some(merged_blob) =
-                accumulator.merged_file_statistics_blob(&existing.statistics_blob)
-            {
-                (merged_blob, existing.num_rows.saturating_add(new_rows))
-            } else {
-                tracing::warn!(
-                    "Failed to merge table stats for {}; replacing aggregate stats with current write",
-                    self.table_metadata.table_name
-                );
-                (new_blob, new_rows)
-            }
-        } else {
-            (new_blob, new_rows)
+        // Merge min/max/null blob and NDV sketches into the existing aggregate.
+        let prev_num_rows = existing_stats.as_ref().map_or(0, |e| e.num_rows);
+        let statistics_blob = match &existing_stats {
+            Some(existing) => accumulator
+                .merged_file_statistics_blob(&existing.statistics_blob)
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        "Failed to merge table stats for {}; replacing with current write",
+                        self.table_metadata.table_name
+                    );
+                    new_blob.clone()
+                }),
+            None => new_blob,
+        };
+        let mut merged_ndv = new_ndv;
+        if let Some(existing_ndv) = existing_stats
+            .as_ref()
+            .and_then(|e| e.ndv_sketches.as_deref())
+        {
+            merged_ndv.merge_serialized(existing_ndv);
+        }
+        let ndv_sketches = merged_ndv.serialize();
+
+        // Apply the live-row-count update relative to the previous aggregate.
+        let num_rows = match num_rows_update {
+            RowCountUpdate::Delta(delta) => prev_num_rows.saturating_add(delta).max(0),
+            RowCountUpdate::Set(n) => n.max(0),
+            RowCountUpdate::Unchanged => prev_num_rows,
         };
 
         let stats = TableStatistics {
             table_id: self.table_metadata.table_id.clone(),
             statistics_blob,
             num_rows,
+            ndv_sketches,
         };
 
         if let Err(e) = self.catalog.upsert_table_statistics(&stats).await {
@@ -8261,8 +8499,13 @@ impl CayenneTableProvider {
             stats
         };
 
-        // Persist table stats from the checkpoint write (best-effort; logs on error).
-        self.persist_table_stats(&stats).await;
+        // Persist table stats from the checkpoint write (best-effort; logs on
+        // error). The flushed rows were already counted on insert (inline-data
+        // commit) — this only moves them from the metastore to Vortex files — so
+        // the live count is `Unchanged`; only the min/max/NDV blob re-merges
+        // (idempotently).
+        self.persist_table_stats(&stats, RowCountUpdate::Unchanged)
+            .await;
 
         Ok(u64::try_from(total_rows).unwrap_or(u64::MAX))
     }
@@ -10750,6 +10993,7 @@ mod tests {
             table_id: "table_id".to_string(),
             statistics_blob,
             num_rows: 3,
+            ndv_sketches: None,
         };
 
         let stats = CayenneTableProvider::table_statistics_to_df(&schema, &table_stats)

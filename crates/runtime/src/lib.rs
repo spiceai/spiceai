@@ -937,6 +937,11 @@ impl Runtime {
     pub(crate) async fn run_executor_statistics_reporter(self: Arc<Self>) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(45));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The statistics source (`local_executor_table_statistics`) reads the
+        // Cayenne metastore aggregate, which is maintained incrementally on the
+        // write path: always-fresh, O(1), and never degrades to a row-count-only
+        // result mid-ingest. So there is no non-degrading cache here — each tick
+        // simply broadcasts the current aggregate.
         loop {
             interval.tick().await;
             let Some(broadcaster) = self.executor_outbound_broadcaster() else {
@@ -972,11 +977,13 @@ impl Runtime {
                 "Reporting per-executor table statistics to schedulers"
             );
             for table in tables {
-                if let Some((statistics, column_names)) =
+                let table_key = table.to_string();
+                if let Some((stats, column_names)) =
                     crate::cluster::partition::local_executor_table_statistics(&df, &table).await
                 {
+                    let encoded = runtime_cluster::encode_statistics(&stats);
                     broadcaster
-                        .broadcast_executor_statistics(table.to_string(), statistics, column_names)
+                        .broadcast_executor_statistics(table_key, encoded, column_names)
                         .await;
                 }
             }
