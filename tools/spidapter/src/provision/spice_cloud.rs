@@ -20,14 +20,14 @@ use spice_cloud_client::types::UpdateAppRequest;
 use system_adapter_protocol::DatasetConfig;
 use uuid::Uuid;
 
-use super::{
+use super::super::{
     FederatedStorageConfig, RunState, ScpRunState, SetupConfig, generate_initial_spicepod,
     serialize_spicepod,
 };
 use crate::args::{DeploymentMode, StdioArgs};
 use crate::commands;
 
-pub(super) async fn provision_scp_app(
+pub(crate) async fn provision_scp_app(
     run_id: Uuid,
     args: &StdioArgs,
     setup_config: &SetupConfig,
@@ -199,7 +199,7 @@ pub(super) async fn provision_scp_app(
 }
 
 #[expect(dead_code)]
-pub(super) async fn wait_for_scp_executor_count(
+pub(crate) async fn wait_for_scp_executor_count(
     cloud: &CloudClient,
     app_id: i64,
     expected_count: u64,

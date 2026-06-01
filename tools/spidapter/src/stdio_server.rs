@@ -39,25 +39,20 @@ use crate::commands;
 #[path = "sources/mod.rs"]
 mod sources;
 
-#[path = "compute/scp.rs"]
-mod compute_scp;
+#[path = "provision/mod.rs"]
+mod provision;
 
-#[path = "compute/local.rs"]
-mod compute_local;
-
-use compute_local::{
-    provision_local_single_node, provision_local_spiced_cluster, teardown_local_run,
+use provision::{
+    Ec2PostgresInstance, is_ec2_mode, launch_ec2_debezium, launch_mongodb_ec2,
+    launch_postgres_ec2, provision_local_single_node, provision_local_spiced_cluster,
+    provision_scp_app, teardown_local_run, terminate_ec2_instance,
 };
-use compute_scp::provision_scp_app;
 use sources::cayenne::generate_cayenne_sink_spicepod;
 use sources::dynamodb::{
     DynamoDbTeardownInfo, create_dynamodb_tables, delete_dynamodb_tables,
     generate_dynamodb_spicepod,
 };
-use sources::ec2_debezium::launch_ec2_debezium;
-use sources::ec2_postgres::{
-    Ec2PostgresInstance, is_ec2_mode, launch_postgres_ec2, terminate_ec2_instance,
-};
+use sources::mongodb::generate_mongodb_spicepod;
 use sources::postgres_cdc::{
     PgConfig, generate_postgres_wal_spicepod, pg_create_table_ddl, pg_error_message,
     setup_postgres_for_wal, teardown_postgres, tpch_schema_name,
@@ -263,6 +258,10 @@ enum FederatedStorageConfig {
     DynamoDB {
         prefix: String,
         region: String,
+        acceleration: AccelerationEngine,
+    },
+    MongoDB {
+        uri: String,
         acceleration: AccelerationEngine,
     },
 }
@@ -571,6 +570,38 @@ impl Handler for SpidapterHandler {
                     acceleration: self.args.acceleration,
                 }
             }
+            FederatedStorage::MongoDB => {
+                let run_id_str = run_id.to_string();
+                let short_id = run_id_str.split('-').next().unwrap_or_default();
+
+                let uri = if is_ec2_mode(&self.args) {
+                    let instance = launch_mongodb_ec2(&self.args, short_id)
+                        .await
+                        .map_err(|e| format!("Failed to provision EC2 MongoDB instance: {e}"))?;
+                    ec2_guards.push(Ec2Guard::new(
+                        instance.instance_id.clone(),
+                        instance.region.clone(),
+                    ));
+                    eprintln!(
+                        "[stdio] EC2 MongoDB: instance {} ready at {}",
+                        instance.instance_id, instance.host
+                    );
+                    instance.uri
+                } else {
+                    self.args
+                        .mongodb_uri
+                        .clone()
+                        .or_else(|| std::env::var("MONGODB_URI").ok())
+                        .ok_or_else(|| {
+                            "MONGODB_URI env var or --mongodb-uri arg is required for local MongoDB mode"
+                                .to_string()
+                        })?
+                };
+                FederatedStorageConfig::MongoDB {
+                    uri,
+                    acceleration: self.args.acceleration,
+                }
+            }
         };
 
         let mut setup_config = SetupConfig::from_metadata(&metadata).set_storage(storage);
@@ -715,6 +746,9 @@ impl Handler for SpidapterHandler {
                         secret_access_key,
                         session_token,
                     }
+                }
+                FederatedStorageConfig::MongoDB { uri, .. } => {
+                    SinkConfig::MongoDb { uri: uri.clone() }
                 }
                 FederatedStorageConfig::Cayenne => unreachable!(),
             };
@@ -939,7 +973,9 @@ impl Handler for SpidapterHandler {
                     .await
                     .map_err(|e| format!("Failed to teardown PostgreSQL: {e}"))?;
             }
-            FederatedStorageConfig::DynamoDB { .. } | FederatedStorageConfig::Cayenne => {}
+            FederatedStorageConfig::DynamoDB { .. }
+            | FederatedStorageConfig::MongoDB { .. }
+            | FederatedStorageConfig::Cayenne => {}
         }
 
         // Disarm guards and run all AWS cleanup concurrently.
@@ -1362,6 +1398,15 @@ async fn generate_initial_spicepod(
                 datasets,
                 args.auto_load_complete,
             ),
+            FederatedStorageConfig::MongoDB { uri, acceleration } => {
+                generate_mongodb_spicepod(
+                    run_id,
+                    uri,
+                    datasets,
+                    acceleration_engine_str(*acceleration),
+                    args.auto_load_complete,
+                )
+            }
         }
     };
 
@@ -1459,6 +1504,8 @@ mod tests {
             ec2_associate_public_ip: false,
             ec2_iam_instance_profile: None,
             spiced_binary: "spiced".to_string(),
+            auto_load_complete: false,
+            mongodb_uri: None,
         }
     }
 

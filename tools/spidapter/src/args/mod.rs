@@ -37,6 +37,8 @@ pub enum FederatedStorage {
     PostgresDebezium,
     #[value(name = "dynamodb")]
     DynamoDB,
+    #[value(name = "mongodb")]
+    MongoDB,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -242,6 +244,10 @@ pub struct StdioArgs {
     /// an internal refresh to complete before marking itself ready.
     #[arg(long, default_value_t = false)]
     pub auto_load_complete: bool,
+
+    /// MongoDB URI (local mode). e.g. mongodb://localhost:27017/spicebench
+    #[arg(long, env = "MONGODB_URI")]
+    pub mongodb_uri: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]

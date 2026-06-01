@@ -19,6 +19,7 @@ use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode
 use spicepod::component::ComponentOrReference;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{Runtime, TelemetryConfig};
+use spicepod::metric::{Metric, Metrics};
 use spicepod::param::Params;
 use spicepod::semantic::Column;
 use spicepod::spec::SpicepodDefinition;
@@ -304,11 +305,6 @@ pub(crate) fn generate_postgres_debezium_spicepod(
             enabled: false,
             ..TelemetryConfig::default()
         },
-        params: std::collections::HashMap::from([
-            // Match cdc_max_coalesced_envelopes to batch_max_size so the CDC
-            // coalescing window is large enough to build full-size write batches.
-            ("cdc_max_coalesced_envelopes".to_string(), "50000".to_string()),
-        ]),
         ..Runtime::default()
     };
 
@@ -345,10 +341,6 @@ pub(crate) fn generate_postgres_debezium_spicepod(
             .map(|k| HashMap::from([(k.clone(), OnConflictBehavior::Upsert)]))
             .unwrap_or_default();
 
-        // Metrics are commented out because the cloud spicepod schema (SpicepodSchema.parse)
-        // expects metrics as {metrics: [...]} but the Rust Metrics struct serializes as a flat
-        // array [...], causing deployment creation to fail with "Invalid spicepod configuration".
-        // Uncomment once the cloud schema is updated to accept flat arrays.
         // dataset.metrics = Some(Metrics {
         //     metrics: vec![
         //         Metric { name: "records_lag".to_string(), enabled: true },

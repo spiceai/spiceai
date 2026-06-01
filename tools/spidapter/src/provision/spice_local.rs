@@ -22,7 +22,7 @@ use system_adapter_protocol::DatasetConfig;
 use tokio::process::{Child, Command as TokioCommand};
 use uuid::Uuid;
 
-use super::{
+use super::super::{
     FederatedStorageConfig, LocalProcesses, LocalRunState, RunState, SetupConfig,
     generate_initial_spicepod, write_local_spicepod,
 };
@@ -57,7 +57,7 @@ struct LocalPkiPaths {
     executor_pki: Vec<(PathBuf, PathBuf)>,
 }
 
-pub(super) fn build_local_extra_envs(_setup_config: &SetupConfig) -> HashMap<String, String> {
+pub(crate) fn build_local_extra_envs(_setup_config: &SetupConfig) -> HashMap<String, String> {
     let mut map = HashMap::new();
     map.insert(
         "SPICED_LOG".to_string(),
@@ -66,7 +66,7 @@ pub(super) fn build_local_extra_envs(_setup_config: &SetupConfig) -> HashMap<Str
     map
 }
 
-pub(super) async fn provision_local_single_node(
+pub(crate) async fn provision_local_single_node(
     run_id: Uuid,
     ready_wait: Duration,
     setup_config: &SetupConfig,
@@ -168,7 +168,7 @@ pub(super) async fn provision_local_single_node(
     })))
 }
 
-pub(super) async fn provision_local_spiced_cluster(
+pub(crate) async fn provision_local_spiced_cluster(
     run_id: Uuid,
     ready_wait: Duration,
     setup_config: &SetupConfig,
@@ -389,7 +389,7 @@ pub(super) async fn provision_local_spiced_cluster(
     })))
 }
 
-pub(super) async fn teardown_local_run(local_state: &mut LocalRunState) -> anyhow::Result<()> {
+pub(crate) async fn teardown_local_run(local_state: &mut LocalRunState) -> anyhow::Result<()> {
     eprintln!(
         "[stdio] teardown: stopping local process(es) (sql endpoint: {})",
         local_state.sql_url
