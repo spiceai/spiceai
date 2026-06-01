@@ -25,7 +25,7 @@ use super::delete::{
 };
 use super::mutation_writer::AppendMutationWriter;
 use super::streaming::StreamingExec;
-use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
+use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use crate::metadata::{
     CreateTableOptions, InlinedData, InlinedDataStats, PkConflictDetection, TableMetadata,
     TableStatistics,
@@ -359,8 +359,19 @@ pub struct CayenneCdcWrite {
     table: CayenneTableProvider,
     rows: u64,
     prepared_append: Option<PreparedStagedAppend>,
+    prepared_on_conflict: Option<PreparedOnConflictDeletionPublish>,
     stats: Option<Arc<ColumnStatsAccumulator>>,
     validated_file_keys: HashSet<OwnedRow>,
+}
+
+pub(crate) struct PreparedOnConflictDeletionPublish {
+    target_snapshot_id: String,
+    snapshot_sequence: i64,
+    delete_sequence: Option<i64>,
+    insert_sequence: Option<i64>,
+    deleted_pk_i64: Vec<i64>,
+    deleted_row_keys: Vec<Box<[u8]>>,
+    position_deletions: HashMap<String, Vec<u32>>,
 }
 
 impl CayenneCdcWrite {
@@ -369,6 +380,7 @@ impl CayenneCdcWrite {
             table,
             rows,
             prepared_append: None,
+            prepared_on_conflict: None,
             stats: None,
             validated_file_keys: HashSet::new(),
         }
@@ -385,6 +397,25 @@ impl CayenneCdcWrite {
             table,
             rows,
             prepared_append: Some(prepared_append),
+            prepared_on_conflict: None,
+            stats: Some(stats),
+            validated_file_keys,
+        }
+    }
+
+    pub(crate) fn prepared_upsert_append(
+        table: CayenneTableProvider,
+        rows: u64,
+        prepared_append: PreparedStagedAppend,
+        prepared_on_conflict: PreparedOnConflictDeletionPublish,
+        stats: Arc<ColumnStatsAccumulator>,
+        validated_file_keys: HashSet<OwnedRow>,
+    ) -> Self {
+        Self {
+            table,
+            rows,
+            prepared_append: Some(prepared_append),
+            prepared_on_conflict: Some(prepared_on_conflict),
             stats: Some(stats),
             validated_file_keys,
         }
@@ -411,6 +442,10 @@ impl CayenneCdcWrite {
         if let Some(prepared_append) = self.prepared_append {
             let publish_start = Instant::now();
             prepared_append.apply_under_barrier().await?;
+            if let Some(prepared_on_conflict) = self.prepared_on_conflict {
+                self.table
+                    .publish_prepared_on_conflict_deletions(prepared_on_conflict)?;
+            }
             let rows = prepared_append.finish().await?;
             record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
             let retention_requested = self.table.has_retention_delete_filters();
@@ -2155,7 +2190,13 @@ impl CayenneTableProvider {
 
     #[must_use]
     pub(crate) fn new_staging_snapshot_id() -> String {
-        format!("{STAGING_DIR_NAME}/{}", uuid::Uuid::now_v7())
+        Self::new_staging_snapshot_id_pair().0
+    }
+
+    #[must_use]
+    pub(crate) fn new_staging_snapshot_id_pair() -> (String, String) {
+        let snapshot_id = uuid::Uuid::now_v7().to_string();
+        (format!("{STAGING_DIR_NAME}/{snapshot_id}"), snapshot_id)
     }
 
     #[must_use]
@@ -2810,13 +2851,22 @@ impl CayenneTableProvider {
         &self,
         staging_snapshot_id: &str,
     ) -> Result<()> {
-        let current_snapshot = self.get_current_snapshot_id();
+        let target_snapshot = self.get_current_snapshot_id();
 
+        self.move_staged_files_to_snapshot(staging_snapshot_id, &target_snapshot)
+            .await
+    }
+
+    pub(crate) async fn move_staged_files_to_snapshot(
+        &self,
+        staging_snapshot_id: &str,
+        target_snapshot_id: &str,
+    ) -> Result<()> {
         if self.table_metadata.path.starts_with("s3://") {
-            self.move_staging_files_s3(staging_snapshot_id, &current_snapshot)
+            self.move_staging_files_s3(staging_snapshot_id, target_snapshot_id)
                 .await
         } else {
-            self.move_staging_files_local(staging_snapshot_id, &current_snapshot)
+            self.move_staging_files_local(staging_snapshot_id, target_snapshot_id)
                 .await
         }
     }
@@ -5519,6 +5569,40 @@ impl CayenneTableProvider {
         insert_pk_bytes: Vec<Vec<u8>>,
         insert_sequence: i64,
     ) -> CatalogResult<Option<Vec<DeletionVectorWriteResult>>> {
+        let Some(results) = self
+            .write_key_deletion_vectors(delete_sequence, row_keys)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        if results.is_empty() {
+            return Ok(None);
+        }
+
+        let delete_files: Vec<crate::metadata::DeleteFile> =
+            results.iter().map(|r| r.delete_file.clone()).collect();
+        self.catalog
+            .commit_on_conflict_deletions(
+                delete_files,
+                &self.table_metadata.table_id,
+                insert_pk_bytes,
+                insert_sequence,
+                None,
+            )
+            .await
+            .map_err(|err| CatalogError::InvalidOperationNoSource {
+                message: format!("Failed to commit deletion vectors: {err}"),
+            })?;
+
+        Ok(Some(results))
+    }
+
+    async fn write_key_deletion_vectors(
+        &self,
+        delete_sequence: i64,
+        row_keys: Vec<Box<[u8]>>,
+    ) -> CatalogResult<Option<Vec<DeletionVectorWriteResult>>> {
         if row_keys.is_empty() {
             return Ok(None);
         }
@@ -5534,21 +5618,290 @@ impl CayenneTableProvider {
             return Ok(None);
         }
 
-        let delete_files: Vec<crate::metadata::DeleteFile> =
-            results.iter().map(|r| r.delete_file.clone()).collect();
+        Ok(Some(results))
+    }
+
+    pub(crate) async fn prepare_on_conflict_deletions_for_staged_snapshot(
+        &self,
+        on_conflict_deletions: OnConflictDeletions,
+        target_snapshot_id: String,
+    ) -> CatalogResult<PreparedOnConflictDeletionPublish> {
+        let OnConflictDeletions {
+            delete_specs,
+            deleted_pk_i64,
+            deleted_row_keys,
+            deleted_inlined_pk_i64,
+            deleted_inlined_row_keys,
+        } = on_conflict_deletions;
+
+        if !deleted_inlined_pk_i64.is_empty() || !deleted_inlined_row_keys.is_empty() {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "Cannot stage CDC upsert for table {} because the batch replaces inlined rows",
+                    self.table_metadata.table_name
+                ),
+            });
+        }
+
+        let has_key_deletions = !deleted_pk_i64.is_empty() || !deleted_row_keys.is_empty();
+        let sequence_count = if has_key_deletions { 3 } else { 1 };
+        let base = self
+            .catalog
+            .reserve_sequence_numbers(&self.table_metadata.table_id, sequence_count)
+            .await
+            .map_err(|err| CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "Failed to reserve sequence numbers for staged on-conflict commit: {err}"
+                ),
+            })?;
+
+        let (delete_sequence, insert_sequence, snapshot_sequence) = if has_key_deletions {
+            (Some(base), Some(base + 1), base + 2)
+        } else {
+            (None, None, base)
+        };
+
+        let position_sequence = delete_sequence.unwrap_or(snapshot_sequence);
+        let (mut delete_files, position_deletions) = self
+            .write_position_deletion_vectors_for_staged_on_conflict(delete_specs, position_sequence)
+            .await?;
+
+        let mut committed_deleted_row_keys = Vec::new();
+        let insert_pk_bytes = if let Some(delete_sequence) = delete_sequence {
+            let row_keys = self.build_pk_deletion_row_keys(&deleted_pk_i64, deleted_row_keys);
+            let insert_pk_bytes: Vec<Vec<u8>> =
+                row_keys.iter().map(|key| key.as_ref().to_vec()).collect();
+            if let Some(results) = self
+                .write_key_deletion_vectors(delete_sequence, row_keys)
+                .await?
+            {
+                delete_files.extend(results.iter().map(|result| result.delete_file.clone()));
+                committed_deleted_row_keys = results
+                    .into_iter()
+                    .find_map(|result| match result.identifiers {
+                        DeletionIdentifier::KeyBased(keys) => Some(keys),
+                        DeletionIdentifier::PositionBased { .. } => None,
+                    })
+                    .unwrap_or_default();
+            }
+            insert_pk_bytes
+        } else {
+            Vec::new()
+        };
+
         self.catalog
             .commit_on_conflict_deletions(
                 delete_files,
                 &self.table_metadata.table_id,
                 insert_pk_bytes,
-                insert_sequence,
+                insert_sequence.unwrap_or(snapshot_sequence),
+                Some(SnapshotSequenceCommit {
+                    snapshot_id: target_snapshot_id.clone(),
+                    sequence_number: snapshot_sequence,
+                }),
             )
             .await
             .map_err(|err| CatalogError::InvalidOperationNoSource {
-                message: format!("Failed to commit deletion vectors: {err}"),
+                message: format!(
+                    "Failed to commit staged on-conflict metadata and snapshot sequence: {err}"
+                ),
             })?;
 
-        Ok(Some(results))
+        Ok(PreparedOnConflictDeletionPublish {
+            target_snapshot_id,
+            snapshot_sequence,
+            delete_sequence,
+            insert_sequence,
+            deleted_pk_i64,
+            deleted_row_keys: committed_deleted_row_keys,
+            position_deletions,
+        })
+    }
+
+    async fn write_position_deletion_vectors_for_staged_on_conflict(
+        &self,
+        delete_specs: HashMap<Arc<str>, Vec<u64>>,
+        sequence_number: i64,
+    ) -> CatalogResult<(Vec<crate::metadata::DeleteFile>, HashMap<String, Vec<u32>>)> {
+        if delete_specs.is_empty() {
+            return Ok((Vec::new(), HashMap::new()));
+        }
+
+        let mut temp_metadata = self.table_metadata.clone();
+        temp_metadata.current_sequence_number = sequence_number;
+        let writer = DeletionVectorWriter::new(&temp_metadata);
+
+        let mut specs = Vec::with_capacity(delete_specs.len());
+        let mut position_deletions = HashMap::with_capacity(delete_specs.len());
+        let mut overflow_count: u64 = 0;
+        let mut first_overflow_id: Option<u64> = None;
+
+        for (file_path, incoming_row_ids) in delete_specs {
+            let mut row_ids = Vec::with_capacity(incoming_row_ids.len());
+            for id in incoming_row_ids {
+                if let Ok(id32) = u32::try_from(id) {
+                    row_ids.push(id32);
+                } else {
+                    if first_overflow_id.is_none() {
+                        first_overflow_id = Some(id);
+                    }
+                    overflow_count += 1;
+                }
+            }
+            row_ids.sort_unstable();
+            row_ids.dedup();
+
+            if row_ids.is_empty() {
+                continue;
+            }
+
+            let file_path = file_path.to_string();
+            let writer_row_ids = row_ids.iter().copied().map(u64::from).collect();
+            specs.push(DeletionVectorWriteSpec::new_position_based_sorted(
+                file_path.clone(),
+                writer_row_ids,
+            ));
+            position_deletions.insert(file_path, row_ids);
+        }
+
+        if overflow_count > 0 {
+            tracing::warn!(
+                "Skipped {} row ID(s) that exceed u32::MAX (first: {}) - table should be compacted",
+                overflow_count,
+                first_overflow_id.unwrap_or(0)
+            );
+        }
+
+        if specs.is_empty() {
+            return Ok((Vec::new(), HashMap::new()));
+        }
+
+        let results = writer.write(specs).await?;
+        let delete_files = results
+            .into_iter()
+            .map(|result| result.delete_file)
+            .collect();
+
+        Ok((delete_files, position_deletions))
+    }
+
+    pub(crate) fn publish_prepared_on_conflict_deletions(
+        &self,
+        prepared: PreparedOnConflictDeletionPublish,
+    ) -> CatalogResult<()> {
+        let snapshot_sequence = prepared.snapshot_sequence;
+        self.publish_staged_position_deletion_cache(prepared.position_deletions);
+
+        if let (Some(delete_sequence), Some(insert_sequence)) =
+            (prepared.delete_sequence, prepared.insert_sequence)
+        {
+            self.publish_staged_key_deletion_cache(
+                &prepared.deleted_pk_i64,
+                prepared.deleted_row_keys,
+                delete_sequence,
+                insert_sequence,
+            )?;
+        }
+
+        let max_delete_seq = self.get_max_delete_sequence();
+        self.protected_snapshots.rcu(|current| {
+            let mut new_map = (**current).clone();
+            new_map.insert(prepared.target_snapshot_id.clone(), max_delete_seq);
+            Arc::new(new_map)
+        });
+
+        tracing::debug!(
+            table = self.table_metadata.table_name.as_str(),
+            snapshot_id = prepared.target_snapshot_id,
+            snapshot_sequence,
+            max_delete_seq,
+            "Published staged on-conflict snapshot"
+        );
+
+        Ok(())
+    }
+
+    fn publish_staged_position_deletion_cache(
+        &self,
+        position_deletions: HashMap<String, Vec<u32>>,
+    ) {
+        if position_deletions.is_empty() {
+            return;
+        }
+
+        let cached_deleted_row_ids = self.pk_deletion_strategy.position_cache();
+        let current = cached_deleted_row_ids.load_full();
+        let mut updated = (*current).clone();
+
+        for (file_path, row_ids) in position_deletions {
+            let mut bitmap = current
+                .get(&file_path)
+                .map_or_else(RoaringBitmap::new, |deletion_vector| {
+                    deletion_vector.to_bitmap()
+                });
+            bitmap.extend(row_ids);
+            updated.insert(file_path, Arc::new(PositionDeletionVector::new(bitmap)));
+        }
+
+        cached_deleted_row_ids.store(Arc::new(updated));
+        self.refresh_deletion_memory_accounting();
+    }
+
+    fn publish_staged_key_deletion_cache(
+        &self,
+        deleted_pk_i64: &[i64],
+        deleted_row_keys: Vec<Box<[u8]>>,
+        delete_sequence: i64,
+        insert_sequence: i64,
+    ) -> CatalogResult<()> {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => {
+                let current = deletion_snapshot.load_full();
+                let updated_deleted = current
+                    .deleted_pk
+                    .extend_max(deleted_pk_i64.iter().map(|&pk| (pk, delete_sequence)));
+                let updated_inserts = current
+                    .insert_records
+                    .extend_max(deleted_pk_i64.iter().map(|&pk| (pk, insert_sequence)));
+                deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_indices(
+                    updated_deleted,
+                    updated_inserts,
+                )));
+                self.refresh_deletion_memory_accounting();
+            }
+            PkDeletionStrategyWithCache::RowConverterBased {
+                deletion_snapshot, ..
+            } => {
+                let current = deletion_snapshot.load_full();
+                let updated_deleted = current.deleted_row_keys.extend_max(
+                    deleted_row_keys
+                        .iter()
+                        .map(|key| (key.clone(), delete_sequence)),
+                );
+                let updated_inserts = current.insert_records.extend_max(
+                    deleted_row_keys
+                        .into_iter()
+                        .map(|key| (key, insert_sequence)),
+                );
+                deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_indices(
+                    updated_deleted,
+                    updated_inserts,
+                )));
+                self.refresh_deletion_memory_accounting();
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Cannot publish staged key deletions for position-based table {}",
+                        self.table_metadata.table_name
+                    ),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     /// Apply deletion vectors generated by on-conflict (upsert) handling.
@@ -11391,6 +11744,52 @@ mod tests {
         (provider, temp_dir)
     }
 
+    async fn create_cdc_upsert_table(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+        };
+
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+        (provider, catalog, temp_dir)
+    }
+
     fn id_value_batch(schema: SchemaRef, ids: &[i64], values: &[i64]) -> RecordBatch {
         use arrow::array::Int64Array;
         RecordBatch::try_new(
@@ -11431,6 +11830,114 @@ mod tests {
         }
         pairs.sort_unstable();
         pairs
+    }
+
+    #[tokio::test]
+    async fn test_cdc_upsert_returns_pending_finalize_and_defers_visibility() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_cdc_upsert_table("cdc_upsert_pending", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("cdc upsert write should prepare");
+
+        assert!(
+            write.has_pending_finalize(),
+            "CDC upsert should return after durable prepare with finalize pending"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "cdc_upsert_pending").await,
+            vec![(1, 10)],
+            "replacement rows should not be visible until finalize moves staged files"
+        );
+
+        write.finish().await.expect("finalize staged upsert");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "cdc_upsert_pending").await,
+            vec![(1, 100)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_overlapping_cdc_upserts_see_staged_keys_before_finalize() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_cdc_upsert_table("cdc_upsert_overlap", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let first = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("first cdc upsert should prepare");
+        assert!(first.has_pending_finalize());
+
+        let second = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[200])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second cdc upsert should prepare while first finalize is pending");
+        assert!(second.has_pending_finalize());
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "cdc_upsert_overlap").await,
+            Vec::<(i64, i64)>::new(),
+            "neither staged protected snapshot should be visible before finalize"
+        );
+
+        first.finish().await.expect("finalize first staged upsert");
+        second
+            .finish()
+            .await
+            .expect("finalize second staged upsert");
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "cdc_upsert_overlap").await,
+            vec![(1, 200)],
+            "the second staged upsert must tombstone the first staged value"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cdc_upsert_reopen_recovers_prepared_protected_snapshot() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_cdc_upsert_table("cdc_upsert_recovery", Arc::clone(&runtime_env)).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("cdc upsert write should prepare");
+        assert!(write.has_pending_finalize());
+        drop(write);
+
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .open("cdc_upsert_recovery")
+            .await
+            .expect("reopen should recover staged protected snapshot WAL");
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, "cdc_upsert_recovery").await,
+            vec![(1, 100)],
+            "reopen recovery must make the prepared CDC upsert visible exactly once"
+        );
     }
 
     #[test]

@@ -85,6 +85,8 @@ pub struct CayenneStagedAppend {
     table: CayenneTableProvider,
     write_guard: Option<OwnedMutexGuard<()>>,
     staging_snapshot_id: String,
+    target_snapshot_id: String,
+    target_kind: StagingWalTargetKind,
     row_count: u64,
 }
 
@@ -94,6 +96,8 @@ impl std::fmt::Debug for CayenneStagedAppend {
             .field("table", &self.table.table_name())
             .field("has_write_guard", &self.write_guard.is_some())
             .field("staging_snapshot_id", &self.staging_snapshot_id)
+            .field("target_snapshot_id", &self.target_snapshot_id)
+            .field("target_kind", &self.target_kind)
             .field("row_count", &self.row_count)
             .finish()
     }
@@ -106,10 +110,31 @@ impl CayenneStagedAppend {
         staging_snapshot_id: String,
         row_count: u64,
     ) -> Self {
+        let target_snapshot_id = table.get_current_snapshot_id();
+        Self::from_staged_append_to_snapshot(
+            table,
+            write_guard,
+            staging_snapshot_id,
+            target_snapshot_id,
+            StagingWalTargetKind::CurrentSnapshot,
+            row_count,
+        )
+    }
+
+    pub(crate) fn from_staged_append_to_snapshot(
+        table: CayenneTableProvider,
+        write_guard: Option<OwnedMutexGuard<()>>,
+        staging_snapshot_id: String,
+        target_snapshot_id: String,
+        target_kind: StagingWalTargetKind,
+        row_count: u64,
+    ) -> Self {
         Self {
             table,
             write_guard,
             staging_snapshot_id,
+            target_snapshot_id,
+            target_kind,
             row_count,
         }
     }
@@ -133,9 +158,19 @@ impl CayenneStagedAppend {
     ///
     /// Returns an error if writing the WAL file fails.
     pub async fn write_wal(&self) -> Result<()> {
-        self.table
-            .write_staging_wal_for(&self.staging_snapshot_id)
-            .await
+        if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+            self.table
+                .write_staging_wal_for(&self.staging_snapshot_id)
+                .await
+        } else {
+            self.table
+                .write_staging_wal_for_target(
+                    &self.staging_snapshot_id,
+                    &self.target_snapshot_id,
+                    self.target_kind,
+                )
+                .await
+        }
     }
 
     /// Moves staged files into the current snapshot.
@@ -144,9 +179,15 @@ impl CayenneStagedAppend {
     ///
     /// Returns an error if moving the staged files fails.
     pub async fn move_staged_files(&self) -> Result<()> {
-        self.table
-            .move_staged_files_to_current_snapshot(&self.staging_snapshot_id)
-            .await
+        if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+            self.table
+                .move_staged_files_to_current_snapshot(&self.staging_snapshot_id)
+                .await
+        } else {
+            self.table
+                .move_staged_files_to_snapshot(&self.staging_snapshot_id, &self.target_snapshot_id)
+                .await
+        }
     }
 
     /// Removes the staging WAL after a successful move.
@@ -215,14 +256,26 @@ impl CayenneStagedAppend {
     ///
     /// Returns an error if writing the staging WAL fails.
     pub async fn prepare(self) -> Result<PreparedStagedAppend> {
-        self.table
-            .write_staging_wal_for(&self.staging_snapshot_id)
-            .await?;
+        if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+            self.table
+                .write_staging_wal_for(&self.staging_snapshot_id)
+                .await?;
+        } else {
+            self.table
+                .write_staging_wal_for_target(
+                    &self.staging_snapshot_id,
+                    &self.target_snapshot_id,
+                    self.target_kind,
+                )
+                .await?;
+        }
         self.table
             .register_inflight_staging_append(&self.staging_snapshot_id);
         Ok(PreparedStagedAppend {
             table: self.table,
             staging_snapshot_id: self.staging_snapshot_id,
+            target_snapshot_id: self.target_snapshot_id,
+            target_kind: self.target_kind,
             row_count: self.row_count,
         })
     }
@@ -260,6 +313,8 @@ impl CayenneStagedAppend {
 pub struct PreparedStagedAppend {
     table: CayenneTableProvider,
     staging_snapshot_id: String,
+    target_snapshot_id: String,
+    target_kind: StagingWalTargetKind,
     row_count: u64,
 }
 
@@ -268,6 +323,8 @@ impl std::fmt::Debug for PreparedStagedAppend {
         f.debug_struct("PreparedStagedAppend")
             .field("table", &self.table.table_name())
             .field("staging_snapshot_id", &self.staging_snapshot_id)
+            .field("target_snapshot_id", &self.target_snapshot_id)
+            .field("target_kind", &self.target_kind)
             .field("row_count", &self.row_count)
             .finish()
     }
@@ -313,13 +370,15 @@ impl PreparedStagedAppend {
         // interleave with the move and observe a torn directory snapshot.
         let _fence = self.table.lock_listing_fence_write_owned().await;
         self.table
-            .move_staged_files_to_current_snapshot(&self.staging_snapshot_id)
+            .move_staged_files_to_snapshot(&self.staging_snapshot_id, &self.target_snapshot_id)
             .await?;
         self.table
             .remove_staging_wal_for(&self.staging_snapshot_id)
             .await?;
-        self.table
-            .publish_current_snapshot_files_changed_under_held_fence();
+        if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+            self.table
+                .publish_current_snapshot_files_changed_under_held_fence();
+        }
         self.table
             .unregister_inflight_staging_append(&self.staging_snapshot_id);
         if !self.table.has_inflight_staging_appends() {
@@ -350,13 +409,15 @@ impl PreparedStagedAppend {
     /// Returns an error if moving the staged files or removing the WAL fails.
     pub async fn apply_under_held_barrier(&self) -> Result<()> {
         self.table
-            .move_staged_files_to_current_snapshot(&self.staging_snapshot_id)
+            .move_staged_files_to_snapshot(&self.staging_snapshot_id, &self.target_snapshot_id)
             .await?;
         self.table
             .remove_staging_wal_for(&self.staging_snapshot_id)
             .await?;
-        self.table
-            .publish_current_snapshot_files_changed_under_held_fence();
+        if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+            self.table
+                .publish_current_snapshot_files_changed_under_held_fence();
+        }
         self.table
             .unregister_inflight_staging_append(&self.staging_snapshot_id);
         if !self.table.has_inflight_staging_appends() {
@@ -478,10 +539,27 @@ pub(crate) struct StagingWal {
     pub table_name: String,
     /// The snapshot directory the staged files should be moved to.
     pub target_snapshot: String,
+    /// Whether `target_snapshot` is the table's active snapshot or a protected
+    /// replacement snapshot that will be published separately after recovery or finalize.
+    #[serde(default)]
+    pub target_kind: StagingWalTargetKind,
     /// Names of the data files in the staging directory.
     pub staged_files: Vec<String>,
     /// ISO-8601 timestamp when this WAL entry was created.
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StagingWalTargetKind {
+    CurrentSnapshot,
+    ProtectedSnapshot,
+}
+
+impl Default for StagingWalTargetKind {
+    fn default() -> Self {
+        Self::CurrentSnapshot
+    }
 }
 
 #[derive(Debug)]
@@ -591,11 +669,25 @@ impl CayenneTableProvider {
     pub(crate) async fn write_staging_wal_for(&self, staging_snapshot_id: &str) -> Result<()> {
         let current_snapshot = self.get_current_snapshot_id();
 
+        self.write_staging_wal_for_target(
+            staging_snapshot_id,
+            &current_snapshot,
+            StagingWalTargetKind::CurrentSnapshot,
+        )
+        .await
+    }
+
+    pub(crate) async fn write_staging_wal_for_target(
+        &self,
+        staging_snapshot_id: &str,
+        target_snapshot: &str,
+        target_kind: StagingWalTargetKind,
+    ) -> Result<()> {
         if self.table_path().starts_with("s3://") {
-            self.write_staging_wal_s3(staging_snapshot_id, &current_snapshot)
+            self.write_staging_wal_s3(staging_snapshot_id, target_snapshot, target_kind)
                 .await?;
         } else {
-            self.write_staging_wal_local(staging_snapshot_id, &current_snapshot)
+            self.write_staging_wal_local(staging_snapshot_id, target_snapshot, target_kind)
                 .await?;
         }
         self.staging_wal_present().store(true, Ordering::Release);
@@ -607,6 +699,7 @@ impl CayenneTableProvider {
         &self,
         staging_snapshot_id: &str,
         target_snapshot: &str,
+        target_kind: StagingWalTargetKind,
     ) -> Result<()> {
         let staging_dir =
             Self::snapshot_dir_path(self.table_path(), self.table_id(), staging_snapshot_id);
@@ -627,6 +720,7 @@ impl CayenneTableProvider {
         let wal = StagingWal {
             table_name: self.table_name().to_string(),
             target_snapshot: target_snapshot.to_string(),
+            target_kind,
             staged_files,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -687,6 +781,7 @@ impl CayenneTableProvider {
         &self,
         staging_snapshot_id: &str,
         target_snapshot: &str,
+        target_kind: StagingWalTargetKind,
     ) -> Result<()> {
         let config = self.require_object_store()?;
 
@@ -725,6 +820,7 @@ impl CayenneTableProvider {
         let wal = StagingWal {
             table_name: self.table_name().to_string(),
             target_snapshot: target_snapshot.to_string(),
+            target_kind,
             staged_files,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -881,7 +977,7 @@ impl CayenneTableProvider {
         located_wals
             .sort_by(|left, right| left.staging_snapshot_id.cmp(&right.staging_snapshot_id));
 
-        let mut recovered_any = false;
+        let mut recovered_current_any = false;
         for located_wal in located_wals {
             if self.staging_append_is_inflight(&located_wal.staging_snapshot_id) {
                 continue;
@@ -915,7 +1011,9 @@ impl CayenneTableProvider {
             }
 
             let current_snapshot = self.get_current_snapshot_id();
-            if current_snapshot != wal.target_snapshot {
+            if wal.target_kind == StagingWalTargetKind::CurrentSnapshot
+                && current_snapshot != wal.target_snapshot
+            {
                 return Err(Error::IncompleteWrite {
                     table: table_name,
                     message: format!(
@@ -1090,10 +1188,8 @@ impl CayenneTableProvider {
                 "Incomplete staged append detected — attempting automated recovery"
             );
 
-            // `current_snapshot` was validated above to equal `wal.target_snapshot`,
-            // so this helper's current-snapshot destination is the WAL target.
             match self
-                .move_staged_files_to_current_snapshot(&staging_snapshot_id)
+                .move_staged_files_to_snapshot(&staging_snapshot_id, &wal.target_snapshot)
                 .await
             {
                 Ok(()) => {
@@ -1118,7 +1214,9 @@ impl CayenneTableProvider {
                         table = table_name.as_str(),
                         "Automated recovery from incomplete write succeeded; table is now writable"
                     );
-                    recovered_any = true;
+                    if wal.target_kind == StagingWalTargetKind::CurrentSnapshot {
+                        recovered_current_any = true;
+                    }
                 }
                 Err(e) => {
                     tracing::error!(
@@ -1140,7 +1238,7 @@ impl CayenneTableProvider {
             }
         }
 
-        if recovered_any {
+        if recovered_current_any {
             self.publish_current_snapshot_files_changed().await;
         }
 

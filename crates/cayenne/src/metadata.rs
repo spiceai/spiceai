@@ -106,7 +106,7 @@ pub struct DataFile {
 }
 
 /// The type of deletion vector: position-based or key-based.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DeletionType {
     /// Position-based deletion using row IDs (for tables without primary key).
     /// Requires consistent ordering between delete and read operations.
@@ -118,7 +118,7 @@ pub enum DeletionType {
 }
 
 /// Represents a deletion vector file tracking deleted rows.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteFile {
     /// Unique identifier for this delete file (`UUIDv7`)
     pub delete_file_id: String,

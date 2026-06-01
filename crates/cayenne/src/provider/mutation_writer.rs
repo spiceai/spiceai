@@ -76,7 +76,7 @@ use tokio::sync::OwnedMutexGuard;
 
 use super::Result;
 use super::context::CayenneContext;
-use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
+use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend, StagingWalTargetKind};
 use super::table::{
     CayenneCdcWrite, CayenneTableProvider, ColumnStatsAccumulator, PostValidationState,
     record_cayenne_write_phase,
@@ -232,8 +232,8 @@ impl<'a> AppendMutationWriter<'a> {
         // configured tables — the bg scheduler picks up the retention request
         // after publish (see `CayenneCdcWrite::finish`).
         let can_stage_for_pipeline = !pending_pk_deletions
-            && !may_have_on_conflict_deletions
-            && self.table.metadata().partition_column.is_none();
+            && self.table.metadata().partition_column.is_none()
+            && (!may_have_on_conflict_deletions || self.table.cached_inlined_row_count() == 0);
 
         if !can_stage_for_pipeline {
             let _write_guard = write_guard;
@@ -297,19 +297,77 @@ impl<'a> AppendMutationWriter<'a> {
             }
             InlineMutationOutcome::Fallback(re_stream) => {
                 prepared_stream = re_stream;
-                let staging_snapshot_id = CayenneTableProvider::new_staging_snapshot_id();
+                let stage_on_conflict = may_have_on_conflict_deletions;
+                let (staging_snapshot_id, target_snapshot_id, target_kind) = if stage_on_conflict {
+                    let (staging_snapshot_id, target_snapshot_id) =
+                        CayenneTableProvider::new_staging_snapshot_id_pair();
+                    (
+                        staging_snapshot_id,
+                        target_snapshot_id,
+                        StagingWalTargetKind::ProtectedSnapshot,
+                    )
+                } else {
+                    (
+                        CayenneTableProvider::new_staging_snapshot_id(),
+                        self.table.get_current_snapshot_id(),
+                        StagingWalTargetKind::CurrentSnapshot,
+                    )
+                };
                 let target_size_bytes = self.context.target_file_size_bytes();
                 self.table
                     .clear_staging_snapshot_dir(&staging_snapshot_id)
                     .await?;
+
+                let (write_guard_for_prepare, held_write_guard) = if stage_on_conflict {
+                    (None, Some(write_guard))
+                } else {
+                    (Some(write_guard), None)
+                };
+
                 let (rows, writer_ops, stats_acc, prepared_append) = self
                     .write_staged_append_prepared(
                         prepared_stream,
                         target_size_bytes,
-                        Some(write_guard),
+                        write_guard_for_prepare,
                         staging_snapshot_id,
+                        target_snapshot_id.clone(),
+                        target_kind,
                     )
                     .await?;
+
+                let PostValidationState {
+                    on_conflict_deletions,
+                    validated_keys,
+                } = take_post_validation(&post_validation);
+
+                let prepared_on_conflict = if stage_on_conflict {
+                    match self
+                        .table
+                        .prepare_on_conflict_deletions_for_staged_snapshot(
+                            on_conflict_deletions,
+                            target_snapshot_id,
+                        )
+                        .await
+                    {
+                        Ok(prepared_on_conflict) => Some(prepared_on_conflict),
+                        Err(err) => {
+                            if let Err(cleanup_err) = prepared_append.rollback().await {
+                                tracing::warn!(
+                                    "Failed to rollback staged append after on-conflict metadata error for table {}: {cleanup_err}",
+                                    self.table.table_name(),
+                                );
+                            }
+                            return Err(err.into());
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                if stage_on_conflict {
+                    self.table.record_file_pk_keys(&validated_keys);
+                }
+                drop(held_write_guard);
 
                 tracing::debug!(
                     table = self.table.table_name(),
@@ -325,13 +383,24 @@ impl<'a> AppendMutationWriter<'a> {
                 // the staged-prepare latency, not full end-to-end.
                 record_cayenne_write_phase(self.table.table_name(), "cdc_path_staged", write_start);
 
-                Ok(CayenneCdcWrite::prepared_append(
-                    self.table.clone_for_write_operations(),
-                    rows,
-                    prepared_append,
-                    stats_acc,
-                    take_post_validation(&post_validation).validated_keys,
-                ))
+                if let Some(prepared_on_conflict) = prepared_on_conflict {
+                    Ok(CayenneCdcWrite::prepared_upsert_append(
+                        self.table.clone_for_write_operations(),
+                        rows,
+                        prepared_append,
+                        prepared_on_conflict,
+                        stats_acc,
+                        validated_keys,
+                    ))
+                } else {
+                    Ok(CayenneCdcWrite::prepared_append(
+                        self.table.clone_for_write_operations(),
+                        rows,
+                        prepared_append,
+                        stats_acc,
+                        validated_keys,
+                    ))
+                }
             }
         }
     }
@@ -657,6 +726,8 @@ impl<'a> AppendMutationWriter<'a> {
         target_size_bytes: usize,
         write_guard: Option<OwnedMutexGuard<()>>,
         staging_snapshot_id: String,
+        target_snapshot_id: String,
+        target_kind: StagingWalTargetKind,
     ) -> Result<(
         u64,
         usize,
@@ -695,10 +766,12 @@ impl<'a> AppendMutationWriter<'a> {
         };
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
 
-        let staged_append = CayenneStagedAppend::from_staged_append_in(
+        let staged_append = CayenneStagedAppend::from_staged_append_to_snapshot(
             self.table.clone_for_write_operations(),
             write_guard,
             staging_snapshot_id.clone(),
+            target_snapshot_id,
+            target_kind,
             rows,
         );
         let prepare_start = Instant::now();

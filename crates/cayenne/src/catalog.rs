@@ -204,6 +204,15 @@ pub enum CatalogError {
 /// Result type for catalog operations.
 pub type CatalogResult<T> = std::result::Result<T, CatalogError>;
 
+/// Snapshot sequence metadata to commit atomically with a related catalog mutation.
+#[derive(Debug, Clone)]
+pub struct SnapshotSequenceCommit {
+    /// Snapshot id whose sequence should be recorded.
+    pub snapshot_id: String,
+    /// Sequence number assigned to the snapshot.
+    pub sequence_number: i64,
+}
+
 // Transaction support is currently not exposed at the catalog level.
 // Each catalog implementation can use backend-specific transactions internally
 // to ensure atomicity of operations.
@@ -344,6 +353,7 @@ pub trait MetadataCatalog: Send + Sync {
         table_id: &str,
         insert_pk_bytes_list: Vec<Vec<u8>>,
         insert_sequence: i64,
+        snapshot_sequence: Option<SnapshotSequenceCommit>,
     ) -> CatalogResult<()>;
 
     /// Get all insert records for a table.

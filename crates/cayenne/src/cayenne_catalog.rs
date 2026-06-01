@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Metadata catalog implementation for Cayenne.
 
-use super::catalog::{CatalogError, CatalogResult, MetadataCatalog};
+use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use super::metadata::{
     CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
     PartitionMetadata, PkConflictDetection, TableMetadata, TableStatistics,
@@ -2230,6 +2230,7 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         insert_pk_bytes_list: Vec<Vec<u8>>,
         insert_sequence: i64,
+        snapshot_sequence: Option<SnapshotSequenceCommit>,
     ) -> CatalogResult<()> {
         // SQLite param limit chunking (mirrors add_insert_records_batch).
         const PARAMS_PER_ROW: usize = 4;
@@ -2248,7 +2249,8 @@ impl MetadataCatalog for CayenneCatalog {
         // the delete+insert pair) before entering this transaction; the txn
         // itself only does the durable catalog writes for the DeleteFiles and
         // InsertRecords.
-        if delete_files.is_empty() && insert_pk_bytes_list.is_empty() {
+        if delete_files.is_empty() && insert_pk_bytes_list.is_empty() && snapshot_sequence.is_none()
+        {
             return Ok(());
         }
 
@@ -2383,6 +2385,38 @@ impl MetadataCatalog for CayenneCatalog {
                     return Err(CatalogError::InvalidOperation {
                         message:
                             "Failed to insert insert-record chunk inside on-conflict transaction"
+                                .to_string(),
+                        source: Box::new(e),
+                    });
+                }
+            }
+
+            if let Some(snapshot_sequence) = &snapshot_sequence {
+                if let Err(e) = tx
+                    .execute(ExecuteParams {
+                        sql: "INSERT OR REPLACE INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3)",
+                        params: vec![
+                            MetastoreValue::Text(table_id.to_string()),
+                            MetastoreValue::Text(snapshot_sequence.snapshot_id.clone()),
+                            MetastoreValue::Integer(snapshot_sequence.sequence_number),
+                        ],
+                    })
+                    .await
+                {
+                    if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
+                        drop(tx);
+                        sleep_before_metastore_write_retry(
+                            attempt,
+                            max_attempts,
+                            "insert snapshot sequence inside on-conflict transaction",
+                        )
+                        .await;
+                        continue 'attempts;
+                    }
+                    drop(tx);
+                    return Err(CatalogError::InvalidOperation {
+                        message:
+                            "Failed to insert snapshot sequence inside on-conflict transaction"
                                 .to_string(),
                         source: Box::new(e),
                     });
@@ -3427,11 +3461,17 @@ mod tests {
         };
 
         catalog
-            .commit_on_conflict_deletions(vec![delete_file.clone()], &table_id, vec![vec![1_u8]], 2)
+            .commit_on_conflict_deletions(
+                vec![delete_file.clone()],
+                &table_id,
+                vec![vec![1_u8]],
+                2,
+                None,
+            )
             .await
             .expect("initial on-conflict deletion commit should succeed");
         catalog
-            .commit_on_conflict_deletions(vec![delete_file], &table_id, vec![vec![1_u8]], 2)
+            .commit_on_conflict_deletions(vec![delete_file], &table_id, vec![vec![1_u8]], 2, None)
             .await
             .expect("replayed on-conflict deletion commit should be idempotent");
 
@@ -3497,7 +3537,13 @@ mod tests {
         };
 
         catalog
-            .commit_on_conflict_deletions(vec![delete_file.clone()], &table_id, vec![vec![1_u8]], 2)
+            .commit_on_conflict_deletions(
+                vec![delete_file.clone()],
+                &table_id,
+                vec![vec![1_u8]],
+                2,
+                None,
+            )
             .await
             .expect("initial on-conflict deletion commit should succeed");
 
@@ -3510,6 +3556,7 @@ mod tests {
                 &table_id,
                 vec![vec![2_u8]],
                 3,
+                None,
             )
             .await
             .expect_err("conflicting delete-file metadata should be rejected");
@@ -3603,7 +3650,7 @@ mod tests {
         let insert_pks: Vec<Vec<u8>> = (0..5_u8).map(|i| vec![i]).collect();
 
         catalog
-            .commit_on_conflict_deletions(delete_files.clone(), &table_id, insert_pks, 2)
+            .commit_on_conflict_deletions(delete_files.clone(), &table_id, insert_pks, 2, None)
             .await
             .expect("batched on-conflict deletion commit should succeed");
 
@@ -3624,7 +3671,7 @@ mod tests {
 
         // Replay should be idempotent across the whole batch.
         catalog
-            .commit_on_conflict_deletions(delete_files, &table_id, vec![vec![0_u8]], 2)
+            .commit_on_conflict_deletions(delete_files, &table_id, vec![vec![0_u8]], 2, None)
             .await
             .expect("replayed batched on-conflict deletion commit should be idempotent");
         let stored = catalog
