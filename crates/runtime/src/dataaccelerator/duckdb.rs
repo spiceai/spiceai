@@ -392,6 +392,12 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("optimizer_duckdb_aggregate_pushdown"),
 ];
 
+static DUCKDB_TYPE_REWRITE_RULES: &[&dyn arrow_tools::type_rewrite::TypeRewriteRule] = &[
+    &arrow_tools::type_rewrite::DictionaryUnwrap,
+    &arrow_tools::type_rewrite::IntervalToMonthDayNano,
+    &arrow_tools::type_rewrite::NullToInt32,
+];
+
 #[async_trait]
 impl DataAccelerator for DuckDBAccelerator {
     fn as_any(&self) -> &dyn Any {
@@ -506,6 +512,9 @@ impl DataAccelerator for DuckDBAccelerator {
         _partition_by: Vec<PartitionedBy>,
         _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        normalize_schema_for_duckdb(&mut cmd)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
         if let Some(duckdb_file) = cmd.options.remove("file") {
             cmd.options.insert("open".to_string(), duckdb_file);
         }
@@ -984,6 +993,17 @@ fn make_on_refresh_write_handler(
 }
 
 register_data_accelerator!(Engine::DuckDB, DuckDBAccelerator);
+
+fn normalize_schema_for_duckdb(cmd: &mut CreateExternalTable) -> datafusion::common::Result<()> {
+    use datafusion::common::ToDFSchema;
+    let arrow_schema = cmd.schema.as_arrow();
+    let normalized =
+        arrow_tools::type_rewrite::apply_rules(arrow_schema, DUCKDB_TYPE_REWRITE_RULES);
+    if normalized != *arrow_schema {
+        cmd.schema = ToDFSchema::to_dfschema_ref(Arc::new(normalized))?;
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -2041,7 +2061,7 @@ mod tests {
         ]));
 
         // Normalize the schema (Dictionary -> Utf8).
-        let accel_schema = Arc::new(arrow_tools::schema::normalize_dictionary_types(
+        let accel_schema = Arc::new(arrow_tools::type_rewrite::normalize_dictionary_types(
             &source_schema,
         ));
         assert_eq!(accel_schema.field(1).data_type(), &DataType::Utf8);
@@ -2204,6 +2224,85 @@ mod tests {
         assert!(
             DuckDBAccelerator::storage_setup_queries(ResolvedAccelerationStorage::Unknown)
                 .is_empty()
+        );
+    }
+
+    fn cmd_with_schema(schema: Arc<Schema>) -> CreateExternalTable {
+        let df_schema = ToDFSchema::to_dfschema_ref(schema).expect("valid schema");
+        CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("t"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::default(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        }
+    }
+
+    #[test]
+    fn normalize_schema_for_duckdb_null_to_int32() {
+        let mut cmd = cmd_with_schema(Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("untyped", DataType::Null, true),
+            Field::new("name", DataType::Utf8, true),
+        ])));
+        super::normalize_schema_for_duckdb(&mut cmd).expect("normalize succeeds");
+        let arrow = cmd.schema.as_arrow();
+        assert_eq!(
+            arrow.field_with_name("id").expect("id field").data_type(),
+            &DataType::Int64
+        );
+        assert_eq!(
+            arrow
+                .field_with_name("untyped")
+                .expect("untyped field")
+                .data_type(),
+            &DataType::Int32
+        );
+        assert_eq!(
+            arrow
+                .field_with_name("name")
+                .expect("name field")
+                .data_type(),
+            &DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn normalize_schema_for_duckdb_interval_to_month_day_nano() {
+        use datafusion::arrow::datatypes::IntervalUnit;
+        let mut cmd = cmd_with_schema(Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("dur", DataType::Interval(IntervalUnit::YearMonth), true),
+        ])));
+        super::normalize_schema_for_duckdb(&mut cmd).expect("normalize succeeds");
+        let arrow = cmd.schema.as_arrow();
+        assert_eq!(
+            arrow.field_with_name("dur").expect("dur field").data_type(),
+            &DataType::Interval(IntervalUnit::MonthDayNano)
+        );
+    }
+
+    #[test]
+    fn normalize_schema_for_duckdb_is_noop_when_no_rules_match() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let mut cmd = cmd_with_schema(Arc::clone(&schema));
+        let schema_before = Arc::clone(&cmd.schema);
+        super::normalize_schema_for_duckdb(&mut cmd).expect("normalize succeeds");
+        assert!(
+            Arc::ptr_eq(&schema_before, &cmd.schema),
+            "schema Arc should be unchanged when no rules match"
         );
     }
 }
