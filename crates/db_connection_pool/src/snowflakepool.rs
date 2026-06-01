@@ -435,7 +435,7 @@ impl std::fmt::Display for SnowflakeAccountIdentifier {
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter `{name}`. Add `{name}` to the Snowflake connector params or configure a secret named `{name}`. For details, visit: https://spiceai.org/docs/components/data-connectors/snowflake#auth"
+        "Missing required Snowflake parameter `{name}`. Add `{name}` to the Snowflake dataset or catalog params, or configure a secret named `{name}`. For data connector details, visit: https://spiceai.org/docs/components/data-connectors/snowflake#auth. For catalog details, visit: https://spiceai.org/docs/components/catalogs/snowflake#auth"
     ))]
     MissingRequiredSecret { name: String },
 
@@ -467,7 +467,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Invalid value for parameter `{parameter}`: {reason}. For details, visit: https://spiceai.org/docs/components/data-connectors/snowflake#parameters"
+        "Invalid value for Snowflake parameter `{parameter}`: {reason}. For data connector parameters, visit: https://spiceai.org/docs/components/data-connectors/snowflake#parameters. For catalog parameters, visit: https://spiceai.org/docs/components/catalogs/snowflake#parameters"
     ))]
     InvalidParameterValue { parameter: String, reason: String },
 
