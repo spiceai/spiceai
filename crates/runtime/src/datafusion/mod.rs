@@ -103,6 +103,7 @@ use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::{
     query_engine::Error as QueryEngineError, schema_provider::SpiceSchemaProvider,
 };
+use runtime_datafusion_index::IndexedTableProvider;
 use runtime_table_partition::provider::PartitionTableProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
@@ -624,7 +625,7 @@ pub enum Table {
     },
 }
 
-fn table_provider_with_spicepod_metadata(
+pub(crate) fn table_provider_with_spicepod_metadata(
     provider: Arc<dyn TableProvider>,
     table_metadata: &HashMap<String, String>,
     columns: &[Column],
@@ -632,6 +633,21 @@ fn table_provider_with_spicepod_metadata(
     let field_metadata = field_metadata_from_columns(columns);
     if table_metadata.is_empty() && field_metadata.is_empty() {
         return provider;
+    }
+
+    // If the provider is an IndexedTableProvider, push the metadata enrichment
+    // inside it so that the IndexTableScan analyzer can still discover it via
+    // downcast_ref::<IndexedTableProvider>().
+    if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+        let enriched_underlying = metadata_enriched_table_provider(
+            indexed.get_underlying(),
+            table_metadata.clone(),
+            field_metadata,
+        );
+        return Arc::new(IndexedTableProvider::with_indexes(
+            enriched_underlying,
+            indexed.get_all_indexes(),
+        ));
     }
 
     metadata_enriched_table_provider(provider, table_metadata.clone(), field_metadata)
@@ -2542,7 +2558,7 @@ impl DataFusion {
             let normalized_refresh_schema = if needs_dict_normalization
                 && arrow_tools::schema::has_dictionary_types(refresh_schema)
             {
-                Arc::new(arrow_tools::schema::normalize_dictionary_types(
+                Arc::new(arrow_tools::type_rewrite::normalize_dictionary_types(
                     refresh_schema,
                 ))
             } else {

@@ -372,11 +372,9 @@
   },
   "$defs": {
     "SpicepodVersion": {
+      "description": "Spicepod schema version. Supported majors: v1, v2. Examples: 'v1', 'v2', 'v2.0', 'v2.0.0', 'v2.0.0-rc.1'.",
       "type": "string",
-      "enum": [
-        "v1",
-        "v2"
-      ]
+      "pattern": "^v(1|2)(?:\\.(0|[1-9]\\d*)(?:\\.(0|[1-9]\\d*)(?:-([0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*))?)?)?$"
     },
     "SpicepodKind": {
       "type": "string",
@@ -1237,6 +1235,15 @@
               "type": "null"
             }
           ]
+        },
+        "target_partitions": {
+          "description": "Overrides `DataFusion`'s local query target partition count.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
         }
       }
     },
@@ -1325,6 +1332,30 @@
         "state_location"
       ]
     },
+    "Params": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ParamValue"
+      }
+    },
+    "ParamValue": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "integer",
+          "format": "int64"
+        },
+        {
+          "type": "number",
+          "format": "double"
+        },
+        {
+          "type": "boolean"
+        }
+      ]
+    },
     "SourceRateControl": {
       "type": "object",
       "properties": {
@@ -1362,30 +1393,6 @@
         }
       },
       "additionalProperties": false
-    },
-    "Params": {
-      "type": "object",
-      "additionalProperties": {
-        "$ref": "#/$defs/ParamValue"
-      }
-    },
-    "ParamValue": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "integer",
-          "format": "int64"
-        },
-        {
-          "type": "number",
-          "format": "double"
-        },
-        {
-          "type": "boolean"
-        }
-      ]
     },
     "Functions": {
       "description": "Controls registration and execution surfaces for Spicepod user-defined functions.\n\nDefaults to disabled. Operators must explicitly set\n`runtime.functions.enabled: true` before the runtime registers top-level\n`functions:` entries or exposes `tools:` entries as SQL functions via\n`as_sql: true`.",
@@ -1804,6 +1811,9 @@
                   "type": "null"
                 }
               ]
+            },
+            "on_schema_change": {
+              "$ref": "#/$defs/OnSchemaChange"
             },
             "ready_state": {
               "$ref": "#/$defs/ReadyState"
@@ -2499,6 +2509,10 @@
           "description": "Controls write behavior for read-write accelerated datasets.\nOnly applies when `access: read_write` and the dataset is accelerated.",
           "$ref": "#/$defs/WriteMode"
         },
+        "storage_profile": {
+          "description": "Storage profile for file-backed acceleration. `auto` detects the\nprofile from the resolved acceleration path; use `local_ssd`/`ssd`/`nvme`\n`ebs`, or `tmpfs`/`ram`/`ramdisk`/`ramfs`/`memory` to override detection.",
+          "$ref": "#/$defs/StorageProfile"
+        },
         "metrics": {
           "anyOf": [
             {
@@ -2827,6 +2841,31 @@
         "write_back"
       ]
     },
+    "StorageProfile": {
+      "description": "Storage profile for file-backed accelerations.",
+      "oneOf": [
+        {
+          "description": "Detect the storage profile from the acceleration path.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "Local SSD/NVMe-backed storage, such as EC2 instance store or Azure\ntemporary/NVMe local storage.",
+          "type": "string",
+          "const": "local_ssd"
+        },
+        {
+          "description": "Network-attached block storage, such as Amazon EBS or Azure Managed\nDisks.",
+          "type": "string",
+          "const": "ebs"
+        },
+        {
+          "description": "In-memory storage, such as a tmpfs or ramfs mount.",
+          "type": "string",
+          "const": "tmpfs"
+        }
+      ]
+    },
     "PartitionedBySchema": {
       "anyOf": [
         {
@@ -2982,6 +3021,31 @@
         "warn",
         "ignore",
         "string"
+      ]
+    },
+    "OnSchemaChange": {
+      "description": "Policy for handling source schema changes after the dataset is registered.",
+      "oneOf": [
+        {
+          "description": "Block schema changes from being applied automatically. The dataset stays healthy and\ncontinues serving queries using the registered schema.",
+          "type": "string",
+          "const": "block"
+        },
+        {
+          "description": "Fail when the projected source schema diverges from the registered dataset schema.",
+          "type": "string",
+          "const": "fail"
+        },
+        {
+          "description": "Add new source columns to the registered schema; reject removals and incompatible changes.",
+          "type": "string",
+          "const": "append_new_columns"
+        },
+        {
+          "description": "Keep the registered dataset schema synchronized with the projected source schema.",
+          "type": "string",
+          "const": "sync_all_columns"
+        }
       ]
     },
     "VectorStore": {
@@ -3852,7 +3916,7 @@
       ]
     },
     "FunctionKind": {
-      "description": "Function kind.",
+      "description": "Function kind.\n\nA future `HigherOrder` variant will land when `DataFusion`'s\n`HigherOrderUDF` trait is absorbed (see apache/datafusion#21679). It lowers\nto a separate trait, not a decoration on `ScalarUDF`, so it must be a\ndistinct kind here as well. Adding it later is backward-compatible: serde\nrejects unknown values today, so no spicepod can accidentally take the\nname.",
       "type": "string",
       "enum": [
         "scalar",
@@ -4092,7 +4156,7 @@
           "type": "string"
         },
         "file_compression_type": {
-          "description": "The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
+          "description": "The type of compression used on the file. If unset, Spice infers compression from file extensions such as .gz, .bz2, .xz, and .zst. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
           "type": "string",
           "enum": [
             "GZIP",
@@ -4380,7 +4444,7 @@
           "type": "string"
         },
         "file_compression_type": {
-          "description": "The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
+          "description": "The type of compression used on the file. If unset, Spice infers compression from file extensions such as .gz, .bz2, .xz, and .zst. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
           "type": "string",
           "enum": [
             "GZIP",
@@ -4521,6 +4585,11 @@
           "description": "Maximum time to wait for a batch to fill before processing",
           "type": "string",
           "default": "1s"
+        },
+        "schema_evolution": {
+          "description": "Enable automatic schema evolution detection on reload. When true, the connector peeks at the latest Kafka message to detect schema changes. Default: false.",
+          "type": "string",
+          "default": "false"
         }
       },
       "required": [
@@ -4724,7 +4793,7 @@
           "type": "string"
         },
         "file_compression_type": {
-          "description": "The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
+          "description": "The type of compression used on the file. If unset, Spice infers compression from file extensions such as .gz, .bz2, .xz, and .zst. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
           "type": "string",
           "enum": [
             "GZIP",
@@ -4921,7 +4990,7 @@
           "type": "string"
         },
         "file_compression_type": {
-          "description": "The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
+          "description": "The type of compression used on the file. If unset, Spice infers compression from file extensions such as .gz, .bz2, .xz, and .zst. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
           "type": "string",
           "enum": [
             "GZIP",
@@ -5187,7 +5256,7 @@
           "default": "disabled"
         },
         "max_concurrent_requests": {
-          "description": "Maximum number of concurrent GitHub HTTP requests for this authentication context. If unset, falls back to runtime.params.github_max_concurrent_connections or the connector default.",
+          "description": "Maximum number of concurrent GitHub HTTP requests for this authentication context. If unset, falls back to runtime.source_rate_control.github_concurrent_connections_limit, deprecated runtime.params.github_max_concurrent_connections, or the connector default.",
           "type": "string"
         },
         "include": {
@@ -5350,7 +5419,7 @@
           "type": "string"
         },
         "file_compression_type": {
-          "description": "The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
+          "description": "The type of compression used on the file. If unset, Spice infers compression from file extensions such as .gz, .bz2, .xz, and .zst. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
           "type": "string",
           "enum": [
             "GZIP",
@@ -5547,7 +5616,7 @@
           "type": "string"
         },
         "file_compression_type": {
-          "description": "The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
+          "description": "The type of compression used on the file. If unset, Spice infers compression from file extensions such as .gz, .bz2, .xz, and .zst. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
           "type": "string",
           "enum": [
             "GZIP",
@@ -5879,7 +5948,7 @@
           "type": "string"
         },
         "file_compression_type": {
-          "description": "The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
+          "description": "The type of compression used on the file. If unset, Spice infers compression from file extensions such as .gz, .bz2, .xz, and .zst. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
           "type": "string",
           "enum": [
             "GZIP",
@@ -6211,7 +6280,7 @@
           "type": "string"
         },
         "file_compression_type": {
-          "description": "The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
+          "description": "The type of compression used on the file. If unset, Spice infers compression from file extensions such as .gz, .bz2, .xz, and .zst. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
           "type": "string",
           "enum": [
             "GZIP",
@@ -6662,7 +6731,7 @@
           "type": "string"
         },
         "file_compression_type": {
-          "description": "The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
+          "description": "The type of compression used on the file. If unset, Spice infers compression from file extensions such as .gz, .bz2, .xz, and .zst. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
           "type": "string",
           "enum": [
             "GZIP",
@@ -6767,6 +6836,24 @@
         "spiceai_tls_ca_certificate_file": {
           "description": "Path to a CA certificate file (PEM format) to use for TLS verification instead of system certificates.",
           "type": "string"
+        },
+        "spiceai_tls_client_certificate_file": {
+          "description": "Path to a PEM client certificate chain to present during the TLS handshake when the upstream Spice runtime requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate'.",
+          "type": "string"
+        },
+        "spiceai_tls_client_key_file": {
+          "description": "Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_key'.",
+          "type": "string"
+        },
+        "spiceai_tls_client_certificate": {
+          "description": "Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file'.",
+          "type": "string",
+          "x-secret": true
+        },
+        "spiceai_tls_client_key": {
+          "description": "Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_key_file'.",
+          "type": "string",
+          "x-secret": true
         }
       },
       "additionalProperties": true
@@ -6795,6 +6882,24 @@
         "spiceai_tls_ca_certificate_file": {
           "description": "Path to a CA certificate file (PEM format) to use for TLS verification instead of system certificates.",
           "type": "string"
+        },
+        "spiceai_tls_client_certificate_file": {
+          "description": "Path to a PEM client certificate chain to present during the TLS handshake when the upstream Spice runtime requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate'.",
+          "type": "string"
+        },
+        "spiceai_tls_client_key_file": {
+          "description": "Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_key'.",
+          "type": "string"
+        },
+        "spiceai_tls_client_certificate": {
+          "description": "Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file'.",
+          "type": "string",
+          "x-secret": true
+        },
+        "spiceai_tls_client_key": {
+          "description": "Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_key_file'.",
+          "type": "string",
+          "x-secret": true
         }
       },
       "additionalProperties": true
@@ -6899,11 +7004,6 @@
             "warn"
           ]
         },
-        "cayenne_footer_cache_mb": {
-          "description": "Size of the in-memory Vortex footer cache in MB. Larger values improve query performance for repeated scans. Default: 128 MB",
-          "type": "string",
-          "default": "128"
-        },
         "cayenne_segment_cache_mb": {
           "description": "Size of the in-memory Vortex segment cache in MB. Set > 0 to cache decompressed data segments. Default: 256 MB",
           "type": "string",
@@ -6927,10 +7027,72 @@
             "zstd"
           ]
         },
-        "cayenne_upload_concurrency": {
-          "description": "Maximum number of concurrent file uploads when writing multiple Vortex files. Default: 4.",
+        "cayenne_pk_conflict_detection": {
+          "description": "Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts and applies on_conflict behavior. 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness and the ingestion path cannot replay existing rows, such as steady-state append-only CDC after bootstrap.",
           "type": "string",
-          "default": "4"
+          "default": "auto",
+          "enum": [
+            "auto",
+            "none"
+          ]
+        },
+        "cayenne_upload_concurrency": {
+          "description": "Maximum number of concurrent file uploads when writing multiple Vortex files. Defaults to available CPU parallelism.",
+          "type": "string"
+        },
+        "cayenne_write_concurrency": {
+          "description": "Optional writer partition override for unsorted Cayenne ingests. Defaults to runtime.query.target_partitions.",
+          "type": "string"
+        },
+        "cayenne_compaction_trigger_files": {
+          "description": "Minimum number of small Vortex files in the current snapshot before tiered compaction runs. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise.",
+          "type": "string"
+        },
+        "cayenne_compaction_trigger_protected_snapshots": {
+          "description": "Number of protected snapshots before snapshot-maintenance compaction runs. This is separate from compaction_trigger_files so small-file tuning does not silently change scan amplification behavior. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise.",
+          "type": "string"
+        },
+        "cayenne_compaction_trigger_snapshot_age_ms": {
+          "description": "Maximum age in milliseconds of the oldest protected snapshot before snapshot-maintenance compaction runs. Set to 0 to disable the age trigger. Default: 60000 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 300000 otherwise.",
+          "type": "string"
+        },
+        "cayenne_compaction_max_levels": {
+          "description": "Maximum number of consecutive compaction passes per trigger. Bounds write amplification when promotion keeps producing new candidates. Default: 3.",
+          "type": "string",
+          "default": "3"
+        },
+        "cayenne_compaction_max_files_per_pick": {
+          "description": "Maximum number of eligible file paths retained in one compaction candidate for trigger selection and observability. The current compactor rewrites the whole current snapshot once triggered, so this does not bound rewrite IO or memory. Default: 32.",
+          "type": "string",
+          "default": "32"
+        },
+        "cayenne_compaction_background_interval_ms": {
+          "description": "Background compaction interval in milliseconds. The accelerator runs a per-table background task at this interval. Set to 0 to disable the background task — inline compaction on writes still runs. Default: 10000 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 30000 otherwise.",
+          "type": "string"
+        },
+        "cayenne_inline_max_rows": {
+          "description": "Maximum rows in a single write that can be inlined into the Cayenne metastore instead of writing a Vortex file. Set to 0 to disable write-entry inlining. Default: 1024 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 0 otherwise.",
+          "type": "string"
+        },
+        "cayenne_inline_max_bytes": {
+          "description": "Maximum serialized Arrow IPC bytes in a single inlined Cayenne metastore entry. Set to 0 to disable write-entry inlining. Default: 1048576 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 0 otherwise.",
+          "type": "string"
+        },
+        "cayenne_inline_max_buffer_bytes": {
+          "description": "Maximum Arrow in-memory bytes buffered while deciding whether to inline a write. Set to 0 to force the Vortex write path after the first buffered batch. Default: 4194304 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 0 otherwise.",
+          "type": "string"
+        },
+        "cayenne_inline_flush_max_rows": {
+          "description": "Maximum inline rows before checkpointing inline data to Vortex. Default: 2048 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 10000 otherwise.",
+          "type": "string"
+        },
+        "cayenne_inline_flush_max_segments": {
+          "description": "Maximum inline entries before checkpointing inline data to Vortex. Default: 16 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 64 otherwise.",
+          "type": "string"
+        },
+        "cayenne_inline_flush_max_bytes": {
+          "description": "Maximum inline IPC bytes before checkpointing inline data to Vortex. Default: 2097152 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8388608 otherwise.",
+          "type": "string"
         }
       },
       "additionalProperties": true
@@ -7318,7 +7480,7 @@
           "x-secret": true
         },
         "max_concurrent_requests": {
-          "description": "Maximum number of concurrent HTTP requests to the SQL Warehouse API.",
+          "description": "Maximum number of concurrent HTTP requests to the Databricks endpoint. Also controls the SQL Warehouse API request semaphore in sql_warehouse mode.",
           "type": "string",
           "default": "8"
         },
@@ -7345,6 +7507,22 @@
           "description": "When true, non-retryable errors (401, 403, 404) permanently disable the connector to prevent a thundering herd of failed requests.",
           "type": "string",
           "default": "true"
+        },
+        "requests_per_second_limit": {
+          "description": "Maximum number of HTTP requests per second to the Databricks endpoint. Overrides runtime.params.http_requests_per_second_limit when set.",
+          "type": "string"
+        },
+        "requests_per_minute_limit": {
+          "description": "Maximum number of HTTP requests per minute to the Databricks endpoint. Overrides runtime.params.http_requests_per_minute_limit when set.",
+          "type": "string"
+        },
+        "rate_control_jitter_min": {
+          "description": "Minimum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_min when set. Accepts durations such as '5ms' or '0ms'. Defaults to 5ms when a request-rate limit is configured, otherwise 0ms.",
+          "type": "string"
+        },
+        "rate_control_jitter_max": {
+          "description": "Maximum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms.",
+          "type": "string"
         },
         "databricks_client_id": {
           "description": "The client ID of the Databricks service principal.",
@@ -9655,6 +9833,9 @@
             }
           ]
         },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
+        },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
         },
@@ -9832,6 +10013,9 @@
               "type": "null"
             }
           ]
+        },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
         },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
@@ -10011,6 +10195,9 @@
             }
           ]
         },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
+        },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
         },
@@ -10188,6 +10375,9 @@
               "type": "null"
             }
           ]
+        },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
         },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
@@ -10367,6 +10557,9 @@
             }
           ]
         },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
+        },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
         },
@@ -10544,6 +10737,9 @@
               "type": "null"
             }
           ]
+        },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
         },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
@@ -10723,6 +10919,9 @@
             }
           ]
         },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
+        },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
         },
@@ -10900,6 +11099,9 @@
               "type": "null"
             }
           ]
+        },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
         },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
@@ -11079,6 +11281,9 @@
             }
           ]
         },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
+        },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
         },
@@ -11256,6 +11461,9 @@
               "type": "null"
             }
           ]
+        },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
         },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
@@ -11435,6 +11643,9 @@
             }
           ]
         },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
+        },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
         },
@@ -11612,6 +11823,9 @@
               "type": "null"
             }
           ]
+        },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
         },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
@@ -11791,6 +12005,9 @@
             }
           ]
         },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
+        },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
         },
@@ -11968,6 +12185,9 @@
               "type": "null"
             }
           ]
+        },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
         },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
@@ -12147,6 +12367,9 @@
             }
           ]
         },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
+        },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
         },
@@ -12324,6 +12547,9 @@
               "type": "null"
             }
           ]
+        },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
         },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
@@ -12503,6 +12729,9 @@
             }
           ]
         },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
+        },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
         },
@@ -12680,6 +12909,9 @@
               "type": "null"
             }
           ]
+        },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
         },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
@@ -12859,6 +13091,9 @@
             }
           ]
         },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
+        },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
         },
@@ -13037,6 +13272,9 @@
             }
           ]
         },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
+        },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
         },
@@ -13214,6 +13452,9 @@
               "type": "null"
             }
           ]
+        },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
         },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
@@ -13402,6 +13643,9 @@
             }
           ]
         },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
+        },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
         },
@@ -13588,6 +13832,9 @@
               "type": "null"
             }
           ]
+        },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
         },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
@@ -13776,6 +14023,9 @@
             }
           ]
         },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
+        },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
         },
@@ -13962,6 +14212,9 @@
               "type": "null"
             }
           ]
+        },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
         },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
@@ -14150,6 +14403,9 @@
             }
           ]
         },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
+        },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
         },
@@ -14336,6 +14592,9 @@
               "type": "null"
             }
           ]
+        },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
         },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
@@ -15424,6 +15683,9 @@
               "type": "null"
             }
           ]
+        },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
         },
         "ready_state": {
           "$ref": "#/$defs/ReadyState"
