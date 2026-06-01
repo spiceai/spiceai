@@ -94,7 +94,11 @@ impl Identity {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        now > self.not_after_unix
+        // Treat the cert as expired *at* `not_after_unix`, not only strictly
+        // after it: the field is defined as the timestamp after which the
+        // server no longer accepts the credential, so the boundary second
+        // should already be considered past the NotAfter limit.
+        now >= self.not_after_unix
     }
 }
 
@@ -280,9 +284,52 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
             path: tmp_path.clone(),
         })?;
     }
-    std::fs::rename(&tmp_path, path).context(IoSnafu {
-        path: path.to_path_buf(),
-    })?;
+    promote_temp(&tmp_path, path)
+}
+
+/// Promote a freshly-written temp file into its final location on non-Unix
+/// platforms, where `std::fs::rename` does **not** atomically replace an
+/// existing destination (it errors if the target already exists). A rotated
+/// or re-adopted identity must be able to overwrite an existing
+/// `identity.json`, so when the plain rename fails we move the existing file
+/// to a backup, retry the rename, and roll the backup back if the retry
+/// fails. The backup is removed on success.
+#[cfg(not(unix))]
+fn promote_temp(tmp_path: &Path, path: &Path) -> Result<()> {
+    if let Err(err) = std::fs::rename(tmp_path, path) {
+        // The most likely cause on non-Unix is that `path` already exists.
+        // If the destination is genuinely absent, surface the original error.
+        if !path.exists() {
+            return Err(err).context(IoSnafu {
+                path: path.to_path_buf(),
+            });
+        }
+
+        let backup_path = path.with_extension("bak");
+        // Clear any stale backup so the rename below can't fail on a leftover.
+        if let Err(rm_err) = std::fs::remove_file(&backup_path)
+            && rm_err.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(rm_err).context(IoSnafu { path: backup_path });
+        }
+        std::fs::rename(path, &backup_path).context(IoSnafu {
+            path: backup_path.clone(),
+        })?;
+        match std::fs::rename(tmp_path, path) {
+            Ok(()) => {
+                // Promotion succeeded; drop the backup (best-effort).
+                let _ = std::fs::remove_file(&backup_path);
+            }
+            Err(promote_err) => {
+                // Roll the original file back into place so we don't leave the
+                // store without an identity, then report the failure.
+                let _ = std::fs::rename(&backup_path, path);
+                return Err(promote_err).context(IoSnafu {
+                    path: path.to_path_buf(),
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -372,5 +419,29 @@ mod tests {
         let mut identity = sample_identity();
         identity.not_after_unix = 1;
         assert!(identity.is_expired());
+    }
+
+    #[test]
+    fn is_expired_treats_boundary_second_as_expired() {
+        // A cert whose `not_after_unix` equals the current second is past the
+        // NotAfter boundary and must be considered expired.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .expect("system clock after unix epoch");
+        let mut identity = sample_identity();
+        identity.not_after_unix = now;
+        assert!(identity.is_expired());
+    }
+
+    #[test]
+    fn is_expired_accepts_future_timestamp() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .expect("system clock after unix epoch");
+        let mut identity = sample_identity();
+        identity.not_after_unix = now + 3600;
+        assert!(!identity.is_expired());
     }
 }

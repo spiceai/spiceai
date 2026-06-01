@@ -774,6 +774,28 @@ mod connect {
             .stdout(predicate::str::contains("SPICE-ADOPT"));
     }
 
+    /// A malformed adoption code (right prefix, wrong shape) should be
+    /// rejected as an invalid argument rather than falling through to the
+    /// legacy pod-add path and emitting a misleading cloud-Spicepod error.
+    #[test]
+    fn test_connect_malformed_adoption_code_is_rejected() {
+        let dir = TempDir::new().expect("create temp config dir");
+        let config_dir = dir.path();
+        spice_cmd()
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("SPICE-ADOPT-AAA-BBBB")
+            .assert()
+            .failure();
+
+        // It must not have been staged as a pending code or treated as a pod:
+        // rejecting early means the pending file is never written.
+        assert!(
+            !config_dir.join("pending-adopt-code").exists(),
+            "malformed code must not be staged"
+        );
+    }
+
     /// `spice connect forget` with no prior state should be a no-op.
     #[test]
     fn test_connect_forget_when_nothing_to_clear() {

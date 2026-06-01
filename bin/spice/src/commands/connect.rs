@@ -125,6 +125,21 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
         return stage_adoption_code(target, args.endpoint.as_deref());
     }
 
+    // An input that clearly looks like an adoption code but fails validation
+    // is a malformed code, not a Spicepod path. Treating it as a pod path
+    // produces a misleading cloud-Spicepod error and may fire a cloud pod-add
+    // request for what was plainly meant to be an adoption code, so reject it
+    // explicitly instead of falling through to the legacy pod-add path.
+    if looks_like_adoption_code(target) {
+        return Err(crate::error::Error::InvalidArgument {
+            message: format!(
+                "'{target}' looks like a Spice Cloud adoption code but is malformed. \
+                 Expected SPICE-ADOPT-XXXX-XXXX-... (each segment is 4 uppercase \
+                 letters or digits). Copy the code from your Spice Cloud portal and retry."
+            ),
+        });
+    }
+
     // Fall back to legacy pod-add behavior.
     let add_args = AddArgs {
         pod_path: target.to_string(),
@@ -319,6 +334,15 @@ fn resolved_endpoint(pending_path: &std::path::Path) -> String {
     runtime_cloud_connect::config::DEFAULT_ENDPOINT.to_string()
 }
 
+/// Returns `true` if `target` is shaped like a Spice Cloud adoption code —
+/// i.e. it starts with the `SPICE-ADOPT` prefix — regardless of whether it
+/// passes full validation. Used to distinguish a malformed adoption code from
+/// a genuine Spicepod path. Matches the `SPICE`/`ADOPT` prefix segments
+/// checked by [`runtime_cloud_connect::is_valid_adoption_code`].
+fn looks_like_adoption_code(target: &str) -> bool {
+    target == "SPICE-ADOPT" || target.starts_with("SPICE-ADOPT-")
+}
+
 fn mask_code(code: &str) -> String {
     let mut parts = code.split('-').collect::<Vec<_>>();
     let len = parts.len();
@@ -390,5 +414,22 @@ mod tests {
     fn mask_code_short_codes_unchanged() {
         assert_eq!(mask_code("SHORT"), "SHORT");
         assert_eq!(mask_code("FOO-BAR"), "FOO-BAR");
+    }
+
+    #[test]
+    fn looks_like_adoption_code_matches_prefix() {
+        // Well-formed and malformed adoption codes both look like codes.
+        assert!(looks_like_adoption_code("SPICE-ADOPT-7K2P-9XYZ-A1B2"));
+        assert!(looks_like_adoption_code("SPICE-ADOPT-AAA-BBBB"));
+        assert!(looks_like_adoption_code("SPICE-ADOPT-aaaa-BBBB"));
+        assert!(looks_like_adoption_code("SPICE-ADOPT"));
+    }
+
+    #[test]
+    fn looks_like_adoption_code_rejects_pod_paths() {
+        assert!(!looks_like_adoption_code("spiceai/quickstart"));
+        assert!(!looks_like_adoption_code("org/pod"));
+        assert!(!looks_like_adoption_code("SPICE-CONNECT-AAAA-BBBB"));
+        assert!(!looks_like_adoption_code("spice-adopt-aaaa-bbbb"));
     }
 }
