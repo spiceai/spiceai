@@ -2535,11 +2535,16 @@ pub(crate) fn render_nsql_context_block(
 fn validate_requested_datasets(
     datasets: Option<&[String]>,
     table_allowlist: Option<&ResolvedTableAwareAllowlist>,
+    table_exists: impl Fn(&TableReference) -> bool,
 ) -> Result<(), NsqlContextError> {
-    if let (Some(requested_datasets), Some(allowlist)) = (datasets, table_allowlist) {
+    if let Some(requested_datasets) = datasets {
         for dataset in requested_datasets {
             let table_ref = TableReference::parse_str(dataset);
-            if !allowlist.table_is_allowed(&table_ref) {
+            if table_allowlist
+                .as_ref()
+                .is_some_and(|allowlist| !allowlist.table_is_allowed(&table_ref))
+                || !table_exists(&table_ref)
+            {
                 return Err(NsqlContextError::DatasetNotFound {
                     dataset: dataset.clone(),
                 });
@@ -2597,7 +2602,9 @@ pub(crate) async fn build_nsql_context(
 
     let table_allowlist_opt = table_allowlist(model, &app)?;
 
-    validate_requested_datasets(datasets.as_deref(), table_allowlist_opt.as_ref())?;
+    validate_requested_datasets(datasets.as_deref(), table_allowlist_opt.as_ref(), |table| {
+        df.table_exists(table)
+    })?;
 
     let tables = datasets.map_or_else(
         || {
@@ -2613,7 +2620,12 @@ pub(crate) async fn build_nsql_context(
             sort_table_references(&mut tables);
             tables
         },
-        |datasets| datasets.iter().map(TableReference::from).collect_vec(),
+        |datasets| {
+            datasets
+                .iter()
+                .map(|dataset| TableReference::parse_str(dataset))
+                .collect_vec()
+        },
     );
 
     let schema_context =
@@ -2814,6 +2826,33 @@ mod tests {
                 "support_tickets".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn validate_requested_datasets_rejects_unregistered_dataset() {
+        let datasets = vec!["missing".to_string()];
+
+        let error = validate_requested_datasets(Some(&datasets), None, |_| false)
+            .expect_err("unregistered requested dataset should be rejected");
+
+        assert!(matches!(
+            error,
+            NsqlContextError::DatasetNotFound { dataset } if dataset == "missing"
+        ));
+    }
+
+    #[test]
+    fn validate_requested_datasets_accepts_registered_allowed_dataset() {
+        let datasets = vec!["orders".to_string()];
+        let allowlist =
+            ResolvedTableAwareAllowlist::with_defaults(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                .with_table_patterns(vec!["orders".to_string()])
+                .expect("allowlist should build");
+
+        validate_requested_datasets(Some(&datasets), Some(&allowlist), |table| {
+            table.table() == "orders"
+        })
+        .expect("registered allowlisted dataset should be valid");
     }
 
     #[test]

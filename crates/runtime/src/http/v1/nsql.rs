@@ -226,7 +226,6 @@ fn nsql_context_response(
             .into_response();
     };
 
-    let context_block = context.context.clone();
     match response_format {
         NsqlContextResponseFormat::Json => Json(context).into_response(),
         NsqlContextResponseFormat::Markdown => {
@@ -235,7 +234,7 @@ fn nsql_context_response(
                 CONTENT_TYPE,
                 HeaderValue::from_static("text/markdown; charset=utf-8"),
             );
-            (StatusCode::OK, headers, context_block).into_response()
+            (StatusCode::OK, headers, context.context).into_response()
         }
         NsqlContextResponseFormat::PlainText => {
             let mut headers = HeaderMap::new();
@@ -243,7 +242,7 @@ fn nsql_context_response(
                 CONTENT_TYPE,
                 HeaderValue::from_static("text/plain; charset=utf-8"),
             );
-            (StatusCode::OK, headers, context_block).into_response()
+            (StatusCode::OK, headers, context.context).into_response()
         }
     }
 }
