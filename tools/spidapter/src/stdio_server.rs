@@ -422,7 +422,7 @@ impl Handler for SpidapterHandler {
         // Build the FederatedStorageConfig (same logic as setup()).
         let storage = match self.args.storage {
             FederatedStorage::Cayenne => FederatedStorageConfig::Cayenne,
-            FederatedStorage::Postgres => {
+            FederatedStorage::PostgresWAL => {
                 let run_id_str = run_id.to_string();
                 let short_id = run_id_str.split('-').next().unwrap_or_default();
 
