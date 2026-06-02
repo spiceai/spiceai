@@ -1161,10 +1161,9 @@ fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<Http
 
     // Ensure `fetched_at` is always present so caching TTL eviction and
     // append-mode `time_column` work even when the user omits the column.
-    const FETCHED_AT: &str = "_fetched_at";
-    if !column_order.iter().any(|n| n == FETCHED_AT) {
-        column_order.push(FETCHED_AT.to_string());
-        metadata_fields.insert(FETCHED_AT.to_string());
+    if !column_order.iter().any(|n| n == "_fetched_at") {
+        column_order.push("_fetched_at".to_string());
+        metadata_fields.insert("_fetched_at".to_string());
     }
 
     Ok(Some(HttpJsonNesting::new(
