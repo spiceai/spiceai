@@ -38,7 +38,7 @@ fn pub_name_for_table(schema: &str, table_name: &str) -> String {
     format!("{schema}_pub_{table_name}")
 }
 
-/// Quote a PostgreSQL identifier using double-quote escaping.
+/// Quote a `PostgreSQL` identifier using double-quote escaping.
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }

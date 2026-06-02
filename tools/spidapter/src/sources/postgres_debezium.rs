@@ -83,7 +83,7 @@ pub(crate) async fn setup_postgres_for_debezium(
 ///
 /// `debezium_host` — hostname the Debezium container uses to reach `PostgreSQL`.
 /// Defaults to `pg.host` but can be overridden via `PG_DEBEZIUM_HOST` when the
-/// Debezium container and the PostgreSQL instance are on different networks.
+/// Debezium container and the `PostgreSQL` instance are on different networks.
 ///
 /// Connectors are named `spicebench-{table}` with slot `spicebench_{table}_slot`.
 /// All connectors are registered concurrently, then we wait for all to reach
@@ -316,7 +316,7 @@ pub(crate) fn generate_postgres_debezium_spicepod(
     for (dataset_name, config) in datasets {
         let topic = format!("spicebench.{}.{dataset_name}", pg.schema);
         let mut dataset = Dataset::new(format!("debezium:{topic}"), dataset_name.as_str());
-        let mut param_map = HashMap::from([
+        let param_map = HashMap::from([
             (
                 "kafka_bootstrap_servers".to_string(),
                 kafka_brokers.to_string(),
