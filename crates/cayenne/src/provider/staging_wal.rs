@@ -215,14 +215,21 @@ impl CayenneStagedAppend {
     /// Returns an error if any fallible step in the finalize sequence (write WAL, move files,
     /// or remove WAL) fails.
     pub async fn finalize_staged_write(&self) -> Result<()> {
-        self.write_wal().await?;
-        let _visibility_guard = self.table.visibility_lock_arc().lock_owned().await;
-        let _fence = self.table.lock_listing_fence_write_owned().await;
-        self.move_staged_files().await?;
-        self.remove_wal().await?;
         self.table
-            .publish_current_snapshot_files_changed_under_held_fence();
-        Ok(())
+            .register_inflight_staging_append(&self.staging_snapshot_id);
+        let result = async {
+            self.write_wal().await?;
+            let _visibility_guard = self.table.visibility_lock_arc().lock_owned().await;
+            let _fence = self.table.lock_listing_fence_write_owned().await;
+            self.move_staged_files().await?;
+            self.remove_wal().await?;
+            self.table
+                .publish_current_snapshot_files_changed_under_held_fence();
+            Ok(())
+        }
+        .await;
+        unregister_inflight_staging_append(&self.table, &self.staging_snapshot_id, result.is_ok());
+        result
     }
 
     /// Commits the staged append, making the new rows visible to readers.
@@ -338,6 +345,20 @@ impl Drop for PreparedStagedAppend {
     }
 }
 
+fn unregister_inflight_staging_append(
+    table: &CayenneTableProvider,
+    staging_snapshot_id: &str,
+    staging_is_clean: bool,
+) {
+    table.unregister_inflight_staging_append(staging_snapshot_id);
+    if staging_is_clean && !table.has_inflight_staging_appends() {
+        table.staging_wal_present().store(false, Ordering::Release);
+        table
+            .staging_may_have_files()
+            .store(false, Ordering::Release);
+    }
+}
+
 impl PreparedStagedAppend {
     /// Returns the number of rows staged for commit.
     #[must_use]
@@ -365,16 +386,7 @@ impl PreparedStagedAppend {
     }
 
     fn mark_inflight_complete(&self) {
-        self.table
-            .unregister_inflight_staging_append(&self.staging_snapshot_id);
-        if !self.table.has_inflight_staging_appends() {
-            self.table
-                .staging_wal_present()
-                .store(false, Ordering::Release);
-            self.table
-                .staging_may_have_files()
-                .store(false, Ordering::Release);
-        }
+        unregister_inflight_staging_append(&self.table, &self.staging_snapshot_id, true);
     }
 
     /// Apply the staged write under the caller's append-side barrier.

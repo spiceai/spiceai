@@ -56,7 +56,7 @@ use runtime_table_partition::provider::PartitionTableProvider;
 #[cfg(test)]
 use snafu::OptionExt;
 use snafu::ResultExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -1136,8 +1136,8 @@ impl RefreshTask {
         // privately in each accelerator module); the accelerator's schema
         // metadata carries the engine name.
         const ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
-        static WARNED: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
-            std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+        static WARNED: std::sync::LazyLock<parking_lot::Mutex<HashSet<TableReference>>> =
+            std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashSet::new()));
 
         let is_cayenne = self
             .accelerator
@@ -1149,7 +1149,7 @@ impl RefreshTask {
         if !is_cayenne {
             return;
         }
-        let first_for_table = WARNED.lock().insert(self.dataset_name.to_string());
+        let first_for_table = WARNED.lock().insert(self.dataset_name.clone());
         if first_for_table {
             tracing::warn!(
                 dataset = %self.dataset_name,

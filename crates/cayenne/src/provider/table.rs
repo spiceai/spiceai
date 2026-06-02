@@ -12531,6 +12531,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_compaction_skips_one_shot_staged_append_finalize() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "staged_append_compaction_pending",
+            ctx.runtime_env(),
+            VortexConfig {
+                target_vortex_file_size_mb: 1,
+                compaction_trigger_files: 4,
+                compaction_max_levels: 1,
+                compaction_max_files_per_pick: 4,
+                compaction_background_interval_ms: 0,
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let staging_snapshot_id = CayenneTableProvider::new_staging_snapshot_id();
+
+        provider
+            .clear_staging_snapshot_dir(&staging_snapshot_id)
+            .await
+            .expect("staging snapshot starts clean");
+        provider
+            .staging_may_have_files()
+            .store(true, Ordering::Release);
+        let (row_count, _writer_ops, _stats_acc) = provider
+            .write_to_snapshot(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                provider.target_file_size_bytes(),
+                &staging_snapshot_id,
+                1,
+            )
+            .await
+            .expect("write staged files");
+        let staged_append =
+            crate::provider::staging_wal::CayenneStagedAppend::from_staged_append_in(
+                provider.clone_for_write_operations(),
+                None,
+                staging_snapshot_id,
+                row_count,
+            );
+
+        provider
+            .new_files_since_last_compaction
+            .store(4, Ordering::Release);
+        let write_guard = provider
+            .write_lock
+            .try_lock()
+            .expect("write lock should be free before compaction trigger");
+        drop(write_guard);
+
+        let fence_guard = provider.lock_listing_fence_write_owned().await;
+        let finalize_task =
+            tokio::spawn(async move { staged_append.finalize_staged_write().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !provider.has_inflight_staging_appends() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one-shot staged append finalize should register in-flight");
+
+        assert!(
+            !CompactionRunner::run_compaction_trigger(&provider)
+                .await
+                .expect("compaction trigger should skip during one-shot staged append finalize"),
+            "compaction must not run while one-shot staged append finalization is in flight"
+        );
+
+        drop(fence_guard);
+        finalize_task
+            .await
+            .expect("finalize task should not panic")
+            .expect("finalize one-shot staged append");
+        assert!(
+            !provider.has_inflight_staging_appends(),
+            "one-shot finalize should clear the inflight marker"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "staged_append_compaction_pending").await,
+            vec![(1, 100)]
+        );
+    }
+
+    #[tokio::test]
     async fn test_staged_position_deletions_fail_on_row_id_overflow() {
         let ctx = SessionContext::new();
         let (provider, _catalog, _tmp) =
