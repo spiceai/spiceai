@@ -32,7 +32,8 @@ pub enum AccelerationEngine {
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum FederatedStorage {
     Cayenne,
-    Postgres,
+    #[value(name = "postgres-wal")]
+    PostgresWAL,
     #[value(name = "postgres-debezium")]
     PostgresDebezium,
     #[value(name = "dynamodb")]

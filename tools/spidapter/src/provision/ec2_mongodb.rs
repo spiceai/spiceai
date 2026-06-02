@@ -168,7 +168,7 @@ pub(crate) async fn launch_mongodb_ec2(
     eprintln!("[stdio] EC2 MongoDB: MongoDB ready");
 
     let uri = format!(
-        "mongodb://{DEFAULT_MONGO_USER}:{mongo_password}@{host}:{MONGO_PORT}/{DEFAULT_MONGO_DATABASE}?authSource={DEFAULT_MONGO_DATABASE}"
+        "mongodb://{DEFAULT_MONGO_USER}:{mongo_password}@{host}:{MONGO_PORT}/{DEFAULT_MONGO_DATABASE}?authSource=admin&directConnection=true"
     );
 
     Ok(Ec2MongoInstance {
@@ -180,6 +180,11 @@ pub(crate) async fn launch_mongodb_ec2(
 }
 
 /// Build the cloud-init user-data script that installs and configures `MongoDB`.
+///
+/// MongoDB is started as a single-node replica set (`rs0`) so that Change Streams
+/// are available. The replica set member is explicitly set to `localhost:27017`
+/// so that the connection URI the caller uses (`localhost`) matches the RS member
+/// address and change stream resume tokens work correctly.
 fn mongodb_user_data(user: &str, password: &str, database: &str) -> String {
     format!(
         r#"#!/bin/bash
@@ -188,6 +193,8 @@ export DEBIAN_FRONTEND=noninteractive
 MONGO_USER='{user}'
 MONGO_PASSWORD='{password}'
 MONGO_DB='{database}'
+PUBLIC_IP=$(curl -s --max-time 10 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null \
+    || hostname -I | awk '{{print $1}}')
 
 apt-get update -y
 apt-get install -y curl gnupg
@@ -201,19 +208,26 @@ echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gp
 apt-get update -y
 apt-get install -y mongodb-org
 
-# Bind to all interfaces
+# Bind to all interfaces and configure replica set (required for Change Streams)
 sed -i 's/bindIp: 127.0.0.1/bindIp: 0.0.0.0/' /etc/mongod.conf
+sed -i '/^#replication:/d' /etc/mongod.conf
+printf '\nreplication:\n  replSetName: rs0\n' >> /etc/mongod.conf
 
 systemctl enable mongod
 systemctl start mongod
 until mongosh --quiet --eval 'db.runCommand({{ping:1}})' >/dev/null 2>&1; do sleep 2; done
 
-# Create user with readWrite on the database
+# Initialise replica set with the public IP so external clients can use it.
+# $PUBLIC_IP is expanded by the shell at runtime.
+mongosh admin --eval "rs.initiate({{_id: 'rs0', members: [{{_id: 0, host: '$PUBLIC_IP:27017'}}]}})"
+until mongosh --quiet --eval 'rs.isMaster().ismaster' 2>/dev/null | grep -q true; do sleep 2; done
+
+# Create user with readWrite on the database (must be done after RS is primary)
 mongosh admin --eval "
   db.createUser({{
     user: '$MONGO_USER',
     pwd:  '$MONGO_PASSWORD',
-    roles: [{{ role: 'readWrite', db: '$MONGO_DB' }}]
+    roles: [{{ role: 'readWrite', db: '$MONGO_DB' }}, {{ role: 'clusterMonitor', db: 'admin' }}]
   }})
 "
 
@@ -221,7 +235,7 @@ mongosh admin --eval "
 sed -i '/^#security:/d' /etc/mongod.conf
 printf '\nsecurity:\n  authorization: enabled\n' >> /etc/mongod.conf
 systemctl restart mongod
-until mongosh "mongodb://$MONGO_USER:$MONGO_PASSWORD@localhost:27017/$MONGO_DB?authSource=$MONGO_DB" \
+until mongosh "mongodb://$MONGO_USER:$MONGO_PASSWORD@localhost:27017/$MONGO_DB?authSource=admin&directConnection=true" \
       --quiet --eval 'db.runCommand({{ping:1}})' >/dev/null 2>&1; do sleep 2; done
 "#
     )

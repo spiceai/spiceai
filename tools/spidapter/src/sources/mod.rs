@@ -46,6 +46,18 @@ pub(super) fn dynamodb_arrow_type_to_spicepod_str(dt: &arrow::datatypes::DataTyp
     }
 }
 
+/// Convert an Arrow `DataType` to a spicepod type string for MongoDB datasets.
+///
+/// MongoDB stores all numeric values natively; the only special case is
+/// `Decimal128/256` which the `MongoDbSink` encodes as BSON Double (Float64).
+pub(super) fn mongodb_arrow_type_to_spicepod_str(dt: &arrow::datatypes::DataType) -> String {
+    use arrow::datatypes::DataType;
+    match dt {
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "Float64".to_string(),
+        other => arrow_type_to_spicepod_str(other),
+    }
+}
+
 /// Convert an Arrow `DataType` to a string the spicepod `parse_declared_type` parser accepts.
 ///
 /// Arrow's `Display` uses abbreviated time-unit forms (`µs`, `ns`) that the parser does not
