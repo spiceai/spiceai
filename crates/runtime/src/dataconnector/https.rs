@@ -18,6 +18,11 @@ use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::metrics::MetricsProvider;
 use crate::component::{ComponentInitialization, DatasetHealthMonitor, StartupOptions};
+use crate::dataconnector::client_identity::{
+    ClientIdentityConfig, ClientIdentityConfigError, TLS_CLIENT_CERTIFICATE,
+    TLS_CLIENT_CERTIFICATE_FILE, TLS_CLIENT_IDENTITY_PARAM_NAMES, TLS_CLIENT_KEY,
+    TLS_CLIENT_KEY_FILE,
+};
 use crate::dataconnector::http_rate_control::{
     self, HttpRateControlConfig, HttpRateControlMetricSource, HttpRateControlMetrics,
     HttpRateControlMetricsProvider,
@@ -59,18 +64,6 @@ use reqwest::{
 use std::time::Duration;
 
 const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
-
-#[derive(Debug)]
-enum ClientIdentityConfig {
-    FromFiles {
-        cert_path: PathBuf,
-        key_path: PathBuf,
-    },
-    FromPem {
-        cert_pem: Vec<u8>,
-        key_pem: Vec<u8>,
-    },
-}
 
 fn parse_pagination_max_pages(value: &str) -> Option<usize> {
     let trimmed = value.trim();
@@ -600,108 +593,105 @@ impl Https {
         custom_headers
     }
 
+    fn client_identity_params_are_configured(&self) -> bool {
+        TLS_CLIENT_IDENTITY_PARAM_NAMES
+            .iter()
+            .any(|name| self.params.get(name).expose().ok().is_some())
+    }
+
+    fn map_client_identity_config_error(
+        &self,
+        dataset: &Dataset,
+        error: ClientIdentityConfigError,
+    ) -> DataConnectorError {
+        match error {
+            ClientIdentityConfigError::Incomplete {
+                set_field,
+                missing_field,
+            } => DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "https".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                message: format!(
+                    "mTLS client identity is half-configured: '{}' is set but '{}' is missing. Set both fields to present a client certificate to the upstream HTTP server, or set neither.",
+                    self.params.user_param(set_field),
+                    self.params.user_param(missing_field),
+                ),
+            },
+            ClientIdentityConfigError::Ambiguous => {
+                DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: format!(
+                        "mTLS client identity is ambiguous: file-based params ('{}', '{}') cannot be mixed with inline params ('{}', '{}'). Use either the file-based pair or the inline pair, not both.",
+                        self.params.user_param(TLS_CLIENT_CERTIFICATE_FILE),
+                        self.params.user_param(TLS_CLIENT_KEY_FILE),
+                        self.params.user_param(TLS_CLIENT_CERTIFICATE),
+                        self.params.user_param(TLS_CLIENT_KEY),
+                    ),
+                }
+            }
+        }
+    }
+
+    fn ensure_client_identity_supported_for_structured_dataset(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<()> {
+        if !self.client_identity_params_are_configured() {
+            return Ok(());
+        }
+
+        let params = TLS_CLIENT_IDENTITY_PARAM_NAMES
+            .iter()
+            .map(|name| format!("'{}'", self.params.user_param(name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "https".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: format!(
+                "mTLS client identity parameters are not supported for structured HTTP file datasets that use the listing connector. Remove {params}, or use a dynamic JSON HTTP API dataset."
+            ),
+        })
+    }
+
     fn resolve_client_identity_config(
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Option<ClientIdentityConfig>> {
         let client_certificate_path = self
             .params
-            .get("tls_client_certificate_file")
+            .get(TLS_CLIENT_CERTIFICATE_FILE)
             .expose()
             .ok()
             .map(PathBuf::from);
         let client_key_path = self
             .params
-            .get("tls_client_key_file")
+            .get(TLS_CLIENT_KEY_FILE)
             .expose()
             .ok()
             .map(PathBuf::from);
         let client_certificate_inline = self
             .params
-            .get("tls_client_certificate")
+            .get(TLS_CLIENT_CERTIFICATE)
             .expose()
             .ok()
             .map(|s| s.as_bytes().to_vec());
         let client_key_inline = self
             .params
-            .get("tls_client_key")
+            .get(TLS_CLIENT_KEY)
             .expose()
             .ok()
             .map(|s| s.as_bytes().to_vec());
 
-        let has_file_cert = client_certificate_path.is_some();
-        let has_file_key = client_key_path.is_some();
-        let has_inline_cert = client_certificate_inline.is_some();
-        let has_inline_key = client_key_inline.is_some();
-
-        if (has_file_cert || has_file_key) && (has_inline_cert || has_inline_key) {
-            return Err(DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: "https".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                message: format!(
-                    "mTLS client identity is ambiguous: both file-based ('{}') and inline ('{}') params are set. Use one or the other, not both.",
-                    self.params.user_param("tls_client_certificate_file"),
-                    self.params.user_param("tls_client_certificate"),
-                ),
-            });
-        }
-
-        if has_file_cert || has_file_key {
-            return match (client_certificate_path, client_key_path) {
-                (Some(cert_path), Some(key_path)) => Ok(Some(ClientIdentityConfig::FromFiles {
-                    cert_path,
-                    key_path,
-                })),
-                (Some(_), None) => Err(DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "https".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    message: format!(
-                        "mTLS client identity is half-configured: '{}' is set but '{}' is missing. Set both fields to present a client certificate to the upstream HTTP server, or set neither.",
-                        self.params.user_param("tls_client_certificate_file"),
-                        self.params.user_param("tls_client_key_file"),
-                    ),
-                }),
-                (None, Some(_)) => Err(DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "https".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    message: format!(
-                        "mTLS client identity is half-configured: '{}' is set but '{}' is missing. Set both fields to present a client certificate to the upstream HTTP server, or set neither.",
-                        self.params.user_param("tls_client_key_file"),
-                        self.params.user_param("tls_client_certificate_file"),
-                    ),
-                }),
-                (None, None) => Ok(None),
-            };
-        }
-
-        if has_inline_cert || has_inline_key {
-            return match (client_certificate_inline, client_key_inline) {
-                (Some(cert_pem), Some(key_pem)) => {
-                    Ok(Some(ClientIdentityConfig::FromPem { cert_pem, key_pem }))
-                }
-                (Some(_), None) => Err(DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "https".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    message: format!(
-                        "mTLS client identity is half-configured: '{}' is set but '{}' is missing. Set both fields to present a client certificate to the upstream HTTP server, or set neither.",
-                        self.params.user_param("tls_client_certificate"),
-                        self.params.user_param("tls_client_key"),
-                    ),
-                }),
-                (None, Some(_)) => Err(DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "https".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    message: format!(
-                        "mTLS client identity is half-configured: '{}' is set but '{}' is missing. Set both fields to present a client certificate to the upstream HTTP server, or set neither.",
-                        self.params.user_param("tls_client_key"),
-                        self.params.user_param("tls_client_certificate"),
-                    ),
-                }),
-                (None, None) => Ok(None),
-            };
-        }
-
-        Ok(None)
+        crate::dataconnector::client_identity::resolve_client_identity_config(
+            client_certificate_path,
+            client_key_path,
+            client_certificate_inline,
+            client_key_inline,
+        )
+        .map_err(|error| self.map_client_identity_config_error(dataset, error))
     }
 
     async fn resolve_client_identity(
@@ -1379,6 +1369,7 @@ impl DataConnector for Https {
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if self.is_structured_format(dataset) {
             self.ensure_rate_control_supported_for_structured_dataset(dataset)?;
+            self.ensure_client_identity_supported_for_structured_dataset(dataset)?;
             // Use ListingTableConnector for file-based structured formats (parquet, csv, etc.)
             // which properly handles file parsing with correct schemas
             let listing_connector =
@@ -1462,14 +1453,14 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .description("Maximum number of idle connections to keep alive per host. Default: 10"),
         ParameterSpec::runtime("pool_idle_timeout")
             .description("Timeout for idle connections in the pool (in seconds). Default: 90"),
-        ParameterSpec::component("tls_client_certificate_file")
-            .description("Path to a PEM client certificate chain to present during the TLS handshake when the upstream HTTP server requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate'. Applies to JSON API endpoints only."),
-        ParameterSpec::component("tls_client_key_file")
-            .description("Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_key'. Applies to JSON API endpoints only."),
-        ParameterSpec::component("tls_client_certificate").secret()
-            .description("Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file'. Applies to JSON API endpoints only."),
-        ParameterSpec::component("tls_client_key").secret()
-            .description("Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_key_file'. Applies to JSON API endpoints only."),
+        ParameterSpec::component(TLS_CLIENT_CERTIFICATE_FILE)
+            .description("Path to a PEM client certificate chain to present during the TLS handshake when the upstream HTTP server requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params."),
+        ParameterSpec::component(TLS_CLIENT_KEY_FILE)
+            .description("Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params."),
+        ParameterSpec::component(TLS_CLIENT_CERTIFICATE).secret()
+            .description("Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params."),
+        ParameterSpec::component(TLS_CLIENT_KEY).secret()
+            .description("Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params."),
         ParameterSpec::runtime("http_headers")
             .description("Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests."),
         ParameterSpec::runtime("max_retries")
@@ -2251,6 +2242,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_http_structured_format_rejects_client_identity_params() {
+        let connector = test_connector_with(&[
+            ("file_format", "csv"),
+            ("http_tls_client_certificate", "inline-cert"),
+            ("http_tls_client_key", "inline-key"),
+        ])
+        .await;
+        let dataset = test_dataset("https://example.com/data.csv", RefreshMode::Full, None).await;
+
+        let error = connector
+            .read_provider(&dataset)
+            .await
+            .expect_err("structured HTTP file datasets should reject mTLS client identity params");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("mTLS client identity parameters are not supported"),
+                    "expected unsupported mTLS params error, got: {message}"
+                );
+                assert!(
+                    message.contains("http_tls_client_certificate"),
+                    "expected user-facing mTLS param in error, got: {message}"
+                );
+                assert!(
+                    message.contains("dynamic JSON HTTP API dataset"),
+                    "expected dynamic JSON guidance in error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_http_auto_structured_format_detects_compressed_url_extension() {
         let connector = test_connector(None).await;
         let dataset =
@@ -2418,7 +2443,37 @@ mod tests {
                     "expected ambiguous identity error, got: {message}"
                 );
                 assert!(message.contains("http_tls_client_certificate_file"));
+                assert!(message.contains("http_tls_client_key_file"));
                 assert!(message.contains("http_tls_client_certificate"));
+                assert!(message.contains("http_tls_client_key"));
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_client_identity_config_rejects_any_mixed_file_and_inline_identity_params() {
+        let connector = test_connector_with(&[
+            ("http_tls_client_certificate_file", "/certs/client.pem"),
+            ("http_tls_client_key", "inline-key"),
+        ])
+        .await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        let error = connector
+            .resolve_client_identity_config(&dataset)
+            .expect_err("any mix of file-based and inline mTLS params should be ambiguous");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("ambiguous"),
+                    "expected ambiguous identity error, got: {message}"
+                );
+                assert!(message.contains("http_tls_client_certificate_file"));
+                assert!(message.contains("http_tls_client_key_file"));
+                assert!(message.contains("http_tls_client_certificate"));
+                assert!(message.contains("http_tls_client_key"));
             }
             other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
         }

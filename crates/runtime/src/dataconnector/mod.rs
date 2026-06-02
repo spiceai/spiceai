@@ -57,6 +57,7 @@ use tracing::Level;
 use std::future::Future;
 use std::time::Duration;
 
+pub mod client_identity;
 pub mod http_rate_control;
 pub mod listing;
 
