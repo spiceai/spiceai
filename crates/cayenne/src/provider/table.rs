@@ -7193,7 +7193,10 @@ impl CayenneTableProvider {
     /// old snapshot dirs are reaped in the background.
     async fn rewrite_current_snapshot_for_compaction(&self) -> Result<()> {
         let compaction_start = std::time::Instant::now();
-        let ctx = self.create_session_context();
+        // Use the dedicated compaction memory environment (carved budget) when
+        // injected, so this rewrite accounts its memory against the isolated
+        // compaction pool rather than competing with queries for the query pool.
+        let ctx = self.create_compaction_session_context();
         let mut stream = self.visible_file_stream_for_rewrite(&ctx).await?;
 
         let target_partitions = if self.context.has_sort_columns() {
@@ -7384,6 +7387,20 @@ impl CayenneTableProvider {
             SessionConfig::default(),
             Arc::clone(self.context.runtime_env()),
         )
+    }
+
+    /// Like [`Self::create_session_context`], but backed by the dedicated
+    /// compaction memory environment when one has been injected (Cayenne
+    /// configured + dedicated thread pools enabled).
+    ///
+    /// Compaction thereby accounts its working memory against a separate,
+    /// bounded pool carved from `runtime.query.memory_limit`, so a large
+    /// snapshot rewrite cannot starve concurrent queries. Falls back to the
+    /// shared query environment when no dedicated compaction env is set.
+    fn create_compaction_session_context(&self) -> SessionContext {
+        let runtime_env = super::compaction::compaction_runtime_env()
+            .unwrap_or_else(|| Arc::clone(self.context.runtime_env()));
+        SessionContext::new_with_config_rt(SessionConfig::default(), runtime_env)
     }
 
     /// Wrap a plan with a `FilterExec` that enforces the retention filter.

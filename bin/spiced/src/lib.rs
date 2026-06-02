@@ -659,10 +659,22 @@ pub async fn run(args: Args) -> Result<()> {
 
             rt.datafusion().set_refresh_runtime(refresh_runtime);
 
-            // The dedicated compaction runtime is created lazily, on first
-            // registration of a Cayenne-accelerated dataset (see
-            // `DataFusion::ensure_compaction_runtime_for_engine`), so deployments
-            // without Cayenne never spin up its worker threads.
+            // Bring up the dedicated compaction runtime only when the DataFusion
+            // builder carved a compaction memory environment — i.e. Cayenne
+            // acceleration is configured on a dataset (and we're in this arm, so
+            // dedicated thread pools are enabled). `set_compaction_runtime`
+            // injects both the runtime handle and the carved memory environment
+            // into the Cayenne crate, isolating compaction on CPU and memory.
+            if rt.datafusion().compaction_runtime_env().is_some() {
+                let compaction_runtime = ManagedTokioRuntime::builder()
+                    .with_low_priority()
+                    .with_thread_name("compaction-worker")
+                    .build()
+                    .boxed()
+                    .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+
+                rt.datafusion().set_compaction_runtime(compaction_runtime);
+            }
         }
         Some("disabled") => {
             tracing::info!(

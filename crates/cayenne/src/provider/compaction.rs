@@ -39,6 +39,7 @@ use std::future::Future;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
+use datafusion_execution::runtime_env::RuntimeEnv;
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
@@ -87,6 +88,37 @@ where
         Some(handle) => handle.spawn(future),
         None => tokio::spawn(future),
     }
+}
+
+/// Process-wide dedicated compaction memory environment, injected once at
+/// startup by the binary when Cayenne acceleration is configured (and dedicated
+/// thread pools are enabled).
+///
+/// Carries a [`RuntimeEnv`] whose memory pool is a separate budget carved from
+/// `runtime.query.memory_limit` (sized in the runtime's `DataFusion` builder)
+/// while sharing the query environment's object-store registry — so compaction
+/// reads and writes the same stores but accounts its working memory against an
+/// isolated, bounded pool that cannot starve queries.
+///
+/// When unset (no Cayenne, dedicated pools disabled, unit tests, other
+/// embedders) compaction falls back to the shared query environment via
+/// [`super::context::CayenneContext::runtime_env`], preserving prior behavior.
+static COMPACTION_RUNTIME_ENV: OnceLock<Arc<RuntimeEnv>> = OnceLock::new();
+
+/// Inject the dedicated compaction memory environment. Called once at process
+/// startup; subsequent calls are ignored (the first env wins).
+pub fn set_compaction_runtime_env(env: Arc<RuntimeEnv>) {
+    if COMPACTION_RUNTIME_ENV.set(env).is_err() {
+        tracing::debug!(
+            target: "cayenne::compaction",
+            "Compaction runtime env already set; ignoring"
+        );
+    }
+}
+
+/// The dedicated compaction memory environment, if one was injected.
+pub(crate) fn compaction_runtime_env() -> Option<Arc<RuntimeEnv>> {
+    COMPACTION_RUNTIME_ENV.get().cloned()
 }
 
 /// Tier thresholds derived from `target_vortex_file_size_mb`.

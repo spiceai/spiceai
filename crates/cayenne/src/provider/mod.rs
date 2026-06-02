@@ -89,7 +89,7 @@ pub(crate) mod utils;
 pub(crate) mod vortex_format;
 
 // Re-export the main type at the module level for convenience
-pub use compaction::set_compaction_runtime_handle;
+pub use compaction::{set_compaction_runtime_env, set_compaction_runtime_handle};
 pub use context::CayenneContext;
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};

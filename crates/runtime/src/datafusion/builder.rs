@@ -313,6 +313,11 @@ pub struct DataFusionBuilder {
     cayenne_sort_merge_min_rows: Option<usize>,
     cayenne_sort_merge_memory_pool_fraction: Option<f64>,
     cayenne_footer_cache_mb: Option<usize>,
+    /// Fraction of the query memory limit to carve into a dedicated compaction
+    /// memory pool. `Some` only when Cayenne acceleration is configured and
+    /// dedicated thread pools are enabled (set by the Runtime builder); `None`
+    /// leaves the full budget to queries and gives compaction no separate pool.
+    compaction_memory_fraction: Option<f64>,
     cayenne_optimizer_rules: CayenneOptimizerRules,
     /// Arbitrary additional analyzer rules.
     additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
@@ -366,6 +371,7 @@ impl DataFusionBuilder {
             cayenne_sort_merge_min_rows: None,
             cayenne_sort_merge_memory_pool_fraction: None,
             cayenne_footer_cache_mb: None,
+            compaction_memory_fraction: None,
             cayenne_optimizer_rules: CayenneOptimizerRules::default(),
             additional_analyzer_rules: vec![],
             executor_registry: None,
@@ -481,6 +487,15 @@ impl DataFusionBuilder {
         self
     }
 
+    /// Carve a dedicated compaction memory pool of `fraction` of the query
+    /// memory limit. Set by the Runtime builder only when Cayenne acceleration
+    /// is configured and dedicated thread pools are enabled.
+    #[must_use]
+    pub fn compaction_memory_fraction(mut self, fraction: Option<f64>) -> Self {
+        self.compaction_memory_fraction = fraction;
+        self
+    }
+
     /// Enables (or disables) Cayenne filter propagation together with its
     /// companion IN-list→range rewrite. The IN-list→range rewrite turns
     /// `col IN (a, b, c)` predicates into range/bound predicates that filter
@@ -542,6 +557,28 @@ impl DataFusionBuilder {
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
         let effective_memory_limit = effective_query_memory_limit(self.memory_limit);
+        // Carve a dedicated compaction memory budget out of the query limit when
+        // a fraction is configured (Cayenne acceleration + dedicated thread
+        // pools). The query pool shrinks by the carved amount so the two budgets
+        // together never exceed the operator's configured memory limit; the
+        // query-side sizing below (hash join, optimizer) then uses the reduced
+        // query budget, and `compaction_memory_bytes` sizes the separate pool.
+        let (effective_memory_limit, compaction_memory_bytes) =
+            match self.compaction_memory_fraction {
+                Some(fraction) => {
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss
+                    )]
+                    let compaction_bytes = (effective_memory_limit as f64 * fraction) as u64;
+                    (
+                        effective_memory_limit.saturating_sub(compaction_bytes),
+                        Some(compaction_bytes),
+                    )
+                }
+                None => (effective_memory_limit, None),
+            };
 
         if let Some(spill_compression) = self.spill_compression {
             config = config.with_spill_compression(spill_compression);
@@ -578,6 +615,21 @@ impl DataFusionBuilder {
 
         let datafusion_ref = super::iceberg_ddl::new_shared_datafusion_ref();
 
+        let query_runtime_env = runtime_env_with_effective_memory_limit(
+            effective_memory_limit,
+            self.temp_directory.clone(),
+            self.io_runtime.clone(),
+            self.cayenne_footer_cache_mb
+                .map(|size_mb| size_mb.saturating_mul(1024 * 1024)),
+        );
+        // Build the dedicated compaction environment from the carved budget,
+        // sharing the query environment's object-store registry so compaction
+        // reads/writes the same stores while accounting memory against its own
+        // bounded pool.
+        let compaction_runtime_env = compaction_memory_bytes.map(|bytes| {
+            build_compaction_runtime_env(bytes, &query_runtime_env, self.temp_directory.clone())
+        });
+
         let mut state = SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
@@ -589,13 +641,7 @@ impl DataFusionBuilder {
                     self.io_runtime.clone(),
                 )),
             ))
-            .with_runtime_env(runtime_env_with_effective_memory_limit(
-                effective_memory_limit,
-                self.temp_directory.clone(),
-                self.io_runtime.clone(),
-                self.cayenne_footer_cache_mb
-                    .map(|size_mb| size_mb.saturating_mul(1024 * 1024)),
-            ));
+            .with_runtime_env(Arc::clone(&query_runtime_env));
 
         #[cfg(feature = "duckdb")]
         {
@@ -832,6 +878,7 @@ impl DataFusionBuilder {
             cpu_runtime: OnceLock::new(),
             refresh_runtime: OnceLock::new(),
             compaction_runtime: OnceLock::new(),
+            compaction_runtime_env,
             io_runtime: self.io_runtime,
             metrics: self.metrics,
             resource_monitor: self.resource_monitor,
@@ -1199,6 +1246,54 @@ fn runtime_env_with_effective_memory_limit(
         Ok(runtime_env) => runtime_env,
         Err(e) => {
             unreachable!("Tests ensure this should never fail: {e}");
+        }
+    }
+}
+
+/// Build a dedicated [`RuntimeEnv`] for background Cayenne compaction.
+///
+/// Sizes a separate [`GreedyMemoryPool`] to `compaction_memory_bytes` (carved
+/// from the query memory limit) wrapped in a [`TrackConsumersPool`] for
+/// accounting, while sharing the query environment's object-store registry so
+/// compaction reads and writes the same stores. The query and compaction pools
+/// together never exceed the operator's configured memory limit.
+fn build_compaction_runtime_env(
+    compaction_memory_bytes: u64,
+    query_runtime_env: &Arc<RuntimeEnv>,
+    temp_directory: Option<String>,
+) -> Arc<RuntimeEnv> {
+    let disk_manager_builder = if let Some(directory) = temp_directory {
+        let mode = DiskManagerMode::Directories(vec![directory.into()]);
+        DiskManager::builder().with_mode(mode)
+    } else {
+        DiskManager::builder()
+    };
+
+    let Some(topn) = NonZeroUsize::new(5) else {
+        unreachable!("Memory pool TopN must be greater than 0");
+    };
+
+    // The runtime supports only 64-bit platforms, so casting u64 to usize will
+    // not truncate on supported targets.
+    #[expect(clippy::cast_possible_truncation)]
+    let compaction_bytes = compaction_memory_bytes as usize;
+
+    let memory_pool = Arc::new(TrackConsumersPool::new(
+        GreedyMemoryPool::new(compaction_bytes),
+        topn,
+    ));
+
+    let runtime_env_builder = RuntimeEnvBuilder::default()
+        // Share the query environment's object-store registry so the stores
+        // Cayenne registered there are visible to compaction.
+        .with_object_store_registry(Arc::clone(&query_runtime_env.object_store_registry))
+        .with_memory_pool(memory_pool)
+        .with_disk_manager_builder(disk_manager_builder);
+
+    match runtime_env_builder.build_arc() {
+        Ok(runtime_env) => runtime_env,
+        Err(e) => {
+            unreachable!("compaction RuntimeEnv build should never fail: {e}");
         }
     }
 }

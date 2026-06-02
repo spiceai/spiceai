@@ -57,6 +57,13 @@ use util::{in_tracing_context, in_tracing_context_async};
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
 const CAYENNE_FOOTER_CACHE_MB_PARAM: &str = "cayenne_footer_cache_mb";
+/// Runtime param: fraction of `runtime.query.memory_limit` carved into a
+/// dedicated Cayenne compaction memory pool when Cayenne acceleration is
+/// configured on a dataset and dedicated thread pools are enabled.
+const CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM: &str = "cayenne_compaction_memory_fraction";
+/// Default carve fraction when the param is unset: 20% of the query budget to
+/// compaction, 80% retained for queries.
+const DEFAULT_COMPACTION_MEMORY_FRACTION: f64 = 0.2;
 
 pub struct RuntimeBuilder {
     app: Option<Arc<app::App>>,
@@ -256,6 +263,37 @@ impl RuntimeBuilder {
         let cayenne_optimizer_rules =
             parse_cayenne_optimizer_rules(&spicepod_rt.params, cayenne_filter_propagation_enabled);
 
+        // Carve a dedicated compaction memory pool only when Cayenne acceleration
+        // is configured (and enabled) on a dataset AND dedicated thread pools are
+        // enabled. This keeps non-Cayenne deployments at full query budget and
+        // matches the dedicated compaction runtime's "create only if Cayenne is
+        // enabled" lifecycle — the carved env is the signal spiced uses to bring
+        // up the compaction worker threads.
+        let cayenne_configured = self.app.as_ref().is_some_and(|app| {
+            app.datasets.iter().any(|dataset| {
+                dataset.acceleration.as_ref().is_some_and(|accel| {
+                    accel.enabled
+                        && accel
+                            .engine
+                            .as_deref()
+                            .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
+                })
+            })
+        });
+        let dedicated_thread_pools_enabled = !matches!(
+            spicepod_rt
+                .params
+                .get("dedicated_thread_pool")
+                .map(String::as_str),
+            Some("disabled")
+        );
+        let compaction_memory_fraction = (cayenne_configured && dedicated_thread_pools_enabled)
+            .then(|| {
+                parse_f64_runtime_param(&spicepod_rt.params, CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM)
+                    .unwrap_or(DEFAULT_COMPACTION_MEMORY_FRACTION)
+                    .clamp(0.05, 0.9)
+            });
+
         #[cfg(not(windows))]
         if cayenne_footer_cache_mb.is_some() {
             self.accelerator_engine_registry
@@ -430,6 +468,7 @@ impl RuntimeBuilder {
         .cayenne_sort_merge_min_rows(cayenne_sort_merge_min_rows)
         .cayenne_sort_merge_memory_pool_fraction(cayenne_sort_merge_memory_pool_fraction)
         .cayenne_footer_cache_mb(cayenne_footer_cache_mb)
+        .compaction_memory_fraction(compaction_memory_fraction)
         .cayenne_optimizer_rules(cayenne_optimizer_rules);
 
         if let Some(DistributedNode::Scheduler {

@@ -99,6 +99,7 @@ use runtime_acceleration::snapshot::AccelerationLayout;
     not(windows)
 ))]
 use runtime_acceleration::snapshot::SnapshotManager;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::{
     query_engine::Error as QueryEngineError, schema_provider::SpiceSchemaProvider,
@@ -719,6 +720,11 @@ pub struct DataFusion {
     // merge + full snapshot rewrite). Isolated from the query and refresh runtimes so the
     // CPU-heavy rewrite can't steal worker threads from queries or CDC ingest.
     compaction_runtime: OnceLock<ManagedTokioRuntime>,
+    // Dedicated DataFusion environment for compaction whose memory pool is a separate
+    // budget carved from the query memory limit (sized in the builder). `Some` only when
+    // Cayenne acceleration is configured and dedicated thread pools are enabled; compaction
+    // executes against it so its memory is accounted separately and cannot starve queries.
+    compaction_runtime_env: Option<Arc<RuntimeEnv>>,
     pub(crate) io_runtime: Handle,
     metrics: Option<Metrics>,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
@@ -1356,9 +1362,14 @@ impl DataFusion {
             );
             return;
         }
-        // Inject only after we have taken ownership, so Cayenne never references
-        // a runtime that was dropped because its `OnceLock` set lost a race.
+        // Inject the dedicated runtime handle and the carved compaction memory
+        // environment into the Cayenne accelerator crate, so background and
+        // post-write compaction run isolated from queries and CDC on both CPU
+        // (this runtime's threads) and memory (the carved pool).
         cayenne::set_compaction_runtime_handle(tokio_handle);
+        if let Some(env) = &self.compaction_runtime_env {
+            cayenne::set_compaction_runtime_env(Arc::clone(env));
+        }
     }
 
     /// Returns the dedicated compaction runtime, if one has been set.
@@ -1369,39 +1380,11 @@ impl DataFusion {
             .map(ManagedTokioRuntime::handle)
     }
 
-    /// Lazily create + inject the dedicated compaction runtime for an engine,
-    /// but only when it is Cayenne — the only engine with background compaction.
-    ///
-    /// This is how the compaction runtime comes to exist: it is created on first
-    /// registration of a Cayenne-accelerated dataset, so deployments without any
-    /// Cayenne acceleration never spin up its worker threads.
-    pub(crate) fn ensure_compaction_runtime_for_engine(&self, engine: Engine) {
-        if matches!(engine.to_unpartitioned(), Engine::Cayenne) {
-            self.ensure_compaction_runtime();
-        }
-    }
-
-    /// Create + inject the dedicated compaction runtime if it does not yet exist.
-    ///
-    /// No-op when dedicated thread pools are disabled (`cpu_runtime` unset — the
-    /// operator opted out via `dedicated_thread_pool=disabled`, so compaction
-    /// uses the ambient runtime like the other pools) or when it already exists.
-    /// Created with low thread priority and a dedicated worker name so it soaks
-    /// up spare cores without competing with queries or CDC ingest.
-    fn ensure_compaction_runtime(&self) {
-        if self.cpu_runtime.get().is_none() || self.compaction_runtime.get().is_some() {
-            return;
-        }
-        match ManagedTokioRuntime::builder()
-            .with_low_priority()
-            .with_thread_name("compaction-worker")
-            .build()
-        {
-            Ok(runtime) => self.set_compaction_runtime(runtime),
-            Err(e) => {
-                tracing::error!("Failed to create the dedicated compaction runtime: {e}");
-            }
-        }
+    /// Returns the dedicated compaction memory environment, if one was carved
+    /// (Cayenne acceleration configured + dedicated thread pools enabled).
+    #[must_use]
+    pub fn compaction_runtime_env(&self) -> Option<&Arc<RuntimeEnv>> {
+        self.compaction_runtime_env.as_ref()
     }
 
     async fn get_table_provider(
@@ -2167,10 +2150,6 @@ impl DataFusion {
         } else {
             Arc::clone(&refresh_schema)
         };
-
-        // Bring up the dedicated compaction runtime before creating a Cayenne
-        // table, so its first compaction pass lands on the isolated runtime.
-        self.ensure_compaction_runtime_for_engine(acceleration_settings.engine);
 
         let accelerated_table_provider = self
             .accelerator_engine_registry
@@ -3258,8 +3237,6 @@ impl DataFusion {
             &table.to_string(),
         )?;
 
-        self.ensure_compaction_runtime_for_engine(acceleration.engine);
-
         let accelerated_table_provider = self
             .accelerator_engine_registry()
             .create_accelerator_table(
@@ -4248,10 +4225,6 @@ async fn build_snapshot_refresh_state(
         .with_snapshots_creation_policy(acceleration_settings.snapshots_creation_policy)
         .with_checkpointer_factory(checkpoint_factory);
     let manager = Arc::new(manager);
-
-    // Snapshot-reload datasets can reach Cayenne table creation without going
-    // through the standard dataset path, so ensure the compaction runtime here too.
-    df.ensure_compaction_runtime_for_engine(acceleration_settings.engine);
 
     // 5. clone everything the reload factory needs into 'static state.
     let registry = Arc::clone(&df.accelerator_engine_registry);
