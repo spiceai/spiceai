@@ -19,8 +19,14 @@ use spice_cloud_client::types::UpdateChannel;
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum SpiceCompute {
-    Cloud,
+    Scp,
     Local,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum StorageCompute {
+    Local,
+    Ec2,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -30,15 +36,15 @@ pub enum AccelerationEngine {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
-pub enum FederatedStorage {
+pub enum Storage {
     Cayenne,
     #[value(name = "postgres-wal")]
     PostgresWAL,
     #[value(name = "postgres-debezium")]
     PostgresDebezium,
-    #[value(name = "dynamodb")]
-    DynamoDB,
-    #[value(name = "mongodb")]
+    #[value(name = "dynamodb-streams")]
+    DynamoDBStreams,
+    #[value(name = "mongodb-changes-stream")]
     MongoDB,
 }
 
@@ -179,7 +185,12 @@ pub struct StdioArgs {
 
     /// Federated storage: `cayenne` (default), `postgres`, `debezium`, or `dynamodb`.
     #[arg(long, env = "SPIDAPTER_STORAGE", default_value = "cayenne")]
-    pub storage: FederatedStorage,
+    pub storage: Storage,
+
+    /// Where the storage backend runs: `local` (default) or `ec2` (provision an EC2 instance).
+    /// When set to `ec2`, `--ec2-subnet-id` and `--ec2-security-group-id` are required.
+    #[arg(long, env = "SPIDAPTER_STORAGE_COMPUTE", default_value = "local")]
+    pub storage_compute: StorageCompute,
 
     /// `PostgreSQL` host for WAL CDC mode. When set, spidapter writes via the `PostgreSQL`
     /// ADBC driver and configures Spice to read via WAL CDC.
@@ -206,14 +217,18 @@ pub struct StdioArgs {
     #[arg(long, env = "SPICE_ACCELERATION", default_value = "cayenne")]
     pub acceleration: AccelerationEngine,
 
-    /// EC2 subnet ID for provisioning a `PostgreSQL` instance. When set together with
-    /// `EC2_SECURITY_GROUP_ID`, spidapter launches an EC2 instance instead of using
-    /// an existing `PostgreSQL` host.
-    #[arg(long, env = "EC2_SUBNET_ID")]
+    /// EC2 subnet ID for provisioning a storage backend instance.
+    /// Required when `--storage-compute ec2` is set.
+    #[arg(long, env = "EC2_SUBNET_ID", required_if_eq("storage_compute", "ec2"))]
     pub ec2_subnet_id: Option<String>,
 
-    /// EC2 security group ID for the provisioned `PostgreSQL` instance.
-    #[arg(long, env = "EC2_SECURITY_GROUP_ID")]
+    /// EC2 security group ID for the provisioned storage backend instance.
+    /// Required when `--storage-compute ec2` is set.
+    #[arg(
+        long,
+        env = "EC2_SECURITY_GROUP_ID",
+        required_if_eq("storage_compute", "ec2")
+    )]
     pub ec2_security_group_id: Option<String>,
 
     /// AMI ID for the EC2 `PostgreSQL` instance (Ubuntu 22.04 recommended).
@@ -238,13 +253,6 @@ pub struct StdioArgs {
     /// Name or path of the spiced binary to spawn (local backend only).
     #[arg(long, default_value = "spiced")]
     pub spiced_binary: String,
-
-    /// Set `auto_load_complete: true` on all dataset params in the generated spicepod.
-    /// This signals to the runtime that the initial data load is managed externally
-    /// (e.g. via Debezium CDC or `DynamoDB` scan) and the dataset should not wait for
-    /// an internal refresh to complete before marking itself ready.
-    #[arg(long, default_value_t = false)]
-    pub auto_load_complete: bool,
 
     /// `MongoDB` URI (local mode). e.g. <mongodb://localhost:27017/spicebench>
     #[arg(long, env = "MONGODB_URI")]

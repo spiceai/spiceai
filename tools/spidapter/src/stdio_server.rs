@@ -33,7 +33,7 @@ use tokio::process::Child;
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::args::{AccelerationEngine, DeploymentMode, FederatedStorage, SpiceCompute, StdioArgs};
+use crate::args::{AccelerationEngine, DeploymentMode, SpiceCompute, StdioArgs, Storage};
 use crate::commands;
 
 #[path = "sources/mod.rs"]
@@ -421,8 +421,8 @@ impl Handler for SpidapterHandler {
 
         // Build the FederatedStorageConfig (same logic as setup()).
         let storage = match self.args.storage {
-            FederatedStorage::Cayenne => FederatedStorageConfig::Cayenne,
-            FederatedStorage::PostgresWAL => {
+            Storage::Cayenne => FederatedStorageConfig::Cayenne,
+            Storage::PostgresWAL => {
                 let run_id_str = run_id.to_string();
                 let short_id = run_id_str.split('-').next().unwrap_or_default();
 
@@ -465,7 +465,7 @@ impl Handler for SpidapterHandler {
                     acceleration: self.args.acceleration,
                 }
             }
-            FederatedStorage::PostgresDebezium => {
+            Storage::PostgresDebezium => {
                 let run_id_str = run_id.to_string();
                 let short_id = run_id_str.split('-').next().unwrap_or_default();
 
@@ -546,7 +546,7 @@ impl Handler for SpidapterHandler {
                     acceleration: self.args.acceleration,
                 }
             }
-            FederatedStorage::DynamoDB => {
+            Storage::DynamoDBStreams => {
                 let region = self
                     .args
                     .aws_region
@@ -561,7 +561,7 @@ impl Handler for SpidapterHandler {
                     acceleration: self.args.acceleration,
                 }
             }
-            FederatedStorage::MongoDB => {
+            Storage::MongoDB => {
                 let run_id_str = run_id.to_string();
                 let short_id = run_id_str.split('-').next().unwrap_or_default();
 
@@ -647,7 +647,7 @@ impl Handler for SpidapterHandler {
         {
             let deployment_mode = setup_config.storage.deployment_mode();
             let provision_result = match self.args.compute {
-                SpiceCompute::Cloud => {
+                SpiceCompute::Scp => {
                     provision_scp_app(
                         run_id,
                         &self.args,
@@ -751,7 +751,7 @@ impl Handler for SpidapterHandler {
 
             let deployment_mode = setup_config.storage.deployment_mode();
             let provision_result = match self.args.compute {
-                SpiceCompute::Cloud => {
+                SpiceCompute::Scp => {
                     provision_scp_app(
                         run_id,
                         &self.args,
@@ -1378,7 +1378,6 @@ async fn generate_initial_spicepod(
                 datasets,
                 prefix,
                 acceleration_engine_str(*acceleration),
-                args.auto_load_complete,
             ),
             FederatedStorageConfig::PostgresDebezium {
                 pg,
@@ -1391,14 +1390,12 @@ async fn generate_initial_spicepod(
                 pg,
                 acceleration_engine_str(*acceleration),
                 datasets,
-                args.auto_load_complete,
             ),
             FederatedStorageConfig::MongoDB { uri, acceleration } => generate_mongodb_spicepod(
                 run_id,
                 uri,
                 datasets,
                 acceleration_engine_str(*acceleration),
-                args.auto_load_complete,
             ),
         }
     };
@@ -1462,7 +1459,7 @@ mod tests {
             channel: None,
             image_tag: None,
             api_key: None,
-            compute: SpiceCompute::Cloud,
+            compute: SpiceCompute::Scp,
             flight_url: None,
             app_memory_limit: None,
             app_cpu_limit: None,
@@ -1483,13 +1480,14 @@ mod tests {
             ephemeral_storage_limit_gb: None,
             organization_tag: None,
             query_memory_limit: None,
-            storage: FederatedStorage::Cayenne,
+            storage: Storage::Cayenne,
             pg_host: None,
             pg_port: 5432,
             pg_user: None,
             pg_password: String::new(),
             pg_database: None,
             acceleration: AccelerationEngine::Cayenne,
+            storage_compute: crate::args::StorageCompute::Local,
             ec2_subnet_id: None,
             ec2_security_group_id: None,
             ec2_ami_id: None,
@@ -1497,7 +1495,6 @@ mod tests {
             ec2_associate_public_ip: false,
             ec2_iam_instance_profile: None,
             spiced_binary: "spiced".to_string(),
-            auto_load_complete: false,
             mongodb_uri: None,
         }
     }
@@ -1518,7 +1515,7 @@ mod tests {
         use clap::ValueEnum;
         assert!(matches!(
             SpiceCompute::from_str("cloud", true),
-            Ok(SpiceCompute::Cloud)
+            Ok(SpiceCompute::Scp)
         ));
     }
 

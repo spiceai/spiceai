@@ -41,9 +41,9 @@ pub(crate) struct Ec2PostgresInstance {
     pub(crate) region: String,
 }
 
-/// Returns true when EC2 provisioning mode is requested (subnet + security group both set).
+/// Returns true when EC2 provisioning mode is requested.
 pub(crate) fn is_ec2_mode(args: &StdioArgs) -> bool {
-    args.ec2_subnet_id.is_some() && args.ec2_security_group_id.is_some()
+    args.storage_compute == crate::args::StorageCompute::Ec2
 }
 
 /// Launch an EC2 instance, install `PostgreSQL`, and wait until it accepts connections.

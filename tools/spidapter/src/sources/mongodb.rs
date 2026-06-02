@@ -33,7 +33,6 @@ pub(crate) fn generate_mongodb_spicepod(
     uri: &str,
     datasets: &HashMap<String, DatasetConfig>,
     _acceleration_engine: &str,
-    _auto_load_complete: bool,
 ) -> SpicepodDefinition {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();

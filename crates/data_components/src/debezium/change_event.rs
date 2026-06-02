@@ -141,8 +141,6 @@ pub struct Source {
     pub ts_ms: i64,
     pub snapshot: String,
     pub db: String,
-    // MongoDB Debezium connector uses `collection`; relational connectors use `table`.
-    #[serde(default, alias = "collection")]
     pub table: String,
 }
 

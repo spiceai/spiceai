@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::args::{AccelerationEngine, FederatedStorage, LocalSpicedArgs, SpiceCompute, StdioArgs};
+use crate::args::{AccelerationEngine, LocalSpicedArgs, SpiceCompute, StdioArgs, Storage};
 use crate::stdio_server;
 
 /// Construct a [`StdioArgs`] pinned to the local backend from the minimal
@@ -26,7 +26,7 @@ fn to_stdio_args(args: &LocalSpicedArgs) -> StdioArgs {
     StdioArgs {
         verbose: args.verbose,
         compute: SpiceCompute::Local,
-        storage: FederatedStorage::Cayenne,
+        storage: Storage::Cayenne,
         acceleration: AccelerationEngine::Cayenne,
         ready_wait: args.ready_wait,
         aws_region: args.aws_region.clone(),
@@ -59,6 +59,7 @@ fn to_stdio_args(args: &LocalSpicedArgs) -> StdioArgs {
         pg_user: None,
         pg_password: String::new(),
         pg_database: None,
+        storage_compute: crate::args::StorageCompute::Local,
         // EC2 provisioning is SCP-only
         ec2_subnet_id: None,
         ec2_security_group_id: None,
@@ -67,7 +68,6 @@ fn to_stdio_args(args: &LocalSpicedArgs) -> StdioArgs {
         ec2_associate_public_ip: false,
         ec2_iam_instance_profile: None,
         spiced_binary: "spiced".to_string(),
-        auto_load_complete: false,
         mongodb_uri: None,
     }
 }
