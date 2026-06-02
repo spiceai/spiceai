@@ -658,6 +658,11 @@ pub async fn run(args: Args) -> Result<()> {
                 .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
 
             rt.datafusion().set_refresh_runtime(refresh_runtime);
+
+            // The dedicated compaction runtime is created lazily, on first
+            // registration of a Cayenne-accelerated dataset (see
+            // `DataFusion::ensure_compaction_runtime_for_engine`), so deployments
+            // without Cayenne never spin up its worker threads.
         }
         Some("disabled") => {
             tracing::info!(

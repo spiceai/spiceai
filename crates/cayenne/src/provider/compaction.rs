@@ -35,10 +35,59 @@ limitations under the License.
 //! periodically invokes the runner. The task is `Semaphore`-gated so a fleet of
 //! tables can't overwhelm the writer pool.
 
-use std::sync::{Arc, Weak};
+use std::future::Future;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
+use tokio::runtime::Handle;
 use tokio::sync::{Notify, Semaphore};
+use tokio::task::JoinHandle;
+
+/// Process-wide handle to the dedicated compaction runtime, injected once at
+/// startup by the binary (see `spiced`'s runtime setup). All Cayenne tables in
+/// the process share it.
+///
+/// Compaction — both the size-tiered protected-snapshot merge and the full
+/// snapshot rewrite — is CPU-heavy and runs in the background. Isolating it on
+/// its own runtime keeps it off the query (compute) and CDC (refresh) runtimes
+/// so a rewrite can't steal worker threads from latency-sensitive work. The
+/// runtime is created with low thread priority, so compaction soaks up spare
+/// cores without starving queries or ingest.
+///
+/// `OnceLock` because there is exactly one such runtime per process and it is
+/// set before any table is created. When unset — unit tests, embedders that
+/// don't wire it up, or `dedicated_thread_pool=disabled` — compaction falls
+/// back to [`tokio::spawn`] on the ambient runtime, preserving prior behavior.
+static COMPACTION_RUNTIME: OnceLock<Handle> = OnceLock::new();
+
+/// Inject the dedicated compaction runtime handle. Called once at process
+/// startup; subsequent calls are ignored (the first handle wins).
+pub fn set_compaction_runtime_handle(handle: Handle) {
+    if COMPACTION_RUNTIME.set(handle).is_err() {
+        tracing::debug!(
+            target: "cayenne::compaction",
+            "Compaction runtime handle already set; ignoring"
+        );
+    }
+}
+
+/// Spawn a compaction task onto the dedicated compaction runtime if one has
+/// been injected, otherwise onto the ambient runtime via [`tokio::spawn`].
+///
+/// Returns the [`JoinHandle`] so callers can abort the task (e.g. the
+/// background compactor aborts on drop). [`JoinHandle::abort`] works across
+/// runtimes, so storing and aborting the handle is valid regardless of which
+/// runtime the task landed on.
+pub(crate) fn spawn_compaction<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match COMPACTION_RUNTIME.get() {
+        Some(handle) => handle.spawn(future),
+        None => tokio::spawn(future),
+    }
+}
 
 /// Tier thresholds derived from `target_vortex_file_size_mb`.
 ///
@@ -265,7 +314,10 @@ impl BackgroundCompactor {
         let shutdown = Arc::new(Notify::new());
         let shutdown_task = Arc::clone(&shutdown);
 
-        let handle = tokio::spawn(async move {
+        // Spawn onto the dedicated compaction runtime (low priority, isolated
+        // from the query and refresh runtimes) when one has been injected;
+        // otherwise fall back to the ambient runtime.
+        let handle = spawn_compaction(async move {
             loop {
                 tokio::select! {
                     () = tokio::time::sleep(interval) => {}

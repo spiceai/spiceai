@@ -6657,7 +6657,10 @@ impl CayenneTableProvider {
         }
 
         let table = self.clone_for_write();
-        tokio::spawn(async move {
+        // Run the compaction pass (size-tiered protected-snapshot merge and/or
+        // full snapshot rewrite) on the dedicated compaction runtime, isolated
+        // from the query (compute) and CDC (refresh) runtimes.
+        super::compaction::spawn_compaction(async move {
             tokio::task::yield_now().await;
             let result = super::compaction::CompactionRunner::run_compaction_trigger(&table).await;
             table

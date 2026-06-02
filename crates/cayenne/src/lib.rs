@@ -89,5 +89,6 @@ pub use provider::{
     CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneTableProvider,
     CayenneTableProviderBuilder, PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry,
     PreparedOverwrite, PreparedStagedAppend, TimeRetentionFilterBuilder,
+    set_compaction_runtime_handle,
 };
 pub use schema::transform_schema_for_vortex;

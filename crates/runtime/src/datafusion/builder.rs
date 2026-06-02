@@ -831,6 +831,7 @@ impl DataFusionBuilder {
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
             refresh_runtime: OnceLock::new(),
+            compaction_runtime: OnceLock::new(),
             io_runtime: self.io_runtime,
             metrics: self.metrics,
             resource_monitor: self.resource_monitor,
