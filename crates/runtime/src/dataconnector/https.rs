@@ -2594,7 +2594,7 @@ mod tests {
         // User explicitly declares _fetched_at.
         dataset.columns = vec![
             Column::new("id"),
-            Column::new("fetched_at"),
+            Column::new("_fetched_at"),
             column_with_marker("details", Value::String("*".to_string())),
         ];
         let nesting = parse_http_json_nesting(&dataset)
