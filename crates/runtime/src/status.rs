@@ -367,6 +367,16 @@ impl RuntimeStatus {
 
     /// Gets or creates a notifier for a component, returning a receiver to watch for status changes.
     fn get_or_create_notifier(&self, component_name: &str) -> watch::Receiver<ComponentStatus> {
+        // Read the current status BEFORE acquiring `notifiers.write()` so this
+        // path locks `statuses` then `notifiers` — the SAME order as
+        // `update_component_status`. Fetching the status while already holding
+        // the `notifiers` write lock is an ABBA lock-order inversion that
+        // deadlocks under concurrent dataset startup (observed wedging the
+        // runtime at scale when many datasets register + wait-for-ready at once).
+        let current = self
+            .get_component_status(component_name)
+            .unwrap_or(ComponentStatus::Initializing);
+
         let mut notifiers = self
             .notifiers
             .write()
@@ -375,9 +385,6 @@ impl RuntimeStatus {
         match notifiers.entry(component_name.to_string()) {
             Entry::Occupied(e) => e.get().subscribe(),
             Entry::Vacant(e) => {
-                let current = self
-                    .get_component_status(component_name)
-                    .unwrap_or(ComponentStatus::Initializing);
                 let (tx, rx) = watch::channel(current);
                 e.insert(tx);
                 rx
