@@ -1108,8 +1108,8 @@ impl RefreshTask {
             }
             if let Some(dedup) = current
                 .as_any()
-                .downcast_ref::<crate::dataaccelerator::upsert_dedup::UpsertDedupTableProvider>()
-            {
+                .downcast_ref::<crate::dataaccelerator::upsert_dedup::UpsertDedupTableProvider>(
+            ) {
                 current = dedup.inner();
                 continue;
             }
