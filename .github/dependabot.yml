@@ -21,7 +21,19 @@ updates:
           - '*'
 
   - package-ecosystem: 'github-actions' # See documentation for possible values
-    directory: '/' # Location of package manifests
+    # Note: directory: '/' covers .github/workflows/ (and root action.yml per docs), but composite
+    # actions in .github/actions/*/action.yml require explicit directories entries.
+    # See https://github.com/dependabot/dependabot-core/issues/6704
+    directories:
+      - '/'
+      - '/.github/actions/check-code-changes'
+      - '/.github/actions/setup-adbc-bigquery'
+      - '/.github/actions/setup-nextest'
+      - '/.github/actions/build-testoperator'
+      - '/.github/actions/build-spicepod-validator'
+      - '/.github/actions/build-spidapter'
+      - '/.github/actions/build-spiced'
+      - '/.github/actions/aws-authorize'
     schedule:
       interval: 'weekly'
     labels:
