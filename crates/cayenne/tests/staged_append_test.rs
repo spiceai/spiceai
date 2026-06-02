@@ -624,7 +624,7 @@ async fn test_prepared_apply_under_barrier_waits_for_write_lock_impl(
     let lock_holder = begin_staged_append_with_rows(&table, &[(99, "Held")]).await?;
 
     let result =
-        tokio::time::timeout(Duration::from_millis(100), prepared.apply_under_barrier()).await;
+        tokio::time::timeout(Duration::from_millis(500), prepared.apply_under_barrier()).await;
     assert!(
         result.is_err(),
         "current-snapshot apply_under_barrier must wait for write_lock before moving files"
