@@ -394,13 +394,10 @@ impl RuntimeStatus {
         match statuses.entry(component_name.to_string()) {
             Entry::Occupied(mut e) => {
                 let state = e.get_mut();
-                match &state.notifier {
-                    Some(tx) => tx.subscribe(),
-                    None => {
-                        let (tx, rx) = watch::channel(state.status.clone());
-                        state.notifier = Some(tx);
-                        rx
-                    }
+                if let Some(tx) = &state.notifier { tx.subscribe() } else {
+                    let (tx, rx) = watch::channel(state.status.clone());
+                    state.notifier = Some(tx);
+                    rx
                 }
             }
             Entry::Vacant(e) => {
