@@ -495,34 +495,11 @@ pub async fn registered_connector_names() -> Vec<String> {
 }
 
 /// Returns the registered connector name whose Levenshtein distance to `name`
-/// is lowest (bounded so short typos only match very close names).
+/// is lowest (bounded so short typos only match very close names). Routes
+/// through [`util::levenshtein::closest_match`] so the "did you mean" UX is
+/// consistent with runtime tunables and component-level parameters.
 pub async fn suggest_connector(name: &str) -> Option<String> {
-    closest_name(name, &registered_connector_names().await)
-}
-
-/// Pure helper used by [`suggest_connector`]. Kept separate from the registry
-/// lookup so its scoring + threshold can be unit-tested without spinning up
-/// the async registry.
-pub(crate) fn closest_name<S: AsRef<str>>(typo: &str, candidates: &[S]) -> Option<String> {
-    let input = typo.to_ascii_lowercase();
-    let mut best: Option<(usize, usize)> = None;
-    for (i, candidate) in candidates.iter().enumerate() {
-        let d = util::levenshtein::distance(&input, &candidate.as_ref().to_ascii_lowercase());
-        if best.as_ref().is_none_or(|(_, b)| d < *b) {
-            best = Some((i, d));
-        }
-    }
-    let (i, distance) = best?;
-    let candidate = candidates[i].as_ref();
-    // Bound: allow at most one edit per 3 chars of the longer string. Prevents a
-    // wildly different name ("kafka" vs. "postgres") from being suggested while
-    // still catching connector-name typos like "postgress" → "postgres" (d=1).
-    let max_allowed = (candidate.len().max(typo.len()) / 3).max(1);
-    if distance <= max_allowed {
-        Some(candidate.to_string())
-    } else {
-        None
-    }
+    util::levenshtein::closest_match(name, &registered_connector_names().await)
 }
 
 pub async fn unregister_all() {
@@ -871,62 +848,11 @@ mod tests {
 
     use super::*;
 
-    fn names(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| (*s).to_string()).collect()
-    }
+    // The closest-match algorithm is exercised in
+    // crates/util/src/levenshtein.rs (`test_closest_match_*`). `suggest_connector`
+    // / `suggest_catalog_connector` just plumb the registry's name list through
+    // it, so no per-call wrapper test is needed here.
 
-    #[test]
-    fn closest_name_matches_one_char_typo() {
-        let candidates = names(&["postgres", "mysql", "snowflake", "kafka"]);
-        assert_eq!(
-            closest_name("postgress", &candidates),
-            Some("postgres".to_string())
-        );
-    }
-
-    #[test]
-    fn closest_name_matches_case_insensitive() {
-        let candidates = names(&["postgres", "mysql"]);
-        assert_eq!(
-            closest_name("MYSQL", &candidates),
-            Some("mysql".to_string())
-        );
-    }
-
-    #[test]
-    fn closest_name_distant_returns_none() {
-        let candidates = names(&["postgres", "mysql", "kafka"]);
-        // "xyz" has no close match.
-        assert_eq!(closest_name("xyz", &candidates), None);
-    }
-
-    #[test]
-    fn closest_name_empty_candidates_returns_none() {
-        let candidates: Vec<String> = Vec::new();
-        assert_eq!(closest_name("postgres", &candidates), None);
-    }
-
-    #[test]
-    fn closest_name_accepts_static_str_slice() {
-        // Verifies the AsRef<str>-generic signature so callers can pass
-        // either &[String] or &[&'static str] allowlists.
-        const CANDIDATES: &[&str] = &["postgres", "mysql", "kafka"];
-        assert_eq!(
-            closest_name("postgress", CANDIDATES),
-            Some("postgres".to_string())
-        );
-    }
-
-    #[test]
-    fn closest_name_short_typo_short_threshold() {
-        // Short names get a max_allowed floor of 1 — a single-char off name matches,
-        // but two chars off does not (protects against wildly different suggestions).
-        let candidates = names(&["pg", "my"]);
-        // "po" vs "pg": distance 1, allowed. vs "my": distance 2, not allowed.
-        assert_eq!(closest_name("po", &candidates), Some("pg".to_string()));
-        // "zz" vs both is distance 2 — no match.
-        assert_eq!(closest_name("zz", &candidates), None);
-    }
     use crate::component::dataset::UnsupportedTypeAction as DatasetUnsupportedTypeAction;
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataconnector::parameters::ConnectorParamsBuilder;

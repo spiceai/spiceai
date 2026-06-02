@@ -750,7 +750,7 @@ fn warn_on_unknown_runtime_params(
         if !key.starts_with(prefix) || known.contains(&key.as_str()) {
             continue;
         }
-        if let Some(suggestion) = crate::dataconnector::closest_name(key, known) {
+        if let Some(suggestion) = util::levenshtein::closest_match(key, known) {
             tracing::warn!(
                 "runtime.params.{key} is not a recognized {family_label} tunable; did you mean '{suggestion}'? Ignoring."
             );
@@ -998,11 +998,11 @@ mod test {
 
     #[test]
     fn known_cayenne_runtime_params_suggests_typo_corrections() {
-        // Pins the cayenne allowlist as the input to the shared closest-name
+        // Pins the cayenne allowlist as the input to the shared closest-match
         // helper so typos like `cayenne_footer_cach_mb` resolve to the
         // intended `cayenne_footer_cache_mb`.
         assert_eq!(
-            crate::dataconnector::closest_name(
+            util::levenshtein::closest_match(
                 "cayenne_footer_cach_mb",
                 KNOWN_CAYENNE_RUNTIME_PARAMS,
             )
@@ -1010,7 +1010,7 @@ mod test {
             Some("cayenne_footer_cache_mb"),
         );
         assert_eq!(
-            crate::dataconnector::closest_name(
+            util::levenshtein::closest_match(
                 "cayenne_completely_made_up",
                 KNOWN_CAYENNE_RUNTIME_PARAMS,
             ),

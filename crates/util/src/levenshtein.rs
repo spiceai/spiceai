@@ -90,6 +90,37 @@ pub fn similarity(a: &str, b: &str) -> f64 {
     1.0 - (dist as f64 / max_len as f64)
 }
 
+/// Returns the candidate in `candidates` closest to `typo` by case-insensitive
+/// Levenshtein distance, if the distance is small enough to be a useful
+/// "did you mean" hint.
+///
+/// Bound: at most one edit per 3 chars of the longer string (minimum 1).
+/// Prevents a wildly different name from being suggested while still catching
+/// short typos like `postgress` → `postgres` (d=1).
+///
+/// Accepts `&[String]` or `&[&str]` — pass the candidate set directly without
+/// converting. Used for runtime tunable typos, connector-name typos, and
+/// component-level parameter typos to keep the "did you mean" UX consistent.
+#[must_use]
+pub fn closest_match<S: AsRef<str>>(typo: &str, candidates: &[S]) -> Option<String> {
+    let input = typo.to_ascii_lowercase();
+    let mut best: Option<(usize, usize)> = None;
+    for (i, candidate) in candidates.iter().enumerate() {
+        let d = distance(&input, &candidate.as_ref().to_ascii_lowercase());
+        if best.as_ref().is_none_or(|(_, b)| d < *b) {
+            best = Some((i, d));
+        }
+    }
+    let (i, d) = best?;
+    let candidate = candidates[i].as_ref();
+    let max_allowed = (candidate.len().max(typo.len()) / 3).max(1);
+    if d <= max_allowed {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,6 +378,59 @@ mod tests {
         assert!(
             (sim - expected).abs() < f64::EPSILON,
             "Expected {expected}, got {sim}"
+        );
+    }
+
+    // ==================== closest_match() tests ====================
+
+    #[test]
+    fn test_closest_match_one_char_typo() {
+        let candidates = ["postgres", "mysql", "snowflake", "kafka"];
+        assert_eq!(
+            closest_match("postgress", &candidates),
+            Some("postgres".to_string())
+        );
+    }
+
+    #[test]
+    fn test_closest_match_case_insensitive() {
+        let candidates = ["postgres", "mysql"];
+        assert_eq!(
+            closest_match("MYSQL", &candidates),
+            Some("mysql".to_string())
+        );
+    }
+
+    #[test]
+    fn test_closest_match_distant_returns_none() {
+        // "xyz" has no close match to any candidate.
+        let candidates = ["postgres", "mysql", "kafka"];
+        assert_eq!(closest_match("xyz", &candidates), None);
+    }
+
+    #[test]
+    fn test_closest_match_empty_candidates_returns_none() {
+        let candidates: [&str; 0] = [];
+        assert_eq!(closest_match("postgres", &candidates), None);
+    }
+
+    #[test]
+    fn test_closest_match_short_typo_short_threshold() {
+        // Short names get a max_allowed floor of 1 — single-char-off matches,
+        // two chars off does not (protects against wildly different suggestions).
+        let candidates = ["pg", "my"];
+        assert_eq!(closest_match("po", &candidates), Some("pg".to_string()));
+        assert_eq!(closest_match("zz", &candidates), None);
+    }
+
+    #[test]
+    fn test_closest_match_accepts_string_slice() {
+        // Confirms the AsRef<str> generic accepts &[String] in addition
+        // to &[&str], so existing Vec<String> callers don't have to convert.
+        let candidates: Vec<String> = vec!["postgres".to_string(), "mysql".to_string()];
+        assert_eq!(
+            closest_match("postgress", &candidates),
+            Some("postgres".to_string())
         );
     }
 }
