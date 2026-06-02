@@ -208,17 +208,29 @@ echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gp
 apt-get update -y
 apt-get install -y mongodb-org
 
-# Bind to all interfaces and configure replica set (required for Change Streams)
-sed -i 's/bindIp: 127.0.0.1/bindIp: 0.0.0.0/' /etc/mongod.conf
-sed -i '/^#replication:/d' /etc/mongod.conf
-printf '\nreplication:\n  replSetName: rs0\n' >> /etc/mongod.conf
+# Write a complete, known-good mongod.conf (avoids fragile sed patching of the default).
+# Phase 1: no auth — needed to init the replica set and create the user.
+cat > /etc/mongod.conf << 'MONGODCONF'
+storage:
+  dbPath: /var/lib/mongodb
+systemLog:
+  destination: file
+  logAppend: true
+  path: /var/log/mongodb/mongod.log
+net:
+  port: 27017
+  bindIp: 0.0.0.0
+processManagement:
+  timeZoneInfo: /usr/share/zoneinfo
+replication:
+  replSetName: rs0
+MONGODCONF
 
 systemctl enable mongod
 systemctl start mongod
 until mongosh --quiet --eval 'db.runCommand({{ping:1}})' >/dev/null 2>&1; do sleep 2; done
 
 # Initialise replica set with the public IP so external clients can use it.
-# $PUBLIC_IP is expanded by the shell at runtime.
 mongosh admin --eval "rs.initiate({{_id: 'rs0', members: [{{_id: 0, host: '$PUBLIC_IP:27017'}}]}})"
 until mongosh --quiet --eval 'rs.isMaster().ismaster' 2>/dev/null | grep -q true; do sleep 2; done
 
@@ -231,9 +243,32 @@ mongosh admin --eval "
   }})
 "
 
-# Enable auth and restart
-sed -i '/^#security:/d' /etc/mongod.conf
-printf '\nsecurity:\n  authorization: enabled\n' >> /etc/mongod.conf
+# Phase 2: enable auth and restart.
+# MongoDB requires a keyFile for intra-RS auth when authorization is enabled,
+# even for a single-node replica set.
+openssl rand -base64 756 > /etc/mongodb-keyfile
+chmod 400 /etc/mongodb-keyfile
+chown mongodb:mongodb /etc/mongodb-keyfile
+
+cat > /etc/mongod.conf << 'MONGODCONF'
+storage:
+  dbPath: /var/lib/mongodb
+systemLog:
+  destination: file
+  logAppend: true
+  path: /var/log/mongodb/mongod.log
+net:
+  port: 27017
+  bindIp: 0.0.0.0
+processManagement:
+  timeZoneInfo: /usr/share/zoneinfo
+replication:
+  replSetName: rs0
+security:
+  authorization: enabled
+  keyFile: /etc/mongodb-keyfile
+MONGODCONF
+
 systemctl restart mongod
 until mongosh "mongodb://$MONGO_USER:$MONGO_PASSWORD@localhost:27017/$MONGO_DB?authSource=admin&directConnection=true" \
       --quiet --eval 'db.runCommand({{ping:1}})' >/dev/null 2>&1; do sleep 2; done
