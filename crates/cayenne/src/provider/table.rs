@@ -1381,7 +1381,7 @@ pub struct CayenneTableProvider {
     /// inline trigger and the background scheduler can't both rewrite the
     /// current snapshot at the same time. Held across the *entire* trigger
     /// sequence — up to `compaction_max_levels` consecutive snapshot rewrites
-    /// per call to [`Self::maybe_compact_small_files`] — so that competing
+    /// per call to [`Self::maybe_compact_current_snapshot`] — so that competing
     /// triggers no-op via `try_lock` rather than chaining onto a backlog. The
     /// per-table write lock continues to serialize ordinary inserts
     /// independently.
@@ -6364,16 +6364,17 @@ impl CayenneTableProvider {
     /// pass is already in flight (inline or background), we skip this trigger
     /// rather than queueing more work.
     ///
-    /// **Callers are responsible for write-lock coordination.** Inline callers
-    /// (in `mutation_writer`) hold `write_lock` already, so they call this
-    /// directly. The background scheduler's [`super::compaction::CompactionRunner`]
-    /// adapter `try_lock`s `write_lock` before delegating here. Tests use the
-    /// `#[doc(hidden)] pub` exposure for direct access — no concurrent writers
-    /// in single-table test setups.
+    /// **Callers are responsible for write-lock coordination.** The scheduled
+    /// background compactor
+    /// ([`super::compaction::CompactionRunner::run_scheduled_compaction`]) acquires
+    /// the per-table `write_lock` before delegating here, so the current-snapshot
+    /// rewrite is serialized against concurrent appends/CDC applies. Tests use
+    /// the `#[doc(hidden)] pub` exposure for direct access — no concurrent
+    /// writers in single-table test setups.
     ///
     /// Returns `Ok(true)` if at least one snapshot rewrite occurred.
     #[doc(hidden)]
-    pub async fn maybe_compact_small_files(&self) -> Result<bool> {
+    pub async fn maybe_compact_current_snapshot(&self) -> Result<bool> {
         let Ok(_guard) = self.compaction_lock.try_lock() else {
             tracing::trace!(
                 table = self.table_metadata.table_name.as_str(),
@@ -6395,12 +6396,15 @@ impl CayenneTableProvider {
         Ok(total_passes > 0)
     }
 
+    /// Generic post-write compaction hook: the fast, non-blocking work to run
+    /// after a write commits. Today its only step is the lock-free
+    /// protected-snapshot subset merge ([`Self::compact_protected_snapshots_subset`]);
     pub(crate) fn schedule_post_write_compaction(&self) {
-        let cfg = self.context.compaction_picker_config();
-        let maintenance_trigger = self.protected_snapshot_maintenance_trigger();
-        if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files
-            && maintenance_trigger.is_none()
-        {
+        // Post-write lock-free protected-snapshot SUBSET compaction only.
+        // It CAS-swaps a size-tiered subset of immutable protected snapshots
+        // so it needs no `write_lock` and can run concurrently
+        let min_inputs = self.context.compaction_trigger_protected_snapshots().max(2);
+        if self.protected_snapshots.load().len() < min_inputs {
             return;
         }
 
@@ -6414,7 +6418,7 @@ impl CayenneTableProvider {
         let table = self.clone_for_write();
         tokio::spawn(async move {
             tokio::task::yield_now().await;
-            let result = super::compaction::CompactionRunner::run_compaction_trigger(&table).await;
+            let result = table.compact_protected_snapshots_subset(usize::MAX).await;
             table
                 .post_write_compaction_scheduled
                 .store(false, Ordering::Release);
@@ -6423,14 +6427,14 @@ impl CayenneTableProvider {
                 Ok(true) => {
                     tracing::debug!(
                         table = table.table_metadata.table_name.as_str(),
-                        "Post-write compaction pass completed"
+                        "Post-write protected-snapshot subset compaction completed"
                     );
                 }
                 Ok(false) => {}
                 Err(e) => {
                     tracing::warn!(
                         table = table.table_metadata.table_name.as_str(),
-                        "Post-write compaction trigger failed: {e}"
+                        "Post-write protected-snapshot subset compaction failed: {e}"
                     );
                 }
             }
@@ -10869,39 +10873,29 @@ fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
 
 #[async_trait::async_trait]
 impl super::compaction::CompactionRunner for CayenneTableProvider {
-    async fn run_compaction_trigger(&self) -> std::result::Result<bool, String> {
-        // Routes to the fast protected-snapshot subset compaction, which only
-        // rewrites immutable protected snapshots and CAS-swaps them in the
-        // catalog. It never touches the current snapshot `S0`, its pointer, or
-        // its delete files, so — unlike the current-snapshot small-file path
-        // (`maybe_compact_small_files` / `run_one_compaction_pass`) — it does
-        // NOT need the per-table `write_lock` and therefore cannot block
-        // concurrent appends/CDC applies. Serialization against other compaction
-        // passes is provided by the internal `compaction_lock` (`try_lock`
-        // inside `compact_protected_snapshots_subset`); cross-process safety by
-        // the CAS in `MetadataCatalog::swap_protected_snapshots`.
+    async fn run_scheduled_compaction(&self) -> std::result::Result<bool, String> {
+        // Scheduled (background timer) path: full current-snapshot file
+        // compaction. `maybe_compact_current_snapshot` rewrites the current
+        // snapshot `S0`, swaps its pointer, and clears its delete files, so it
+        // must run with the per-table `write_lock` held to exclude concurrent
+        // appends/CDC applies. The background scheduler holds no other locks, so
+        // acquire `write_lock` here before delegating. The internal
+        // `compaction_lock` (acquired with `try_lock` inside
+        // `maybe_compact_current_snapshot`) still serializes this against any
+        // post-write protected-snapshot subset pass.
         //
-        // Cheap lock-free early-out first: skip acquiring `compaction_lock` /
-        // `listing_fence` and building a session context unless the protected
-        // set already has enough runs to be worth merging. `protected_snapshots`
-        // is an `ArcSwap`, so `load()` is a cheap atomic read. The authoritative
-        // re-check (and size-tiering) still happens under the fence inside
-        // `compact_protected_snapshots_subset`; this guard only avoids wasted
-        // work on the common path where nothing has accumulated yet.
-        let min_inputs = self.context.compaction_trigger_protected_snapshots().max(2);
-        let protected_len = self.protected_snapshots.load().len();
-        if protected_len < min_inputs {
-            tracing::trace!(
-                target: "cayenne::compaction",
+        // Use `try_lock` so this heavyweight full-table rewrite yields to active
+        // writers: under sustained write load we skip this tick rather than
+        // stalling appends/CDC applies behind a long rewrite, and retry on the
+        // next interval.
+        let Ok(_write_guard) = self.write_lock.try_lock() else {
+            tracing::debug!(
                 table = self.table_metadata.table_name.as_str(),
-                protected_len,
-                min_inputs,
-                "Skipping protected-snapshot compaction: protected set below trigger floor",
+                "Skipping scheduled compaction: write_lock held by an active writer",
             );
             return Ok(false);
-        }
-
-        self.compact_protected_snapshots_subset(usize::MAX)
+        };
+        self.maybe_compact_current_snapshot()
             .await
             .map_err(|e| e.to_string())
     }

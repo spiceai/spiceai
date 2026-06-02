@@ -1082,7 +1082,7 @@ async fn test_writer_wal_survives_inline_compaction_impl(
 
     // While the WAL is pending, explicitly trigger compaction.
     // This may create a new snapshot and schedule old snapshot cleanup.
-    let _compacted = table.maybe_compact_small_files().await?;
+    let _compacted = table.maybe_compact_current_snapshot().await?;
 
     // Now let the writer finish (move files + remove WAL).
     // The move should target the *current* live snapshot (whatever compaction left),
@@ -1125,7 +1125,7 @@ async fn test_pending_writer_wal_survives_compaction_trigger_impl(
     // This exercises the writer + compaction interaction and ensures the
     // pre-recovery audit / move logic does not break a benign pending writer
     // when the snapshot pointer moves.
-    let _ = table.maybe_compact_small_files().await?;
+    let _ = table.maybe_compact_current_snapshot().await?;
 
     // The writer must still be able to commit successfully.
     staged.commit().await?;

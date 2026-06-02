@@ -62,8 +62,8 @@ fn aggressive_compaction_config() -> VortexConfig {
         compaction_max_levels: 3,
         compaction_max_files_per_pick: 32,
         // Disable the background scheduler so tests are deterministic — we
-        // drive compaction explicitly via maybe_compact_small_files() on the
-        // inline path or by triggering it from the test body.
+        // drive compaction explicitly via maybe_compact_current_snapshot() on
+        // the inline path or by triggering it from the test body.
         compaction_background_interval_ms: 0,
         ..VortexConfig::default()
     }
@@ -640,16 +640,16 @@ async fn compaction_handles_concurrent_compaction_triggers(
     Ok(())
 }
 
-/// Helper that calls into the `#[doc(hidden)] pub` `maybe_compact_small_files`
+/// Helper that calls into the `#[doc(hidden)] pub` `maybe_compact_current_snapshot`
 /// trigger directly. Returns true if a rewrite happened.
 ///
 /// Tests don't go through the [`cayenne::provider::compaction::CompactionRunner`]
-/// adapter the background scheduler uses, because that adapter `try_lock`s
+/// adapter the background scheduler uses, because that adapter acquires
 /// `write_lock` to serialize with appends. Single-table integration tests have
 /// no concurrent writers, so calling the trigger directly is correct.
 async fn run_compaction(table: &Arc<CayenneTableProvider>) -> bool {
     table
-        .maybe_compact_small_files()
+        .maybe_compact_current_snapshot()
         .await
         .expect("compaction must succeed in tests")
 }

@@ -230,7 +230,7 @@ pub(crate) trait CompactionRunner: Send + Sync {
     /// Run one compaction trigger. Returns `Ok(true)` if any compaction
     /// occurred. Errors are reported via the return value; the scheduler logs
     /// and continues on Err.
-    async fn run_compaction_trigger(&self) -> Result<bool, String>;
+    async fn run_scheduled_compaction(&self) -> Result<bool, String>;
 
     /// Identifier used in log messages.
     fn compaction_target_name(&self) -> &str;
@@ -239,7 +239,7 @@ pub(crate) trait CompactionRunner: Send + Sync {
 /// Per-table background compactor.
 ///
 /// Owns a tokio task that wakes every `interval`, acquires a permit from the
-/// shared semaphore, and calls `runner.run_compaction_trigger()`. Cancellation
+/// shared semaphore, and calls `runner.run_scheduled_compaction()`. Cancellation
 /// happens via [`Drop`]: dropping the `BackgroundCompactor` fires the shutdown
 /// `Notify` and aborts the task's `JoinHandle`.
 ///
@@ -284,7 +284,7 @@ impl BackgroundCompactor {
                     break;
                 };
 
-                match runner.run_compaction_trigger().await {
+                match runner.run_scheduled_compaction().await {
                     Ok(true) => {
                         tracing::debug!(
                             target: "cayenne::compaction",
@@ -513,7 +513,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CompactionRunner for CountingRunner {
-        async fn run_compaction_trigger(&self) -> Result<bool, String> {
+        async fn run_scheduled_compaction(&self) -> Result<bool, String> {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(false)
