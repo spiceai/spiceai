@@ -17,9 +17,10 @@ limitations under the License.
 //! Staging Write-Ahead Log (WAL) for crash-safe staged appends.
 //!
 //! When a Cayenne table performs a staged append, data files are first written
-//! to a `_staging/` directory and then moved to the active snapshot. The move
-//! is **not** atomic as a batch (individual renames are atomic on local FS, but
-//! the loop over files is not).
+//! to a `_staging/` directory and then moved to the target snapshot. The target
+//! can be either the active snapshot or a protected snapshot that is published
+//! later. The move is **not** atomic as a batch (individual renames are atomic
+//! on local FS, but the loop over files is not).
 //!
 //! The staging WAL bridges this gap:
 //!
@@ -48,8 +49,8 @@ limitations under the License.
 //!   where the visibility flip is a catalog pointer mutation inside a shared
 //!   [`crate::metastore::MetastoreTransaction`]. For the append lifecycle it is
 //!   a no-op.
-//! - [`PreparedStagedAppend::finish`] releases the write guard and returns the
-//!   row count.
+//! - [`PreparedStagedAppend::finish`] completes the typestate transition and
+//!   returns the row count.
 //!
 //! The legacy one-shot [`CayenneStagedAppend::commit`] is reimplemented in terms
 //! of this lifecycle and remains observably identical to the previous behavior.
@@ -173,7 +174,7 @@ impl CayenneStagedAppend {
         }
     }
 
-    /// Moves staged files into the current snapshot.
+    /// Moves staged files into the configured target snapshot.
     ///
     /// # Errors
     ///
@@ -243,8 +244,8 @@ impl CayenneStagedAppend {
 
     /// Prepare the staged append for commit.
     ///
-    /// Writes the staging WAL — a durable record of the intent to move the
-    /// already-staged files into the current snapshot directory. After this
+    /// Writes the staging WAL: a durable record of the intent to move the
+    /// already-staged files into the configured target snapshot directory. After this
     /// returns, the caller owns the lifecycle: it must either complete the
     /// commit via [`PreparedStagedAppend::apply_under_barrier`] (and then
     /// [`PreparedStagedAppend::finish`]) or [`PreparedStagedAppend::rollback`]
@@ -344,10 +345,32 @@ impl PreparedStagedAppend {
         self.row_count
     }
 
+    async fn lock_current_snapshot_for_apply(&self) -> Option<OwnedMutexGuard<()>> {
+        if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+            Some(self.table.write_lock_arc().lock_owned().await)
+        } else {
+            None
+        }
+    }
+
+    fn try_lock_current_snapshot_for_held_barrier(&self) -> Result<Option<OwnedMutexGuard<()>>> {
+        if self.target_kind != StagingWalTargetKind::CurrentSnapshot {
+            return Ok(None);
+        }
+
+        self.table.write_lock_arc().try_lock_owned().map(Some).map_err(|_| Error::Internal {
+            table: self.table.table_name().to_string(),
+            message: "Failed to acquire write_lock while applying a current-snapshot staged append under a held listing fence".to_string(),
+        })
+    }
+
     /// Apply the staged write under the caller's append-side barrier.
     ///
-    /// Performs, in order: move staged files into the current snapshot
-    /// directory; remove the staging WAL; invalidate the list-files cache.
+    /// Performs, in order: move staged files into the target snapshot
+    /// directory; remove the staging WAL; invalidate the list-files cache for
+    /// current-snapshot targets. Current-snapshot targets hold `write_lock`
+    /// while moving files so background compaction cannot interleave with the
+    /// snapshot directory mutation.
     /// The WAL is removed *before* the listing-table refresh to preserve the
     /// existing crash-safety invariant ("WAL absent ⇒ files moved
     /// successfully"); a crash between WAL removal and listing refresh leaves
@@ -363,6 +386,7 @@ impl PreparedStagedAppend {
     ///
     /// Returns an error if moving the staged files or removing the WAL fails.
     pub async fn apply_under_barrier(&self) -> Result<()> {
+        let _write_guard = self.lock_current_snapshot_for_apply().await;
         let _visibility_guard = self.table.visibility_lock_arc().lock_owned().await;
         // Hold the listing fence for the entire move + WAL removal + listing
         // swap sequence. Without this, `CayenneTableProvider::scan()` (which
@@ -396,7 +420,10 @@ impl PreparedStagedAppend {
     /// partition's `listing_fence` for write.
     ///
     /// Same observable effect as [`Self::apply_under_barrier`] but skips the
-    /// internal fence acquisition. Used by the cross-partition append
+    /// internal fence acquisition. For current-snapshot targets, this method
+    /// still requires `write_lock` to protect against background compaction.
+    /// It attempts a non-blocking acquisition because the caller already holds
+    /// the listing fence. Used by the cross-partition append
     /// coordinator (#10125 step 6), which locks fences on every participating
     /// partition (sorted to keep concurrent coordinators deadlock-free) for
     /// the duration of one barrier window, calls this method on each, and
@@ -408,6 +435,7 @@ impl PreparedStagedAppend {
     ///
     /// Returns an error if moving the staged files or removing the WAL fails.
     pub async fn apply_under_held_barrier(&self) -> Result<()> {
+        let _write_guard = self.try_lock_current_snapshot_for_held_barrier()?;
         self.table
             .move_staged_files_to_snapshot(&self.staging_snapshot_id, &self.target_snapshot_id)
             .await?;

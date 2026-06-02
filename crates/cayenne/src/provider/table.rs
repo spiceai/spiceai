@@ -379,6 +379,13 @@ pub(crate) struct PreparedOnConflictDeletionPublish {
     deleted_pk_i64: Vec<i64>,
     deleted_row_keys: Vec<Box<[u8]>>,
     position_deletions: HashMap<String, Vec<u32>>,
+    /// Count of existing rows superseded by this upsert, captured from
+    /// [`OnConflictDeletions::total_superseded`] at validation time. This is the
+    /// authoritative live-row-delta input: it must NOT be recomputed from the
+    /// fields above, because `deleted_pk_i64` and `deleted_row_keys` carry the
+    /// SAME `Int64Pk` deletions in two encodings (i64 + committed byte keys), so
+    /// summing their lengths double-counts, and neither captures `position_deletions`.
+    superseded: usize,
 }
 
 impl CayenneCdcWrite {
@@ -449,10 +456,12 @@ impl CayenneCdcWrite {
         if let Some(prepared_append) = self.prepared_append {
             let publish_start = Instant::now();
             let superseded_rows = if let Some(prepared_on_conflict) = self.prepared_on_conflict {
-                // Each staged on-conflict deletion is represented once in the
-                // key-delete lists; positioned delete vectors are a subset.
-                let superseded = prepared_on_conflict.deleted_pk_i64.len()
-                    + prepared_on_conflict.deleted_row_keys.len();
+                // Authoritative superseded-row count, captured at validation time.
+                // Do NOT recompute from `deleted_pk_i64`/`deleted_row_keys`: for an
+                // `Int64Pk` table those hold the SAME deletions in two encodings, so
+                // summing their lengths double-counts, and neither sees
+                // `position_deletions`. See `PreparedOnConflictDeletionPublish::superseded`.
+                let superseded = prepared_on_conflict.superseded;
 
                 // Publish the staged file move AND the deletion / protected-snapshot
                 // caches under a SINGLE listing-fence write. A concurrent `scan()`
@@ -2028,6 +2037,14 @@ impl OnConflictDeletions {
             + self.deleted_row_keys.len()
             + self.deleted_inlined_pk_i64.len()
             + self.deleted_inlined_row_keys.len()
+    }
+
+    /// Whether this upsert replaces any *inlined* rows. The staged
+    /// (pipelined) on-conflict commit cannot represent an inline rewrite, so a
+    /// batch with inlined conflicts must fall back to the synchronous publish
+    /// (see `AppendMutationWriter::write_cdc_pipelined`).
+    pub(crate) fn has_inlined_deletions(&self) -> bool {
+        !self.deleted_inlined_pk_i64.is_empty() || !self.deleted_inlined_row_keys.is_empty()
     }
 }
 
@@ -3756,16 +3773,23 @@ impl CayenneTableProvider {
             )
             .await?;
 
-        // Get the maximum delete sequence from current deletions.
-        // This snapshot is protected from deletions with seq <= max_delete_seq.
-        let max_delete_seq = self.get_max_delete_sequence();
-
-        // Add to protected snapshots so scan applies only NEWER deletions (seq > max_delete_seq)
-        // We do NOT clear old protected snapshots because they may contain data that's still valid.
-        // Each protected snapshot applies its own partial deletion filter based on when it was created.
+        // Protect this snapshot using its OWN allocated `sequence_number` as the
+        // deletion threshold: the same value just persisted to
+        // `cayenne_snapshot_sequence` and reloaded by `load_protected_snapshots` on
+        // restart. The in-memory threshold MUST match the persisted one, or the
+        // partial-deletion filter (`delete_seq > threshold`) returns different rows
+        // before vs after a reload. The live `get_max_delete_sequence()` must NOT be
+        // used here: an unrelated deletion committed between this snapshot's sequence
+        // allocation and this publish can raise the global max past this snapshot's
+        // own sequence, so the in-memory threshold would skip a delete that the
+        // reloaded threshold applies. See `load_protected_snapshots` for the matching
+        // rationale.
+        //
+        // We do NOT clear old protected snapshots because they may still hold valid
+        // data; each applies its own partial deletion filter from when it was created.
         self.protected_snapshots.rcu(|current| {
             let mut new_map = (**current).clone();
-            new_map.insert(new_snapshot_id.clone(), max_delete_seq);
+            new_map.insert(new_snapshot_id.clone(), sequence_number);
             Arc::new(new_map)
         });
 
@@ -3790,43 +3814,17 @@ impl CayenneTableProvider {
             .set_snapshot_sequence(&self.table_metadata.table_id, snapshot_id, sequence_number)
             .await?;
 
-        let max_delete_seq = self.get_max_delete_sequence();
+        // Threshold = this snapshot's OWN allocated `sequence_number` (just persisted
+        // above), matching `load_protected_snapshots` so scans are reload-stable. See
+        // the note in `insert_to_new_snapshot_with_sequence` for why the live global
+        // max would diverge from the reloaded threshold.
         self.protected_snapshots.rcu(|current| {
             let mut new_map = (**current).clone();
-            new_map.insert(snapshot_id.to_string(), max_delete_seq);
+            new_map.insert(snapshot_id.to_string(), sequence_number);
             Arc::new(new_map)
         });
 
         Ok(())
-    }
-
-    /// Get the maximum delete sequence number from the cached deletions.
-    ///
-    /// Reads the index's cached `max_sequence_number` field (O(1)) instead of
-    /// walking `entries().values().max()` (O(N)). The cache is maintained by
-    /// `DeletionIndex::from_map` at construction and `DeletionIndex::extend_max`
-    /// on every insert; deletion indexes are build-once / extend-only so the
-    /// cached value never goes stale. See
-    /// `crates/cayenne/benches/get_max_delete_sequence_walk.rs` for the
-    /// before-numbers (up to ~5.7 M× speedup at 1 M cached deletions).
-    fn get_max_delete_sequence(&self) -> i64 {
-        match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                deletion_snapshot, ..
-            } => deletion_snapshot
-                .load()
-                .deleted_pk
-                .max_sequence_number()
-                .unwrap_or(0),
-            PkDeletionStrategyWithCache::RowConverterBased {
-                deletion_snapshot, ..
-            } => deletion_snapshot
-                .load()
-                .deleted_row_keys
-                .max_sequence_number()
-                .unwrap_or(0),
-            PkDeletionStrategyWithCache::PositionBased { .. } => 0,
-        }
     }
 
     fn pk_deletion_snapshot(&self) -> PkDeletionSnapshot {
@@ -5816,6 +5814,11 @@ impl CayenneTableProvider {
         on_conflict_deletions: OnConflictDeletions,
         target_snapshot_id: String,
     ) -> CatalogResult<PreparedOnConflictDeletionPublish> {
+        // Capture the superseded-row count BEFORE destructuring re-encodes the
+        // deletions: at validation time each superseded row is counted exactly
+        // once (position OR file-i64 OR file-row-key OR inlined), so this is the
+        // correct live-row-delta input. See `PreparedOnConflictDeletionPublish::superseded`.
+        let superseded = on_conflict_deletions.total_superseded();
         let OnConflictDeletions {
             delete_specs,
             deleted_pk_i64,
@@ -5905,6 +5908,7 @@ impl CayenneTableProvider {
             deleted_pk_i64,
             deleted_row_keys: committed_deleted_row_keys,
             position_deletions,
+            superseded,
         })
     }
 
@@ -5993,10 +5997,18 @@ impl CayenneTableProvider {
             )?;
         }
 
-        let max_delete_seq = self.get_max_delete_sequence();
+        // Threshold = the snapshot's OWN allocated `sequence_number` (reserved in
+        // `prepare_on_conflict_deletions_for_staged_snapshot` and persisted to
+        // `cayenne_snapshot_sequence` in the same catalog commit). This MUST equal the
+        // value `load_protected_snapshots` reloads on restart so the partial-deletion
+        // filter (`delete_seq > threshold`) is reload-stable. The live
+        // `get_max_delete_sequence()` is NOT used: with pipelined finalization an
+        // unrelated deletion can land between this snapshot's sequence allocation and
+        // this (backgrounded) publish, raising the global max past `snapshot_sequence`
+        // and skipping a delete the reloaded threshold would apply.
         self.protected_snapshots.rcu(|current| {
             let mut new_map = (**current).clone();
-            new_map.insert(prepared.target_snapshot_id.clone(), max_delete_seq);
+            new_map.insert(prepared.target_snapshot_id.clone(), snapshot_sequence);
             Arc::new(new_map)
         });
 
@@ -6004,7 +6016,6 @@ impl CayenneTableProvider {
             table = self.table_metadata.table_name.as_str(),
             snapshot_id = prepared.target_snapshot_id,
             snapshot_sequence,
-            max_delete_seq,
             "Published staged on-conflict snapshot"
         );
 
@@ -9119,8 +9130,9 @@ impl CayenneTableProvider {
 
     /// Load protected snapshots from the catalog.
     ///
-    /// Protected snapshots are those with sequence > `max_delete_sequence`.
-    /// They contain data written after deletions and should skip deletion filtering.
+    /// Protected snapshots use their persisted per-snapshot sequence number as
+    /// the deletion threshold. Scans apply only deletion vectors with
+    /// `delete_seq > threshold` for each protected snapshot.
     async fn load_protected_snapshots(
         catalog: Arc<dyn MetadataCatalog>,
         table_id: &str,
@@ -12210,6 +12222,146 @@ mod tests {
             collect_id_value_pairs(&ctx, &reopened, "cdc_upsert_recovery").await,
             vec![(1, 100)],
             "reopen recovery must make the prepared CDC upsert visible exactly once"
+        );
+    }
+
+    /// Regression: an upsert that replaces existing rows must NOT inflate the
+    /// tracked live `num_rows`. The CDC finalize path nets inserts against the
+    /// rows the on-conflict resolution supersedes
+    /// (`live_rows_delta = inserted - superseded`). A regression that forgets
+    /// the subtraction drifts the cached COUNT(*) up by the conflict count on
+    /// every upsert, so a long-running upsert workload would report a row count
+    /// far above the true live set.
+    #[tokio::test]
+    async fn test_cdc_upsert_live_row_count_does_not_drift_on_replace() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_cdc_upsert_table("cdc_upsert_rowcount", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let table_id = provider.table_metadata.table_id.clone();
+
+        // Initial load: three distinct keys → three live rows.
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(
+                    Arc::clone(&schema),
+                    &[1, 2, 3],
+                    &[10, 20, 30],
+                )),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("initial cdc load should prepare")
+            .finish()
+            .await
+            .expect("finalize initial load");
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("flush stats after initial load");
+
+        let initial_num_rows = catalog
+            .get_table_statistics(&table_id)
+            .await
+            .expect("stats query after load")
+            .expect("stats present after load")
+            .num_rows;
+        assert_eq!(initial_num_rows, 3, "three inserts → three live rows");
+
+        // Upsert two of the three keys. Each conflicts with an existing row:
+        // two inserts, two supersedes → a net live delta of zero.
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[100, 200])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("upsert should prepare")
+            .finish()
+            .await
+            .expect("finalize upsert");
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("flush stats after upsert");
+
+        // Data is correct: replaced values for 1 and 2, original for 3.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "cdc_upsert_rowcount").await,
+            vec![(1, 100), (2, 200), (3, 30)],
+            "upsert must replace conflicting rows in place"
+        );
+
+        // The tracked live count must stay at 3 — NOT drift to 5. Before the
+        // fix, `live_rows_delta` counted the two inserts without subtracting the
+        // two superseded rows, leaving `num_rows` at 3 + 2 = 5.
+        let after_num_rows = catalog
+            .get_table_statistics(&table_id)
+            .await
+            .expect("stats query after upsert")
+            .expect("stats present after upsert")
+            .num_rows;
+        assert_eq!(
+            after_num_rows, 3,
+            "upsert replacing two rows must leave the live count at 3, not drift to 5"
+        );
+    }
+
+    /// Regression: every protected snapshot's in-memory deletion threshold must
+    /// equal its persisted `cayenne_snapshot_sequence` value. The partial
+    /// deletion filter applies deletions with `delete_seq > threshold`, and on
+    /// restart `load_protected_snapshots` rebuilds the thresholds from the
+    /// persisted per-snapshot sequence numbers. If the in-memory publish used
+    /// the live global max delete sequence instead of the snapshot's own
+    /// sequence, the two would diverge and a scan would return different rows
+    /// before vs after a reload.
+    #[tokio::test]
+    async fn test_cdc_upsert_protected_threshold_matches_persisted_sequence() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_cdc_upsert_table("cdc_upsert_threshold", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let table_id = provider.table_metadata.table_id.clone();
+
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("initial cdc load should prepare")
+            .finish()
+            .await
+            .expect("finalize initial load");
+
+        // Upsert both keys — this stages a protected snapshot whose deletion
+        // threshold is published from the snapshot's own allocated sequence.
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[100, 200])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("upsert should prepare")
+            .finish()
+            .await
+            .expect("finalize upsert");
+
+        let in_mem = provider.protected_snapshots.load_full();
+        let persisted = catalog
+            .get_all_snapshot_sequences(&table_id)
+            .await
+            .expect("persisted snapshot sequences");
+
+        assert!(
+            !in_mem.is_empty(),
+            "the staged CDC upsert must register at least one protected snapshot"
+        );
+        assert_eq!(
+            *in_mem, persisted,
+            "in-memory protected-snapshot thresholds must equal the persisted \
+             per-snapshot sequence numbers (matching load_protected_snapshots), or \
+             scans return different rows before vs after a reload"
         );
     }
 

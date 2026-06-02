@@ -549,6 +549,8 @@ async fn test_wal_persists_on_move_failure_impl(
 // ============================================================================
 
 test_with_backends!(test_prepared_lifecycle_matches_commit_impl);
+test_with_backends!(test_prepared_apply_under_barrier_waits_for_write_lock_impl);
+test_with_backends!(test_held_barrier_current_snapshot_requires_write_lock_impl);
 
 async fn test_prepared_lifecycle_matches_commit_impl(
     fixture: common::TestFixture,
@@ -607,6 +609,68 @@ async fn test_prepared_lifecycle_matches_commit_impl(
         ]
     );
     assert_staging_empty(&staging);
+
+    Ok(())
+}
+
+async fn test_prepared_apply_under_barrier_waits_for_write_lock_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx) = setup_table(&fixture, "lifecycle_write_lock").await;
+
+    let staged = begin_staged_append_with_rows(&table, &[(1, "Alice")]).await?;
+    let prepared = staged.prepare().await?;
+
+    let lock_holder = begin_staged_append_with_rows(&table, &[(99, "Held")]).await?;
+
+    let result =
+        tokio::time::timeout(Duration::from_millis(100), prepared.apply_under_barrier()).await;
+    assert!(
+        result.is_err(),
+        "current-snapshot apply_under_barrier must wait for write_lock before moving files"
+    );
+
+    lock_holder.rollback().await?;
+    prepared.apply_under_barrier().await?;
+    assert_eq!(prepared.finish().await?, 1);
+
+    let rows = query_all(&ctx, "lifecycle_write_lock").await;
+    assert_eq!(rows, vec![(1, "Alice".to_string())]);
+    assert_staging_empty(&staging_dir(&table));
+
+    Ok(())
+}
+
+async fn test_held_barrier_current_snapshot_requires_write_lock_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx) = setup_table(&fixture, "held_barrier_write_lock").await;
+
+    let staged = begin_staged_append_with_rows(&table, &[(1, "Alice")]).await?;
+    let prepared = staged.prepare().await?;
+
+    let lock_holder = begin_staged_append_with_rows(&table, &[(99, "Held")]).await?;
+
+    let fence = prepared.lock_listing_fence_write_owned().await;
+    let err = prepared
+        .apply_under_held_barrier()
+        .await
+        .expect_err("held-barrier current-snapshot apply must fail while write_lock is held");
+    assert!(
+        err.to_string().contains("Failed to acquire write_lock"),
+        "unexpected error: {err}"
+    );
+    drop(fence);
+
+    lock_holder.rollback().await?;
+    let fence = prepared.lock_listing_fence_write_owned().await;
+    prepared.apply_under_held_barrier().await?;
+    drop(fence);
+    assert_eq!(prepared.finish().await?, 1);
+
+    let rows = query_all(&ctx, "held_barrier_write_lock").await;
+    assert_eq!(rows, vec![(1, "Alice".to_string())]);
+    assert_staging_empty(&staging_dir(&table));
 
     Ok(())
 }
