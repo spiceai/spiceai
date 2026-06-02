@@ -498,6 +498,10 @@ const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
 const PODS_WATCHER: &str = "pods_watcher";
 const COMPONENTS_INITIAL_LOAD: &str = "components_initial_load";
+const CACHE_MAINTENANCE: &str = "cache_maintenance";
+
+/// How often [`Runtime::run_cache_maintenance`] drives moka housekeeping.
+const CACHE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 // Allow 30 seconds for tasks for graceful shutdown
 const RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -926,6 +930,28 @@ impl Runtime {
         }
 
         Ok(())
+    }
+
+    /// Periodically drives moka housekeeping so invalidation predicates and
+    /// expired entries are reclaimed even on caches with no `get`/`insert`
+    /// traffic. Returns immediately when no cache is configured; otherwise loops
+    /// until the task is cancelled at shutdown.
+    pub(crate) async fn run_cache_maintenance(self: Arc<Self>) -> Result<()> {
+        let caching = self.datafusion().caching();
+        if caching.results.is_none()
+            && caching.plans.is_none()
+            && caching.search.is_none()
+            && caching.embeddings.is_none()
+        {
+            return Ok(());
+        }
+
+        let mut interval = tokio::time::interval(CACHE_MAINTENANCE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            caching.run_pending_maintenance().await;
+        }
     }
 
     /// Periodically recompute and rebroadcast this executor's per-table row-count
@@ -1412,6 +1438,16 @@ impl Runtime {
             })
             .await;
 
+        // `None` cancellation token: the loop is aborted at shutdown.
+        let maintenance_self = Arc::clone(&self);
+        let cache_maintenance_future = self
+            .start_runtime_task(
+                CACHE_MAINTENANCE,
+                None,
+                maintenance_self.run_cache_maintenance(),
+            )
+            .await;
+
         // wait for all servers to shut down or if any of the servers fail to start
         if let Some(cluster_future) = maybe_cluster_future {
             return match tokio::try_join!(
@@ -1419,6 +1455,7 @@ impl Runtime {
                 flight_future,
                 metrics_future,
                 pods_watcher_future,
+                cache_maintenance_future,
                 cluster_future,
                 shutdown_signal_future
             ) {
@@ -1432,6 +1469,7 @@ impl Runtime {
             flight_future,
             metrics_future,
             pods_watcher_future,
+            cache_maintenance_future,
             shutdown_signal_future
         ) {
             Err(err) => Err(err),
