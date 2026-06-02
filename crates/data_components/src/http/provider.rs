@@ -850,7 +850,7 @@ impl HttpTableProvider {
                 true,
             ),
             Field::new(
-                "fetched_at",
+                "_fetched_at",
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
                 true,
             ),
@@ -1818,7 +1818,7 @@ impl HttpExec {
                 }
                 Ok(Arc::new(builder.finish()) as ArrayRef)
             }
-            "fetched_at" => {
+            "_fetched_at" => {
                 use arrow::array::TimestampNanosecondArray;
                 Ok(Arc::new(TimestampNanosecondArray::from(vec![
                     timestamp_nanos;
@@ -1831,7 +1831,7 @@ impl HttpExec {
         }
     }
 
-    /// Compute the per-batch `fetched_at` timestamp in nanoseconds since
+    /// Compute the per-batch `_fetched_at` timestamp in nanoseconds since
     /// the Unix epoch, preferring the response `Date` header and falling
     /// back to the current system time.
     fn compute_fetched_at_nanos(fetch_result: &HttpFetchResult) -> DataFusionResult<i64> {
@@ -4234,7 +4234,7 @@ mod tests {
         assert_eq!(schema.field(4).name(), "content");
         assert_eq!(schema.field(5).name(), "response_status");
         assert_eq!(schema.field(6).name(), "response_headers");
-        assert_eq!(schema.field(7).name(), "fetched_at");
+        assert_eq!(schema.field(7).name(), "_fetched_at");
         assert_eq!(*schema.field(0).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(1).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(2).data_type(), DataType::Utf8);
@@ -4256,7 +4256,7 @@ mod tests {
         assert!(!schema.field(4).is_nullable()); // content is not nullable
         assert!(!schema.field(5).is_nullable()); // response_status is not nullable
         assert!(schema.field(6).is_nullable()); // response_headers is nullable
-        assert!(schema.field(7).is_nullable()); // fetched_at is nullable
+        assert!(schema.field(7).is_nullable()); // _fetched_at is nullable
     }
 
     #[tokio::test]
