@@ -6946,6 +6946,15 @@ impl CayenneTableProvider {
         use super::compaction::{FileEntry, pick_candidates};
         let pass_start = std::time::Instant::now();
 
+        if self.has_inflight_staging_appends() {
+            tracing::trace!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Skipping compaction trigger: staged append finalization is in flight",
+            );
+            return Ok(false);
+        }
+
         // Cheap early-out using in-memory counters. During the common
         // "accumulation phase" of many small appends we have not yet created
         // enough new files or protected snapshots to possibly cross a
@@ -10796,10 +10805,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         //
         // Using `try_lock` keeps the background loop non-blocking from a
         // writer's perspective — if a writer is active we skip this tick and
-        // re-evaluate on the next interval. The inline trigger paths in
-        // `mutation_writer.rs` call `maybe_compact_small_files` directly while
-        // the caller already holds `write_lock`, so they bypass this guard
-        // (tokio mutexes are not re-entrant, so we must not re-acquire there).
+        // re-evaluate on the next interval.
         let Ok(_write_guard) = self.write_lock.try_lock() else {
             tracing::trace!(
                 target: "cayenne::compaction",
@@ -10808,6 +10814,16 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
             );
             return Ok(false);
         };
+
+        if self.has_inflight_staging_appends() {
+            tracing::trace!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Skipping background compaction: staged append finalization is in flight",
+            );
+            return Ok(false);
+        }
+
         self.maybe_compact_small_files()
             .await
             .map_err(|e| e.to_string())
@@ -10857,6 +10873,7 @@ impl CayenneTableProvider {
 mod tests {
     use crate::CayenneCatalog;
     use crate::metadata::VortexConfig;
+    use crate::provider::compaction::CompactionRunner;
 
     use super::*;
 
@@ -12033,6 +12050,23 @@ mod tests {
         table_name: &str,
         runtime_env: Arc<RuntimeEnv>,
     ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        create_cdc_upsert_table_with_vortex_config(
+            table_name,
+            runtime_env,
+            VortexConfig {
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+        )
+        .await
+    }
+
+    async fn create_cdc_upsert_table_with_vortex_config(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        vortex_config: VortexConfig,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
         use arrow::datatypes::{DataType, Field, Schema};
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -12061,11 +12095,7 @@ mod tests {
             )),
             base_path: data_dir,
             partition_column: None,
-            vortex_config: VortexConfig {
-                inline_max_rows: 0,
-                deletion_mode: crate::metadata::DeletionMode::Key,
-                ..VortexConfig::default()
-            },
+            vortex_config,
         };
 
         let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
@@ -12085,6 +12115,12 @@ mod tests {
             ],
         )
         .expect("id/value batch is valid")
+    }
+
+    fn id_value_batch_for_range(schema: SchemaRef, start_id: i64, rows: i64) -> RecordBatch {
+        let ids: Vec<i64> = (start_id..start_id + rows).collect();
+        let values: Vec<i64> = ids.iter().map(|id| id * 10).collect();
+        id_value_batch(schema, &ids, &values)
     }
 
     /// Read back all `(id, value)` pairs, sorted by id, for assertion.
@@ -12363,6 +12399,111 @@ mod tests {
              per-snapshot sequence numbers (matching load_protected_snapshots), or \
              scans return different rows before vs after a reload"
         );
+    }
+
+    #[tokio::test]
+    async fn test_compaction_skips_pending_cdc_upsert_finalize() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "cdc_upsert_compaction_pending",
+            ctx.runtime_env(),
+            VortexConfig {
+                target_vortex_file_size_mb: 1,
+                compaction_trigger_files: 4,
+                compaction_max_levels: 1,
+                compaction_max_files_per_pick: 4,
+                compaction_background_interval_ms: 0,
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let table_id = provider.table_metadata.table_id.clone();
+
+        let batch_rows = 10_000_i64;
+        for batch_idx in 0..4_i64 {
+            let start = 1 + batch_idx * batch_rows;
+            provider
+                .write_cdc_append_stream(
+                    single_batch_stream(id_value_batch_for_range(
+                        Arc::clone(&schema),
+                        start,
+                        batch_rows,
+                    )),
+                    &ctx.task_ctx(),
+                )
+                .await
+                .expect("initial CDC batch should prepare")
+                .finish()
+                .await
+                .expect("finalize initial CDC batch");
+        }
+
+        let sequence_count_before_pending = catalog
+            .get_all_snapshot_sequences(&table_id)
+            .await
+            .expect("initial snapshot sequences")
+            .len();
+
+        let pending = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("cdc upsert should prepare");
+        assert!(pending.has_pending_finalize());
+
+        assert_eq!(
+            catalog
+                .get_all_snapshot_sequences(&table_id)
+                .await
+                .expect("snapshot sequence persisted for pending CDC upsert")
+                .len(),
+            sequence_count_before_pending + 1,
+            "Stage A must durably register the protected target before finalize"
+        );
+
+        assert!(
+            !CompactionRunner::run_compaction_trigger(&provider)
+                .await
+                .expect("compaction trigger should skip while finalize is pending"),
+            "compaction must not rewrite while a CDC upsert protected snapshot is pending finalize"
+        );
+        assert_eq!(
+            catalog
+                .get_all_snapshot_sequences(&table_id)
+                .await
+                .expect("pending sequence should survive skipped compaction")
+                .len(),
+            sequence_count_before_pending + 1,
+            "skipped compaction must not bulk-delete a pending protected snapshot sequence"
+        );
+
+        pending.finish().await.expect("finalize pending cdc upsert");
+        let pairs = collect_id_value_pairs(&ctx, &provider, "cdc_upsert_compaction_pending").await;
+        assert_eq!(
+            pairs.len(),
+            usize::try_from(batch_rows * 4).expect("row count fits usize")
+        );
+        assert_eq!(pairs[0], (1, 100));
+        assert_eq!(pairs[1], (2, 20));
+
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .open("cdc_upsert_compaction_pending")
+            .await
+            .expect("reopen should preserve finalized protected CDC upsert");
+        let reopened_pairs =
+            collect_id_value_pairs(&ctx, &reopened, "cdc_upsert_compaction_pending").await;
+        assert_eq!(
+            reopened_pairs.len(),
+            usize::try_from(batch_rows * 4).expect("row count fits usize"),
+            "pending CDC upsert data must remain reload-stable after compaction skip"
+        );
+        assert_eq!(reopened_pairs[0], (1, 100));
+        assert_eq!(reopened_pairs[1], (2, 20));
     }
 
     #[test]
