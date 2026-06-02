@@ -38,7 +38,7 @@ use datafusion::sql::TableReference;
 // Shared utility
 // ---------------------------------------------------------------------------
 
-/// Convert a [`Column`] expression (as produced by DataFusion SQL parsing of
+/// Convert a [`Column`] expression (as produced by `DataFusion` SQL parsing of
 /// a dotted table name) back into a [`TableReference`].
 #[must_use]
 pub fn table_ref_from_column_expr(c: &Column) -> TableReference {
@@ -103,6 +103,12 @@ pub enum DistanceMetric {
 }
 
 impl DistanceMetric {
+    /// Parse a user-provided distance metric name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `s` is not one of the supported values for
+    /// `vector_search`: `cosine`, `l2`, or `dot` (including aliases).
     pub fn parse(s: &str) -> DataFusionResult<Self> {
         match s.to_ascii_lowercase().as_str() {
             "cosine" | "cos" => Ok(Self::Cosine),
@@ -137,6 +143,10 @@ pub struct VectorSearchTableFuncArgs {
 
 impl VectorSearchTableFuncArgs {
     /// Build the expression list for a `vector_search(...)` UDTF invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `limit` cannot be represented as `u64`.
     pub fn to_expr(&self) -> DataFusionResult<Vec<Expr>> {
         let query_expr = if self.queries.len() > 1 {
             let make_array = datafusion::functions_nested::make_array::make_array_udf();
@@ -188,9 +198,16 @@ impl VectorSearchTableFuncArgs {
     }
 
     /// Check [`Self::column`] is valid, attempt to pick a default, and retrieve the associated [`EmbeddingColumnConfig`].
-    pub fn get_column_and_config(
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when:
+    /// - A requested column is not indexed for vector search.
+    /// - No column is provided and there are multiple indexed columns.
+    /// - The table has no indexed embedding columns.
+    pub fn get_column_and_config<S: std::hash::BuildHasher>(
         &self,
-        embedded_columns: &HashMap<String, EmbeddingColumnConfig>,
+        embedded_columns: &HashMap<String, EmbeddingColumnConfig, S>,
     ) -> DataFusionResult<(String, EmbeddingColumnConfig)> {
         let cfg = self
             .column
@@ -276,6 +293,7 @@ impl std::fmt::Debug for EmbeddingColumnConfig {
 }
 
 /// Find the closest column name via Levenshtein distance.
+#[must_use]
 pub fn closest_column(target: &str, candidates: &[String]) -> Option<String> {
     let target_lower = target.to_lowercase();
     let (best, distance) = candidates
@@ -296,6 +314,11 @@ pub fn closest_column(target: &str, candidates: &[String]) -> Option<String> {
 }
 
 /// Parse a scalar value as a u64 limit parameter.
+///
+/// # Errors
+///
+/// Returns an error if `scalar` is not a non-negative integer value (or a
+/// string that parses to one).
 pub fn parse_limit_scalar(scalar: &ScalarValue) -> DataFusionResult<u64> {
     match scalar {
         ScalarValue::Int64(Some(limit)) => u64::try_from(*limit).map_err(|_| {
@@ -361,6 +384,13 @@ impl TextSearchTableFuncArgs {
     }
 
     /// Find column to perform full text search upon.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when:
+    /// - A requested column is not indexed for text search.
+    /// - No column is provided and multiple indexed columns exist.
+    /// - The table has no indexed text-search columns.
     pub fn column(&self, search_fields: &[String]) -> DataFusionResult<String> {
         if let Some(col) = &self.column {
             if !search_fields.contains(col) {

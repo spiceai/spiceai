@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::missing_errors_doc)]
+
 use arrow::array::{
     Array, ArrayRef, FixedSizeListArray, FixedSizeListBuilder, GenericListArray, LargeListArray,
     LargeStringArray, ListArray, OffsetSizeTrait, PrimitiveBuilder, RecordBatch, StringArray,
@@ -218,10 +220,18 @@ fn to_sendable_stream(
     }
 }
 
-pub fn construct_record_batch(
+/// Construct a projected record batch by replacing base columns with generated
+/// embedding columns when present.
+///
+/// # Errors
+///
+/// Returns an [`ArrowError`] if the projected schema and collected columns do
+/// not form a valid [`RecordBatch`] (for example, when column lengths or types
+/// are incompatible with the schema).
+pub fn construct_record_batch<S: std::hash::BuildHasher>(
     batch: &RecordBatch,
     projected_schema: &SchemaRef,
-    embedding_cols: &HashMap<String, ArrayRef>,
+    embedding_cols: &HashMap<String, ArrayRef, S>,
 ) -> Result<RecordBatch, ArrowError> {
     let cols: Vec<ArrayRef> = projected_schema
         .fields()
@@ -243,9 +253,9 @@ pub fn construct_record_batch(
 /// For columns that are in the base table, no additional columns are calculated.
 ///
 /// The additional columns returned here should match those specified in [`super::table::EmbeddingTable::embedding_fields`]
-pub async fn compute_additional_embedding_columns(
+pub async fn compute_additional_embedding_columns<S: std::hash::BuildHasher>(
     rb: &RecordBatch,
-    embedded_columns: &HashMap<String, EmbeddingColumnConfig>,
+    embedded_columns: &HashMap<String, EmbeddingColumnConfig, S>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 ) -> Result<HashMap<String, ArrayRef>, Box<dyn std::error::Error + Send + Sync>> {
     let additional_embedding_columns: HashMap<_, _> = embedded_columns

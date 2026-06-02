@@ -40,6 +40,7 @@ impl MemoryToolCatalog {
         Self { df, app }
     }
 
+    #[must_use]
     pub fn name() -> &'static str {
         "memory"
     }

@@ -66,6 +66,7 @@ impl SpiceToolsOptions {
         )
     }
 
+    #[must_use]
     pub fn tools_by_name(&self) -> Vec<&str> {
         match self {
             SpiceToolsOptions::Auto => vec![

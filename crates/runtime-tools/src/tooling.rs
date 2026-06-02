@@ -42,7 +42,6 @@ impl Tooling {
 
     /// Extension methods for [`Tooling`] that require runtime-local knowledge
     /// (e.g. which catalogs are "default" and therefore don't prefix tool names).
-
     pub async fn tools(&self) -> Vec<Arc<dyn SpiceModelTool>> {
         match self {
             Tooling::Tool(t) | Tooling::FunctionTool(t) => vec![Arc::clone(t)],

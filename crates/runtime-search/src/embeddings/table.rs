@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::missing_errors_doc)]
+
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::{any::Any, sync::Arc};
