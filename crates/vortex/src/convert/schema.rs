@@ -209,7 +209,8 @@ mod tests {
             Nullability::NonNullable,
         );
 
-        let physical_schema = calculate_physical_schema(&dtype, &logical_schema).unwrap();
+        let physical_schema = calculate_physical_schema(&dtype, &logical_schema)
+            .expect("dictionary physical schema should be calculated");
 
         // Should preserve the dictionary type from the logical schema
         assert_eq!(
@@ -239,7 +240,8 @@ mod tests {
             Nullability::NonNullable,
         );
 
-        let physical_schema = calculate_physical_schema(&dtype, &logical_schema).unwrap();
+        let physical_schema = calculate_physical_schema(&dtype, &logical_schema)
+            .expect("utf8/binary physical schema should be calculated");
 
         assert_eq!(physical_schema.field(0).data_type(), &DataType::Utf8);
         assert_eq!(physical_schema.field(1).data_type(), &DataType::LargeUtf8);
@@ -262,7 +264,7 @@ mod tests {
         let result = calculate_physical_schema(&dtype, &logical_schema);
         assert!(
             result
-                .unwrap_err()
+                .expect_err("incompatible dtype should fail schema calculation")
                 .to_string()
                 .contains("not compatible with")
         );
@@ -282,7 +284,7 @@ mod tests {
         let result = calculate_physical_schema(&dtype, &logical_schema);
         assert!(
             result
-                .unwrap_err()
+                .expect_err("incompatible dtype should fail schema calculation")
                 .to_string()
                 .contains("not compatible with")
         );
@@ -325,7 +327,8 @@ mod tests {
             Nullability::NonNullable,
         );
 
-        let physical_schema = calculate_physical_schema(&dtype, &logical_schema).unwrap();
+        let physical_schema = calculate_physical_schema(&dtype, &logical_schema)
+            .expect("nested struct physical schema should be calculated");
 
         // Check outer structure
         assert_eq!(physical_schema.fields().len(), 2);
@@ -366,7 +369,8 @@ mod tests {
             Nullability::NonNullable,
         );
 
-        let physical_schema = calculate_physical_schema(&dtype, &logical_schema).unwrap();
+        let physical_schema = calculate_physical_schema(&dtype, &logical_schema)
+            .expect("list-with-dict physical schema should be calculated");
 
         if let DataType::List(elem_field) = physical_schema.field(0).data_type() {
             assert_eq!(
@@ -389,7 +393,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("non-struct dtype should fail schema calculation")
                 .to_string()
                 .contains("Expected struct dtype")
         );
@@ -425,7 +429,8 @@ mod tests {
             Nullability::NonNullable,
         );
 
-        let physical_schema = calculate_physical_schema(&dtype, &logical_schema).unwrap();
+        let physical_schema = calculate_physical_schema(&dtype, &logical_schema)
+            .expect("metadata-preserving physical schema should be calculated");
 
         assert_eq!(physical_schema.metadata(), &schema_metadata);
         assert_eq!(physical_schema.field(0).metadata(), &field_metadata);
@@ -456,7 +461,8 @@ mod tests {
             Nullability::NonNullable,
         );
 
-        let physical_schema = calculate_physical_schema(&dtype, &logical_schema).unwrap();
+        let physical_schema = calculate_physical_schema(&dtype, &logical_schema)
+            .expect("nested-list element-metadata physical schema should be calculated");
 
         if let DataType::List(elem_field) = physical_schema.field(0).data_type() {
             assert_eq!(elem_field.metadata(), &elem_metadata);

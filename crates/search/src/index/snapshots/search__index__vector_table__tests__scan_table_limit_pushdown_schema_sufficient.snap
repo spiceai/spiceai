@@ -1,0 +1,13 @@
+---
+source: crates/search/src/index/vector_table.rs
+expression: "format!(\"{}\", pretty::pretty_format_batches(&col).map_err(|e| e.to_string())?)"
+---
++---------------+---------------------------------------------------------------------------+
+| plan_type     | plan                                                                      |
++---------------+---------------------------------------------------------------------------+
+| logical_plan  | Projection: my_vectored_table.pk, my_vectored_table.another_column        |
+|               |   Limit: skip=0, fetch=5                                                  |
+|               |     TableScan: my_vectored_table projection=[another_column, pk], fetch=5 |
+| physical_plan | BaseTable: projection=["pk", "another_column"] filter=[] limit=Some(5)    |
+|               |                                                                           |
++---------------+---------------------------------------------------------------------------+

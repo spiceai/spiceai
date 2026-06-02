@@ -1454,7 +1454,7 @@ async fn test_caching_mode_background_refresh_on_miss() -> Result<(), anyhow::Er
                 .await?
                 .filter(col("request_path").eq(lit("/search/people")))?
                 .filter(col("request_query").eq(lit("q=background")))?
-                .select(vec![col("request_path"), col("request_query"), col("fetched_at")])?
+                .select(vec![col("request_path"), col("request_query"), col("_fetched_at")])?
                 .limit(0, Some(1))?;
 
             let batches2 = df2.collect().await?;
@@ -1478,12 +1478,12 @@ async fn test_caching_mode_background_refresh_on_miss() -> Result<(), anyhow::Er
                 .column(2)
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
-                .expect("fetched_at should be TimestampNanosecondArray");
+                .expect("_fetched_at should be TimestampNanosecondArray");
             assert!(
                 !fetched_at_array2.is_null(0),
-                "fetched_at should be set (background refresh populated cache)"
+                "_fetched_at should be set (background refresh populated cache)"
             );
-            eprintln!("TEST: Step 2 complete - data served from cache with fetched_at timestamp set");
+            eprintln!("TEST: Step 2 complete - data served from cache with _fetched_at timestamp set");
 
             eprintln!("\nTEST SUMMARY:");
             eprintln!("✅ Step 1: Cache miss → fetch from source → background cache population triggered");
@@ -1567,7 +1567,7 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
                 .await?
                 .filter(col("request_path").eq(lit("/search/people")))?
                 .filter(col("request_query").eq(lit("q=staleness")))?
-                .select(vec![col("request_path"), col("request_query"), col("fetched_at")])?
+                .select(vec![col("request_path"), col("request_query"), col("_fetched_at")])?
                 .limit(0, Some(1))?;
 
             let batches1 = df1.collect().await?;
@@ -1577,15 +1577,15 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
             );
             assert_eq!(batches1[0].num_rows(), 1, "Should have 1 row");
 
-            // Capture the initial fetched_at timestamp
+            // Capture the initial _fetched_at timestamp
             let batch1 = &batches1[0];
             let fetched_at_array1 = batch1
                 .column(2)
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
-                .expect("fetched_at should be TimestampNanosecondArray");
+                .expect("_fetched_at should be TimestampNanosecondArray");
             let initial_fetched_at = fetched_at_array1.value(0);
-            eprintln!("TEST: Step 1 complete - cache populated with fresh data (fetched_at: {initial_fetched_at})");
+            eprintln!("TEST: Step 1 complete - cache populated with fresh data (_fetched_at: {initial_fetched_at})");
 
             // Small delay to ensure cache is populated
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -1604,7 +1604,7 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
                 .await?
                 .filter(col("request_path").eq(lit("/search/people")))?
                 .filter(col("request_query").eq(lit("q=staleness")))?
-                .select(vec![col("request_path"), col("request_query"), col("fetched_at")])?
+                .select(vec![col("request_path"), col("request_query"), col("_fetched_at")])?
                 .limit(0, Some(1))?;
 
             let batches2 = df2.collect().await?;
@@ -1626,18 +1626,18 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
                 "Should return data (even though stale)"
             );
 
-            // Verify this is still the old data (same fetched_at as initial)
+            // Verify this is still the old data (same _fetched_at as initial)
             let fetched_at_array2 = batch2
                 .column(2)
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
-                .expect("fetched_at should be TimestampNanosecondArray");
+                .expect("_fetched_at should be TimestampNanosecondArray");
             let stale_fetched_at = fetched_at_array2.value(0);
             assert_eq!(
                 stale_fetched_at, initial_fetched_at,
                 "Should return stale data with original timestamp"
             );
-            eprintln!("TEST: Step 3 complete - stale data returned (fetched_at unchanged: {stale_fetched_at}), background refresh triggered");
+            eprintln!("TEST: Step 3 complete - stale data returned (_fetched_at unchanged: {stale_fetched_at}), background refresh triggered");
 
             // Wait for background refresh to complete
             eprintln!("TEST: Waiting for background refresh to update cache...");
@@ -1652,27 +1652,27 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
                 .await?
                 .filter(col("request_path").eq(lit("/search/people")))?
                 .filter(col("request_query").eq(lit("q=staleness")))?
-                .select(vec![col("request_path"), col("request_query"), col("fetched_at")])?
+                .select(vec![col("request_path"), col("request_query"), col("_fetched_at")])?
                 .limit(0, Some(1))?;
 
             let batches3 = df3.collect().await?;
             assert!(!batches3.is_empty(), "Should have refreshed cache data");
             assert_eq!(batches3[0].num_rows(), 1, "Should have 1 row");
 
-            // Verify the fetched_at timestamp was updated (background refresh occurred)
+            // Verify the _fetched_at timestamp was updated (background refresh occurred)
             let batch3 = &batches3[0];
             let fetched_at_array3 = batch3
                 .column(2)
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
-                .expect("fetched_at should be TimestampNanosecondArray");
+                .expect("_fetched_at should be TimestampNanosecondArray");
             let refreshed_fetched_at = fetched_at_array3.value(0);
 
             assert!(
                 refreshed_fetched_at > initial_fetched_at,
-                "fetched_at should be updated after background refresh (initial: {initial_fetched_at}, refreshed: {refreshed_fetched_at})"
+                "_fetched_at should be updated after background refresh (initial: {initial_fetched_at}, refreshed: {refreshed_fetched_at})"
             );
-            eprintln!("TEST: Step 4 complete - cache refreshed in background (new fetched_at: {}, delta: {} ns)",
+            eprintln!("TEST: Step 4 complete - cache refreshed in background (new _fetched_at: {}, delta: {} ns)",
                 refreshed_fetched_at,
                 refreshed_fetched_at - initial_fetched_at
             );
@@ -1758,21 +1758,21 @@ async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyho
             let df = runtime
                 .datafusion()
                 .ctx
-                .sql("SELECT content, fetched_at FROM tvmaze WHERE request_query = 'q=lauren'")
+                .sql("SELECT content, _fetched_at FROM tvmaze WHERE request_query = 'q=lauren'")
                 .await?;
             let results = df.clone().collect().await?;
             assert_eq!(results.len(), 1, "Should have 1 batch");
             assert!(results[0].num_rows() > 0, "Should have at least 1 row");
 
             let fetched_at_array = results[0]
-                .column_by_name("fetched_at")
-                .expect("fetched_at column should exist")
+                .column_by_name("_fetched_at")
+                .expect("_fetched_at column should exist")
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
-                .expect("fetched_at should be TimestampNanosecondArray");
+                .expect("_fetched_at should be TimestampNanosecondArray");
             let initial_fetched_at = fetched_at_array.value(0);
             let initial_row_count = results[0].num_rows();
-            eprintln!("TEST: Step 1 complete - cache populated with {initial_row_count} row(s), initial fetched_at: {initial_fetched_at}");
+            eprintln!("TEST: Step 1 complete - cache populated with {initial_row_count} row(s), initial _fetched_at: {initial_fetched_at}");
 
             // Step 2: Wait for refresh_check_interval to potentially trigger
             // For caching mode, the interval refresh should check for stale data and refresh it
@@ -1785,20 +1785,20 @@ async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyho
             let df3 = runtime
                 .datafusion()
                 .ctx
-                .sql("SELECT content, fetched_at FROM tvmaze WHERE request_query = 'q=lauren'")
+                .sql("SELECT content, _fetched_at FROM tvmaze WHERE request_query = 'q=lauren'")
                 .await?;
             let results3 = df3.collect().await?;
             assert_eq!(results3.len(), 1, "Should have 1 batch");
 
             let fetched_at_array3 = results3[0]
-                .column_by_name("fetched_at")
-                .expect("fetched_at column should exist")
+                .column_by_name("_fetched_at")
+                .expect("_fetched_at column should exist")
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
-                .expect("fetched_at should be TimestampNanosecondArray");
+                .expect("_fetched_at should be TimestampNanosecondArray");
             let refreshed_fetched_at = fetched_at_array3.value(0);
 
-            eprintln!("TEST: Initial fetched_at: {}, After interval: {}, Delta: {} ns",
+            eprintln!("TEST: Initial _fetched_at: {}, After interval: {}, Delta: {} ns",
                 initial_fetched_at, refreshed_fetched_at, refreshed_fetched_at.saturating_sub(initial_fetched_at));
             eprintln!("TEST: Step 3 complete - checked for interval refresh");
 
@@ -1812,24 +1812,24 @@ async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyho
             let df5 = runtime
                 .datafusion()
                 .ctx
-                .sql("SELECT content, fetched_at FROM tvmaze WHERE request_query = 'q=lauren'")
+                .sql("SELECT content, _fetched_at FROM tvmaze WHERE request_query = 'q=lauren'")
                 .await?;
             let results5 = df5.collect().await?;
 
             // After retention, the data should either:
-            // 1. Be evicted and cause a fresh fetch (new fetched_at)
+            // 1. Be evicted and cause a fresh fetch (new _fetched_at)
             // 2. Or still be there if retention hasn't run yet
             // We'll check if the fetched_at changed significantly
             if !results5.is_empty() && results5[0].num_rows() > 0 {
                 let fetched_at_array5 = results5[0]
-                    .column_by_name("fetched_at")
-                    .expect("fetched_at column should exist")
+                    .column_by_name("_fetched_at")
+                    .expect("_fetched_at column should exist")
                     .as_any()
                     .downcast_ref::<TimestampNanosecondArray>()
-                    .expect("fetched_at should be TimestampNanosecondArray");
+                    .expect("_fetched_at should be TimestampNanosecondArray");
                 let final_fetched_at = fetched_at_array5.value(0);
 
-                eprintln!("TEST: Final fetched_at: {}, Delta from initial: {} ns",
+                eprintln!("TEST: Final _fetched_at: {}, Delta from initial: {} ns",
                     final_fetched_at, final_fetched_at.saturating_sub(initial_fetched_at));
 
                 // If retention worked and data was re-fetched, it should be significantly newer
