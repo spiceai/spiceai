@@ -47,7 +47,7 @@ use super::streams::{
 
 // Ports 8020-8030 reserved for this module; 8001-8014 are used by streams.rs / dml.rs.
 const PORT_NO_ACCEL_NO_SCHEMA_NO_TABLE: u16 = 8020;
-const PORT_NO_ACCEL_NO_SCHEMA_EMPTY: u16 = 8021;
+const PORT_NO_ACCEL_NO_SCHEMA_EMPTY: u16 = 8031;
 const PORT_NO_ACCEL_SCHEMA_NO_TABLE_EMPTY_RESULT: u16 = 8022;
 const PORT_NO_ACCEL_SCHEMA_NO_TABLE_WITH_ROWS: u16 = 8023;
 const PORT_NO_ACCEL_SCHEMA_EMPTY_IMMEDIATE: u16 = 8024;

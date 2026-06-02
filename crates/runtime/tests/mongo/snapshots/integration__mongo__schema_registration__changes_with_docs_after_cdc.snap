@@ -1,0 +1,12 @@
+---
+source: crates/runtime/tests/mongo/schema_registration.rs
+expression: formatted
+---
++-----+----------------+---------+
+| _id | name           | version |
++-----+----------------+---------+
+| 1   | Item 1 updated | 1       |
+| 2   | Item 2         | 2       |
+| 3   | Item 3         | 3       |
+| 4   | Item 4         | 4       |
++-----+----------------+---------+

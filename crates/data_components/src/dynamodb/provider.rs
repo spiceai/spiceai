@@ -16,8 +16,8 @@ limitations under the License.
 
 use super::{
     DescribeTableSnafu, Error, FailedToBootstrapTableSnafu, FailedToInitializeCheckpointSnafu,
-    FailedToInitializeStreamSnafu, Result, ScanSnafu, TableDoesNotExistSnafu,
-    TableStatusIsNotActiveSnafu,
+    FailedToInitializeStreamSnafu, Result, ScanSnafu, StreamsNotEnabledSnafu,
+    TableDoesNotExistSnafu, TableStatusIsNotActiveSnafu,
 };
 use crate::cdc::ChangeBatch;
 use crate::delete::DeletionExec;
@@ -88,12 +88,22 @@ pub struct DynamoDBTableProvider {
     pub ready_lag: Duration,
     json_nesting: Option<JsonNesting>,
     write_parallelism: usize,
+    streams_enabled: bool,
 }
 
 type DynamoDBItemStream =
     dyn Stream<Item = DataFusionResult<HashMap<String, AttributeValue>>> + Send + 'static;
 
 const DEFAULT_PARTITIONS: usize = 8;
+
+struct TableMetadata {
+    schema: SchemaRef,
+    partition_key: String,
+    sort_key: Option<String>,
+    flattened_fields: HashSet<String>,
+    item_count: Option<i64>,
+    streams_enabled: bool,
+}
 
 impl DynamoDBTableProvider {
     /// Creates a new `DynamoDB` table provider.
@@ -126,17 +136,23 @@ impl DynamoDBTableProvider {
                 .build(),
         );
 
-        let (table_schema, partition_key, sort_key, flattened_fields, table_total_item_count) =
-            Self::fetch_table_metadata(
-                Arc::clone(&db_client),
-                &table_name,
-                unnest_depth,
-                schema_infer_max_records,
-                &time_format,
-                json_nesting,
-                declared_schema,
-            )
-            .await?;
+        let TableMetadata {
+            schema: table_schema,
+            partition_key,
+            sort_key,
+            flattened_fields,
+            item_count: table_total_item_count,
+            streams_enabled,
+        } = Self::fetch_table_metadata(
+            Arc::clone(&db_client),
+            &table_name,
+            unnest_depth,
+            schema_infer_max_records,
+            &time_format,
+            json_nesting,
+            declared_schema,
+        )
+        .await?;
 
         // Check that all static fields are present in the table schema
         if let Some(static_fields) =
@@ -195,6 +211,7 @@ impl DynamoDBTableProvider {
             ready_lag,
             json_nesting: json_nesting.cloned(),
             write_parallelism,
+            streams_enabled,
         })
     }
 
@@ -268,7 +285,14 @@ impl DynamoDBTableProvider {
             ready_lag,
             json_nesting: None,
             write_parallelism,
+            streams_enabled: false,
         })
+    }
+
+    /// Returns `true` if DynamoDB Streams is enabled on the underlying table.
+    #[must_use]
+    pub fn streams_enabled(&self) -> bool {
+        self.streams_enabled
     }
 
     /// Fetch partition key and sort key from `DynamoDB` table metadata.
@@ -319,13 +343,7 @@ impl DynamoDBTableProvider {
         time_format: &str,
         json_nesting: Option<&JsonNesting>,
         declared_schema: Option<SchemaRef>,
-    ) -> Result<(
-        SchemaRef,
-        String,
-        Option<String>,
-        HashSet<String>,
-        Option<i64>,
-    )> {
+    ) -> Result<TableMetadata> {
         let response = db_client
             .describe_table()
             .table_name(table_name)
@@ -344,6 +362,8 @@ impl DynamoDBTableProvider {
         if *table_status != TableStatus::Active {
             return TableStatusIsNotActiveSnafu.fail();
         }
+
+        let streams_enabled = table.latest_stream_arn.is_some();
 
         let key_schema = table.key_schema();
 
@@ -386,13 +406,14 @@ impl DynamoDBTableProvider {
                          Only columns declared in `columns:` will be tracked until the \
                          table contains data that can be used for schema inference."
                     );
-                    Ok((
+                    Ok(TableMetadata {
                         schema,
                         partition_key,
                         sort_key,
-                        HashSet::new(),
-                        table.item_count,
-                    ))
+                        flattened_fields: HashSet::new(),
+                        item_count: table.item_count,
+                        streams_enabled,
+                    })
                 }
                 None => Err(Error::EmptyTable {
                     table_name: table_name.to_string(),
@@ -425,13 +446,14 @@ impl DynamoDBTableProvider {
             schema
         );
 
-        Ok((
+        Ok(TableMetadata {
             schema,
             partition_key,
             sort_key,
             flattened_fields,
-            table.item_count,
-        ))
+            item_count: table.item_count,
+            streams_enabled,
+        })
     }
 
     fn get_partitions_from_table_size(&self) -> usize {

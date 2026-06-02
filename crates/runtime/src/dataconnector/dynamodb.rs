@@ -410,6 +410,22 @@ impl DataConnector for DynamoDB {
             connector_component: ConnectorComponent::from(dataset),
             source: Box::new(e),
         })?;
+
+        let is_changes_mode = dataset
+            .acceleration
+            .as_ref()
+            .is_some_and(|a| a.enabled && a.refresh_mode == Some(RefreshMode::Changes));
+
+        if is_changes_mode && !provider.streams_enabled() {
+            return Err(DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "dynamodb".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(data_components::dynamodb::Error::StreamsNotEnabled {
+                    table_name: table_name.to_string(),
+                }),
+            });
+        }
+
         Ok(Arc::new(provider))
     }
 
