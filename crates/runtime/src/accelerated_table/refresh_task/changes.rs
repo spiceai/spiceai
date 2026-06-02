@@ -1025,6 +1025,9 @@ impl RefreshTask {
             return Ok(None);
         }
 
+        #[cfg(not(windows))]
+        self.warn_if_cayenne_cdc_synchronous_fallback();
+
         let _lock_guard = self.accelerator_write_mutex.lock().await;
 
         let (streaming_plan, insert_plan) = {
@@ -1079,11 +1082,81 @@ impl RefreshTask {
         Ok(None)
     }
 
+    /// Resolve the inner [`CayenneTableProvider`] from the accelerator, peeling
+    /// the wrappers it is created behind. Non-partitioned Cayenne tables are
+    /// wrapped in `PolyTableProvider` (read/write split), optionally
+    /// `UpsertDedupTableProvider` (when `remove_duplicates`/`last_write_wins` is
+    /// set), and `IndexedTableProvider` (vector indexes). A direct downcast to
+    /// `CayenneTableProvider` misses through any of these, so without peeling the
+    /// CDC apply silently falls back to the synchronous `insert_into` path and
+    /// loses pipelined finalization (backgrounded publish, no blocking
+    /// `apply_on_conflict_deletions`). Mirrors the wrapper-peeling done by
+    /// `search::util::find_concrete_table_provider`.
     #[cfg(not(windows))]
     fn cayenne_accelerator(&self) -> Option<&CayenneTableProvider> {
-        self.accelerator
-            .as_any()
-            .downcast_ref::<CayenneTableProvider>()
+        let mut current: &Arc<dyn TableProvider> = &self.accelerator;
+        loop {
+            if let Some(cayenne) = current.as_any().downcast_ref::<CayenneTableProvider>() {
+                return Some(cayenne);
+            }
+            if let Some(poly) = current
+                .as_any()
+                .downcast_ref::<data_components::poly::PolyTableProvider>()
+            {
+                current = poly.writer_ref();
+                continue;
+            }
+            if let Some(dedup) = current
+                .as_any()
+                .downcast_ref::<crate::dataaccelerator::upsert_dedup::UpsertDedupTableProvider>()
+            {
+                current = dedup.inner();
+                continue;
+            }
+            if let Some(indexed) = current
+                .as_any()
+                .downcast_ref::<runtime_datafusion_index::IndexedTableProvider>()
+            {
+                current = indexed.get_underlying_ref();
+                continue;
+            }
+            return None;
+        }
+    }
+
+    /// Warn once per table when the CDC apply takes the synchronous fallback for
+    /// a Cayenne-engine dataset — i.e. [`Self::cayenne_accelerator`] could not
+    /// unwrap the inner provider through its wrappers, so pipelined finalization
+    /// is silently disabled. For non-Cayenne accelerators the synchronous path is
+    /// expected, so this stays quiet.
+    #[cfg(not(windows))]
+    fn warn_if_cayenne_cdc_synchronous_fallback(&self) {
+        // Mirrors the per-engine-module `SPICE_ACCELERATOR_METADATA_KEY` (defined
+        // privately in each accelerator module); the accelerator's schema
+        // metadata carries the engine name.
+        const ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
+        let is_cayenne = self
+            .accelerator
+            .schema()
+            .metadata()
+            .get(ACCELERATOR_METADATA_KEY)
+            .map(String::as_str)
+            == Some("cayenne");
+        if !is_cayenne {
+            return;
+        }
+        static WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        let first_for_table = WARNED
+            .lock()
+            .map(|mut set| set.insert(self.dataset_name.clone()))
+            .unwrap_or(false);
+        if first_for_table {
+            tracing::warn!(
+                dataset = %self.dataset_name,
+                "Cayenne CDC fell back to the synchronous write path: cayenne_accelerator() could not unwrap the inner CayenneTableProvider through its provider wrappers. Pipelined finalization (backgrounded publish, no blocking apply_on_conflict_deletions) is DISABLED for this table — an unrecognized provider wrapper likely needs peeling in cayenne_accelerator()."
+            );
+        }
     }
 
     async fn process_truncate(
