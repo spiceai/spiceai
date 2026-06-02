@@ -26,14 +26,7 @@ updates:
     # See https://github.com/dependabot/dependabot-core/issues/6704
     directories:
       - '/'
-      - '/.github/actions/check-code-changes'
-      - '/.github/actions/setup-adbc-bigquery'
-      - '/.github/actions/setup-nextest'
-      - '/.github/actions/build-testoperator'
-      - '/.github/actions/build-spicepod-validator'
-      - '/.github/actions/build-spidapter'
-      - '/.github/actions/build-spiced'
-      - '/.github/actions/aws-authorize'
+      - '/.github/actions/*'
     schedule:
       interval: 'weekly'
     labels:
