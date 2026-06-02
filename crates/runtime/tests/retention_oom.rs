@@ -281,9 +281,7 @@ async fn wait_for_row_count(
 
     Err(anyhow::anyhow!(
         "Timed out after {timeout:?} waiting for `{sql}` to return {expected_rows}; last row count: {}",
-        last_rows
-            .map(|rows| rows.to_string())
-            .unwrap_or_else(|| "<none>".to_string())
+        last_rows.map_or_else(|| "<none>".to_string(), |rows| rows.to_string())
     ))
 }
 
