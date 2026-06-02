@@ -181,7 +181,7 @@ pub(crate) async fn launch_mongodb_ec2(
 
 /// Build the cloud-init user-data script that installs and configures `MongoDB`.
 ///
-/// MongoDB is started as a single-node replica set (`rs0`) so that Change Streams
+/// `MongoDB` is started as a single-node replica set (`rs0`) so that Change Streams
 /// are available. The replica set member is explicitly set to `localhost:27017`
 /// so that the connection URI the caller uses (`localhost`) matches the RS member
 /// address and change stream resume tokens work correctly.
@@ -199,12 +199,12 @@ PUBLIC_IP=$(curl -s --max-time 10 http://169.254.169.254/latest/meta-data/public
 apt-get update -y
 apt-get install -y curl gnupg
 
-# Install MongoDB 7.0
-curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc \
-    | gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg
-echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] \
-    https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" \
-    > /etc/apt/sources.list.d/mongodb-org-7.0.list
+# Install MongoDB 8.0 (required for Client::bulk_write support)
+curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc \
+    | gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] \
+    https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/8.0 multiverse" \
+    > /etc/apt/sources.list.d/mongodb-org-8.0.list
 apt-get update -y
 apt-get install -y mongodb-org
 

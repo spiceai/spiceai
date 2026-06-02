@@ -14,7 +14,9 @@
 
 use std::collections::HashMap;
 
-use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode, RefreshOnStartup, ZeroResultsAction};
+use spicepod::acceleration::{
+    Acceleration, Mode, OnConflictBehavior, RefreshMode,
+};
 use spicepod::component::ComponentOrReference;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{Runtime, TelemetryConfig};
@@ -32,8 +34,8 @@ pub(crate) fn generate_mongodb_spicepod(
     run_id: &Uuid,
     uri: &str,
     datasets: &HashMap<String, DatasetConfig>,
-    acceleration_engine: &str,
-    auto_load_complete: bool,
+    _acceleration_engine: &str,
+    _auto_load_complete: bool,
 ) -> SpicepodDefinition {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
@@ -57,28 +59,21 @@ pub(crate) fn generate_mongodb_spicepod(
             let sep = if uri.contains('?') { "&" } else { "?" };
             format!("{uri}{sep}tls=false")
         };
-        let mut param_map = HashMap::from([
-            ("mongodb_connection_string".to_string(), conn_str),
-        ]);
+        let param_map = HashMap::from([("mongodb_connection_string".to_string(), conn_str)]);
 
         // MongoDB change stream delete events only carry `_id`, so we use `_id` as
         // the acceleration primary key. The sink computes `_id` from the TPC-H PK columns.
         let primary_key = Some("_id".to_string());
-        let on_conflict =
-            HashMap::from([("_id".to_string(), OnConflictBehavior::Upsert)]);
+        let on_conflict = HashMap::from([("_id".to_string(), OnConflictBehavior::Upsert)]);
 
         // Use just the collection name in `from:` — database comes from the connection_string URI.
         // Using `db.collection` in `from:` can conflict with the URI's database and break CDC.
-        let mut dataset = Dataset::new(
-            format!("mongodb:{dataset_name}"),
-            dataset_name.as_str(),
-        );
+        let mut dataset = Dataset::new(format!("mongodb:{dataset_name}"), dataset_name.as_str());
         dataset.params = Some(spicepod::param::Params::from_string_map(param_map));
 
         // Add `_id` as the first column (string key the sink writes), then all data columns.
-        let mut columns: Vec<Column> = vec![
-            Column::new("_id").with_type("Utf8").with_nullable(false),
-        ];
+        let mut columns: Vec<Column> =
+            vec![Column::new("_id").with_type("Utf8").with_nullable(false)];
         columns.extend(dataset_config.schema.fields().iter().map(|field| {
             Column::new(field.name())
                 .with_type(mongodb_arrow_type_to_spicepod_str(field.data_type()))
