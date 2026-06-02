@@ -1670,7 +1670,7 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
 
             assert!(
                 refreshed_fetched_at > initial_fetched_at,
-                "fetched_at should be updated after background refresh (initial: {initial_fetched_at}, refreshed: {refreshed_fetched_at})"
+                "_fetched_at should be updated after background refresh (initial: {initial_fetched_at}, refreshed: {refreshed_fetched_at})"
             );
             eprintln!("TEST: Step 4 complete - cache refreshed in background (new _fetched_at: {}, delta: {} ns)",
                 refreshed_fetched_at,
@@ -1758,7 +1758,7 @@ async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyho
             let df = runtime
                 .datafusion()
                 .ctx
-                .sql("SELECT content, fetched_at FROM tvmaze WHERE request_query = 'q=lauren'")
+                .sql("SELECT content, _fetched_at FROM tvmaze WHERE request_query = 'q=lauren'")
                 .await?;
             let results = df.clone().collect().await?;
             assert_eq!(results.len(), 1, "Should have 1 batch");
