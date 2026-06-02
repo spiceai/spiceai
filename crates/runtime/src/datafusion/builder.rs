@@ -1422,8 +1422,7 @@ mod tests {
             tokio::runtime::Handle::current(),
             None,
         );
-        let compaction_env =
-            build_compaction_runtime_env(256 * 1024 * 1024, &query_env, None);
+        let compaction_env = build_compaction_runtime_env(256 * 1024 * 1024, &query_env, None);
 
         // The carved compaction pool is a DISTINCT pool, so compaction memory is
         // accounted and bounded separately and cannot starve queries.

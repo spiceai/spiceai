@@ -289,9 +289,12 @@ impl RuntimeBuilder {
         );
         let compaction_memory_fraction = (cayenne_configured && dedicated_thread_pools_enabled)
             .then(|| {
-                parse_f64_runtime_param(&spicepod_rt.params, CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM)
-                    .unwrap_or(DEFAULT_COMPACTION_MEMORY_FRACTION)
-                    .clamp(0.05, 0.9)
+                parse_f64_runtime_param(
+                    &spicepod_rt.params,
+                    CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM,
+                )
+                .unwrap_or(DEFAULT_COMPACTION_MEMORY_FRACTION)
+                .clamp(0.05, 0.9)
             });
 
         #[cfg(not(windows))]

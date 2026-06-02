@@ -77,6 +77,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
@@ -99,7 +100,6 @@ use runtime_acceleration::snapshot::AccelerationLayout;
     not(windows)
 ))]
 use runtime_acceleration::snapshot::SnapshotManager;
-use datafusion::execution::runtime_env::RuntimeEnv;
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::{
     query_engine::Error as QueryEngineError, schema_provider::SpiceSchemaProvider,
@@ -1360,9 +1360,7 @@ impl DataFusion {
             // lost the race. Drop this redundant runtime WITHOUT injecting its
             // handle into Cayenne: Cayenne must reference the runtime we actually
             // retained, never one that is about to be dropped here.
-            tracing::debug!(
-                "Dedicated compaction runtime already set; dropping the redundant one"
-            );
+            tracing::debug!("Dedicated compaction runtime already set; dropping the redundant one");
             return;
         }
         // Inject the dedicated runtime handle and the carved compaction memory

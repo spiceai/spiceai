@@ -6964,7 +6964,8 @@ impl CayenneTableProvider {
 
         if let Some(trigger) = maintenance_trigger {
             self.log_snapshot_maintenance_trigger(trigger);
-            self.rewrite_current_snapshot_for_compaction_tracked().await?;
+            self.rewrite_current_snapshot_for_compaction_tracked()
+                .await?;
             return Ok(true);
         }
 
@@ -7000,7 +7001,8 @@ impl CayenneTableProvider {
         // is used for tracing/metrics. The rewrite intentionally consolidates
         // the full current snapshot so compaction preserves a single coherent
         // snapshot boundary instead of mixing old and newly written file sets.
-        self.rewrite_current_snapshot_for_compaction_tracked().await?;
+        self.rewrite_current_snapshot_for_compaction_tracked()
+            .await?;
 
         tracing::info!(
             target: "cayenne::compaction",
@@ -7201,7 +7203,11 @@ impl CayenneTableProvider {
         let result = self.rewrite_current_snapshot_for_compaction().await;
 
         let table = self.table_metadata.table_name.to_string();
-        let result_label = if result.is_ok() { "completed" } else { "failed" };
+        let result_label = if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        };
         telemetry::track_cayenne_compaction_duration(
             pass_start.elapsed(),
             &[
