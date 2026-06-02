@@ -53,13 +53,13 @@ use sources::dynamodb::{
     generate_dynamodb_spicepod,
 };
 use sources::mongodb::generate_mongodb_spicepod;
-use sources::postgres_wal::{
-    PgConfig, generate_postgres_wal_spicepod, pg_create_table_ddl, pg_error_message,
-    setup_postgres_for_wal, teardown_postgres, tpch_schema_name,
-};
 use sources::postgres_debezium::{
     generate_postgres_debezium_spicepod, register_debezium_postgres_connector,
     setup_postgres_for_debezium,
+};
+use sources::postgres_wal::{
+    PgConfig, generate_postgres_wal_spicepod, pg_create_table_ddl, pg_error_message,
+    setup_postgres_for_wal, teardown_postgres, tpch_schema_name,
 };
 
 const POST_SETUP_SQL_MAX_RETRIES: u64 = 5;
@@ -1314,7 +1314,11 @@ async fn write_local_spicepod(
 ) -> anyhow::Result<PathBuf> {
     let spicepod_yaml = serialize_spicepod(spicepod)?;
     let spicepod_path = working_dir.join("spicepod.yaml");
-    eprintln!("[stdio] Writing local spicepod ({} bytes) to {}", spicepod_yaml.len(), spicepod_path.display());
+    eprintln!(
+        "[stdio] Writing local spicepod ({} bytes) to {}",
+        spicepod_yaml.len(),
+        spicepod_path.display()
+    );
     tokio::fs::write(&spicepod_path, spicepod_yaml).await?;
     Ok(spicepod_path)
 }

@@ -243,7 +243,11 @@ pub(crate) fn pg_create_table_ddl(
 
     let pk_cols = &dataset.primary_key_columns;
     if !pk_cols.is_empty() {
-        let pk_list = pk_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+        let pk_list = pk_cols
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
         cols.push(format!("PRIMARY KEY ({pk_list})"));
     }
 
@@ -302,7 +306,11 @@ pub(crate) async fn setup_postgres_for_wal(
 
     // Drop and recreate tables to ensure clean state on each benchmark run.
     for (name, dataset) in datasets {
-        let drop_ddl = format!("DROP TABLE IF EXISTS {}.{}", quote_ident(&pg.schema), quote_ident(name));
+        let drop_ddl = format!(
+            "DROP TABLE IF EXISTS {}.{}",
+            quote_ident(&pg.schema),
+            quote_ident(name)
+        );
         eprintln!("[stdio] pg WAL setup: {drop_ddl}");
         client.execute(&drop_ddl, &[]).await.map_err(|e| {
             anyhow::anyhow!("failed to drop table '{name}': {}", pg_error_message(&e))
@@ -351,7 +359,11 @@ pub(crate) async fn teardown_postgres(
     let client = pg.connect().await?;
 
     for name in datasets.keys() {
-        let drop_table = format!("DROP TABLE IF EXISTS {}.{}", quote_ident(&pg.schema), quote_ident(name));
+        let drop_table = format!(
+            "DROP TABLE IF EXISTS {}.{}",
+            quote_ident(&pg.schema),
+            quote_ident(name)
+        );
         eprintln!("[stdio] pg teardown: {drop_table}");
         client.execute(&drop_table, &[]).await.map_err(|e| {
             anyhow::anyhow!("failed to drop table '{name}': {}", pg_error_message(&e))
