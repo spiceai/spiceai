@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q65"
 ---
-+--------------+-------------+---------+-----------------+------------------+---------------------+
-| s_store_name | i_item_desc | revenue | i_current_price | i_wholesale_cost | i_brand             |
-+--------------+-------------+---------+-----------------+------------------+---------------------+
-| able         | A           | 4.54    | 0.51            | 0.18             | exportiamalg #1     |
-| able         | A           | 6.96    | 6.64            | 2.19             | maxinameless #7     |
-| able         | A           | 10.53   | 3.54            | 1.23             | edu packscholar #1  |
-| able         | A           | 0.00    | 1.81            | 0.66             | edu packexporti #1  |
-| able         | A           | 3.21    | 3.29            | 2.79             | amalgamalg #2       |
-| able         | A           | 6.92    | 3.50            | 1.26             | edu packedu pack #1 |
-| able         | A           | 8.32    | 2.71            | 2.19             | amalgscholar #1     |
-| able         | A           | 2.35    | 8.44            | 2.70             | exportischolar #1   |
-| able         | A           | 0.91    | 1.11            | 0.87             | corpbrand #1        |
-| able         | A           | 5.05    | 1.05            | 0.86             | amalgamalg #1       |
-+--------------+-------------+---------+-----------------+------------------+---------------------+
++--------------+-------------+---------+-----------------+------------------+--------------------+
+| s_store_name | i_item_desc | revenue | i_current_price | i_wholesale_cost | i_brand            |
++--------------+-------------+---------+-----------------+------------------+--------------------+
+| able         | A           | 2.35    | 8.44            | 2.70             | exportischolar #1  |
+| able         | A           | 7.47    | 4.79            | 2.63             | exportischolar #1  |
+| able         | A           | 6.96    | 6.64            | 2.19             | maxinameless #7    |
+| able         | A           | 8.85    | 3.97            | 1.66             | amalgexporti #2    |
+| able         | A           | 3.64    | 3.54            | 1.23             | edu packscholar #1 |
+| able         | A           | 2.23    | 2.71            | 2.19             | amalgscholar #1    |
+| able         | A           | 0.00    | 3.25            | 2.89             | importoamalg #1    |
+| able         | A           | 0.91    | 1.11            | 0.87             | corpbrand #1       |
+| able         | A           | 0.00    | 1.81            | 0.66             | edu packexporti #1 |
+| able         | A           | 9.71    | 3.35            | 2.34             | edu packexporti #2 |
++--------------+-------------+---------+-----------------+------------------+--------------------+

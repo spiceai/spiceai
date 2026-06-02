@@ -5,8 +5,8 @@ description: "Query: tpcds_q71"
 +----------+---------------------+--------+----------+-----------+
 | brand_id | brand               | t_hour | t_minute | ext_price |
 +----------+---------------------+--------+----------+-----------+
-| 1001001  | univamalgamalg #16  | 17     | 45       |           |
 | 1001001  | amalgunivamalg #13  | 17     | 24       |           |
+| 1001001  | univamalgamalg #16  | 17     | 45       |           |
 | 1001001  | amalgamalg #2       | 19     | 39       |           |
 | 1001001  | amalgscholar #2     | 19     | 18       |           |
 | 1001001  | amalgamalg #2       | 17     | 43       |           |
