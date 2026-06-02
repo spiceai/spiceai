@@ -87,17 +87,17 @@ impl PartitionAssignmentTask {
         tokio::select! {
             () = self.cancel.cancelled() => {
                 tracing::info!("Partition metadata initialization cancelled during shutdown");
-                self.status.update_component_status("partition_metadata", &ComponentStatus::error_with_message("Cancelled during shutdown"));
+                self.status.update_component_status("partition_metadata", ComponentStatus::error_with_message("Cancelled during shutdown"));
                 return Ok(());
             }
             result = self.initialize_metadata() => {
                 match result {
                     Ok(()) => {
-                        self.status.update_component_status("partition_metadata", &ComponentStatus::Ready);
+                        self.status.update_component_status("partition_metadata", ComponentStatus::Ready);
                     }
                     Err(err) => {
                         tracing::warn!("Failed to initialize partition metadata: {err}");
-                        self.status.update_component_status("partition_metadata", &ComponentStatus::error_with_message(format!("Failed to initialize: {err}")));
+                        self.status.update_component_status("partition_metadata", ComponentStatus::error_with_message(format!("Failed to initialize: {err}")));
                     }
                 }
             }
@@ -118,7 +118,7 @@ impl PartitionAssignmentTask {
 
                     match self.run_assignment_cycle().await {
                         Ok(()) => {
-                            self.status.update_component_status("partition_metadata", &ComponentStatus::Ready);
+                            self.status.update_component_status("partition_metadata", ComponentStatus::Ready);
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -127,7 +127,7 @@ impl PartitionAssignmentTask {
                             );
                             self.status.update_component_status(
                                 "partition_metadata",
-                                &ComponentStatus::error_with_message(format!(
+                                ComponentStatus::error_with_message(format!(
                                     "Assignment cycle failed: {e}"
                                 )),
                             );
