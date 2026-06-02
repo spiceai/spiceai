@@ -1372,7 +1372,11 @@ impl DataFusion {
             cayenne::set_compaction_runtime_env(Arc::clone(env));
         }
         if let Some(bytes) = self.compaction_memory_bytes {
-            telemetry::track_cayenne_compaction_memory_pool_bytes(bytes, &[]);
+            // The compaction metrics (incl. the pool-size gauge) are registered by
+            // the binary AFTER metrics init via
+            // `telemetry::register_cayenne_compaction_metrics`. This runs before the
+            // Prometheus meter exists, so emitting the gauge here would bind it to
+            // the noop meter and it would never reach `/metrics`.
             tracing::info!(
                 compaction_memory_bytes = bytes,
                 "Dedicated Cayenne compaction runtime active (carved memory pool + low-priority worker threads)"
@@ -1393,6 +1397,14 @@ impl DataFusion {
     #[must_use]
     pub fn compaction_runtime_env(&self) -> Option<&Arc<RuntimeEnv>> {
         self.compaction_runtime_env.as_ref()
+    }
+
+    /// Returns the size in bytes of the carved compaction memory pool, if one was
+    /// carved. Used by the binary to register/publish the compaction pool-size
+    /// metric after the Prometheus meter is installed.
+    #[must_use]
+    pub fn compaction_memory_pool_bytes(&self) -> Option<u64> {
+        self.compaction_memory_bytes
     }
 
     async fn get_table_provider(

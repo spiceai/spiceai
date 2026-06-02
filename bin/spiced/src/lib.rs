@@ -743,6 +743,16 @@ pub async fn run(args: Args) -> Result<()> {
             metric_prefix,
         )
         .context(UnableToInitializeMetricsSnafu)?;
+
+        // Metrics are now initialized (the Prometheus meter provider is installed).
+        // Register the Cayenne compaction instruments so the carved pool-size gauge
+        // plus the duration + exhaustion metrics appear in `/metrics` from startup.
+        // The compaction runtime is set up earlier (before metrics init), so the
+        // instruments must be (re)bound to the real meter here rather than at carve
+        // time — otherwise they'd bind to the early noop meter and never export.
+        if let Some(bytes) = rt.datafusion().compaction_memory_pool_bytes() {
+            telemetry::register_cayenne_compaction_metrics(bytes);
+        }
     }
 
     let (tls_config, client_auth_mode) = tls::load_tls_config(
