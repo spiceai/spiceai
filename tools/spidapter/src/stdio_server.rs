@@ -453,7 +453,7 @@ impl Handler for SpidapterHandler {
                 };
 
                 let pg = pg.ok_or_else(|| {
-                    "FederatedStorage::Postgres requires PG_HOST or EC2 provisioning".to_string()
+                    "postgres-wal storage requires PG_HOST (or EC2 provisioning via --storage-compute ec2)".to_string()
                 })?;
 
                 setup_postgres_for_wal(&pg, &datasets)
