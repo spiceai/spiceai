@@ -272,10 +272,6 @@ where
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::unwrap_used,
-    reason = "tests use unwrap for concise assertions"
-)]
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
@@ -714,13 +710,13 @@ list:
         }
 
         let yaml = "display-name: test";
-        let config: Config = from_str(yaml).unwrap();
+        let config: Config = from_str(yaml).expect("should parse renamed field");
         assert_eq!(config.name, "test");
 
         let config = Config {
             name: "example".into(),
         };
-        let yaml = to_string(&config).unwrap();
+        let yaml = to_string(&config).expect("should serialize renamed field");
         assert!(yaml.contains("display-name:"));
     }
 
@@ -734,12 +730,12 @@ list:
 
         // Test original field name
         let yaml = "name: test";
-        let config: Config = from_str(yaml).unwrap();
+        let config: Config = from_str(yaml).expect("should parse original field name");
         assert_eq!(config.name, "test");
 
         // Test alias
         let yaml = "display_name: test";
-        let config: Config = from_str(yaml).unwrap();
+        let config: Config = from_str(yaml).expect("should parse aliased field name");
         assert_eq!(config.name, "test");
     }
 
@@ -761,7 +757,7 @@ list:
 name: test
 value: 42
 ";
-        let outer: Outer = from_str(yaml).unwrap();
+        let outer: Outer = from_str(yaml).expect("should parse flattened struct");
         assert_eq!(outer.name, "test");
         assert_eq!(outer.inner.value, 42);
     }
@@ -777,7 +773,7 @@ value: 42
 anchor_value: &my_anchor hello
 alias_value: *my_anchor
 ";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse anchor and alias");
         assert_eq!(
             value.get("anchor_value").and_then(|v| v.as_str()),
             Some("hello")
@@ -800,10 +796,10 @@ development:
   database: dev_db
   settings: *defaults
 ";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse anchor mapping");
 
         // Check defaults
-        let defaults = value.get("defaults").unwrap();
+        let defaults = value.get("defaults").expect("defaults key should exist");
         assert_eq!(
             defaults.get("adapter").and_then(|v| v.as_str()),
             Some("postgres")
@@ -814,7 +810,11 @@ development:
         );
 
         // Check that alias resolves correctly
-        let settings = value.get("development").unwrap().get("settings").unwrap();
+        let settings = value
+            .get("development")
+            .expect("development key should exist")
+            .get("settings")
+            .expect("settings key should exist");
         assert_eq!(
             settings.get("adapter").and_then(|v| v.as_str()),
             Some("postgres")
@@ -836,15 +836,18 @@ colors: &colors
 
 primary_colors: *colors
 ";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse anchor sequence");
 
-        let colors = value.get("colors").and_then(|v| v.as_sequence()).unwrap();
+        let colors = value
+            .get("colors")
+            .and_then(|v| v.as_sequence())
+            .expect("colors should be a sequence");
         assert_eq!(colors.len(), 3);
 
         let primary = value
             .get("primary_colors")
             .and_then(|v| v.as_sequence())
-            .unwrap();
+            .expect("primary_colors should be a sequence");
         assert_eq!(primary.len(), 3);
         assert_eq!(primary[0].as_str(), Some("red"));
     }
@@ -858,7 +861,7 @@ second: &second 2
 ref_first: *first
 ref_second: *second
 ";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse multiple anchors");
         assert_eq!(
             value.get("first").and_then(super::value::Value::as_i64),
             Some(1)
@@ -892,8 +895,11 @@ refs:
   - *item1
   - *item2
 ";
-        let value: Value = from_str(yaml).unwrap();
-        let refs = value.get("refs").and_then(|v| v.as_sequence()).unwrap();
+        let value: Value = from_str(yaml).expect("should parse anchors in sequence");
+        let refs = value
+            .get("refs")
+            .and_then(|v| v.as_sequence())
+            .expect("refs should be a sequence");
         assert_eq!(refs[0].get("name").and_then(|v| v.as_str()), Some("first"));
         assert_eq!(refs[1].get("name").and_then(|v| v.as_str()), Some("second"));
     }
@@ -911,8 +917,10 @@ development:
   <<: *defaults
   database: dev_db
 ";
-        let value: Value = from_str(yaml).unwrap();
-        let dev = value.get("development").unwrap();
+        let value: Value = from_str(yaml).expect("should parse merge key");
+        let dev = value
+            .get("development")
+            .expect("development key should exist");
 
         // Check that merge happened
         assert_eq!(dev.get("database").and_then(|v| v.as_str()), Some("dev_db"));
@@ -935,8 +943,10 @@ production:
   <<: *defaults
   host: prod.example.com
 ";
-        let value: Value = from_str(yaml).unwrap();
-        let prod = value.get("production").unwrap();
+        let value: Value = from_str(yaml).expect("should parse merge key override");
+        let prod = value
+            .get("production")
+            .expect("production key should exist");
 
         // adapter should come from merge
         assert_eq!(
@@ -964,8 +974,8 @@ combined:
   <<: [*base, *extra]
   value: 42
 ";
-        let value: Value = from_str(yaml).unwrap();
-        let combined = value.get("combined").unwrap();
+        let value: Value = from_str(yaml).expect("should parse multiple merge sources");
+        let combined = value.get("combined").expect("combined key should exist");
 
         assert_eq!(combined.get("name").and_then(|v| v.as_str()), Some("base"));
         assert_eq!(
@@ -993,17 +1003,32 @@ null1: null
 null2: ~
 null3:
 ";
-        let value: Value = from_str(yaml).unwrap();
-        assert!(value.get("null1").unwrap().is_null());
-        assert!(value.get("null2").unwrap().is_null());
-        assert!(value.get("null3").unwrap().is_null());
+        let value: Value = from_str(yaml).expect("should parse null variations");
+        assert!(
+            value
+                .get("null1")
+                .expect("null1 key should exist")
+                .is_null()
+        );
+        assert!(
+            value
+                .get("null2")
+                .expect("null2 key should exist")
+                .is_null()
+        );
+        assert!(
+            value
+                .get("null3")
+                .expect("null3 key should exist")
+                .is_null()
+        );
 
         // Verify that capitalized versions are strings in YAML 1.2
         let yaml_11_style = r"
 null_cap: Null
 null_upper: NULL
 ";
-        let value: Value = from_str(yaml_11_style).unwrap();
+        let value: Value = from_str(yaml_11_style).expect("should parse capitalized null strings");
         // These are strings in YAML 1.2, not null
         assert_eq!(value.get("null_cap").and_then(|v| v.as_str()), Some("Null"));
         assert_eq!(
@@ -1024,7 +1049,7 @@ false1: false
 false2: False
 false3: FALSE
 ";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse boolean variations");
 
         // True variations (case-insensitive in yaml-rust2)
         assert_eq!(
@@ -1061,7 +1086,7 @@ no_val: no
 on_val: on
 off_val: off
 ";
-        let value: Value = from_str(yaml_11_style).unwrap();
+        let value: Value = from_str(yaml_11_style).expect("should parse YAML 1.1 bool strings");
         assert_eq!(value.get("yes_val").and_then(|v| v.as_str()), Some("yes"));
         assert_eq!(value.get("no_val").and_then(|v| v.as_str()), Some("no"));
         assert_eq!(value.get("on_val").and_then(|v| v.as_str()), Some("on"));
@@ -1077,7 +1102,7 @@ negative: -17
 hex: 0x2A
 octal: 0o52
 ";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse integer formats");
         assert_eq!(
             value.get("decimal").and_then(super::value::Value::as_i64),
             Some(42)
@@ -1107,13 +1132,13 @@ infinity: .inf
 neg_infinity: -.inf
 not_a_number: .nan
 ";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse float formats");
 
         assert!(
             (value
                 .get("float1")
                 .and_then(super::value::Value::as_f64)
-                .unwrap()
+                .expect("float1 should be a float")
                 - 3.15)
                 .abs()
                 < 0.001
@@ -1122,7 +1147,7 @@ not_a_number: .nan
             (value
                 .get("float2")
                 .and_then(super::value::Value::as_f64)
-                .unwrap()
+                .expect("float2 should be a float")
                 - (-0.5))
                 .abs()
                 < 0.001
@@ -1131,7 +1156,7 @@ not_a_number: .nan
             (value
                 .get("scientific")
                 .and_then(super::value::Value::as_f64)
-                .unwrap()
+                .expect("scientific should be a float")
                 - 1200.0)
                 .abs()
                 < 0.001
@@ -1140,28 +1165,28 @@ not_a_number: .nan
             value
                 .get("infinity")
                 .and_then(super::value::Value::as_f64)
-                .unwrap()
+                .expect("infinity should be a float")
                 .is_infinite()
         );
         assert!(
             value
                 .get("neg_infinity")
                 .and_then(super::value::Value::as_f64)
-                .unwrap()
+                .expect("neg_infinity should be a float")
                 .is_infinite()
         );
         assert!(
             value
                 .get("neg_infinity")
                 .and_then(super::value::Value::as_f64)
-                .unwrap()
+                .expect("neg_infinity should be a float")
                 .is_sign_negative()
         );
         assert!(
             value
                 .get("not_a_number")
                 .and_then(super::value::Value::as_f64)
-                .unwrap()
+                .expect("not_a_number should be a float")
                 .is_nan()
         );
     }
@@ -1178,7 +1203,7 @@ double: "hello world"
 single_escape: 'it''s a test'
 double_escape: "line1\nline2"
 "#;
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse quoted strings");
         assert_eq!(
             value.get("single").and_then(|v| v.as_str()),
             Some("hello world")
@@ -1206,8 +1231,11 @@ literal: |
   Line 2
   Line 3
 ";
-        let value: Value = from_str(yaml).unwrap();
-        let literal = value.get("literal").and_then(|v| v.as_str()).unwrap();
+        let value: Value = from_str(yaml).expect("should parse literal block scalar");
+        let literal = value
+            .get("literal")
+            .and_then(|v| v.as_str())
+            .expect("literal should be a string");
         assert!(literal.contains("Line 1"));
         assert!(literal.contains("Line 2"));
         assert!(literal.contains("Line 3"));
@@ -1223,8 +1251,11 @@ folded: >
   line that will be
   folded into one.
 ";
-        let value: Value = from_str(yaml).unwrap();
-        let folded = value.get("folded").and_then(|v| v.as_str()).unwrap();
+        let value: Value = from_str(yaml).expect("should parse folded block scalar");
+        let folded = value
+            .get("folded")
+            .and_then(|v| v.as_str())
+            .expect("folded should be a string");
         // Folded should join lines with spaces
         assert!(folded.contains("This is a long"));
     }
@@ -1241,10 +1272,19 @@ keep: |+
   text
 
 ";
-        let value: Value = from_str(yaml).unwrap();
-        let strip = value.get("strip").and_then(|v| v.as_str()).unwrap();
-        let clip = value.get("clip").and_then(|v| v.as_str()).unwrap();
-        let keep = value.get("keep").and_then(|v| v.as_str()).unwrap();
+        let value: Value = from_str(yaml).expect("should parse block chomping");
+        let strip = value
+            .get("strip")
+            .and_then(|v| v.as_str())
+            .expect("strip should be a string");
+        let clip = value
+            .get("clip")
+            .and_then(|v| v.as_str())
+            .expect("clip should be a string");
+        let keep = value
+            .get("keep")
+            .and_then(|v| v.as_str())
+            .expect("keep should be a string");
 
         // Strip removes all trailing newlines
         assert!(!strip.ends_with('\n'));
@@ -1265,13 +1305,25 @@ keep: |+
 flow: [1, 2, 3, 4, 5]
 nested: [[1, 2], [3, 4]]
 ";
-        let value: Value = from_str(yaml).unwrap();
-        let flow = value.get("flow").and_then(|v| v.as_sequence()).unwrap();
+        let value: Value = from_str(yaml).expect("should parse flow sequence");
+        let flow = value
+            .get("flow")
+            .and_then(|v| v.as_sequence())
+            .expect("flow should be a sequence");
         assert_eq!(flow.len(), 5);
 
-        let nested = value.get("nested").and_then(|v| v.as_sequence()).unwrap();
+        let nested = value
+            .get("nested")
+            .and_then(|v| v.as_sequence())
+            .expect("nested should be a sequence");
         assert_eq!(nested.len(), 2);
-        assert_eq!(nested[0].as_sequence().unwrap().len(), 2);
+        assert_eq!(
+            nested[0]
+                .as_sequence()
+                .expect("nested[0] should be a sequence")
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -1280,19 +1332,19 @@ nested: [[1, 2], [3, 4]]
 flow: {name: John, age: 30}
 nested: {outer: {inner: value}}
 ";
-        let value: Value = from_str(yaml).unwrap();
-        let flow = value.get("flow").unwrap();
+        let value: Value = from_str(yaml).expect("should parse flow mapping");
+        let flow = value.get("flow").expect("flow key should exist");
         assert_eq!(flow.get("name").and_then(|v| v.as_str()), Some("John"));
         assert_eq!(
             flow.get("age").and_then(super::value::Value::as_i64),
             Some(30)
         );
 
-        let nested = value.get("nested").unwrap();
+        let nested = value.get("nested").expect("nested key should exist");
         assert_eq!(
             nested
                 .get("outer")
-                .unwrap()
+                .expect("outer key should exist")
                 .get("inner")
                 .and_then(|v| v.as_str()),
             Some("value")
@@ -1309,8 +1361,11 @@ config:
   list: [a, b, c]
   map: {key: value}
 ";
-        let value: Value = from_str(yaml).unwrap();
-        let items = value.get("items").and_then(|v| v.as_sequence()).unwrap();
+        let value: Value = from_str(yaml).expect("should parse mixed flow and block");
+        let items = value
+            .get("items")
+            .and_then(|v| v.as_sequence())
+            .expect("items should be a sequence");
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].get("name").and_then(|v| v.as_str()), Some("item1"));
     }
@@ -1323,7 +1378,7 @@ config:
   - b
 : value
 ";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse complex keys");
         assert!(value.is_mapping());
     }
 
@@ -1339,7 +1394,7 @@ config:
 string_num: !!str 123
 float_val: !!float 42
 ";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse explicit type tags");
         // !!str should make it a string
         assert_eq!(
             value.get("string_num").and_then(|v| v.as_str()),
@@ -1348,7 +1403,7 @@ float_val: !!float 42
         // !!float should make it a float
         let float_val = value.get("float_val").and_then(super::value::Value::as_f64);
         assert!(float_val.is_some());
-        assert!((float_val.unwrap() - 42.0).abs() < 0.001);
+        assert!((float_val.expect("float_val should be a float") - 42.0).abs() < 0.001);
     }
 
     // ============================================================
@@ -1365,9 +1420,12 @@ list:
   - item1 # comment
   - item2
 ";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse yaml with comments");
         assert_eq!(value.get("key").and_then(|v| v.as_str()), Some("value"));
-        let list = value.get("list").and_then(|v| v.as_sequence()).unwrap();
+        let list = value
+            .get("list")
+            .and_then(|v| v.as_sequence())
+            .expect("list should be a sequence");
         assert_eq!(list.len(), 2);
     }
 
@@ -1382,16 +1440,21 @@ empty_string: ""
 empty_array: []
 empty_map: {}
 "#;
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse empty values");
         assert_eq!(value.get("empty_string").and_then(|v| v.as_str()), Some(""));
         assert!(
             value
                 .get("empty_array")
                 .and_then(|v| v.as_sequence())
-                .unwrap()
+                .expect("empty_array should be a sequence")
                 .is_empty()
         );
-        assert!(value.get("empty_map").unwrap().is_mapping());
+        assert!(
+            value
+                .get("empty_map")
+                .expect("empty_map key should exist")
+                .is_mapping()
+        );
     }
 
     #[test]
@@ -1402,7 +1465,7 @@ hash: "has # hash"
 bracket: "has [bracket]"
 brace: "has {brace}"
 "#;
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse special characters in strings");
         assert_eq!(
             value.get("colon").and_then(|v| v.as_str()),
             Some("has: colon")
@@ -1428,7 +1491,7 @@ emoji: 🎉
 chinese: 中文
 mixed: "Hello 世界 🌍"
 "#;
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse unicode");
         assert_eq!(value.get("emoji").and_then(|v| v.as_str()), Some("🎉"));
         assert_eq!(value.get("chinese").and_then(|v| v.as_str()), Some("中文"));
         assert_eq!(
@@ -1447,18 +1510,18 @@ level1:
         level5:
           value: deep
 ";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse deeply nested mapping");
         let deep = value
             .get("level1")
-            .unwrap()
+            .expect("level1 key should exist")
             .get("level2")
-            .unwrap()
+            .expect("level2 key should exist")
             .get("level3")
-            .unwrap()
+            .expect("level3 key should exist")
             .get("level4")
-            .unwrap()
+            .expect("level4 key should exist")
             .get("level5")
-            .unwrap()
+            .expect("level5 key should exist")
             .get("value");
         assert_eq!(deep.and_then(|v| v.as_str()), Some("deep"));
     }
@@ -1470,7 +1533,7 @@ large_int: 9223372036854775807
 large_neg: -9223372036854775808
 large_float: 1.7976931348623157e+308
 ";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse large numbers");
         assert_eq!(
             value.get("large_int").and_then(super::value::Value::as_i64),
             Some(i64::MAX)
@@ -1483,7 +1546,7 @@ large_float: 1.7976931348623157e+308
             value
                 .get("large_float")
                 .and_then(super::value::Value::as_f64)
-                .unwrap()
+                .expect("large_float should be a float")
                 > 1e300
         );
     }
@@ -1494,7 +1557,7 @@ large_float: 1.7976931348623157e+308
         let yaml = r"---
 key: value
 ...";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse document markers");
         assert_eq!(value.get("key").and_then(|v| v.as_str()), Some("value"));
     }
 
@@ -1508,11 +1571,11 @@ four_space:
     deeply:
         nested: value
 ";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse indentation variants");
         assert_eq!(
             value
                 .get("two_space")
-                .unwrap()
+                .expect("two_space key should exist")
                 .get("nested")
                 .and_then(|v| v.as_str()),
             Some("value")
@@ -1520,9 +1583,9 @@ four_space:
         assert_eq!(
             value
                 .get("four_space")
-                .unwrap()
+                .expect("four_space key should exist")
                 .get("deeply")
-                .unwrap()
+                .expect("deeply key should exist")
                 .get("nested")
                 .and_then(|v| v.as_str()),
             Some("value")
@@ -1549,10 +1612,10 @@ derived:
     <<: *config
     timeout: 60
 ";
-        let value: Value = from_str(yaml).unwrap();
-        let derived = value.get("derived").unwrap();
+        let value: Value = from_str(yaml).expect("should parse nested anchors and merges");
+        let derived = value.get("derived").expect("derived key should exist");
         assert_eq!(derived.get("name").and_then(|v| v.as_str()), Some("base"));
-        let config = derived.get("config").unwrap();
+        let config = derived.get("config").expect("config key should exist");
         assert_eq!(
             config.get("timeout").and_then(super::value::Value::as_i64),
             Some(60)
@@ -1574,11 +1637,11 @@ use1: *tmpl
 use2: *tmpl
 use3: *tmpl
 ";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse reused anchors");
         assert_eq!(
             value
                 .get("use1")
-                .unwrap()
+                .expect("use1 key should exist")
                 .get("key")
                 .and_then(|v| v.as_str()),
             Some("value")
@@ -1586,7 +1649,7 @@ use3: *tmpl
         assert_eq!(
             value
                 .get("use2")
-                .unwrap()
+                .expect("use2 key should exist")
                 .get("key")
                 .and_then(|v| v.as_str()),
             Some("value")
@@ -1594,7 +1657,7 @@ use3: *tmpl
         assert_eq!(
             value
                 .get("use3")
-                .unwrap()
+                .expect("use3 key should exist")
                 .get("key")
                 .and_then(|v| v.as_str()),
             Some("value")
@@ -1617,8 +1680,8 @@ second: &second
 merged:
   <<: [*first, *second]
 ";
-        let value: Value = from_str(yaml).unwrap();
-        let merged = value.get("merged").unwrap();
+        let value: Value = from_str(yaml).expect("should parse merge priority");
+        let merged = value.get("merged").expect("merged key should exist");
         // First anchor takes precedence for duplicate keys
         assert_eq!(
             merged.get("key").and_then(|v| v.as_str()),
@@ -1645,7 +1708,7 @@ merged:
 binary: !!binary |
   R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7
 ";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse binary data");
         // Binary data is typically returned as a string
         assert!(value.get("binary").is_some());
     }
@@ -1658,7 +1721,7 @@ date1: 2024-01-15
 date2: 2024-01-15T10:30:00Z
 date3: 2024-01-15 10:30:00 -05:00
 ";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse timestamps");
         // Timestamps are typically returned as strings in yaml-rust2
         assert!(value.get("date1").is_some());
         assert!(value.get("date2").is_some());
@@ -1676,7 +1739,7 @@ backslash: "path\\to\\file"
 quote: "say \"hello\""
 unicode: "smiley: \u263A"
 "#;
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse escape sequences");
         assert_eq!(
             value.get("tab").and_then(|v| v.as_str()),
             Some("hello\tworld")
@@ -1703,7 +1766,7 @@ unicode: "smiley: \u263A"
 : complex_value
 simple_key: simple_value
 ";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse explicit key");
         assert!(value.is_mapping());
         assert_eq!(
             value.get("complex_key").and_then(|v| v.as_str()),
@@ -1719,11 +1782,11 @@ simple_key: simple_value
     fn test_yaml_empty_document() {
         // Test empty and whitespace-only documents
         let yaml = "";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse empty document");
         assert!(value.is_null());
 
         let yaml = "   \n\n   ";
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse whitespace-only document");
         assert!(value.is_null());
     }
 
@@ -1737,7 +1800,7 @@ url: http://example.com
 time: "10:30:00"
 message: "key: value pair"
 "#;
-        let value: Value = from_str(yaml).unwrap();
+        let value: Value = from_str(yaml).expect("should parse colons in values");
         assert_eq!(
             value.get("url").and_then(|v| v.as_str()),
             Some("http://example.com")
@@ -1776,8 +1839,8 @@ message: "key: value pair"
             .collect(),
         };
 
-        let yaml = to_string(&original).unwrap();
-        let parsed: ComplexConfig = from_str(&yaml).unwrap();
+        let yaml = to_string(&original).expect("should serialize complex config");
+        let parsed: ComplexConfig = from_str(&yaml).expect("should parse complex config back");
         assert_eq!(original, parsed);
     }
 
@@ -2228,12 +2291,18 @@ folded: > # Another header comment
   folded text here
 ";
         let value: Value = from_str(yaml).expect("should parse block scalar with header comment");
-        let literal = value.get("literal").and_then(|v| v.as_str()).unwrap();
+        let literal = value
+            .get("literal")
+            .and_then(|v| v.as_str())
+            .expect("literal should be a string");
         assert!(
             literal.contains("some text here"),
             "literal content should not include the header comment"
         );
-        let folded = value.get("folded").and_then(|v| v.as_str()).unwrap();
+        let folded = value
+            .get("folded")
+            .and_then(|v| v.as_str())
+            .expect("folded should be a string");
         assert!(
             folded.contains("folded text here"),
             "folded content should not include the header comment"
@@ -2252,9 +2321,15 @@ keep: |+ # keep comment
 ";
         let value: Value =
             from_str(yaml).expect("should parse block scalar with chomping + comment");
-        let strip = value.get("strip").and_then(|v| v.as_str()).unwrap();
+        let strip = value
+            .get("strip")
+            .and_then(|v| v.as_str())
+            .expect("strip should be a string");
         assert_eq!(strip, "stripped text");
-        let keep = value.get("keep").and_then(|v| v.as_str()).unwrap();
+        let keep = value
+            .get("keep")
+            .and_then(|v| v.as_str())
+            .expect("keep should be a string");
         assert!(keep.starts_with("kept text"));
     }
 
@@ -2313,7 +2388,10 @@ keep: |+ # keep comment
         let yaml = "{items: [1, 2, 3,], name: test,}";
         let value: Value =
             from_str(yaml).expect("should parse nested flow collections with trailing commas");
-        let items = value.get("items").and_then(|v| v.as_sequence()).unwrap();
+        let items = value
+            .get("items")
+            .and_then(|v| v.as_sequence())
+            .expect("items should be a sequence");
         assert_eq!(items.len(), 3);
     }
 
@@ -2322,7 +2400,10 @@ keep: |+ # keep comment
         // Empty flow sequence
         let yaml = "items: []";
         let value: Value = from_str(yaml).expect("should parse empty flow sequence");
-        let items = value.get("items").and_then(|v| v.as_sequence()).unwrap();
+        let items = value
+            .get("items")
+            .and_then(|v| v.as_sequence())
+            .expect("items should be a sequence");
         assert!(items.is_empty(), "empty flow sequence should have 0 items");
     }
 
@@ -2331,7 +2412,10 @@ keep: |+ # keep comment
         // Empty flow mapping
         let yaml = "data: {}";
         let value: Value = from_str(yaml).expect("should parse empty flow mapping");
-        let data = value.get("data").and_then(|v| v.as_mapping()).unwrap();
+        let data = value
+            .get("data")
+            .and_then(|v| v.as_mapping())
+            .expect("data should be a mapping");
         assert!(data.is_empty(), "empty flow mapping should have 0 entries");
     }
 
@@ -2345,7 +2429,7 @@ keep: |+ # keep comment
         let yaml = "{}";
         let value: Value = from_str(yaml).expect("should parse bare empty mapping");
         assert!(value.is_mapping());
-        assert!(value.as_mapping().unwrap().is_empty());
+        assert!(value.as_mapping().expect("should be a mapping").is_empty());
     }
 
     #[test]
@@ -2378,7 +2462,7 @@ metadata: {}
 - five: six
 ";
         let value: Value = from_str(yaml).expect("should parse compact nested mapping in sequence");
-        let seq = value.as_sequence().unwrap();
+        let seq = value.as_sequence().expect("top level should be a sequence");
         assert_eq!(seq.len(), 2);
         assert_eq!(seq[0].get("one").and_then(|v| v.as_str()), Some("two"));
         assert_eq!(seq[0].get("three").and_then(|v| v.as_str()), Some("four"));
@@ -2395,9 +2479,11 @@ metadata: {}
   - four
 ";
         let value: Value = from_str(yaml).expect("should parse compact nested sequences");
-        let outer = value.as_sequence().unwrap();
+        let outer = value.as_sequence().expect("top level should be a sequence");
         assert_eq!(outer.len(), 2);
-        let inner0 = outer[0].as_sequence().unwrap();
+        let inner0 = outer[0]
+            .as_sequence()
+            .expect("inner element should be a sequence");
         assert_eq!(inner0.len(), 2);
         assert_eq!(inner0[0].as_str(), Some("one"));
         assert_eq!(inner0[1].as_str(), Some("two"));
@@ -2417,7 +2503,10 @@ products:
 ";
         let value: Value =
             from_str(yaml).expect("should parse compact nested mapping in sequence value");
-        let products = value.get("products").and_then(|v| v.as_sequence()).unwrap();
+        let products = value
+            .get("products")
+            .and_then(|v| v.as_sequence())
+            .expect("products should be a sequence");
         assert_eq!(products.len(), 3);
         assert_eq!(
             products[0].get("item").and_then(Value::as_str),
@@ -2440,7 +2529,10 @@ products:
         // Line breaks are folded into spaces, empty lines become line feeds
         let yaml = "value: ' 1st non-empty\n\n 2nd non-empty \n 3rd non-empty '";
         let value: Value = from_str(yaml).expect("should parse multi-line single-quoted scalar");
-        let s = value.get("value").and_then(|v| v.as_str()).unwrap();
+        let s = value
+            .get("value")
+            .and_then(|v| v.as_str())
+            .expect("value should be a string");
         // Per YAML spec, single newline folds to space, blank line becomes \n
         assert_eq!(s, " 1st non-empty\n2nd non-empty 3rd non-empty ");
     }
@@ -2451,7 +2543,10 @@ products:
         let yaml = "value: 'line one\n  line two'";
         let value: Value =
             from_str(yaml).expect("should parse simple multi-line single-quoted scalar");
-        let s = value.get("value").and_then(|v| v.as_str()).unwrap();
+        let s = value
+            .get("value")
+            .and_then(|v| v.as_str())
+            .expect("value should be a string");
         // Single newline folds to space
         assert_eq!(s, "line one line two");
     }

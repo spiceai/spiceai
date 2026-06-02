@@ -52,7 +52,7 @@ impl CachingEngineSys {
 
         // Update fetched_at for the table
         let update_query = format!(
-            "UPDATE \"{table_name}\" SET fetched_at = (now() AT TIME ZONE 'UTC')::TIMESTAMP_NS"
+            "UPDATE \"{table_name}\" SET _fetched_at = (now() AT TIME ZONE 'UTC')::TIMESTAMP_NS"
         );
         tx.execute(&update_query, []).map_err(Error::external)?;
 

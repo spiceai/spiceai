@@ -41,7 +41,7 @@ limitations under the License.
 //! In addition, declared columns whose names match one of the HTTP
 //! connector's built-in metadata fields (`request_path`,
 //! `request_query`, `request_body`, `request_headers`, `content`,
-//! `response_status`, `response_headers`, `fetched_at`) are *passed
+//! `response_status`, `response_headers`, `_fetched_at`) are *passed
 //! through* from the HTTP request/response rather than being decomposed
 //! from the JSON body. This lets queries reference both decomposed
 //! columns and the original HTTP metadata (e.g. for direct fetches via
