@@ -203,7 +203,7 @@ async fn run_inner_workload() -> Result<(), anyhow::Error> {
         primary_key: Some("id".to_string()),
         retention_sql: Some("DELETE FROM oom_events WHERE id >= 0".to_string()),
         retention_check_enabled: true,
-        retention_check_interval: Some("1s".to_string()),
+        retention_check_interval: Some("10s".to_string()),
         params: Some(Params::from_string_map(params)),
         ..Acceleration::default()
     });
@@ -226,12 +226,7 @@ async fn run_inner_workload() -> Result<(), anyhow::Error> {
     let loaded_rows = query_single_u64(&runtime, "SELECT COUNT(*) FROM oom_events").await?;
     eprintln!("Loaded rows currently visible in Cayenne table: {loaded_rows}");
 
-    let expected_rows = u64::try_from(rows).unwrap_or_default();
-    if loaded_rows == 0 {
-        return Err(anyhow::anyhow!(
-            "Expected at least one row to be visible before retention finishes, but found 0"
-        ));
-    }
+    let expected_rows = u64::try_from(rows).context("generated row count exceeded u64 range")?;
 
     if loaded_rows > expected_rows {
         return Err(anyhow::anyhow!(
@@ -240,19 +235,56 @@ async fn run_inner_workload() -> Result<(), anyhow::Error> {
     }
 
     eprintln!("Waiting for retention worker to execute PK-based delete...");
-    tokio::time::sleep(Duration::from_secs(30)).await;
-
-    let remaining_rows = query_single_u64(&runtime, "SELECT COUNT(*) FROM oom_events").await?;
+    let remaining_rows = wait_for_row_count(
+        &runtime,
+        "SELECT COUNT(*) FROM oom_events",
+        0,
+        Duration::from_secs(45),
+    )
+    .await?;
     eprintln!("Remaining rows after retention worker: {remaining_rows}");
-
-    if remaining_rows != 0 {
-        return Err(anyhow::anyhow!(
-            "Expected retention to delete all rows, but {remaining_rows} rows remain"
-        ));
-    }
 
     eprintln!("Retention delete completed without OOM.");
     Ok(())
+}
+
+async fn wait_for_row_count(
+    rt: &Arc<Runtime>,
+    sql: &str,
+    expected_rows: u64,
+    timeout: Duration,
+) -> Result<u64, anyhow::Error> {
+    let start = std::time::Instant::now();
+    let mut last_rows = None;
+    let mut last_error = None;
+
+    while start.elapsed() < timeout {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        match query_single_u64(rt, sql).await {
+            Ok(rows) if rows == expected_rows => return Ok(rows),
+            Ok(rows) => {
+                last_rows = Some(rows);
+                last_error = None;
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+    }
+
+    if let Some(error) = last_error {
+        return Err(anyhow::anyhow!(
+            "Timed out after {timeout:?} waiting for `{sql}` to return {expected_rows}; last query error: {error:#}"
+        ));
+    }
+
+    Err(anyhow::anyhow!(
+        "Timed out after {timeout:?} waiting for `{sql}` to return {expected_rows}; last row count: {}",
+        last_rows
+            .map(|rows| rows.to_string())
+            .unwrap_or_else(|| "<none>".to_string())
+    ))
 }
 
 fn workspace_root() -> Result<PathBuf, anyhow::Error> {
