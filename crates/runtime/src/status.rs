@@ -99,11 +99,15 @@ impl RuntimeStatus {
 
     /// Updates the status of a component and tracks if it has ever been ready.
     pub(crate) fn update_component_status(&self, component_name: &str, status: ComponentStatus) {
-        let mut statuses = match self.statuses.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        statuses.insert(component_name.to_string(), status.clone());
+        // Acquire and release `statuses` before taking `notifiers` to avoid a
+        // lock-ordering deadlock with `get_or_create_notifier`
+        {
+            let mut statuses = match self.statuses.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            statuses.insert(component_name.to_string(), status.clone());
+        }
 
         if status == ComponentStatus::Ready {
             let mut ever_ready = match self.ever_ready_components.write() {
