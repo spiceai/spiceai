@@ -114,15 +114,15 @@ impl RuntimeStatus {
         match statuses.entry(component_name.to_string()) {
             Entry::Occupied(mut e) => {
                 let state = e.get_mut();
-                state.status = status.clone();
+                state.status = status;
                 if let Some(tx) = &state.notifier {
                     // send_replace stores the new value even when no receivers exist.
-                    tx.send_replace(status.clone());
+                    tx.send_replace(status);
                 }
             }
             Entry::Vacant(e) => {
                 e.insert(ComponentState {
-                    status: status.clone(),
+                    status,
                     notifier: None,
                 });
             }
