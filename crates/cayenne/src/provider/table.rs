@@ -7704,7 +7704,7 @@ impl CayenneTableProvider {
         // partial deletion filter exactly as the read path does, then stream
         // the merged rows into a fresh snapshot dir.
         let phase2_start = std::time::Instant::now();
-        let ctx = self.create_session_context();
+        let ctx = self.create_compaction_session_context();
         let state = ctx.state();
         let pk_indices = self.pk_column_indices.clone();
 
@@ -11690,6 +11690,8 @@ mod tests {
             .await
             .expect("table created");
 
+        let compaction_setup_guard = provider.compaction_lock.lock().await;
+
         // Each insert into an upsert table publishes a new protected snapshot.
         // Create more than the trigger floor of small (tier-0) snapshots.
         let n = i64::try_from(TRIGGER).expect("TRIGGER fits in i64") + 2;
@@ -11713,6 +11715,8 @@ mod tests {
             expected,
             "sanity: all inserted rows visible before compaction"
         );
+
+        drop(compaction_setup_guard);
 
         let merged = provider
             .compact_protected_snapshots_subset(usize::MAX)

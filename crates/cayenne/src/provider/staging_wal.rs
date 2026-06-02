@@ -377,6 +377,27 @@ impl PreparedStagedAppend {
         }
     }
 
+    fn ensure_current_snapshot_target_unchanged(&self) -> Result<()> {
+        if self.target_kind != StagingWalTargetKind::CurrentSnapshot {
+            return Ok(());
+        }
+
+        let current_snapshot_id = self.table.get_current_snapshot_id();
+        if current_snapshot_id == self.target_snapshot_id {
+            return Ok(());
+        }
+
+        Err(Error::IncompleteWrite {
+            table: self.table.table_name().to_string(),
+            message: format!(
+                "Refusing to apply staged append WAL '{}' because it targets current snapshot '{}', but the current snapshot is now '{}'. Manual resolution is required.",
+                self.staging_wal_path().display(),
+                self.target_snapshot_id,
+                current_snapshot_id,
+            ),
+        })
+    }
+
     /// Apply the staged write under the caller's append-side barrier.
     ///
     /// Performs, in order: move staged files into the target snapshot
@@ -406,6 +427,7 @@ impl PreparedStagedAppend {
         // holds `listing_fence.read()` across DataFusion's listing call) can
         // interleave with the move and observe a torn directory snapshot.
         let _fence = self.table.lock_listing_fence_write_owned().await;
+        self.ensure_current_snapshot_target_unchanged()?;
         self.table
             .move_staged_files_to_snapshot(&self.staging_snapshot_id, &self.target_snapshot_id)
             .await?;
@@ -439,6 +461,7 @@ impl PreparedStagedAppend {
     /// Returns an error if moving the staged files or removing the WAL fails.
     pub async fn apply_under_held_barrier(&self) -> Result<()> {
         let _write_guard = self.try_lock_current_snapshot_for_held_barrier()?;
+        self.ensure_current_snapshot_target_unchanged()?;
         self.table
             .move_staged_files_to_snapshot(&self.staging_snapshot_id, &self.target_snapshot_id)
             .await?;
