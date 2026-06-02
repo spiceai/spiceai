@@ -36,10 +36,11 @@ limitations under the License.
 //! tables can't overwhelm the writer pool.
 
 use std::future::Future;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, LazyLock, Weak};
 use std::time::Duration;
 
 use datafusion_execution::runtime_env::RuntimeEnv;
+use parking_lot::RwLock;
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
@@ -55,21 +56,25 @@ use tokio::task::JoinHandle;
 /// runtime is created with low thread priority, so compaction soaks up spare
 /// cores without starving queries or ingest.
 ///
-/// `OnceLock` because there is exactly one such runtime per process and it is
-/// set before any table is created. When unset — unit tests, embedders that
-/// don't wire it up, or `dedicated_thread_pool=disabled` — compaction falls
-/// back to [`tokio::spawn`] on the ambient runtime, preserving prior behavior.
-static COMPACTION_RUNTIME: OnceLock<Handle> = OnceLock::new();
+/// Replaceable so test binaries that create and drop multiple runtimes in one
+/// process do not keep spawning onto a handle from an already-dropped runtime.
+/// When unset — unit tests, embedders that don't wire it up, or
+/// `dedicated_thread_pool=disabled` — compaction falls back to [`tokio::spawn`]
+/// on the ambient runtime, preserving prior behavior.
+static COMPACTION_RUNTIME: LazyLock<RwLock<Option<Handle>>> = LazyLock::new(|| RwLock::new(None));
 
 /// Inject the dedicated compaction runtime handle. Called once at process
-/// startup; subsequent calls are ignored (the first handle wins).
+/// startup. Later calls replace the previous handle so tests that create a new
+/// runtime after dropping an old one do not retain stale global state.
 pub fn set_compaction_runtime_handle(handle: Handle) {
-    if COMPACTION_RUNTIME.set(handle).is_err() {
+    let mut guard = COMPACTION_RUNTIME.write();
+    if guard.is_some() {
         tracing::debug!(
             target: "cayenne::compaction",
-            "Compaction runtime handle already set; ignoring"
+            "Replacing compaction runtime handle"
         );
     }
+    *guard = Some(handle);
 }
 
 /// Spawn a compaction task onto the dedicated compaction runtime if one has
@@ -84,7 +89,8 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    spawn_on(COMPACTION_RUNTIME.get(), future)
+    let handle = COMPACTION_RUNTIME.read().clone();
+    spawn_on(handle.as_ref(), future)
 }
 
 /// Spawn `future` on `handle` if provided, otherwise on the ambient runtime via
@@ -112,25 +118,32 @@ where
 /// reads and writes the same stores but accounts its working memory against an
 /// isolated, bounded pool that cannot starve queries.
 ///
+/// Replaceable for the same reason as [`COMPACTION_RUNTIME`]: integration tests
+/// can create multiple runtime environments in one process.
+///
 /// When unset (no Cayenne, dedicated pools disabled, unit tests, other
 /// embedders) compaction falls back to the shared query environment via
 /// [`super::context::CayenneContext::runtime_env`], preserving prior behavior.
-static COMPACTION_RUNTIME_ENV: OnceLock<Arc<RuntimeEnv>> = OnceLock::new();
+static COMPACTION_RUNTIME_ENV: LazyLock<RwLock<Option<Arc<RuntimeEnv>>>> =
+    LazyLock::new(|| RwLock::new(None));
 
 /// Inject the dedicated compaction memory environment. Called once at process
-/// startup; subsequent calls are ignored (the first env wins).
+/// startup. Later calls replace the previous environment so tests do not retain
+/// stale global state.
 pub fn set_compaction_runtime_env(env: Arc<RuntimeEnv>) {
-    if COMPACTION_RUNTIME_ENV.set(env).is_err() {
+    let mut guard = COMPACTION_RUNTIME_ENV.write();
+    if guard.is_some() {
         tracing::debug!(
             target: "cayenne::compaction",
-            "Compaction runtime env already set; ignoring"
+            "Replacing compaction runtime env"
         );
     }
+    *guard = Some(env);
 }
 
 /// The dedicated compaction memory environment, if one was injected.
 pub(crate) fn compaction_runtime_env() -> Option<Arc<RuntimeEnv>> {
-    COMPACTION_RUNTIME_ENV.get().cloned()
+    COMPACTION_RUNTIME_ENV.read().clone()
 }
 
 /// Tier thresholds derived from `target_vortex_file_size_mb`.

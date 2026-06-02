@@ -64,6 +64,8 @@ const CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM: &str = "cayenne_compaction_memor
 /// Default carve fraction when the param is unset: 20% of the query budget to
 /// compaction, 80% retained for queries.
 const DEFAULT_COMPACTION_MEMORY_FRACTION: f64 = 0.2;
+const MIN_COMPACTION_MEMORY_FRACTION: f64 = 0.05;
+const MAX_COMPACTION_MEMORY_FRACTION: f64 = 0.9;
 
 pub struct RuntimeBuilder {
     app: Option<Arc<app::App>>,
@@ -289,12 +291,12 @@ impl RuntimeBuilder {
         );
         let compaction_memory_fraction = (cayenne_configured && dedicated_thread_pools_enabled)
             .then(|| {
-                parse_f64_runtime_param(
+                let requested = parse_f64_runtime_param(
                     &spicepod_rt.params,
                     CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM,
                 )
-                .unwrap_or(DEFAULT_COMPACTION_MEMORY_FRACTION)
-                .clamp(0.05, 0.9)
+                .unwrap_or(DEFAULT_COMPACTION_MEMORY_FRACTION);
+                clamp_cayenne_compaction_memory_fraction(requested)
             });
 
         #[cfg(not(windows))]
@@ -757,6 +759,19 @@ fn parse_f64_runtime_param(params: &HashMap<String, String>, key: &str) -> Optio
     }
 }
 
+fn clamp_cayenne_compaction_memory_fraction(value: f64) -> f64 {
+    let clamped = value.clamp(
+        MIN_COMPACTION_MEMORY_FRACTION,
+        MAX_COMPACTION_MEMORY_FRACTION,
+    );
+    if value < MIN_COMPACTION_MEMORY_FRACTION || value > MAX_COMPACTION_MEMORY_FRACTION {
+        tracing::warn!(
+            "runtime.params.{CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM}={value} is outside supported range [{MIN_COMPACTION_MEMORY_FRACTION}, {MAX_COMPACTION_MEMORY_FRACTION}]; using {clamped}"
+        );
+    }
+    clamped
+}
+
 const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
 const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
 
@@ -956,6 +971,13 @@ mod test {
         assert_eq!(parse_f64_runtime_param(&params, "nan"), None);
         assert_eq!(parse_f64_runtime_param(&params, "bad"), None);
         assert_eq!(parse_f64_runtime_param(&params, "missing"), None);
+    }
+
+    #[test]
+    fn test_clamp_cayenne_compaction_memory_fraction() {
+        assert_eq!(clamp_cayenne_compaction_memory_fraction(0.0), 0.05);
+        assert_eq!(clamp_cayenne_compaction_memory_fraction(0.2), 0.2);
+        assert_eq!(clamp_cayenne_compaction_memory_fraction(1.0), 0.9);
     }
 
     #[test]

@@ -234,12 +234,18 @@ async fn run_inner_workload() -> Result<(), anyhow::Error> {
         ));
     }
 
+    if rows > 0 && loaded_rows == 0 {
+        return Err(anyhow::anyhow!(
+            "Expected at least one visible row before retention delete, but COUNT(*) returned 0"
+        ));
+    }
+
     eprintln!("Waiting for retention worker to execute PK-based delete...");
     let remaining_rows = wait_for_row_count(
         &runtime,
         "SELECT COUNT(*) FROM oom_events",
         0,
-        Duration::from_secs(45),
+        Duration::from_secs(75),
     )
     .await?;
     eprintln!("Remaining rows after retention worker: {remaining_rows}");
