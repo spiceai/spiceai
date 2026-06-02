@@ -1239,7 +1239,6 @@ fn graph_err(e: &graph_rs_sdk::GraphFailure) -> object_store::Error {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "tests use unwrap to assert happy paths")]
 mod tests {
     use super::*;
 
@@ -1259,18 +1258,26 @@ mod tests {
     #[test]
     fn conflict_behavior_from_str() {
         assert_eq!(
-            "replace".parse::<ConflictBehavior>().unwrap(),
+            "replace"
+                .parse::<ConflictBehavior>()
+                .expect("\"replace\" should parse as ConflictBehavior"),
             ConflictBehavior::Replace
         );
         assert_eq!(
-            "fail".parse::<ConflictBehavior>().unwrap(),
+            "fail"
+                .parse::<ConflictBehavior>()
+                .expect("\"fail\" should parse as ConflictBehavior"),
             ConflictBehavior::Fail
         );
         assert_eq!(
-            "rename".parse::<ConflictBehavior>().unwrap(),
+            "rename"
+                .parse::<ConflictBehavior>()
+                .expect("\"rename\" should parse as ConflictBehavior"),
             ConflictBehavior::Rename
         );
-        "bogus".parse::<ConflictBehavior>().unwrap_err();
+        "bogus"
+            .parse::<ConflictBehavior>()
+            .expect_err("\"bogus\" should not parse as ConflictBehavior");
     }
 
     #[test]
@@ -1368,7 +1375,7 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind mock");
-            let addr = listener.local_addr().unwrap();
+            let addr = listener.local_addr().expect("mock listener local_addr");
             let responses = Arc::new(tokio::sync::Mutex::new(VecDeque::from(responses)));
             let count = Arc::new(AtomicUsize::new(0));
             let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -1444,7 +1451,9 @@ mod tests {
 
         fn mock_store(endpoint: &str) -> SharepointObjectStore {
             let mut client = GraphClient::new("unused-test-token");
-            client.use_test_endpoint(&Url::parse(&format!("{endpoint}/v1.0")).unwrap());
+            client.use_test_endpoint(
+                &Url::parse(&format!("{endpoint}/v1.0")).expect("test endpoint URL should parse"),
+            );
             SharepointObjectStore::new(
                 Arc::new(client),
                 None,
@@ -1470,12 +1479,12 @@ mod tests {
                         .thread_stack_size(64 * 1024 * 1024)
                         .enable_all()
                         .build()
-                        .unwrap()
+                        .expect("test tokio runtime should build")
                         .block_on(f);
                 })
-                .unwrap()
+                .expect("test runner thread should spawn")
                 .join()
-                .unwrap();
+                .expect("test runner thread should join");
         }
 
         const HEAD_JSON: &str = r#"{
@@ -1490,7 +1499,10 @@ mod tests {
             run_async(async {
                 let (url, count, _captured) = start_mock(vec![MockResp::ok_json(HEAD_JSON)]).await;
                 let store = mock_store(&url);
-                let meta = store.head(&Path::from("Documents/file.csv")).await.unwrap();
+                let meta = store
+                    .head(&Path::from("Documents/file.csv"))
+                    .await
+                    .expect("head should return drive-item metadata");
                 assert_eq!(meta.size, 42);
                 assert_eq!(meta.e_tag.as_deref(), Some("\"abc\""));
                 assert_eq!(meta.version.as_deref(), Some("\"def\""));
@@ -1508,7 +1520,7 @@ mod tests {
                 let err = store
                     .head(&Path::from("Documents/missing.csv"))
                     .await
-                    .unwrap_err();
+                    .expect_err("head of missing object should fail");
                 assert!(
                     matches!(err, object_store::Error::NotFound { .. }),
                     "expected NotFound, got {err:?}"
@@ -1529,7 +1541,7 @@ mod tests {
                 let result = store
                     .get_opts(&Path::from("Documents/file.csv"), GetOptions::default())
                     .await
-                    .unwrap();
+                    .expect("get_opts should return a result");
                 // get_opts uses the fetched payload length as the authoritative
                 // size, not the HEAD-reported size — Graph occasionally
                 // misreports `size`. Body is "hello, world" (12 bytes).
@@ -1538,11 +1550,11 @@ mod tests {
                     GetResultPayload::Stream(mut s) => {
                         let mut all = Vec::new();
                         while let Some(chunk) = s.next().await {
-                            all.extend_from_slice(&chunk.unwrap());
+                            all.extend_from_slice(&chunk.expect("stream chunk should be Ok"));
                         }
                         all
                     }
-                    _ => panic!("expected stream payload"),
+                    GetResultPayload::File(..) => panic!("expected stream payload"),
                 };
                 assert_eq!(bytes, b"hello, world");
                 assert_eq!(count.load(Ordering::SeqCst), 2);
@@ -1557,7 +1569,7 @@ mod tests {
                 store
                     .delete(&Path::from("Documents/file.csv"))
                     .await
-                    .unwrap();
+                    .expect("delete should succeed");
                 assert_eq!(count.load(Ordering::SeqCst), 1);
             });
         }
@@ -1575,7 +1587,7 @@ mod tests {
                 let err = store
                     .delete(&Path::from("Documents/gone.csv"))
                     .await
-                    .unwrap_err();
+                    .expect_err("delete of missing object should fail");
                 assert!(matches!(err, object_store::Error::NotFound { .. }));
             });
         }
@@ -1592,7 +1604,7 @@ mod tests {
                         PutOptions::default(),
                     )
                     .await
-                    .unwrap();
+                    .expect("put_opts should succeed");
                 assert_eq!(result.e_tag.as_deref(), Some("\"abc\""));
                 assert_eq!(result.version.as_deref(), Some("\"def\""));
                 assert_eq!(count.load(Ordering::SeqCst), 1);
@@ -1634,7 +1646,7 @@ mod tests {
                 let mut stream = store.list(Some(&Path::from("Documents")));
                 let mut names = Vec::new();
                 while let Some(item) = stream.next().await {
-                    let meta = item.unwrap();
+                    let meta = item.expect("list item should be Ok");
                     names.push(meta.location.to_string());
                 }
                 // Folders skipped from files-only list; two files across two pages.
@@ -1662,7 +1674,7 @@ mod tests {
                 let result = store
                     .list_with_delimiter(Some(&Path::from("Documents")))
                     .await
-                    .unwrap();
+                    .expect("list_with_delimiter should succeed");
                 assert_eq!(result.objects.len(), 1);
                 assert!(result.objects[0].location.to_string().ends_with("a.csv"));
                 assert_eq!(result.common_prefixes.len(), 1);
