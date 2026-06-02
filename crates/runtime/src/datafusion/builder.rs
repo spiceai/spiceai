@@ -563,22 +563,24 @@ impl DataFusionBuilder {
         // together never exceed the operator's configured memory limit; the
         // query-side sizing below (hash join, optimizer) then uses the reduced
         // query budget, and `compaction_memory_bytes` sizes the separate pool.
-        let (effective_memory_limit, compaction_memory_bytes) =
-            match self.compaction_memory_fraction {
-                Some(fraction) => {
-                    #[expect(
-                        clippy::cast_precision_loss,
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss
-                    )]
-                    let compaction_bytes = (effective_memory_limit as f64 * fraction) as u64;
-                    (
-                        effective_memory_limit.saturating_sub(compaction_bytes),
-                        Some(compaction_bytes),
-                    )
-                }
-                None => (effective_memory_limit, None),
-            };
+        let compaction_memory_fraction = self
+            .compaction_memory_fraction
+            .and_then(validate_compaction_memory_fraction);
+        let (effective_memory_limit, compaction_memory_bytes) = match compaction_memory_fraction {
+            Some(fraction) => {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss
+                )]
+                let compaction_bytes = (effective_memory_limit as f64 * fraction) as u64;
+                (
+                    effective_memory_limit.saturating_sub(compaction_bytes),
+                    Some(compaction_bytes),
+                )
+            }
+            None => (effective_memory_limit, None),
+        };
 
         if let Some(spill_compression) = self.spill_compression {
             config = config.with_spill_compression(spill_compression);
@@ -1251,6 +1253,17 @@ fn runtime_env_with_effective_memory_limit(
     }
 }
 
+fn validate_compaction_memory_fraction(fraction: f64) -> Option<f64> {
+    if fraction.is_finite() && fraction > 0.0 && fraction < 1.0 {
+        return Some(fraction);
+    }
+
+    tracing::warn!(
+        "Ignoring invalid DataFusion compaction_memory_fraction={fraction}; expected a finite value greater than 0 and less than 1"
+    );
+    None
+}
+
 /// Build a dedicated [`RuntimeEnv`] for background Cayenne compaction.
 ///
 /// Sizes a separate [`GreedyMemoryPool`] to `compaction_memory_bytes` (carved
@@ -1294,7 +1307,10 @@ fn build_compaction_runtime_env(
     match runtime_env_builder.build_arc() {
         Ok(runtime_env) => runtime_env,
         Err(e) => {
-            unreachable!("compaction RuntimeEnv build should never fail: {e}");
+            tracing::warn!(
+                "Failed to build dedicated Cayenne compaction RuntimeEnv: {e}; falling back to the query RuntimeEnv"
+            );
+            Arc::clone(query_runtime_env)
         }
     }
 }
@@ -1439,6 +1455,15 @@ mod tests {
             ),
             "compaction env must share the query object-store registry"
         );
+    }
+
+    #[test]
+    fn validate_compaction_memory_fraction_accepts_only_strict_fractions() {
+        assert_eq!(validate_compaction_memory_fraction(0.5), Some(0.5));
+        assert_eq!(validate_compaction_memory_fraction(0.0), None);
+        assert_eq!(validate_compaction_memory_fraction(1.0), None);
+        assert_eq!(validate_compaction_memory_fraction(f64::NAN), None);
+        assert_eq!(validate_compaction_memory_fraction(f64::INFINITY), None);
     }
 
     #[test]
