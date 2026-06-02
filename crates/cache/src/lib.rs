@@ -339,6 +339,25 @@ impl Caching {
         }
         Ok(())
     }
+
+    /// Drives moka housekeeping on every configured cache. `moka::future::Cache`
+    /// has no background maintenance thread, so invalidation predicates and
+    /// expired entries on a cache with no `get`/`insert` traffic are only
+    /// reclaimed when this runs.
+    pub async fn run_pending_maintenance(&self) {
+        if let Some(results) = &self.results {
+            results.run_pending_tasks().await;
+        }
+        if let Some(plans) = &self.plans {
+            plans.checkpoint().await;
+        }
+        if let Some(search) = &self.search {
+            search.checkpoint().await;
+        }
+        if let Some(embeddings) = &self.embeddings {
+            embeddings.checkpoint().await;
+        }
+    }
 }
 
 // TODO: sunset ``QueryResultsCacheProvider`` in favor of ``CacheProvider``?
@@ -719,6 +738,55 @@ mod tests {
             display_zstd.contains("encoding: zstd"),
             "Display should include encoding: zstd, got: {display_zstd}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_run_pending_maintenance_handles_untouched_caches() {
+        use crate::result::search::CachedSearchResult;
+        use spicepod::component::caching::CacheConfig;
+
+        // A search cache that never receives get/insert traffic, plus a results
+        // cache.
+        let results = Arc::new(
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid results cache"),
+        );
+        let search = lru_cache::build_from_config::<CachedSearchResult>(&CacheConfig::default())
+            .expect("valid search cache")
+            .as_tabled_provider();
+
+        let caching = Caching::new()
+            .with_results_cache(results)
+            .with_search_cache(search);
+
+        let table = TableReference::bare("never_read");
+
+        // Each call registers a moka invalidation predicate.
+        for _ in 0..1_000 {
+            caching
+                .invalidate_for_table(table.clone())
+                .expect("invalidation should succeed");
+        }
+
+        // Maintenance drains the predicates; the caches stay empty and functional.
+        caching.run_pending_maintenance().await;
+
+        let results = caching.results.as_ref().expect("results configured");
+        assert_eq!(results.item_count().await, 0);
+        let search = caching.search.as_ref().expect("search configured");
+        assert_eq!(search.item_count().await, 0);
+
+        // Another invalidate + maintenance cycle still works.
+        caching
+            .invalidate_for_table(table)
+            .expect("invalidation should succeed");
+        caching.run_pending_maintenance().await;
+    }
+
+    #[tokio::test]
+    async fn test_run_pending_maintenance_on_empty_caching_is_noop() {
+        // No configured caches: maintenance must be a harmless no-op.
+        Caching::new().run_pending_maintenance().await;
     }
 
     #[tokio::test]
