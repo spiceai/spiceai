@@ -1149,7 +1149,7 @@ impl RefreshTask {
             std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
         let first_for_table = WARNED
             .lock()
-            .map(|mut set| set.insert(self.dataset_name.clone()))
+            .map(|mut set| set.insert(self.dataset_name.to_string()))
             .unwrap_or(false);
         if first_for_table {
             tracing::warn!(
