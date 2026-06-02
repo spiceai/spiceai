@@ -5927,20 +5927,18 @@ impl CayenneTableProvider {
 
         let mut specs = Vec::with_capacity(delete_specs.len());
         let mut position_deletions = HashMap::with_capacity(delete_specs.len());
-        let mut overflow_count: u64 = 0;
-        let mut first_overflow_id: Option<u64> = None;
-
         for (file_path, incoming_row_ids) in delete_specs {
             let mut row_ids = Vec::with_capacity(incoming_row_ids.len());
             for id in incoming_row_ids {
-                if let Ok(id32) = u32::try_from(id) {
-                    row_ids.push(id32);
-                } else {
-                    if first_overflow_id.is_none() {
-                        first_overflow_id = Some(id);
+                let id32 = u32::try_from(id).map_err(|_| {
+                    CatalogError::InvalidOperationNoSource {
+                        message: format!(
+                            "Cannot stage CDC upsert for table {} because row id {id} in file {file_path} exceeds u32::MAX; compact the table before retrying",
+                            self.table_metadata.table_name
+                        ),
                     }
-                    overflow_count += 1;
-                }
+                })?;
+                row_ids.push(id32);
             }
             row_ids.sort_unstable();
             row_ids.dedup();
@@ -5956,14 +5954,6 @@ impl CayenneTableProvider {
                 writer_row_ids,
             ));
             position_deletions.insert(file_path, row_ids);
-        }
-
-        if overflow_count > 0 {
-            tracing::warn!(
-                "Skipped {} row ID(s) that exceed u32::MAX (first: {}) - table should be compacted",
-                overflow_count,
-                first_overflow_id.unwrap_or(0)
-            );
         }
 
         if specs.is_empty() {
@@ -12447,7 +12437,7 @@ mod tests {
             .expect("initial snapshot sequences")
             .len();
 
-        let pending = provider
+        let mut pending = provider
             .write_cdc_append_stream(
                 single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
                 &ctx.task_ctx(),
@@ -12466,11 +12456,31 @@ mod tests {
             "Stage A must durably register the protected target before finalize"
         );
 
+        let prepared_append = pending
+            .prepared_append
+            .take()
+            .expect("staged CDC upsert should have a prepared append");
+        let prepared_on_conflict = pending
+            .prepared_on_conflict
+            .take()
+            .expect("staged CDC upsert should have prepared on-conflict metadata");
+
+        prepared_append
+            .apply_under_held_barrier()
+            .await
+            .expect("apply staged files before protected metadata publish");
+        assert!(
+            provider.has_inflight_staging_appends(),
+            "prepared append must remain inflight until protected metadata is published and finish() runs"
+        );
+
         assert!(
             !CompactionRunner::run_compaction_trigger(&provider)
                 .await
-                .expect("compaction trigger should skip while finalize is pending"),
-            "compaction must not rewrite while a CDC upsert protected snapshot is pending finalize"
+                .expect(
+                    "compaction trigger should skip while protected metadata publish is pending"
+                ),
+            "compaction must not rewrite after staged files move but before protected metadata publish"
         );
         assert_eq!(
             catalog
@@ -12482,7 +12492,21 @@ mod tests {
             "skipped compaction must not bulk-delete a pending protected snapshot sequence"
         );
 
-        pending.finish().await.expect("finalize pending cdc upsert");
+        provider
+            .publish_prepared_on_conflict_deletions(prepared_on_conflict)
+            .expect("publish protected metadata");
+        assert_eq!(
+            prepared_append
+                .finish()
+                .await
+                .expect("finish pending cdc upsert"),
+            1
+        );
+        assert!(
+            !provider.has_inflight_staging_appends(),
+            "finish should clear the prepared append inflight marker"
+        );
+
         let pairs = collect_id_value_pairs(&ctx, &provider, "cdc_upsert_compaction_pending").await;
         assert_eq!(
             pairs.len(),
@@ -12504,6 +12528,30 @@ mod tests {
         );
         assert_eq!(reopened_pairs[0], (1, 100));
         assert_eq!(reopened_pairs[1], (2, 20));
+    }
+
+    #[tokio::test]
+    async fn test_staged_position_deletions_fail_on_row_id_overflow() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_cdc_upsert_table("cdc_upsert_position_overflow", ctx.runtime_env()).await;
+
+        let overflow_row_id = u64::from(u32::MAX) + 1;
+        let err = provider
+            .write_position_deletion_vectors_for_staged_on_conflict(
+                HashMap::from([(
+                    Arc::<str>::from("snapshot/file.vortex"),
+                    vec![overflow_row_id],
+                )]),
+                1,
+            )
+            .await
+            .expect_err("row ids above u32::MAX must fail the staged upsert");
+
+        assert!(
+            err.to_string().contains("exceeds u32::MAX"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -364,6 +364,19 @@ impl PreparedStagedAppend {
         })
     }
 
+    fn mark_inflight_complete(&self) {
+        self.table
+            .unregister_inflight_staging_append(&self.staging_snapshot_id);
+        if !self.table.has_inflight_staging_appends() {
+            self.table
+                .staging_wal_present()
+                .store(false, Ordering::Release);
+            self.table
+                .staging_may_have_files()
+                .store(false, Ordering::Release);
+        }
+    }
+
     /// Apply the staged write under the caller's append-side barrier.
     ///
     /// Performs, in order: move staged files into the target snapshot
@@ -403,16 +416,6 @@ impl PreparedStagedAppend {
             self.table
                 .publish_current_snapshot_files_changed_under_held_fence();
         }
-        self.table
-            .unregister_inflight_staging_append(&self.staging_snapshot_id);
-        if !self.table.has_inflight_staging_appends() {
-            self.table
-                .staging_wal_present()
-                .store(false, Ordering::Release);
-            self.table
-                .staging_may_have_files()
-                .store(false, Ordering::Release);
-        }
         Ok(())
     }
 
@@ -445,16 +448,6 @@ impl PreparedStagedAppend {
         if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
             self.table
                 .publish_current_snapshot_files_changed_under_held_fence();
-        }
-        self.table
-            .unregister_inflight_staging_append(&self.staging_snapshot_id);
-        if !self.table.has_inflight_staging_appends() {
-            self.table
-                .staging_wal_present()
-                .store(false, Ordering::Release);
-            self.table
-                .staging_may_have_files()
-                .store(false, Ordering::Release);
         }
         Ok(())
     }
@@ -525,6 +518,7 @@ impl PreparedStagedAppend {
         // Async kept so a future cross-partition coordinator can call
         // `prep.finish().await` uniformly without callers having to know
         // whether finish is sync or async for this mode.
+        self.mark_inflight_complete();
         Ok(self.row_count)
     }
 
@@ -542,16 +536,7 @@ impl PreparedStagedAppend {
         self.table
             .clear_staging_snapshot_dir(&self.staging_snapshot_id)
             .await?;
-        self.table
-            .unregister_inflight_staging_append(&self.staging_snapshot_id);
-        if !self.table.has_inflight_staging_appends() {
-            self.table
-                .staging_wal_present()
-                .store(false, Ordering::Release);
-            self.table
-                .staging_may_have_files()
-                .store(false, Ordering::Release);
-        }
+        self.mark_inflight_complete();
         Ok(())
     }
 }
