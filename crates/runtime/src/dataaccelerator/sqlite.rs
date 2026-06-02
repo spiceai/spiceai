@@ -23,7 +23,6 @@ use crate::{
         snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
         storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
     },
-    datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
     parameters::ParameterSpec,
     register_data_accelerator, spice_data_base_path,
@@ -37,8 +36,7 @@ use datafusion::{
 };
 use datafusion_table_providers::{
     sql::db_connection_pool::{
-        self as db_connection_pool, dbconnection::sqliteconn::SqliteConnection,
-        sqlitepool::SqliteConnectionPool,
+        dbconnection::sqliteconn::SqliteConnection, sqlitepool::SqliteConnectionPool,
     },
     sqlite::{SqliteTableProviderFactory, write::SqliteTableWriter},
 };
@@ -124,9 +122,7 @@ impl SqliteAccelerator {
         }
         Self {
             sqlite_factory: SqliteTableProviderFactory::new()
-                .with_batch_insert_use_prepared_statements(true)
-                .with_decimal_between(true)
-                .with_function_support(deny_spice_specific_functions().as_ref().clone()),
+                .with_batch_insert_use_prepared_statements(true),
         }
     }
 
@@ -491,44 +487,20 @@ impl DataAccelerator for SqliteAccelerator {
     }
 
     fn supports_snapshot_reload(&self) -> bool {
-        true
+        false
     }
 
-    /// Reloads the SQLite-backed table provider from the snapshot file that
-    /// was just written to the primary path.
-    ///
-    /// Drops the previous provider, evicts the cached connection pool from
-    /// the upstream `SqliteTableProviderFactory` registry, and then re-runs
-    /// the registry factory to build a fresh provider over the on-disk file.
-    /// See the `DuckDB` implementation for the rationale around evicting the
-    /// pool before rebuilding.
+    /// SQLite snapshot reload is disabled until the upstream factory exposes
+    /// safe connection-pool invalidation again.
     async fn reload_from_snapshot(
         &self,
-        source: &dyn AccelerationSource,
+        _source: &dyn AccelerationSource,
         previous_provider: Arc<dyn TableProvider>,
-        provider_factory: super::ReloadProviderFactory,
+        _provider_factory: super::ReloadProviderFactory,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         drop(previous_provider);
 
-        let acceleration =
-            source
-                .acceleration()
-                .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-                    "acceleration not configured for snapshot reload".into()
-                })?;
-        match acceleration.mode {
-            Mode::File | Mode::FileCreate | Mode::FileUpdate => {
-                let path = self.sqlite_file_path(source).boxed()?;
-                self.sqlite_factory.invalidate_file_instance(path).await;
-            }
-            Mode::Memory => {
-                self.sqlite_factory
-                    .invalidate_instance(&db_connection_pool::DbInstanceKey::memory())
-                    .await;
-            }
-        }
-
-        provider_factory().await
+        Err("SQLite snapshot reload is unavailable because datafusion-table-providers 0.11 no longer exposes safe connection-pool invalidation".into())
     }
 
     async fn drop_table(
@@ -565,7 +537,7 @@ mod tests {
 
     use crate::dataaccelerator::DataAccelerator;
     use arrow::{
-        array::{Int64Array, RecordBatch, StringArray, UInt64Array},
+        array::{Int64Array, RecordBatch, StringArray},
         datatypes::{DataType, Schema},
     };
     use datafusion::{
@@ -640,46 +612,14 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let plan = table
+        let delete_error = table
             .delete_from(&ctx.state(), vec![filter])
             .await
-            .expect("deletion should be successful");
-
-        let result = collect(plan, ctx.task_ctx())
-            .await
-            .expect("deletion successful");
-        let actual = result
-            .first()
-            .expect("result should have at least one batch")
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .expect("result should be UInt64Array");
-        // Expect 2 rows deleted: "1970-01-01" (epoch=0) and "2012-12-01T11:11:11Z" (1354360271000ms)
-        // both are < 1354360272000ms
-        let expected = UInt64Array::from(vec![2]);
-        assert_eq!(actual, &expected);
-
-        let filter = col("time_int").lt(lit(1354360273));
-        let plan = table
-            .delete_from(&ctx.state(), vec![filter])
-            .await
-            .expect("deletion should be successful");
-
-        let result = collect(plan, ctx.task_ctx())
-            .await
-            .expect("deletion successful");
-        let actual = result
-            .first()
-            .expect("result should have at least one batch")
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .expect("result should be UInt64Array");
-        // Only 1 row remains after the first delete (time_int=1354360272),
-        // which matches time_int < 1354360273
-        let expected = UInt64Array::from(vec![1]);
-        assert_eq!(actual, &expected);
+            .expect_err("SQLite delete should fail safely while provider DML is unavailable");
+        assert!(
+            delete_error.to_string().contains("DELETE not supported"),
+            "expected SQLite delete to be unsupported, got: {delete_error}"
+        );
     }
 
     #[tokio::test]

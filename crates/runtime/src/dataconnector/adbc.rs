@@ -25,16 +25,18 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
 use datafusion_table_providers::adbc::AdbcTableFactory;
+use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::query_arrow;
-use datafusion_table_providers::sql::db_connection_pool::{DbConnectionPool, JoinPushDown};
 use futures::TryStreamExt;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
+#[cfg(test)]
 use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
@@ -383,14 +385,7 @@ impl AdbcFactory {
             connection_namespace.schema.as_deref(),
         );
 
-        let join_context = build_join_context(
-            &uri_str,
-            username,
-            connection_namespace.catalog.as_deref(),
-            connection_namespace.schema.as_deref(),
-        );
-
-        let federation_enabled = is_query_federation_enabled(&params.parameters).map_err(|e| {
+        is_query_federation_enabled(&params.parameters).map_err(|e| {
             DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: "adbc".to_string(),
                 connector_component: params.component.clone(),
@@ -475,8 +470,7 @@ impl AdbcFactory {
 
             let mut pool_builder = AdbcConnectionPoolBuilder::new(db)
                 .with_max_size(pool_size)
-                .with_min_idle(pool_min_idle)
-                .with_join_push_down(JoinPushDown::AllowedFor(join_context));
+                .with_min_idle(pool_min_idle);
 
             if let Some(conn_opts) = conn_options {
                 pool_builder = pool_builder.with_conn_options(conn_opts);
@@ -526,8 +520,7 @@ impl AdbcFactory {
                 }
             })?;
 
-        let adbc_factory =
-            AdbcTableFactory::new(Arc::clone(&pool)).with_federation_enabled(federation_enabled);
+        let adbc_factory = AdbcTableFactory::new(Arc::clone(&pool));
 
         Ok(Arc::new(Adbc {
             factory: Some(adbc_factory),
@@ -1078,7 +1071,8 @@ fn build_conn_options(
 ///   enabling federated join pushdown
 /// - Different usernames, catalogs, or schemas produce different hashes,
 ///   preventing incorrect cross-credential pushdown
-pub(crate) fn build_join_context(
+#[cfg(test)]
+fn build_join_context(
     uri: &str,
     username: Option<&str>,
     catalog: Option<&str>,

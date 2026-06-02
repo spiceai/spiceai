@@ -49,10 +49,29 @@ use datafusion::{
     physical_plan::{
         ColumnarValue, PhysicalExpr,
         expressions::{BinaryExpr, InListExpr, Literal},
-        joins::{CollectLeftAccumulator, ColumnBounds, SeededRandomState},
+        joins::SeededRandomState,
     },
     scalar::ScalarValue,
 };
+
+pub trait ColumnBounds: Send + Sync {
+    fn physical_expr(
+        &self,
+        left_expr: Arc<dyn PhysicalExpr>,
+    ) -> DataFusionResult<Arc<dyn PhysicalExpr>>;
+}
+
+pub trait CollectLeftAccumulator: Sized + Send + Sync {
+    fn name(&self) -> &'static str;
+
+    fn static_name() -> &'static str;
+
+    fn try_new(expr: Arc<dyn PhysicalExpr>, schema: &SchemaRef) -> DataFusionResult<Self>;
+
+    fn update_batch(&mut self, batch: &RecordBatch) -> DataFusionResult<()>;
+
+    fn evaluate(self) -> DataFusionResult<Arc<dyn ColumnBounds>>;
+}
 
 pub const DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES: usize = 128 * 1024 * 1024; // 128Mb - can store approximately 32 million i32 keys.
 const DEFAULT_MAXIMUM_BLOOM_FILTER_MEMORY_BYTES: usize = 8 * 1024 * 1024;

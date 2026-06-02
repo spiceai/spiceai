@@ -16,14 +16,70 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use datafusion::logical_expr::LogicalPlan;
-use datafusion_federation::{FederationAnalyzerForLogicalPlan, FederationProvider};
+use datafusion::common::arrow::datatypes::SchemaRef;
+use datafusion::datasource::TableType;
+use datafusion::logical_expr::TableSource;
+use datafusion::optimizer::optimizer::Optimizer;
+use datafusion_federation::{FederatedTableSource, FederationProvider, sql::SQLTableSource};
 
-#[derive(Debug)]
+pub struct AcceleratedTableFederatedTableSource {
+    table_source: SQLTableSource,
+    federation_provider: Arc<AcceleratedTableFederationProvider>,
+}
+
+impl AcceleratedTableFederatedTableSource {
+    pub fn new(
+        table_source: SQLTableSource,
+        federation_provider: Arc<AcceleratedTableFederationProvider>,
+    ) -> Self {
+        Self {
+            table_source,
+            federation_provider,
+        }
+    }
+}
+
+impl std::fmt::Debug for AcceleratedTableFederatedTableSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcceleratedTableFederatedTableSource")
+            .field("table_reference", &self.table_source.table_reference())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TableSource for AcceleratedTableFederatedTableSource {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self.table_source.as_any()
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.table_source.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.table_source.table_type()
+    }
+}
+
+impl FederatedTableSource for AcceleratedTableFederatedTableSource {
+    fn federation_provider(&self) -> Arc<dyn FederationProvider> {
+        Arc::clone(&self.federation_provider) as Arc<dyn FederationProvider>
+    }
+}
+
 pub struct AcceleratedTableFederationProvider {
     enabled: bool,
     provider: Option<Arc<dyn FederationProvider>>,
     refresher: Arc<crate::accelerated_table::refresh::Refresher>,
+}
+
+impl std::fmt::Debug for AcceleratedTableFederationProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcceleratedTableFederationProvider")
+            .field("enabled", &self.enabled)
+            .field("has_provider", &self.provider.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl AcceleratedTableFederationProvider {
@@ -60,10 +116,10 @@ impl FederationProvider for AcceleratedTableFederationProvider {
         self.federation_provider().and_then(|x| x.compute_context())
     }
 
-    fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
+    fn optimizer(&self) -> Option<Arc<Optimizer>> {
         if !self.enabled {
             return None;
         }
-        self.federation_provider()?.analyzer(plan)
+        self.federation_provider()?.optimizer()
     }
 }

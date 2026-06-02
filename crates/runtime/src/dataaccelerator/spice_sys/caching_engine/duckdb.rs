@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::{CachingEngineSys, Error, Result};
-use datafusion_table_providers::duckdb::{DuckDB, RelationName, TableDefinition};
+use datafusion_table_providers::duckdb::DuckDB;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use std::sync::Arc;
 
@@ -28,16 +28,8 @@ impl CachingEngineSys {
 
         let tx = duckdb_conn.transaction().map_err(Error::external)?;
 
-        // Create a TableDefinition from the dataset name to find internal tables
-        let table_definition = TableDefinition::new(
-            RelationName::new(&self.dataset_name),
-            Arc::new(arrow::datatypes::Schema::empty()), // Schema not needed for listing tables
-        );
-
-        let has_table = table_definition.has_table(&tx).map_err(Error::external)?;
-        let mut internal_tables = table_definition
-            .list_internal_tables(&tx)
-            .map_err(Error::external)?;
+        let has_table = table_exists(&tx, &self.dataset_name)?;
+        let mut internal_tables = list_internal_tables(&tx, &self.dataset_name)?;
 
         // Determine the actual table name (internal or direct)
         let table_name = match (internal_tables.pop(), has_table) {
@@ -59,4 +51,42 @@ impl CachingEngineSys {
         tx.commit().map_err(Error::external)?;
         Ok(())
     }
+}
+
+fn table_exists(tx: &spiceai_duckdb::Transaction<'_>, table_name: &str) -> Result<bool> {
+    let mut stmt = tx
+        .prepare("SELECT 1 FROM duckdb_tables() WHERE table_name = ?")
+        .map_err(Error::external)?;
+    let mut rows = stmt.query([table_name]).map_err(Error::external)?;
+    Ok(rows.next().map_err(Error::external)?.is_some())
+}
+
+fn list_internal_tables(
+    tx: &spiceai_duckdb::Transaction<'_>,
+    table_name: &str,
+) -> Result<Vec<(String, u64)>> {
+    let pattern = format!("__data_{table_name}%");
+    let mut stmt = tx
+        .prepare("SELECT table_name FROM duckdb_tables() WHERE table_name LIKE ?")
+        .map_err(Error::external)?;
+    let mut rows = stmt.query([pattern]).map_err(Error::external)?;
+
+    let mut table_names = Vec::new();
+    while let Some(row) = rows.next().map_err(Error::external)? {
+        let internal_table_name: String = row.get(0).map_err(Error::external)?;
+        let Some(inner_name) = internal_table_name.strip_prefix("__data_") else {
+            continue;
+        };
+        let Some((inner_table_name, timestamp)) = inner_name.rsplit_once('_') else {
+            continue;
+        };
+        if inner_table_name != table_name {
+            continue;
+        }
+        let timestamp = timestamp.parse::<u64>().map_err(Error::external)?;
+        table_names.push((internal_table_name, timestamp));
+    }
+
+    table_names.sort_by(|left, right| left.1.cmp(&right.1));
+    Ok(table_names)
 }

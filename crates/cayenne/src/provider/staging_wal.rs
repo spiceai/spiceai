@@ -62,6 +62,7 @@ use crate::metastore::MetastoreTransaction;
 use crate::provider::Error;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::TryStreamExt;
+use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};

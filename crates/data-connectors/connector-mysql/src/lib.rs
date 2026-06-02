@@ -18,7 +18,6 @@ use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser::dialect::MySqlDialect;
 use datafusion_table_providers::mysql::MySQLTableFactory;
-use datafusion_table_providers::sql::arrow_sql_gen::mysql::MysqlZeroDateBehavior;
 use datafusion_table_providers::sql::db_connection_pool::{
     Error as DbConnectionPoolError, dbconnection,
     mysqlpool::{self, MySQLConnectionPool},
@@ -191,18 +190,22 @@ impl DataConnectorFactory for MySQLFactory {
                 );
             }
 
-            let zero_date_behavior = match params
-                .parameters
-                .get("zero_date_behavior")
-                .ok()
-                .map(|s| s.expose_secret().to_ascii_lowercase())
-                .as_deref()
-            {
-                Some("error") => MysqlZeroDateBehavior::Error,
-                // `one_of_ignore_ascii_case` validation has already rejected anything other
-                // than "null" / "error"; default + any other value falls through to Null.
-                _ => MysqlZeroDateBehavior::Null,
-            };
+            if matches!(
+                params
+                    .parameters
+                    .get("zero_date_behavior")
+                    .ok()
+                    .map(|s| s.expose_secret().to_ascii_lowercase())
+                    .as_deref(),
+                Some("error")
+            ) {
+                return Err(DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "mysql".to_string(),
+                    connector_component: params.component.clone(),
+                    message: "The mysql zero_date_behavior=error mode is unavailable with datafusion-table-providers 0.11; zero dates are coerced to NULL by the upstream MySQL reader".to_string(),
+                }
+                .into());
+            }
 
             if let Some(time_zone) = params.parameters.get("time_zone").expose().ok() {
                 // "LOCAL_SYSTEM" value must be replaced with the actual system time zone information.
@@ -224,7 +227,7 @@ impl DataConnectorFactory for MySQLFactory {
             }
 
             let pool = match MySQLConnectionPool::new(params.parameters.to_secret_map()).await {
-                Ok(pool) => Arc::new(pool.with_zero_date_behavior(zero_date_behavior)),
+                Ok(pool) => Arc::new(pool),
                 Err(error) => match error {
                     mysqlpool::Error::InvalidUsernameOrPassword => {
                         return Err(

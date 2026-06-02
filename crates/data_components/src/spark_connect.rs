@@ -37,9 +37,11 @@ use datafusion::{
     error::Result,
     logical_expr::Expr,
     physical_plan::ExecutionPlan,
-    sql::TableReference,
+    sql::{
+        TableReference,
+        unparser::{Unparser, dialect::DefaultDialect},
+    },
 };
-use datafusion_table_providers::sql::sql_provider_datafusion::expr::{self, Engine};
 use futures::Stream;
 use runtime_rate_control::RateController;
 use spark_connect_rs::errors::SparkError;
@@ -156,7 +158,10 @@ async fn get_table_provider(
     let dataframe = session.table(spark_table_reference.as_str())?;
 
     let rate_controller_permit = acquire_rate_controller_permit(rate_controller.as_ref()).await?;
-    let arrow_schema = dataframe.clone().limit(0).collect().await?.schema();
+    let arrow_schema = crate::source_arrow_compat::record_batch_to_arrow(
+        &dataframe.clone().limit(0).collect().await?,
+    )?
+    .schema();
     drop(rate_controller_permit);
 
     Ok(Arc::new(SparkConnectTableProvider {
@@ -197,7 +202,7 @@ impl TableProvider for SparkConnectTableProvider {
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         let mut filter_push_down = vec![];
         for filter in filters {
-            match expr::to_sql(filter) {
+            match expr_to_sql(filter) {
                 Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
                 Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
             }
@@ -230,7 +235,7 @@ struct SparkConnectExecutionPlan {
     projected_schema: SchemaRef,
     filters: Vec<String>,
     limit: Option<i32>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     rate_controller: Option<Arc<RateController>>,
 }
 
@@ -266,19 +271,25 @@ impl SparkConnectExecutionPlan {
             projected_schema: Arc::clone(&projected_schema),
             filters: filters
                 .iter()
-                .map(|f| expr::to_sql_with_engine(f, Some(Engine::Spark)))
+                .map(expr_to_sql)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?,
             limit,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
             rate_controller,
         })
     }
+}
+
+fn expr_to_sql(expr: &Expr) -> DataFusionResult<String> {
+    Unparser::new(&DefaultDialect {})
+        .expr_to_sql(expr)
+        .map(|expr| expr.to_string())
 }
 
 impl DisplayAs for SparkConnectExecutionPlan {
@@ -308,7 +319,7 @@ impl ExecutionPlan for SparkConnectExecutionPlan {
         "SparkConnectExecutionPlan"
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -375,7 +386,11 @@ fn dataframe_to_stream(
         let data = dataframe
             .collect()
             .await
-            .map_err(map_error_to_datafusion_err)?;
+            .map_err(map_error_to_datafusion_err)
+            .and_then(|batch| {
+                crate::source_arrow_compat::record_batch_to_arrow(&batch)
+                    .map_err(DataFusionError::from)
+            })?;
         drop(rate_controller_permit);
         yield (Ok(data))
     }

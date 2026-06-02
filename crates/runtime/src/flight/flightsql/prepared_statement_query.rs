@@ -119,6 +119,7 @@ impl VisitorMut for ParameterCastRewriter<'_> {
                         ]),
                         vec![],
                     ),
+                    array: false,
                     format: None,
                     kind: datafusion::sql::sqlparser::ast::CastKind::Cast,
                 };

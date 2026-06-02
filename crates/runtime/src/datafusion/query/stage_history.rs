@@ -20,7 +20,7 @@ limitations under the License.
 //! Run from `QueryHandle::finish_tracker_*` after the Ballista job reaches
 //! terminal state (success, failure, or cancellation). Walks the in-process
 //! `ExecutionGraph` and produces child rows via the existing `OTel` pipeline
-//! — child spans created inside `parent_span.in_scope(...)` inherit the
+//! - child spans created inside `parent_span.in_scope(...)` inherit the
 //! parent's `OTel` context, so the exporter at
 //! `crate::task_history::otel_exporter` writes them with the correct
 //! `parent_span_id`.
@@ -36,17 +36,18 @@ limitations under the License.
 //! for backwards-compatible label queries.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
+use ballista_core::serde::protobuf::{RunningTask, SuccessfulTask, task_status};
 use ballista_scheduler::state::execution_graph::ExecutionGraph;
 use ballista_scheduler::state::execution_stage::{ExecutionStage, TaskInfo};
-use datafusion::common::format::ExplainFormat;
+use datafusion::physical_plan::displayable;
 use opentelemetry_sdk::trace::SpanData;
 use tracing::Span;
 
 use crate::task_history::TaskSpan;
 use crate::task_history::otel_exporter::{SpanRetention, SpanTransform};
-use std::sync::Arc;
 
 /// Name of the tracing span this module emits per stage. Also the value
 /// of the `task` column in the resulting `task_history` row.
@@ -133,7 +134,7 @@ fn emit_stage_span(
     // Render the stage plan in tree form via Ballista's per-variant
     // `format_with` so the row's `input` matches what `EXPLAIN FORMAT TREE`
     // would produce for the stage in isolation.
-    let plan_str = stage.format_with(&ExplainFormat::Tree);
+    let plan_str = displayable(stage.plan()).indent(true).to_string();
 
     parent_span.in_scope(|| {
         // Span name must match `BALLISTA_STAGE_SPAN_NAME` so
@@ -162,7 +163,7 @@ fn emit_stage_span(
         if let Some(err) = summary.error_message.as_deref() {
             tracing::error!(target: "task_history", parent: &stage_span, "{err}");
         }
-        // stage_span drops here → OTel closes it → exporter writes the row.
+        // stage_span drops here -> OTel closes it -> exporter writes the row.
     });
 }
 
@@ -172,11 +173,25 @@ fn emit_stage_span(
 fn executor_ids_in_stage(stage: &ExecutionStage) -> Vec<String> {
     let mut ids = Vec::new();
     for task_info in iter_task_infos(stage) {
-        if !task_info.executor_id.is_empty() {
-            ids.push(task_info.executor_id.clone());
+        if let Some(executor_id) = task_executor_id(task_info) {
+            ids.push(executor_id.to_string());
         }
     }
     ids
+}
+
+fn task_executor_id(task: &TaskInfo) -> Option<&str> {
+    match &task.task_status {
+        task_status::Status::Running(RunningTask { executor_id })
+        | task_status::Status::Successful(SuccessfulTask { executor_id, .. }) => {
+            if executor_id.is_empty() {
+                None
+            } else {
+                Some(executor_id.as_str())
+            }
+        }
+        task_status::Status::Failed(_) => None,
+    }
 }
 
 /// Iterate over the concrete `TaskInfo`s in a stage regardless of variant.
@@ -222,18 +237,15 @@ fn summarize_stage(stage: &ExecutionStage) -> StageSummary {
         if task.finish_time > stage_ended_at {
             stage_ended_at = task.finish_time;
         }
-        // Skip tasks that haven't been placed yet (pending or failed without
-        // executor assignment). Including their empty `executor_id` would
-        // pollute the per-stage histogram (a `:N` bucket) and disagree with
-        // the job-level `executor_count`, which already filters empty ids.
-        if task.executor_id.is_empty() {
+        let Some(executor_id) = task_executor_id(task) else {
             continue;
-        }
+        };
         if dur > slowest_task_ms {
             slowest_task_ms = dur;
-            slowest_task_executor.clone_from(&task.executor_id);
+            slowest_task_executor.clear();
+            slowest_task_executor.push_str(executor_id);
         }
-        *by_executor.entry(task.executor_id.clone()).or_insert(0) += 1;
+        *by_executor.entry(executor_id.to_string()).or_insert(0) += 1;
     }
     if stage_started_at == u128::MAX {
         stage_started_at = 0;
@@ -277,7 +289,7 @@ fn u128_to_u64_sat(v: u128) -> u64 {
 ///   the real per-stage runtime rather than the brief span-emission
 ///   window inside `record_stage_history`.
 /// - [`SpanRetention`]: declares that a `ballista_stage` row depends
-///   on its parent `sql_query` row — the stage row is written only
+///   on its parent `sql_query` row - the stage row is written only
 ///   when the parent row is also being written, avoiding orphans.
 ///
 /// Register on the exporter (both hooks):
@@ -291,8 +303,8 @@ fn u128_to_u64_sat(v: u128) -> u64 {
 pub struct BallistaStageMiddleware;
 
 impl BallistaStageMiddleware {
-    /// Helper that constructs an `Arc<Self>` and returns it twice — once
-    /// as each trait object — so a single instance can be registered for
+    /// Helper that constructs an `Arc<Self>` and returns it twice - once
+    /// as each trait object - so a single instance can be registered for
     /// both hooks in a single chained builder call.
     #[must_use]
     pub fn pair() -> (Arc<dyn SpanTransform>, Arc<dyn SpanRetention>) {

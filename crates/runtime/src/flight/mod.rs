@@ -553,6 +553,11 @@ pub enum Error {
     ))]
     ClusterSchedulerNotInitialized {},
 
+    #[snafu(display(
+        "The cluster executor is not initialized, preventing the flight service from starting."
+    ))]
+    ClusterExecutorNotInitialized {},
+
     #[snafu(display("Unable to start internal cluster server: {source}"))]
     UnableToStartClusterServer { source: tonic::transport::Error },
 

@@ -12,6 +12,7 @@ version.workspace = true
 anyhow.workspace = true
 app = { path = "../app" }
 arrow = { workspace = true, features = ["prettyprint", "chrono-tz"] }
+spice-client-arrow = { package = "arrow", version = "57.2", features = ["prettyprint"] }
 arrow_tools = { path = "../arrow_tools" }
 arrow-json.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }

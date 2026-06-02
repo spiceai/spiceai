@@ -17,6 +17,7 @@ arrow-csv.workspace = true
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 arrow-ipc.workspace = true
 arrow-json.workspace = true
+arrow-row.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
 arrow_tools = { path = "../arrow_tools" }
 async-openai.workspace = true
@@ -64,6 +65,13 @@ duckdb = { workspace = true, features = [
     "bundled",
     "r2d2",
     "extensions-full",
+], optional = true }
+spiceai_duckdb = { package = "spiceai_duckdb_fork", version = "=1.4.4", features = [
+    "bundled",
+    "r2d2",
+    "vtab",
+    "vtab-arrow",
+    "appender-arrow",
 ], optional = true }
 dynamodb-streams = { path = "../dynamodb-streams", optional = true }
 event_stream = { path = "../event_stream" }
@@ -292,6 +300,7 @@ elasticsearch = [
 ]
 duckdb = [
     "dep:duckdb",
+    "dep:spiceai_duckdb",
     "db_connection_pool/duckdb",
     "data_components/duckdb",
     "datafusion-optimizer-rules/duckdb",
@@ -380,7 +389,7 @@ turso = [
     "dep:rusqlite",
     "runtime-acceleration/turso",
 ]
-vortex = ["ballista-core/vortex", "ballista-executor/vortex"]
+vortex = []
 [target.'cfg(not(windows))'.dependencies]
 cayenne = { path = "../cayenne", features = ["turso", "partition-table-provider"] }
 vortex.workspace = true

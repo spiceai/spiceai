@@ -114,9 +114,7 @@ use datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
-use runtime_datafusion::join_accumulator::{
-    DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES, ExactLeftAccumulator,
-};
+use runtime_datafusion::join_accumulator::DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -1097,12 +1095,10 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
             }
 
             tracing::debug!(
-                "Replacing HashJoinExec with ExactLeftAccumulator for Cayenne acceleration"
+                "Skipping Cayenne ExactLeftAccumulator rewrite because DataFusion 53 no longer exposes custom hash join accumulator hooks"
             );
 
-            let new_join = hash_join.recreate_with_accumulator::<ExactLeftAccumulator>();
-
-            Ok(Transformed::yes(Arc::new(new_join)))
+            Ok(Transformed::no(node))
         })
         .data()
     }
@@ -1144,7 +1140,6 @@ mod tests {
     use object_store::ObjectMeta;
     use object_store::ObjectStore;
     use object_store::path::Path;
-    use runtime_datafusion::join_accumulator::ExactLeftAccumulator;
     use std::any::Any;
     use std::sync::Arc;
 
@@ -1437,6 +1432,7 @@ mod tests {
             None,
             PartitionMode::Partitioned,
             null_equality,
+            false,
         )
         .expect("hash join should be valid")
     }
@@ -1510,26 +1506,15 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_hash_join_with_cayenne_probe_side() {
-        let schema = order_line_schema();
-        let left = file_exec_with_statistics(
-            &schema,
-            "left.vortex",
-            None,
-            Statistics::new_unknown(&schema).with_num_rows(Precision::Exact(1_000)),
-        );
-        let right =
-            cayenne_file_exec_with_num_rows(&schema, "right.vortex", Precision::Exact(1_000_000));
-        let join = Arc::new(hash_join(left, right, "order_id", "order_id"));
+    fn leaves_cayenne_probe_hash_join_unchanged_without_accumulator_hooks() {
+        let right = Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
+        let join = Arc::new(join_with_right(right));
 
         let optimized = optimize(join);
 
         assert!(
-            optimized
-                .as_any()
-                .downcast_ref::<HashJoinExec<ExactLeftAccumulator>>()
-                .is_some(),
-            "Cayenne-backed joins should use ExactLeftAccumulator"
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "DataFusion 53 no longer exposes custom hash join accumulator hooks"
         );
     }
 
@@ -1692,70 +1677,33 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_hash_join_through_transparent_projection() {
-        let schema = order_line_schema();
-        let left = file_exec_with_statistics(
-            &schema,
-            "left.vortex",
-            None,
-            Statistics::new_unknown(&schema).with_num_rows(Precision::Exact(1_000)),
-        );
-        let right_input =
-            cayenne_file_exec_with_num_rows(&schema, "right.vortex", Precision::Exact(1_000_000));
+    fn leaves_transparent_projection_hash_join_unchanged_without_accumulator_hooks() {
+        let right_input = Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
         let right_schema = right_input.schema();
         let right = Arc::new(
             ProjectionExec::try_new(
                 vec![(
-                    col("order_id", &right_schema).expect("projection column should exist"),
-                    "order_id".to_string(),
+                    col("right_id", &right_schema).expect("projection column should exist"),
+                    "right_id".to_string(),
                 )],
                 right_input,
             )
             .expect("projection should be valid"),
         );
-        let join = Arc::new(hash_join(left, right, "order_id", "order_id"));
+        let join = Arc::new(join_with_right(right));
 
         let optimized = optimize(join);
 
         assert!(
-            optimized
-                .as_any()
-                .downcast_ref::<HashJoinExec<ExactLeftAccumulator>>()
-                .is_some(),
-            "Transparent wrappers over Cayenne scans should still use ExactLeftAccumulator"
+            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            "Transparent wrappers over Cayenne scans should remain valid HashJoinExec plans"
         );
     }
 
     #[test]
-    fn rewrites_nested_cayenne_probe_join_chain() {
-        let nested_left_schema = Arc::new(Schema::new(vec![Field::new(
-            "nested_left_id",
-            DataType::Int32,
-            false,
-        )]));
-        let nested_right_schema = Arc::new(Schema::new(vec![Field::new(
-            "nested_right_id",
-            DataType::Int32,
-            false,
-        )]));
-        let top_schema = Arc::new(Schema::new(vec![Field::new(
-            "top_id",
-            DataType::Int32,
-            false,
-        )]));
-        let nested_left = Arc::new(CayenneAccelerationExec::new(file_exec_with_statistics(
-            &nested_left_schema,
-            "nested-left.vortex",
-            None,
-            Statistics::new_unknown(&nested_left_schema).with_num_rows(Precision::Exact(1_000)),
-        )));
-        let nested_right = Arc::new(CayenneAccelerationExec::new(file_exec_with_statistics(
-            &nested_right_schema,
-            "nested-right.vortex",
-            None,
-            Statistics::new_unknown(&nested_right_schema)
-                .with_num_rows(Precision::Exact(1_000_000)),
-        )));
+    fn leaves_nested_cayenne_probe_join_chain_without_accumulator_hooks() {
+        let nested_left = Arc::new(CayenneAccelerationExec::new(memory_exec("nested_left_id")));
+        let nested_right = Arc::new(CayenneAccelerationExec::new(memory_exec("nested_right_id")));
         let nested_join = Arc::new(hash_join(
             nested_left,
             nested_right,
@@ -1763,12 +1711,7 @@ mod tests {
             "nested_right_id",
         ));
         let top_join = Arc::new(hash_join(
-            file_exec_with_statistics(
-                &top_schema,
-                "top.vortex",
-                None,
-                Statistics::new_unknown(&top_schema).with_num_rows(Precision::Exact(100)),
-            ),
+            memory_exec("top_id"),
             nested_join,
             "top_id",
             "nested_left_id",
@@ -1778,9 +1721,9 @@ mod tests {
         let snapshot = plan_snapshot(&optimized);
 
         assert_eq!(
-            1,
+            0,
             snapshot.matches("accumulator=ExactLeftAccumulator").count(),
-            "Only the nested Cayenne probe join has clear probe-side scan statistics for the exact accumulator"
+            "DataFusion 53 no longer exposes custom hash join accumulator hooks"
         );
     }
 

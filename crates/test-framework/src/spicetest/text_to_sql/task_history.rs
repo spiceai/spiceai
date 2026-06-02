@@ -20,7 +20,6 @@ use tokio::time::sleep;
 
 use anyhow::Result;
 use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
-use futures::TryStreamExt;
 use opentelemetry::trace::TraceId;
 
 /// Metrics from `runtime.task_history` for a `nsql` operation.
@@ -299,13 +298,8 @@ async fn retry_query_until_llm_found(
         let query = query.clone();
         let data = Arc::clone(&data);
         async move {
-            match spice_client.sql(&query).await {
-                Ok(stream) => {
-                    let Some(rbs) = stream.try_collect::<Vec<RecordBatch>>().await.ok() else {
-                        sleep(Duration::from_secs(1)).await;
-                        return false;
-                    };
-
+            match crate::spice_client_arrow_compat::query_to_batches(&spice_client, &query).await {
+                Ok(rbs) => {
                     let Some(rb) = rbs.first() else {
                         sleep(Duration::from_secs(1)).await;
                         return false;
@@ -352,12 +346,8 @@ async fn retry_query_expecting_results(
         let query = query.clone();
         let data = Arc::clone(&data);
         async move {
-            match spice_client.sql(&query).await {
-                Ok(stream) => {
-                    let Some(rbs) = stream.try_collect::<Vec<RecordBatch>>().await.ok() else {
-                        sleep(Duration::from_secs(1)).await;
-                        return false;
-                    };
+            match crate::spice_client_arrow_compat::query_to_batches(&spice_client, &query).await {
+                Ok(rbs) => {
                     if rbs.first().is_none_or(|rb| rb.num_rows() == 0) {
                         sleep(Duration::from_secs(1)).await;
                         false

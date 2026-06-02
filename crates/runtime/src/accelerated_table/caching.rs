@@ -1682,7 +1682,7 @@ pub type SynchronizedChildren = Arc<RwLock<Vec<Arc<dyn TableProvider>>>>;
 /// Caching acceleration execution plan that checks staleness and triggers background refresh
 pub struct CachingAccelerationScanExec {
     input: Arc<dyn ExecutionPlan>,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
     /// Maximum time data is considered "fresh" - can be served without refresh
     max_age: Option<Duration>,
     /// Time window after `max_age` during which stale data can be served while revalidating
@@ -1728,11 +1728,14 @@ impl CachingAccelerationScanExec {
         // Default max_age (TTL) to 30 seconds if not specified
         let max_age = max_age.or(Some(Duration::from_secs(30)));
 
-        let plan_properties = input
-            .properties()
-            .clone()
-            .with_emission_type(EmissionType::Final)
-            .with_partitioning(Partitioning::UnknownPartitioning(1));
+        let plan_properties = Arc::new(
+            input
+                .properties()
+                .as_ref()
+                .clone()
+                .with_emission_type(EmissionType::Final)
+                .with_partitioning(Partitioning::UnknownPartitioning(1)),
+        );
 
         Self {
             input,
@@ -1780,7 +1783,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         self.input.schema()
     }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         &self.plan_properties
     }
 
@@ -2122,7 +2125,7 @@ mod tests {
     #[cfg(feature = "duckdb")]
     use datafusion_table_providers::duckdb::DuckDBTableProviderFactory;
     #[cfg(feature = "duckdb")]
-    use duckdb::AccessMode;
+    use spiceai_duckdb::AccessMode;
 
     use super::*;
     use arrow::array::{
@@ -3768,7 +3771,7 @@ mod tests {
         };
 
         let duckdb_factory = DuckDBTableProviderFactory::new(AccessMode::ReadWrite);
-        let table = create_table_provider(&duckdb_factory, &external_table, None)
+        let table = create_table_provider(&duckdb_factory, &external_table)
             .await
             .expect("table should be created");
 
@@ -3862,7 +3865,7 @@ mod tests {
         };
 
         let duckdb_factory = DuckDBTableProviderFactory::new(AccessMode::ReadWrite);
-        let table = create_table_provider(&duckdb_factory, &external_table, None)
+        let table = create_table_provider(&duckdb_factory, &external_table)
             .await
             .expect("table should be created");
 

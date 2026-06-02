@@ -65,7 +65,9 @@ use datafusion::{
     sql::TableReference,
 };
 use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
-use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
+use datafusion_federation::{
+    FederatedPlanner, FederatedTableProviderAdaptor, FederationOptimizerRule,
+};
 use datafusion_optimizer_rules::physical_plan::HttpParamsPushdown;
 use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, is_retriable_error,
@@ -1560,7 +1562,7 @@ impl RefreshTask {
         disable_federation: bool,
         io_runtime: Handle,
     ) -> SessionContext {
-        let state_builder = SessionStateBuilder::new()
+        let mut state_builder = SessionStateBuilder::new()
             .with_config(get_df_default_config())
             .with_runtime_env(default_runtime_env(io_runtime))
             .with_default_features();
@@ -1570,11 +1572,13 @@ impl RefreshTask {
 
         let mut analyzer_rules_builder = AnalyzerRulesBuilder::default();
 
-        // If federation is disabled, disable the federation analyzer rule and don't include the federated planner.
+        // If federation is disabled, don't include the federation optimizer rule or federated planner.
         if disable_federation {
             analyzer_rules_builder = analyzer_rules_builder.include_federation(false);
         } else {
             analyzer_rules_builder = analyzer_rules_builder.include_federation(true);
+            state_builder =
+                state_builder.with_optimizer_rule(Arc::new(FederationOptimizerRule::new()));
             extension_planners.push(Arc::new(FederatedPlanner::new()));
         }
 

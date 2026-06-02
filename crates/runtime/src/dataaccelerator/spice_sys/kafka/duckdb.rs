@@ -18,6 +18,7 @@ use super::super::offsets::{self, sort_offsets};
 use super::{Error, KAFKA_OFFSETS_TABLE_NAME, KAFKA_TABLE_NAME, KafkaMetadata, KafkaSys, Result};
 use data_components::kafka::KafkaOffset;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use spiceai_duckdb as duckdb;
 use std::sync::Arc;
 
 impl KafkaSys {

@@ -22,7 +22,8 @@ use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use object_store::{
-    GetResult, ObjectStore, PutMode, PutPayload, UpdateVersion, path::Path as ObjectPath,
+    GetResult, ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion,
+    path::Path as ObjectPath,
 };
 use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_secrets::{Secrets, get_params_with_secrets};

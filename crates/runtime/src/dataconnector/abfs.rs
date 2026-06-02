@@ -28,9 +28,10 @@ use super::{
 };
 
 use crate::{
-    Runtime, component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
+    Runtime,
+    component::dataset::Dataset,
+    dataconnector::listing::{LISTING_TABLE_PARAMETERS, ObjectVersionType},
 };
-use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -404,8 +405,8 @@ register_data_connector!(
 mod tests {
     use super::*;
     use crate::dataconnector::listing::ListingTableConnector;
+    use crate::dataconnector::listing::ObjectVersionType;
     use crate::parameters::ParameterSpec;
-    use datafusion::parquet::arrow::async_reader::ObjectVersionType;
     use datafusion_table_providers::util::secrets::to_secret_map;
     use std::collections::HashMap;
 

@@ -443,7 +443,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
         Arc::clone(self.properties().eq_properties.schema())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.inner.properties()
     }
 
@@ -533,11 +533,6 @@ impl ExecutionPlan for CayenneAccelerationExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         self.inner.metrics()
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        #[expect(deprecated)]
-        self.inner.statistics()
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {

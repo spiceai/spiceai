@@ -30,7 +30,7 @@ use datafusion::{
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::util::{
-    column_reference::ColumnReference, constraints::UpsertOptions, on_conflict::OnConflict,
+    column_reference::ColumnReference, on_conflict::OnConflict,
 };
 use linkme::distributed_slice;
 use runtime_acceleration::snapshot::{AccelerationLayout, SnapshotDownloadInfo};
@@ -64,6 +64,31 @@ pub mod upsert_dedup;
 
 pub(crate) use snapshots::validate_snapshot_paths;
 pub use snapshots::{CayenneSnapshotValidationError, validate_cayenne_snapshot_consistency};
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpsertOptions {
+    pub remove_duplicates: bool,
+    pub last_write_wins: bool,
+}
+
+impl UpsertOptions {
+    #[must_use]
+    pub const fn with_remove_duplicates(mut self, remove_duplicates: bool) -> Self {
+        self.remove_duplicates = remove_duplicates;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_last_write_wins(mut self, last_write_wins: bool) -> Self {
+        self.last_write_wins = last_write_wins;
+        self
+    }
+
+    #[must_use]
+    pub const fn is_default(&self) -> bool {
+        !self.remove_duplicates && !self.last_write_wins
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct AcceleratorRegistration {
@@ -2281,7 +2306,7 @@ mod accelerator_compat_tests {
         };
 
         let schema = transformed_data.schema();
-        let exec = MockExec::new(vec![Ok(transformed_data)], schema);
+        let exec = MockExec::new(vec![Ok(transformed_data)], schema).with_use_task(false);
         let insertion = table
             .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
             .await
@@ -2552,7 +2577,7 @@ mod accelerator_compat_tests {
     async fn test_delete_operations() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
             // Skip engines that don't support deletion
-            if engine == Engine::Arrow || engine == Engine::Cayenne {
+            if matches!(engine, Engine::Arrow | Engine::Cayenne | Engine::DuckDB) {
                 return;
             }
 

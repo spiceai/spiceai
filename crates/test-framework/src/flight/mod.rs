@@ -26,6 +26,8 @@ use flight_client::FlightClient;
 use futures::StreamExt;
 use spiceai::{Client as SpiceClient, SpiceClientError};
 
+use crate::spice_client_arrow_compat::{from_spice_record_batch, optional_params_to_spice};
+
 /// Query a flight client and return the result as a vector of record batches
 ///
 /// # Errors
@@ -36,12 +38,13 @@ pub async fn query_to_batches(
     sql: &str,
     params: Option<RecordBatch>,
 ) -> Result<Vec<RecordBatch>> {
+    let params = optional_params_to_spice(params)?;
     let mut stream = spice_client.sql_with_params(sql, params).await?;
 
     let mut batches = Vec::new();
     while let Some(batch) = stream.next().await {
         match batch {
-            Ok(batch) => batches.push(batch),
+            Ok(batch) => batches.push(from_spice_record_batch(&batch)?),
             Err(e) => match e {
                 SpiceClientError::ConnectionReset { .. } => {
                     batches.clear();

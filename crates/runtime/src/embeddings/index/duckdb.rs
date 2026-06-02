@@ -212,11 +212,6 @@ pub(crate) async fn wrap_accelerator_with_duckdb_vector_indexes(
         )));
     };
 
-    // Exclude Spice-managed HNSW indexes from the DuckDB writer's index drift check.
-    // These indexes are created externally (after each refresh) and are not registered
-    // in the TableDefinition configuration.
-    table_definition.add_ignored_index_prefix("__spice_vss_");
-
     let mut provider = if let Some(indexed) = accelerator_provider
         .as_any()
         .downcast_ref::<IndexedTableProvider>()

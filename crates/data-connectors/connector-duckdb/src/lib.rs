@@ -31,7 +31,6 @@ use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::is_table_function;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use duckdb::AccessMode;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
@@ -40,6 +39,7 @@ use runtime::dataconnector::{
 use runtime::datafusion::dialect::new_duckdb_dialect;
 use runtime::parameters::ParameterSpec;
 use snafu::prelude::*;
+use spiceai_duckdb::AccessMode;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;

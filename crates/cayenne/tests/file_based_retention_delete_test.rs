@@ -42,7 +42,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::*;
 use datafusion_common::ScalarValue;
-use datafusion_execution::cache::TableScopedPath;
+use datafusion_execution::cache::{TableScopedPath, cache_manager::CachedFileList};
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
@@ -834,8 +834,8 @@ fn table_id_dir(
 }
 
 /// Creates a dummy non-empty cache value. The cache rejects empty vecs internally.
-fn dummy_cache_value() -> std::sync::Arc<Vec<ObjectMeta>> {
-    std::sync::Arc::new(vec![ObjectMeta {
+fn dummy_cache_value() -> CachedFileList {
+    CachedFileList::new(vec![ObjectMeta {
         location: object_store::path::Path::from("dummy/file.parquet"),
         last_modified: chrono::Utc::now(),
         size: 42,

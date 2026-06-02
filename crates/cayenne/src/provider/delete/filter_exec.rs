@@ -227,7 +227,7 @@ pub struct KeyBasedDeletionFilterExec {
     /// Optional minimum sequence number for protected-snapshot filtering.
     /// See [`Int64PkDeletionFilterExec::min_delete_seq_to_apply`].
     min_delete_seq_to_apply: Option<i64>,
-    properties: datafusion_physical_plan::PlanProperties,
+    properties: Arc<datafusion_physical_plan::PlanProperties>,
 }
 
 impl KeyBasedDeletionFilterExec {
@@ -286,7 +286,7 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
         self
     }
 
-    fn properties(&self) -> &datafusion_physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<datafusion_physical_plan::PlanProperties> {
         &self.properties
     }
 
@@ -498,7 +498,7 @@ pub struct Int64PkDeletionFilterExec {
     /// protected snapshot's creation without rebuilding the deletion
     /// index. `None` means apply every deletion in `deleted_pk_values`.
     min_delete_seq_to_apply: Option<i64>,
-    properties: datafusion_physical_plan::PlanProperties,
+    properties: Arc<datafusion_physical_plan::PlanProperties>,
 }
 
 impl Int64PkDeletionFilterExec {
@@ -555,7 +555,7 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
         self
     }
 
-    fn properties(&self) -> &datafusion_physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<datafusion_physical_plan::PlanProperties> {
         &self.properties
     }
 

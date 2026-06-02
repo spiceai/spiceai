@@ -225,7 +225,7 @@ impl ExecutionPlan for BytesProcessedExec {
         Arc::clone(self.properties().eq_properties.schema())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.input_exec.properties()
     }
 
@@ -321,11 +321,6 @@ impl ExecutionPlan for BytesProcessedExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         self.input_exec.metrics()
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        #[expect(deprecated)]
-        self.input_exec.statistics()
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {

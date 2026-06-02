@@ -308,6 +308,7 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
             join.join_type,
             join.join_constraint,
             join.null_equality,
+            join.null_aware,
         )?;
 
         Ok(Transformed::yes(LogicalPlan::Join(new_join)))
@@ -2872,6 +2873,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let r = rule();
@@ -2951,6 +2953,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let r = rule();
@@ -3036,6 +3039,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let r = rule();
@@ -3434,6 +3438,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNull,
+            false,
         )?);
 
         let r = rule();
@@ -3487,6 +3492,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let r = rule();

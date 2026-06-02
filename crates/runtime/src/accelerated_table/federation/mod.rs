@@ -23,7 +23,7 @@ use datafusion::datasource::TableProvider;
 use datafusion_federation::{
     FederatedTableProviderAdaptor, FederatedTableSource, sql::SQLTableSource,
 };
-use provider::AcceleratedTableFederationProvider;
+use provider::{AcceleratedTableFederatedTableSource, AcceleratedTableFederationProvider};
 
 mod provider;
 
@@ -37,11 +37,10 @@ impl AcceleratedTable {
                 .clone(),
         );
 
-        let remote_table_name = accelerated_table_federation_provider
-            .get_table_source()?
+        let remote_table_source = accelerated_table_federation_provider.get_table_source()?;
+        let sql_table_source = remote_table_source
             .as_any()
-            .downcast_ref::<SQLTableSource>()
-            .map(SQLTableSource::table_reference)?;
+            .downcast_ref::<SQLTableSource>()?;
 
         let enabled =
             self.zero_results_action != ZeroResultsAction::UseSource && !self.disable_federation;
@@ -52,10 +51,15 @@ impl AcceleratedTable {
             self.refresher(),
         ));
 
-        Some(Arc::new(SQLTableSource::new_with_schema(
-            fed_provider,
-            remote_table_name,
+        let table_source = SQLTableSource::new_with_schema(
+            Arc::clone(&sql_table_source.provider),
+            sql_table_source.table_reference().into(),
             Arc::clone(&self.schema()),
+        );
+
+        Some(Arc::new(AcceleratedTableFederatedTableSource::new(
+            table_source,
+            fed_provider,
         )))
     }
 

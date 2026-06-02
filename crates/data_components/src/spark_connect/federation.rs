@@ -35,7 +35,7 @@ use super::{SparkConnectTableProvider, acquire_rate_controller_permit};
 
 impl SparkConnectTableProvider {
     fn create_federated_table_source(self: Arc<Self>) -> Arc<dyn FederatedTableSource> {
-        let table_name = self.table_reference.clone();
+        let table_name = self.table_reference.clone().into();
         tracing::trace!(
             %self.table_reference,
             "create_federated_table_source"
@@ -112,7 +112,11 @@ impl SQLExecutor for SparkConnectTableProvider {
         let schema = dataframe
             .collect()
             .await
-            .map_err(map_error_to_datafusion_err)?
+            .map_err(map_error_to_datafusion_err)
+            .and_then(|batch| {
+                crate::source_arrow_compat::record_batch_to_arrow(&batch)
+                    .map_err(DataFusionError::from)
+            })?
             .schema();
         drop(rate_controller_permit);
         Ok(schema)
@@ -137,7 +141,11 @@ fn spark_query_to_stream(
             .map_err(map_error_to_datafusion_err)?
             .collect()
             .await
-            .map_err(map_error_to_datafusion_err)?;
+            .map_err(map_error_to_datafusion_err)
+            .and_then(|batch| {
+                crate::source_arrow_compat::record_batch_to_arrow(&batch)
+                    .map_err(DataFusionError::from)
+            })?;
         drop(rate_controller_permit);
         yield (Ok(data))
     }

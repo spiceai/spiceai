@@ -371,12 +371,12 @@ impl TableProvider for WorkflowRunsTableProvider {
             fetch_logs: self.fetch_logs,
             schema: Arc::clone(&self.schema),
             client: Arc::clone(&self.client),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(Arc::clone(&self.schema)),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Final,
                 Boundedness::Bounded,
-            ),
+            )),
         });
 
         if let Some(projection) = projection {
@@ -408,7 +408,7 @@ struct WorkflowRunsExecutionPlan {
     fetch_logs: bool,
     schema: SchemaRef,
     client: Arc<GithubRestClient>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl DisplayAs for WorkflowRunsExecutionPlan {
@@ -446,7 +446,7 @@ impl ExecutionPlan for WorkflowRunsExecutionPlan {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -524,10 +524,6 @@ impl ExecutionPlan for WorkflowRunsExecutionPlan {
 
     fn metrics(&self) -> Option<datafusion::physical_plan::metrics::MetricsSet> {
         None
-    }
-
-    fn statistics(&self) -> datafusion::error::Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema()))
     }
 
     fn partition_statistics(

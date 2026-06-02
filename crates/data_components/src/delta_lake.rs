@@ -16,7 +16,6 @@ limitations under the License.
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
-use aws_sdk_credential_bridge;
 use chrono::TimeZone;
 use datafusion::catalog::Session;
 use datafusion::catalog::memory::DataSourceExec;
@@ -97,6 +96,12 @@ pub enum Error {
     SnapshotLockError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Failed to create object store for Delta Lake table {table_url}: {source}"))]
+    ObjectStore {
+        table_url: String,
+        source: object_store::Error,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -150,6 +155,7 @@ impl Read for DeltaTableFactory {
 pub struct DeltaTable {
     table_url: Url,
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    parquet_object_store: Arc<dyn object_store::ObjectStore>,
     /// User-facing Arrow schema with logical column names. When the Delta table
     /// uses column mapping (`Name` or `Id` mode), parquet files store data under
     /// physical column names that differ from these logical names.
@@ -166,7 +172,7 @@ impl DeltaTable {
     pub fn from(
         table_location: String,
         options: HashMap<String, SecretString>,
-        io_runtime: &Handle,
+        _io_runtime: &Handle,
     ) -> Result<Self> {
         let table_url = delta_kernel::try_parse_uri(ensure_folder_location(table_location))
             .map_err(handle_delta_error)?;
@@ -184,49 +190,21 @@ impl DeltaTable {
             }
         }
 
-        let table_object_store = if table_url.scheme() == "s3" {
-            let region = storage_options.get("aws_region").map(ToString::to_string);
+        let (parquet_object_store, _) = object_store::parse_url_opts(
+            &table_url,
+            storage_options
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )
+        .context(ObjectStoreSnafu {
+            table_url: table_url.to_string(),
+        })?;
+        let parquet_object_store: Arc<dyn object_store::ObjectStore> =
+            Arc::from(parquet_object_store);
 
-            if let Some(sdk_config) = aws_sdk_credential_bridge::should_use_sdk_credentials(
-                &storage_options,
-                "aws_access_key_id",
-                "aws_secret_access_key",
-            ) {
-                // Use AWS SDK credential bridge for IAM role or environment-based authentication.
-                // This allows dynamic credential fetching from IAM roles, environment variables,
-                // or other AWS credential sources at query time.
-                tracing::trace!("Using AWS SDK credentials provider for Delta Lake table");
-                match aws_sdk_credential_bridge::from_s3_url_and_config(
-                    &table_url,
-                    region,
-                    sdk_config.as_ref(),
-                    io_runtime.clone(),
-                ) {
-                    Ok(object_store) => Some(object_store),
-                    Err(err) => {
-                        tracing::debug!(
-                            "Unable to create S3 object store with AWS SDK credentials for Delta Lake table at {}: {err}",
-                            table_url
-                        );
-                        None
-                    }
-                }
-            } else {
-                tracing::trace!(
-                    "Using delta_kernel's built-in AWS credential resolution for Delta Lake table"
-                );
-                None
-            }
-        } else {
-            None
-        };
-
-        let engine = match table_object_store {
-            Some(object_store) => Arc::new(DefaultEngine::new(object_store.into())),
-            None => Arc::new(DefaultEngine::new(
-                store_from_url_opts(&table_url, storage_options).map_err(handle_delta_error)?,
-            )),
-        };
+        let engine = Arc::new(DefaultEngine::new(
+            store_from_url_opts(&table_url, storage_options).map_err(handle_delta_error)?,
+        ));
 
         let snapshot = Snapshot::builder_for(table_url.clone())
             .build(engine.as_ref())
@@ -255,6 +233,7 @@ impl DeltaTable {
         Ok(Self {
             table_url,
             engine,
+            parquet_object_store,
             arrow_schema: Arc::new(arrow_schema),
             delta_schema,
             snapshot: RwLock::new(snapshot),
@@ -600,16 +579,9 @@ impl TableProvider for DeltaTable {
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.arrow_schema))?;
 
-        let store = self
-            .engine
-            .get_object_store_for_url(&self.table_url)
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(
-                    "Failed to get object store for table location".to_string(),
-                )
-            })?;
-        let parquet_file_reader_factory = Arc::new(DefaultParquetFileReaderFactory::new(store))
-            as Arc<dyn ParquetFileReaderFactory>;
+        let parquet_file_reader_factory = Arc::new(DefaultParquetFileReaderFactory::new(
+            Arc::clone(&self.parquet_object_store),
+        )) as Arc<dyn ParquetFileReaderFactory>;
         let projected_delta_schema = project_delta_schema(
             &self.arrow_schema,
             Arc::clone(&self.delta_schema),
@@ -1081,6 +1053,7 @@ fn to_delta_kernel_expr(expr: &Expr) -> Option<Expression> {
         | Expr::Exists(_)
         | Expr::Wildcard { .. }
         | Expr::Unnest { .. }
+        | Expr::SetComparison(_)
         | Expr::OuterReferenceColumn(_, _)
         | Expr::AggregateFunction { .. }
         | Expr::WindowFunction { .. }
@@ -1153,6 +1126,7 @@ fn to_delta_kernel_binary_expression(
         | Operator::HashLongArrow
         | Operator::AtAt
         | Operator::IntegerDivide
+        | Operator::Colon
         | Operator::HashMinus
         | Operator::AtQuestion
         | Operator::Question
@@ -1292,6 +1266,7 @@ fn to_delta_kernel_scalar(scalar: ScalarValue) -> Option<Scalar> {
         | ScalarValue::DurationNanosecond(_)
         | ScalarValue::Union(_, _, _)
         | ScalarValue::Dictionary(_, _)
+        | ScalarValue::RunEndEncoded(_, _, _)
         | ScalarValue::Decimal32(_, _, _)
         | ScalarValue::Decimal64(_, _, _) => None,
     }

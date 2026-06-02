@@ -734,10 +734,9 @@ fn invalid_parameter_error(
 mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_table_providers::util::{
-        column_reference::ColumnReference, constraints::UpsertOptions,
-    };
+    use datafusion_table_providers::util::column_reference::ColumnReference;
     use runtime::component::dataset::acceleration::{Acceleration, RefreshMode};
+    use runtime::dataaccelerator::UpsertOptions;
     use secrecy::SecretString;
     use std::collections::HashMap;
 

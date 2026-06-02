@@ -117,6 +117,11 @@ impl Catalog for RestCatalog {
         self.inner.drop_table(table).await
     }
 
+    /// Drop a table from the catalog and delete the underlying table data.
+    async fn purge_table(&self, table: &TableIdent) -> IcebergResult<()> {
+        self.inner.purge_table(table).await
+    }
+
     /// Check if a table exists in the catalog.
     async fn table_exists(&self, table: &TableIdent) -> IcebergResult<bool> {
         self.inner.table_exists(table).await
@@ -138,7 +143,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use iceberg::CatalogBuilder;
     use iceberg_catalog_rest::RestCatalogBuilder;
-    use iceberg_datafusion::IcebergTableProvider;
+    use iceberg_datafusion::IcebergStaticTableProvider;
     use iceberg_storage_opendal::OpenDalStorageFactory;
     use std::sync::Arc;
 
@@ -156,7 +161,6 @@ mod tests {
         let catalog = RestCatalog::new(
             RestCatalogBuilder::default()
                 .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-                    configured_scheme: "s3".to_string(),
                     customized_credential_load: None,
                 }))
                 .load(
@@ -189,13 +193,16 @@ mod tests {
             .await;
         println!("{tables:?}");
 
-        let df_table_provider = IcebergTableProvider::try_new(
-            Arc::new(catalog),
-            NamespaceIdent::new("nyc".to_string()),
-            "taxis".to_string(),
-        )
-        .await
-        .expect("Failed to create table provider");
+        let table = catalog
+            .load_table(&TableIdent::new(
+                NamespaceIdent::new("nyc".to_string()),
+                "taxis".to_string(),
+            ))
+            .await
+            .expect("Failed to load table");
+        let df_table_provider = IcebergStaticTableProvider::try_new_from_table(table)
+            .await
+            .expect("Failed to create table provider");
 
         let ctx = SessionContext::new();
         ctx.register_table("ice_ice_baby", Arc::new(df_table_provider))

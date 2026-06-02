@@ -227,7 +227,16 @@ pub async fn start_executor_flight_server(
         rt.datafusion().data_update_broadcaster(),
     );
     let session_store = spice_service.session_store();
-    let composite_service = CompositeFlightService::new(spice_service);
+    let ballista_work_dir = rt
+        .df
+        .executor
+        .read()
+        .map_err(|_| Error::ClusterExecutorNotInitialized {})?
+        .as_ref()
+        .ok_or(Error::ClusterExecutorNotInitialized {})?
+        .work_dir
+        .clone();
+    let composite_service = CompositeFlightService::new(spice_service, ballista_work_dir);
 
     // Get app for request context
     let app = rt.app.read().await.as_ref().map(Arc::clone);

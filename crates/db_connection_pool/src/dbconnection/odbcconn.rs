@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::io::Cursor as IoCursor;
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
@@ -75,6 +76,16 @@ pub type ODBCDbConnectionPool<'a> =
 pub enum Error {
     #[snafu(display("Failed to convert query result to Arrow: {source}"))]
     ArrowError { source: arrow::error::ArrowError },
+    #[snafu(display("Failed to read ODBC Arrow batch: {source}"))]
+    ODBCArrowReadError {
+        source: arrow_odbc::arrow::error::ArrowError,
+    },
+    #[snafu(display("Failed to serialize ODBC Arrow response: {source}"))]
+    ODBCArrowSerializeError {
+        source: arrow_odbc::arrow::error::ArrowError,
+    },
+    #[snafu(display("Failed to deserialize ODBC Arrow response: {source}"))]
+    ODBCArrowDeserializeError { source: arrow::error::ArrowError },
     #[snafu(display("ODBC driver error: {source}"))]
     ArrowODBCError { source: arrow_odbc::Error },
     #[snafu(display("ODBC connection error: {source}"))]
@@ -162,11 +173,14 @@ where
             .boxed()
             .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
 
-        let schema = Arc::new(
-            arrow_schema_from(&mut prepared, None, false)
-                .boxed()
-                .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?,
-        );
+        let odbc_schema = arrow_schema_from(&mut prepared, None, false)
+            .boxed()
+            .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
+        let schema = Arc::new(odbc_schema_to_arrow(&odbc_schema).map_err(|e| {
+            dbconnection::Error::UnableToGetSchema {
+                source: e.to_string().into(),
+            }
+        })?);
 
         Ok(schema)
     }
@@ -179,7 +193,7 @@ where
     ) -> Result<SendableRecordBatchStream> {
         // prepare some tokio channels to communicate query results back from the thread
         let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<RecordBatch>(4);
-        let (schema_tx, mut schema_rx) = tokio::sync::mpsc::channel::<Arc<Schema>>(1);
+        let (schema_tx, mut schema_rx) = tokio::sync::mpsc::channel::<SchemaRef>(1);
 
         // clone internals and parameters to let the thread own them
         let conn = Arc::clone(&self.conn); // clones the mutex not the connection, so we can .lock a connection inside the thread
@@ -210,7 +224,8 @@ where
             let cxn = handle.block_on(async { conn.lock().await });
 
             let mut prepared = cxn.prepare(&sql)?;
-            let schema = Arc::new(arrow_schema_from(&mut prepared, None, false)?);
+            let odbc_schema = Arc::new(arrow_schema_from(&mut prepared, None, false)?);
+            let schema = Arc::new(odbc_schema_to_arrow(&odbc_schema)?);
             blocking_channel_send(&schema_tx, Arc::clone(&schema))?;
 
             let mut statement = prepared.into_handle();
@@ -275,7 +290,7 @@ where
                 Ok::<_, GenericError>(CursorImpl::new(statement.as_stmt_ref()))
             }?;
 
-            let reader = build_odbc_reader(cursor, &schema, &secrets)?;
+            let reader = build_odbc_reader(cursor, &odbc_schema, &secrets)?;
             for batch in reader {
                 if cloned_token.is_cancelled() {
                     return Err(Error::ChannelError {
@@ -283,7 +298,8 @@ where
                     }
                     .into());
                 }
-                blocking_channel_send(&batch_tx, batch.context(ArrowSnafu)?)?;
+                let batch = batch.context(ODBCArrowReadSnafu)?;
+                blocking_channel_send(&batch_tx, odbc_record_batch_to_arrow(&batch)?)?;
             }
             if !cloned_token.is_cancelled() {
                 cloned_token.cancel();
@@ -374,7 +390,7 @@ where
 
 fn build_odbc_reader<C: Cursor>(
     cursor: C,
-    schema: &Arc<Schema>,
+    schema: &Arc<arrow_odbc::arrow::datatypes::Schema>,
     params: &HashMap<String, SecretString>,
 ) -> Result<OdbcReader<C>, Error> {
     let mut builder = OdbcReaderBuilder::new();
@@ -409,6 +425,47 @@ fn build_odbc_reader<C: Cursor>(
     });
 
     builder.build(cursor).context(ArrowODBCSnafu)
+}
+
+fn odbc_schema_to_arrow(schema: &arrow_odbc::arrow::datatypes::Schema) -> Result<Schema, Error> {
+    let mut buffer = Vec::new();
+    {
+        let mut writer = source_arrow_ipc::writer::StreamWriter::try_new(&mut buffer, schema)
+            .context(ODBCArrowSerializeSnafu)?;
+        writer.finish().context(ODBCArrowSerializeSnafu)?;
+    }
+
+    let reader = arrow::ipc::reader::StreamReader::try_new(IoCursor::new(buffer), None)
+        .context(ODBCArrowDeserializeSnafu)?;
+    Ok(reader.schema().as_ref().clone())
+}
+
+fn odbc_record_batch_to_arrow(
+    record_batch: &arrow_odbc::arrow::record_batch::RecordBatch,
+) -> Result<RecordBatch, Error> {
+    let mut buffer = Vec::new();
+    let schema = record_batch.schema();
+    {
+        let mut writer =
+            source_arrow_ipc::writer::StreamWriter::try_new(&mut buffer, schema.as_ref())
+                .context(ODBCArrowSerializeSnafu)?;
+        writer
+            .write(record_batch)
+            .context(ODBCArrowSerializeSnafu)?;
+        writer.finish().context(ODBCArrowSerializeSnafu)?;
+    }
+
+    let mut reader = arrow::ipc::reader::StreamReader::try_new(IoCursor::new(buffer), None)
+        .context(ODBCArrowDeserializeSnafu)?;
+    let Some(batch) = reader.next() else {
+        return Err(Error::ArrowError {
+            source: arrow::error::ArrowError::ParseError(
+                "ODBC Arrow IPC stream did not contain a record batch".to_string(),
+            ),
+        });
+    };
+
+    batch.context(ODBCArrowDeserializeSnafu)
 }
 
 /// Extracts diagnostic error messages from an ODBC handle after a failed call.

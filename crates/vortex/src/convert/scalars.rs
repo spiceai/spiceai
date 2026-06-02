@@ -127,6 +127,8 @@ impl TryToDataFusion<ScalarValue> for Scalar {
             DType::FixedSizeList(..) => {
                 vortex_bail!("fixed-size list scalar conversion is not supported")
             }
+            DType::Union(..) => vortex_bail!("union scalar conversion is not supported"),
+            DType::Variant(_) => vortex_bail!("variant scalar conversion is not supported"),
             DType::Extension(ext) => {
                 let storage_scalar = self.as_extension().to_storage_scalar();
 

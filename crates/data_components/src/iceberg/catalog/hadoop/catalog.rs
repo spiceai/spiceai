@@ -349,6 +349,13 @@ impl Catalog for HadoopCatalog {
         ))
     }
 
+    async fn purge_table(&self, _table: &TableIdent) -> Result<()> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Purging tables is not supported in hadoop catalog",
+        ))
+    }
+
     async fn rename_table(&self, _src: &TableIdent, _dest: &TableIdent) -> Result<()> {
         Err(Error::new(
             ErrorKind::FeatureUnsupported,

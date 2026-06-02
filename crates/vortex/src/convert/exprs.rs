@@ -174,16 +174,16 @@ impl DefaultExpressionConvertor {
                 let when_expr = self.convert(when_expr.as_ref())?;
                 let then_expr = self.convert(then_expr.as_ref())?;
                 else_expr = zip_expr(
+                    Binary.new_expr(Operator::Eq, [base_expr.clone(), when_expr]),
                     then_expr,
                     else_expr,
-                    Binary.new_expr(Operator::Eq, [base_expr.clone(), when_expr]),
                 );
             }
         } else {
             for (when_expr, then_expr) in case_expr.when_then_expr().iter().rev() {
                 let when_expr = self.convert(when_expr.as_ref())?;
                 let then_expr = self.convert(then_expr.as_ref())?;
-                else_expr = zip_expr(then_expr, else_expr, when_expr);
+                else_expr = zip_expr(when_expr, then_expr, else_expr);
             }
         }
 
@@ -433,7 +433,8 @@ fn try_operator_from_df(value: DFOperator) -> DFResult<Operator> {
         | DFOperator::AtQuestion
         | DFOperator::Question
         | DFOperator::QuestionAnd
-        | DFOperator::QuestionPipe => {
+        | DFOperator::QuestionPipe
+        | DFOperator::Colon => {
             tracing::debug!(operator = %value, "Can't pushdown binary_operator operator");
             Err(exec_datafusion_err!(
                 "Unsupported datafusion operator {value}"

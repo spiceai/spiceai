@@ -52,7 +52,7 @@ pub struct SchemaCastScanExec {
     target_schema: SchemaRef,
     /// The actual output schema (target schema with nullability adjustments from input)
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl SchemaCastScanExec {
@@ -119,12 +119,12 @@ impl SchemaCastScanExec {
         }
         let emission_type = input.pipeline_behavior();
         let boundedness = input.boundedness();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             eq_properties,
             input.output_partitioning().clone(),
             emission_type,
             boundedness,
-        );
+        ));
         Self {
             input,
             target_schema: schema,
@@ -171,7 +171,7 @@ impl ExecutionPlan for SchemaCastScanExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -254,11 +254,6 @@ impl ExecutionPlan for SchemaCastScanExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         self.input.metrics()
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        #[expect(deprecated)]
-        self.input.statistics()
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {

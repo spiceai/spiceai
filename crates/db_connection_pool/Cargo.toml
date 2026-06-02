@@ -31,6 +31,7 @@ serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
+source-arrow-ipc = { package = "arrow-ipc", version = "57", optional = true }
 tokio = { workspace = true, optional = true, features = ["rt"] }
 tokio-util = { workspace = true }
 tracing.workspace = true
@@ -52,6 +53,7 @@ duckdb = [
 mysql = ["datafusion-table-providers/mysql"]
 odbc = [
   "dep:odbc-api",
+  "dep:source-arrow-ipc",
   "dep:async-stream",
   "dep:arrow-odbc",
   "dep:tokio",
@@ -65,7 +67,12 @@ postgres = [
   "datafusion-table-providers/postgres-federation",
 ]
 scylladb = ["dep:scylla", "dep:async-stream"]
-snowflake = ["dep:snowflake-api", "dep:pkcs8", "dep:serde_json"]
+snowflake = [
+  "dep:snowflake-api",
+  "dep:source-arrow-ipc",
+  "dep:pkcs8",
+  "dep:serde_json",
+]
 sqlite = [
   "datafusion-table-providers/sqlite",
   "datafusion-table-providers/sqlite-federation",

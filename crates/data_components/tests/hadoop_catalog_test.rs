@@ -90,7 +90,6 @@ fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
     HadoopCatalogBuilder::default()
         .with_warehouse_root("s3a://hadoop/")
         .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: "s3a".to_string(),
             customized_credential_load: None,
         }))
         .with_operator(operator)
@@ -104,9 +103,7 @@ fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
 /// as `s3://hadoop/` while the underlying table metadata uses `s3a://hadoop/`.
 ///
 /// Uses `with_storage_factory_builder` so that when the Hadoop catalog infers the
-/// `s3a` scheme from the metadata locations, the storage factory is rebuilt with
-/// `configured_scheme: "s3a"`. Without this rebuild, the rebuilt `FileIO` would
-/// reject `s3a://...` paths because the original factory was configured for `s3`.
+/// `s3a` scheme from the metadata locations, the storage factory is rebuilt.
 #[expect(clippy::expect_used)]
 fn get_s3_to_s3a_inferred_hadoop_catalog() -> HadoopCatalogBuilder {
     #[cfg(not(feature = "test_hadoop_catalog_docker"))]
@@ -141,9 +138,8 @@ fn get_s3_to_s3a_inferred_hadoop_catalog() -> HadoopCatalogBuilder {
 
     HadoopCatalogBuilder::default()
         .with_warehouse_root("s3://hadoop/")
-        .with_storage_factory_builder(|scheme| {
+        .with_storage_factory_builder(|_scheme| {
             Arc::new(OpenDalStorageFactory::S3 {
-                configured_scheme: scheme.to_string(),
                 customized_credential_load: None,
             })
         })

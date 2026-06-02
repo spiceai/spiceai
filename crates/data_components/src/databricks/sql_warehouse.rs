@@ -2059,7 +2059,7 @@ impl crate::Read for DatabricksSqlWarehouse {
         let dialect = Arc::new(databricks_dialect());
 
         let table_provider = Arc::new(
-            SqlTable::new("databricks", &self.pool, table_reference, None)
+            SqlTable::new("databricks", &self.pool, table_reference)
                 .await
                 .context(SqlTableInitializationFailedSnafu)?
                 .with_dialect(dialect),

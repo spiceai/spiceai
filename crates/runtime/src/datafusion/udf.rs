@@ -33,11 +33,11 @@ use crate::search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
 use crate::search::rrf;
 use crate::search::rrf::RRF_UDF_NAME;
 use crate::search::util::parse_explicit_primary_keys;
+use data_components::function_support::{FunctionRestriction, FunctionSupport};
 use datafusion::execution::FunctionRegistry;
 use datafusion::functions::math::random::RandomFunc;
 use datafusion::logical_expr::ScalarUDF;
 use datafusion::prelude::SessionContext;
-use datafusion_table_providers::util::supported_functions::{FunctionRestriction, FunctionSupport};
 use parking_lot::RwLock;
 use runtime_datafusion::query_engine::QueryEngine;
 #[cfg(feature = "models")]

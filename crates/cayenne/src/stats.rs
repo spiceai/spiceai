@@ -25,6 +25,7 @@ use std::sync::Arc;
 use arrow_schema::Schema;
 use datafusion_common::stats::Precision;
 use datafusion_common::{ColumnStatistics, ScalarValue, Statistics};
+use vortex::VortexSessionDefault;
 use vortex::array::stats::StatsSet;
 use vortex::dtype::arrow::FromArrowType;
 use vortex::dtype::{DType, Nullability};
@@ -115,7 +116,7 @@ fn scalar_to_df(scalar: &Scalar) -> Option<ScalarValue> {
             // extension types. Round-trip through Arrow so DataFusion
             // `ScalarValue` gets the correct logical type (preserving time
             // unit / time zone).
-            let datum: Arc<dyn arrow::array::Datum> = scalar.try_into().ok()?;
+            let datum = Arc::<dyn arrow::array::Datum>::try_from(scalar).ok()?;
             let (array, _is_scalar) = datum.get();
             ScalarValue::try_from_array(array, 0).ok()
         }
@@ -130,6 +131,7 @@ fn vortex_precision_to_df<T: Debug + Clone + PartialEq + Eq + PartialOrd>(
     match p {
         VortexPrecision::Exact(v) => Precision::Exact(v),
         VortexPrecision::Inexact(v) => Precision::Inexact(v),
+        VortexPrecision::Absent => Precision::Absent,
     }
 }
 
@@ -187,33 +189,23 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
 
 /// Convert a Vortex [`StatsSet`] and column [`DType`] to `DataFusion` [`ColumnStatistics`].
 pub(crate) fn stats_set_to_column_stats(stats: &StatsSet, dtype: &DType) -> ColumnStatistics {
-    let min_value = stats
-        .get(Stat::Min)
-        .and_then(|p| {
-            let sv = p.map(|v| vortex_stat_to_df(&v, Stat::Min, dtype));
-            match sv {
-                VortexPrecision::Exact(Some(v)) => Some(Precision::Exact(v)),
-                VortexPrecision::Inexact(Some(v)) => Some(Precision::Inexact(v)),
-                _ => None,
-            }
-        })
-        .unwrap_or(Precision::Absent);
+    let min_value = vortex_precision_to_df(
+        stats
+            .get(Stat::Min)
+            .and_then(|v| vortex_stat_to_df(&v, Stat::Min, dtype)),
+    );
 
-    let max_value = stats
-        .get(Stat::Max)
-        .and_then(|p| {
-            let sv = p.map(|v| vortex_stat_to_df(&v, Stat::Max, dtype));
-            match sv {
-                VortexPrecision::Exact(Some(v)) => Some(Precision::Exact(v)),
-                VortexPrecision::Inexact(Some(v)) => Some(Precision::Inexact(v)),
-                _ => None,
-            }
-        })
-        .unwrap_or(Precision::Absent);
+    let max_value = vortex_precision_to_df(
+        stats
+            .get(Stat::Max)
+            .and_then(|v| vortex_stat_to_df(&v, Stat::Max, dtype)),
+    );
 
-    let null_count = stats
-        .get_as::<usize>(Stat::NullCount, &vortex::dtype::PType::U64.into())
-        .map_or(Precision::Absent, vortex_precision_to_df);
+    let null_count = vortex_precision_to_df(
+        stats
+            .get_as::<u64>(Stat::NullCount, &vortex::dtype::PType::U64.into())
+            .and_then(|count| usize::try_from(count).ok()),
+    );
 
     ColumnStatistics {
         null_count,
@@ -269,7 +261,11 @@ pub(crate) fn serialize_file_statistics(stats: &FileStatistics) -> VortexResult<
 pub fn deserialize_file_statistics(bytes: &[u8], schema: &Schema) -> VortexResult<FileStatistics> {
     let struct_dtype = vortex_struct_dtype_from_schema(schema);
     let fb_stats = flatbuffers::root::<vortex::flatbuffers::footer::FileStatistics>(bytes)?;
-    FileStatistics::from_flatbuffer(&fb_stats, &struct_dtype)
+    FileStatistics::from_flatbuffer(
+        &fb_stats,
+        &struct_dtype,
+        &vortex_session::VortexSession::default(),
+    )
 }
 
 /// Convert an Arrow [`Schema`] to a Vortex struct [`DType`].
@@ -372,8 +368,20 @@ mod tests {
         };
         let set = column_stats_to_stats_set(&cs);
         // Pre-serialize sanity: StatsSet has Utf8 min/max.
-        assert!(set.get(Stat::Min).is_some(), "min present in StatsSet");
-        assert!(set.get(Stat::Max).is_some(), "max present in StatsSet");
+        assert!(
+            matches!(
+                set.get(Stat::Min),
+                VortexPrecision::Exact(_) | VortexPrecision::Inexact(_)
+            ),
+            "min present in StatsSet"
+        );
+        assert!(
+            matches!(
+                set.get(Stat::Max),
+                VortexPrecision::Exact(_) | VortexPrecision::Inexact(_)
+            ),
+            "max present in StatsSet"
+        );
 
         let file_stats = build_file_statistics(vec![set], &schema);
         let bytes = serialize_file_statistics(&file_stats).expect("serialize ok");

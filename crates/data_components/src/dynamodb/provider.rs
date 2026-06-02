@@ -698,7 +698,7 @@ pub struct DynamoDBTableProviderExec {
     projected_schema: SchemaRef,
     unnest_depth: Option<usize>,
     time_format: Arc<String>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     json_nesting: Option<JsonNesting>,
 }
 
@@ -720,12 +720,12 @@ impl DynamoDBTableProviderExec {
             unnest_depth,
             time_format,
             json_nesting,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(partitions),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }
     }
 }
@@ -759,7 +759,7 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

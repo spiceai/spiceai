@@ -20,11 +20,7 @@ use datafusion::{
     sql::{TableReference, unparser::dialect::Dialect},
 };
 use datafusion_table_providers::sql::{
-    db_connection_pool as db_connection_pool_datafusion,
-    sql_provider_datafusion::{
-        SqlTable,
-        expr::{self, Engine},
-    },
+    db_connection_pool as db_connection_pool_datafusion, sql_provider_datafusion::SqlTable,
 };
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use snafu::prelude::*;
@@ -50,9 +46,6 @@ pub enum Error {
     UnableToGetSchema {
         source: db_connection_pool_datafusion::dbconnection::Error,
     },
-
-    #[snafu(display("Failed to generate SQL for the ODBC query: {source}"))]
-    UnableToGenerateSQL { source: expr::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -87,7 +80,7 @@ where
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<ODBCDbConnectionPool<'a>> = pool;
 
-        let table = SqlTable::new("odbc", &dyn_pool, table_reference, Some(Engine::ODBC))
+        let table = SqlTable::new("odbc", &dyn_pool, table_reference)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 

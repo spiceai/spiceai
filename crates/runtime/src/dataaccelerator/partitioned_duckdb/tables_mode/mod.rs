@@ -26,13 +26,14 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::{
-    common::DFSchema,
+    common::{Constraints, DFSchema},
     datasource::TableProvider,
     error::DataFusionError,
     execution::runtime_env::RuntimeEnv,
     logical_expr::{CreateExternalTable, TableProviderFilterPushDown},
     prelude::Expr,
     scalar::ScalarValue,
+    sql::TableReference,
     sql::unparser::expr_to_sql,
 };
 use datafusion_table_providers::{
@@ -41,7 +42,8 @@ use datafusion_table_providers::{
         write::DuckDBTableWriter,
     },
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
-    util::{constraints::UpsertOptions, on_conflict::OnConflict},
+    util::on_conflict::OnConflict,
+    util::{column_reference::ColumnReference, indexes::IndexType},
 };
 use runtime_table_partition::{
     Partition,
@@ -50,6 +52,8 @@ use runtime_table_partition::{
     provider::PartitionTableProvider,
 };
 use snafu::{OptionExt, prelude::*};
+
+use crate::dataaccelerator::UpsertOptions;
 
 use crate::dataaccelerator::{BootstrapStatus, upsert_dedup::UpsertDedupTableProvider};
 use crate::{
@@ -221,6 +225,8 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
             creator.table_definition(),
             creator.on_conflict().cloned(),
             creator.upsert_options().clone(),
+            creator.constraints().cloned(),
+            creator.indexes().to_vec(),
             source,
         ));
 
@@ -255,6 +261,7 @@ struct DuckDBPartitionCreator {
     table_definition: Arc<TableDefinition>,
     on_conflict: Option<OnConflict>,
     upsert_options: UpsertOptions,
+    indexes: Vec<(ColumnReference, IndexType)>,
     partition_by: PartitionedBy,
     schema: SchemaRef,
 }
@@ -269,7 +276,7 @@ impl DuckDBPartitionCreator {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // We use the DuckDB factory to create a table provider in order to extract
         // target table definition and on_conflict settings that will be used directly for each partition.
-        let table_provider = create_table_provider(duckdb_factory, &cmd, None)
+        let table_provider = create_table_provider(duckdb_factory, &cmd)
             .await
             .map_err(|e| format!("Failed to create table provider: {e}"))?;
 
@@ -283,16 +290,45 @@ impl DuckDBPartitionCreator {
 
         // Extract UpsertOptions from cmd options
         let upsert_options = Self::extract_upsert_options(&cmd);
+        let table_definition = writer.table_definition();
+        let on_conflict = Self::extract_on_conflict(&cmd)?;
+        let indexes = Self::extract_indexes(&cmd)?;
 
         Ok(Self {
             pool,
             cmd,
-            table_definition: writer.table_definition(),
-            on_conflict: writer.on_conflict().cloned(),
+            table_definition,
+            on_conflict,
             upsert_options,
+            indexes,
             partition_by,
             schema,
         })
+    }
+
+    fn extract_on_conflict(
+        cmd: &CreateExternalTable,
+    ) -> Result<Option<OnConflict>, Box<dyn std::error::Error + Send + Sync>> {
+        cmd.options
+            .get("on_conflict")
+            .map(|value| OnConflict::try_from(value.as_str()))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    fn extract_indexes(
+        cmd: &CreateExternalTable,
+    ) -> Result<Vec<(ColumnReference, IndexType)>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(indexes_str) = cmd.options.get("indexes") else {
+            return Ok(Vec::new());
+        };
+
+        datafusion_table_providers::util::hashmap_from_option_string::<String, IndexType>(
+            indexes_str,
+        )
+        .into_iter()
+        .map(|(columns, index_type)| Ok((ColumnReference::try_from(columns.as_str())?, index_type)))
+        .collect()
     }
 
     /// Extracts `UpsertOptions` from the command options.
@@ -322,6 +358,18 @@ impl DuckDBPartitionCreator {
 
     pub fn upsert_options(&self) -> &UpsertOptions {
         &self.upsert_options
+    }
+
+    pub fn indexes(&self) -> &[(ColumnReference, IndexType)] {
+        &self.indexes
+    }
+
+    pub fn constraints(&self) -> Option<&Constraints> {
+        if self.cmd.constraints.is_empty() {
+            None
+        } else {
+            Some(&self.cmd.constraints)
+        }
     }
 
     fn list_partitioned_tables(&self) -> Result<Vec<String>, creator::Error> {
@@ -373,10 +421,8 @@ impl PartitionCreator for DuckDBPartitionCreator {
         let schema = DFSchema::try_from(Arc::clone(&self.schema))
             .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
 
-        let duckdb_table_factory = DuckDBTableFactory::new(Arc::clone(&self.pool))
-            .with_dialect(new_duckdb_dialect())
-            .with_schema(Arc::clone(&self.schema))
-            .with_indexes(self.table_definition.indexes().to_vec());
+        let duckdb_table_factory =
+            DuckDBTableFactory::new(Arc::clone(&self.pool)).with_dialect(new_duckdb_dialect());
 
         let mut partitions = Vec::with_capacity(partitioned_tables.len());
         for table in partitioned_tables {
@@ -409,7 +455,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
                 })?;
 
             let table_provider = duckdb_table_factory
-                .table_provider(table.into())
+                .table_provider(TableReference::bare(table.clone()))
                 .await
                 .map_err(|e| creator::Error::InferringPartitions { source: e })?;
 

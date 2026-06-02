@@ -16,6 +16,7 @@ limitations under the License.
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use datafusion::optimizer::optimizer::Optimizer;
 use datafusion::{
     catalog::Session,
     common::{Constraints, Statistics},
@@ -26,8 +27,7 @@ use datafusion::{
     prelude::Expr,
 };
 use datafusion_federation::{
-    FederatedTableProviderAdaptor, FederatedTableSource, FederationAnalyzerForLogicalPlan,
-    FederationProvider,
+    FederatedTableProviderAdaptor, FederatedTableSource, FederationProvider,
 };
 use std::collections::HashMap;
 use std::{any::Any, borrow::Cow, sync::Arc};
@@ -98,9 +98,8 @@ impl FederationProvider for PolyTableProvider {
             .and_then(|f| f.compute_context())
     }
 
-    fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
-        self.get_federation_provider()
-            .and_then(|f| f.analyzer(plan))
+    fn optimizer(&self) -> Option<Arc<Optimizer>> {
+        self.get_federation_provider().and_then(|f| f.optimizer())
     }
 }
 

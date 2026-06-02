@@ -188,7 +188,7 @@ pub async fn create_logical_plan_from_statement(
                 )
                 .await;
             }
-            SQLStatement::Merge { .. } if ctx.catalog_mode == CatalogMode::Cayenne => {
+            SQLStatement::Merge(_) if ctx.catalog_mode == CatalogMode::Cayenne => {
                 return merge::plan_distributed_merge(statement, session, ctx, sql).await;
             }
             _ => {}

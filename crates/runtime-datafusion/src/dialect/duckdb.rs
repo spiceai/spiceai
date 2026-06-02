@@ -63,6 +63,7 @@ pub(crate) fn cosine_distance_to_sql(
                         Some(num_elements),
                     )),
                     kind: ast::CastKind::DoubleColon,
+                    array: false,
                     format: None,
                 })
             }
@@ -80,6 +81,7 @@ pub(crate) fn cosine_distance_to_sql(
                         Some(num_elements),
                     )),
                     kind: ast::CastKind::DoubleColon,
+                    array: false,
                     format: None,
                 })
             }
@@ -139,6 +141,7 @@ pub(crate) fn array_distance_to_sql(
                 Some(n),
             )),
             kind: ast::CastKind::DoubleColon,
+            array: false,
             format: None,
         }
     };

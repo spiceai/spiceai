@@ -22,6 +22,7 @@ use std::{
 
 use super::{CHECKPOINT_TABLE_NAME, DatasetCheckpoint, Error, Result, SCHEMA_MIGRATION_01_STMT};
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use spiceai_duckdb as duckdb;
 
 impl DatasetCheckpoint {
     pub(super) fn init_duckdb(pool: &Arc<DuckDbConnectionPool>) -> Result<()> {

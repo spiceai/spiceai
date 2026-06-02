@@ -27,7 +27,7 @@ use rustyline::{Config, Editor};
 use spiceai::query::{QueryInfo, QueryStatus};
 use spiceai::{Client, ClientBuilder};
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::select;
@@ -836,12 +836,17 @@ async fn display_results(
     }
 
     // Fetch results as Arrow RecordBatches
-    let batches = job
+    let spice_batches = job
         .results()
         .await
         .map_err(|e| crate::error::Error::InvalidResponse {
             message: format!("getting results: {e}"),
         })?;
+
+    let batches = spice_batches
+        .iter()
+        .map(spice_record_batch_to_arrow)
+        .collect::<Result<Vec<_>>>()?;
 
     let total_rows: usize = batches
         .iter()
@@ -899,6 +904,48 @@ async fn display_results(
     }
 
     Ok(())
+}
+
+fn spice_record_batch_to_arrow(
+    batch: &spice_client_arrow::record_batch::RecordBatch,
+) -> Result<arrow::record_batch::RecordBatch> {
+    let mut data = Vec::new();
+    {
+        let mut writer = spice_client_arrow::ipc::writer::StreamWriter::try_new(
+            &mut data,
+            batch.schema().as_ref(),
+        )
+        .map_err(|e| crate::error::Error::InvalidResponse {
+            message: format!("serializing Arrow results for conversion: {e}"),
+        })?;
+        writer
+            .write(batch)
+            .map_err(|e| crate::error::Error::InvalidResponse {
+                message: format!("serializing Arrow batch for conversion: {e}"),
+            })?;
+        writer
+            .finish()
+            .map_err(|e| crate::error::Error::InvalidResponse {
+                message: format!("finalizing Arrow conversion stream: {e}"),
+            })?;
+    }
+
+    let mut reader =
+        arrow::ipc::reader::StreamReader::try_new(Cursor::new(data), None).map_err(|e| {
+            crate::error::Error::InvalidResponse {
+                message: format!("reading converted Arrow results: {e}"),
+            }
+        })?;
+
+    reader
+        .next()
+        .transpose()
+        .map_err(|e| crate::error::Error::InvalidResponse {
+            message: format!("decoding converted Arrow batch: {e}"),
+        })?
+        .ok_or_else(|| crate::error::Error::InvalidResponse {
+            message: "Arrow conversion produced no record batch".to_string(),
+        })
 }
 
 fn display_query_info(info: &QueryInfo) {

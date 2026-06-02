@@ -20,7 +20,7 @@ use arrow::array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
-    common::DFSchema,
+    common::{Constraints, DFSchema},
     error::DataFusionError,
     logical_expr::dml::InsertOp,
     physical_expr::create_physical_expr,
@@ -33,9 +33,10 @@ use datafusion_datasource::sink::DataSinkExec;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_optimizer_rules::pass_thru::PassThruExec;
 use datafusion_table_providers::{
-    duckdb::{TableDefinition, write_settings::DuckDBWriteSettings},
+    duckdb::TableDefinition,
     sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
-    util::{constraints::UpsertOptions, on_conflict::OnConflict},
+    util::on_conflict::OnConflict,
+    util::{column_reference::ColumnReference, indexes::IndexType},
 };
 use futures::StreamExt;
 use runtime_table_partition::{
@@ -45,9 +46,10 @@ use runtime_table_partition::{
 };
 
 use crate::dataaccelerator::{
-    AccelerationSource,
+    AccelerationSource, UpsertOptions,
     partitioned_duckdb::tables_mode::{
-        partition_buffer::PartitionBufferConfig, sink::DuckDBPartitionedDataSink,
+        partition_buffer::PartitionBufferConfig,
+        sink::{DuckDBPartitionedDataSink, DuckDBWriteSettings},
     },
 };
 
@@ -58,6 +60,8 @@ pub struct DuckDBPartitionedInsertStrategy {
     table_definition: Arc<TableDefinition>,
     on_conflict: Option<OnConflict>,
     upsert_options: UpsertOptions,
+    constraints: Option<Constraints>,
+    indexes: Vec<(ColumnReference, IndexType)>,
     write_settings: DuckDBWriteSettings,
     partition_buffer_config: PartitionBufferConfig,
 }
@@ -69,6 +73,8 @@ impl DuckDBPartitionedInsertStrategy {
         table_definition: Arc<TableDefinition>,
         on_conflict: Option<OnConflict>,
         upsert_options: UpsertOptions,
+        constraints: Option<Constraints>,
+        indexes: Vec<(ColumnReference, IndexType)>,
         source: &dyn AccelerationSource,
     ) -> Self {
         let write_settings = if let Some(acceleration) = source.acceleration() {
@@ -96,6 +102,8 @@ impl DuckDBPartitionedInsertStrategy {
             table_definition,
             on_conflict,
             upsert_options,
+            constraints,
+            indexes,
             write_settings,
             partition_buffer_config,
         }
@@ -216,6 +224,8 @@ impl InsertStrategy for DuckDBPartitionedInsertStrategy {
             insert_op,
             self.on_conflict.clone(),
             self.upsert_options.clone(),
+            self.constraints.clone(),
+            self.indexes.clone(),
             schema,
             partitioner,
         )

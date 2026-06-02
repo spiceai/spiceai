@@ -18,6 +18,7 @@ pub mod federation;
 pub mod provider;
 mod write;
 
+use crate::function_support::FunctionSupport;
 use arrow::array::Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
@@ -35,7 +36,6 @@ use datafusion::{
 use datafusion_table_providers::sql::{
     db_connection_pool::DbConnectionPool, sql_provider_datafusion::SqlTable,
 };
-use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use snowflake_api::SnowflakeApi;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
@@ -203,6 +203,10 @@ async fn probe_snowflake_information_schema(
             }
         }
         Ok(snowflake_api::QueryResult::Arrow(batches)) => {
+            let batches = match crate::source_arrow_compat::batches_to_arrow(&batches) {
+                Ok(batches) => batches,
+                Err(e) => return SchemaProbeResult::Failed(e.into()),
+            };
             match parse_information_schema_arrow(&batches, &table_reference.to_string()) {
                 Ok(schema) => SchemaProbeResult::Ok(schema),
                 Err(e) => SchemaProbeResult::Failed(e.into()),
@@ -731,7 +735,6 @@ impl SnowflakeTableFactory {
                 &pool,
                 Arc::clone(&schema),
                 table_reference_for_provider.clone(),
-                None,
             )
             .with_dialect(Arc::clone(&dialect)),
         );

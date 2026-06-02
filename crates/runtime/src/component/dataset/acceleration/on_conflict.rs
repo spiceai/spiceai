@@ -15,10 +15,11 @@ limitations under the License.
 */
 
 use datafusion_table_providers::util::{
-    column_reference::ColumnReference, constraints::UpsertOptions, on_conflict::OnConflict,
+    column_reference::ColumnReference, on_conflict::OnConflict,
 };
 
 use crate::component::dataset;
+use crate::dataaccelerator::UpsertOptions;
 
 use super::{Acceleration, IndexType, OnConflictBehavior};
 

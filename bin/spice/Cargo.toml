@@ -100,6 +100,7 @@ runtime-api-types = { path = "../../crates/runtime-api-types" }
 spicepod = { path = "../../crates/spicepod", default-features = false }
 spiceai = { workspace = true }
 arrow = { workspace = true, features = ["prettyprint"] }
+spice-client-arrow = { package = "arrow", version = "57.2", features = ["prettyprint"] }
 arrow-json.workspace = true
 test-framework = { path = "../../crates/test-framework" }
 

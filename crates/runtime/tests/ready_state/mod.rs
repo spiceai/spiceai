@@ -271,7 +271,7 @@ impl ExecutionPlan for DelayedExecutionPlan {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.inner.properties()
     }
 

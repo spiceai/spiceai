@@ -17,12 +17,10 @@ limitations under the License.
 //! Spice-owned `SQLExecutor` wrapper that applies a function deny-list to
 //! Snowflake federation decisions.
 //!
-//! Upstream `impl SQLExecutor for SqlTable<T, P>` inherits the trait default for
-//! `can_execute_plan`, which always returns `true`. As a result, any plan —
-//! including ones with Spice-only UDFs like `json_get_str` — is pushed to the
-//! remote engine, where it fails. This wrapper consults a `FunctionSupport`
-//! deny-list and refuses federation when an unsupported function appears, so
-//! `DataFusion` evaluates the affected expression locally instead.
+//! This wrapper installs a logical optimizer that consults a `FunctionSupport`
+//! deny-list and unwraps federated plans when an unsupported function appears,
+//! so `DataFusion` evaluates the affected expression locally instead of
+//! pushing Spice-only UDFs like `json_get_str` to the remote engine.
 
 use std::sync::Arc;
 
@@ -30,21 +28,19 @@ use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::SchemaRef,
     error::Result as DataFusionResult,
-    logical_expr::LogicalPlan,
     physical_plan::{PhysicalExpr, SendableRecordBatchStream},
     sql::{TableReference, unparser::dialect::Dialect},
 };
 use datafusion_federation::{
     FederatedTableProviderAdaptor, FederatedTableSource,
-    sql::{RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource},
+    sql::{LogicalOptimizer, RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource},
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::SqlTable;
-use datafusion_table_providers::util::supported_functions::{
-    FunctionSupport, contains_unsupported_functions,
-};
 
-/// `SQLExecutor` that delegates to a wrapped [`SqlTable`] but overrides
-/// [`SQLExecutor::can_execute_plan`] to consult a function deny-list.
+use crate::function_support::{FunctionSupport, unfederate_plan_with_unsupported_functions};
+
+/// `SQLExecutor` that delegates to a wrapped [`SqlTable`] but installs a logical
+/// optimizer to consult a function deny-list.
 pub struct DenyFunctionsSqlExecutor<T: 'static, P: 'static> {
     inner: Arc<SqlTable<T, P>>,
     function_support: Option<FunctionSupport>,
@@ -83,14 +79,11 @@ impl<T: 'static, P: 'static> SQLExecutor for DenyFunctionsSqlExecutor<T, P> {
         SQLExecutor::dialect(self.inner.as_ref())
     }
 
-    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
-        // Default to allowing federation when no deny-list is configured. When
-        // one is provided, reject any plan that touches a denied function so
-        // DataFusion evaluates it locally instead of pushing unparseable SQL to
-        // the remote engine.
-        self.function_support.as_ref().is_none_or(|func_supp| {
-            !contains_unsupported_functions(plan, func_supp).unwrap_or(false)
-        })
+    fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
+        let function_support = self.function_support.clone()?;
+        Some(Box::new(move |plan| {
+            unfederate_plan_with_unsupported_functions(plan, &function_support)
+        }))
     }
 
     fn execute(
@@ -144,20 +137,19 @@ mod tests {
     use std::any::Any;
     use std::error::Error;
 
+    use crate::function_support::{FunctionRestriction, FunctionSupport};
     use async_trait::async_trait;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::TableProvider;
     use datafusion::logical_expr::{
-        ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF, TableSource, Volatility,
-        builder::LogicalTableSource, create_udf, expr::ScalarFunction,
+        ColumnarValue, Expr, Extension, LogicalPlan, LogicalPlanBuilder, ScalarUDF, TableSource,
+        Volatility, builder::LogicalTableSource, create_udf, expr::ScalarFunction,
     };
     use datafusion::prelude::col;
     use datafusion_federation::sql::SQLExecutor;
+    use datafusion_federation::{FederatedPlanNode, sql::SQLFederationPlanner};
     use datafusion_table_providers::sql::db_connection_pool::{
         DbConnectionPool, JoinPushDown, dbconnection::DbConnection,
-    };
-    use datafusion_table_providers::util::supported_functions::{
-        FunctionRestriction, FunctionSupport,
     };
 
     use super::*;
@@ -202,7 +194,6 @@ mod tests {
             &pool,
             schema,
             TableReference::bare("t"),
-            None,
         ))
     }
 
@@ -243,43 +234,68 @@ mod tests {
         )
     }
 
+    fn federated_plan(plan: LogicalPlan) -> LogicalPlan {
+        let executor: Arc<dyn SQLExecutor> =
+            Arc::new(DenyFunctionsSqlExecutor::new(test_sql_table(), None));
+        let planner = Arc::new(SQLFederationPlanner::new(executor));
+        LogicalPlan::Extension(Extension {
+            node: Arc::new(FederatedPlanNode::new(plan, planner)),
+        })
+    }
+
+    fn assert_federated_plan_contains(actual: &LogicalPlan, expected: &LogicalPlan) {
+        let LogicalPlan::Extension(extension) = actual else {
+            panic!("expected federated extension plan");
+        };
+        let federated = extension
+            .node
+            .as_any()
+            .downcast_ref::<FederatedPlanNode>()
+            .expect("federated plan node");
+        assert_eq!(federated.plan(), expected);
+    }
+
     #[test]
-    fn can_execute_plan_allows_when_no_deny_list() {
+    fn logical_optimizer_absent_when_no_deny_list() {
         let executor = DenyFunctionsSqlExecutor::new(test_sql_table(), None);
-        let plan = scan_with_projection("json_get_str");
         assert!(
-            executor.can_execute_plan(&plan),
-            "no deny-list should permit federation of any plan"
+            executor.logical_optimizer().is_none(),
+            "no deny-list should leave federation decisions unchanged"
         );
     }
 
     #[test]
-    fn can_execute_plan_blocks_denied_function() {
+    fn logical_optimizer_unfederates_denied_function() {
         let executor =
             DenyFunctionsSqlExecutor::new(test_sql_table(), Some(deny_support(&["json_get_str"])));
         let plan = scan_with_projection("json_get_str");
+        let mut optimizer = executor
+            .logical_optimizer()
+            .expect("deny-list should install optimizer");
+        let optimized = optimizer(federated_plan(plan.clone())).expect("optimize plan");
         assert!(
-            !executor.can_execute_plan(&plan),
+            optimized == plan,
             "deny-listed function in projection must block federation"
         );
     }
 
     #[test]
-    fn can_execute_plan_allows_non_denied_function() {
+    fn logical_optimizer_keeps_non_denied_function_federated() {
         let executor =
             DenyFunctionsSqlExecutor::new(test_sql_table(), Some(deny_support(&["json_get_str"])));
         let plan = scan_with_projection("upper");
-        assert!(
-            executor.can_execute_plan(&plan),
-            "function not on deny-list should still federate"
-        );
+        let federated = federated_plan(plan.clone());
+        let mut optimizer = executor
+            .logical_optimizer()
+            .expect("deny-list should install optimizer");
+        let optimized = optimizer(federated).expect("optimize plan");
+        assert_federated_plan_contains(&optimized, &plan);
     }
 
     #[test]
     fn create_spice_federated_table_provider_wires_deny_list() {
-        // Regression test for #10703: building the federated adaptor must
-        // route can_execute_plan decisions through the deny-list wrapper, not
-        // upstream's default `true`-everywhere impl.
+        // Regression test for #10703: building the federated adaptor must route
+        // logical optimization through the deny-list wrapper.
         let table = test_sql_table();
         let schema = table.schema();
         let adaptor = create_spice_federated_table_provider(

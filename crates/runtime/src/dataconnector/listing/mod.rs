@@ -21,7 +21,7 @@ use crate::parameters::{ParameterSpec, Parameters};
 
 mod connector;
 mod infer;
-pub use connector::{ListingTableConnector, build_table_parquet_options};
+pub use connector::{ListingTableConnector, ObjectVersionType, build_table_parquet_options};
 
 /// All [`super::DataConnectorFactory`] that create [`ListingTableConnector`]s should have at least these parameters returned from the associated [`super::DataConnectorFactory::parameters`].
 pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[

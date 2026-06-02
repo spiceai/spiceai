@@ -60,7 +60,7 @@ pub struct UdtfExec {
     /// The inner execution plan from the UDTF's `TableProvider`.
     inner: Arc<dyn ExecutionPlan>,
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl UdtfExec {
@@ -71,12 +71,12 @@ impl UdtfExec {
         let eq_properties = EquivalenceProperties::new(schema);
         let emission_type = inner.pipeline_behavior();
         let boundedness = inner.boundedness();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             eq_properties,
             inner.output_partitioning().clone(),
             emission_type,
             boundedness,
-        );
+        ));
 
         Self {
             args,
@@ -95,12 +95,12 @@ impl UdtfExec {
     #[must_use]
     pub fn placeholder(args: UdtfArgs, schema: SchemaRef) -> Self {
         let eq_properties = EquivalenceProperties::new(Arc::clone(&schema));
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             eq_properties,
             Partitioning::UnknownPartitioning(1),
             datafusion::physical_plan::execution_plan::EmissionType::Final,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-        );
+        ));
 
         // Create a placeholder inner plan - this will be replaced when the
         // plan is actually executed after reconstruction
@@ -155,7 +155,7 @@ impl ExecutionPlan for UdtfExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -229,11 +229,6 @@ impl ExecutionPlan for UdtfExec {
         self.inner.metrics()
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        #[expect(deprecated)]
-        self.inner.statistics()
-    }
-
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
         self.inner.partition_statistics(partition)
     }
@@ -302,18 +297,18 @@ impl ExecutionPlan for UdtfExec {
 #[derive(Debug)]
 struct PlaceholderExec {
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl PlaceholderExec {
     fn new(schema: SchemaRef) -> Self {
         let eq_properties = EquivalenceProperties::new(Arc::clone(&schema));
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             eq_properties,
             Partitioning::UnknownPartitioning(1),
             datafusion::physical_plan::execution_plan::EmissionType::Final,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-        );
+        ));
         Self { schema, properties }
     }
 }
@@ -341,7 +336,7 @@ impl ExecutionPlan for PlaceholderExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -412,10 +407,6 @@ impl ExecutionPlan for PlaceholderExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         None
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema))
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {

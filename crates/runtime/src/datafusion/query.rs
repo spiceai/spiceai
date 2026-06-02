@@ -316,8 +316,8 @@ impl Query {
             runtime_query = false,
             distributed = true,
             job_id = %job_id,
-            // Distributed-job summary labels — recorded at completion by
-            // `crate::datafusion::query::stage_history::record_stage_history`.
+            // Distributed-job summary labels. Ballista 53 no longer exposes the
+            // scheduler execution graph needed to populate these fields.
             ballista_job_id = tracing::field::Empty,
             stage_count = tracing::field::Empty,
             executor_count = tracing::field::Empty,
@@ -1769,6 +1769,7 @@ fn scalar_to_json_value(
         ScalarValue::Map(array) => single_row_map_to_json(array),
         ScalarValue::Union(Some((_type_id, value)), _, _) => scalar_to_json_value(value),
         ScalarValue::Dictionary(_, value) => scalar_to_json_value(value),
+        ScalarValue::RunEndEncoded(_, _, value) => scalar_to_json_value(value),
         ScalarValue::Null
         | ScalarValue::Float16(None)
         | ScalarValue::Float32(None)
@@ -2612,7 +2613,7 @@ mod tests {
     struct TestExecutionPlan {
         metrics: Option<MetricsSet>,
         children: Vec<Arc<dyn ExecutionPlan>>,
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
     }
 
     impl TestExecutionPlan {
@@ -2620,12 +2621,12 @@ mod tests {
             Self {
                 metrics,
                 children,
-                properties: PlanProperties::new(
+                properties: Arc::new(PlanProperties::new(
                     EquivalenceProperties::new(Arc::new(Schema::empty())),
                     Partitioning::UnknownPartitioning(1),
                     EmissionType::Final,
                     Boundedness::Bounded,
-                ),
+                )),
             }
         }
     }
@@ -2651,7 +2652,7 @@ mod tests {
             self
         }
 
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
 

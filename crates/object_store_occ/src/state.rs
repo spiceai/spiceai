@@ -19,7 +19,9 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use object_store::path::Path;
-use object_store::{Error as ObjectStoreError, ObjectStore, PutMode, PutOptions, UpdateVersion};
+use object_store::{
+    Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion,
+};
 use parking_lot::RwLock;
 use serde::Serialize;
 use serde::de::DeserializeOwned;

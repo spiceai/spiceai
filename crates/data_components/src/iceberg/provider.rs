@@ -26,7 +26,7 @@ use datafusion::error::Result as DFResult;
 use futures::future::try_join_all;
 use globset::GlobSet;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
-use iceberg_datafusion::IcebergTableProvider;
+use iceberg_datafusion::IcebergStaticTableProvider;
 use tokio::sync::Semaphore;
 
 use crate::RefreshableCatalogProvider;
@@ -315,27 +315,23 @@ impl IcebergSchemaProvider {
             .await
             .map_err(|e| Error::SemaphoreError { source: e })?;
 
-        // Use IcebergTableProvider - it keeps a reference to the catalog for read/write support
-        match IcebergTableProvider::try_new(
-            Arc::clone(&catalog),
-            table_name.namespace().clone(),
-            table_name.name().to_string(),
-        )
-        .await
-        {
-            Ok(provider) => {
-                // Wrap in IcebergDeletionProvider so that
-                // catalog tables support DELETE FROM via equality delete files.
-                // Access control is handled by the SQL validator, not here.
-                let deletion_provider = crate::iceberg::delete::IcebergDeletionProvider::new(
-                    Arc::clone(&catalog),
-                    table_name.namespace().clone(),
-                    table_name.name().to_string(),
-                    Arc::new(provider),
-                );
-                let adapted: Arc<dyn TableProvider> = Arc::new(deletion_provider);
-                Ok(Some(adapted))
-            }
+        match catalog.load_table(&table_name).await {
+            Ok(table) => match IcebergStaticTableProvider::try_new_from_table(table).await {
+                Ok(provider) => {
+                    // Wrap in IcebergDeletionProvider so that
+                    // catalog tables support DELETE FROM via equality delete files.
+                    // Access control is handled by the SQL validator, not here.
+                    let deletion_provider = crate::iceberg::delete::IcebergDeletionProvider::new(
+                        Arc::clone(&catalog),
+                        table_name.namespace().clone(),
+                        table_name.name().to_string(),
+                        Arc::new(provider),
+                    );
+                    let adapted: Arc<dyn TableProvider> = Arc::new(deletion_provider);
+                    Ok(Some(adapted))
+                }
+                Err(e) => Err(handle_iceberg_error(e)),
+            },
             Err(e) => {
                 let err_msg = e.to_string();
                 if err_msg.contains("NoSuchIcebergTableException") || err_msg.contains("code: 404")

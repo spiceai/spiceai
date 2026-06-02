@@ -52,8 +52,8 @@ limitations under the License.
 
 use std::path::{Path, PathBuf};
 
-use object_store::ObjectStore;
 use object_store::path::Path as ObjectStorePath;
+use object_store::{ObjectStore, ObjectStoreExt};
 use tokio::io::AsyncWriteExt;
 
 use super::Result;

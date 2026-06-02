@@ -22,7 +22,6 @@ use arrow::{
 };
 use async_stream::stream;
 use async_trait::async_trait;
-use datafusion_table_providers::sql::sql_provider_datafusion::expr;
 use flight_client::{
     MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE,
     cookie::{CookieService, CookieStore},
@@ -87,7 +86,7 @@ pub enum Error {
     #[snafu(display(
         "Failed to create SQL query (flightsql). {source} An unexpected error occurred. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
-    UnableToGenerateSQL { source: expr::Error },
+    UnableToGenerateSQL { source: DataFusionError },
 
     #[snafu(display("Query execution failed (flightsql). {source}"))]
     UnableToQueryArrowFlight { source: FlightError },
@@ -349,7 +348,7 @@ impl FlightSQLTable {
                 .collect(),
             })
             .await
-            .context(UnableToRetrieveSchemaArrowSnafu {
+            .context(UnableToRetrieveSchemaFlightSnafu {
                 table_name: table_reference.to_string(),
             })?;
 
@@ -362,7 +361,7 @@ impl FlightSQLTable {
                 client
                     .do_get(tkt.clone())
                     .await
-                    .context(UnableToRetrieveSchemaArrowSnafu {
+                    .context(UnableToRetrieveSchemaFlightSnafu {
                         table_name: table_reference.to_string(),
                     })?;
             let batch = stream.try_collect::<Vec<_>>().await.context(
@@ -460,7 +459,7 @@ pub struct FlightSqlExec {
     filters: Vec<Expr>,
     limit: Option<usize>,
     sort_exprs: Vec<PhysicalSortExpr>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     cookie_store: Arc<CookieStore>,
     metrics: ExecutionPlanMetricsSet,
     /// Optional W3C `traceparent` value (e.g. `00-{trace_id}-{span_id}-01`)
@@ -496,12 +495,12 @@ impl FlightSqlExec {
             filters: filters.to_vec(),
             limit,
             sort_exprs: Vec::new(),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
             cookie_store,
             metrics: ExecutionPlanMetricsSet::new(),
             trace_parent: None,
@@ -602,7 +601,7 @@ impl FlightSqlExec {
                         format!("({sql})")
                     })
                 })
-                .collect::<expr::Result<Vec<_>>>()
+                .collect::<DataFusionResult<Vec<_>>>()
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))
         };
@@ -682,7 +681,7 @@ impl ExecutionPlan for FlightSqlExec {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -720,12 +719,12 @@ impl ExecutionPlan for FlightSqlExec {
             filters: self.filters.clone(),
             limit: self.limit,
             sort_exprs,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 eq_properties,
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
             cookie_store: Arc::clone(&self.cookie_store),
             metrics: ExecutionPlanMetricsSet::new(),
             trace_parent: self.trace_parent.clone(),

@@ -24,7 +24,6 @@ use std::{
 use anyhow::Result;
 use arrow::array::RecordBatch;
 use dashmap::DashMap;
-use futures::TryStreamExt;
 use indicatif::ProgressBar;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -586,17 +585,12 @@ impl SpiceTestQueryWorker {
                     self.id, query.name, ref_schema
                 );
 
-                let mut ref_result_stream = spice_client
-                    .sql_with_params(
-                        &reference_query.sql,
-                        reference_query.get_parameters_batch().transpose()?,
-                    )
-                    .await?;
-
-                let mut ref_batches = vec![];
-                while let Some(batch) = ref_result_stream.try_next().await? {
-                    ref_batches.push(batch);
-                }
+                let ref_batches = crate::spice_client_arrow_compat::query_with_params_to_batches(
+                    spice_client.as_ref(),
+                    &reference_query.sql,
+                    reference_query.get_parameters_batch().transpose()?,
+                )
+                .await?;
 
                 // Validate against reference query results
                 let validation_result =

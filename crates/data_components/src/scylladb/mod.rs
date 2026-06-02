@@ -204,11 +204,10 @@ impl Read for ScyllaDbTableFactory {
             .context(UnableToFetchTableSchemaSnafu)?;
 
         // Create the base SqlTable with CQL dialect
-        let base_table = SqlTable::new("scylladb", &pool, table_reference.clone(), None)
+        let base_table = SqlTable::new("scylladb", &pool, table_reference.clone())
             .await
             .context(UnableToConstructSQLTableSnafu)?
-            .with_dialect(Arc::new(CqlDialect::new()))
-            .with_allow_physical_filter_pushdown(false);
+            .with_dialect(Arc::new(CqlDialect::new()));
 
         // Wrap in ScyllaDbTable with schema for filter pushdown
         Ok(Arc::new(ScyllaDbTable {

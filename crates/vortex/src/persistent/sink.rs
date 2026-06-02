@@ -23,6 +23,7 @@ use datafusion_physical_plan::metrics::MetricsSet;
 use futures::SinkExt;
 use futures::StreamExt;
 use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use tokio::task::JoinHandle;
 use uuid::Uuid;

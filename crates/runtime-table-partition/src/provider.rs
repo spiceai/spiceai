@@ -738,7 +738,7 @@ impl ExecutionPlan for PartitionedUnionExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.inner_union.properties()
     }
 
@@ -806,11 +806,6 @@ impl ExecutionPlan for PartitionedUnionExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         self.inner_union.metrics()
-    }
-
-    fn statistics(&self) -> Result<Statistics, DataFusionError> {
-        #[expect(deprecated)]
-        self.inner_union.statistics()
     }
 
     fn partition_statistics(

@@ -132,18 +132,12 @@ impl IcebergCatalog {
             .with_operator(operator)
             .with_properties(props);
 
-        // Use a builder closure for the storage factory so that scheme inference
-        // (e.g. inferring `s3a://` from table metadata when the warehouse root is
-        // configured as `s3://`) can rebuild the factory with the new scheme. The
-        // S3 `OpenDalStorageFactory` validates that paths match the configured
-        // scheme, so the factory must be reconstructed when the scheme changes.
         if catalog_id.starts_with("gs://") || catalog_id.starts_with("gcs://") {
             catalog_builder =
                 catalog_builder.with_storage_factory(Arc::new(OpenDalStorageFactory::Gcs));
         } else if catalog_id.starts_with("s3://") || catalog_id.starts_with("s3a://") {
-            catalog_builder = catalog_builder.with_storage_factory_builder(move |scheme| {
+            catalog_builder = catalog_builder.with_storage_factory_builder(move |_scheme| {
                 Arc::new(OpenDalStorageFactory::S3 {
-                    configured_scheme: scheme.to_string(),
                     customized_credential_load: s3_credential_loader.clone(),
                 })
             });
@@ -258,16 +252,6 @@ pub const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
     ParameterSpec::component("gcs_no_auth")
         .description("Set to 'true' to allow anonymous access to GCS (for public buckets)."),
 ];
-
-/// Returns the S3 scheme (`"s3a"` or `"s3"`) from a URL that is known to start with
-/// an S3-family scheme. Any non-`s3a://` prefix is treated as plain `"s3"`.
-pub(crate) fn s3_scheme_from_url(url: &str) -> String {
-    if url.starts_with("s3a://") {
-        "s3a".to_string()
-    } else {
-        "s3".to_string()
-    }
-}
 
 /// Maps a Spice parameter name to an Iceberg property name.
 pub(crate) fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<Vec<String>> {
@@ -401,20 +385,9 @@ impl CatalogConnector for IcebergCatalog {
             .await;
         }
 
-        // For the REST catalog path, materialize the storage factory now so it can
-        // be passed to `get_rest_catalog`. The configured scheme is derived from the
-        // catalog's `warehouse` property (if present) since `catalog_id` is an HTTP
-        // URL for REST catalogs and would otherwise always resolve to plain `s3`.
-        // Falling back to `catalog_id` preserves prior behavior for callers that
-        // do not set a `warehouse` property.
-        let configured_s3_scheme = props.get("warehouse").map_or_else(
-            || s3_scheme_from_url(&catalog_id),
-            |w| s3_scheme_from_url(w),
-        );
         let storage_factory: Option<Arc<dyn StorageFactory>> =
             s3_credential_loader.map(|custom_loader| {
                 Arc::new(OpenDalStorageFactory::S3 {
-                    configured_scheme: configured_s3_scheme,
                     customized_credential_load: Some(custom_loader),
                 }) as Arc<dyn StorageFactory>
             });
@@ -675,7 +648,6 @@ fn default_storage_factory_from_props(props: &HashMap<String, String>) -> Arc<dy
         Arc::new(OpenDalStorageFactory::Gcs)
     } else {
         Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: "s3".to_string(),
             customized_credential_load: None,
         })
     }

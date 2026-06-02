@@ -24,7 +24,7 @@ use aws_sdk_credential_bridge::S3CredentialProvider;
 use data_components::iceberg::catalog::hadoop::{HadoopCatalogBuilder, MetadataMode};
 use datafusion::catalog::TableProvider;
 use iceberg::{Catalog, TableIdent, io::StorageFactory};
-use iceberg_datafusion::IcebergTableProvider;
+use iceberg_datafusion::IcebergStaticTableProvider;
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use secrecy::ExposeSecret;
 use util::concat_arrays;
@@ -36,7 +36,7 @@ use super::DataConnectorFactory;
 use crate::{
     catalogconnector::iceberg::{
         ICEBERG_PARAM_LEN, get_rest_catalog, map_param_name_to_iceberg_prop,
-        parse_hadoop_table_url, parse_table_url, s3_scheme_from_url, verify_s3_endpoint,
+        parse_hadoop_table_url, parse_table_url, verify_s3_endpoint,
     },
     component::dataset::Dataset,
     dataconnector::{
@@ -192,10 +192,7 @@ impl IcebergDataConnector {
                     })?
                     .into_custom_loader();
 
-                let configured_scheme = s3_scheme_from_url(source);
-
                 Some(Arc::new(OpenDalStorageFactory::S3 {
-                    configured_scheme,
                     customized_credential_load: Some(custom_loader),
                 }) as Arc<dyn StorageFactory>)
             } else {
@@ -261,18 +258,22 @@ impl IcebergDataConnector {
         let namespace_ident = namespace.name().clone();
         let table_identifier = TableIdent::new(namespace_ident, table_name.clone());
 
-        // Create IcebergTableProvider with catalog reference for read/write support
-        let table_provider = IcebergTableProvider::try_new(
-            Arc::clone(&catalog_client),
-            table_identifier.namespace().clone(),
-            table_identifier.name().to_string(),
-        )
-        .await
-        .map_err(|e| Error::UnableToGetReadProvider {
-            dataconnector: "iceberg".into(),
-            connector_component: ConnectorComponent::from(dataset),
-            source: Box::new(e),
-        })?;
+        let table = catalog_client
+            .load_table(&table_identifier)
+            .await
+            .map_err(|e| Error::UnableToGetReadProvider {
+                dataconnector: "iceberg".into(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(e),
+            })?;
+
+        let table_provider = IcebergStaticTableProvider::try_new_from_table(table)
+            .await
+            .map_err(|e| Error::UnableToGetReadProvider {
+                dataconnector: "iceberg".into(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(e),
+            })?;
 
         Ok(IcebergTableParts {
             provider: Arc::new(table_provider),
@@ -312,7 +313,6 @@ impl IcebergDataConnector {
                 Arc::new(OpenDalStorageFactory::Gcs)
             } else if source.starts_with("s3://") || source.starts_with("s3a://") {
                 Arc::new(OpenDalStorageFactory::S3 {
-                    configured_scheme: s3_scheme_from_url(source),
                     customized_credential_load: None,
                 })
             } else {
@@ -344,18 +344,22 @@ impl IcebergDataConnector {
                 }
             })?);
 
-        // Create IcebergTableProvider with catalog reference for read/write support
-        let table_provider = IcebergTableProvider::try_new(
-            Arc::clone(&catalog_client),
-            table_identifier.namespace().clone(),
-            table_identifier.name().to_string(),
-        )
-        .await
-        .map_err(|e| Error::UnableToGetReadProvider {
-            dataconnector: "iceberg".into(),
-            connector_component: ConnectorComponent::from(dataset),
-            source: Box::new(e),
-        })?;
+        let table = catalog_client
+            .load_table(&table_identifier)
+            .await
+            .map_err(|e| Error::UnableToGetReadProvider {
+                dataconnector: "iceberg".into(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(e),
+            })?;
+
+        let table_provider = IcebergStaticTableProvider::try_new_from_table(table)
+            .await
+            .map_err(|e| Error::UnableToGetReadProvider {
+                dataconnector: "iceberg".into(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(e),
+            })?;
 
         Ok(IcebergTableParts {
             provider: Arc::new(table_provider),

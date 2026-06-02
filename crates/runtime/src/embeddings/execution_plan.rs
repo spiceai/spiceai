@@ -55,7 +55,7 @@ pub struct EmbeddingTableExec {
     projected_schema: SchemaRef,
     filters: Vec<Expr>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     base_plan: Arc<dyn ExecutionPlan>,
 
@@ -93,7 +93,7 @@ impl ExecutionPlan for EmbeddingTableExec {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -157,12 +157,17 @@ impl EmbeddingTableExec {
     fn compute_properties(
         base_plan: &Arc<dyn ExecutionPlan>,
         projected_schema: &SchemaRef,
-    ) -> PlanProperties {
+    ) -> Arc<PlanProperties> {
         let eq_properties = EquivalenceProperties::new(Arc::clone(projected_schema));
         let partitioning = base_plan.properties().partitioning.clone();
         let emission_type = base_plan.pipeline_behavior();
         let boundedness = base_plan.boundedness();
-        PlanProperties::new(eq_properties, partitioning, emission_type, boundedness)
+        Arc::new(PlanProperties::new(
+            eq_properties,
+            partitioning,
+            emission_type,
+            boundedness,
+        ))
     }
 }
 

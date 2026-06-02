@@ -16,7 +16,7 @@ impl FlightTable {
     fn create_federated_table_source(self: Arc<Self>) -> Arc<dyn FederatedTableSource> {
         let table_name = self.table_reference.clone();
         tracing::trace!(
-            %self.table_reference,
+            table_reference = %self.table_reference.to_quoted_string(),
             "create_federated_table_source"
         );
         let schema = Arc::clone(&self.schema);

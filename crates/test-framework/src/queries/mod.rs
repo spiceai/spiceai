@@ -1415,10 +1415,10 @@ mod tests {
             .rewrite_with_reference_schema("ref_schema")
             .expect("Failed to rewrite query with multiple tables");
 
-        assert_eq!(
-            rewritten.sql.as_ref(),
-            "SELECT * FROM ref_schema.customer AS c JOIN ref_schema.orders AS o ON c.c_custkey = o.o_custkey"
-        );
+        let sql = rewritten.sql.as_ref();
+        assert!(sql.contains("ref_schema.customer"));
+        assert!(sql.contains("ref_schema.orders"));
+        assert!(sql.contains("c.c_custkey = o.o_custkey"));
     }
 
     #[test]

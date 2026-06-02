@@ -226,6 +226,15 @@ impl SnowflakeCatalogProvider {
         match result {
             snowflake_api::QueryResult::Arrow(batches) => {
                 let mut names = Vec::new();
+                let batches =
+                    crate::source_arrow_compat::batches_to_arrow(&batches).map_err(|error| {
+                        UnexpectedResponseSnafu {
+                        reason: format!(
+                            "Failed to convert Arrow response for Snowflake schema listing: {error}"
+                        ),
+                    }
+                    .build()
+                    })?;
                 for batch in batches {
                     let col = batch.column_by_name("SCHEMA_NAME").context(
                         UnexpectedResponseSnafu {
@@ -433,6 +442,15 @@ impl SnowflakeSchemaProvider {
         match result {
             snowflake_api::QueryResult::Arrow(batches) => {
                 let mut names = Vec::new();
+                let batches =
+                    crate::source_arrow_compat::batches_to_arrow(&batches).map_err(|error| {
+                        UnexpectedResponseSnafu {
+                        reason: format!(
+                            "Failed to convert Arrow response for Snowflake table listing: {error}"
+                        ),
+                    }
+                    .build()
+                    })?;
                 for batch in batches {
                     let col = batch.column_by_name("TABLE_NAME").context(
                         UnexpectedResponseSnafu {

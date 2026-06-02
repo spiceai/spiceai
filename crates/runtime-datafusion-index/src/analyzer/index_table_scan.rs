@@ -383,7 +383,7 @@ impl ExecutionPlan for IndexerExec {
         Arc::clone(self.properties().eq_properties.schema())
     }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         self.input_exec.properties()
     }
 
@@ -557,11 +557,6 @@ impl ExecutionPlan for IndexerExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         self.input_exec.metrics()
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        #[expect(deprecated)]
-        self.input_exec.statistics()
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {

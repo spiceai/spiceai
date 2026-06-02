@@ -32,7 +32,6 @@ use ::datafusion::optimizer::AnalyzerRule;
 use ::datafusion::prelude::SessionConfig;
 use ::datafusion::sql::ResolvedTableReference;
 use app::App;
-use ballista_core::config::ShuffleFormat as BallistaShuffleFormat;
 use ballista_core::extension::SessionConfigExt;
 use ballista_core::registry::BallistaFunctionRegistry;
 use ballista_core::serde::BallistaCodec;
@@ -43,14 +42,14 @@ use ballista_core::serde::protobuf::{
 };
 use ballista_core::utils::{GrpcClientConfig, create_grpc_client_endpoint};
 use ballista_core::{ConfigProducer, RuntimeProducer};
+use ballista_executor::execution_engine::DefaultExecutionEngine;
 use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
 use ballista_scheduler::cluster::memory::{InMemoryClusterState, InMemoryJobState};
 use ballista_scheduler::cluster::{BallistaCluster, ClusterState};
-use ballista_scheduler::config::{OnCancelTasksFn, SchedulerConfig};
+use ballista_scheduler::config::SchedulerConfig;
 use ballista_scheduler::scheduler_process;
 use ballista_scheduler::scheduler_server::SchedulerServer;
-use ballista_scheduler::state::execution_graph::RunningTaskInfo;
 use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_expr::Expr;
@@ -60,9 +59,7 @@ use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_datafusion::config::request_context_config::SpiceRequestContextConfig;
 use runtime_object_store::registry::default_runtime_env;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
-use runtime_proto::{
-    GetAppDefinitionRequest, GetDdlCatchupRequest, GetSchedulersRequest, TaskCancelInfo,
-};
+use runtime_proto::{GetAppDefinitionRequest, GetDdlCatchupRequest, GetSchedulersRequest};
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
 use std::collections::{HashMap, HashSet};
@@ -193,8 +190,8 @@ fn spawn_scheduler_poll_loop(
     executor: Arc<Executor>,
     codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode>,
     readiness_sender: Arc<Mutex<Option<oneshot::Sender<String>>>>,
-    poll_now_notify: Option<Arc<Notify>>,
-    available_task_slots: Arc<tokio::sync::Semaphore>,
+    _poll_now_notify: Option<Arc<Notify>>,
+    _available_task_slots: Arc<tokio::sync::Semaphore>,
 ) -> SchedulerPollHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
@@ -289,43 +286,27 @@ fn spawn_scheduler_poll_loop(
                 .max_encoding_message_size(usize::MAX)
                 .max_decoding_message_size(usize::MAX);
 
-            let (tx_ready, rx_ready) = oneshot::channel();
-            let readiness_sender = Arc::clone(&readiness_sender);
-            let readiness_task = tokio::spawn(async move {
-                if let Ok(executor_id) = rx_ready.await {
-                    let sender = if let Ok(mut sender) = readiness_sender.lock() {
-                        sender.take()
-                    } else {
-                        tracing::warn!(
-                            "Readiness sender lock poisoned while handling executor readiness"
-                        );
-                        None
-                    };
-                    if let Some(sender) = sender {
-                        let _ = sender.send(executor_id);
-                    }
-                }
-            });
+            let sender = if let Ok(mut sender) = readiness_sender.lock() {
+                sender.take()
+            } else {
+                tracing::warn!("Readiness sender lock poisoned while handling executor readiness");
+                None
+            };
+            if let Some(sender) = sender {
+                let _ = sender.send(executor.metadata.id.clone());
+            }
 
-            let poll_future = execution_loop::poll_loop(
-                scheduler,
-                Arc::clone(&executor),
-                codec.clone(),
-                Some(tx_ready),
-                poll_now_notify.clone(),
-                Some(Arc::clone(&available_task_slots)),
-            );
+            let poll_future =
+                execution_loop::poll_loop(scheduler, Arc::clone(&executor), codec.clone());
 
             tokio::select! {
                 () = token.cancelled() => {
-                    readiness_task.abort();
                     tracing::debug!(
                         "Stopping scheduler poll loop for {scheduler_address} (cancelled)"
                     );
                     break;
                 }
                 result = poll_future => {
-                    readiness_task.abort();
                     if let Err(err) = result {
                         tracing::warn!(
                             "Scheduler poll loop ended for {scheduler_address}: {err}"
@@ -1207,7 +1188,7 @@ pub async fn initialize_cluster_executor(
 
     // Get shuffle_location from app params; if set to a path (not "memory"), use it as work_dir
     // Otherwise fall back to temp_directory from query config or system temp dir
-    // Note: shuffle_memory_mode and object store config is set via the scheduler's override_session_builder
+    // Note: Ballista 53 manages shuffle behavior internally; this setting only informs work_dir.
     let shuffle_location = app_def.runtime.params.get("shuffle_location");
 
     // Determine work_dir for executor:
@@ -1314,14 +1295,14 @@ pub async fn initialize_cluster_executor(
                 resource: Some(Resource::TaskSlots(concurrent_tasks)),
             }],
         }),
+        os_info: None,
     };
 
     // Use advertise address as node_id for metrics
     let metrics_node_id = format!("{advertise_host}:{advertise_port}");
 
-    // Configure executor session config with shuffle locality metrics callback
+    // Configure executor session config
     let config_producer_tls = client_tls_config.clone();
-    let config_producer_node_id = metrics_node_id.clone();
     let config_producer: ConfigProducer = Arc::new(move || {
         let mut config = SessionConfig::new_with_ballista()
             .with_option_extension(SpiceClusterConfig::default())
@@ -1330,13 +1311,7 @@ pub async fn initialize_cluster_executor(
             // Use 100MB max message size to match other gRPC configurations in the codebase.
             // The default Ballista config is 16MB which is too small for shuffle operations
             // with large batches.
-            .with_ballista_grpc_client_max_message_size(100 * 1024 * 1024)
-            // Enable shuffle locality metrics callback to track local vs remote shuffle reads
-            .with_ballista_shuffle_read_metrics_callback(
-                metrics_collector::OtelShuffleReadMetricsCallback::new_arc(
-                    config_producer_node_id.clone(),
-                ),
-            );
+            .with_ballista_grpc_client_max_message_size(100 * 1024 * 1024);
 
         if let Some(tls_config) = config_producer_tls.clone() {
             config = config.with_ballista_override_create_grpc_client_endpoint({
@@ -1361,7 +1336,7 @@ pub async fn initialize_cluster_executor(
         Arc::new(BallistaFunctionRegistry::default()),
         Arc::new(metrics_collector),
         concurrent_tasks as usize,
-        None,
+        Arc::new(DefaultExecutionEngine::new()),
     ));
 
     let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
@@ -1690,25 +1665,6 @@ async fn create_scheduler_server(
             .and_then(|app| app.runtime.params.get("shuffle_location"))
             .cloned()
     };
-    let shuffle_memory_mode = shuffle_location.as_deref() == Some("memory");
-
-    // Determine shuffle storage type and URL from shuffle_location
-    // - "memory" -> in-memory shuffle (no storage_type/storage_url needed)
-    // - "s3://..." -> S3 object store
-    // - "abfs://..." or "az://..." -> Azure object store
-    // - other path or None -> local disk storage
-    let (shuffle_storage_type, shuffle_storage_url): (Option<String>, Option<String>) =
-        match shuffle_location.as_deref() {
-            Some("memory") | None => (None, None), // Memory mode or default - handled separately
-            Some(loc) if loc.starts_with("s3://") => {
-                (Some("s3".to_string()), Some(loc.to_string()))
-            }
-            Some(loc) if loc.starts_with("abfs://") || loc.starts_with("az://") => {
-                (Some("azure".to_string()), Some(loc.to_string()))
-            }
-            Some(loc) => (Some("local".to_string()), Some(loc.to_string())), // Explicit local path
-        };
-
     let client_tls_config = rt.df.cluster_config.client_tls_config();
     let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> =
         client_tls_config.clone().map(|tls_config| {
@@ -1718,90 +1674,16 @@ async fn create_scheduler_server(
             }) as _
         });
 
-    // Convert shuffle_format param to ballista ShuffleFormat
-    #[cfg(feature = "vortex")]
-    let ballista_shuffle_format = match shuffle_format.as_str() {
-        "vortex" => BallistaShuffleFormat::Vortex,
-        _ => BallistaShuffleFormat::ArrowIpc,
-    };
-
-    #[cfg(not(feature = "vortex"))]
-    let ballista_shuffle_format = {
-        if shuffle_format.as_str() == "vortex" {
-            tracing::warn!(
-                "Vortex shuffle format requested but 'vortex' feature is not enabled. Falling back to ArrowIpc."
-            );
-        }
-        BallistaShuffleFormat::ArrowIpc
-    };
-
     // Create metrics collector with the scheduler's advertise address as node_id
     let metrics_node_id = rt
         .df
         .cluster_config
         .scheduler_url_string()
         .map_or_else(|| bind_addr.to_string(), ToString::to_string);
-    let scheduler_metrics_collector = Arc::new(
-        metrics_collector::OtelSchedulerMetricsCollector::new(metrics_node_id.clone()),
-    );
 
     // Create the executor stream registry for PollNow broadcasts.
     // This registry will be shared with the ClusterServiceImpl.
     let executor_stream_registry = ExecutorControlStreamRegistry::new();
-
-    // Create callback that broadcasts PollNow to all connected executors when work is available.
-    let registry_for_callback = executor_stream_registry.clone();
-    let on_work_available: Arc<dyn Fn(&str) + Send + Sync> =
-        Arc::new(move |reason: &str| registry_for_callback.broadcast_poll_now(reason));
-
-    let registry_for_cancel = executor_stream_registry.clone();
-    let on_cancel_tasks: OnCancelTasksFn =
-        Arc::new(move |executor_id: &str, tasks: Vec<RunningTaskInfo>| {
-            let tasks_to_cancel = tasks
-                .into_iter()
-                .filter_map(|task| {
-                    let Ok(task_id) = u32::try_from(task.task_id) else {
-                        tracing::warn!(
-                            executor_id,
-                            task_id = task.task_id,
-                            "Skipping cancel task with out-of-range task_id"
-                        );
-                        return None;
-                    };
-
-                    let Ok(stage_id) = u32::try_from(task.stage_id) else {
-                        tracing::warn!(
-                            executor_id,
-                            stage_id = task.stage_id,
-                            "Skipping cancel task with out-of-range stage_id"
-                        );
-                        return None;
-                    };
-
-                    let Ok(partition_id) = u32::try_from(task.partition_id) else {
-                        tracing::warn!(
-                            executor_id,
-                            partition_id = task.partition_id,
-                            "Skipping cancel task with out-of-range partition_id"
-                        );
-                        return None;
-                    };
-
-                    Some(TaskCancelInfo {
-                        task_id,
-                        job_id: task.job_id,
-                        stage_id,
-                        partition_id,
-                    })
-                })
-                .collect::<Vec<_>>();
-
-            if !registry_for_cancel.send_cancel_tasks(executor_id, tasks_to_cancel) {
-                tracing::warn!(
-                    "Failed to send cancel tasks to executor {executor_id}: no control stream"
-                );
-            }
-        });
 
     // Create InMemoryClusterState first so we can reference it in the config_producer
     let cluster_state: Arc<dyn ClusterState> = Arc::new(InMemoryClusterState::default());
@@ -1861,21 +1743,11 @@ async fn create_scheduler_server(
                 .cloned()
                 .unwrap_or_default();
 
-            let mut cfg = current_context
+            let cfg = current_context
                 .copied_config()
                 .with_target_partitions(target_partitions)
                 .with_option_extension(SpiceClusterConfig::default())
-                .with_option_extension(incoming_request_context)
-                .with_ballista_shuffle_format(ballista_shuffle_format)
-                .with_ballista_shuffle_memory_mode(shuffle_memory_mode);
-
-            // Apply object store shuffle configuration if specified
-            if let Some(ref storage_type) = shuffle_storage_type {
-                cfg = cfg.with_ballista_shuffle_storage_type(storage_type);
-            }
-            if let Some(ref storage_url) = shuffle_storage_url {
-                cfg = cfg.with_ballista_shuffle_storage_url(storage_url);
-            }
+                .with_option_extension(incoming_request_context);
 
             // Filter out PartitionedTableScanRewrite from analyzer rules.
             // That rule rewrites TableScans into UNION ALL of FlightSQL partitions
@@ -1917,8 +1789,6 @@ async fn create_scheduler_server(
             .with_target_partitions(target_partitions)
             .with_option_extension(SpiceClusterConfig::default())
             .with_option_extension(SpiceRequestContextConfig::default())
-            .with_ballista_shuffle_format(ballista_shuffle_format)
-            .with_ballista_shuffle_memory_mode(shuffle_memory_mode)
     });
 
     // Manually create the BallistaCluster with our custom config_producer
@@ -1944,9 +1814,6 @@ async fn create_scheduler_server(
         grpc_server_max_encoding_message_size: u32::MAX,
 
         override_create_grpc_client_endpoint,
-        override_metrics_collector: Some(scheduler_metrics_collector),
-        on_work_available: Some(on_work_available),
-        on_cancel_tasks: Some(on_cancel_tasks),
 
         // Faster failure detection: 30s timeout with 10s heartbeat interval
         executor_timeout_seconds: 30,

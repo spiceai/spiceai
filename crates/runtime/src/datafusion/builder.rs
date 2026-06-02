@@ -69,7 +69,7 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
-use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
+use datafusion_federation::{FederatedPlanner, FederationOptimizerRule};
 use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
 
 #[cfg(feature = "duckdb")]
@@ -581,6 +581,7 @@ impl DataFusionBuilder {
         let mut state = SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
+            .with_optimizer_rule(Arc::new(FederationOptimizerRule::new()))
             // Replace the default analyzer rules with an empty set so we can add our own predefined list later (see `AnalyzerRulesBuilder`).
             .with_analyzer_rules(vec![])
             .with_query_planner(Arc::new(
@@ -1028,7 +1029,6 @@ fn has_cayenne_accelerator_metadata(provider: &dyn TableProvider) -> bool {
 }
 
 pub struct AnalyzerRulesBuilder {
-    include_federation: bool,
     extra_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
 }
 
@@ -1039,8 +1039,7 @@ impl AnalyzerRulesBuilder {
     }
 
     #[must_use]
-    pub fn include_federation(mut self, include: bool) -> Self {
-        self.include_federation = include;
+    pub fn include_federation(self, _include: bool) -> Self {
         self
     }
 
@@ -1056,14 +1055,10 @@ impl AnalyzerRulesBuilder {
     /// Spice customizes the order of the analyzer rules, since some of them are only relevant when `DataFusion` is executing the query,
     /// as opposed to when underlying federated query engines will execute the query.
     ///
-    /// This list should be kept in sync with the default rules in `Analyzer::new()`, but with the federation analyzer rule added first.
+    /// This list should be kept in sync with the default rules in `Analyzer::new()`.
     #[must_use]
     pub fn build(self) -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
         let mut rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> = vec![];
-        if self.include_federation {
-            rules.push(Arc::new(federation_analyzer_rule()));
-        }
-        // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
         rules.extend([
             Arc::new(ResolveGroupingFunction::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
             Arc::new(TypeCoercion::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
@@ -1075,7 +1070,6 @@ impl AnalyzerRulesBuilder {
 impl Default for AnalyzerRulesBuilder {
     fn default() -> Self {
         Self {
-            include_federation: true,
             extra_rules: vec![],
         }
     }
@@ -1482,7 +1476,6 @@ mod tests {
             rule_names,
             vec![
                 "spice_ddl_rewrite",
-                "federation_optimizer_rule",
                 "resolve_grouping_function",
                 "type_coercion",
                 "spice_ddl_rewrite",

@@ -29,11 +29,7 @@ use crate::{
         snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
         storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
     },
-    datafusion::{
-        dialect::new_duckdb_dialect,
-        sort_columns::{SortColumn, parse_sort_columns},
-        udf::deny_spice_functions_for_duckdb,
-    },
+    datafusion::dialect::new_duckdb_dialect,
     make_spice_data_directory,
     parameters::ParameterSpec,
     register_data_accelerator, spice_data_base_path,
@@ -43,31 +39,31 @@ use data_components::poly::PolyTableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
-    catalog::TableProviderFactory,
-    datasource::TableProvider,
-    execution::context::SessionContext,
-    logical_expr::CreateExternalTable,
-    sql::sqlparser::ast::{
-        Delete, FromTable, Ident, ObjectName, ObjectNamePart, Statement as SQLStatement,
-        TableFactor,
+    catalog::{Session, TableProviderFactory},
+    common::{Constraints, Statistics},
+    datasource::{TableProvider, TableType},
+    execution::{SendableRecordBatchStream, context::SessionContext},
+    logical_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown},
+    physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+        coalesce_partitions::CoalescePartitionsExec, stream::RecordBatchStreamAdapter,
     },
+    scalar::ScalarValue,
 };
 use datafusion_table_providers::{
     duckdb::{
-        DuckDB, DuckDBSettingsRegistry, DuckDBTableProviderFactory,
-        write::{DuckDBTableWriter, WriteCompletionHandler},
+        DuckDB, DuckDBSettingsRegistry, DuckDBTableProviderFactory, write::DuckDBTableWriter,
     },
-    sql::db_connection_pool::{
-        self as db_connection_pool,
-        duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
-    },
+    sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
+    util::{column_reference::ColumnReference, indexes::IndexType},
 };
-use duckdb::AccessMode;
+use futures::StreamExt;
 use itertools::Itertools;
 use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_table_partition::expression::PartitionedBy;
 use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
+use spiceai_duckdb::AccessMode;
 use std::collections::HashMap;
 use std::{
     any::Any,
@@ -93,7 +89,6 @@ pub(crate) fn create_factory() -> DuckDBTableProviderFactory {
                 .with_setting(Box::new(settings::IndexScanMaxCount))
                 .with_setting(Box::new(settings::TimeZone)),
         )
-        .with_function_support(deny_spice_functions_for_duckdb().as_ref().clone())
 }
 
 pub(crate) const DEFAULT_CONNECTION_POOL_SIZE: u32 = 10;
@@ -603,64 +598,36 @@ impl DataAccelerator for DuckDBAccelerator {
             }
         }
 
-        let write_completion_handler = source.and_then(|src| {
-            let acceleration = src.acceleration()?;
-            let dataset_name = src.name().to_string();
-            let schema = Arc::new(cmd.schema.as_arrow().clone());
-
-            let mut config = OnRefreshConfig::empty();
-
-            // Parse retention SQL if configured
-            if let Some(retention_sql) = acceleration
+        if let Some(acceleration) = source.and_then(AccelerationSource::acceleration) {
+            if acceleration
                 .retention_sql
                 .as_deref()
                 .map(str::trim)
-                .filter(|sql| !sql.is_empty())
+                .is_some_and(|retention_sql| !retention_sql.is_empty())
             {
-                match crate::datafusion::retention_sql::parse_retention_sql(
-                    src.name(),
-                    retention_sql,
-                    Arc::clone(&schema),
-                ) {
-                    Ok(parsed_sql) => {
-                        config = config.with_retention(parsed_sql.delete_statement);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to parse retention_sql for dataset {dataset_name}: {e}. Retention SQL will not be applied.");
-                    }
-                }
+                return Err(DataFusionError::NotImplemented(
+                    "DuckDB retention_sql is unavailable because datafusion-table-providers 0.11 no longer exposes a pre-commit write hook"
+                        .to_string(),
+                )
+                .into());
             }
 
-            // Parse on_refresh_sort_columns if configured
-            if let Some(sort_columns_str) = acceleration
+            if acceleration
                 .params
                 .get("on_refresh_sort_columns")
                 .map(String::as_str)
                 .map(str::trim)
-                .filter(|s| !s.is_empty())
+                .is_some_and(|sort_columns| !sort_columns.is_empty())
             {
-                match parse_sort_columns(sort_columns_str, &schema) {
-                    Ok(sort_columns) => {
-                        tracing::debug!(
-                            dataset = %dataset_name,
-                            sort_columns = ?sort_columns,
-                            "Parsed on_refresh_sort_columns"
-                        );
-                        config = config.with_sort(sort_columns);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to parse on_refresh_sort_columns for dataset {dataset_name}: {e}. Sorting will not be applied."
-                        );
-                    }
-                }
+                return Err(DataFusionError::NotImplemented(
+                    "DuckDB on_refresh_sort_columns is unavailable because datafusion-table-providers 0.11 no longer exposes a pre-commit write hook"
+                        .to_string(),
+                )
+                .into());
             }
+        }
 
-            Some(make_on_refresh_write_handler(dataset_name, config))
-        });
-
-        Ok(create_table_provider(&self.duckdb_factory, &cmd, write_completion_handler).await?)
+        Ok(create_table_provider(&self.duckdb_factory, &cmd).await?)
     }
 
     fn prefix(&self) -> &'static str {
@@ -672,7 +639,7 @@ impl DataAccelerator for DuckDBAccelerator {
     }
 
     fn supports_snapshot_reload(&self) -> bool {
-        true
+        false
     }
 
     /// Reloads the `DuckDB`-backed table provider from the snapshot file
@@ -688,39 +655,12 @@ impl DataAccelerator for DuckDBAccelerator {
     /// even after the file has been atomically replaced on disk.
     async fn reload_from_snapshot(
         &self,
-        source: &dyn AccelerationSource,
+        _source: &dyn AccelerationSource,
         previous_provider: Arc<dyn TableProvider>,
-        provider_factory: super::ReloadProviderFactory,
+        _provider_factory: super::ReloadProviderFactory,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        // Drop the caller's clone first so the only remaining strong refs to
-        // the prior pool are the registry entry (which we are about to evict)
-        // and any in-flight queries (which will drain naturally).
         drop(previous_provider);
-
-        // Evict the cached pool. For file mode this matches the path the
-        // factory keyed on at construction time; for memory mode this falls
-        // back to the in-memory key. Snapshot reload is only meaningful for
-        // file mode in practice (memory accelerators cannot be snapshotted),
-        // but the memory branch is kept for completeness.
-        let acceleration =
-            source
-                .acceleration()
-                .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-                    "acceleration not configured for snapshot reload".into()
-                })?;
-        match acceleration.mode {
-            Mode::File | Mode::FileCreate | Mode::FileUpdate => {
-                let path = self.duckdb_file_path(source).boxed()?;
-                self.duckdb_factory.invalidate_file_instance(path).await;
-            }
-            Mode::Memory => {
-                self.duckdb_factory
-                    .invalidate_instance(&db_connection_pool::DbInstanceKey::memory())
-                    .await;
-            }
-        }
-
-        provider_factory().await
+        Err("DuckDB snapshot reload is unavailable because datafusion-table-providers 0.11 no longer exposes safe connection-pool invalidation".into())
     }
 
     async fn drop_table(
@@ -770,7 +710,6 @@ fn apply_changes_refresh_write_defaults(cmd: &mut CreateExternalTable, is_change
 pub(crate) async fn create_table_provider(
     duckdb_factory: &DuckDBTableProviderFactory,
     cmd: &CreateExternalTable,
-    on_data_written: Option<WriteCompletionHandler>,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = SessionContext::new();
 
@@ -785,10 +724,7 @@ pub(crate) async fn create_table_provider(
     };
 
     let read_provider = Arc::clone(&duckdb_writer.read_provider);
-    let duckdb_writer: Arc<DuckDBTableWriter> = match on_data_written {
-        Some(handler) => Arc::new(duckdb_writer.clone().with_on_data_written_handler(handler)),
-        None => Arc::new(duckdb_writer.clone()),
-    };
+    let duckdb_writer: Arc<DuckDBTableWriter> = Arc::new(duckdb_writer.clone());
 
     // Wrap with upsert deduplication if needed
     let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
@@ -796,6 +732,7 @@ pub(crate) async fn create_table_provider(
         &cmd.options,
         cmd.constraints.clone(),
     );
+    let write_provider = guard_unique_index_overwrites(write_provider, cmd);
 
     let mut schema_metadata = HashMap::new();
     schema_metadata.insert(
@@ -823,173 +760,307 @@ pub(crate) async fn create_table_provider(
     Ok(table_provider)
 }
 
-/// Reconstruct the DELETE statement with the internal `DuckDB` table name.
-fn reconstruct_retention_sql_with_table_name(
-    delete: &Delete,
-    internal_table_name: &str,
-) -> Result<String, String> {
-    // Clone the delete statement and modify the table name
-    let mut modified_delete = delete.clone();
-
-    // Replace the table name with the internal table name
-    // DuckDB internal table names should be used as-is without schema qualification
-    let FromTable::WithFromKeyword(from_tables) = &mut modified_delete.from else {
-        return Err("DELETE statement must use FROM keyword".to_string());
-    };
-
-    // Replace the first table's name, keeping all other properties
-    let Some(table_relation) = from_tables.first_mut() else {
-        return Err("No table specified in DELETE statement".to_string());
-    };
-
-    if let TableFactor::Table { name, .. } = &mut table_relation.relation {
-        *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
-            internal_table_name,
-        ))]);
+fn guard_unique_index_overwrites(
+    write_provider: Arc<dyn TableProvider>,
+    cmd: &CreateExternalTable,
+) -> Arc<dyn TableProvider> {
+    let unique_indexes = duckdb_unique_index_columns(cmd);
+    if unique_indexes.is_empty() {
+        write_provider
     } else {
-        return Err("DELETE statement must reference a simple table".to_string());
+        Arc::new(DuckDBUniqueIndexGuardTableProvider {
+            inner: write_provider,
+            unique_indexes: Arc::from(unique_indexes),
+        })
     }
-
-    // Simply convert the AST to string using Display trait
-    let statement = SQLStatement::Delete(modified_delete);
-    Ok(statement.to_string())
 }
 
-/// Configuration for on-refresh operations that run after data is written but before commit.
-#[derive(Clone, Default)]
-struct OnRefreshConfig {
-    /// Parsed DELETE statement for retention SQL
-    retention_delete: Option<Delete>,
-    /// Sort columns configuration
-    sort_columns: Vec<SortColumn>,
+fn duckdb_unique_index_columns(cmd: &CreateExternalTable) -> Vec<Vec<String>> {
+    let Some(indexes) = cmd.options.get("indexes") else {
+        return Vec::new();
+    };
+
+    datafusion_table_providers::util::hashmap_from_option_string::<String, IndexType>(indexes)
+        .into_iter()
+        .filter_map(|(columns, index_type)| {
+            if index_type != IndexType::Unique {
+                return None;
+            }
+            ColumnReference::try_from(columns.as_str())
+                .ok()
+                .map(|columns| columns.iter().map(str::to_string).collect())
+        })
+        .collect()
 }
 
-impl OnRefreshConfig {
-    /// Creates an empty config.
-    fn empty() -> Self {
-        Self::default()
-    }
+#[derive(Debug, Clone)]
+struct DuckDBUniqueIndexGuardTableProvider {
+    inner: Arc<dyn TableProvider>,
+    unique_indexes: Arc<[Vec<String>]>,
+}
 
-    /// Sets retention SQL configuration.
-    #[must_use]
-    fn with_retention(mut self, delete: Delete) -> Self {
-        self.retention_delete = Some(delete);
+#[async_trait]
+impl TableProvider for DuckDBUniqueIndexGuardTableProvider {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
-    /// Sets sort columns configuration.
-    #[must_use]
-    fn with_sort(mut self, columns: Vec<SortColumn>) -> Self {
-        self.sort_columns = columns;
-        self
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        self.inner.schema()
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.inner.constraints()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.inner.table_type()
+    }
+
+    fn statistics(&self) -> Option<Statistics> {
+        self.inner.statistics()
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> datafusion::common::Result<Vec<TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        self.inner.scan(state, projection, filters, limit).await
+    }
+
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        overwrite: datafusion::logical_expr::dml::InsertOp,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        let input = if overwrite == datafusion::logical_expr::dml::InsertOp::Overwrite {
+            let input = Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>;
+            Arc::new(UniqueIndexValidationExec::try_new(
+                input,
+                Arc::clone(&self.unique_indexes),
+            )?) as Arc<dyn ExecutionPlan>
+        } else {
+            input
+        };
+        self.inner.insert_into(state, input, overwrite).await
+    }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        self.inner.delete_from(state, filters).await
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        self.inner.update(state, assignments, filters).await
+    }
+
+    async fn truncate(
+        &self,
+        state: &dyn Session,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        self.inner.truncate(state).await
     }
 }
 
-fn make_on_refresh_write_handler(
-    dataset_name: String,
-    config: OnRefreshConfig,
-) -> WriteCompletionHandler {
-    Arc::new(move |tx, table_manager, _schema, inserted_rows| {
-        let internal_table_name = table_manager.table_name().to_string();
+#[derive(Debug)]
+struct UniqueIndexValidationExec {
+    input: Arc<dyn ExecutionPlan>,
+    unique_index_names: Arc<[Vec<String>]>,
+    unique_index_indices: Arc<[Vec<usize>]>,
+    properties: Arc<PlanProperties>,
+}
 
-        // Apply retention SQL if configured
-        if let Some(ref parsed_delete) = config.retention_delete {
-            tracing::debug!(
-                dataset = %dataset_name,
-                table = %internal_table_name,
-                inserted_rows,
-                "Applying retention SQL before commit"
-            );
+impl UniqueIndexValidationExec {
+    fn try_new(
+        input: Arc<dyn ExecutionPlan>,
+        unique_index_names: Arc<[Vec<String>]>,
+    ) -> datafusion::common::Result<Self> {
+        let schema = input.schema();
+        let unique_index_indices = unique_index_names
+            .iter()
+            .map(|columns| {
+                columns
+                    .iter()
+                    .map(|column| {
+                        schema.index_of(column).map_err(|error| {
+                            DataFusionError::Plan(format!(
+                                "Failed to validate DuckDB unique index column {column}: {error}"
+                            ))
+                        })
+                    })
+                    .collect::<datafusion::common::Result<Vec<_>>>()
+            })
+            .collect::<datafusion::common::Result<Vec<_>>>()?;
 
-            let reconstructed_sql = match reconstruct_retention_sql_with_table_name(
-                parsed_delete,
-                &internal_table_name,
-            ) {
-                Ok(sql) => sql,
-                Err(e) => {
-                    return Err(DataFusionError::Execution(format!(
-                        "Failed to reconstruct retention SQL for dataset {dataset_name}: {e}"
-                    )));
+        Ok(Self {
+            properties: Arc::clone(input.properties()),
+            input,
+            unique_index_names,
+            unique_index_indices: Arc::from(unique_index_indices),
+        })
+    }
+}
+
+impl DisplayAs for UniqueIndexValidationExec {
+    fn fmt_as(
+        &self,
+        display_format: DisplayFormatType,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        match display_format {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => write!(f, "UniqueIndexValidationExec"),
+        }
+    }
+}
+
+impl ExecutionPlan for UniqueIndexValidationExec {
+    fn name(&self) -> &'static str {
+        Self::static_name()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        let mut children = children.into_iter();
+        let Some(input) = children.next() else {
+            return Err(DataFusionError::Internal(
+                "UniqueIndexValidationExec expected one child but received none".to_string(),
+            ));
+        };
+        if children.next().is_some() {
+            return Err(DataFusionError::Internal(
+                "UniqueIndexValidationExec expected exactly one child".to_string(),
+            ));
+        }
+
+        Ok(Arc::new(Self::try_new(
+            input,
+            Arc::clone(&self.unique_index_names),
+        )?))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> datafusion::common::Result<SendableRecordBatchStream> {
+        let input = self.input.execute(partition, context)?;
+        let schema = self.input.schema();
+        let unique_index_indices = Arc::clone(&self.unique_index_indices);
+        let stream = futures::stream::try_unfold(
+            UniqueIndexValidationState::Collecting {
+                input,
+                unique_index_indices,
+                schema: Arc::clone(&schema),
+            },
+            |state| async move {
+                match state {
+                    UniqueIndexValidationState::Collecting {
+                        mut input,
+                        unique_index_indices,
+                        schema,
+                    } => {
+                        let mut batches = Vec::new();
+                        while let Some(batch) = input.next().await {
+                            batches.push(batch?);
+                        }
+                        validate_unique_index_batches(&batches, &unique_index_indices, &schema)?;
+
+                        let mut batches = batches.into_iter();
+                        Ok(batches
+                            .next()
+                            .map(|batch| (batch, UniqueIndexValidationState::Emitting { batches })))
+                    }
+                    UniqueIndexValidationState::Emitting { mut batches } => Ok(batches
+                        .next()
+                        .map(|batch| (batch, UniqueIndexValidationState::Emitting { batches }))),
                 }
-            };
+            },
+        );
 
-            tracing::debug!(
-                dataset = %dataset_name,
-                table = %internal_table_name,
-                sql = %reconstructed_sql,
-                "Reconstructed retention SQL with internal table name"
-            );
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+}
 
-            match tx.execute(reconstructed_sql.as_str(), []) {
-                Ok(affected_rows) => {
-                    tracing::debug!(
-                        dataset = %dataset_name,
-                        table = %internal_table_name,
-                        affected_rows,
-                        "Retention SQL applied before commit"
-                    );
+enum UniqueIndexValidationState {
+    Collecting {
+        input: SendableRecordBatchStream,
+        unique_index_indices: Arc<[Vec<usize>]>,
+        schema: arrow::datatypes::SchemaRef,
+    },
+    Emitting {
+        batches: std::vec::IntoIter<arrow::record_batch::RecordBatch>,
+    },
+}
+
+fn validate_unique_index_batches(
+    batches: &[arrow::record_batch::RecordBatch],
+    unique_index_indices: &[Vec<usize>],
+    schema: &arrow::datatypes::SchemaRef,
+) -> datafusion::common::Result<()> {
+    for index_columns in unique_index_indices {
+        let mut seen = HashSet::new();
+        for batch in batches {
+            for row_index in 0..batch.num_rows() {
+                let values = index_columns
+                    .iter()
+                    .map(|column_index| {
+                        ScalarValue::try_from_array(batch.column(*column_index), row_index)
+                    })
+                    .collect::<datafusion::common::Result<Vec<_>>>()?;
+
+                if values.iter().any(ScalarValue::is_null) {
+                    continue;
                 }
-                Err(err) => {
+
+                if !seen.insert(values) {
+                    let columns = index_columns
+                        .iter()
+                        .map(|column_index| schema.field(*column_index).name().as_str())
+                        .join(", ");
                     return Err(DataFusionError::Execution(format!(
-                        "Failed to apply retention SQL for dataset {dataset_name} (table {internal_table_name}): {err}"
+                        "Duplicate values detected for DuckDB unique index on ({columns}); aborting overwrite to preserve existing data"
                     )));
                 }
             }
         }
+    }
 
-        // Current sorting implementation is experimental. CREATE OR REPLACE TABLE recreates
-        // the table from scratch, which means:
-        // - Primary keys and unique constraints (table-level definitions) are NOT preserved
-        // - Indexes (separate DB objects) are dropped when the original table is replaced
-        // - Foreign key constraints are NOT preserved
-        if !config.sort_columns.is_empty() {
-            let order_by_clause: String = config
-                .sort_columns
-                .iter()
-                .map(|sc| format!("\"{}\" {}", sc.column, sc.direction))
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            tracing::debug!(
-                dataset = %dataset_name,
-                table = %internal_table_name,
-                inserted_rows,
-                order_by = %order_by_clause,
-                "Applying on-refresh sort before commit"
-            );
-
-            let sort_sql = format!(
-                "CREATE OR REPLACE TABLE \"{internal_table_name}\" AS SELECT * FROM \"{internal_table_name}\" ORDER BY {order_by_clause}"
-            );
-
-            tracing::debug!(
-                dataset = %dataset_name,
-                table = %internal_table_name,
-                sql = %sort_sql,
-                "Executing on-refresh sort SQL"
-            );
-
-            if let Err(err) = tx.execute(sort_sql.as_str(), []) {
-                return Err(DataFusionError::Execution(format!(
-                    "Failed to apply on-refresh sort for dataset {dataset_name} (table {internal_table_name}): {err}"
-                )));
-            }
-
-            tracing::debug!(
-                dataset = %dataset_name,
-                table = %internal_table_name,
-                "On-refresh sort applied before commit"
-            );
-        }
-
-        table_manager.create_indexes(tx).map_err(|err| {
-            DataFusionError::Execution(format!(
-                "Failed to create DuckDB indexes for dataset {dataset_name} (table {internal_table_name}) before refresh commit: {err}"
-            ))
-        })?;
-
-        Ok(())
-    })
+    Ok(())
 }
 
 register_data_accelerator!(Engine::DuckDB, DuckDBAccelerator);
@@ -1011,7 +1082,7 @@ mod tests {
 
     use crate::component::dataset::builder::DatasetBuilder;
     use arrow::{
-        array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray, UInt64Array},
+        array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray},
         datatypes::{DataType, Field, Schema},
     };
     use datafusion::{
@@ -1025,7 +1096,7 @@ mod tests {
 
     use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::acceleration::{Engine, Mode};
-    use crate::dataaccelerator::{DataAccelerator, duckdb::DuckDBAccelerator};
+    use crate::dataaccelerator::{AccelerationSource, DataAccelerator, duckdb::DuckDBAccelerator};
 
     fn external_table_with_options(options: HashMap<String, String>) -> CreateExternalTable {
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -1051,6 +1122,65 @@ mod tests {
             constraints: Constraints::new_unverified(vec![]),
             column_defaults: HashMap::default(),
             temporary: false,
+        }
+    }
+
+    async fn dataset_with_acceleration(
+        name: &str,
+        acceleration: Acceleration,
+    ) -> crate::component::dataset::Dataset {
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+
+        let mut dataset = DatasetBuilder::try_new(name.to_string(), name)
+            .expect("to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("to build dataset");
+
+        dataset.acceleration = Some(acceleration);
+        dataset
+    }
+
+    async fn duckdb_create_external_table_error(acceleration: Acceleration) -> String {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
+            .expect("to convert Arrow schema to DataFusion schema");
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("unsupported_config_table"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        let dataset = dataset_with_acceleration("unsupported_config_table", acceleration).await;
+
+        let result = DuckDBAccelerator::new()
+            .create_external_table(
+                external_table,
+                Some(&dataset as &dyn AccelerationSource),
+                vec![],
+                None,
+            )
+            .await;
+
+        match result {
+            Ok(_) => panic!("unsupported DuckDB acceleration config should fail"),
+            Err(error) => error.to_string(),
         }
     }
 
@@ -1097,97 +1227,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retention_sql_applies_before_commit() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int64,
-            false,
-        )]));
-        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
-            .expect("to convert Arrow schema to DataFusion schema");
+    async fn retention_sql_configuration_is_rejected() {
+        let error_msg = duckdb_create_external_table_error(Acceleration {
+            engine: Engine::DuckDB,
+            retention_sql: Some("DELETE FROM unsupported_config_table WHERE value < 5".to_string()),
+            ..Default::default()
+        })
+        .await;
 
-        let external_table = CreateExternalTable {
-            schema: df_schema,
-            name: TableReference::bare("retention_table"),
-            location: String::new(),
-            file_type: String::new(),
-            table_partition_cols: vec![],
-            if_not_exists: true,
-            or_replace: false,
-            definition: None,
-            order_exprs: vec![],
-            unbounded: false,
-            options: HashMap::new(),
-            constraints: Constraints::new_unverified(vec![]),
-            column_defaults: HashMap::default(),
-            temporary: false,
-        };
-
-        let duckdb_accelerator = DuckDBAccelerator::new();
-        let retention_sql = "DELETE FROM retention_table WHERE value < 5";
-        let parsed_delete = crate::datafusion::retention_sql::parse_retention_sql(
-            &TableReference::bare("retention_table"),
-            retention_sql,
-            Arc::clone(&schema),
-        )
-        .expect("should parse retention SQL")
-        .delete_statement;
-        let handler = super::make_on_refresh_write_handler(
-            "retention_dataset".to_string(),
-            super::OnRefreshConfig::empty().with_retention(parsed_delete),
+        assert!(
+            error_msg.contains("DuckDB retention_sql is unavailable"),
+            "expected retention_sql unsupported error, got: {error_msg}"
         );
-
-        let table = super::create_table_provider(
-            &duckdb_accelerator.duckdb_factory,
-            &external_table,
-            Some(handler),
-        )
-        .await
-        .expect("table should be created");
-
-        let input = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(vec![1, 3, 5, 7]))],
-        )
-        .expect("to create RecordBatch");
-
-        let exec = Arc::new(MockExec::new(vec![Ok(input)], schema));
-
-        let write_ctx = SessionContext::new();
-        let insert_plan = table
-            .insert_into(
-                &write_ctx.state(),
-                Arc::<MockExec>::clone(&exec),
-                InsertOp::Append,
-            )
-            .await
-            .expect("to create insert plan");
-
-        collect(insert_plan, write_ctx.task_ctx())
-            .await
-            .expect("to execute insert");
-
-        let read_ctx = SessionContext::new();
-        let scan_plan = table
-            .scan(&read_ctx.state(), None, &[], None)
-            .await
-            .expect("to create scan plan");
-
-        let batches = collect(scan_plan, read_ctx.task_ctx())
-            .await
-            .expect("to execute scan");
-
-        let mut values = Vec::new();
-        for batch in &batches {
-            let column = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("to downcast column to Int64Array");
-            values.extend((0..column.len()).map(|idx| column.value(idx)));
-        }
-
-        assert_eq!(values, vec![5, 7]);
     }
 
     #[tokio::test]
@@ -1221,18 +1272,10 @@ mod tests {
         };
 
         let duckdb_accelerator = DuckDBAccelerator::new();
-        let handler = super::make_on_refresh_write_handler(
-            "indexed_overwrite_dataset".to_string(),
-            super::OnRefreshConfig::empty(),
-        );
-
-        let table = super::create_table_provider(
-            &duckdb_accelerator.duckdb_factory,
-            &external_table,
-            Some(handler),
-        )
-        .await
-        .expect("table should be created");
+        let table =
+            super::create_table_provider(&duckdb_accelerator.duckdb_factory, &external_table)
+                .await
+                .expect("table should be created");
 
         let write_ctx = SessionContext::new();
         let initial_input = RecordBatch::try_new(
@@ -1293,171 +1336,17 @@ mod tests {
 
     #[tokio::test]
     async fn retention_sql_fails_with_internal_tables() {
-        use datafusion_table_providers::duckdb::DuckDB;
-        use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-        use tempfile::TempDir;
+        let error_msg = duckdb_create_external_table_error(Acceleration {
+            engine: Engine::DuckDB,
+            retention_sql: Some("DELETE FROM taxi_trips WHERE value < 5".to_string()),
+            ..Default::default()
+        })
+        .await;
 
-        // This test reproduces the bug where retention SQL fails with internal tables.
-        //
-        // When DuckDB uses internal tables (for indexes/constraints via preserve_insertion_order),
-        // the write completion handler receives the internal table name (like __data_table_123)
-        // from table_manager.table_name(), but the retention SQL references the logical table name.
-        //
-        // DuckDB's error: "Can only delete from base table!" occurs because DELETE statements
-        // must target the base/view table name, not the internal table directly.
-
-        let temp_dir = TempDir::new().expect("to create temp directory");
-        let db_path = temp_dir.path().join("test_retention.db");
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
-        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
-            .expect("to convert Arrow schema to DataFusion schema");
-
-        let mut options = HashMap::new();
-        // Use file mode to enable full DuckDB features
-        options.insert(
-            "open".to_string(),
-            db_path
-                .to_str()
-                .expect("to convert path to string")
-                .to_string(),
-        );
-        // Enable preserve_insertion_order which triggers internal table creation
-        options.insert("preserve_insertion_order".to_string(), "true".to_string());
-
-        let external_table = CreateExternalTable {
-            schema: df_schema,
-            name: TableReference::bare("taxi_trips"),
-            location: String::new(),
-            file_type: String::new(),
-            table_partition_cols: vec![],
-            if_not_exists: true,
-            or_replace: false,
-            definition: None,
-            order_exprs: vec![],
-            unbounded: false,
-            options,
-            constraints: Constraints::new_unverified(vec![]),
-            column_defaults: HashMap::default(),
-            temporary: false,
-        };
-
-        let duckdb_accelerator = DuckDBAccelerator::new();
-
-        // The retention SQL references the logical table name "taxi_trips"
-        let retention_sql = "DELETE FROM taxi_trips WHERE value < 5";
-        let parsed_delete = crate::datafusion::retention_sql::parse_retention_sql(
-            &TableReference::bare("taxi_trips"),
-            retention_sql,
-            Arc::clone(&schema),
-        )
-        .expect("should parse retention SQL")
-        .delete_statement;
-        let handler = super::make_on_refresh_write_handler(
-            "taxi_trips".to_string(),
-            super::OnRefreshConfig::empty().with_retention(parsed_delete),
-        );
-
-        let table = super::create_table_provider(
-            &duckdb_accelerator.duckdb_factory,
-            &external_table,
-            Some(handler),
-        )
-        .await
-        .expect("table should be created");
-
-        // Insert initial data
-        let input = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
-                Arc::new(Int64Array::from(vec![1, 3, 5, 7])),
-            ],
-        )
-        .expect("to create RecordBatch");
-
-        let exec = Arc::new(MockExec::new(vec![Ok(input.clone())], Arc::clone(&schema)));
-
-        let write_ctx = SessionContext::new();
-        let insert_plan = table
-            .insert_into(
-                &write_ctx.state(),
-                Arc::<MockExec>::clone(&exec),
-                InsertOp::Append,
-            )
-            .await
-            .expect("to create insert plan");
-
-        // First insert should succeed
-        collect(insert_plan, write_ctx.task_ctx())
-            .await
-            .expect("first insert should succeed");
-
-        // Verify internal tables were created by checking DuckDB directly
-        let pool = Arc::new(
-            DuckDbConnectionPool::new_file(
-                db_path.to_str().expect("to convert path to string"),
-                &duckdb::AccessMode::ReadWrite,
-            )
-            .expect("to create DuckDB connection pool"),
-        );
-
-        let mut conn = pool.connect_sync().expect("to get connection from pool");
-        let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("to get DuckDB connection");
-
-        // Check for internal tables (they follow the pattern __data_*)
-        let internal_tables: Vec<String> = duckdb_conn
-            .get_underlying_conn_mut()
-            .prepare(
-                "SELECT table_name FROM information_schema.tables WHERE table_name LIKE '__data_%'",
-            )
-            .expect("to prepare SQL statement")
-            .query_map([], |row| row.get(0))
-            .expect("to execute query")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("to collect query results");
-
-        if internal_tables.is_empty() {
-            eprintln!(
-                "WARNING: No internal tables found. Test may not be validating the bug correctly."
-            );
-            eprintln!(
-                "This could mean preserve_insertion_order didn't trigger internal table creation."
-            );
-            return;
-        }
-
-        eprintln!("Found internal tables: {internal_tables:?}");
-
-        // Now try to insert more data - this should trigger the retention SQL
-        // and fail because it tries to DELETE from the internal table name
-        let exec2 = Arc::new(MockExec::new(vec![Ok(input)], schema));
-
-        let insert_plan2 = table
-            .insert_into(&write_ctx.state(), exec2, InsertOp::Append)
-            .await
-            .expect("to create second insert plan");
-
-        let result = collect(insert_plan2, write_ctx.task_ctx()).await;
-
-        // This should fail with "Can only delete from base table!"
         assert!(
-            result.is_err(),
-            "Expected an error due to retention SQL targeting internal table, but insert succeeded"
+            error_msg.contains("DuckDB retention_sql is unavailable"),
+            "expected retention_sql unsupported error, got: {error_msg}"
         );
-
-        let error_msg = result.expect_err("Expected error").to_string();
-        assert!(
-            error_msg.contains("Can only delete from base table")
-                || error_msg.contains("Binder Error")
-                || error_msg.contains("to apply retention SQL"),
-            "Expected error about deleting from base table, got: {error_msg}"
-        );
-
-        eprintln!("✓ Test correctly reproduced the error: {error_msg}");
     }
 
     #[tokio::test]
@@ -1554,108 +1443,14 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let plan = table
+        let delete_error = table
             .delete_from(&ctx.state(), vec![filter])
             .await
-            .expect("deletion should be successful");
-
-        let result = collect(plan, ctx.task_ctx())
-            .await
-            .expect("deletion successful");
-        let actual = result
-            .first()
-            .expect("result should have at least one batch")
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .expect("result should be UInt64Array");
-        let expected = UInt64Array::from(vec![2]);
-        assert_eq!(actual, &expected);
-
-        let filter = col("time_int").lt(lit(1354360273));
-        let plan = table
-            .delete_from(&ctx.state(), vec![filter])
-            .await
-            .expect("deletion should be successful");
-
-        let result = collect(plan, ctx.task_ctx())
-            .await
-            .expect("deletion successful");
-        let actual = result
-            .first()
-            .expect("result should have at least one batch")
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .expect("result should be UInt64Array");
-        let expected = UInt64Array::from(vec![1]);
-        assert_eq!(actual, &expected);
-
-        let insertion = table
-            .insert_into(
-                &ctx.state(),
-                Arc::<MockExec>::clone(&exec),
-                InsertOp::Append,
-            )
-            .await
-            .expect("insertion should be successful");
-
-        collect(insertion, ctx.task_ctx())
-            .await
-            .expect("insert successful");
-
-        let filter = col("time").lt(lit(ScalarValue::TimestampMillisecond(
-            Some(1354360272000),
-            None,
-        )));
-        let plan = table
-            .delete_from(&ctx.state(), vec![filter])
-            .await
-            .expect("deletion should be successful");
-
-        let result = collect(plan, ctx.task_ctx())
-            .await
-            .expect("deletion successful");
-        let actual = result
-            .first()
-            .expect("result should have at least one batch")
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .expect("result should be UInt64Array");
-        let expected = UInt64Array::from(vec![2]);
-        assert_eq!(actual, &expected);
-
-        let insertion = table
-            .insert_into(&ctx.state(), exec, InsertOp::Append)
-            .await
-            .expect("insertion should be successful");
-
-        collect(insertion, ctx.task_ctx())
-            .await
-            .expect("insert successful");
-
-        let filter = col("time_with_zone").lt(lit(ScalarValue::TimestampMillisecond(
-            Some(1354360272000),
-            None,
-        )));
-        let plan = table
-            .delete_from(&ctx.state(), vec![filter])
-            .await
-            .expect("deletion should be successful");
-
-        let result = collect(plan, ctx.task_ctx())
-            .await
-            .expect("deletion successful");
-        let actual = result
-            .first()
-            .expect("result should have at least one batch")
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .expect("result should be UInt64Array");
-        let expected = UInt64Array::from(vec![2]);
-        assert_eq!(actual, &expected);
+            .expect_err("DuckDB delete should fail safely while provider DML is unavailable");
+        assert!(
+            delete_error.to_string().contains("DELETE not supported"),
+            "expected DuckDB delete to be unsupported, got: {delete_error}"
+        );
     }
 
     #[tokio::test]
@@ -1698,347 +1493,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_retention_sql_with_duckdb_accelerator() {
-        use tempfile::TempDir;
+        let error_msg = duckdb_create_external_table_error(Acceleration {
+            engine: Engine::DuckDB,
+            retention_sql: Some("DELETE FROM retention_test_dataset WHERE value < 5".to_string()),
+            ..Default::default()
+        })
+        .await;
 
-        // Create a temporary directory for the DuckDB file
-        let temp_dir = TempDir::new().expect("to create temp dir");
-        let db_path = temp_dir.path().join("test_retention.db");
-
-        // Create schema
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
-        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
-            .expect("to convert Arrow schema to DataFusion schema");
-
-        // Prepare the external table command with file path
-        let mut external_table = CreateExternalTable {
-            schema: df_schema,
-            name: TableReference::bare("retention_test_dataset"),
-            location: String::new(),
-            file_type: String::new(),
-            table_partition_cols: vec![],
-            if_not_exists: true,
-            or_replace: false,
-            definition: None,
-            order_exprs: vec![],
-            unbounded: false,
-            options: HashMap::new(),
-            constraints: Constraints::new_unverified(vec![]),
-            column_defaults: HashMap::default(),
-            temporary: false,
-        };
-        external_table.options.insert(
-            "open".to_string(),
-            db_path
-                .to_str()
-                .expect("to convert path to string")
-                .to_string(),
-        );
-
-        // Parse retention SQL and create handler
-        let retention_sql = "DELETE FROM retention_test_dataset WHERE value < 5";
-        let parsed_delete = crate::datafusion::retention_sql::parse_retention_sql(
-            &TableReference::bare("retention_test_dataset"),
-            retention_sql,
-            Arc::clone(&schema),
-        )
-        .expect("should parse retention SQL")
-        .delete_statement;
-        let handler = super::make_on_refresh_write_handler(
-            "retention_test_dataset".to_string(),
-            super::OnRefreshConfig::empty().with_retention(parsed_delete),
-        );
-
-        // Create the accelerator and table
-        let accelerator = DuckDBAccelerator::new();
-        let table = super::create_table_provider(
-            &accelerator.duckdb_factory,
-            &external_table,
-            Some(handler),
-        )
-        .await
-        .expect("table should be created");
-
-        // Insert initial data with values both above and below the retention threshold
-        let input = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6])),
-                Arc::new(Int64Array::from(vec![2, 3, 4, 6, 7, 8])), // values: 2, 3, 4 should be deleted (< 5)
-            ],
-        )
-        .expect("to create RecordBatch");
-
-        let exec = Arc::new(MockExec::new(vec![Ok(input.clone())], Arc::clone(&schema)));
-
-        let write_ctx = SessionContext::new();
-        let insert_plan = table
-            .insert_into(
-                &write_ctx.state(),
-                Arc::<MockExec>::clone(&exec),
-                InsertOp::Append,
-            )
-            .await
-            .expect("to create insert plan");
-
-        // Execute the insert - this should trigger the retention SQL
-        collect(insert_plan, write_ctx.task_ctx())
-            .await
-            .expect("insert should succeed");
-
-        // Query the table to verify retention SQL was applied
-        let read_ctx = SessionContext::new();
-        let scan = table
-            .scan(&read_ctx.state(), None, &[], None)
-            .await
-            .expect("scan should succeed");
-
-        let results = collect(scan, read_ctx.task_ctx())
-            .await
-            .expect("collect should succeed");
-
-        // Verify that only rows with value >= 5 remain
-        let mut total_rows = 0;
-        let mut values = Vec::new();
-        for batch in &results {
-            total_rows += batch.num_rows();
-            let value_array = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("value column should be Int64Array");
-
-            // Collect all values
-            for i in 0..value_array.len() {
-                values.push(value_array.value(i));
-            }
-        }
-
-        // All values should be >= 5
-        for value in &values {
-            assert!(
-                *value >= 5,
-                "Found value {value} which should have been deleted by retention SQL"
-            );
-        }
-
-        // We should have 3 rows remaining (values 6, 7, 8)
-        assert_eq!(
-            total_rows, 3,
-            "Expected 3 rows after retention (values >= 5), found {total_rows}. Values: {values:?}"
-        );
-
-        // cleanup
-        drop(table);
-        drop(temp_dir);
-    }
-
-    #[tokio::test]
-    async fn test_reconstruct_retention_sql() {
-        let sql = "DELETE FROM taxi_trips WHERE status = 'expired'";
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "status",
-            DataType::Utf8,
-            true,
-        )]));
-        let parsed = crate::datafusion::retention_sql::parse_retention_sql(
-            &TableReference::bare("taxi_trips"),
-            sql,
-            schema,
-        )
-        .expect("should parse");
-
-        let internal_name = "__data_taxi_trips_1234567890";
-        let result = super::reconstruct_retention_sql_with_table_name(
-            &parsed.delete_statement,
-            internal_name,
-        );
-
-        assert!(result.is_ok(), "Should reconstruct SQL successfully");
-        let reconstructed = result.expect("reconstructed");
-
-        // Verify the internal table name is used
         assert!(
-            reconstructed.contains(internal_name),
-            "Should contain internal table name"
-        );
-
-        // Verify the WHERE clause is preserved
-        assert!(
-            reconstructed.contains("status = 'expired'")
-                || reconstructed.contains("status = \"expired\""),
-            "Should preserve WHERE clause"
-        );
-
-        // Verify it's still a DELETE statement
-        assert!(
-            reconstructed.to_lowercase().starts_with("delete from"),
-            "Should start with DELETE FROM"
+            error_msg.contains("DuckDB retention_sql is unavailable"),
+            "expected retention_sql unsupported error, got: {error_msg}"
         );
     }
 
     #[tokio::test]
-    async fn test_reconstruct_retention_sql_complex_where() {
-        let sql = "DELETE FROM orders WHERE created_at < NOW() - INTERVAL '30 days' AND status IN ('cancelled', 'expired')";
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("created_at", DataType::Utf8, true),
-            Field::new("status", DataType::Utf8, true),
-        ]));
-        let parsed = crate::datafusion::retention_sql::parse_retention_sql(
-            &TableReference::bare("orders"),
-            sql,
-            schema,
-        )
-        .expect("should parse");
-
-        let internal_name = "__data_orders_9876543210";
-        let result = super::reconstruct_retention_sql_with_table_name(
-            &parsed.delete_statement,
-            internal_name,
+    async fn on_refresh_sort_columns_configuration_is_rejected() {
+        let mut params = HashMap::new();
+        params.insert(
+            "on_refresh_sort_columns".to_string(),
+            "value DESC".to_string(),
         );
+
+        let error_msg = duckdb_create_external_table_error(Acceleration {
+            engine: Engine::DuckDB,
+            params,
+            ..Default::default()
+        })
+        .await;
 
         assert!(
-            result.is_ok(),
-            "Should reconstruct complex SQL successfully"
+            error_msg.contains("DuckDB on_refresh_sort_columns is unavailable"),
+            "expected on_refresh_sort_columns unsupported error, got: {error_msg}"
         );
-        let reconstructed = result.expect("reconstructed");
-
-        // Verify the internal table name is used
-        assert!(
-            reconstructed.contains(internal_name),
-            "Should contain internal table name"
-        );
-
-        // Basic sanity check - make sure it's still a valid DELETE statement structure
-        assert!(
-            reconstructed.to_lowercase().starts_with("delete from"),
-            "Should start with DELETE FROM"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_sort_columns_with_duckdb_accelerator() {
-        use crate::datafusion::sort_columns::SortColumn;
-        use tempfile::TempDir;
-
-        // Create a temporary directory for the DuckDB file
-        let temp_dir = TempDir::new().expect("to create temp dir");
-        let db_path = temp_dir.path().join("test_sort.db");
-
-        // Create schema
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
-        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
-            .expect("to convert Arrow schema to DataFusion schema");
-
-        // Prepare the external table command with file path
-        let mut external_table = CreateExternalTable {
-            schema: df_schema,
-            name: TableReference::bare("sort_test_dataset"),
-            location: String::new(),
-            file_type: String::new(),
-            table_partition_cols: vec![],
-            if_not_exists: true,
-            or_replace: false,
-            definition: None,
-            order_exprs: vec![],
-            unbounded: false,
-            options: HashMap::new(),
-            constraints: Constraints::new_unverified(vec![]),
-            column_defaults: HashMap::default(),
-            temporary: false,
-        };
-        external_table.options.insert(
-            "open".to_string(),
-            db_path
-                .to_str()
-                .expect("to convert path to string")
-                .to_string(),
-        );
-
-        // Create sort columns configuration - sort by value DESC
-        let sort_columns = vec![SortColumn::desc("value")];
-        let handler = super::make_on_refresh_write_handler(
-            "sort_test_dataset".to_string(),
-            super::OnRefreshConfig::empty().with_sort(sort_columns),
-        );
-
-        // Create the accelerator and table
-        let accelerator = DuckDBAccelerator::new();
-        let table = super::create_table_provider(
-            &accelerator.duckdb_factory,
-            &external_table,
-            Some(handler),
-        )
-        .await
-        .expect("table should be created");
-
-        // Insert data in unsorted order
-        let input = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
-                Arc::new(Int64Array::from(vec![30, 10, 50, 20, 40])), // unsorted values
-            ],
-        )
-        .expect("to create RecordBatch");
-
-        let exec = Arc::new(MockExec::new(vec![Ok(input.clone())], Arc::clone(&schema)));
-
-        let write_ctx = SessionContext::new();
-        let insert_plan = table
-            .insert_into(
-                &write_ctx.state(),
-                Arc::<MockExec>::clone(&exec),
-                InsertOp::Append,
-            )
-            .await
-            .expect("to create insert plan");
-
-        // Execute the insert - this should trigger the sort
-        collect(insert_plan, write_ctx.task_ctx())
-            .await
-            .expect("insert should succeed");
-
-        // Query the table to verify sorting was applied
-        let read_ctx = SessionContext::new();
-        let scan = table
-            .scan(&read_ctx.state(), None, &[], None)
-            .await
-            .expect("scan should succeed");
-
-        let results = collect(scan, read_ctx.task_ctx())
-            .await
-            .expect("collect should succeed");
-
-        // Collect all values in order
-        let mut values = Vec::new();
-        for batch in &results {
-            let value_array = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("value column should be Int64Array");
-
-            for i in 0..value_array.len() {
-                values.push(value_array.value(i));
-            }
-        }
-
-        // Verify data is sorted in descending order
-        assert_eq!(
-            values,
-            vec![50, 40, 30, 20, 10],
-            "Data should be sorted by value DESC"
-        );
-
-        // cleanup
-        drop(table);
-        drop(temp_dir);
     }
 
     /// Regression test for <https://github.com/spiceai/spiceai/issues/2889>.

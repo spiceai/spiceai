@@ -29,8 +29,7 @@ use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
 use crate::{
-    component::dataset::acceleration::Engine, datafusion::udf::deny_spice_specific_functions,
-    parameters::ParameterSpec, register_data_accelerator,
+    component::dataset::acceleration::Engine, parameters::ParameterSpec, register_data_accelerator,
 };
 
 use super::{AccelerationSource, DataAccelerator, upsert_dedup};
@@ -69,8 +68,7 @@ impl PostgresAccelerator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            postgres_factory: PostgresTableProviderFactory::new()
-                .with_function_support(deny_spice_specific_functions().as_ref().clone()),
+            postgres_factory: PostgresTableProviderFactory::new(),
         }
     }
 }

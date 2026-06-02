@@ -1,40 +1,45 @@
-use crate::common::plan_node_key::PlanNodeKey;
-use crate::common::search_visitor::SearchVisitor;
-use crate::concrete;
-use crate::physical_plan::duckdb::{ConcreteDuckSqlExec, PARSER_DIALECT};
 use datafusion::common::Result;
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
-use datafusion::error::DataFusionError;
+#[cfg(test)]
 use datafusion::logical_expr::sqlparser::ast::{CteAsMaterialized, ObjectName, Query};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
+#[cfg(test)]
 use datafusion::sql::sqlparser::ast::helpers::attached_token::AttachedToken;
+#[cfg(test)]
 use datafusion::sql::sqlparser::ast::{
     BinaryOperator, Cte, Expr, Ident, ObjectNamePart, Select, SelectItem, SetExpr, Statement,
     TableAlias, TableFactor, TableWithJoins, Value, ValueWithSpan, Visit, VisitMut, With,
     visit_expressions, visit_expressions_mut, visit_relations,
 };
-use datafusion::sql::sqlparser::parser::Parser;
+#[cfg(test)]
 use datafusion::sql::sqlparser::tokenizer::Span;
+#[cfg(test)]
 use datafusion_expr::sqlparser::ast::GroupByExpr;
+#[cfg(test)]
 use datafusion_table_providers::util::column_reference::ColumnReference;
+#[cfg(test)]
 use datafusion_table_providers::util::indexes::IndexType;
+#[cfg(test)]
 use std::collections::HashSet;
 use std::fmt::Debug;
+#[cfg(test)]
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
+#[cfg(test)]
 const CTE_NAME: &str = "_intermediate_materialize";
 
 pub struct DuckDBIntermediateIndexMaterializationOptimizer {}
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 struct ExprWithIdents<T> {
     expr: T,
     references: HashSet<Expr>,
 }
 
+#[cfg(test)]
 impl<T: Visit + Clone> ExprWithIdents<T> {
     pub fn from(expr: &T) -> Self {
         let mut references = HashSet::new();
@@ -53,6 +58,7 @@ impl<T: Visit + Clone> ExprWithIdents<T> {
     }
 }
 
+#[cfg(test)]
 fn simple_column_ident(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Identifier(ident) => Some(ident.value.clone()),
@@ -66,7 +72,10 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
     pub fn new() -> Arc<Self> {
         Arc::new(DuckDBIntermediateIndexMaterializationOptimizer {})
     }
+}
 
+#[cfg(test)]
+impl DuckDBIntermediateIndexMaterializationOptimizer {
     /// Split a SQL AST expression into conjunctive parts
     /// This mimics `datafusion::logical_expr::utils::split_conjunction` but for SQL AST
     fn split_conjunction(expr: &Expr) -> Vec<&Expr> {
@@ -247,6 +256,7 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
         let table_alias = TableAlias {
             name: Ident::new(CTE_NAME),
             columns: vec![],
+            explicit: false,
         };
 
         let cte_query = Query {
@@ -373,53 +383,7 @@ impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Find DuckSqlExec
-        let Some(exec) = SearchVisitor::first_concrete_down::<ConcreteDuckSqlExec>(&plan)? else {
-            return Ok(plan);
-        };
-
-        let Some(duck_exec) = concrete!(exec, ConcreteDuckSqlExec) else {
-            return Ok(plan);
-        };
-
-        if duck_exec.indexes().is_empty() {
-            return Ok(plan);
-        }
-
-        // Get its SQL + statement
-        let sql = duck_exec.sql().map_err(|e| {
-            DataFusionError::Execution(format!("Unable to generate DuckDB SQL: {e}"))
-        })?;
-
-        let Some(statement) = Parser::parse_sql(&PARSER_DIALECT, sql.as_str())?
-            .first()
-            .cloned()
-        else {
-            return Ok(plan);
-        };
-
-        let Some(new_statement) = Self::rewrite_statement(&statement, duck_exec.indexes()) else {
-            return Ok(plan);
-        };
-
-        let old_exec_key = PlanNodeKey::from(exec.as_ref());
-
-        // Finally, replace the old DuckSqlExec with the optimized one
-        let transformed = plan.transform_down(|node| {
-            let node_key = PlanNodeKey::from(node.as_ref());
-
-            if node_key == old_exec_key {
-                let new_exec = duck_exec
-                    .clone()
-                    .with_optimized_sql(new_statement.to_string(), Some(duck_exec.schema()));
-
-                Ok(Transformed::yes(Arc::new(new_exec)))
-            } else {
-                Ok(Transformed::no(node))
-            }
-        });
-
-        transformed.map(|t| t.data)
+        Ok(plan)
     }
 
     fn name(&self) -> &'static str {
@@ -434,6 +398,8 @@ impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::physical_plan::duckdb::PARSER_DIALECT;
+    use datafusion::sql::sqlparser::parser::Parser;
     use datafusion_table_providers::util::column_reference::ColumnReference;
     use datafusion_table_providers::util::indexes::IndexType;
 

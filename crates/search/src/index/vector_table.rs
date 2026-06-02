@@ -390,7 +390,7 @@ mod tests {
             self
         }
 
-        fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
             self.0.properties()
         }
 

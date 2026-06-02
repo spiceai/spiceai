@@ -113,7 +113,7 @@ use datafusion::{
     },
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType, dml::InsertOp},
+    logical_expr::{Expr, TableProviderFilterPushDown, TableType, dml::InsertOp},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -135,14 +135,13 @@ use datafusion::{
 use datafusion_federation::{
     FederatedTableProviderAdaptor, FederatedTableSource,
     sql::{
-        RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
-        ast_analyzer::{AstAnalyzer, AstAnalyzerRule},
+        AstAnalyzer, LogicalOptimizer, RemoteTableRef, SQLExecutor, SQLFederationProvider,
+        SQLTableSource,
     },
 };
 use datafusion_table_providers::sqlite::sqlite_interval::SQLiteIntervalVisitor;
-use datafusion_table_providers::util::supported_functions::{
-    FunctionSupport, contains_unsupported_functions,
-};
+
+use crate::function_support::{FunctionSupport, unfederate_plan_with_unsupported_functions};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use snafu::prelude::*;
 use turso::{Builder, Connection, Database, Value as TursoValue};
@@ -1111,7 +1110,7 @@ impl TursoTableProvider {
     /// Also applies `TursoBetweenVisitor` to rewrite numeric `BETWEEN` expressions
     /// into explicit `CAST(... AS REAL)` comparisons, since Turso does not have the
     /// `decimal_cmp()` extension available in standard SQLite.
-    fn turso_ast_analyzer() -> AstAnalyzerRule {
+    fn turso_ast_analyzer() -> AstAnalyzer {
         Box::new(|mut ast| {
             let mut interval_visitor = SQLiteIntervalVisitor::default();
             let _ = ast.visit(&mut interval_visitor);
@@ -1283,14 +1282,14 @@ impl SQLExecutor for TursoTableProvider {
     }
 
     fn ast_analyzer(&self) -> Option<AstAnalyzer> {
-        Some(AstAnalyzer::new(vec![Self::turso_ast_analyzer()]))
+        Some(Self::turso_ast_analyzer())
     }
 
-    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
-        // Default to not federate if [`Self::function_support`] provided, otherwise true.
-        self.function_support.as_ref().is_none_or(|func_supp| {
-            !contains_unsupported_functions(plan, func_supp).unwrap_or(false)
-        })
+    fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
+        let function_support = self.function_support.clone()?;
+        Some(Box::new(move |plan| {
+            unfederate_plan_with_unsupported_functions(plan, &function_support)
+        }))
     }
 
     fn execute(
@@ -1414,7 +1413,7 @@ pub struct TursoExec {
     pool: Arc<TursoConnectionPool>,
     filters: Vec<Expr>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl TursoExec {
@@ -1434,12 +1433,12 @@ impl TursoExec {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             schema,
@@ -1516,7 +1515,7 @@ impl ExecutionPlan for TursoExec {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

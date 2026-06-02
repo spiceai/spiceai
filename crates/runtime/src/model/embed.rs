@@ -32,6 +32,8 @@ use llms::bedrock::{
 };
 use runtime_secrets::{Secrets, get_params_with_secrets};
 
+use object_store::ObjectStoreExt;
+
 #[cfg(feature = "models")]
 use llms::embeddings::candle::{download_hf_file, tei::TeiEmbed};
 use llms::embeddings::{Embed, Error as EmbedError};

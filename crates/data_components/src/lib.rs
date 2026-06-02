@@ -91,6 +91,7 @@ pub mod elasticsearch;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
+pub mod function_support;
 pub mod iceberg;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 pub mod kafka;
@@ -116,6 +117,8 @@ pub mod s3_vectors;
 pub mod schema_discovery;
 #[cfg(feature = "scylladb")]
 pub mod scylladb;
+#[cfg(any(feature = "snowflake", feature = "spark_connect"))]
+pub(crate) mod source_arrow_compat;
 pub mod sql_expr;
 
 #[cfg(feature = "sharepoint")]
@@ -373,9 +376,9 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field};
     use datafusion::error::DataFusionError;
     use datafusion::logical_expr::TableSource;
+    use datafusion::optimizer::optimizer::Optimizer;
     use datafusion_federation::{
-        FederatedTableProviderAdaptor, FederatedTableSource, FederationAnalyzerForLogicalPlan,
-        FederationProvider,
+        FederatedTableProviderAdaptor, FederatedTableSource, FederationProvider,
     };
 
     #[derive(Debug)]
@@ -390,7 +393,7 @@ mod tests {
             Some("test-context".to_string())
         }
 
-        fn analyzer(&self, _plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
+        fn optimizer(&self) -> Option<Arc<Optimizer>> {
             None
         }
     }

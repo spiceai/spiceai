@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
@@ -47,7 +48,7 @@ pub enum Error {
     UnableToConstructTlsChannel { source: flight_client::tls::Error },
 
     #[snafu(display("Failed to connect to the Flight server. {source}"))]
-    UnableToPerformHandshake { source: arrow::error::ArrowError },
+    UnableToPerformHandshake { source: FlightError },
 
     #[snafu(display(
         "Failed to apply parameter '{parameter}': {source}. Ensure the value is valid and retry. For details, visit: https://spiceai.org/docs/components/data-connectors/flightsql#params"

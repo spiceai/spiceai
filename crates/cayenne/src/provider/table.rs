@@ -74,7 +74,7 @@ use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::{PartitionedFile, TableSchema, compute_all_files_statistics};
 use datafusion_execution::cache::TableScopedPath;
-use datafusion_execution::cache::cache_manager::FileStatisticsCache;
+use datafusion_execution::cache::cache_manager::{CachedFileMetadata, FileStatisticsCache};
 use datafusion_execution::cache::cache_unit::DefaultFileStatisticsCache;
 use datafusion_execution::config::SessionConfig;
 use datafusion_expr::dml::InsertOp;
@@ -91,10 +91,9 @@ use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::{RecordBatchStream, SendableRecordBatchStream};
-use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
-use object_store::{ObjectStore, path::Path as ObjectStorePath};
+use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectStorePath};
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use roaring::RoaringBitmap;
 use std::any::Any;
@@ -1177,6 +1176,18 @@ trait OnConflictExt {
 impl OnConflictExt for OnConflict {
     fn get_upsert_options(&self) -> UpsertOptions {
         UpsertOptions::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct UpsertOptions {
+    remove_duplicates: bool,
+    last_write_wins: bool,
+}
+
+impl UpsertOptions {
+    fn is_default(&self) -> bool {
+        !self.remove_duplicates && !self.last_write_wins
     }
 }
 
@@ -5325,7 +5336,7 @@ impl CayenneTableProvider {
                         continue;
                     }
 
-                    let key_bytes = key.as_ref();
+                    let key_bytes: &[u8] = key.as_ref();
                     if let Some(existing_idx) = seen.get(key_bytes) {
                         if ctx.upsert_options.last_write_wins {
                             keep_mask[*existing_idx] = false;
@@ -8913,10 +8924,6 @@ impl CayenneTableProvider {
         for (name, data_type) in &options.table_partition_cols {
             builder.push(Field::new(name, data_type.clone(), false));
         }
-        for metadata_col in &options.metadata_cols {
-            builder.push(metadata_col.field());
-        }
-
         Arc::new(
             builder
                 .finish()
@@ -9059,7 +9066,6 @@ impl CayenneTableProvider {
                     .with_file_groups(partitioned_file_lists)
                     .with_constraints(Constraints::default())
                     .with_statistics(statistics)
-                    .with_metadata_cols(options.metadata_cols.clone())
                     .with_projection_indices(projection.cloned())?
                     .with_limit(limit)
                     .with_output_ordering(output_ordering)
@@ -9150,11 +9156,12 @@ impl CayenneTableProvider {
         format: &dyn FileFormat,
         part_file: &PartitionedFile,
     ) -> datafusion_common::Result<Arc<Statistics>> {
-        if let Some(statistics) = self
+        if let Some(cached) = self
             .scan_file_statistics
-            .get_with_extra(&part_file.object_meta.location, &part_file.object_meta)
+            .get(&part_file.object_meta.location)
+            && cached.is_valid_for(&part_file.object_meta)
         {
-            return Ok(statistics);
+            return Ok(cached.statistics);
         }
 
         let statistics = Arc::new(
@@ -9167,10 +9174,9 @@ impl CayenneTableProvider {
                 )
                 .await?,
         );
-        self.scan_file_statistics.put_with_extra(
+        self.scan_file_statistics.put(
             &part_file.object_meta.location,
-            Arc::clone(&statistics),
-            &part_file.object_meta,
+            CachedFileMetadata::new(part_file.object_meta.clone(), Arc::clone(&statistics), None),
         );
 
         Ok(statistics)

@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
@@ -59,8 +60,14 @@ pub enum Error {
         source: snowflake_api::SnowflakeApiError,
     },
 
-    #[snafu(display("Error executing query: {source}"))]
-    SnowflakeArrowError { source: arrow::error::ArrowError },
+    #[snafu(display("Error reading Snowflake Arrow response: {source}"))]
+    SnowflakeSourceArrowError { source: snowflake_api::ArrowError },
+
+    #[snafu(display("Failed to serialize Snowflake Arrow response: {source}"))]
+    SnowflakeArrowSerializeError { source: snowflake_api::ArrowError },
+
+    #[snafu(display("Failed to deserialize Snowflake Arrow response: {source}"))]
+    SnowflakeArrowDeserializeError { source: arrow::error::ArrowError },
 
     #[snafu(display("Failed to convert Snowflake timestamp value: {reason}"))]
     UnableToCastSnowflakeTimestamp { reason: String },
@@ -116,7 +123,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
 
         let result = match res {
             snowflake_api::QueryResult::Arrow(batches) => {
-                names_from_arrow_batches(batches, tables_error)
+                names_from_snowflake_arrow_batches(batches, tables_error)
             }
             snowflake_api::QueryResult::Json(resp) => {
                 names_from_json_rows(&resp.value, tables_error)
@@ -141,7 +148,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
 
         let result = match res {
             snowflake_api::QueryResult::Arrow(batches) => {
-                names_from_arrow_batches(batches, schemas_error)
+                names_from_snowflake_arrow_batches(batches, schemas_error)
             }
             snowflake_api::QueryResult::Json(resp) => {
                 names_from_json_rows(&resp.value, schemas_error)
@@ -213,10 +220,9 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
         );
 
         let mut transformed_stream = stream.map(|batch| {
-            batch.and_then(|batch| {
-                snowflake_schema_cast(&batch)
-                    .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
-            })
+            let batch = batch.context(SnowflakeSourceArrowSnafu)?;
+            let batch = snowflake_record_batch_to_arrow(&batch)?;
+            snowflake_schema_cast(&batch)
         });
 
         let Some(first_batch) = transformed_stream.next().await else {
@@ -226,7 +232,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
             )));
         };
 
-        let batch = first_batch.context(SnowflakeArrowSnafu)?;
+        let batch = first_batch?;
 
         let schema = batch.schema();
 
@@ -275,6 +281,51 @@ fn names_from_arrow_batches(
     }
 
     Ok(names)
+}
+
+fn names_from_snowflake_arrow_batches(
+    batches: Vec<snowflake_api::RecordBatch>,
+    make_error: fn(String) -> dbconnection::Error,
+) -> Result<Vec<String>, dbconnection::Error> {
+    let batches = snowflake_batches_to_arrow(batches).map_err(|e| make_error(e.to_string()))?;
+    names_from_arrow_batches(batches, make_error)
+}
+
+fn snowflake_batches_to_arrow(
+    batches: Vec<snowflake_api::RecordBatch>,
+) -> Result<Vec<RecordBatch>, Error> {
+    batches
+        .iter()
+        .map(snowflake_record_batch_to_arrow)
+        .collect()
+}
+
+fn snowflake_record_batch_to_arrow(
+    record_batch: &snowflake_api::RecordBatch,
+) -> Result<RecordBatch, Error> {
+    let mut buffer = Vec::new();
+    let schema = record_batch.schema();
+    {
+        let mut writer =
+            source_arrow_ipc::writer::StreamWriter::try_new(&mut buffer, schema.as_ref())
+                .context(SnowflakeArrowSerializeSnafu)?;
+        writer
+            .write(record_batch)
+            .context(SnowflakeArrowSerializeSnafu)?;
+        writer.finish().context(SnowflakeArrowSerializeSnafu)?;
+    }
+
+    let mut reader = arrow::ipc::reader::StreamReader::try_new(Cursor::new(buffer), None)
+        .context(SnowflakeArrowDeserializeSnafu)?;
+    let Some(batch) = reader.next() else {
+        return Err(Error::FailedToCreateRecordBatch {
+            source: arrow::error::ArrowError::ParseError(
+                "Snowflake Arrow IPC stream did not contain a record batch".to_string(),
+            ),
+        });
+    };
+
+    batch.context(SnowflakeArrowDeserializeSnafu)
 }
 
 fn tables_error(msg: String) -> dbconnection::Error {

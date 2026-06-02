@@ -14,11 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataaccelerator::UpsertOptions;
 #[cfg(feature = "duckdb")]
 use crate::dataaccelerator::partitioned_duckdb::{DuckDBPartitionMode, get_duckdb_partition_mode};
-use datafusion_table_providers::util::{
-    column_reference::ColumnReference, constraints::UpsertOptions,
-};
+use datafusion_table_providers::util::column_reference::ColumnReference;
 use runtime_acceleration::snapshot::SnapshotBehavior;
 use serde::{Deserialize, Serialize};
 use spicepod::acceleration::{SnapshotsCompaction, SnapshotsCreationPolicy, SnapshotsTrigger};

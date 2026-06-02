@@ -27,8 +27,8 @@ use chrono::DateTime;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::{
-    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
+    Attributes, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
 use ssh2::Session;
 
@@ -209,47 +209,6 @@ impl SFTPObjectStore {
         .await
         .map_err(|e| generic_error(STORE_NAME, e))?
     }
-
-    /// Get file metadata without reading content.
-    async fn get_file_metadata(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        let config = Arc::clone(&self.config);
-        let location = location.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let session = config.connect()?;
-            let sftp = session.sftp().map_err(handle_error)?;
-            let location_string = format!("/{location}");
-
-            let stat = sftp
-                .stat(std::path::Path::new(&location_string))
-                .map_err(|e| object_store::Error::NotFound {
-                    path: location_string.clone(),
-                    source: e.into(),
-                })?;
-
-            let size = stat.size.ok_or_else(|| object_store::Error::Generic {
-                store: STORE_NAME,
-                source: "No size found for file".into(),
-            })?;
-
-            #[expect(clippy::cast_possible_wrap)]
-            let last_modified = DateTime::from_timestamp(
-                stat.mtime.ok_or_else(|| object_store::Error::Generic {
-                    store: STORE_NAME,
-                    source: "No modification time found for file".into(),
-                })? as i64,
-                0,
-            )
-            .ok_or_else(|| object_store::Error::Generic {
-                store: STORE_NAME,
-                source: "Failed to construct DateTime".into(),
-            })?;
-
-            Ok(build_object_meta(location, size, last_modified))
-        })
-        .await
-        .map_err(|e| generic_error(STORE_NAME, e))?
-    }
 }
 
 fn handle_error<T: Into<Box<dyn std::error::Error + Sync + Send>>>(
@@ -322,6 +281,10 @@ impl ObjectStore for SFTPObjectStore {
 
             let object_meta = build_object_meta(location.clone(), size, last_modified);
 
+            if options.head {
+                return Ok((object_meta, 0, 0, Vec::new()));
+            }
+
             let (start, end, data_to_read) = resolve_range(options.range.as_ref(), size);
 
             // Seek to start position
@@ -355,20 +318,10 @@ impl ObjectStore for SFTPObjectStore {
         })
     }
 
-    async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        self.get_file_metadata(location).await
-    }
-
-    async fn delete(&self, _location: &Path) -> object_store::Result<()> {
-        Err(object_store::Error::NotSupported {
-            source: "SFTP delete not implemented".into(),
-        })
-    }
-
-    fn delete_stream<'a>(
-        &'a self,
-        _locations: BoxStream<'a, object_store::Result<Path>>,
-    ) -> BoxStream<'a, object_store::Result<Path>> {
+    fn delete_stream(
+        &self,
+        _locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
         futures::stream::once(async {
             Err(object_store::Error::NotSupported {
                 source: "SFTP delete_stream not implemented".into(),
@@ -415,15 +368,14 @@ impl ObjectStore for SFTPObjectStore {
         self.list_directory_shallow(prefix).await
     }
 
-    async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+    async fn copy_opts(
+        &self,
+        _from: &Path,
+        _to: &Path,
+        _options: CopyOptions,
+    ) -> object_store::Result<()> {
         Err(object_store::Error::NotSupported {
-            source: "SFTP copy not implemented".into(),
-        })
-    }
-
-    async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
-        Err(object_store::Error::NotSupported {
-            source: "SFTP copy_if_not_exists not implemented".into(),
+            source: "SFTP copy_opts not implemented".into(),
         })
     }
 }
