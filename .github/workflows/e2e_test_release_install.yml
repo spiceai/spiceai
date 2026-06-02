@@ -65,9 +65,17 @@ jobs:
         if: github.event_name != 'workflow_dispatch' || inputs.install_script_branch != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INSTALL_SCRIPT_BRANCH: ${{ inputs.install_script_branch }}
         run: |
-          BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
-          curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${BRANCH}/install/install.sh" | /bin/bash
+          if [ -n "${INSTALL_SCRIPT_BRANCH}" ]; then
+            curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${INSTALL_SCRIPT_BRANCH}/install/install.sh" | /bin/bash
+          else
+            # For pull_request / push events (triggered by changes to install scripts): execute the checked-out version of the script.
+            # This correctly tests the proposed changes even for PRs from forks (where head_ref would not exist on upstream),
+            # and avoids using untrusted data (github.head_ref / github.ref_name from fork PRs) directly in shell script interpolation.
+            # See: https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
+            bash -c "$(cat ./install/install.sh)"
+          fi
 
       - name: add Spice bin to PATH
         run: |
@@ -271,9 +279,17 @@ jobs:
         shell: wsl-bash {0}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INSTALL_SCRIPT_BRANCH: ${{ inputs.install_script_branch }}
         run: |
-          BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
-          curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${BRANCH}/install/install.sh" | /bin/bash
+          if [ -n "${INSTALL_SCRIPT_BRANCH}" ]; then
+            curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${INSTALL_SCRIPT_BRANCH}/install/install.sh" | /bin/bash
+          else
+            # For pull_request / push events (triggered by changes to install scripts): execute the checked-out version of the script.
+            # This correctly tests the proposed changes even for PRs from forks (where head_ref would not exist on upstream),
+            # and avoids using untrusted data (github.head_ref / github.ref_name from fork PRs) directly in shell script interpolation.
+            # See: https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
+            bash -c "$(cat ./install/install.sh)"
+          fi
 
       - name: check installation
         shell: wsl-bash {0}
