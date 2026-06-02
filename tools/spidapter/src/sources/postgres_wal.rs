@@ -28,17 +28,19 @@ use uuid::Uuid;
 
 use crate::args::StdioArgs;
 
-#[expect(dead_code)]
-pub(crate) const PG_REPLICATION_SLOT_NAME: &str = "spicebench_slot";
-
 pub(crate) fn tpch_schema_name(run_id: &Uuid) -> String {
     format!("tpch_{}", crate::commands::run_id_short(run_id))
 }
 /// Legacy single-publication name kept for teardown cleanup only.
 const PG_PUBLICATION_NAME: &str = "spicebench_pub";
 
-fn pub_name_for_table(table_name: &str) -> String {
-    format!("spicebench_pub_{table_name}")
+fn pub_name_for_table(schema: &str, table_name: &str) -> String {
+    format!("{schema}_pub_{table_name}")
+}
+
+/// Quote a PostgreSQL identifier using double-quote escaping.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// `PostgreSQL` connection details for the WAL CDC write path.
@@ -153,7 +155,7 @@ pub(crate) fn generate_postgres_wal_spicepod(
             ("pg_sslmode".to_string(), "disable".to_string()),
             (
                 "pg_publication".to_string(),
-                pub_name_for_table(dataset_name),
+                pub_name_for_table(&pg.schema, dataset_name),
             ),
         ]);
 
@@ -228,7 +230,7 @@ pub(crate) fn pg_create_table_ddl(
             let nullable = if f.is_nullable() { "" } else { " NOT NULL" };
             Ok(format!(
                 "{} {}{}",
-                f.name(),
+                quote_ident(f.name()),
                 pg_type_for_arrow(f.data_type())?,
                 nullable
             ))
@@ -241,12 +243,14 @@ pub(crate) fn pg_create_table_ddl(
 
     let pk_cols = &dataset.primary_key_columns;
     if !pk_cols.is_empty() {
-        let pk_list = pk_cols.join(", ");
+        let pk_list = pk_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
         cols.push(format!("PRIMARY KEY ({pk_list})"));
     }
 
     Ok(format!(
-        "CREATE TABLE IF NOT EXISTS {schema_name}.{table_name} ({})",
+        "CREATE TABLE IF NOT EXISTS {}.{} ({})",
+        quote_ident(schema_name),
+        quote_ident(table_name),
         cols.join(", ")
     ))
 }
@@ -287,7 +291,7 @@ pub(crate) async fn setup_postgres_for_wal(
     }
 
     // Create schema
-    let create_schema = format!("CREATE SCHEMA IF NOT EXISTS {}", pg.schema);
+    let create_schema = format!("CREATE SCHEMA IF NOT EXISTS {}", quote_ident(&pg.schema));
     client.execute(&create_schema, &[]).await.map_err(|e| {
         anyhow::anyhow!(
             "failed to create schema '{}': {}",
@@ -298,7 +302,7 @@ pub(crate) async fn setup_postgres_for_wal(
 
     // Drop and recreate tables to ensure clean state on each benchmark run.
     for (name, dataset) in datasets {
-        let drop_ddl = format!("DROP TABLE IF EXISTS {}.{}", pg.schema, name);
+        let drop_ddl = format!("DROP TABLE IF EXISTS {}.{}", quote_ident(&pg.schema), quote_ident(name));
         eprintln!("[stdio] pg WAL setup: {drop_ddl}");
         client.execute(&drop_ddl, &[]).await.map_err(|e| {
             anyhow::anyhow!("failed to drop table '{name}': {}", pg_error_message(&e))
@@ -312,9 +316,11 @@ pub(crate) async fn setup_postgres_for_wal(
 
     // Create one publication per table so each dataset's replication slot only
     // receives WAL events from its own table, preventing schema-mismatch errors.
+    // Publication names include the schema (which is per-run) to avoid collisions
+    // when multiple benchmark runs share the same PostgreSQL server.
     for name in datasets.keys() {
-        let pub_name = pub_name_for_table(name);
-        let qualified_table = format!("{}.{}", pg.schema, name);
+        let pub_name = pub_name_for_table(&pg.schema, name);
+        let qualified_table = format!("{}.{}", quote_ident(&pg.schema), quote_ident(name));
         // Drop first for idempotency across benchmark runs.
         client
             .execute(&format!("DROP PUBLICATION IF EXISTS {pub_name}"), &[])
@@ -345,7 +351,7 @@ pub(crate) async fn teardown_postgres(
     let client = pg.connect().await?;
 
     for name in datasets.keys() {
-        let drop_table = format!("DROP TABLE IF EXISTS {}.{}", pg.schema, name);
+        let drop_table = format!("DROP TABLE IF EXISTS {}.{}", quote_ident(&pg.schema), quote_ident(name));
         eprintln!("[stdio] pg teardown: {drop_table}");
         client.execute(&drop_table, &[]).await.map_err(|e| {
             anyhow::anyhow!("failed to drop table '{name}': {}", pg_error_message(&e))
@@ -370,7 +376,7 @@ pub(crate) async fn teardown_postgres(
             drop_replication_slot(&client, &slot).await;
         }
 
-        let pub_name = pub_name_for_table(name);
+        let pub_name = pub_name_for_table(&pg.schema, name);
         let drop_pub = format!("DROP PUBLICATION IF EXISTS {pub_name}");
         eprintln!("[stdio] pg teardown: {drop_pub}");
         client.execute(&drop_pub, &[]).await.map_err(|e| {
@@ -382,7 +388,7 @@ pub(crate) async fn teardown_postgres(
     }
 
     // Drop the schema (and everything remaining in it) created for this run
-    let drop_schema = format!("DROP SCHEMA IF EXISTS {} CASCADE", pg.schema);
+    let drop_schema = format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_ident(&pg.schema));
     eprintln!("[stdio] pg teardown: {drop_schema}");
     client.execute(&drop_schema, &[]).await.map_err(|e| {
         anyhow::anyhow!(

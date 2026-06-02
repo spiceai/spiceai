@@ -39,7 +39,7 @@ pub(crate) struct DynamoDbTeardownInfo {
 /// Pre-create `DynamoDB` tables so that spicebench can ingest via `CreateAppend` mode
 /// without needing to set the `partition_key` statement option.
 ///
-/// Returns a mapping from logical dataset name → physical `DynamoDB` table name.
+/// Returns the table-name prefix used to construct physical names as `{prefix}.{dataset_name}`.
 // Validated, self-contained spec for one DynamoDB table — all data extracted before spawning.
 struct TableSpec {
     dataset_name: String,

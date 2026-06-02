@@ -10,7 +10,6 @@ version.workspace = true
 
 [dependencies]
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
-arrow-ipc.workspace = true
 arrow.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
@@ -18,7 +17,6 @@ aws-config.workspace = true
 aws-sdk-dynamodb.workspace = true
 aws-sdk-ec2.workspace = true
 base64.workspace = true
-mongodb.workspace = true
 clap.workspace = true
 dirs = "6"
 reqwest.workspace = true

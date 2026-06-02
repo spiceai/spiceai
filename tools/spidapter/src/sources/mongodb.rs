@@ -25,14 +25,11 @@ use uuid::Uuid;
 
 use super::mongodb_arrow_type_to_spicepod_str;
 
-/// Database name used for all `MongoDB` benchmark collections.
-const MONGODB_DATABASE: &str = "spicebench";
-
 pub(crate) fn generate_mongodb_spicepod(
     run_id: &Uuid,
     uri: &str,
     datasets: &HashMap<String, DatasetConfig>,
-    _acceleration_engine: &str,
+    acceleration_engine: &str,
 ) -> SpicepodDefinition {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
@@ -80,7 +77,7 @@ pub(crate) fn generate_mongodb_spicepod(
 
         dataset.acceleration = Some(Acceleration {
             enabled: true,
-            engine: Some("cayenne".to_string()),
+            engine: Some(acceleration_engine.to_string()),
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Changes),
             primary_key,

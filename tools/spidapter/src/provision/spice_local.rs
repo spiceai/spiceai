@@ -73,9 +73,8 @@ pub(crate) async fn provision_local_single_node(
     datasets: &HashMap<String, DatasetConfig>,
     args: &StdioArgs,
 ) -> anyhow::Result<RunState> {
-    let num_exec = num_executors()?;
-    eprintln!("[stdio] local backend: provisioning cluster with {num_exec} executor(s)");
-    let ports = allocate_local_ports(LOCAL_BIND_HOST, num_exec)?;
+    eprintln!("[stdio] local backend: provisioning single-node spiced");
+    let ports = allocate_local_ports(LOCAL_BIND_HOST)?;
 
     let working_dir = create_local_working_dir(run_id).await?;
     let local_flight_api_key = matches!(setup_config.storage, FederatedStorageConfig::Cayenne)
@@ -109,7 +108,9 @@ pub(crate) async fn provision_local_single_node(
         &spiced_args,
         "spiced",
         &extra_envs,
-    ) {
+    )
+    .await
+    {
         Ok(child) => child,
         Err(error) => {
             let _ = cleanup_local_artifacts(&working_dir).await;
@@ -246,7 +247,9 @@ pub(crate) async fn provision_local_spiced_cluster(
         &scheduler_args,
         "scheduler",
         &extra_envs,
-    ) {
+    )
+    .await
+    {
         Ok(child) => child,
         Err(error) => {
             let _ = cleanup_local_artifacts(&working_dir).await;
@@ -299,7 +302,9 @@ pub(crate) async fn provision_local_spiced_cluster(
             &exec_args,
             &label,
             &extra_envs,
-        ) {
+        )
+        .await
+        {
             Ok(child) => executor_children.push(child),
             Err(error) => {
                 for c in &mut executor_children {
@@ -429,15 +434,7 @@ fn allocate_cluster_ports(host: &str, num_executors: usize) -> anyhow::Result<Cl
     })
 }
 
-fn allocate_local_ports(host: &str, num_executors: usize) -> anyhow::Result<LocalPorts> {
-    let mut executor_ports = Vec::with_capacity(num_executors);
-    for _ in 0..num_executors {
-        executor_ports.push((
-            reserve_local_port(host)?,
-            reserve_local_port(host)?,
-            reserve_local_port(host)?,
-        ));
-    }
+fn allocate_local_ports(host: &str) -> anyhow::Result<LocalPorts> {
     Ok(LocalPorts {
         http: reserve_local_port(host)?,
         flight: reserve_local_port(host)?,
@@ -544,7 +541,7 @@ fn executor_spiced_args(
     ]
 }
 
-fn spawn_local_spiced(
+async fn spawn_local_spiced(
     spiced_path: &str,
     current_dir: &Path,
     args: &[String],
@@ -561,8 +558,11 @@ fn spawn_local_spiced(
         log_path.display()
     );
 
-    let log_file = std::fs::File::create(&log_path)
-        .map_err(|e| anyhow::anyhow!("Failed to create log file {}: {e}", log_path.display()))?;
+    let log_file = tokio::fs::File::create(&log_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create log file {}: {e}", log_path.display()))?
+        .into_std()
+        .await;
 
     TokioCommand::new(spiced_path)
         .kill_on_drop(true)
@@ -882,16 +882,14 @@ async fn stop_child_process(child: &mut Child, process_name: &str) -> anyhow::Re
 async fn cleanup_local_artifacts(working_dir: &Path) -> anyhow::Result<()> {
     if tokio::fs::metadata(working_dir).await.is_ok() {
         // Preserve log files outside the working dir before deleting it
-        for entry in std::fs::read_dir(working_dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "log") {
-                let dest = std::env::temp_dir().join(entry.file_name());
-                let _ = std::fs::copy(&path, &dest);
-                eprintln!("[stdio] local backend: log preserved at {}", dest.display());
+        if let Ok(mut entries) = tokio::fs::read_dir(working_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "log") {
+                    let dest = std::env::temp_dir().join(entry.file_name());
+                    let _ = tokio::fs::copy(&path, &dest).await;
+                    eprintln!("[stdio] local backend: log preserved at {}", dest.display());
+                }
             }
         }
         tokio::fs::remove_dir_all(working_dir).await?;

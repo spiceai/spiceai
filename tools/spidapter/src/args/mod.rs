@@ -183,7 +183,7 @@ pub struct StdioArgs {
     #[arg(long, env = "SPIDAPTER_QUERY_MEMORY_LIMIT")]
     pub query_memory_limit: Option<String>,
 
-    /// Federated storage: `cayenne` (default), `postgres`, `debezium`, or `dynamodb`.
+    /// Federated storage: `cayenne` (default), `postgres-wal`, `postgres-debezium`, `dynamodb-streams`, or `mongodb-changes-stream`.
     #[arg(long, env = "SPIDAPTER_STORAGE", default_value = "cayenne")]
     pub storage: Storage,
 

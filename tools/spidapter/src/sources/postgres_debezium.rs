@@ -77,11 +77,13 @@ pub(crate) async fn setup_postgres_for_debezium(
 
 /// Register the Debezium `PostgreSQL` connector via the Kafka Connect REST API.
 ///
-/// `debezium_host` — hostname the Debezium container uses to reach `PostgreSQL`.
-/// Defaults to `pg.host` but can be overridden via `PG_DEBEZIUM_HOST` when the
 /// Register one Debezium connector per table so each gets its own replication
 /// slot and WAL stream — allowing all tables to be captured in parallel rather
 /// than being serialized behind the largest table (lineitem).
+///
+/// `debezium_host` — hostname the Debezium container uses to reach `PostgreSQL`.
+/// Defaults to `pg.host` but can be overridden via `PG_DEBEZIUM_HOST` when the
+/// Debezium container and the PostgreSQL instance are on different networks.
 ///
 /// Connectors are named `spicebench-{table}` with slot `spicebench_{table}_slot`.
 /// All connectors are registered concurrently, then we wait for all to reach

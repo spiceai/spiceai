@@ -1313,8 +1313,8 @@ async fn write_local_spicepod(
     working_dir: &Path,
 ) -> anyhow::Result<PathBuf> {
     let spicepod_yaml = serialize_spicepod(spicepod)?;
-    eprintln!("[stdio] Generated local spicepod:\n{spicepod_yaml}");
     let spicepod_path = working_dir.join("spicepod.yaml");
+    eprintln!("[stdio] Writing local spicepod ({} bytes) to {}", spicepod_yaml.len(), spicepod_path.display());
     tokio::fs::write(&spicepod_path, spicepod_yaml).await?;
     Ok(spicepod_path)
 }

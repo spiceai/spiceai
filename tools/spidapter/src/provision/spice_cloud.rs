@@ -108,7 +108,7 @@ pub(crate) async fn provision_scp_app(
 
     let spicepod = generate_initial_spicepod(&run_id, setup_config, datasets, None, args).await?;
     let spicepod_yaml = serialize_spicepod(&spicepod)?;
-    eprintln!("[stdio] Generated spicepod:\n{spicepod_yaml}");
+    eprintln!("[stdio] Generated spicepod ({} bytes)", spicepod_yaml.len());
 
     eprintln!("[stdio] Uploading spicepod to app...");
     commands::apply_spicepod_to_app(&cloud, app_id, &spicepod_yaml).await?;
