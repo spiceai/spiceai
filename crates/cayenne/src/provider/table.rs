@@ -6964,7 +6964,7 @@ impl CayenneTableProvider {
 
         if let Some(trigger) = maintenance_trigger {
             self.log_snapshot_maintenance_trigger(trigger);
-            self.rewrite_current_snapshot_for_compaction().await?;
+            self.rewrite_current_snapshot_for_compaction_tracked().await?;
             return Ok(true);
         }
 
@@ -7000,7 +7000,7 @@ impl CayenneTableProvider {
         // is used for tracing/metrics. The rewrite intentionally consolidates
         // the full current snapshot so compaction preserves a single coherent
         // snapshot boundary instead of mixing old and newly written file sets.
-        self.rewrite_current_snapshot_for_compaction().await?;
+        self.rewrite_current_snapshot_for_compaction_tracked().await?;
 
         tracing::info!(
             target: "cayenne::compaction",
@@ -7191,6 +7191,38 @@ impl CayenneTableProvider {
     /// On success the catalog is atomically pointed at the new snapshot, the
     /// in-memory listing table is swapped, deletion caches are cleared, and
     /// old snapshot dirs are reaped in the background.
+    /// Runs a snapshot-rewrite compaction pass and records its telemetry: pass
+    /// duration with a `completed`/`failed` result dimension (the histogram's
+    /// count doubles as the pass counter) and, on a memory-exhaustion failure,
+    /// the dedicated-pool exhaustion counter. This is the single entry point the
+    /// background and post-write compaction triggers call.
+    async fn rewrite_current_snapshot_for_compaction_tracked(&self) -> Result<()> {
+        let pass_start = Instant::now();
+        let result = self.rewrite_current_snapshot_for_compaction().await;
+
+        let table = self.table_metadata.table_name.to_string();
+        let result_label = if result.is_ok() { "completed" } else { "failed" };
+        telemetry::track_cayenne_compaction_duration(
+            pass_start.elapsed(),
+            &[
+                telemetry::KeyValue::new("table", table.clone()),
+                telemetry::KeyValue::new("result", result_label),
+            ],
+        );
+        if let Err(e) = &result {
+            if matches!(
+                e,
+                Error::DataFusion { source }
+                    if matches!(source, datafusion_common::DataFusionError::ResourcesExhausted(_))
+            ) {
+                telemetry::track_cayenne_compaction_memory_exhausted(&[telemetry::KeyValue::new(
+                    "table", table,
+                )]);
+            }
+        }
+        result
+    }
+
     async fn rewrite_current_snapshot_for_compaction(&self) -> Result<()> {
         let compaction_start = std::time::Instant::now();
         // Use the dedicated compaction memory environment (carved budget) when

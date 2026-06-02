@@ -446,6 +446,60 @@ pub fn track_cayenne_write_phase_duration(duration: Duration, dimensions: &[KeyV
         .record(duration.as_secs_f64() * 1000.0, dimensions);
 }
 
+static CAYENNE_COMPACTION_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
+
+/// Records the wall-clock duration of a Cayenne background compaction pass.
+/// `dimensions` should carry `table` and `result` (`"completed"` | `"failed"`).
+/// The histogram's count doubles as the compaction-pass counter.
+pub fn track_cayenne_compaction_duration(duration: Duration, dimensions: &[KeyValue]) {
+    CAYENNE_COMPACTION_DURATION_MS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_histogram("cayenne_compaction_duration_ms")
+                .with_description("Wall-clock time of Cayenne background compaction passes.")
+                .with_unit("ms")
+                .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+                .build()
+        })
+        .record(duration.as_secs_f64() * 1000.0, dimensions);
+}
+
+static CAYENNE_COMPACTION_MEMORY_POOL_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+/// Records the size in bytes of the dedicated compaction memory pool carved from
+/// the query memory limit. Emitted once at startup, when the carve happens.
+pub fn track_cayenne_compaction_memory_pool_bytes(bytes: u64, dimensions: &[KeyValue]) {
+    CAYENNE_COMPACTION_MEMORY_POOL_BYTES
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_compaction_memory_pool_bytes")
+                .with_description(
+                    "Size of the dedicated compaction memory pool carved from the query memory limit.",
+                )
+                .with_unit("By")
+                .build()
+        })
+        .record(bytes, dimensions);
+}
+
+static CAYENNE_COMPACTION_MEMORY_EXHAUSTED: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts compaction passes that failed because the dedicated compaction memory
+/// pool could not satisfy a reservation (`ResourcesExhausted`). A non-zero rate
+/// means the carve fraction is too small for the rewrite working set.
+pub fn track_cayenne_compaction_memory_exhausted(dimensions: &[KeyValue]) {
+    CAYENNE_COMPACTION_MEMORY_EXHAUSTED
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_counter("cayenne_compaction_memory_exhausted_total")
+                .with_description(
+                    "Compaction passes that hit ResourcesExhausted on the dedicated compaction memory pool.",
+                )
+                .build()
+        })
+        .add(1, dimensions);
+}
+
 static SNAPSHOT_BOOTSTRAP_DURATION_MS: OnceLock<Counter<f64>> = OnceLock::new();
 static SNAPSHOT_BOOTSTRAP_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
 

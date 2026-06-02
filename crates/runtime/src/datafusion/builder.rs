@@ -879,6 +879,7 @@ impl DataFusionBuilder {
             refresh_runtime: OnceLock::new(),
             compaction_runtime: OnceLock::new(),
             compaction_runtime_env,
+            compaction_memory_bytes,
             io_runtime: self.io_runtime,
             metrics: self.metrics,
             resource_monitor: self.resource_monitor,
@@ -1341,8 +1342,9 @@ mod tests {
     use datafusion_expr::{Expr, LogicalPlan};
 
     use super::{
-        CayenneOptimizerRules, DataFusionBuilder, configure_hash_join_memory_limits,
-        exact_join_filter_memory_limit, runtime_env_with_effective_memory_limit,
+        CayenneOptimizerRules, DataFusionBuilder, build_compaction_runtime_env,
+        configure_hash_join_memory_limits, exact_join_filter_memory_limit,
+        runtime_env_with_effective_memory_limit,
     };
     use crate::dataaccelerator::AcceleratorEngineRegistry;
     use crate::status;
@@ -1409,6 +1411,34 @@ mod tests {
         assert_eq!(
             runtime_env.cache_manager.get_metadata_cache_limit(),
             8 * 1024 * 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_runtime_env_separate_pool_shared_object_store() {
+        let query_env = runtime_env_with_effective_memory_limit(
+            1024 * 1024 * 1024,
+            None,
+            tokio::runtime::Handle::current(),
+            None,
+        );
+        let compaction_env =
+            build_compaction_runtime_env(256 * 1024 * 1024, &query_env, None);
+
+        // The carved compaction pool is a DISTINCT pool, so compaction memory is
+        // accounted and bounded separately and cannot starve queries.
+        assert!(
+            !std::sync::Arc::ptr_eq(&query_env.memory_pool, &compaction_env.memory_pool),
+            "compaction env must have its own memory pool"
+        );
+        // ...but it SHARES the query env's object-store registry, so compaction
+        // reads and writes the same stores Cayenne registered there.
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &query_env.object_store_registry,
+                &compaction_env.object_store_registry
+            ),
+            "compaction env must share the query object-store registry"
         );
     }
 

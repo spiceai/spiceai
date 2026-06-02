@@ -84,7 +84,19 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    match COMPACTION_RUNTIME.get() {
+    spawn_on(COMPACTION_RUNTIME.get(), future)
+}
+
+/// Spawn `future` on `handle` if provided, otherwise on the ambient runtime via
+/// [`tokio::spawn`]. Extracted from [`spawn_compaction`] so the routing decision
+/// is unit-testable with a local handle, without setting the process-global
+/// [`COMPACTION_RUNTIME`] (which would pollute sibling tests in the binary).
+fn spawn_on<F>(handle: Option<&Handle>, future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match handle {
         Some(handle) => handle.spawn(future),
         None => tokio::spawn(future),
     }
@@ -427,6 +439,44 @@ mod tests {
     /// Helper: target file size of 256 MiB, matching the default.
     fn default_cfg() -> CompactionPickerConfig {
         CompactionPickerConfig::new(8, 32, 256 * 1024 * 1024)
+    }
+
+    /// `spawn_on(Some(handle))` runs the task on the provided runtime's worker
+    /// thread — the dedicated-compaction-runtime path. Asserted via the worker
+    /// thread name rather than touching the process-global `COMPACTION_RUNTIME`.
+    #[test]
+    fn spawn_on_uses_provided_handle() {
+        let dedicated = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("test-compaction-rt")
+            .enable_all()
+            .build()
+            .expect("build dedicated runtime");
+        let handle = dedicated.handle().clone();
+
+        let thread_name = dedicated.block_on(async move {
+            spawn_on(Some(&handle), async {
+                std::thread::current().name().map(String::from)
+            })
+            .await
+            .expect("spawned task completes")
+        });
+
+        assert_eq!(
+            thread_name.as_deref(),
+            Some("test-compaction-rt"),
+            "task should run on the provided runtime's worker thread"
+        );
+    }
+
+    /// `spawn_on(None)` falls back to the ambient runtime via `tokio::spawn`,
+    /// preserving prior behavior when no dedicated compaction runtime is set.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_on_falls_back_to_ambient_runtime() {
+        let value = spawn_on(None, async { 7_u8 })
+            .await
+            .expect("spawned task completes");
+        assert_eq!(value, 7, "fallback path should run and return the value");
     }
 
     #[test]

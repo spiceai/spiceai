@@ -725,6 +725,9 @@ pub struct DataFusion {
     // Cayenne acceleration is configured and dedicated thread pools are enabled; compaction
     // executes against it so its memory is accounted separately and cannot starve queries.
     compaction_runtime_env: Option<Arc<RuntimeEnv>>,
+    // Size in bytes of the carved compaction memory pool, retained for the
+    // startup confirmation log + the `cayenne_compaction_memory_pool_bytes` gauge.
+    compaction_memory_bytes: Option<u64>,
     pub(crate) io_runtime: Handle,
     metrics: Option<Metrics>,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
@@ -1369,6 +1372,13 @@ impl DataFusion {
         cayenne::set_compaction_runtime_handle(tokio_handle);
         if let Some(env) = &self.compaction_runtime_env {
             cayenne::set_compaction_runtime_env(Arc::clone(env));
+        }
+        if let Some(bytes) = self.compaction_memory_bytes {
+            telemetry::track_cayenne_compaction_memory_pool_bytes(bytes, &[]);
+            tracing::info!(
+                compaction_memory_bytes = bytes,
+                "Dedicated Cayenne compaction runtime active (carved memory pool + low-priority worker threads)"
+            );
         }
     }
 
