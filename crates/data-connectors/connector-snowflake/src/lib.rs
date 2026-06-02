@@ -78,16 +78,57 @@ impl SnowflakeFactory {
     }
 }
 
+const SNOWFLAKE_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/snowflake";
+const SNOWFLAKE_ACCOUNT_IDENTIFIER_DOCS: &str =
+    "https://docs.snowflake.com/en/user-guide/admin-account-identifier";
+
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("username").secret(),
-    ParameterSpec::component("password").secret(),
-    ParameterSpec::component("private_key_path").secret(),
-    ParameterSpec::component("private_key").secret(),
-    ParameterSpec::component("private_key_passphrase").secret(),
-    ParameterSpec::component("account").secret(),
-    ParameterSpec::component("warehouse").secret(),
-    ParameterSpec::component("role").secret(),
-    ParameterSpec::component("auth_type"),
+    ParameterSpec::component("username")
+        .secret()
+        .description("Snowflake username for password or key-pair authentication.")
+        .examples(&["MACHINE_USER"])
+        .help_link(SNOWFLAKE_DOCS),
+    ParameterSpec::component("password")
+        .secret()
+        .description("Snowflake password. Use only with password authentication.")
+        .help_link(SNOWFLAKE_DOCS),
+    ParameterSpec::component("private_key_path")
+        .secret()
+        .description("Path to a PEM private key file for key-pair authentication. Use either `snowflake_private_key_path` or `snowflake_private_key`, not both.")
+        .examples(&["/secrets/snowflake/rsa_key.p8"])
+        .help_link(SNOWFLAKE_DOCS),
+    ParameterSpec::component("private_key")
+        .secret()
+        .description("PEM private key content for key-pair authentication. Use either `snowflake_private_key` or `snowflake_private_key_path`, not both.")
+        .help_link(SNOWFLAKE_DOCS),
+    ParameterSpec::component("private_key_passphrase")
+        .secret()
+        .description("Passphrase for an encrypted private key used with key-pair authentication.")
+        .help_link(SNOWFLAKE_DOCS),
+    ParameterSpec::component("account")
+        .secret()
+        .description("Snowflake account identifier. Supports preferred account names, org-qualified names, full snowflakecomputing.com URLs, and legacy account locators.")
+        .examples(&[
+            "myorg-myaccount",
+            "myorg.myaccount",
+            "https://myorg-myaccount.snowflakecomputing.com",
+            "xy12345.us-east-2.aws",
+        ])
+        .help_link(SNOWFLAKE_ACCOUNT_IDENTIFIER_DOCS),
+    ParameterSpec::component("warehouse")
+        .secret()
+        .description("Snowflake warehouse to use for queries.")
+        .examples(&["COMPUTE_WH"])
+        .help_link(SNOWFLAKE_DOCS),
+    ParameterSpec::component("role")
+        .secret()
+        .description("Snowflake role to use for the session.")
+        .examples(&["ANALYST"])
+        .help_link(SNOWFLAKE_DOCS),
+    ParameterSpec::component("auth_type")
+        .description("Snowflake authentication type. Use `password` or `snowflake` for password authentication, and `keypair` or `snowflake_jwt` for key-pair authentication. Defaults to password unless only key-pair credentials are provided.")
+        .one_of_ignore_ascii_case(&["password", "snowflake", "keypair", "snowflake_jwt"])
+        .help_link(SNOWFLAKE_DOCS),
 ];
 
 // https://github.com/apache/datafusion-sqlparser-rs/blob/87d190734c7b978e8252b110c9529d7a93a30cf0/src/keywords.rs#L1061
@@ -313,6 +354,25 @@ mod tests {
         assert!(
             private_key.secret,
             "private_key holds PEM key material and must be marked secret"
+        );
+    }
+
+    #[test]
+    fn auth_type_declares_supported_values_for_early_validation() {
+        let factory = SnowflakeFactory::new();
+        let auth_type = factory
+            .parameters()
+            .iter()
+            .find(|p| p.name == "auth_type")
+            .expect("auth_type parameter must be declared");
+
+        assert!(
+            auth_type.one_of_ignore_ascii_case,
+            "auth_type validation must accept documented aliases case-insensitively"
+        );
+        assert_eq!(
+            auth_type.one_of,
+            Some(&["password", "snowflake", "keypair", "snowflake_jwt"][..])
         );
     }
 
