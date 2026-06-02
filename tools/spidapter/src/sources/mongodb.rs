@@ -14,9 +14,7 @@
 
 use std::collections::HashMap;
 
-use spicepod::acceleration::{
-    Acceleration, Mode, OnConflictBehavior, RefreshMode,
-};
+use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode};
 use spicepod::component::ComponentOrReference;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{Runtime, TelemetryConfig};
