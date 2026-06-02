@@ -503,22 +503,23 @@ pub async fn suggest_connector(name: &str) -> Option<String> {
 /// Pure helper used by [`suggest_connector`]. Kept separate from the registry
 /// lookup so its scoring + threshold can be unit-tested without spinning up
 /// the async registry.
-pub(crate) fn closest_name(typo: &str, candidates: &[String]) -> Option<String> {
+pub(crate) fn closest_name<S: AsRef<str>>(typo: &str, candidates: &[S]) -> Option<String> {
     let input = typo.to_ascii_lowercase();
-    let mut best: Option<(String, usize)> = None;
-    for candidate in candidates {
-        let d = util::levenshtein::distance(&input, &candidate.to_ascii_lowercase());
+    let mut best: Option<(usize, usize)> = None;
+    for (i, candidate) in candidates.iter().enumerate() {
+        let d = util::levenshtein::distance(&input, &candidate.as_ref().to_ascii_lowercase());
         if best.as_ref().is_none_or(|(_, b)| d < *b) {
-            best = Some((candidate.clone(), d));
+            best = Some((i, d));
         }
     }
-    let (candidate, distance) = best?;
+    let (i, distance) = best?;
+    let candidate = candidates[i].as_ref();
     // Bound: allow at most one edit per 3 chars of the longer string. Prevents a
     // wildly different name ("kafka" vs. "postgres") from being suggested while
     // still catching connector-name typos like "postgress" → "postgres" (d=1).
     let max_allowed = (candidate.len().max(typo.len()) / 3).max(1);
     if distance <= max_allowed {
-        Some(candidate)
+        Some(candidate.to_string())
     } else {
         None
     }
@@ -903,6 +904,17 @@ mod tests {
     fn closest_name_empty_candidates_returns_none() {
         let candidates: Vec<String> = Vec::new();
         assert_eq!(closest_name("postgres", &candidates), None);
+    }
+
+    #[test]
+    fn closest_name_accepts_static_str_slice() {
+        // Verifies the AsRef<str>-generic signature so callers can pass
+        // either &[String] or &[&'static str] allowlists.
+        const CANDIDATES: &[&str] = &["postgres", "mysql", "kafka"];
+        assert_eq!(
+            closest_name("postgress", CANDIDATES),
+            Some("postgres".to_string())
+        );
     }
 
     #[test]

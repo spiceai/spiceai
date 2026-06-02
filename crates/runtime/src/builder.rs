@@ -60,6 +60,8 @@ const CAYENNE_FOOTER_CACHE_MB_PARAM: &str = "cayenne_footer_cache_mb";
 const CAYENNE_SORT_MERGE_MIN_ROWS_PARAM: &str = "cayenne_sort_merge_min_rows";
 const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
     "cayenne_sort_merge_memory_pool_fraction";
+const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
+const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
 
 /// All `runtime.params` keys with a `cayenne_` prefix that the runtime
 /// recognizes. Used to surface typos: any `cayenne_*` key not in this list
@@ -259,7 +261,12 @@ impl RuntimeBuilder {
         // URL tables are opt-in via `runtime.params.url_tables=enabled`
         let url_tables_enabled =
             spicepod_rt.params.get("url_tables").map(String::as_str) == Some("enabled");
-        warn_on_unknown_cayenne_runtime_params(&spicepod_rt.params);
+        warn_on_unknown_runtime_params(
+            &spicepod_rt.params,
+            "cayenne_",
+            KNOWN_CAYENNE_RUNTIME_PARAMS,
+            "Cayenne",
+        );
         let cayenne_sort_merge_min_rows =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_SORT_MERGE_MIN_ROWS_PARAM);
         log_applied_cayenne_param(
@@ -279,19 +286,19 @@ impl RuntimeBuilder {
         log_applied_cayenne_param(CAYENNE_FOOTER_CACHE_MB_PARAM, cayenne_footer_cache_mb);
         let cayenne_filter_propagation_enabled =
             parse_cayenne_filter_propagation(&spicepod_rt.params).is_enabled();
-        if spicepod_rt
-            .params
-            .contains_key(CAYENNE_FILTER_PROPAGATION_PARAM)
-        {
-            log_applied_cayenne_param(
-                CAYENNE_FILTER_PROPAGATION_PARAM,
-                Some(if cayenne_filter_propagation_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
+        log_applied_cayenne_param(
+            CAYENNE_FILTER_PROPAGATION_PARAM,
+            spicepod_rt
+                .params
+                .get(CAYENNE_FILTER_PROPAGATION_PARAM)
+                .map(|_| {
+                    if cayenne_filter_propagation_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
                 }),
-            );
-        }
+        );
         let cayenne_optimizer_rules =
             parse_cayenne_optimizer_rules(&spicepod_rt.params, cayenne_filter_propagation_enabled);
 
@@ -724,58 +731,34 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
 /// values). See spiceai/spiceai#10970.
 fn log_applied_cayenne_param<V: std::fmt::Display>(key: &str, value: Option<V>) {
     if let Some(value) = value {
-        in_tracing_context(|| {
-            tracing::info!("Cayenne runtime tunable applied: runtime.params.{key}={value}");
-        });
+        tracing::info!("Cayenne runtime tunable applied: runtime.params.{key}={value}");
     }
 }
 
-/// Warn (with a "did you mean" suggestion when close) on any
-/// `cayenne_*`-prefixed key in `runtime.params` that the runtime does not
-/// recognize, so typos like `cayenne_footer_cach_mb` don't silently leave
-/// the runtime on defaults. See spiceai/spiceai#10970.
-fn warn_on_unknown_cayenne_runtime_params(params: &HashMap<String, String>) {
+/// Warn (with a "did you mean" suggestion when close) on any key in
+/// `runtime.params` that begins with `prefix` but is not in `known`, so typos
+/// like `cayenne_footer_cach_mb` don't silently leave the runtime on
+/// defaults. `family_label` names the family for the warning text (e.g.
+/// "Cayenne"). See spiceai/spiceai#10970.
+fn warn_on_unknown_runtime_params(
+    params: &HashMap<String, String>,
+    prefix: &str,
+    known: &[&str],
+    family_label: &str,
+) {
     for key in params.keys() {
-        if !key.starts_with("cayenne_") {
+        if !key.starts_with(prefix) || known.contains(&key.as_str()) {
             continue;
         }
-        if KNOWN_CAYENNE_RUNTIME_PARAMS.contains(&key.as_str()) {
-            continue;
+        if let Some(suggestion) = crate::dataconnector::closest_name(key, known) {
+            tracing::warn!(
+                "runtime.params.{key} is not a recognized {family_label} tunable; did you mean '{suggestion}'? Ignoring."
+            );
+        } else {
+            tracing::warn!(
+                "runtime.params.{key} is not a recognized {family_label} tunable; ignoring."
+            );
         }
-        let suggestion = closest_known_cayenne_param(key);
-        in_tracing_context(|| {
-            if let Some(suggestion) = suggestion.as_deref() {
-                tracing::warn!(
-                    "runtime.params.{key} is not a recognized Cayenne tunable; did you mean '{suggestion}'? Ignoring."
-                );
-            } else {
-                tracing::warn!(
-                    "runtime.params.{key} is not a recognized Cayenne tunable; ignoring."
-                );
-            }
-        });
-    }
-}
-
-/// Closest recognized cayenne runtime param to `typo`, bounded so unrelated
-/// names don't get spurious "did you mean" suggestions. Mirrors the bound
-/// used by `dataconnector::closest_name` (≤ one edit per 3 chars of the
-/// longer string, minimum 1).
-fn closest_known_cayenne_param(typo: &str) -> Option<String> {
-    let input = typo.to_ascii_lowercase();
-    let mut best: Option<(&'static str, usize)> = None;
-    for candidate in KNOWN_CAYENNE_RUNTIME_PARAMS {
-        let d = util::levenshtein::distance(&input, &candidate.to_ascii_lowercase());
-        if best.as_ref().is_none_or(|(_, b)| d < *b) {
-            best = Some((candidate, d));
-        }
-    }
-    let (candidate, distance) = best?;
-    let max_allowed = (candidate.len().max(typo.len()) / 3).max(1);
-    if distance <= max_allowed {
-        Some(candidate.to_string())
-    } else {
-        None
     }
 }
 
@@ -814,9 +797,6 @@ fn parse_f64_runtime_param(params: &HashMap<String, String>, key: &str) -> Optio
         }
     }
 }
-
-const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
-const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CayenneFilterPropagation {
@@ -1017,64 +997,25 @@ mod test {
     }
 
     #[test]
-    fn closest_known_cayenne_param_suggests_for_short_typos() {
+    fn known_cayenne_runtime_params_suggests_typo_corrections() {
+        // Pins the cayenne allowlist as the input to the shared closest-name
+        // helper so typos like `cayenne_footer_cach_mb` resolve to the
+        // intended `cayenne_footer_cache_mb`.
         assert_eq!(
-            closest_known_cayenne_param("cayenne_footer_cach_mb").as_deref(),
+            crate::dataconnector::closest_name(
+                "cayenne_footer_cach_mb",
+                KNOWN_CAYENNE_RUNTIME_PARAMS,
+            )
+            .as_deref(),
             Some("cayenne_footer_cache_mb"),
         );
         assert_eq!(
-            closest_known_cayenne_param("cayenne_sort_merge_min_row").as_deref(),
-            Some("cayenne_sort_merge_min_rows"),
-        );
-        assert_eq!(
-            closest_known_cayenne_param("CAYENNE_FOOTER_CACHE_MB").as_deref(),
-            Some("cayenne_footer_cache_mb"),
-        );
-    }
-
-    #[test]
-    fn closest_known_cayenne_param_returns_none_for_unrelated_names() {
-        // Far enough off that we'd rather not nudge the operator toward a
-        // wrong tunable.
-        assert!(closest_known_cayenne_param("cayenne_completely_made_up").is_none());
-    }
-
-    #[test]
-    fn warn_on_unknown_cayenne_runtime_params_ignores_known_and_non_cayenne_keys() {
-        // Sanity check: this should not panic, and only logs (which we
-        // don't capture here). The behaviour we care about — unknown keys
-        // becoming a warning vs. known keys staying silent — is covered
-        // by `closest_known_cayenne_param_*` and the explicit allowlist.
-        let params = HashMap::from([
-            (CAYENNE_FOOTER_CACHE_MB_PARAM.to_string(), "16".to_string()),
-            (
-                CAYENNE_OPTIMIZER_RULES_PARAM.to_string(),
-                "auto".to_string(),
+            crate::dataconnector::closest_name(
+                "cayenne_completely_made_up",
+                KNOWN_CAYENNE_RUNTIME_PARAMS,
             ),
-            ("url_tables".to_string(), "enabled".to_string()),
-            ("some_unrelated_key".to_string(), "value".to_string()),
-        ]);
-        warn_on_unknown_cayenne_runtime_params(&params);
-    }
-
-    #[test]
-    fn known_cayenne_runtime_params_covers_every_parsed_key() {
-        // Guardrail so that adding a new `cayenne_*` runtime tunable also
-        // requires extending the typo-detection allowlist. Each entry here
-        // is one of the cayenne_* keys parsed in `build()`.
-        let parsed_keys = [
-            CAYENNE_FOOTER_CACHE_MB_PARAM,
-            CAYENNE_SORT_MERGE_MIN_ROWS_PARAM,
-            CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,
-            CAYENNE_FILTER_PROPAGATION_PARAM,
-            CAYENNE_OPTIMIZER_RULES_PARAM,
-        ];
-        for key in parsed_keys {
-            assert!(
-                KNOWN_CAYENNE_RUNTIME_PARAMS.contains(&key),
-                "KNOWN_CAYENNE_RUNTIME_PARAMS missing entry for {key}"
-            );
-        }
+            None,
+        );
     }
 
     #[test]
