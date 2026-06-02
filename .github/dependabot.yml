@@ -22,7 +22,8 @@ updates:
 
   - package-ecosystem: 'github-actions' # See documentation for possible values
     # Note: directory: '/' covers .github/workflows/ (and root action.yml per docs), but composite
-    # actions in .github/actions/*/action.yml require explicit directories entries.
+    # actions in .github/actions/*/action.yml are not auto-scanned; use explicit directories (or
+    # globs like '/.github/actions/*' if supported by the Dependabot version) to cover them.
     # See https://github.com/dependabot/dependabot-core/issues/6704
     directories:
       - '/'
