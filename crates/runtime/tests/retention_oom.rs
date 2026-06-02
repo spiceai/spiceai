@@ -45,6 +45,7 @@ const INNER_PAYLOAD_BYTES_ENV: &str = "SPICE_OOM_REPRO_PAYLOAD_BYTES";
 const DEFAULT_ROWS: usize = 1_500_000;
 const DEFAULT_PAYLOAD_BYTES: usize = 256;
 const CONTAINER_MEMORY_LIMIT_MB: usize = 768;
+const TEST_CAYENNE_WRITE_CONCURRENCY: &str = "4";
 
 const TEST_NAME: &str = "test_cayenne_pk_delete_oom_repro";
 
@@ -186,6 +187,11 @@ async fn run_inner_workload() -> Result<(), anyhow::Error> {
     params.insert(
         "cayenne_metadata_dir".to_string(),
         metadata_dir.display().to_string(),
+    );
+    // Keep snapshot write fan-out bounded so this regression test stays deterministic across hosts with different CPU counts
+    params.insert(
+        "cayenne_write_concurrency".to_string(),
+        TEST_CAYENNE_WRITE_CONCURRENCY.to_string(),
     );
 
     let mut dataset = Dataset::new(format!("file://{}", csv_path.display()), "oom_events");
