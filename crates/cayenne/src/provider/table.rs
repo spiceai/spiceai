@@ -4240,6 +4240,23 @@ impl CayenneTableProvider {
         self.table_memory.set_keyset_bytes(0);
     }
 
+    /// Rewrite every cached keyset entry from `RowLocation::Inlined` to
+    /// `RowLocation::FileUnlocated`. Called after an inline checkpoint has
+    /// flushed the memtable to files.
+    ///
+    /// Only the `Exact` keyset carries per-key `RowLocation`s; the `Bloom` index
+    /// emits key-based deletes to both lists, so no change is needed.
+    fn flip_inlined_keyset_entries_to_file_unlocated(&self) {
+        let mut guard = self.pk_keyset_cache.lock();
+        if let Some(CachedPkIndex::Exact(keyset)) = guard.as_mut() {
+            for location in keyset.keys.values_mut() {
+                if matches!(location, RowLocation::Inlined) {
+                    *location = RowLocation::FileUnlocated;
+                }
+            }
+        }
+    }
+
     fn record_pk_keys_with_location(&self, keys: &HashSet<OwnedRow>, location: &RowLocation) {
         if keys.is_empty() {
             return;
@@ -8143,6 +8160,9 @@ impl CayenneTableProvider {
 
             self.clear_inlined_metadata_after_checkpoint().await?;
             self.refresh_listing_table_under_held_fence()?;
+            // The flush moved every inline row to a file, but the keyset still tags
+            // those rows `Inlined`. Without this flip a later upsert will lead to duplicate record.
+            self.flip_inlined_keyset_entries_to_file_unlocated();
             stats
         };
 
