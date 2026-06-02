@@ -116,7 +116,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "mTLS client identity is ambiguous: file-based params ('tls_client_certificate_file', 'tls_client_key_file') cannot be mixed with inline params ('tls_client_certificate', 'tls_client_key'). Use either the file-based pair or the inline pair, not both."
+        "mTLS client identity is ambiguous: file-based params ('spiceai_tls_client_certificate_file', 'spiceai_tls_client_key_file') cannot be mixed with inline params ('spiceai_tls_client_certificate', 'spiceai_tls_client_key'). Use either the file-based pair or the inline pair, not both."
     ))]
     AmbiguousClientIdentity,
 }
@@ -124,8 +124,8 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Resolves the client identity from the four possible params:
-/// `tls_client_certificate_file` / `tls_client_key_file` (file-based) and
-/// `tls_client_certificate` / `tls_client_key` (inline PEM).
+/// `spiceai_tls_client_certificate_file` / `spiceai_tls_client_key_file` (file-based) and
+/// `spiceai_tls_client_certificate` / `spiceai_tls_client_key` (inline PEM).
 ///
 /// Returns `Ok(None)` when no client identity is configured, `Ok(Some(...))`
 /// when a complete identity is found, or `Err` when the params are
@@ -147,8 +147,8 @@ fn resolve_client_identity_params(
             set_field,
             missing_field,
         } => Error::IncompleteClientIdentity {
-            set_field: set_field.to_string(),
-            missing_field: missing_field.to_string(),
+            set_field: format!("spiceai_{}", set_field),
+            missing_field: format!("spiceai_{}", missing_field),
         },
         ClientIdentityConfigError::Ambiguous => Error::AmbiguousClientIdentity,
     })

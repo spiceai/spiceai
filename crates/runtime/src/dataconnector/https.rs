@@ -1132,7 +1132,7 @@ impl Https {
             .set_rate_controller(rate_controller.shared().controller.as_ref());
         provider = provider
             .with_rate_limiter(Some(rate_limiter))
-            .with_rate_controller(rate_controller.shared().controller.clone());
+            .with_rate_controller(rate_controller.shared().controller.as_ref().map(Arc::clone));
 
         let provider = Arc::new(provider);
         if let Some(metric_source) = &self.rate_control_metric_source {
