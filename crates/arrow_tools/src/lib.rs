@@ -18,3 +18,4 @@ pub mod decimal;
 pub mod format;
 pub mod record_batch;
 pub mod schema;
+pub mod type_rewrite;

@@ -17,7 +17,6 @@ limitations under the License.
 // Benchmark code has different lint requirements than production code
 #![allow(
     clippy::expect_used,
-    clippy::unwrap_used,
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,

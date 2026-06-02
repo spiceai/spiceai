@@ -1266,6 +1266,8 @@ impl Runtime {
                             Vec::new()
                         };
                     let table_name = resolved_name.to_string();
+                    // Statistics flow via the periodic ExecutorStatistics reporter,
+                    // not this readiness ack.
                     let sent = b
                         .broadcast_partitions_loaded(table_name.clone(), bytes)
                         .await;
@@ -1522,12 +1524,12 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
         Ok(caching_sys) => {
             if let Err(e) = caching_sys.update_fetched_at() {
                 tracing::warn!(
-                    "Failed to update fetched_at for cached dataset {}: {e}",
+                    "Failed to update _fetched_at for cached dataset {}: {e}",
                     dataset.name
                 );
             } else {
                 tracing::info!(
-                    "Updated fetched_at for all records in cached dataset {}",
+                    "Updated _fetched_at for all records in cached dataset {}",
                     dataset.name
                 );
             }

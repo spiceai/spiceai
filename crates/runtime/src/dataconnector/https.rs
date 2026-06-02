@@ -1136,7 +1136,8 @@ fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<Http
         });
     }
 
-    let column_order: Vec<String> = dataset.columns.iter().map(|col| col.name.clone()).collect();
+    let mut column_order: Vec<String> =
+        dataset.columns.iter().map(|col| col.name.clone()).collect();
 
     // Reject the catch-all column itself being named after a reserved
     // HTTP metadata field — it would be ambiguous whether the column
@@ -1152,11 +1153,18 @@ fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<Http
         });
     }
 
-    let metadata_fields: std::collections::HashSet<String> = column_order
+    let mut metadata_fields: std::collections::HashSet<String> = column_order
         .iter()
         .filter(|name| HTTP_METADATA_FIELDS.contains(&name.as_str()))
         .cloned()
         .collect();
+
+    // Ensure `fetched_at` is always present so caching TTL eviction and
+    // append-mode `time_column` work even when the user omits the column.
+    if !column_order.iter().any(|n| n == "_fetched_at") {
+        column_order.push("_fetched_at".to_string());
+        metadata_fields.insert("_fetched_at".to_string());
+    }
 
     Ok(Some(HttpJsonNesting::new(
         column_order,
@@ -1179,7 +1187,7 @@ const HTTP_METADATA_FIELDS: &[&str] = &[
     "content",
     "response_status",
     "response_headers",
-    "fetched_at",
+    "_fetched_at",
 ];
 
 #[async_trait]
@@ -2271,10 +2279,17 @@ mod tests {
             .expect("parse should succeed")
             .expect("expected Some(nesting) when marker is present");
         assert_eq!(nesting.json_field_name, "data");
-        assert_eq!(nesting.column_order, vec!["id", "name", "data"]);
+        assert_eq!(
+            nesting.column_order,
+            vec!["id", "name", "data", "_fetched_at"]
+        );
         assert!(nesting.static_fields.contains("id"));
         assert!(nesting.static_fields.contains("name"));
         assert!(!nesting.static_fields.contains("data"));
+        assert!(
+            nesting.metadata_fields.contains("_fetched_at"),
+            "_fetched_at should be auto-injected into metadata_fields"
+        );
     }
 
     #[tokio::test]
@@ -2359,10 +2374,20 @@ mod tests {
         assert_eq!(nesting.json_field_name, "data");
         assert_eq!(
             nesting.column_order,
-            vec!["request_path", "response_status", "id", "data"]
+            vec![
+                "request_path",
+                "response_status",
+                "id",
+                "data",
+                "_fetched_at"
+            ]
         );
         assert!(nesting.metadata_fields.contains("request_path"));
         assert!(nesting.metadata_fields.contains("response_status"));
+        assert!(
+            nesting.metadata_fields.contains("_fetched_at"),
+            "_fetched_at should be auto-injected into metadata_fields"
+        );
         assert!(
             !nesting.metadata_fields.contains("id"),
             "non-reserved column must not be classified as metadata"
@@ -2371,6 +2396,7 @@ mod tests {
         // fields, otherwise the body would shadow the HTTP metadata.
         assert!(!nesting.static_fields.contains("request_path"));
         assert!(!nesting.static_fields.contains("response_status"));
+        assert!(!nesting.static_fields.contains("_fetched_at"));
         assert!(nesting.static_fields.contains("id"));
     }
 
@@ -2466,23 +2492,35 @@ mod tests {
         ];
         let schema = static_schema_for_https_dataset(&params, &dataset)
             .expect("json_nest dynamic mode -> Some");
-        assert_eq!(schema.fields().len(), 3);
-        for f in schema.fields() {
+        // 3 user-declared columns + auto-injected _fetched_at
+        assert_eq!(schema.fields().len(), 4);
+        // User-declared columns default to Utf8.
+        for name in &["id", "name", "data"] {
+            let f = schema
+                .field_with_name(name)
+                .expect("declared json_nest test column should exist in schema");
             assert_eq!(
                 f.data_type(),
                 &arrow_schema::DataType::Utf8,
-                "untyped json_nest column should default to Utf8 (field {})",
-                f.name()
+                "untyped json_nest column should default to Utf8 (field {name})",
             );
             assert!(f.is_nullable());
         }
+        // Auto-injected _fetched_at gets its type from base_table_schema.
+        let fetched_at = schema
+            .field_with_name("_fetched_at")
+            .expect("_fetched_at should be present in dynamic json_nest schema");
+        assert_eq!(
+            fetched_at.data_type(),
+            &arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+        );
         assert_eq!(
             schema
                 .fields()
                 .iter()
                 .map(|f| f.name().clone())
                 .collect::<Vec<_>>(),
-            vec!["id", "name", "data"]
+            vec!["id", "name", "data", "_fetched_at"]
         );
     }
 
@@ -2497,7 +2535,8 @@ mod tests {
         ];
         let schema = static_schema_for_https_dataset(&params, &dataset)
             .expect("json_nest dynamic mode -> Some");
-        assert_eq!(schema.fields().len(), 3);
+        // 3 user-declared columns + auto-injected _fetched_at
+        assert_eq!(schema.fields().len(), 4);
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(schema.field(0).data_type(), &arrow_schema::DataType::Int64);
         assert!(!schema.field(0).is_nullable());
@@ -2505,6 +2544,11 @@ mod tests {
         assert_eq!(schema.field(1).data_type(), &arrow_schema::DataType::Utf8);
         assert_eq!(schema.field(2).name(), "data");
         assert_eq!(schema.field(2).data_type(), &arrow_schema::DataType::Utf8);
+        assert_eq!(schema.field(3).name(), "_fetched_at");
+        assert_eq!(
+            schema.field(3).data_type(),
+            &arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+        );
     }
 
     #[tokio::test]
@@ -2517,5 +2561,87 @@ mod tests {
         ];
         // Defer the user-facing error to the eager path.
         assert!(static_schema_for_https_dataset(&params, &dataset).is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_auto_injects_fetched_at() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        // User declares only body columns + catch-all, no _fetched_at.
+        dataset.columns = vec![
+            Column::new("id"),
+            Column::new("title"),
+            column_with_marker("extra", Value::String("*".to_string())),
+        ];
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting)");
+
+        assert!(
+            nesting.column_order.contains(&"_fetched_at".to_string()),
+            "_fetched_at should be auto-injected into column_order"
+        );
+        assert!(
+            nesting.metadata_fields.contains("_fetched_at"),
+            "_fetched_at should be in metadata_fields"
+        );
+        assert!(
+            !nesting.static_fields.contains("_fetched_at"),
+            "_fetched_at must not be a static body field"
+        );
+        // Auto-injected at the end, after user-declared columns.
+        assert_eq!(
+            nesting
+                .column_order
+                .last()
+                .expect("column_order should include auto-injected _fetched_at"),
+            "_fetched_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_does_not_duplicate_fetched_at() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        // User explicitly declares _fetched_at.
+        dataset.columns = vec![
+            Column::new("id"),
+            Column::new("_fetched_at"),
+            column_with_marker("details", Value::String("*".to_string())),
+        ];
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting)");
+
+        let count = nesting
+            .column_order
+            .iter()
+            .filter(|n| *n == "_fetched_at")
+            .count();
+        assert_eq!(count, 1, "_fetched_at should not be duplicated");
+        assert!(nesting.metadata_fields.contains("_fetched_at"));
+        // When user declares it, it stays in the user's position.
+        assert_eq!(nesting.column_order[1], "_fetched_at");
+    }
+
+    #[tokio::test]
+    async fn build_json_nest_schema_includes_fetched_at_when_auto_injected() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        dataset.columns = vec![
+            Column::new("id"),
+            column_with_marker("data", Value::String("*".to_string())),
+        ];
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting)");
+        let schema =
+            build_json_nest_schema(&dataset, &nesting).expect("schema build should succeed");
+
+        let fetched_at = schema
+            .field_with_name("_fetched_at")
+            .expect("_fetched_at should be present in the schema");
+        assert_eq!(
+            fetched_at.data_type(),
+            &arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+            "_fetched_at should have its base_table_schema type"
+        );
     }
 }

@@ -45,6 +45,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+const SCHEMA_INFERENCE_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
@@ -673,6 +675,76 @@ async fn get_metadata_from_kafka(
     Ok((kafka_consumer, metadata, schema))
 }
 
+/// Peek at the most recent message on `topic` using a temporary consumer.
+/// Does not touch the real consumer or its group offsets.
+async fn fetch_latest_change_event(
+    dataset: &Dataset,
+    topic: &str,
+    kafka_config: &KafkaConfig,
+) -> super::DataConnectorResult<(Option<ChangeEventKey>, ChangeEvent)> {
+    let dataset_name = dataset.name.to_string();
+
+    match KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
+        topic,
+        kafka_config,
+        SCHEMA_INFERENCE_TIMEOUT,
+    )
+    .await
+    {
+        Ok(Some(pair)) => Ok(pair),
+        Ok(None) => Err(super::DataConnectorError::UnableToGetReadProvider {
+            dataconnector: "debezium".to_string(),
+            source: format!(
+                "No messages available on Kafka topic '{topic}' for dataset '{dataset_name}' within {SCHEMA_INFERENCE_TIMEOUT:?} while inferring schema (schema_evolution=true). Verify the topic exists and the Debezium connector is producing messages. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+            )
+            .into(),
+            connector_component: ConnectorComponent::from(dataset),
+        }),
+        Err(e) => Err(e).boxed().context(super::UnableToGetReadProviderSnafu {
+            dataconnector: "debezium",
+            connector_component: ConnectorComponent::from(dataset),
+        }),
+    }
+}
+
+/// Read the first available message.
+async fn fetch_first_event(
+    dataset: &Dataset,
+    topic: &str,
+    kafka_consumer: &KafkaConsumer,
+) -> super::DataConnectorResult<(Option<ChangeEventKey>, ChangeEvent)> {
+    let dataset_name = dataset.name.to_string();
+
+    let msg = tokio::time::timeout(
+        SCHEMA_INFERENCE_TIMEOUT,
+        kafka_consumer.next_json::<ChangeEventKey, ChangeEvent>(),
+    )
+    .await
+    .map_err(|_elapsed| super::DataConnectorError::UnableToGetReadProvider {
+        dataconnector: "debezium".to_string(),
+        source: format!(
+            "Timed out after {SCHEMA_INFERENCE_TIMEOUT:?} waiting for a message on Kafka topic '{topic}' for dataset '{dataset_name}' while inferring schema. Verify the Debezium connector is producing messages. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+        )
+        .into(),
+        connector_component: ConnectorComponent::from(dataset),
+    })?
+    .boxed()
+    .context(super::UnableToGetReadProviderSnafu {
+        dataconnector: "debezium",
+        connector_component: ConnectorComponent::from(dataset),
+    })?
+    .ok_or_else(|| super::DataConnectorError::UnableToGetReadProvider {
+        dataconnector: "debezium".to_string(),
+        source: format!(
+            "No messages available on Kafka topic '{topic}' for dataset '{dataset_name}' while inferring schema. Verify the topic exists and the Debezium connector is producing messages. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium"
+        )
+        .into(),
+        connector_component: ConnectorComponent::from(dataset),
+    })?;
+
+    Ok(msg.into_key_value())
+}
+
 /// Peek at the latest Kafka message to detect schema evolution. If the schema has
 /// changed from the cached metadata, update the stored metadata and return the fresh
 /// schema. Falls back to the cached schema if the peek fails or no messages are available.
@@ -699,7 +771,7 @@ async fn refresh_schema_if_evolved(
     let peek_result = KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
         topic,
         kafka_config,
-        Duration::from_secs(30),
+        SCHEMA_INFERENCE_TIMEOUT,
     )
     .await;
 

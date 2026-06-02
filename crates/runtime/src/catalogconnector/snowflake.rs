@@ -33,6 +33,9 @@ use std::any::Any;
 use std::sync::Arc;
 
 pub const PREFIX: &str = "snowflake";
+const SNOWFLAKE_DOCS: &str = "https://spiceai.org/docs/components/catalogs/snowflake";
+const SNOWFLAKE_ACCOUNT_IDENTIFIER_DOCS: &str =
+    "https://docs.snowflake.com/en/user-guide/admin-account-identifier";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -45,31 +48,50 @@ pub enum Error {
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("username")
         .secret()
-        .description("The Snowflake username for authentication."),
+        .description("Snowflake username for password or key-pair authentication.")
+        .examples(&["MACHINE_USER"])
+        .help_link(SNOWFLAKE_DOCS),
     ParameterSpec::component("password")
         .secret()
-        .description("The Snowflake password for authentication."),
+        .description("Snowflake password. Use only with password authentication.")
+        .help_link(SNOWFLAKE_DOCS),
     ParameterSpec::component("private_key")
         .secret()
-        .description("The private key content for key pair authentication."),
+        .description("PEM private key content for key-pair authentication. Use either `snowflake_private_key` or `snowflake_private_key_path`, not both.")
+        .help_link(SNOWFLAKE_DOCS),
     ParameterSpec::component("private_key_path")
         .secret()
-        .description("The path to a private key file for key pair authentication."),
+        .description("Path to a PEM private key file for key-pair authentication. Use either `snowflake_private_key_path` or `snowflake_private_key`, not both.")
+        .examples(&["/secrets/snowflake/rsa_key.p8"])
+        .help_link(SNOWFLAKE_DOCS),
     ParameterSpec::component("private_key_passphrase")
         .secret()
-        .description("The passphrase for the private key file."),
+        .description("Passphrase for an encrypted private key used with key-pair authentication.")
+        .help_link(SNOWFLAKE_DOCS),
     ParameterSpec::component("account")
         .secret()
-        .description("The Snowflake account identifier."),
+        .description("Snowflake account identifier. Supports preferred account names, org-qualified names, full snowflakecomputing.com URLs, and legacy account locators.")
+        .examples(&[
+            "myorg-myaccount",
+            "myorg.myaccount",
+            "https://myorg-myaccount.snowflakecomputing.com",
+            "xy12345.us-east-2.aws",
+        ])
+        .help_link(SNOWFLAKE_ACCOUNT_IDENTIFIER_DOCS),
     ParameterSpec::component("warehouse")
         .secret()
-        .description("The Snowflake warehouse to use."),
+        .description("Snowflake warehouse to use for queries.")
+        .examples(&["COMPUTE_WH"])
+        .help_link(SNOWFLAKE_DOCS),
     ParameterSpec::component("role")
         .secret()
-        .description("The Snowflake role to use."),
-    ParameterSpec::component("auth_type").description(
-        "The authentication type ('snowflake' or 'keypair'). Defaults to 'snowflake'.",
-    ),
+        .description("Snowflake role to use for the session.")
+        .examples(&["ANALYST"])
+        .help_link(SNOWFLAKE_DOCS),
+    ParameterSpec::component("auth_type")
+        .description("Snowflake authentication type. Use `password` or `snowflake` for password authentication, and `keypair` or `snowflake_jwt` for key-pair authentication. Defaults to password unless only key-pair credentials are provided.")
+        .one_of_ignore_ascii_case(&["password", "snowflake", "keypair", "snowflake_jwt"])
+        .help_link(SNOWFLAKE_DOCS),
 ];
 
 /// A catalog connector for Snowflake, providing access to schemas and tables
