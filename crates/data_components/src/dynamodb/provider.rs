@@ -16,8 +16,8 @@ limitations under the License.
 
 use super::{
     DescribeTableSnafu, Error, FailedToBootstrapTableSnafu, FailedToInitializeCheckpointSnafu,
-    FailedToInitializeStreamSnafu, Result, ScanSnafu, StreamsNotEnabledSnafu,
-    TableDoesNotExistSnafu, TableStatusIsNotActiveSnafu,
+    FailedToInitializeStreamSnafu, Result, ScanSnafu, TableDoesNotExistSnafu,
+    TableStatusIsNotActiveSnafu,
 };
 use crate::cdc::ChangeBatch;
 use crate::delete::DeletionExec;
@@ -289,7 +289,7 @@ impl DynamoDBTableProvider {
         })
     }
 
-    /// Returns `true` if DynamoDB Streams is enabled on the underlying table.
+    /// Returns `true` if `DynamoDB` Streams is enabled on the underlying table.
     #[must_use]
     pub fn streams_enabled(&self) -> bool {
         self.streams_enabled

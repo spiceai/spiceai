@@ -49,17 +49,6 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Returns `10^exp` as `i128`, or `None` on overflow.
-#[inline]
-#[must_use]
-pub fn pow10_i128(exp: i8) -> Option<i128> {
-    let mut acc: i128 = 1;
-    for _ in 0..exp {
-        acc = acc.checked_mul(10)?;
-    }
-    Some(acc)
-}
-
 /// Rescales `unscaled` from `src_scale` decimal places to `dst_scale`.
 ///
 /// # Errors
@@ -70,12 +59,16 @@ pub fn rescale_i128(unscaled: i128, src_scale: i8, dst_scale: i8) -> Result<i128
         Equal => Ok(unscaled),
         Less => {
             let diff = dst_scale - src_scale;
-            let mul = pow10_i128(diff).context(OverflowSnafu)?;
+            let mul = 10_i128
+                .checked_pow(u32::from(diff as u8))
+                .context(OverflowSnafu)?;
             unscaled.checked_mul(mul).context(OverflowSnafu)
         }
         Greater => {
             let diff = src_scale - dst_scale;
-            let div = pow10_i128(diff).context(OverflowSnafu)?;
+            let div = 10_i128
+                .checked_pow(u32::from(diff as u8))
+                .context(OverflowSnafu)?;
             Ok(unscaled / div)
         }
     }
@@ -110,7 +103,9 @@ pub fn parse_number_to_decimal(n: &serde_json::Number, target_scale: i8) -> Resu
         let f: f64 = s.parse().map_err(|_| Error::Invalid {
             reason: format!("cannot parse '{s}' as decimal"),
         })?;
-        let scale_factor = pow10_i128(target_scale).context(OverflowSnafu)?;
+        let scale_factor = 10_i128
+            .checked_pow(u32::from(target_scale as u8))
+            .context(OverflowSnafu)?;
         #[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
         return Ok((f * scale_factor as f64).round() as i128);
     }
