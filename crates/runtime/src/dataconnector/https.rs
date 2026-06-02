@@ -643,7 +643,8 @@ impl Https {
 
         let params = TLS_CLIENT_IDENTITY_PARAM_NAMES
             .iter()
-            .map(|name| format!("'{}'", self.params.user_param(name)))
+            .filter(|&&name| self.params.get(name).expose().ok().is_some())
+            .map(|&name| format!("'{}'", self.params.user_param(name)))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -2254,7 +2255,7 @@ mod tests {
         let connector = test_connector_with(&[
             ("file_format", "csv"),
             ("http_tls_client_certificate", "inline-cert"),
-            ("http_tls_client_key", "inline-key"),
+            // Only one param set, to verify error message lists only the configured one(s)
         ])
         .await;
         let dataset = test_dataset("https://example.com/data.csv", RefreshMode::Full, None).await;
@@ -2273,6 +2274,10 @@ mod tests {
                 assert!(
                     message.contains("http_tls_client_certificate"),
                     "expected user-facing mTLS param in error, got: {message}"
+                );
+                assert!(
+                    !message.contains("http_tls_client_key"),
+                    "error should not mention unset key param, got: {message}"
                 );
                 assert!(
                     message.contains("dynamic JSON HTTP API dataset"),
