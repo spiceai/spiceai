@@ -1135,6 +1135,9 @@ impl RefreshTask {
         // privately in each accelerator module); the accelerator's schema
         // metadata carries the engine name.
         const ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
+        static WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
         let is_cayenne = self
             .accelerator
             .schema()
@@ -1145,8 +1148,6 @@ impl RefreshTask {
         if !is_cayenne {
             return;
         }
-        static WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-            std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
         let first_for_table = WARNED
             .lock()
             .map(|mut set| set.insert(self.dataset_name.to_string()))
