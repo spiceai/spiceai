@@ -1016,7 +1016,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
             // Register partition_metadata as Initializing so `/v1/ready`
             // waits for metadata seeding to complete before reporting ready.
             rt.status
-                .update_component_status("partition_metadata", ComponentStatus::Initializing);
+                .update_component_status("partition_metadata", &ComponentStatus::Initializing);
 
             let pa_task = PartitionAssignmentTask::new(
                 rt.datafusion(),

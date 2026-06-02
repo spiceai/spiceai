@@ -340,7 +340,7 @@ mod tests {
         use crate::status::{ComponentStatus, RuntimeReadyState};
         let status = RuntimeStatus::new();
         status.set_ready_state(RuntimeReadyState::OnRegistration);
-        status.update_component_status("test:probe", ComponentStatus::Ready);
+        status.update_component_status("test:probe", &ComponentStatus::Ready);
         status
     }
 
