@@ -2100,7 +2100,7 @@ fn protected_snapshot_size_tier(bytes: u64, base_bytes: u64, growth: u64) -> u32
 ///
 /// `inputs` is `(snapshot_id, deletion_threshold, bytes)`. Returns the selected
 /// `(snapshot_id, deletion_threshold)` pairs oldest-first (input order is
-/// assumed oldest-first, i.e. UUIDv7 lexical order), or empty if no tier has
+/// assumed oldest-first, i.e. `UUIDv7` lexical order), or empty if no tier has
 /// `>= min_runs` runs.
 fn select_protected_snapshot_merge_tier(
     inputs: &[(String, i64, u64)],
@@ -7191,10 +7191,7 @@ impl CayenneTableProvider {
         // only when its tier fills up and it levels up) and read amplification
         // to at most `min_runs - 1` un-merged runs per tier — instead of folding
         // the large carried-forward blob back in on every pass.
-        let min_runs = self
-            .context
-            .compaction_trigger_protected_snapshots()
-            .max(2);
+        let min_runs = self.context.compaction_trigger_protected_snapshots().max(2);
         let inputs = select_protected_snapshot_merge_tier(
             &sized_candidates,
             min_runs,
@@ -7223,11 +7220,7 @@ impl CayenneTableProvider {
             .filter(|(id, _, _)| selected_ids.contains(id.as_str()))
             .collect();
         let total_input_bytes: u64 = selected_sizes.iter().map(|(_, _, b)| *b).sum();
-        let largest_input_bytes = selected_sizes
-            .iter()
-            .map(|(_, _, b)| *b)
-            .max()
-            .unwrap_or(0);
+        let largest_input_bytes = selected_sizes.iter().map(|(_, _, b)| *b).max().unwrap_or(0);
         // Percent of selected bytes contributed by the single largest run,
         // computed with integer (u128) math to avoid any float cast. With
         // size-tiering this should stay low (runs are same-tier), in contrast to
@@ -7238,8 +7231,11 @@ impl CayenneTableProvider {
         } else {
             0
         };
-        let selected_tier =
-            protected_snapshot_size_tier(largest_input_bytes, PROTECTED_TIER_BASE_BYTES, PROTECTED_TIER_GROWTH);
+        let selected_tier = protected_snapshot_size_tier(
+            largest_input_bytes,
+            PROTECTED_TIER_BASE_BYTES,
+            PROTECTED_TIER_GROWTH,
+        );
 
         tracing::info!(
             target: "cayenne::compaction",
@@ -7271,8 +7267,12 @@ impl CayenneTableProvider {
             let plan = self
                 .create_snapshot_scan_plan(&state, snapshot_id, None, &[], None)
                 .await?;
-            let filtered =
-                self.apply_partial_deletion_filter(plan, &pk_indices, *threshold, &deletion_snapshot)?;
+            let filtered = self.apply_partial_deletion_filter(
+                plan,
+                &pk_indices,
+                *threshold,
+                &deletion_snapshot,
+            )?;
             plans.push(filtered);
         }
 
@@ -7296,7 +7296,12 @@ impl CayenneTableProvider {
         let target_partitions = state.config().target_partitions();
         let write_start = std::time::Instant::now();
         let write_result = self
-            .write_to_snapshot(stream, target_size_bytes, &new_snapshot_id, target_partitions)
+            .write_to_snapshot(
+                stream,
+                target_size_bytes,
+                &new_snapshot_id,
+                target_partitions,
+            )
             .await;
 
         let (total_rows, _writer_ops, _stats_acc) = match write_result {
@@ -7374,7 +7379,8 @@ impl CayenneTableProvider {
         // sleep, which now excludes the merged inputs and includes the new
         // snapshot, so only the merged-away dirs are removed.
         let current_snapshot_id = self.get_current_snapshot_id();
-        self.trigger_old_snapshot_cleanup(&current_snapshot_id).await;
+        self.trigger_old_snapshot_cleanup(&current_snapshot_id)
+            .await;
 
         tracing::info!(
             target: "cayenne::compaction",
@@ -10862,10 +10868,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         // re-check (and size-tiering) still happens under the fence inside
         // `compact_protected_snapshots_subset`; this guard only avoids wasted
         // work on the common path where nothing has accumulated yet.
-        let min_inputs = self
-            .context
-            .compaction_trigger_protected_snapshots()
-            .max(2);
+        let min_inputs = self.context.compaction_trigger_protected_snapshots().max(2);
         let protected_len = self.protected_snapshots.load().len();
         if protected_len < min_inputs {
             tracing::trace!(
@@ -11003,10 +11006,10 @@ mod tests {
         // Two tier-0 runs (small) and two tier-1 runs (large). With min_runs=2
         // the LOWEST qualifying tier (tier 0) is selected.
         let inputs = vec![
-            sized("a", 1024),          // tier 0
-            sized("b", 2048),          // tier 0
-            sized("c", base * 4),      // tier 1
-            sized("d", base * 5),      // tier 1
+            sized("a", 1024),     // tier 0
+            sized("b", 2048),     // tier 0
+            sized("c", base * 4), // tier 1
+            sized("d", base * 5), // tier 1
         ];
         let selected = select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth);
         let ids: Vec<&str> = selected.iter().map(|(id, _)| id.as_str()).collect();
@@ -11044,10 +11047,18 @@ mod tests {
         let base = 8 * 1024 * 1024;
         let growth = 8;
         // Fewer than two inputs, or a sub-2 floor, can never merge.
-        assert!(select_protected_snapshot_merge_tier(&[sized("a", 1)], 2, 32, base, growth).is_empty());
         assert!(
-            select_protected_snapshot_merge_tier(&[sized("a", 1), sized("b", 2)], 1, 32, base, growth)
-                .is_empty()
+            select_protected_snapshot_merge_tier(&[sized("a", 1)], 2, 32, base, growth).is_empty()
+        );
+        assert!(
+            select_protected_snapshot_merge_tier(
+                &[sized("a", 1), sized("b", 2)],
+                1,
+                32,
+                base,
+                growth
+            )
+            .is_empty()
         );
     }
 
@@ -11132,6 +11143,127 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// End-to-end coverage for the fast protected-snapshot compaction
+    /// (`compact_protected_snapshots_subset`). The other tests cover only the
+    /// pure tier-selection math; this exercises the real rewrite + CAS swap +
+    /// in-memory reconciliation. It builds more than the trigger floor of small
+    /// (tier-0) protected snapshots via upsert-table inserts, runs the subset
+    /// compaction, and asserts it (a) merges — reducing the protected-snapshot
+    /// count, (b) preserves every visible row, and (c) leaves the merged
+    /// snapshot's in-memory threshold equal to its persisted sequence number
+    /// (reload-stable: the partial-deletion filter must behave identically
+    /// before and after a restart).
+    #[tokio::test]
+    async fn protected_snapshot_subset_compaction_merges_and_preserves_rows() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        const TRIGGER: usize = 4;
+        let ctx = SessionContext::new();
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: "compact_subset".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                // Disable the inline memtable so each upsert-table write lands in
+                // a file-backed protected snapshot (the compaction's domain)
+                // instead of being absorbed inline.
+                inline_max_rows: 0,
+                // Deterministic, low trigger floor so a handful of snapshots merge.
+                compaction_trigger_protected_snapshots: TRIGGER,
+                // Pin the background compactor far out so only our explicit call
+                // runs — the test must not race the 30s background tick.
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .create(options)
+            .await
+            .expect("table created");
+
+        // Each insert into an upsert table publishes a new protected snapshot.
+        // Create more than the trigger floor of small (tier-0) snapshots.
+        let n = i64::try_from(TRIGGER).expect("TRIGGER fits in i64") + 2;
+        for i in 0..n {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
+            )
+            .await;
+        }
+
+        let before = provider.protected_snapshots.load_full().len();
+        assert!(
+            before >= TRIGGER,
+            "expected >= {TRIGGER} protected snapshots before compaction, got {before}"
+        );
+
+        let expected: Vec<(i64, i64)> = (0..n).map(|i| (i, i * 10)).collect();
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "compact_subset").await,
+            expected,
+            "sanity: all inserted rows visible before compaction"
+        );
+
+        let merged = provider
+            .compact_protected_snapshots_subset(usize::MAX)
+            .await
+            .expect("compaction should not error");
+        assert!(merged, "a tier with >= {TRIGGER} runs should have merged");
+
+        // (a) Inputs replaced by a single merged snapshot → count drops.
+        let after = provider.protected_snapshots.load_full().len();
+        assert!(
+            after < before,
+            "compaction must reduce the protected-snapshot count: {before} -> {after}"
+        );
+
+        // (b) Every visible row preserved through the merge.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "compact_subset").await,
+            expected,
+            "compaction must preserve all visible rows"
+        );
+
+        // (c) Reload-stable thresholds: every in-memory protected-snapshot
+        // threshold must equal its persisted sequence number, or a scan would
+        // return different rows before vs after a restart.
+        let in_mem = provider.protected_snapshots.load_full();
+        let persisted = catalog
+            .get_all_snapshot_sequences(&provider.table_metadata.table_id)
+            .await
+            .expect("persisted snapshot sequences");
+        for (id, threshold) in in_mem.iter() {
+            assert_eq!(
+                persisted.get(id),
+                Some(threshold),
+                "protected snapshot {id}: in-memory threshold {threshold} must equal persisted {:?}",
+                persisted.get(id),
+            );
+        }
     }
 
     #[test]
