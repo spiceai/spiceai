@@ -5,14 +5,14 @@ description: "Query: tpcds_q71"
 +----------+----------------------+--------+----------+-----------+
 | brand_id | brand                | t_hour | t_minute | ext_price |
 +----------+----------------------+--------+----------+-----------+
-| 1001001  | amalgscholar #2      | 19     | 18       |           |
-| 1001001  | amalgamalg #2        | 17     | 43       |           |
 | 1001001  | amalgunivamalg #13   | 17     | 24       |           |
-| 1001001  | importomaxi #4       | 19     | 12       |           |
+| 1001001  | amalgamalg #2        | 17     | 43       |           |
 | 1001001  | amalgamalg #2        | 19     | 39       |           |
-| 1001001  | importoimporto #2    | 8      | 53       |           |
+| 1001001  | amalgscholar #2      | 19     | 18       |           |
+| 1001001  | importomaxi #4       | 19     | 12       |           |
 | 1001001  | univamalgamalg #16   | 17     | 45       |           |
+| 1001001  | importoimporto #2    | 8      | 53       |           |
 | 1002001  | namelessbrand #8     | 19     | 14       |           |
 | 1002001  | exportiunivamalg #10 | 17     | 8        |           |
-| 1002001  | corpcorp #6          | 8      | 22       |           |
+| 1002001  | importounivamalg #1  | 17     | 4        |           |
 +----------+----------------------+--------+----------+-----------+
