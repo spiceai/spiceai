@@ -61,12 +61,10 @@ Spice SQL runs on Apache DataFusion with the SQL parser configured for the Postg
 - `vector_search`: Runs vector search over a configured embedding/vector index. Syntax: `vector_search(dataset, 'query text'[, column])`.
 
 ### Additional registered functions
-- `ai`: Runs a prompt against a configured language model (SCALAR). Syntax: `ai(prompt[, model => 'model_name'])`.
 - `bucket`: Assigns a numeric expression to a bucket boundary (SCALAR). Syntax: `bucket(value, buckets)`.
 - `col_description`: Returns the configured description for a table column (SCALAR). Syntax: `col_description(table_catalog, table_schema, table_name, column_name)`.
 - `cosine_distance`: Computes cosine distance between two vectors (SCALAR). Syntax: `cosine_distance(vector_a, vector_b)`.
 - `digest_many`: Computes a digest for one or more input expressions (SCALAR). Syntax: `digest_many(value[, ...])`.
-- `embed`: Generates an embedding with a configured embedding model (SCALAR). Syntax: `embed(input[, model => 'model_name'])`.
 - `inner_product`: Computes the inner product of two vectors (SCALAR). Syntax: `inner_product(vector_a, vector_b)`.
 - `l2_distance`: Computes Euclidean distance between two vectors (SCALAR). Syntax: `l2_distance(vector_a, vector_b)`.
 - `l2_norm`: Computes the L2 norm of a vector (SCALAR). Syntax: `l2_norm(vector)`.

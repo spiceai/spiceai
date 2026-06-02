@@ -3128,6 +3128,19 @@ mod tests {
         assert!(!additional_names.contains("json_get"));
     }
 
+    #[cfg(feature = "models")]
+    #[test]
+    fn function_context_includes_model_functions_when_registered() {
+        let app = app::AppBuilder::new("test").build();
+        let available_names = HashSet::from([AI_UDF_NAME.to_string(), EMBED_UDF_NAME.to_string()]);
+
+        let context = nsql_function_context_for_test(&app, &available_names, false, false);
+        let additional_names = entry_names(&context.additional);
+
+        assert!(additional_names.contains(AI_UDF_NAME));
+        assert!(additional_names.contains(EMBED_UDF_NAME));
+    }
+
     #[test]
     fn function_context_requires_text_and_vector_search_for_fusion_and_rerank() {
         let app = app::AppBuilder::new("test").build();

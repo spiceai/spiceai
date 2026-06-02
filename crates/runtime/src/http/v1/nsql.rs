@@ -1125,7 +1125,7 @@ mod tests {
 
     fn nsql_context_function_context_for_test(include_search_functions: bool) -> String {
         let app = app_with_functions(true, vec![ticket_priority_function()]);
-        let mut available_names = all_context_function_names_for_test();
+        let mut available_names = snapshot_context_function_names_for_test();
         available_names.insert("ticket_priority".to_string());
 
         nsql_function_context_for_test(
@@ -1135,6 +1135,13 @@ mod tests {
             include_search_functions,
         )
         .render_markdown()
+    }
+
+    fn snapshot_context_function_names_for_test() -> HashSet<String> {
+        let mut names = all_context_function_names_for_test();
+        names.remove("ai");
+        names.remove("embed");
+        names
     }
 
     fn nsql_context_block_with_samples_for_test() -> String {
@@ -1346,7 +1353,7 @@ mod tests {
         let app = AppBuilder::new("test").build();
         response.functions = nsql_function_context_for_test(
             &app,
-            &all_context_function_names_for_test(),
+            &snapshot_context_function_names_for_test(),
             true,
             true,
         );

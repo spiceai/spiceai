@@ -271,12 +271,6 @@ expression: response
     ],
     "additional": [
       {
-        "name": "ai",
-        "syntax": "ai(prompt[, model => 'model_name'])",
-        "description": "Runs a prompt against a configured language model.",
-        "function_type": "SCALAR"
-      },
-      {
         "name": "bucket",
         "syntax": "bucket(value, buckets)",
         "description": "Assigns a numeric expression to a bucket boundary.",
@@ -298,12 +292,6 @@ expression: response
         "name": "digest_many",
         "syntax": "digest_many(value[, ...])",
         "description": "Computes a digest for one or more input expressions.",
-        "function_type": "SCALAR"
-      },
-      {
-        "name": "embed",
-        "syntax": "embed(input[, model => 'model_name'])",
-        "description": "Generates an embedding with a configured embedding model.",
         "function_type": "SCALAR"
       },
       {
