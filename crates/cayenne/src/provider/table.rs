@@ -11332,14 +11332,20 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         // inside `compact_protected_snapshots_subset`); cross-process safety by
         // the CAS in `MetadataCatalog::swap_protected_snapshots`.
         //
-        if self.has_inflight_staging_appends() {
-            tracing::trace!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
-                "Skipping background compaction: staged append finalization is in flight",
-            );
-            return Ok(false);
-        }
+        // This path intentionally does NOT gate on
+        // `has_inflight_staging_appends()`. Under sustained CDC upsert the
+        // pipelined finalize keeps a staging append in flight essentially
+        // continuously, so gating on it here would permanently STARVE
+        // background compaction: protected snapshots grow unbounded, read
+        // amplification slows every scan and cold keyset rebuild, the
+        // one-finalize-deep apply pipeline falls behind, and replication never
+        // converges. The subset compaction captures a coherent input set under
+        // the `listing_fence` read side (serialized against the Stage-B
+        // publish's fence write) and only ever rewrites already-published,
+        // immutable protected snapshots — so it is safe to run concurrently
+        // with in-flight staging appends. The inflight gate is required only
+        // for the current-snapshot rewrite path (`run_one_compaction_pass`),
+        // which takes the `write_lock`.
 
         // Cheap lock-free early-out first: skip acquiring `compaction_lock` /
         // `listing_fence` and building a session context unless the protected
