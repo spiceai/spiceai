@@ -39,6 +39,7 @@ use spicepod::semantic::Column;
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use tokio::runtime::Handle;
@@ -52,12 +53,24 @@ use super::{
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use reqwest::{
-    Client,
+    Client, Identity,
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 use std::time::Duration;
 
 const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
+
+#[derive(Debug)]
+enum ClientIdentityConfig {
+    FromFiles {
+        cert_path: PathBuf,
+        key_path: PathBuf,
+    },
+    FromPem {
+        cert_pem: Vec<u8>,
+        key_pem: Vec<u8>,
+    },
+}
 
 fn parse_pagination_max_pages(value: &str) -> Option<usize> {
     let trimmed = value.trim();
@@ -587,8 +600,174 @@ impl Https {
         custom_headers
     }
 
+    fn resolve_client_identity_config(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<Option<ClientIdentityConfig>> {
+        let client_certificate_path = self
+            .params
+            .get("tls_client_certificate_file")
+            .expose()
+            .ok()
+            .map(PathBuf::from);
+        let client_key_path = self
+            .params
+            .get("tls_client_key_file")
+            .expose()
+            .ok()
+            .map(PathBuf::from);
+        let client_certificate_inline = self
+            .params
+            .get("tls_client_certificate")
+            .expose()
+            .ok()
+            .map(|s| s.as_bytes().to_vec());
+        let client_key_inline = self
+            .params
+            .get("tls_client_key")
+            .expose()
+            .ok()
+            .map(|s| s.as_bytes().to_vec());
+
+        let has_file_cert = client_certificate_path.is_some();
+        let has_file_key = client_key_path.is_some();
+        let has_inline_cert = client_certificate_inline.is_some();
+        let has_inline_key = client_key_inline.is_some();
+
+        if (has_file_cert || has_file_key) && (has_inline_cert || has_inline_key) {
+            return Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "https".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                message: format!(
+                    "mTLS client identity is ambiguous: both file-based ('{}') and inline ('{}') params are set. Use one or the other, not both.",
+                    self.params.user_param("tls_client_certificate_file"),
+                    self.params.user_param("tls_client_certificate"),
+                ),
+            });
+        }
+
+        if has_file_cert || has_file_key {
+            return match (client_certificate_path, client_key_path) {
+                (Some(cert_path), Some(key_path)) => Ok(Some(ClientIdentityConfig::FromFiles {
+                    cert_path,
+                    key_path,
+                })),
+                (Some(_), None) => Err(DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: format!(
+                        "mTLS client identity is half-configured: '{}' is set but '{}' is missing. Set both fields to present a client certificate to the upstream HTTP server, or set neither.",
+                        self.params.user_param("tls_client_certificate_file"),
+                        self.params.user_param("tls_client_key_file"),
+                    ),
+                }),
+                (None, Some(_)) => Err(DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: format!(
+                        "mTLS client identity is half-configured: '{}' is set but '{}' is missing. Set both fields to present a client certificate to the upstream HTTP server, or set neither.",
+                        self.params.user_param("tls_client_key_file"),
+                        self.params.user_param("tls_client_certificate_file"),
+                    ),
+                }),
+                (None, None) => Ok(None),
+            };
+        }
+
+        if has_inline_cert || has_inline_key {
+            return match (client_certificate_inline, client_key_inline) {
+                (Some(cert_pem), Some(key_pem)) => {
+                    Ok(Some(ClientIdentityConfig::FromPem { cert_pem, key_pem }))
+                }
+                (Some(_), None) => Err(DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: format!(
+                        "mTLS client identity is half-configured: '{}' is set but '{}' is missing. Set both fields to present a client certificate to the upstream HTTP server, or set neither.",
+                        self.params.user_param("tls_client_certificate"),
+                        self.params.user_param("tls_client_key"),
+                    ),
+                }),
+                (None, Some(_)) => Err(DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: format!(
+                        "mTLS client identity is half-configured: '{}' is set but '{}' is missing. Set both fields to present a client certificate to the upstream HTTP server, or set neither.",
+                        self.params.user_param("tls_client_key"),
+                        self.params.user_param("tls_client_certificate"),
+                    ),
+                }),
+                (None, None) => Ok(None),
+            };
+        }
+
+        Ok(None)
+    }
+
+    async fn resolve_client_identity(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<Option<Identity>> {
+        let Some(config) = self.resolve_client_identity_config(dataset)? else {
+            return Ok(None);
+        };
+
+        let identity_pem = match config {
+            ClientIdentityConfig::FromFiles {
+                cert_path,
+                key_path,
+            } => {
+                let cert = tokio::fs::read(&cert_path).await.boxed().map_err(|e| {
+                    DataConnectorError::InvalidConfiguration {
+                        dataconnector: "https".to_string(),
+                        message: format!(
+                            "Failed to read mTLS client certificate file '{}'. Ensure the file exists and is readable.",
+                            cert_path.display()
+                        ),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: e,
+                    }
+                })?;
+                let key = tokio::fs::read(&key_path).await.boxed().map_err(|e| {
+                    DataConnectorError::InvalidConfiguration {
+                        dataconnector: "https".to_string(),
+                        message: format!(
+                            "Failed to read mTLS client key file '{}'. Ensure the file exists and is readable.",
+                            key_path.display()
+                        ),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: e,
+                    }
+                })?;
+
+                let mut identity_pem = Vec::with_capacity(cert.len() + key.len() + 1);
+                identity_pem.extend_from_slice(&cert);
+                identity_pem.push(b'\n');
+                identity_pem.extend_from_slice(&key);
+                identity_pem
+            }
+            ClientIdentityConfig::FromPem { cert_pem, key_pem } => {
+                let mut identity_pem = Vec::with_capacity(cert_pem.len() + key_pem.len() + 1);
+                identity_pem.extend_from_slice(&cert_pem);
+                identity_pem.push(b'\n');
+                identity_pem.extend_from_slice(&key_pem);
+                identity_pem
+            }
+        };
+
+        Identity::from_pem(&identity_pem)
+            .map(Some)
+            .boxed()
+            .map_err(|e| DataConnectorError::InvalidConfiguration {
+                dataconnector: "https".to_string(),
+                message: "Failed to parse mTLS client identity. Ensure the certificate chain and private key are PEM encoded and match.".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: e,
+            })
+    }
+
     /// Build HTTP client with configured timeouts and connection pool settings
-    fn build_http_client(&self, dataset: &Dataset) -> DataConnectorResult<Client> {
+    async fn build_http_client(&self, dataset: &Dataset) -> DataConnectorResult<Client> {
         let timeout_secs = self
             .params
             .get("client_timeout")
@@ -621,12 +800,18 @@ impl Https {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(90);
 
-        Client::builder()
+        let mut builder = Client::builder()
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(Duration::from_secs(connect_timeout_secs))
             .timeout(Duration::from_secs(timeout_secs))
             .pool_max_idle_per_host(pool_max_idle_per_host)
-            .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs))
+            .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs));
+
+        if let Some(identity) = self.resolve_client_identity(dataset).await? {
+            builder = builder.identity(identity);
+        }
+
+        builder
             .build()
             .boxed()
             .map_err(|e| DataConnectorError::InternalWithSource {
@@ -791,7 +976,7 @@ impl Https {
             }
         })?;
 
-        let client = self.build_http_client(dataset)?;
+        let client = self.build_http_client(dataset).await?;
 
         let HttpProviderParams {
             file_format,
@@ -1277,6 +1462,14 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .description("Maximum number of idle connections to keep alive per host. Default: 10"),
         ParameterSpec::runtime("pool_idle_timeout")
             .description("Timeout for idle connections in the pool (in seconds). Default: 90"),
+        ParameterSpec::component("tls_client_certificate_file")
+            .description("Path to a PEM client certificate chain to present during the TLS handshake when the upstream HTTP server requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate'. Applies to JSON API endpoints only."),
+        ParameterSpec::component("tls_client_key_file")
+            .description("Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_key'. Applies to JSON API endpoints only."),
+        ParameterSpec::component("tls_client_certificate").secret()
+            .description("Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file'. Applies to JSON API endpoints only."),
+        ParameterSpec::component("tls_client_key").secret()
+            .description("Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_key_file'. Applies to JSON API endpoints only."),
         ParameterSpec::runtime("http_headers")
             .description("Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests."),
         ParameterSpec::runtime("max_retries")
@@ -1631,6 +1824,18 @@ mod tests {
         });
 
         dataset
+    }
+
+    fn test_client_identity_pems() -> (String, String) {
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, "http-connector-client");
+        let mut params = rcgen::CertificateParams::default();
+        params.distinguished_name = dn;
+        let key_pair = rcgen::KeyPair::generate().expect("client key should be generated");
+        let cert = params
+            .self_signed(&key_pair)
+            .expect("client certificate should be generated");
+        (cert.pem(), key_pair.serialize_pem())
     }
 
     fn assert_invalid_url_error(error: DataConnectorError) {
@@ -2074,6 +2279,190 @@ mod tests {
             result.is_none(),
             "expected None when no auth params are configured"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_client_identity_config_returns_none_when_unset() {
+        let connector = test_connector(None).await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        let result = connector
+            .resolve_client_identity_config(&dataset)
+            .expect("no mTLS params should be valid");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_client_identity_config_parses_prefixed_file_params() {
+        let connector = test_connector_with(&[
+            ("http_tls_client_certificate_file", "/certs/client.pem"),
+            ("http_tls_client_key_file", "/certs/client.key"),
+        ])
+        .await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        let config = connector
+            .resolve_client_identity_config(&dataset)
+            .expect("file-based mTLS params should be valid")
+            .expect("expected client identity config");
+
+        match config {
+            ClientIdentityConfig::FromFiles {
+                cert_path,
+                key_path,
+            } => {
+                assert_eq!(cert_path, PathBuf::from("/certs/client.pem"));
+                assert_eq!(key_path, PathBuf::from("/certs/client.key"));
+            }
+            other => panic!("expected file-based identity config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_client_identity_config_parses_prefixed_inline_params() {
+        let connector = test_connector_with(&[
+            (
+                "http_tls_client_certificate",
+                "-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----\n",
+            ),
+            (
+                "http_tls_client_key",
+                "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n",
+            ),
+        ])
+        .await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        let config = connector
+            .resolve_client_identity_config(&dataset)
+            .expect("inline mTLS params should be valid")
+            .expect("expected client identity config");
+
+        match config {
+            ClientIdentityConfig::FromPem { cert_pem, key_pem } => {
+                assert!(cert_pem.starts_with(b"-----BEGIN CERTIFICATE-----"));
+                assert!(key_pem.starts_with(b"-----BEGIN PRIVATE KEY-----"));
+            }
+            other => panic!("expected inline identity config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_client_identity_config_rejects_half_configured_file_identity() {
+        let connector =
+            test_connector_with(&[("http_tls_client_certificate_file", "/certs/client.pem")]).await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        let error = connector
+            .resolve_client_identity_config(&dataset)
+            .expect_err("certificate file without key file should be rejected");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("http_tls_client_certificate_file"),
+                    "expected certificate file param in error, got: {message}"
+                );
+                assert!(
+                    message.contains("http_tls_client_key_file"),
+                    "expected key file param in error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_client_identity_config_rejects_half_configured_inline_identity() {
+        let connector = test_connector_with(&[("http_tls_client_key", "not-a-key")]).await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        let error = connector
+            .resolve_client_identity_config(&dataset)
+            .expect_err("key without certificate should be rejected");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("http_tls_client_key"),
+                    "expected key param in error, got: {message}"
+                );
+                assert!(
+                    message.contains("http_tls_client_certificate"),
+                    "expected certificate param in error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_client_identity_config_rejects_ambiguous_identity_sources() {
+        let connector = test_connector_with(&[
+            ("http_tls_client_certificate_file", "/certs/client.pem"),
+            ("http_tls_client_key_file", "/certs/client.key"),
+            ("http_tls_client_certificate", "inline-cert"),
+            ("http_tls_client_key", "inline-key"),
+        ])
+        .await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        let error = connector
+            .resolve_client_identity_config(&dataset)
+            .expect_err("file and inline identities should be mutually exclusive");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("ambiguous"),
+                    "expected ambiguous identity error, got: {message}"
+                );
+                assert!(message.contains("http_tls_client_certificate_file"));
+                assert!(message.contains("http_tls_client_certificate"));
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_http_client_rejects_invalid_inline_identity_pem() {
+        let connector = test_connector_with(&[
+            ("http_tls_client_certificate", "not a certificate"),
+            ("http_tls_client_key", "not a key"),
+        ])
+        .await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        let error = connector
+            .build_http_client(&dataset)
+            .await
+            .expect_err("invalid inline PEM should be rejected");
+
+        match error {
+            DataConnectorError::InvalidConfiguration { message, .. } => {
+                assert!(
+                    message.contains("Failed to parse mTLS client identity"),
+                    "expected invalid PEM parse error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfiguration, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_http_client_accepts_valid_inline_identity_pem() {
+        let (cert_pem, key_pem) = test_client_identity_pems();
+        let connector = test_connector_with(&[
+            ("http_tls_client_certificate", cert_pem.as_str()),
+            ("http_tls_client_key", key_pem.as_str()),
+        ])
+        .await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        connector
+            .build_http_client(&dataset)
+            .await
+            .expect("valid inline mTLS identity should build an HTTP client");
     }
 
     #[tokio::test]
